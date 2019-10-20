@@ -1,0 +1,8 @@
+syntax = "proto3";
+package summa.proto;
+
+message SearchRequest {
+  string query = 1;
+  int32 page = 2;
+  int32 page_size = 3;
+}

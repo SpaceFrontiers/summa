@@ -1,0 +1,9 @@
+syntax = "proto3";
+package summa.proto;
+
+import "summa/proto/document.proto";
+
+message SearchResponse {
+  repeated Document documents = 1;
+  bool has_next = 2;
+}

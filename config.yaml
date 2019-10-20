@@ -1,0 +1,14 @@
+---
+
+http:
+  bind_addr: 0.0.0.0:40080
+  keep_alive_secs: 75
+  max_body_size_mb: 32
+  workers: 4
+log_path: /var/log/summa/{{ ENV_TYPE }}
+search_engine:
+  data_path: /summa
+  default_page_size: 4
+  timeout_secs: 5
+  writer_memory_mb: 4096
+  writer_threads: 4

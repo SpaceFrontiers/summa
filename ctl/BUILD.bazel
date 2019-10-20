@@ -1,0 +1,22 @@
+load("@pip_modules_external//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "ctl",
+    srcs = glob([
+        "**/*.py",
+    ]),
+    data = [
+        "//summa:config.yaml",
+    ],
+    main = "main.py",
+    srcs_version = "PY3",
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("brotli"),
+        requirement("fire"),
+        "//library/clicolor",
+        "//library/configurator",
+        "//utils",
+    ],
+)
