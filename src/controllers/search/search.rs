@@ -2,8 +2,10 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Deserialize;
 
 use crate::config::Config as ApplicationConfig;
-use crate::errors::Error;
+use crate::errors::{BadRequestError, Error};
 use crate::search_engine::SearchEngine;
+
+use super::super::get_header;
 
 #[derive(Deserialize)]
 pub struct Search {
@@ -30,9 +32,13 @@ pub async fn search(
 
     let limit = page_size;
     let offset = page_size * page;
-    let results = search_engine.search(schema_name, &query, limit, offset)?;
-
-    Ok(HttpResponse::Ok()
-        .content_type("application/json")
-        .body(serde_json::to_string(&results)?))
+    let search_response = search_engine.search(schema_name, &query, limit, offset).await?;
+    match get_header(&req, "Accept") {
+        Some("application/json") | Some("*/*") | None => {
+            Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .body(search_response.to_json()?))
+        },
+        _ => Err(Error::BadRequestError(BadRequestError::UnknownContentTypeError))?
+    }
 }

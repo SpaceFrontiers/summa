@@ -1,6 +1,5 @@
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
-use templar::Context;
 use textwrap::indent;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,7 +34,8 @@ impl std::fmt::Display for Config {
             "Summa Config:".green().bold(),
             indent(
                 &serde_yaml::to_string(&self)
-                    .map_err(|e| crate::errors::ConfigError::YamlError(e)).unwrap(),
+                    .map_err(|e| crate::errors::ConfigError::YamlError(e))
+                    .unwrap(),
                 "  "
             ),
         )
@@ -47,21 +47,13 @@ impl Config {
         let mut buffer = String::new();
         reader.read_to_string(&mut buffer)?;
 
-        let template = templar::Templar::global().parse(&buffer)?;
-        let mut data: templar::Document = templar::Document::default();
-
         for (key, value) in std::env::vars() {
-            data[key] = value.into();
+            let re = regex::Regex::new(&format!(r"\{{\{{\s*{}\s*\}}\}}", key)).unwrap();
+            buffer = re
+                .replace_all(&buffer, |_caps: &regex::Captures| &value)
+                .to_string();
         }
 
-        let context = templar::StandardContext::new();
-        context.set(data)?;
-
-        let rendered = template.render(&context)?;
-
-        Ok(
-            serde_yaml::from_str(&rendered)
-                .map_err(|e| crate::errors::ConfigError::YamlError(e))?,
-        )
+        Ok(serde_yaml::from_str(&buffer).map_err(|e| crate::errors::ConfigError::YamlError(e))?)
     }
 }

@@ -1,7 +1,0 @@
-syntax = "proto3";
-package summa.proto;
-
-message Document {
-  bytes document = 1;
-  float score = 2;
-}

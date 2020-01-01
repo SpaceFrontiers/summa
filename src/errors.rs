@@ -8,9 +8,19 @@ pub enum ConfigError {
 }
 
 #[derive(thiserror::Error, Debug)]
+pub enum BadRequestError {
+    #[error("doc_parsing_error")]
+    DocParsingError(tantivy::schema::DocParsingError),
+    #[error("unknown_content_type_error")]
+    UnknownContentTypeError,
+    #[error("utf8_error")]
+    Utf8Error(std::str::Utf8Error),
+}
+
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("bad_request_error")]
-    BadRequestError,
+    BadRequestError(BadRequestError),
     #[error("canceled_error")]
     CanceledError,
     #[error("config_error")]
@@ -23,14 +33,10 @@ pub enum Error {
     IOError(std::io::Error),
     #[error("poison_error")]
     PoisonError,
-    #[error("protobuf_error")]
-    ProtobufError(protobuf::error::ProtobufError),
     #[error("not_found_error")]
     NotFoundError,
     #[error("tantivy_error")]
     TantivyError(tantivy::TantivyError),
-    #[error("templar_error")]
-    TemplarError(templar::error::TemplarError),
     #[error("timeout_error")]
     TimeoutError,
     #[error("unknown_schema_error")]
@@ -52,12 +58,6 @@ impl From<actix_web::error::BlockingError<Error>> for Error {
     }
 }
 
-impl From<protobuf::error::ProtobufError> for Error {
-    fn from(error: protobuf::error::ProtobufError) -> Self {
-        Error::ProtobufError(error)
-    }
-}
-
 impl From<serde_json::error::Error> for Error {
     fn from(_error: serde_json::error::Error) -> Self {
         Error::InternalError
@@ -70,9 +70,22 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<std::str::Utf8Error> for Error {
+    fn from(error: std::str::Utf8Error) -> Self {
+        Error::BadRequestError(BadRequestError::Utf8Error(error))
+    }
+}
+
+
 impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(_error: std::sync::PoisonError<T>) -> Self {
         Error::PoisonError
+    }
+}
+
+impl From<tantivy::schema::DocParsingError> for Error {
+    fn from(error: tantivy::schema::DocParsingError) -> Self {
+        Error::BadRequestError(BadRequestError::DocParsingError(error))
     }
 }
 
@@ -85,12 +98,6 @@ impl From<tantivy::TantivyError> for Error {
 impl From<tokio::time::Elapsed> for Error {
     fn from(_error: tokio::time::Elapsed) -> Self {
         Error::TimeoutError
-    }
-}
-
-impl From<templar::error::TemplarError> for Error {
-    fn from(error: templar::error::TemplarError) -> Self {
-        Error::TemplarError(error)
     }
 }
 
@@ -114,19 +121,11 @@ impl actix_web::error::ResponseError for Error {
 
     fn status_code(&self) -> actix_web::http::StatusCode {
         match *self {
-            Error::BadRequestError => actix_web::http::StatusCode::BAD_REQUEST,
-            Error::CanceledError => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Error::ConfigError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Error::InternalError => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Error::BadRequestError(_) => actix_web::http::StatusCode::BAD_REQUEST,
             Error::InvalidSyntaxError(_) => actix_web::http::StatusCode::BAD_REQUEST,
-            Error::IOError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             Error::NotFoundError => actix_web::http::StatusCode::NOT_FOUND,
-            Error::PoisonError => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Error::ProtobufError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Error::TantivyError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Error::TemplarError(_) => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
             Error::TimeoutError => actix_web::http::StatusCode::GATEWAY_TIMEOUT,
-            Error::UnknownSchemaError => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            _ => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }

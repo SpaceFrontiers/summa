@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::convert::TryInto;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}};
+use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
@@ -9,10 +12,11 @@ use tantivy::schema::{Document, Schema};
 use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, SimpleTokenizer, StopWordFilter, TextAnalyzer,
 };
-use tantivy::{Index, IndexReader, ReloadPolicy};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
 use crate::config::SearchEngineConfig;
 use crate::logging::create_logger;
+use crate::thread_handler::ThreadHandler;
 
 use super::STOP_WORDS;
 
@@ -26,6 +30,7 @@ pub struct SearchEngine {
 pub struct SchemaConfig {
     pub default_fields: Vec<String>,
     pub enabled: bool,
+    pub key_field: String,
     pub multi_fields: Vec<String>,
     pub name: String,
     pub schema: Schema,
@@ -35,59 +40,91 @@ pub struct SchemaConfig {
 pub struct IndexKeeper {
     pub index: Index,
     pub index_reader: IndexReader,
+    pub index_writer: Arc<RwLock<IndexWriter>>,
     pub query_parser: QueryParser,
     pub schema_config: SchemaConfig,
 }
 
-#[derive(Serialize)]
 pub struct SearchResponse {
-    pub documents: Vec<SearchResponseDocument>,
-    pub has_next: bool,
+    schema_config: SchemaConfig,
+    scored_documents: Vec<ScoredDocument>,
+    has_next: bool,
 }
 
-#[derive(Serialize)]
-pub struct SearchResponseDocument {
-    pub document: BTreeMap<String, NamedFieldValue>,
+pub struct ScoredDocument {
+    pub document: Document,
     pub score: f32,
+    pub position: u32,
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
-pub enum NamedFieldValue {
-    Value(tantivy::schema::Value),
-    Vec(Vec<tantivy::schema::Value>)
-}
-
-impl IndexKeeper {
-    fn to_named_doc(&self, document: &Document) -> BTreeMap<String, NamedFieldValue> {
-        // ToDo: move it to Tantivy to eliminate copying
-        let named_document = self.schema_config.schema.to_named_doc(document);
-        let mut named_document_casted: BTreeMap<String, NamedFieldValue> = BTreeMap::new();
-        let schema = &self.schema_config.schema;
-
-        for (_, field_entry) in schema.fields() {
-            match named_document.0.get(field_entry.name()).map(|x| x.get(0)) {
-                Some(Some(value)) => {
-                    named_document_casted.insert(
-                        field_entry.name().to_string(),
-                        NamedFieldValue::Value(value.clone())
-                    );
-                },
-                _ => {}
-            }
+impl SearchResponse {
+    pub fn to_json(&self) -> Result<Vec<u8>, crate::errors::Error> {
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum NamedFieldValue {
+            Value(tantivy::schema::Value),
+            Vec(Vec<tantivy::schema::Value>),
         }
-        for field_name in self.schema_config.multi_fields.iter() {
-            match named_document.0.get(field_name) {
-                Some(value) => {
-                    named_document_casted.insert(
-                        field_name.to_string(),
-                        NamedFieldValue::Vec(value.to_vec())
-                    );
-                },
-                _ => {}
-            }
+
+        #[derive(Serialize)]
+        struct JsonScoredDocument {
+            schema: String,
+            document: BTreeMap<String, NamedFieldValue>,
+            score: f32,
         }
-        named_document_casted
+
+        #[derive(Serialize)]
+        struct JsonSearchResponse {
+            has_next: bool,
+            scored_documents: Vec<JsonScoredDocument>,
+        }
+
+        let json_scored_documents = self
+            .scored_documents
+            .iter()
+            .map(|scored_document| {
+                let named_document = self
+                    .schema_config
+                    .schema
+                    .to_named_doc(&scored_document.document);
+                let mut named_document_casted: BTreeMap<String, NamedFieldValue> = BTreeMap::new();
+                let schema = &self.schema_config.schema;
+                for (_, field_entry) in schema.fields() {
+                    match named_document.0.get(field_entry.name()).map(|x| x.get(0)) {
+                        Some(Some(value)) => {
+                            named_document_casted.insert(
+                                field_entry.name().to_string(),
+                                NamedFieldValue::Value(value.clone()),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
+                for field_name in self.schema_config.multi_fields.iter() {
+                    match named_document.0.get(field_name) {
+                        Some(value) => {
+                            named_document_casted.insert(
+                                field_name.to_string(),
+                                NamedFieldValue::Vec(value.to_vec()),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
+                JsonScoredDocument {
+                    schema: self.schema_config.name.clone(),
+                    document: named_document_casted,
+                    score: scored_document.score,
+                }
+            })
+            .collect();
+
+        Ok(serde_json::to_vec(&JsonSearchResponse {
+            has_next: self.has_next,
+            scored_documents: json_scored_documents,
+        })?)
     }
 }
 
@@ -117,13 +154,19 @@ impl SearchEngine {
         let schema = schema_config.schema.clone();
         let name = schema_config.name.clone();
 
-        let index_path = Path::new(&data_path).join("index").join(&schema_config.name);
+        let index_path = Path::new(&data_path)
+            .join("index")
+            .join(&schema_config.name);
         let index = create_index(&index_path, &schema)?;
         let index_reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommit)
             .try_into()
             .unwrap();
+        let index_writer = index
+            .writer_with_num_threads(4, 4 * 1024 * 1024 * 1024)
+            .unwrap();
+
         let default_fields = schema_config
             .default_fields
             .iter()
@@ -134,6 +177,7 @@ impl SearchEngine {
         let index_keeper = IndexKeeper {
             index,
             index_reader,
+            index_writer: Arc::new(RwLock::new(index_writer)),
             query_parser,
             schema_config,
         };
@@ -145,12 +189,15 @@ impl SearchEngine {
         search_engine_config: &SearchEngineConfig,
     ) -> Result<(), crate::errors::Error> {
         let schema_path = std::path::Path::new(&search_engine_config.data_path).join("schema");
-        fs::create_dir_all(&schema_path).map_err(
-            |e| std::io::Error::new(
+        fs::create_dir_all(&schema_path).map_err(|e| {
+            std::io::Error::new(
                 e.kind(),
-                format!("cannot create schema directory {}", &schema_path.to_str().unwrap())
+                format!(
+                    "cannot create schema directory {}",
+                    &schema_path.to_str().unwrap()
+                ),
             )
-        )?;
+        })?;
         for entry in fs::read_dir(&schema_path)? {
             let entry = entry?;
             let schema_path = entry.path();
@@ -160,10 +207,7 @@ impl SearchEngine {
         }
         Ok(())
     }
-    fn reindex(&self) {
-
-    }
-    pub fn search(
+    pub async fn search(
         &self,
         schema_name: &str,
         query: &str,
@@ -175,39 +219,121 @@ impl SearchEngine {
             .get(schema_name)
             .ok_or(crate::errors::Error::UnknownSchemaError)?;
         let searcher = index_keeper.index_reader.searcher();
-        let parsed_query = index_keeper
-            .query_parser
-            .parse_query(&query)
-            .map_err(|e| crate::errors::Error::InvalidSyntaxError((e, String::from(query))))?;
-        let top_docs = searcher.search(
-            &parsed_query,
-            &TopDocs::with_limit(limit + 1).and_offset(offset),
-        )?;
-        let has_next = top_docs.len() > limit;
+        let schema_config = index_keeper.schema_config.clone();
 
-        let mut documents = vec![];
-        for (score, doc_address) in top_docs {
-            let document = searcher.doc(doc_address)?;
-            documents.push(SearchResponseDocument {
-                document: index_keeper.to_named_doc(&document),
-                score,
+        let parsed_query = index_keeper.query_parser.parse_query(&query);
+        let parsed_query = match parsed_query {
+            Err(tantivy::query::QueryParserError::FieldDoesNotExist(_)) => {
+                return Ok(SearchResponse {
+                    schema_config,
+                    scored_documents: vec![],
+                    has_next: false,
+                })
+            }
+            Err(e) => Err(crate::errors::Error::InvalidSyntaxError((
+                e,
+                String::from(query),
+            ))),
+            Ok(r) => Ok(r),
+        }?;
+        tokio::task::spawn_blocking(move || {
+            let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit + 1).and_offset(offset))?;
+            let has_next = top_docs.len() > limit;
+            Ok(SearchResponse {
+                schema_config,
+                scored_documents: top_docs[..std::cmp::min(limit, top_docs.len())]
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (score, doc_address))| {
+                        let document = searcher.doc(*doc_address).unwrap();
+                        ScoredDocument {
+                            document,
+                            score: *score,
+                            position: position.try_into().unwrap(),
+                        }
+                    })
+                    .collect(),
+                has_next,
             })
-        }
-        let search_response = SearchResponse {
-            documents,
-            has_next,
-        };
+        })
+        .await?
+    }
+    pub fn get_schema(&self, schema_name: &str) -> Result<&Schema, crate::errors::Error> {
+        Ok(&self.indices
+            .get(schema_name)
+            .ok_or(crate::errors::Error::UnknownSchemaError)?
+            .schema_config
+            .schema)
+    }
+    pub async fn commit(
+        &self,
+        schema_name: &str,
+    ) -> Result<(), crate::errors::Error> {
+        let index_keeper = self
+            .indices
+            .get(schema_name)
+            .ok_or(crate::errors::Error::UnknownSchemaError)?;
+        index_keeper.index_writer.write().unwrap().commit()?;
+        Ok(())
+    }
+    pub async fn put_document(
+        &self,
+        schema_name: &str,
+        document: Document,
+    ) -> Result<(), crate::errors::Error> {
+        let index_keeper = self
+            .indices
+            .get(schema_name)
+            .ok_or(crate::errors::Error::UnknownSchemaError)?;
+        let id_field = index_keeper.schema_config.schema.get_field(
+            &index_keeper.schema_config.key_field
+        ).unwrap();
 
-        Ok(search_response)
+        index_keeper.index_writer.read().unwrap().delete_term(
+            Term::from_field_i64(
+                id_field,
+                document.get_first(id_field).unwrap().i64_value().unwrap(),
+            )
+        );
+        index_keeper.index_writer.read().unwrap().add_document(document);
+
+        Ok(())
+    }
+    pub fn start_reindexing_thread(&self) -> ThreadHandler {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_in_thread = running.clone();
+
+        let timeout = Duration::from_secs(120);
+        let logger = self.logger.clone();
+
+        let indices = self.indices.clone();
+
+        let join_handle = Box::new(std::thread::spawn(move || -> Result<(), crate::errors::Error> {
+            while running_in_thread.load(Ordering::Acquire) {
+                std::thread::sleep(timeout);
+                for (schema_name, index_keeper) in &indices {
+                    index_keeper.index_writer.write().unwrap().commit()?;
+                }
+            }
+            for (schema_name, index_keeper) in &indices {
+                index_keeper.index_writer.write().unwrap().commit()?;
+            }
+            info!(logger, "exit";
+                "action" => "exit",
+                "mode" => "update_thread",
+            );
+            Ok(())
+        }));
+        ThreadHandler::new(join_handle, running)
     }
 }
 
 fn create_index(path: &PathBuf, schema: &Schema) -> Result<Index, crate::errors::Error> {
     let mut index = Index::open_or_create(
-        MmapDirectory::open(path).map_err(
-            |_e| std::io::Error::new(std::io::ErrorKind::Other, "cannot mmap directory")
-        )?,
-        schema.clone()
+        MmapDirectory::open(path).map_err(|_e| {
+            std::io::Error::new(std::io::ErrorKind::Other, "cannot mmap directory")
+        })?,
+        schema.clone(),
     )?;
     index.set_default_multithread_executor().map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::Other, "cannot set multithread executor")

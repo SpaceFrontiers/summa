@@ -2,6 +2,7 @@ use actix_service::Service;
 use actix_web::{web, App, HttpServer};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -46,6 +47,17 @@ fn main() -> Result<(), Error> {
         let search_engine =
             SearchEngine::new(&config.search_engine, PathBuf::from(&config.log_path))?;
 
+        let reindexing_handler = search_engine.start_reindexing_thread();
+
+        std::thread::spawn(move || {
+            let term = Arc::new(AtomicBool::new(false));
+            signal_hook::flag::register(signal_hook::SIGTERM, Arc::clone(&term)).unwrap();
+            while !term.load(Ordering::Relaxed) {
+                std::thread::park_timeout(std::time::Duration::from_secs(5));
+            }
+            reindexing_handler.stop().unwrap().unwrap();
+        });
+
         Ok(HttpServer::new(move || {
             let search_engine_timeout_secs = Duration::from_secs(config.search_engine.timeout_secs);
             App::new()
@@ -68,6 +80,14 @@ fn main() -> Result<(), Error> {
                 .service(
                     web::resource("/v1/{schema_name}/search/")
                         .route(web::get().to(summa::controllers::search::search)),
+                )
+                .service(
+                    web::resource("/v1/{schema_name}/commit/")
+                        .route(web::post().to(summa::controllers::documents::commit)),
+                )
+                .service(
+                    web::resource("/v1/{schema_name}/")
+                        .route(web::put().to(summa::controllers::documents::put)),
                 )
         })
         .keep_alive(http_config.keep_alive_secs)

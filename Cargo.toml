@@ -24,7 +24,6 @@ colored = "2"
 crossbeam = "0.8"
 futures = "0.3"
 libc = "0.2.79"
-protobuf = "2.18.0"
 rand = "0.7"
 reopen = { version = "1", features = ["signals"] }
 serde = "1"
@@ -35,7 +34,6 @@ slog = "2.5"
 slog-async = "2.5"
 slog-json = "2.3"
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "master", features = ["brotli-compression"] }
-templar = "0.4"
 textwrap = "0.12"
 thiserror = "1"
 tokio = { version = "0.2", features = ["full", "time"] }

@@ -81,17 +81,15 @@ where
             let duration = start_time.elapsed().as_secs_f32();
             match res {
                 Ok(r) => {
-                    if r.request().method() == "GET" {
-                        info!(logger, "handled request";
-                            "method" => %r.request().method(),
-                            "mode" => "request",
-                            "response_time" => duration,
-                            "request_id" => r.request().headers().get("request-id").map(HeaderValue::to_str).unwrap_or(Ok("")).unwrap(),
-                            "route" => r.request().path(),
-                            "status_code" => r.status().as_u16(),
-                            "url" => %r.request().uri(),
-                        );
-                    }
+                    info!(logger, "handled request";
+                        "method" => %r.request().method(),
+                        "mode" => "request",
+                        "response_time" => duration,
+                        "request_id" => r.request().headers().get("request-id").map(HeaderValue::to_str).unwrap_or(Ok("")).unwrap(),
+                        "route" => r.request().path(),
+                        "status_code" => r.status().as_u16(),
+                        "url" => %r.request().uri(),
+                    );
                     Ok(r)
                 }
                 Err(e) => {
