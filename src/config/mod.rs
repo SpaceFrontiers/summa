@@ -47,11 +47,15 @@ impl Config {
         let mut buffer = String::new();
         reader.read_to_string(&mut buffer)?;
 
-        for (key, value) in std::env::vars() {
-            let re = regex::Regex::new(&format!(r"\{{\{{\s*{}\s*\}}\}}", key)).unwrap();
-            buffer = re
-                .replace_all(&buffer, |_caps: &regex::Captures| &value)
-                .to_string();
+        for (key, value) in std::env::vars_os() {
+            if let Ok(key) = key.into_string() {
+                if let Ok(value) = value.into_string() {
+                    let re = regex::Regex::new(&format!(r"\{{\{{\s*{}\s*\}}\}}", key)).unwrap();
+                    buffer = re
+                        .replace_all(&buffer, |_caps: &regex::Captures| &value)
+                        .to_string();
+                }
+            }
         }
 
         Ok(serde_yaml::from_str(&buffer).map_err(|e| crate::errors::ConfigError::YamlError(e))?)

@@ -61,7 +61,11 @@ where
                 .unwrap()
                 .to_owned()
         } else {
-            thread_rng().sample_iter(&Alphanumeric).take(12).collect()
+            let mut rng = thread_rng();
+            std::iter::repeat(())
+                .map(|()| rng.sample(Alphanumeric) as char)
+                .take(12)
+                .collect()
         };
         let mut req = req;
         req.headers_mut().append(

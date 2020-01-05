@@ -2,7 +2,10 @@ use actix_service::Service;
 use actix_web::{web, App, HttpServer};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -36,7 +39,9 @@ fn main() -> Result<(), Error> {
     let config_file = String::from(matches.value_of("config").unwrap_or("config.yaml"));
 
     actix_rt::System::new("<name>").block_on(async move {
-        let config = ApplicationConfig::from_reader(File::open(config_file)?)?;
+        let config = ApplicationConfig::from_reader(
+            File::open(config_file.clone()).map_err(|e| Error::FileError((e, config_file)))?,
+        )?;
         println!("\n{}", config);
 
         let http_config = config.http.clone();
@@ -51,7 +56,8 @@ fn main() -> Result<(), Error> {
 
         std::thread::spawn(move || {
             let term = Arc::new(AtomicBool::new(false));
-            signal_hook::flag::register(signal_hook::SIGTERM, Arc::clone(&term)).unwrap();
+            signal_hook::flag::register(signal_hook::consts::signal::SIGTERM, Arc::clone(&term))
+                .unwrap();
             while !term.load(Ordering::Relaxed) {
                 std::thread::park_timeout(std::time::Duration::from_secs(5));
             }
@@ -92,9 +98,13 @@ fn main() -> Result<(), Error> {
         })
         .keep_alive(http_config.keep_alive_secs)
         .workers(http_config.workers)
-        .bind(&http_config.bind_addr).map_err(
-            |e| std::io::Error::new(e.kind(), format!("cannot bind to {}", &http_config.bind_addr))
-        )?
+        .bind(&http_config.bind_addr)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot bind to {}", &http_config.bind_addr),
+            )
+        })?
         .run()
         .await?)
     })

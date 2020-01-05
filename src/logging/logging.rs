@@ -81,15 +81,17 @@ where
             let duration = start_time.elapsed().as_secs_f32();
             match res {
                 Ok(r) => {
-                    info!(logger, "handled request";
-                        "method" => %r.request().method(),
-                        "mode" => "request",
-                        "response_time" => duration,
-                        "request_id" => r.request().headers().get("request-id").map(HeaderValue::to_str).unwrap_or(Ok("")).unwrap(),
-                        "route" => r.request().path(),
-                        "status_code" => r.status().as_u16(),
-                        "url" => %r.request().uri(),
-                    );
+                    if r.request().method() != "PUT" {
+                        info!(logger, "handled request";
+                            "method" => %r.request().method(),
+                            "mode" => "request",
+                            "response_time" => duration,
+                            "request_id" => r.request().headers().get("request-id").map(HeaderValue::to_str).unwrap_or(Ok("")).unwrap(),
+                            "route" => r.request().path(),
+                            "status_code" => r.status().as_u16(),
+                            "url" => %r.request().uri(),
+                        );
+                    };
                     Ok(r)
                 }
                 Err(e) => {
@@ -117,12 +119,13 @@ pub fn create_logger(filepath: &std::path::Path) -> Result<slog::Logger, crate::
 
         std::fs::set_permissions(&cloned_filepath, permissions)?;
         log_file
-    })).map_err(
-        |e| std::io::Error::new(
+    }))
+    .map_err(|e| {
+        std::io::Error::new(
             e.kind(),
-            format!("cannot create logfile {}", &filepath.to_str().unwrap())
+            format!("cannot create logfile {}", &filepath.to_str().unwrap()),
         )
-    )?;
+    })?;
 
     log_file.handle().register_signal(libc::SIGHUP)?;
 

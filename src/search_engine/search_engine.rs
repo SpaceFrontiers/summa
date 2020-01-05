@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 use std::time::Duration;
 use tantivy::collector::TopDocs;
-use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Document, Schema};
 use tantivy::tokenizer::{
@@ -144,6 +146,8 @@ impl SearchEngine {
         &mut self,
         schema_path: PathBuf,
         data_path: PathBuf,
+        writer_threads: usize,
+        writer_memory_mb: usize,
     ) -> Result<(), crate::errors::Error> {
         let schema_config_yaml = std::fs::read_to_string(schema_path)?;
         let schema_config: SchemaConfig = serde_yaml::from_str(&schema_config_yaml)
@@ -157,14 +161,14 @@ impl SearchEngine {
         let index_path = Path::new(&data_path)
             .join("index")
             .join(&schema_config.name);
-        let index = create_index(&index_path, &schema)?;
+        let index = open_index(&index_path)?;
         let index_reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommit)
             .try_into()
             .unwrap();
         let index_writer = index
-            .writer_with_num_threads(4, 4 * 1024 * 1024 * 1024)
+            .writer_with_num_threads(writer_threads, writer_memory_mb * 1024 * 1024)
             .unwrap();
 
         let default_fields = schema_config
@@ -202,7 +206,12 @@ impl SearchEngine {
             let entry = entry?;
             let schema_path = entry.path();
             if schema_path.is_file() {
-                self.add_schema(schema_path, PathBuf::from(&search_engine_config.data_path))?;
+                self.add_schema(
+                    schema_path,
+                    PathBuf::from(&search_engine_config.data_path),
+                    search_engine_config.writer_threads,
+                    search_engine_config.writer_memory_mb,
+                )?;
             }
         }
         Ok(())
@@ -237,7 +246,10 @@ impl SearchEngine {
             Ok(r) => Ok(r),
         }?;
         tokio::task::spawn_blocking(move || {
-            let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit + 1).and_offset(offset))?;
+            let top_docs = searcher.search(
+                &parsed_query,
+                &TopDocs::with_limit(limit + 1).and_offset(offset),
+            )?;
             let has_next = top_docs.len() > limit;
             Ok(SearchResponse {
                 schema_config,
@@ -259,16 +271,14 @@ impl SearchEngine {
         .await?
     }
     pub fn get_schema(&self, schema_name: &str) -> Result<&Schema, crate::errors::Error> {
-        Ok(&self.indices
+        Ok(&self
+            .indices
             .get(schema_name)
             .ok_or(crate::errors::Error::UnknownSchemaError)?
             .schema_config
             .schema)
     }
-    pub async fn commit(
-        &self,
-        schema_name: &str,
-    ) -> Result<(), crate::errors::Error> {
+    pub async fn commit(&self, schema_name: &str) -> Result<(), crate::errors::Error> {
         let index_keeper = self
             .indices
             .get(schema_name)
@@ -285,17 +295,19 @@ impl SearchEngine {
             .indices
             .get(schema_name)
             .ok_or(crate::errors::Error::UnknownSchemaError)?;
-        let id_field = index_keeper.schema_config.schema.get_field(
-            &index_keeper.schema_config.key_field
-        ).unwrap();
-
-        index_keeper.index_writer.read().unwrap().delete_term(
-            Term::from_field_i64(
+        let id_field = index_keeper
+            .schema_config
+            .schema
+            .get_field(&index_keeper.schema_config.key_field)
+            .unwrap();
+        {
+            let index_writer = index_keeper.index_writer.read().unwrap();
+            index_writer.delete_term(Term::from_field_i64(
                 id_field,
                 document.get_first(id_field).unwrap().i64_value().unwrap(),
-            )
-        );
-        index_keeper.index_writer.read().unwrap().add_document(document);
+            ));
+            index_writer.add_document(document);
+        }
 
         Ok(())
     }
@@ -303,41 +315,35 @@ impl SearchEngine {
         let running = Arc::new(AtomicBool::new(true));
         let running_in_thread = running.clone();
 
-        let timeout = Duration::from_secs(120);
+        let timeout = Duration::from_secs(60);
         let logger = self.logger.clone();
 
         let indices = self.indices.clone();
 
-        let join_handle = Box::new(std::thread::spawn(move || -> Result<(), crate::errors::Error> {
-            while running_in_thread.load(Ordering::Acquire) {
-                std::thread::sleep(timeout);
+        let join_handle = Box::new(std::thread::spawn(
+            move || -> Result<(), crate::errors::Error> {
+                while running_in_thread.load(Ordering::Acquire) {
+                    std::thread::sleep(timeout);
+                    for (schema_name, index_keeper) in &indices {
+                        index_keeper.index_writer.write().unwrap().commit()?;
+                    }
+                }
                 for (schema_name, index_keeper) in &indices {
                     index_keeper.index_writer.write().unwrap().commit()?;
                 }
-            }
-            for (schema_name, index_keeper) in &indices {
-                index_keeper.index_writer.write().unwrap().commit()?;
-            }
-            info!(logger, "exit";
-                "action" => "exit",
-                "mode" => "update_thread",
-            );
-            Ok(())
-        }));
+                info!(logger, "exit";
+                    "action" => "exit",
+                    "mode" => "update_thread",
+                );
+                Ok(())
+            },
+        ));
         ThreadHandler::new(join_handle, running)
     }
 }
 
-fn create_index(path: &PathBuf, schema: &Schema) -> Result<Index, crate::errors::Error> {
-    let mut index = Index::open_or_create(
-        MmapDirectory::open(path).map_err(|_e| {
-            std::io::Error::new(std::io::ErrorKind::Other, "cannot mmap directory")
-        })?,
-        schema.clone(),
-    )?;
-    index.set_default_multithread_executor().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::Other, "cannot set multithread executor")
-    })?;
+fn open_index(path: &PathBuf) -> Result<Index, crate::errors::Error> {
+    let index = Index::open_in_dir(path)?;
     index.tokenizers().register(
         "default",
         TextAnalyzer::from(SimpleTokenizer)

@@ -25,6 +25,8 @@ pub enum Error {
     CanceledError,
     #[error("config_error")]
     ConfigError(ConfigError),
+    #[error("file_error")]
+    FileError((std::io::Error, String)),
     #[error("internal_error")]
     InternalError,
     #[error("invalid_syntax_error")]
@@ -76,7 +78,6 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
-
 impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(_error: std::sync::PoisonError<T>) -> Self {
         Error::PoisonError
@@ -125,7 +126,7 @@ impl actix_web::error::ResponseError for Error {
             Error::InvalidSyntaxError(_) => actix_web::http::StatusCode::BAD_REQUEST,
             Error::NotFoundError => actix_web::http::StatusCode::NOT_FOUND,
             Error::TimeoutError => actix_web::http::StatusCode::GATEWAY_TIMEOUT,
-            _ => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            _ => actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
