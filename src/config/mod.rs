@@ -2,9 +2,17 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use textwrap::indent;
 
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+pub struct CorsConfig {
+    pub allowed_headers: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_origins: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HttpConfig {
     pub bind_addr: String,
+    pub cors: CorsConfig,
     pub keep_alive_secs: usize,
     pub max_body_size_mb: usize,
     pub workers: usize,
@@ -12,6 +20,7 @@ pub struct HttpConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchEngineConfig {
+    pub auto_commit: bool,
     pub data_path: String,
     pub default_page_size: usize,
     pub timeout_secs: u64,

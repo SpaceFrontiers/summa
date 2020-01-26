@@ -1,3 +1,4 @@
+use actix_cors::Cors;
 use actix_service::Service;
 use actix_web::{web, App, HttpServer};
 use std::fs::File;
@@ -9,13 +10,42 @@ use std::sync::{
 use std::time::Duration;
 use tokio::time::timeout;
 
-use summa::config::Config as ApplicationConfig;
+use summa::config::{Config as ApplicationConfig, CorsConfig};
 use summa::errors::Error;
 use summa::logging::{create_logger, Logging};
 use summa::request_id::RequestIDWrapper;
 use summa::SearchEngine;
 
+fn configure_cors(cors_config: &CorsConfig) -> actix_cors::Cors {
+    let allowed_headers: Vec<actix_web::http::HeaderName> = cors_config
+        .allowed_headers
+        .iter()
+        .map(|header| actix_web::http::HeaderName::from_bytes(header.as_bytes()).unwrap())
+        .collect();
+    let allowed_methods: Vec<actix_web::http::Method> = cors_config
+        .allowed_methods
+        .iter()
+        .map(|method| actix_web::http::Method::from_bytes(method.as_bytes()).unwrap())
+        .collect();
+    let mut cors = Cors::default()
+        .allowed_methods(allowed_methods)
+        .allowed_headers(allowed_headers)
+        .max_age(3600);
+    for origin in cors_config.allowed_origins.iter() {
+        if origin == "*" {
+            cors = cors.allow_any_origin();
+            cors = cors.send_wildcard();
+            break;
+        } else {
+            cors = cors.allowed_origin(origin);
+        }
+    }
+    cors
+}
+
 fn main() -> Result<(), Error> {
+    env_logger::init();
+
     let matches = clap::App::new("Summa")
         .version("0.1.0")
         .author("Pasha Podolsky")
@@ -36,15 +66,19 @@ fn main() -> Result<(), Error> {
         )
         .get_matches();
 
-    let config_file = String::from(matches.value_of("config").unwrap_or("config.yaml"));
+    let config_file = String::from(matches.value_of("config").unwrap_or("summa.yaml"));
 
     actix_rt::System::new("<name>").block_on(async move {
         let config = ApplicationConfig::from_reader(
             File::open(config_file.clone()).map_err(|e| Error::FileError((e, config_file)))?,
         )?;
-        println!("\n{}", config);
+        println!("{}", config);
 
         let http_config = config.http.clone();
+        let search_engine_config = config.search_engine.clone();
+        let payload_config = web::PayloadConfig::new(
+            config.http.max_body_size_mb * 1024 * 1024,
+        );
 
         let error_logger = create_logger(&Path::new(&config.log_path).join("error.log"))?;
         let request_logger = create_logger(&Path::new(&config.log_path).join("request.log"))?;
@@ -52,21 +86,27 @@ fn main() -> Result<(), Error> {
         let search_engine =
             SearchEngine::new(&config.search_engine, PathBuf::from(&config.log_path))?;
 
-        let reindexing_handler = search_engine.start_reindexing_thread();
-
-        std::thread::spawn(move || {
-            let term = Arc::new(AtomicBool::new(false));
-            signal_hook::flag::register(signal_hook::consts::signal::SIGTERM, Arc::clone(&term))
+        if config.search_engine.auto_commit {
+            let auto_commit_handler = search_engine.start_auto_commit_thread();
+            std::thread::spawn(move || {
+                let term = Arc::new(AtomicBool::new(false));
+                signal_hook::flag::register(
+                    signal_hook::consts::signal::SIGTERM,
+                    Arc::clone(&term),
+                )
                 .unwrap();
-            while !term.load(Ordering::Relaxed) {
-                std::thread::park_timeout(std::time::Duration::from_secs(5));
-            }
-            reindexing_handler.stop().unwrap().unwrap();
-        });
+                while !term.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_secs(5));
+                }
+                auto_commit_handler.stop().unwrap().unwrap();
+            });
+        }
 
         Ok(HttpServer::new(move || {
-            let search_engine_timeout_secs = Duration::from_secs(config.search_engine.timeout_secs);
+            let search_engine_timeout_secs = Duration::from_secs(search_engine_config.timeout_secs);
+            let cors = configure_cors(&http_config.cors);
             App::new()
+                .wrap(cors)
                 .wrap(Logging::new(request_logger.clone(), error_logger.clone()))
                 .wrap(RequestIDWrapper)
                 .wrap_fn(move |req, srv| {
@@ -78,10 +118,7 @@ fn main() -> Result<(), Error> {
                             .map_err(|_e| Error::TimeoutError)?
                     }
                 })
-                .app_data(web::PayloadConfig::new(
-                    config.http.max_body_size_mb * 1024 * 1024,
-                ))
-                .data(config.clone())
+                .app_data(payload_config.clone())
                 .data(search_engine.clone())
                 .service(
                     web::resource("/v1/{schema_name}/search/")
@@ -96,13 +133,13 @@ fn main() -> Result<(), Error> {
                         .route(web::put().to(summa::controllers::documents::put)),
                 )
         })
-        .keep_alive(http_config.keep_alive_secs)
-        .workers(http_config.workers)
-        .bind(&http_config.bind_addr)
+        .keep_alive(config.http.keep_alive_secs)
+        .workers(config.http.workers)
+        .bind(&config.http.bind_addr)
         .map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("cannot bind to {}", &http_config.bind_addr),
+                format!("cannot bind to {}", &config.http.bind_addr),
             )
         })?
         .run()

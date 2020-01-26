@@ -20,10 +20,11 @@ use crate::config::SearchEngineConfig;
 use crate::logging::create_logger;
 use crate::thread_handler::ThreadHandler;
 
-use super::STOP_WORDS;
+use super::{SummaTokenizer, STOP_WORDS};
 
 #[derive(Clone)]
 pub struct SearchEngine {
+    search_engine_config: SearchEngineConfig,
     indices: HashMap<String, IndexKeeper>,
     logger: slog::Logger,
 }
@@ -131,15 +132,19 @@ impl SearchResponse {
 }
 
 impl SearchEngine {
+    pub fn get_config(&self) -> &SearchEngineConfig {
+        &self.search_engine_config
+    }
     pub fn new(
         search_engine_config: &SearchEngineConfig,
         log_path: PathBuf,
     ) -> Result<SearchEngine, crate::errors::Error> {
         let mut search_engine = SearchEngine {
+            search_engine_config: search_engine_config.clone(),
             indices: HashMap::new(),
             logger: create_logger(&Path::new(&log_path).join("statbox.log"))?,
         };
-        search_engine.read_schema_files(search_engine_config)?;
+        search_engine.read_schema_files()?;
         Ok(search_engine)
     }
     fn add_schema(
@@ -190,9 +195,8 @@ impl SearchEngine {
     }
     fn read_schema_files(
         &mut self,
-        search_engine_config: &SearchEngineConfig,
     ) -> Result<(), crate::errors::Error> {
-        let schema_path = std::path::Path::new(&search_engine_config.data_path).join("schema");
+        let schema_path = std::path::Path::new(&self.get_config().data_path).join("schema");
         fs::create_dir_all(&schema_path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -208,9 +212,9 @@ impl SearchEngine {
             if schema_path.is_file() {
                 self.add_schema(
                     schema_path,
-                    PathBuf::from(&search_engine_config.data_path),
-                    search_engine_config.writer_threads,
-                    search_engine_config.writer_memory_mb,
+                    PathBuf::from(&self.get_config().data_path),
+                    self.get_config().writer_threads,
+                    self.get_config().writer_memory_mb,
                 )?;
             }
         }
@@ -311,7 +315,7 @@ impl SearchEngine {
 
         Ok(())
     }
-    pub fn start_reindexing_thread(&self) -> ThreadHandler {
+    pub fn start_auto_commit_thread(&self) -> ThreadHandler {
         let running = Arc::new(AtomicBool::new(true));
         let running_in_thread = running.clone();
 
@@ -324,11 +328,11 @@ impl SearchEngine {
             move || -> Result<(), crate::errors::Error> {
                 while running_in_thread.load(Ordering::Acquire) {
                     std::thread::sleep(timeout);
-                    for (schema_name, index_keeper) in &indices {
+                    for (_, index_keeper) in &indices {
                         index_keeper.index_writer.write().unwrap().commit()?;
                     }
                 }
-                for (schema_name, index_keeper) in &indices {
+                for (_, index_keeper) in &indices {
                     index_keeper.index_writer.write().unwrap().commit()?;
                 }
                 info!(logger, "exit";
@@ -347,6 +351,15 @@ fn open_index(path: &PathBuf) -> Result<Index, crate::errors::Error> {
     index.tokenizers().register(
         "default",
         TextAnalyzer::from(SimpleTokenizer)
+            .filter(RemoveLongFilter::limit(200))
+            .filter(LowerCaser)
+            .filter(StopWordFilter::remove(
+                STOP_WORDS.iter().map(|x| String::from(*x)).collect(),
+            )),
+    );
+    index.tokenizers().register(
+        "summa",
+        TextAnalyzer::from(SummaTokenizer)
             .filter(RemoveLongFilter::limit(200))
             .filter(LowerCaser)
             .filter(StopWordFilter::remove(

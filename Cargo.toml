@@ -13,6 +13,7 @@ keywords = ["search", "information", "retrieval"]
 edition = "2018"
 
 [dependencies]
+actix-cors = "0.5.4"
 actix-http = "2"
 actix-rt = "1"
 actix-service = "1"

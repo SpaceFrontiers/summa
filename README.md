@@ -1,9 +1,19 @@
-### Summa Server
+### Summa
 
-Summa Server is a software for storing and searching in textual data
+Summa is a tiny embeddedable search engine.
 
 Main features
-1. HTTP API
-2. Inverted index for fast textual search
-3. Differential updates from other instances of Summa Server
-4. Space-efficient storage for documents
+1. GRPC/HTTP API
+2. Fast textual search
+3. Space-efficient storage for documents
+
+### HTTP API v1
+
+#### `Search`
+`GET /v1/{schema_name}/search/?query=foobar`
+
+#### `Add`
+`PUT /v1/{schema_name}/`
+
+#### `Commit`
+`POST /v1/{schema_name}/commit/`

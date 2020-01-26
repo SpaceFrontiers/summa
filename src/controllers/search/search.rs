@@ -1,7 +1,6 @@
 use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Deserialize;
 
-use crate::config::Config as ApplicationConfig;
 use crate::errors::{BadRequestError, Error};
 use crate::search_engine::SearchEngine;
 
@@ -18,7 +17,6 @@ pub async fn search(
     req: HttpRequest,
     path: web::Path<(String,)>,
     query_params: web::Query<Search>,
-    config: web::Data<ApplicationConfig>,
     search_engine: web::Data<SearchEngine>,
 ) -> Result<HttpResponse, Error> {
     let schema_name = path.0.0.as_str();
@@ -26,7 +24,7 @@ pub async fn search(
 
     let page = query_params.page.unwrap_or(0);
     let page_size = match query_params.page_size.unwrap_or(0) {
-        0 => config.search_engine.default_page_size,
+        0 => search_engine.get_config().default_page_size,
         x => x,
     };
 
