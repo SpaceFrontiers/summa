@@ -10,3 +10,4 @@ pub mod search_engine;
 mod thread_handler;
 
 pub use search_engine::SearchEngine;
+pub use thread_handler::ThreadHandler;

@@ -25,6 +25,8 @@ pub enum Error {
     CanceledError,
     #[error("config_error")]
     ConfigError(ConfigError),
+    #[error("crossbeam_send_error")]
+    CrossbeamSendError,
     #[error("file_error")]
     FileError((std::io::Error, String)),
     #[error("internal_error")]
@@ -48,6 +50,12 @@ pub enum Error {
 impl From<ConfigError> for Error {
     fn from(error: ConfigError) -> Self {
         Error::ConfigError(error)
+    }
+}
+
+impl<D> From<crossbeam_channel::SendError<D>> for Error {
+    fn from(_error: crossbeam_channel::SendError<D>) -> Self {
+        Error::CrossbeamSendError
     }
 }
 
