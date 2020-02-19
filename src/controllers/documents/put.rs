@@ -15,7 +15,7 @@ pub async fn put(
 ) -> Result<HttpResponse, Error> {
     let schema_name = path.0.0.as_str();
 
-    let document = match get_header(&req, "Accept") {
+    let document = match get_header(&req, "Content-Type") {
         Some("application/json") | Some("*/*") | None => {
             Ok(search_engine.get_schema(schema_name)?.parse_document(std::str::from_utf8(&body[..])?)?)
         },

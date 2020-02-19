@@ -35,7 +35,7 @@ class SummaHttpClient(BaseStandardClient):
                 f'/v1/{schema}/',
                 json=document,
                 headers={
-                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
                     'Request-Id': request_id,
                 },
             )
@@ -44,7 +44,7 @@ class SummaHttpClient(BaseStandardClient):
                 f'/v1/{schema}/',
                 data=document,
                 headers={
-                    'Accept': 'application/tantivy',
+                    'Content-Type': 'application/tantivy',
                     'Request-Id': request_id,
                 },
             )
@@ -66,6 +66,7 @@ class SummaHttpClient(BaseStandardClient):
                     'page_size': page_size,
                 }),
                 headers={
+                    'Accept': 'application/json',
                     'Request-Id': request_id,
                 },
             )
