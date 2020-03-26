@@ -1,6 +1,6 @@
 from typing import (
+    Dict,
     Optional,
-    Union,
 )
 
 from aiobaseclient import BaseStandardClient
@@ -29,25 +29,15 @@ class SummaHttpClient(BaseStandardClient):
             },
         )
 
-    async def put_document(self, schema: str, document: Union[bytes, dict], request_id: str = None):
-        if isinstance(document, dict):
-            return await self.put(
-                f'/v1/{schema}/',
-                json=document,
-                headers={
-                    'Content-Type': 'application/json',
-                    'Request-Id': request_id,
-                },
-            )
-        else:
-            return await self.put(
-                f'/v1/{schema}/',
-                data=document,
-                headers={
-                    'Content-Type': 'application/tantivy',
-                    'Request-Id': request_id,
-                },
-            )
+    async def put_document(self, schema: str, document: Dict, request_id: str = None):
+        return await self.put(
+            f'/v1/{schema}/',
+            json=document,
+            headers={
+                'Content-Type': 'application/json',
+                'Request-Id': request_id,
+            },
+        )
 
     async def search(
         self,

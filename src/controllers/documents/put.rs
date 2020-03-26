@@ -1,5 +1,4 @@
 use actix_web::{http, web, HttpRequest, HttpResponse};
-use tantivy::BinarySerializable;
 
 use crate::errors::{BadRequestError, Error};
 use crate::search_engine::SearchEngine;
@@ -19,10 +18,6 @@ pub async fn put(
         Some("application/json") | Some("*/*") | None => {
             Ok(search_engine.get_schema(schema_name)?.parse_document(std::str::from_utf8(&body[..])?)?)
         },
-        Some("application/tantivy") => {
-            let mut b = &body[..];
-            Ok(BinarySerializable::deserialize(&mut b)?)
-        }
         _ => Err(Error::BadRequestError(BadRequestError::UnknownContentTypeError))
     }?;
 

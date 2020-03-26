@@ -60,7 +60,7 @@ schema:
 `GET /v1/{schema_name}/search/?query=lord`
 
 #### `Asyncronous add`
-`PUT /v1/{schema_name}/` -H 'Content-Type: application/json' --data '{"id": 1, "title": "Lord of the Rings"}'
+`PUT /v1/{schema_name}/ -H 'Content-Type: application/json' --data '{"id": 1, "title": "Lord of the Rings"}'`
 
 #### `Commit`
 `POST /v1/{schema_name}/commit/`
