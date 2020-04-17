@@ -4,7 +4,6 @@ extern crate slog;
 use actix_cors::Cors;
 use actix_service::Service;
 use actix_web::{web, App, HttpServer};
-use std::fs::File;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -15,7 +14,7 @@ use tokio::time::timeout;
 
 use summa::config::{Config as ApplicationConfig, CorsConfig};
 use summa::errors::Error;
-use summa::logging::{create_logger, Logging};
+use summa::logging::{create_logger, create_term_logger, Logging};
 use summa::request_id::RequestIDWrapper;
 use summa::SearchEngine;
 use summa::ThreadHandler;
@@ -70,23 +69,24 @@ fn main() -> Result<(), Error> {
         )
         .get_matches();
 
-    let config_file = String::from(matches.value_of("config").unwrap_or("summa.yaml"));
-    let config = ApplicationConfig::from_reader(
-        File::open(config_file.clone()).map_err(|e| Error::FileError((e, config_file)))?,
-    )?;
+    let config_filepath = String::from(matches.value_of("config").unwrap_or("/summa/summa.yaml"));
+    let config = ApplicationConfig::from_file(&config_filepath)?;
     println!("{}", config);
     let http_config = config.http.clone();
     let search_engine_config = config.search_engine.clone();
-    let payload_config = web::PayloadConfig::new(
-        config.http.max_body_size_mb * 1024 * 1024,
-    );
+    let payload_config = web::PayloadConfig::new(config.http.max_body_size_mb * 1024 * 1024);
 
     let error_logger = create_logger(&Path::new(&config.log_path).join("error.log"))?;
-    let logger = create_logger(&Path::new(&config.log_path).join("statbox.log"))?;
-    let request_logger = create_logger(&Path::new(&config.log_path).join("request.log"))?;
+    let logger = match config.debug {
+        true => create_term_logger(),
+        false => create_logger(&Path::new(&config.log_path).join("statbox.log"))
+    }?;
+    let request_logger = match config.debug {
+        true => create_term_logger(),
+        false => create_logger(&Path::new(&config.log_path).join("request.log")),
+    }?;
 
-    let search_engine =
-        SearchEngine::new(&config.search_engine, logger.clone())?;
+    let search_engine = SearchEngine::new(&config.search_engine, logger.clone())?;
 
     let master_auto_commit_thread_handler = if config.search_engine.auto_commit {
         let timeout = Duration::from_secs(60);
@@ -96,25 +96,26 @@ fn main() -> Result<(), Error> {
         let running = Arc::new(AtomicBool::new(true));
         let running_in_thread = running.clone();
 
-        let join_handle = Box::new(std::thread::spawn(move || -> Result<(), summa::errors::Error> {
-            info!(logger, "start";
-                "action" => "start",
-                "mode" => "master_auto_commit_thread"
-            );
-            while running_in_thread.load(Ordering::Relaxed) {
-                std::thread::park_timeout(std::time::Duration::from_secs(1));
-            }
-            info!(logger, "sigterm";
-                "action" => "sigterm",
-                "mode" => "master_auto_commit_thread"
-            );
-            for auto_commit_handler in auto_commit_handlers {
-                auto_commit_handler.stop().unwrap().unwrap();
-            }
-            Ok(())
-        }));
+        let join_handle = Box::new(std::thread::spawn(
+            move || -> Result<(), summa::errors::Error> {
+                info!(logger, "start";
+                    "action" => "start",
+                    "mode" => "master_auto_commit_thread"
+                );
+                while running_in_thread.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_secs(1));
+                }
+                info!(logger, "sigterm";
+                    "action" => "sigterm",
+                    "mode" => "master_auto_commit_thread"
+                );
+                for auto_commit_handler in auto_commit_handlers {
+                    auto_commit_handler.stop().unwrap().unwrap();
+                }
+                Ok(())
+            },
+        ));
         Some(ThreadHandler::new(join_handle, running))
-
     } else {
         None
     };
@@ -139,6 +140,10 @@ fn main() -> Result<(), Error> {
                 .app_data(payload_config.clone())
                 .data(search_engine.clone())
                 .service(
+                    web::resource("/v1/meta")
+                        .route(web::get().to(summa::controllers::meta::meta)),
+                )
+                .service(
                     web::resource("/v1/{schema_name}/search/")
                         .route(web::get().to(summa::controllers::search::search)),
                 )
@@ -153,18 +158,21 @@ fn main() -> Result<(), Error> {
         })
         .keep_alive(config.http.keep_alive_secs)
         .workers(config.http.workers)
-        .bind(&config.http.bind_addr)
+        .bind(&format!("{}:{}", &config.http.address, config.http.port))
         .map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("cannot bind to {}", &config.http.bind_addr),
+                format!(
+                    "cannot bind to {}:{}",
+                    &config.http.address, config.http.port
+                ),
             )
         })?
         .run()
         .await?)
     });
     if let Some(master_auto_commit_thread_handler) = master_auto_commit_thread_handler {
-       master_auto_commit_thread_handler.stop().unwrap().unwrap();
+        master_auto_commit_thread_handler.stop().unwrap().unwrap();
     };
     rval
 }

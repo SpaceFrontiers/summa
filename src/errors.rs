@@ -2,12 +2,6 @@ use serde_json::json;
 use std::convert::From;
 
 #[derive(thiserror::Error, Debug)]
-pub enum ConfigError {
-    #[error("yaml_error")]
-    YamlError(serde_yaml::Error),
-}
-
-#[derive(thiserror::Error, Debug)]
 pub enum BadRequestError {
     #[error("doc_parsing_error")]
     DocParsingError(tantivy::schema::DocParsingError),
@@ -24,7 +18,7 @@ pub enum Error {
     #[error("canceled_error")]
     CanceledError,
     #[error("config_error")]
-    ConfigError(ConfigError),
+    ConfigError(config::ConfigError),
     #[error("crossbeam_send_error")]
     CrossbeamSendError,
     #[error("file_error")]
@@ -45,10 +39,12 @@ pub enum Error {
     TimeoutError,
     #[error("unknown_schema_error")]
     UnknownSchemaError,
+    #[error("yaml_error")]
+    YamlError(serde_yaml::Error),
 }
 
-impl From<ConfigError> for Error {
-    fn from(error: ConfigError) -> Self {
+impl From<config::ConfigError> for Error {
+    fn from(error: config::ConfigError) -> Self {
         Error::ConfigError(error)
     }
 }

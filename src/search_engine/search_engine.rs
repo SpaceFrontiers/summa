@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, RwLock,
-};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -135,7 +133,7 @@ impl SearchEngine {
     ) -> Result<(), crate::errors::Error> {
         let schema_config_yaml = std::fs::read_to_string(schema_path)?;
         let schema_config: SchemaConfig = serde_yaml::from_str(&schema_config_yaml)
-            .map_err(|e| crate::errors::ConfigError::YamlError(e))?;
+            .map_err(|e| crate::errors::Error::YamlError(e))?;
         if !schema_config.enabled {
             return Ok(());
         }
@@ -176,9 +174,7 @@ impl SearchEngine {
         self.indices.insert(name, schema_engine);
         Ok(())
     }
-    fn read_schema_files(
-        &mut self,
-    ) -> Result<(), crate::errors::Error> {
+    fn read_schema_files(&mut self) -> Result<(), crate::errors::Error> {
         let schema_path = std::path::Path::new(&self.get_config().data_path).join("schema");
         fs::create_dir_all(&schema_path).map_err(|e| {
             std::io::Error::new(
@@ -257,8 +253,15 @@ impl SearchEngine {
         })
         .await?
     }
-    pub fn start_auto_commit_threads(&self, timeout: Duration, wakeup_timeout: Duration) -> Vec<ThreadHandler> {
-        self.indices.iter().map(|(_, v)| v.start_auto_commit_thread(timeout, wakeup_timeout)).collect()
+    pub fn start_auto_commit_threads(
+        &self,
+        timeout: Duration,
+        wakeup_timeout: Duration,
+    ) -> Vec<ThreadHandler> {
+        self.indices
+            .iter()
+            .map(|(_, v)| v.start_auto_commit_thread(timeout, wakeup_timeout))
+            .collect()
     }
     pub fn get_schema(&self, schema_name: &str) -> Result<&Schema, crate::errors::Error> {
         Ok(&self
@@ -272,7 +275,8 @@ impl SearchEngine {
     pub async fn commit(&self, schema_name: &str) -> Result<(), crate::errors::Error> {
         self.indices
             .get(schema_name)
-            .ok_or(crate::errors::Error::UnknownSchemaError)?.commit()
+            .ok_or(crate::errors::Error::UnknownSchemaError)?
+            .commit()
     }
     pub async fn put_document(
         &self,
@@ -285,6 +289,12 @@ impl SearchEngine {
             .ok_or(crate::errors::Error::UnknownSchemaError)?;
         schema_engine.document_sender.send(document)?;
         Ok(())
+    }
+
+    pub fn list_schemas(&self) -> Vec<String> {
+        let mut result = self.indices.keys().cloned().collect::<Vec<String>>();
+        result.sort();
+        result
     }
 }
 

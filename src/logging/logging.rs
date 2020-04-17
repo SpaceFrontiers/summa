@@ -146,3 +146,22 @@ pub fn create_logger(filepath: &std::path::Path) -> Result<slog::Logger, crate::
     let async_drain = Mutex::new(slog_async::Async::new(json_drain).build()).map(slog::Fuse);
     Ok(slog::Logger::root(async_drain, o!()))
 }
+
+pub fn create_term_logger() -> Result<slog::Logger, crate::errors::Error> {
+    let json_drain = Mutex::new(
+        slog_json::Json::new(std::io::stdout())
+            .add_key_value(o!(
+                "unixtime" => PushFnValue(move |_ : &Record, ser| {
+                    ser.emit(chrono::Local::now().timestamp())
+                }),
+                "datetime" => PushFnValue(move |_ : &Record, ser| {
+                    ser.emit(format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S.%f")))
+                })
+            ))
+            .set_flush(true)
+            .build(),
+    )
+    .map(slog::Fuse);
+    let async_drain = Mutex::new(slog_async::Async::new(json_drain).build()).map(slog::Fuse);
+    Ok(slog::Logger::root(async_drain, o!()))
+}

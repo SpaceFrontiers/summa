@@ -2,7 +2,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use textwrap::indent;
 
-#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CorsConfig {
     pub allowed_headers: Vec<String>,
     pub allowed_methods: Vec<String>,
@@ -11,10 +11,11 @@ pub struct CorsConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HttpConfig {
-    pub bind_addr: String,
+    pub address: String,
     pub cors: CorsConfig,
     pub keep_alive_secs: usize,
     pub max_body_size_mb: usize,
+    pub port: usize,
     pub workers: usize,
 }
 
@@ -30,6 +31,7 @@ pub struct SearchEngineConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    pub debug: bool,
     pub http: HttpConfig,
     pub log_path: String,
     pub search_engine: SearchEngineConfig,
@@ -41,32 +43,17 @@ impl std::fmt::Display for Config {
             f,
             "{}\n{}",
             "Summa Config:".green().bold(),
-            indent(
-                &serde_yaml::to_string(&self)
-                    .map_err(|e| crate::errors::ConfigError::YamlError(e))
-                    .unwrap(),
-                "  "
-            ),
+            indent(&serde_yaml::to_string(&self).unwrap(), "  "),
         )
     }
 }
 
 impl Config {
-    pub fn from_reader<T: std::io::Read>(mut reader: T) -> Result<Self, crate::errors::Error> {
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer)?;
-
-        for (key, value) in std::env::vars_os() {
-            if let Ok(key) = key.into_string() {
-                if let Ok(value) = value.into_string() {
-                    let re = regex::Regex::new(&format!(r"\{{\{{\s*{}\s*\}}\}}", key)).unwrap();
-                    buffer = re
-                        .replace_all(&buffer, |_caps: &regex::Captures| &value)
-                        .to_string();
-                }
-            }
-        }
-
-        Ok(serde_yaml::from_str(&buffer).map_err(|e| crate::errors::ConfigError::YamlError(e))?)
+    pub fn from_file(config_filepath: &str) -> Result<Self, crate::errors::Error> {
+        let mut s = config::Config::new();
+        s.merge(config::File::with_name(config_filepath))?;
+        s.merge(config::Environment::with_prefix("SUMMA").separator("."))?;
+        s.try_into()
+            .map_err(|e| crate::errors::Error::ConfigError(e))
     }
 }

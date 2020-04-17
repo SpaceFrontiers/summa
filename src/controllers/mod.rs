@@ -1,4 +1,5 @@
 pub mod documents;
+pub mod meta;
 pub mod search;
 
 use actix_web::http::header::HeaderValue;
