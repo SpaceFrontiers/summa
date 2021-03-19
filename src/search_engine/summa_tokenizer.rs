@@ -90,42 +90,23 @@ pub mod tests {
     use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenizerManager};
 
     pub fn assert_token(token: &Token, position: usize, text: &str, from: usize, to: usize) {
-        assert_eq!(
-            token.position, position,
-            "expected position {} but {:?}",
-            position, token
-        );
+        assert_eq!(token.position, position, "expected position {} but {:?}", position, token);
         assert_eq!(token.text, text, "expected text {} but {:?}", text, token);
-        assert_eq!(
-            token.offset_from, from,
-            "expected offset_from {} but {:?}",
-            from, token
-        );
-        assert_eq!(
-            token.offset_to, to,
-            "expected offset_to {} but {:?}",
-            to, token
-        );
+        assert_eq!(token.offset_from, from, "expected offset_from {} but {:?}", from, token);
+        assert_eq!(token.offset_to, to, "expected offset_to {} but {:?}", to, token);
     }
 
     #[test]
     fn test_en_tokenizer() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register(
-            "tokenizer",
-            TextAnalyzer::from(SummaTokenizer)
-                .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser),
-        );
+        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
                 tokens.push(token.clone());
             };
-            tokenizer
-                .token_stream("Hello, world!")
-                .process(&mut add_token);
+            tokenizer.token_stream("Hello, world!").process(&mut add_token);
         }
 
         assert_eq!(tokens.len(), 2);
@@ -136,21 +117,14 @@ pub mod tests {
     #[test]
     fn test_zh_tokenizer() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register(
-            "tokenizer",
-            TextAnalyzer::from(SummaTokenizer)
-                .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser),
-        );
+        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
                 tokens.push(token.clone());
             };
-            tokenizer
-                .token_stream("在查hello, worl土d动!")
-                .process(&mut add_token);
+            tokenizer.token_stream("在查hello, worl土d动!").process(&mut add_token);
         }
         assert_eq!(tokens.len(), 7);
         assert_token(&tokens[0], 0, "在", 0, 3);
@@ -165,21 +139,14 @@ pub mod tests {
     #[test]
     fn test_zh_tokenizer_2() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register(
-            "tokenizer",
-            TextAnalyzer::from(SummaTokenizer)
-                .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser),
-        );
+        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
                 tokens.push(token.clone());
             };
-            tokenizer
-                .token_stream("Veri 在查hello, c查m p查 查lex  worl土d动!")
-                .process(&mut add_token);
+            tokenizer.token_stream("Veri 在查hello, c查m p查 查lex  worl土d动!").process(&mut add_token);
         }
         assert_eq!(tokens.len(), 15);
         assert_token(&tokens[0], 0, "veri", 0, 4);
@@ -201,12 +168,7 @@ pub mod tests {
     #[test]
     fn test_zh_tokenizer_3() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register(
-            "tokenizer",
-            TextAnalyzer::from(SummaTokenizer)
-                .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser),
-        );
+        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {

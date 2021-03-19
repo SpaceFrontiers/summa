@@ -1,0 +1,18 @@
+syntax = "proto3";
+package summa;
+
+message Index {
+  string index_name = 1;
+  repeated string index_aliases = 2;
+}
+
+message IndexDocumentOperation {
+  bytes document = 1;
+  bool reindex = 2;
+}
+
+message IndexOperation {
+ oneof operation {
+   IndexDocumentOperation index_document = 2;
+ }
+}

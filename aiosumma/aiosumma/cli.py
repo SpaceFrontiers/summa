@@ -1,17 +1,15 @@
 import fire
-from aiokit.utils import sync_fu
-from aiosumma.client import SummaHttpClient
+from aiosumma.client import SummaClient
 
 
-async def search(base_url, schema, query):
-    async with SummaHttpClient(base_url=base_url) as c:
-        return await c.search(schema, query)
+async def cli(endpoint):
+    client = SummaClient(endpoint=endpoint)
+    await client.start_and_wait()
+    return client.get_interface()
 
 
 def main():
-    fire.Fire({
-        'search': sync_fu(search),
-    })
+    fire.Fire(cli)
 
 
 if __name__ == '__main__':

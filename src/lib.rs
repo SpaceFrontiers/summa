@@ -1,13 +1,67 @@
+#![crate_name = "summa"]
+//! Fast full-text search server with following features:
+//!
+//! - Simple GRPC API
+//! - Indexing documents through Kafka
+//!
+//! ## Quickstart
+//! #### Launch server
+//! ```bash
+//! summa-server serve
+//! ```
+//! #### Create index schema
+//! ```yaml
+//! ---
+//! # yamllint disable rule:key-ordering
+//! - name: id
+//!   type: i64
+//!   options:
+//!     fast: single
+//!     fieldnorms: false
+//!     indexed: true
+//!     stored: true
+//! - name: body
+//!   type: text
+//!   options:
+//!     indexing:
+//!       fieldnorms: true
+//!       record: position
+//!       tokenizer: summa
+//!     stored: true
+//! - name: tags
+//!   type: text
+//!   options:
+//!     indexing:
+//!       fieldnorms: true
+//!       record: position
+//!       tokenizer: summa
+//!     stored: true
+//! - name: title
+//!   type: text
+//!   options:
+//!     indexing:
+//!       fieldnorms: true
+//!       record: position
+//!       tokenizer: summa
+//!     stored: true
+//! ```
+//! #### Create index
+//! #### Index documents
+//! #### Search
+
 #[macro_use]
-extern crate slog;
+extern crate lazy_static;
 
-pub mod config;
-pub mod controllers;
+mod apis;
+pub mod configurator;
+mod consumers;
 pub mod errors;
-pub mod logging;
-pub mod request_id;
-pub mod search_engine;
-mod thread_handler;
+mod requests;
+mod search_engine;
+pub mod servers;
+mod services;
+mod utils;
 
-pub use search_engine::SearchEngine;
-pub use thread_handler::ThreadHandler;
+pub mod proto {
+    tonic::include_proto!("summa");
+}

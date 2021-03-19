@@ -1,9 +1,11 @@
-mod schema_engine;
-mod search_engine;
+//! Search engine internal parts
+
+mod default_tokenizers;
+mod index_holder;
+mod index_updater;
+mod index_writer_holder;
 mod stop_words;
 mod summa_tokenizer;
 
-pub use schema_engine::{SchemaConfig, SchemaEngine};
-pub use search_engine::SearchEngine;
-pub use stop_words::STOP_WORDS;
-pub use summa_tokenizer::SummaTokenizer;
+pub(crate) use index_holder::IndexHolder;
+pub(crate) use index_updater::IndexUpdater;

@@ -1,3 +1,3 @@
-from .client import SummaHttpClient
+from .client import SummaClient
 
-__all__ = ['SummaHttpClient']
+__all__ = ['SummaClient']

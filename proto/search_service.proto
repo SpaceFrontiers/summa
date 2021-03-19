@@ -1,0 +1,25 @@
+syntax = "proto3";
+package summa;
+
+service SearchApi {
+  rpc search (SearchRequest) returns (SearchResponse) {}
+}
+
+message ScoredDocument {
+  string document = 1;
+  float score = 2;
+  uint32 position = 3;
+}
+
+message SearchRequest {
+  string index_alias = 1;
+  string query = 2;
+  uint32 limit = 3;
+  uint32 offset = 4;
+}
+
+message SearchResponse {
+  repeated ScoredDocument scored_documents = 1;
+  bool has_next = 2;
+  string index_name = 4;
+}

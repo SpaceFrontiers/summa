@@ -1,55 +1,49 @@
 [package]
+edition = "2021"
 name = "summa"
-version = "0.1.0"
-authors = ["Pasha Podolsky"]
-license = "MIT"
-categories = ["database-implementations", "data-structures"]
-description = """Search engine server"""
-documentation = "https://docs.rs/summa/"
-homepage = "https://github.com/izihawa/summa"
-repository = "https://github.com/izihawa/summa"
-readme = "README.md"
-keywords = ["search", "information", "retrieval"]
-edition = "2018"
+version = "2.0.0"
+
+[[bin]]
+name = "summa-server"
+path = "bin/main.rs"
+
+[lib]
+name = "summa"
+path = "src/lib.rs"
+
+[build-dependencies]
+tonic-build = { version = "0.6.2", default-features = false, features = ["prost", "transport"] }
 
 [dependencies]
-actix-cors = "0.5.4"
-actix-http = "2"
-actix-rt = "1"
-actix-service = "1"
-actix-threadpool = "0.3"
-actix-web = "3"
-chrono = "0.4"
-clap = "2"
-colored = "2"
-config = "0.11.0"
-crossbeam = "0.8"
-futures = "0.3"
-libc = "0.2.79"
-rand = "0.7"
-regex = "1.4.2"
-reopen = { version = "1", features = ["signals"] }
-serde = "1"
-serde_json = "1"
-serde_qs = "0.7"
-serde_yaml = "0.8"
-signal-hook = "0.3.2"
-slog = "2.5"
-slog-async = "2.5"
-slog-json = "2.3"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "master", features = ["brotli-compression"] }
-textwrap = "0.12"
-thiserror = "1"
-tokio = { version = "0.2", features = ["full", "time"] }
-
-[profile.release]
-opt-level = 3
-debug = false
-debug-assertions = false
-
-[profile.test]
-debug-assertions = true
-overflow-checks = true
-
-[features]
-build-binary = []
+clap = { version = "3.1.6", features = ["cargo"] }
+colored = "2.0.0"
+config = "0.12.0"
+futures = "0.3.21"
+futures-util = "0.3.21"
+hyper = "0.14.17"
+lazy_static = "1.4.0"
+num_cpus = "1.13.1"
+opentelemetry = "0.17.0"
+opentelemetry-prometheus = "0.10.0"
+parking_lot = { version = "0.12.0", features = ["send_guard"] }
+prometheus = "0.13.0"
+prost = "0.9.0"
+prost-types = "0.9.0"
+rand = "0.8.5"
+rdkafka = "0.28.0"
+serde = { version = "1.0.136", features = ["derive"] }
+serde_derive = "1.0.136"
+serde_yaml = "0.8.23"
+signal-hook = "0.3.13"
+tantivy = { version = "0.17.0", features = ["brotli-compression"] }
+tantivy-fst = "0.3.0"
+textwrap = "0.15.0"
+thiserror = "1.0.30"
+tokio = { version = "1.17.0", features = ["full", "time"] }
+tonic = "0.6.2"
+tower = "0.4.12"
+tower-http = { version = "0.2.5", features = ["set-header", "trace"] }
+tracing = "0.1.32"
+tracing-appender = "0.2.2"
+tracing-futures = "0.2.5"
+tracing-subscriber = { version = "0.3.9", features = ["env-filter", "json"] }
