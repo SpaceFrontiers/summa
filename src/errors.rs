@@ -8,12 +8,8 @@ pub enum BadRequestError {
     AliasedError(String),
     #[error("existing_config_error: {0}")]
     ExistingConfigError(PathBuf),
-    #[error("existing_consumer_error: {0}")]
-    ExistingConsumerError(String),
     #[error("existing_consumers_error: {0}")]
     ExistingConsumersError(String),
-    #[error("existing_index_error: {0}")]
-    ExistingIndexError(String),
     #[error("not_found_error: {0}")]
     NotFoundError(String),
     #[error("utf8_error: {0}")]
@@ -22,6 +18,10 @@ pub enum BadRequestError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ValidationError {
+    #[error("existing_consumer_error: {0}")]
+    ExistingConsumerError(String),
+    #[error("existing_index_error: {0}")]
+    ExistingIndexError(String),
     #[error("invalid_memory_error: {0}")]
     InvalidMemoryError(u64),
     #[error("invalid_threads_number_error: {0}")]

@@ -86,6 +86,8 @@ pub fn setup_tracing(log_path: &PathBuf, debug: bool) -> WorkerGuard {
 
 fn proceed_args() -> clap::ArgMatches {
     command!()
+        .name("summa")
+        .override_usage("summa-server [OPTIONS] <SUBCOMMAND>")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .about(LONG_ABOUT)

@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 pub trait Persistable {
-    fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<Self>
+    fn from_file(config_filepath: &Path, env_prefix: Option<&str>, mandatory: bool) -> SummaResult<Self>
     where
         Self: Sized;
     fn save(&self) -> SummaResult<&Self>;
@@ -68,9 +68,9 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> ConfigHolder<TConfig> {
 }
 
 impl<'a, TConfig: Serialize + Deserialize<'a>> Persistable for ConfigHolder<TConfig> {
-    fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<ConfigHolder<TConfig>> {
+    fn from_file(config_filepath: &Path, env_prefix: Option<&str>, mandatory: bool) -> SummaResult<ConfigHolder<TConfig>> {
         let mut s = Config::builder();
-        if config_filepath.exists() {
+        if config_filepath.exists() || mandatory {
             s = s.add_source(File::from(config_filepath));
         }
         if let Some(env_prefix) = env_prefix {

@@ -19,10 +19,10 @@ pub struct ApplicationConfig {
 impl Default for ApplicationConfig {
     fn default() -> Self {
         ApplicationConfig {
-            data_path: PathBuf::from("./summa/data"),
+            data_path: PathBuf::from("./data/bin"),
             debug: true,
             grpc: GrpcConfig::default(),
-            log_path: PathBuf::from("./summa/logs"),
+            log_path: PathBuf::from("./data/logs"),
             metrics: MetricsConfig::default(),
         }
     }
@@ -37,7 +37,7 @@ pub struct GrpcConfig {
 impl Default for GrpcConfig {
     fn default() -> Self {
         GrpcConfig {
-            endpoint: "127.0.0.0:8082".to_string(),
+            endpoint: "127.0.0.1:8082".to_string(),
             workers: 1,
         }
     }
@@ -51,7 +51,7 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         MetricsConfig {
-            endpoint: "127.0.0.0:8084".to_string(),
+            endpoint: "127.0.0.1:8084".to_string(),
         }
     }
 }

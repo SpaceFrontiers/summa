@@ -1,9 +1,8 @@
-use crate::configurator::configs::{KafkaConsumerConfig, RuntimeConfigHolder};
+use crate::configurator::configs::RuntimeConfigHolder;
 use crate::consumers::kafka::KafkaConsumer;
 use crate::consumers::ConsumerRegistry;
-use crate::errors::{BadRequestError, Error, SummaResult};
-
-use crate::requests::CreateIndexRequest;
+use crate::errors::{BadRequestError, Error, SummaResult, ValidationError};
+use crate::requests::{CreateConsumerRequest, CreateIndexRequest};
 use crate::search_engine::IndexHolder;
 use crate::services::AliasService;
 use futures::future::join_all;
@@ -78,7 +77,7 @@ impl IndexService {
         // ToDo: Move validation to CreateIndexRequest class
         let index_path = self.root_path.join(&create_index_request.index_name);
         if index_path.exists() {
-            return Err(Error::BadRequestError(BadRequestError::ExistingIndexError(create_index_request.index_name.clone())));
+            Err(ValidationError::ExistingIndexError(create_index_request.index_name.clone()))?;
         }
         let data_path = index_path.join("data");
         std::fs::create_dir_all(&data_path).map_err(|e| Error::IOError((e, Some(data_path.clone()))))?;
@@ -128,10 +127,13 @@ impl IndexService {
         Ok(delete_index_result)
     }
 
-    pub async fn create_consumer(&self, consumer_name: &str, consumer_config: &KafkaConsumerConfig) -> SummaResult<()> {
-        self.consumer_registry.insert_consumer_config(consumer_name, consumer_config);
-        let index_holder = self.get_index_holder(&consumer_config.index_name)?;
-        index_holder.index_updater().add_consumer(KafkaConsumer::new(consumer_name, consumer_config).await?)?;
+    pub async fn create_consumer(&self, create_consumer_request: CreateConsumerRequest) -> SummaResult<()> {
+        self.consumer_registry
+            .insert_consumer_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?;
+        let index_holder = self.get_index_holder(&create_consumer_request.index_name)?;
+        index_holder
+            .index_updater()
+            .add_consumer(KafkaConsumer::new(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config).await?)?;
         Ok(())
     }
 

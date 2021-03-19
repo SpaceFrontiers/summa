@@ -1,6 +1,7 @@
 use crate::configurator::configs::{KafkaConsumerConfig, RuntimeConfigHolder};
-use crate::errors::{BadRequestError, SummaResult};
+use crate::errors::{BadRequestError, SummaResult, ValidationError};
 use parking_lot::RwLock;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -16,12 +17,12 @@ impl ConsumerRegistry {
         })
     }
 
-    pub fn insert_consumer_config(&self, consumer_name: &str, consumer_config: &KafkaConsumerConfig) -> Option<KafkaConsumerConfig> {
-        self.runtime_config
-            .write()
-            .autosave()
-            .consumer_configs
-            .insert(consumer_name.to_string(), consumer_config.clone())
+    pub fn insert_consumer_config(&self, consumer_name: &str, consumer_config: &KafkaConsumerConfig) -> SummaResult<()> {
+        match self.runtime_config.write().autosave().consumer_configs.entry(consumer_name.to_string()) {
+            Entry::Occupied(_) => Err(ValidationError::ExistingConsumerError(consumer_name.to_string()))?,
+            Entry::Vacant(v) => v.insert(consumer_config.clone()),
+        };
+        Ok(())
     }
 
     pub fn delete_consumer_config(&self, consumer_name: &str) -> SummaResult<KafkaConsumerConfig> {

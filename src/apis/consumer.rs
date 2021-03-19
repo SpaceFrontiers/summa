@@ -2,9 +2,9 @@
 //!
 //! Consumer GRPC API is using for managing Kafka consumers
 
-use crate::configurator::configs::KafkaConsumerConfig;
 use crate::errors::SummaResult;
 use crate::proto;
+use crate::requests::CreateConsumerRequest;
 use crate::services::IndexService;
 use tonic::{Request, Response, Status};
 
@@ -24,14 +24,8 @@ impl ConsumerApiImpl {
 impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     async fn create_consumer(&self, proto_request: Request<proto::CreateConsumerRequest>) -> Result<Response<proto::CreateConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let kafka_consumer_config = KafkaConsumerConfig::new(
-            &proto_request.bootstrap_servers,
-            &proto_request.group_id,
-            &proto_request.index_name,
-            proto_request.threads,
-            &proto_request.topics,
-        )?;
-        self.index_service.create_consumer(&proto_request.consumer_name, &kafka_consumer_config).await?;
+        let create_consumer_request = CreateConsumerRequest::from_proto(&proto_request)?;
+        self.index_service.create_consumer(create_consumer_request).await?;
         let response = proto::CreateConsumerResponse {};
         Ok(Response::new(response))
     }

@@ -1,7 +1,7 @@
 syntax = "proto3";
 package summa;
 
-import "summa/proto/index.proto";
+import "proto/index.proto";
 
 service IndexApi {
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}

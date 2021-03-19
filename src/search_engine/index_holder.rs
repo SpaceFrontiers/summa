@@ -74,7 +74,7 @@ impl IndexHolder {
 
     #[instrument]
     pub(crate) fn open(index_name: &str, config_filepath: &Path, data_path: &Path) -> SummaResult<IndexHolder> {
-        let index_config: IndexConfigHolder = ConfigHolder::from_file(config_filepath, None)?;
+        let index_config: IndexConfigHolder = ConfigHolder::from_file(config_filepath, None, true)?;
         let index_config = Arc::new(RwLock::new(index_config));
 
         let index = Index::open_in_dir(data_path)?;
