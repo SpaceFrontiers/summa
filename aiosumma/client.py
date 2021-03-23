@@ -10,12 +10,12 @@ from aiogrpcclient import (
     BaseGrpcClient,
     expose,
 )
-from proto_grpc_py_pb.proto import consumer_service_pb2 as consumer_service_pb
-from proto_grpc_py_pb.proto import index_service_pb2 as index_service_pb
-from proto_grpc_py_pb.proto import search_service_pb2 as search_service_pb
-from proto_grpc_py_pb.proto.consumer_service_pb2_grpc import ConsumerApiStub
-from proto_grpc_py_pb.proto.index_service_pb2_grpc import IndexApiStub
-from proto_grpc_py_pb.proto.search_service_pb2_grpc import SearchApiStub
+from proto import consumer_service_pb2 as consumer_service_pb
+from proto import index_service_pb2 as index_service_pb
+from proto import search_service_pb2 as search_service_pb
+from proto.consumer_service_pb2_grpc import ConsumerApiStub
+from proto.index_service_pb2_grpc import IndexApiStub
+from proto.search_service_pb2_grpc import SearchApiStub
 
 
 class SummaClient(BaseGrpcClient):
