@@ -1,16 +1,11 @@
 use crate::configurator::configs::IndexConfigHolder;
-use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::errors::{Error, SummaResult};
-use crate::proto;
-use parking_lot::RwLock;
-use rdkafka::message::BorrowedMessage;
-use rdkafka::Message;
 use std::str::from_utf8;
-use std::sync::Arc;
 use tantivy::schema::{Field, Schema};
 use tantivy::{Index, IndexWriter, Term};
 use tracing::info;
 
+/// Managing write operations to index
 pub(crate) struct IndexWriterHolder {
     index_writer: IndexWriter,
     index_name: String,
@@ -19,9 +14,9 @@ pub(crate) struct IndexWriterHolder {
 }
 
 impl IndexWriterHolder {
-    pub fn new(index_name: &str, index: &Index, index_config: Arc<RwLock<IndexConfigHolder>>) -> SummaResult<IndexWriterHolder> {
+    pub fn new(index_name: &str, index: &Index, index_config: &IndexConfigHolder) -> SummaResult<IndexWriterHolder> {
         let schema = index.schema();
-        let index_config = index_config.read();
+        let index_config = index_config;
         let index_writer = index.writer_with_num_threads(index_config.writer_threads.try_into().unwrap(), index_config.writer_heap_size_bytes.try_into().unwrap())?;
         Ok(IndexWriterHolder {
             index_writer,
@@ -53,20 +48,6 @@ impl IndexWriterHolder {
         self.index_writer.commit()?;
         info!(action = "commited_index", index_name = ?self.index_name);
         Ok(())
-    }
-
-    pub fn process_message(&self, message: Result<BorrowedMessage<'_>, rdkafka::error::KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
-        let message = message.map_err(|e| KafkaConsumingError::KafkaError(e))?;
-        let payload = message.payload().ok_or(KafkaConsumingError::EmptyPayloadError)?;
-        let proto_message: proto::IndexOperation = prost::Message::decode(payload).map_err(|e| KafkaConsumingError::ProtoDecodeError(e))?;
-        let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperationError)?;
-        match index_operation {
-            proto::index_operation::Operation::IndexDocument(index_document_operation) => {
-                self.index_document(&index_document_operation.document, index_document_operation.reindex)
-                    .map_err(|e| KafkaConsumingError::IndexError(e))?;
-                Ok(KafkaConsumingStatus::Consumed)
-            }
-        }
     }
 }
 

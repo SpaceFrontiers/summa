@@ -1,4 +1,5 @@
 import json
+import os
 import os.path
 from typing import (
     List,
@@ -10,12 +11,16 @@ from aiogrpcclient import (
     BaseGrpcClient,
     expose,
 )
-from proto import consumer_service_pb2 as consumer_service_pb
-from proto import index_service_pb2 as index_service_pb
-from proto import search_service_pb2 as search_service_pb
-from proto.consumer_service_pb2_grpc import ConsumerApiStub
-from proto.index_service_pb2_grpc import IndexApiStub
-from proto.search_service_pb2_grpc import SearchApiStub
+from summa.proto.proto_grpc_py_pb import \
+    consumer_service_pb2 as consumer_service_pb
+from summa.proto.proto_grpc_py_pb import index_service_pb2 as index_service_pb
+from summa.proto.proto_grpc_py_pb import \
+    search_service_pb2 as search_service_pb
+from summa.proto.proto_grpc_py_pb.consumer_service_pb2_grpc import (
+    ConsumerApiStub,
+)
+from summa.proto.proto_grpc_py_pb.index_service_pb2_grpc import IndexApiStub
+from summa.proto.proto_grpc_py_pb.search_service_pb2_grpc import SearchApiStub
 
 
 class SummaClient(BaseGrpcClient):
@@ -344,7 +349,7 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
-    async def set_alias(
+    async def set_index_alias(
         self,
         index_alias: str,
         index_name: str,

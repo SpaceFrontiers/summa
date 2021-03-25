@@ -5,11 +5,14 @@ use crate::errors::{BadRequestError, Error, SummaResult, ValidationError};
 use crate::requests::{CreateConsumerRequest, CreateIndexRequest};
 use crate::search_engine::IndexHolder;
 use crate::services::AliasService;
-use futures::future::join_all;
+use crate::utils::sync::{Handler, OwningHandler};
+use futures_util::future::join_all;
 use opentelemetry::metrics::{BatchObserverResult, Unit};
 use opentelemetry::{global, KeyValue};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::collections::HashMap;
+use std::fs::DirEntry;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,7 +22,7 @@ pub struct IndexService {
     root_path: PathBuf,
     alias_service: AliasService,
     consumer_registry: ConsumerRegistry,
-    index_holders: Arc<RwLock<HashMap<String, IndexHolder>>>,
+    index_holders: Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>>,
 }
 
 #[derive(Default)]
@@ -29,17 +32,22 @@ pub struct DeleteIndexResult {
 }
 
 impl IndexService {
-    pub fn new(root_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>, alias_service: &AliasService) -> SummaResult<IndexService> {
+    pub async fn new(root_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>, alias_service: &AliasService) -> SummaResult<IndexService> {
         let consumer_registry = ConsumerRegistry::new(runtime_config)?;
-        let index_holders = std::fs::read_dir(root_path)?
-            .filter_map(|possible_index_path| possible_index_path.ok())
-            .filter(|possible_index_path| possible_index_path.path().join("index.yaml").exists())
-            .map(|index_path| {
-                let index_config_filepath = index_path.path().join("index.yaml");
-                let index_name = String::from(index_path.file_name().to_str().unwrap());
-                Ok((index_name.clone(), IndexHolder::open(&index_name, &index_config_filepath, &index_path.path().join("data"))?))
-            })
-            .collect::<SummaResult<HashMap<String, IndexHolder>>>()?;
+        let mut index_holders: HashMap<String, OwningHandler<IndexHolder>> = HashMap::new();
+        for index_path in IndexService::indices_on_disk(root_path)? {
+            let index_config_filepath = index_path.path().join("index.yaml");
+            let index_name = String::from(index_path.file_name().to_str().unwrap());
+            let consumer_configs = consumer_registry.get_consumer_configs_for_index(&index_name);
+            let consumers = consumer_configs
+                .iter()
+                .map(|(consumer_name, consumer_config)| KafkaConsumer::new(consumer_name, consumer_config));
+            let consumers: SummaResult<Vec<_>> = join_all(consumers).await.into_iter().collect();
+            index_holders.insert(
+                index_name.clone(),
+                OwningHandler::new(IndexHolder::open(&index_name, &index_config_filepath, &index_path.path().join("data"), consumers?)?),
+            );
+        }
 
         let index_service = IndexService {
             root_path: root_path.to_path_buf(),
@@ -51,26 +59,34 @@ impl IndexService {
         Ok(index_service)
     }
 
+    pub fn indices_on_disk(root_path: &Path) -> SummaResult<Vec<DirEntry>> {
+        Ok(std::fs::read_dir(root_path)?
+            .filter_map(|possible_index_path| possible_index_path.ok())
+            .filter(|possible_index_path| possible_index_path.path().join("index.yaml").exists())
+            .collect())
+    }
+
     pub fn consumer_registry(&self) -> &ConsumerRegistry {
         &self.consumer_registry
     }
 
-    pub fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, IndexHolder>> {
+    pub fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
         self.index_holders.read()
     }
-    pub fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, IndexHolder>> {
+    pub fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
         self.index_holders.write()
     }
 
-    pub fn get_index_holder(&self, index_alias_or_name: &str) -> SummaResult<IndexHolder> {
+    pub fn get_index_holder(&self, index_alias_or_name: &str) -> SummaResult<Handler<IndexHolder>> {
         let index_name = self.alias_service.resolve_index_alias(index_alias_or_name);
         let index_name = index_name.as_deref().unwrap_or(index_alias_or_name);
-        Ok(self
+        let index_holder = self
             .index_holders
             .read()
             .get(index_name)
             .ok_or_else(|| BadRequestError::NotFoundError(index_alias_or_name.to_string()))?
-            .clone())
+            .handler();
+        Ok(index_holder)
     }
 
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<()> {
@@ -87,8 +103,11 @@ impl IndexService {
             &index_path.join("index.yaml"),
             &data_path,
             &create_index_request.schema,
+            Vec::new(),
         )?;
-        self.index_holders.write().insert(create_index_request.index_name.to_string(), index_holder);
+        self.index_holders
+            .write()
+            .insert(create_index_request.index_name.to_string(), OwningHandler::new(index_holder));
         Ok(())
     }
 
@@ -119,11 +138,11 @@ impl IndexService {
             }
         }
 
-        RwLockUpgradableReadGuard::<'_, HashMap<std::string::String, IndexHolder>>::upgrade(index_holders)
+        let index = RwLockUpgradableReadGuard::<'_, HashMap<String, OwningHandler<IndexHolder>>>::upgrade(index_holders)
             .remove(index_name)
-            .unwrap()
-            .delete()
-            .await?;
+            .unwrap();
+        let inner = tokio::task::spawn_blocking(move || index.into_inner()).await?;
+        inner.delete().await?;
         Ok(delete_index_result)
     }
 
@@ -133,6 +152,7 @@ impl IndexService {
         let index_holder = self.get_index_holder(&create_consumer_request.index_name)?;
         index_holder
             .index_updater()
+            .write()
             .add_consumer(KafkaConsumer::new(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config).await?)?;
         Ok(())
     }
@@ -140,7 +160,7 @@ impl IndexService {
     pub async fn delete_consumer(&self, consumer_name: &str) -> SummaResult<()> {
         let consumer_config = self.consumer_registry.delete_consumer_config(consumer_name)?;
         let index_holder = self.get_index_holder(&consumer_config.index_name)?;
-        index_holder.index_updater().delete_consumer(consumer_name).await?;
+        index_holder.index_updater().write().delete_consumer(consumer_name).await?;
         Ok(())
     }
 
@@ -176,23 +196,11 @@ impl IndexService {
     }
 
     /// Reading consumers configs and injecting consumers into appropriate indices
-    pub async fn start(&self) -> SummaResult<()> {
-        for index_holder in self.index_holders().values() {
-            let consumer_configs = self.consumer_registry.get_consumer_configs_for_index(&index_holder.index_name());
-            let consumers: Vec<_> = consumer_configs
-                .iter()
-                .map(|(consumer_name, consumer_config)| KafkaConsumer::new(consumer_name, consumer_config))
-                .collect();
-            let consumers = join_all(consumers).await.into_iter().collect::<SummaResult<Vec<_>>>()?;
-            index_holder.start(consumers)?;
-        }
-        Ok(())
-    }
 
     /// Stopping index holders
     pub async fn stop(self) -> SummaResult<()> {
         for (_, index_holder) in self.index_holders_mut().drain() {
-            index_holder.stop().await?;
+            index_holder.into_inner().stop().await?;
         }
         Ok(())
     }

@@ -45,7 +45,7 @@ impl Application {
         rt.block_on(async {
             let application_config = self.configurator.application_config.read();
             let metrics_server = MetricsServer::new(application_config.metrics.endpoint.parse()?)?;
-            let grpc_server = GrpcServer::new(application_config.grpc.endpoint.parse()?, &application_config.data_path, &self.configurator.runtime_config)?;
+            let grpc_server = GrpcServer::new(application_config.grpc.endpoint.parse()?, &application_config.data_path, &self.configurator.runtime_config).await?;
             drop(application_config);
 
             try_join!(metrics_server.start(), grpc_server.start())?;

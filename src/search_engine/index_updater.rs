@@ -1,12 +1,32 @@
 use super::index_writer_holder::IndexWriterHolder;
+use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::consumers::kafka::KafkaConsumer;
 use crate::errors::{Error, SummaResult};
+use crate::proto;
+use rdkafka::message::BorrowedMessage;
+use rdkafka::Message;
 use std::sync::Arc;
 
+/// Index updating through Kafka consumers and via direct invocation
 #[derive(Debug)]
 pub(crate) struct IndexUpdater {
     consumers: Vec<KafkaConsumer>,
     index_writer_holder: Arc<IndexWriterHolder>,
+}
+
+fn process_message(index_writer_holder: &IndexWriterHolder, message: Result<BorrowedMessage<'_>, rdkafka::error::KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
+    let message = message.map_err(|e| KafkaConsumingError::KafkaError(e))?;
+    let payload = message.payload().ok_or(KafkaConsumingError::EmptyPayloadError)?;
+    let proto_message: proto::IndexOperation = prost::Message::decode(payload).map_err(|e| KafkaConsumingError::ProtoDecodeError(e))?;
+    let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperationError)?;
+    match index_operation {
+        proto::index_operation::Operation::IndexDocument(index_document_operation) => {
+            index_writer_holder
+                .index_document(&index_document_operation.document, index_document_operation.reindex)
+                .map_err(|e| KafkaConsumingError::IndexError(e))?;
+            Ok(KafkaConsumingStatus::Consumed)
+        }
+    }
 }
 
 impl IndexUpdater {
@@ -29,7 +49,7 @@ impl IndexUpdater {
     async fn start_consumers(&mut self) -> SummaResult<()> {
         for consumer in &self.consumers {
             let index_writer_holder = self.index_writer_holder.clone();
-            consumer.start(move |message| index_writer_holder.process_message(message))?;
+            consumer.start(move |message| process_message(&index_writer_holder, message))?;
         }
         Ok(())
     }
@@ -43,7 +63,7 @@ impl IndexUpdater {
 
     pub(crate) fn add_consumer(&mut self, consumer: KafkaConsumer) -> SummaResult<()> {
         let index_writer_holder = self.index_writer_holder.clone();
-        consumer.start(move |message| index_writer_holder.process_message(message))?;
+        consumer.start(move |message| process_message(&index_writer_holder, message))?;
         self.consumers.push(consumer);
         Ok(())
     }

@@ -34,6 +34,8 @@ impl KafkaConsumer {
         kafka_producer_config.set("bootstrap.servers", config.bootstrap_servers.join(","));
 
         if config.create_topics {
+            let config = config.clone();
+            let kafka_producer_config = kafka_producer_config.clone();
             KafkaConsumer::create_topics(&kafka_producer_config, &config).await?;
         }
 

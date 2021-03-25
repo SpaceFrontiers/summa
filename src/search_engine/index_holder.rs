@@ -8,8 +8,9 @@ use crate::errors::{Error, SummaResult};
 use crate::proto;
 use crate::search_engine::IndexUpdater;
 use crate::utils::thread_handler::ThreadHandler;
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
+
 use std::sync::Arc;
 use std::time::Duration;
 use tantivy::collector::TopDocs;
@@ -21,22 +22,28 @@ use tokio::sync::oneshot;
 use tokio::time;
 use tracing::{info, instrument, warn};
 
-#[derive(Clone)]
 pub struct IndexHolder {
     index_name: String,
     schema: Schema,
     data_path: PathBuf,
     index: Index,
-    index_config: Arc<RwLock<IndexConfigHolder>>,
+    index_config: IndexConfigHolder,
     index_reader: IndexReader,
-    index_updater: Arc<Mutex<IndexUpdater>>,
-    autocommit_thread: Option<Arc<Mutex<ThreadHandler>>>,
+    index_updater: Arc<RwLock<IndexUpdater>>,
+    autocommit_thread: Option<ThreadHandler>,
 }
 
 impl IndexHolder {
-    pub fn new(index_name: &str, index_config: IndexConfig, config_filepath: &Path, data_path: &Path, schema: &Schema) -> SummaResult<IndexHolder> {
+    pub(crate) fn new(
+        index_name: &str,
+        index_config: IndexConfig,
+        config_filepath: &Path,
+        data_path: &Path,
+        schema: &Schema,
+        consumers: Vec<KafkaConsumer>,
+    ) -> SummaResult<IndexHolder> {
         IndexHolder::create(index_config, config_filepath, data_path, schema)?;
-        IndexHolder::open(index_name, config_filepath, data_path)
+        IndexHolder::open(index_name, config_filepath, data_path, consumers)
     }
 
     #[instrument]
@@ -51,31 +58,9 @@ impl IndexHolder {
         Ok(())
     }
 
-    pub(crate) fn start(&self, consumers: Vec<KafkaConsumer>) -> SummaResult<()> {
-        self.index_updater.lock().add_consumers(consumers)
-    }
-
-    pub(crate) async fn stop(self) -> SummaResult<()> {
-        if let Some(autocommit_thread) = self.autocommit_thread {
-            Arc::try_unwrap(autocommit_thread).unwrap().into_inner().stop().await?;
-        }
-        self.index_updater.lock().commit(false).await?;
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    pub(crate) async fn delete(self) -> SummaResult<()> {
-        let data_path = self.data_path.clone();
-        self.stop().await?;
-        let index_path = data_path.parent().unwrap();
-        std::fs::remove_dir_all(&index_path).map_err(|e| Error::IOError((e, Some(index_path.to_path_buf()))))?;
-        Ok(())
-    }
-
     #[instrument]
-    pub(crate) fn open(index_name: &str, config_filepath: &Path, data_path: &Path) -> SummaResult<IndexHolder> {
+    pub(crate) fn open(index_name: &str, config_filepath: &Path, data_path: &Path, consumers: Vec<KafkaConsumer>) -> SummaResult<IndexHolder> {
         let index_config: IndexConfigHolder = ConfigHolder::from_file(config_filepath, None, true)?;
-        let index_config = Arc::new(RwLock::new(index_config));
 
         let index = Index::open_in_dir(data_path)?;
         let schema = index.schema();
@@ -83,22 +68,25 @@ impl IndexHolder {
             index.tokenizers().register(tokenizer_name, tokenizer.clone())
         }
         let index_reader = index.reader()?;
-        let index_writer_holder = IndexWriterHolder::new(index_name, &index, index_config.clone())?;
-        let index_updater = Arc::new(Mutex::new(IndexUpdater::new(index_writer_holder)));
+        let index_writer_holder = IndexWriterHolder::new(index_name, &index, &index_config)?;
 
-        let autocommit_interval_ms = index_config.read().autocommit_interval_ms;
+        let mut index_updater = IndexUpdater::new(index_writer_holder);
+        index_updater.add_consumers(consumers)?;
+        let index_updater = Arc::new(RwLock::new(index_updater));
+
+        let autocommit_interval_ms = index_config.autocommit_interval_ms;
 
         let autocommit_thread = match autocommit_interval_ms {
             Some(interval_ms) => {
                 let index_updater = index_updater.clone();
                 let (shutdown_trigger, shutdown_tripwire) = oneshot::channel();
-                Some(Arc::new(Mutex::new(ThreadHandler::new(
+                Some(ThreadHandler::new(
                     tokio::spawn(async move {
                         let inner_task = async move {
                             let mut interval = time::interval(Duration::from_millis(interval_ms));
                             loop {
                                 interval.tick().await;
-                                if let Err(error) = index_updater.lock().commit(true).await {
+                                if let Err(error) = index_updater.write().commit(true).await {
                                     warn!(error = ?error)
                                 }
                             }
@@ -112,7 +100,7 @@ impl IndexHolder {
                         Ok(())
                     }),
                     shutdown_trigger,
-                ))))
+                ))
             }
             None => None,
         };
@@ -129,12 +117,26 @@ impl IndexHolder {
         })
     }
 
-    pub(crate) fn index_name(&self) -> &str {
-        &self.index_name
+    pub(crate) async fn stop(self) -> SummaResult<()> {
+        if let Some(autocommit_thread) = self.autocommit_thread {
+            autocommit_thread.stop().await?;
+        }
+        self.index_updater.write().commit(false).await?;
+        Ok(())
     }
 
-    pub(crate) fn schema(&self) -> &Schema {
-        &self.schema
+    #[instrument(skip(self))]
+    pub(crate) async fn delete(self) -> SummaResult<()> {
+        let data_path = self.data_path.clone();
+        self.stop().await?;
+        let index_path = data_path.parent().unwrap();
+        info!(action = "delete_directory", index_path = ?index_path);
+        std::fs::remove_dir_all(&index_path).map_err(|e| Error::IOError((e, Some(index_path.to_path_buf()))))?;
+        Ok(())
+    }
+
+    pub(crate) fn index_name(&self) -> &str {
+        &self.index_name
     }
 
     pub(crate) fn count(&self) -> u64 {
@@ -145,17 +147,17 @@ impl IndexHolder {
         self.index_reader.searcher().space_usage().unwrap()
     }
 
-    pub(crate) fn index_updater(&self) -> MutexGuard<'_, IndexUpdater> {
-        self.index_updater.lock()
+    pub(crate) fn index_updater(&self) -> &Arc<RwLock<IndexUpdater>> {
+        &self.index_updater
     }
 
     #[instrument(skip(self))]
     pub(crate) async fn search(&self, query: &str, limit: usize, offset: usize) -> SummaResult<proto::SearchResponse> {
-        let schema = self.schema().clone();
+        let schema = self.schema.clone();
         let searcher = self.index_reader.searcher();
 
         let index_name = self.index_name.to_string();
-        let default_fields = self.index_config.read().default_fields.clone();
+        let default_fields = self.index_config.default_fields.clone();
 
         let query_parser = QueryParser::for_index(&self.index, default_fields);
         let parsed_query = query_parser.parse_query(&query);
@@ -203,6 +205,6 @@ impl IndexHolder {
 
 impl std::fmt::Debug for IndexHolder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self.index)
+        write!(f, "IndexHolder({:?})", self.index)
     }
 }

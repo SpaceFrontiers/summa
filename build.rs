@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "proto/index_service.proto",
             "proto/search_service.proto",
         ],
-        &["./"],
+        &["./proto"],
     )?;
     Ok(())
 }

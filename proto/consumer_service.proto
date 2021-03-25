@@ -1,8 +1,7 @@
 syntax = "proto3";
 package summa;
 
-import "proto/consumer.proto";
-import "proto/index.proto";
+import "consumer.proto";
 
 service ConsumerApi {
   rpc create_consumer (CreateConsumerRequest) returns (CreateConsumerResponse) {}

@@ -3,7 +3,7 @@ import sys
 import traceback
 
 import fire
-from aiosumma.client import SummaClient
+from summa.aiosumma.client import SummaClient
 
 
 async def client_cli(endpoint):

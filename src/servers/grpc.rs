@@ -64,9 +64,9 @@ impl GrpcServer {
         )
     }
 
-    pub fn new(addr: SocketAddr, data_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>) -> SummaResult<GrpcServer> {
+    pub async fn new(addr: SocketAddr, data_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>) -> SummaResult<GrpcServer> {
         let alias_service = AliasService::new(runtime_config);
-        let index_service = IndexService::new(data_path, runtime_config, &alias_service)?;
+        let index_service = IndexService::new(data_path, runtime_config, &alias_service).await?;
         Ok(GrpcServer {
             addr,
             alias_service,
@@ -99,7 +99,6 @@ impl GrpcServer {
 
         let rx = signal_channel();
         info!(target: "grpc", action = "starting", addr = ?self.addr);
-        self.index_service.start().await?;
         router
             .serve_with_shutdown(self.addr, async move {
                 rx.map(drop).await;
