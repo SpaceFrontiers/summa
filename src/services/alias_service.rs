@@ -12,16 +12,19 @@ pub struct AliasService {
 }
 
 impl AliasService {
+    /// New `AliasService`
     pub fn new(runtime_config: &Arc<RwLock<RuntimeConfigHolder>>) -> AliasService {
         AliasService {
             runtime_config: runtime_config.clone(),
         }
     }
 
+    /// All aliases
     pub fn index_aliases(&self) -> MappedRwLockReadGuard<'_, HashMap<String, String>> {
         RwLockReadGuard::map(self.runtime_config.read(), |f| &f.aliases)
     }
 
+    /// Copy aliases for the specific index
     pub fn get_index_aliases_for_index(&self, index_name: &str) -> Vec<String> {
         self.index_aliases()
             .iter()
@@ -30,14 +33,17 @@ impl AliasService {
             .collect::<Vec<String>>()
     }
 
+    /// Find index by alias
     pub fn resolve_index_alias(&self, alias: &str) -> Option<String> {
         self.index_aliases().get(alias).cloned()
     }
 
+    /// Set new alias for index
     pub fn set_index_alias(&self, alias: &str, index_name: &str) -> Option<String> {
         self.runtime_config.write().autosave().aliases.insert(alias.to_string(), index_name.to_string())
     }
 
+    /// Delete all aliases listed in `index_aliases`
     pub fn delete_index_aliases(&self, index_aliases: &Vec<String>) {
         let mut runtime_config = self.runtime_config.write();
         let mut runtime_config_autosave = runtime_config.autosave();

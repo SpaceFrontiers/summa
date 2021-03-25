@@ -4,7 +4,7 @@
 
 use crate::errors::SummaResult;
 use crate::proto;
-use crate::requests::CreateConsumerRequest;
+use crate::requests::{CreateConsumerRequest, DeleteConsumerRequest};
 use crate::services::IndexService;
 use tonic::{Request, Response, Status};
 
@@ -60,7 +60,8 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
 
     async fn delete_consumer(&self, proto_request: Request<proto::DeleteConsumerRequest>) -> Result<Response<proto::DeleteConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        self.index_service.delete_consumer(&proto_request.consumer_name).await?;
+        let delete_consumer_request = DeleteConsumerRequest::from_proto(proto_request)?;
+        self.index_service.delete_consumer(delete_consumer_request).await?;
         let response = proto::DeleteConsumerResponse {};
         Ok(Response::new(response))
     }

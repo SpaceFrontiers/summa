@@ -1,18 +1,17 @@
 use crate::configurator::configs::RuntimeConfigHolder;
 use crate::consumers::kafka::KafkaConsumer;
 use crate::consumers::ConsumerRegistry;
-use crate::errors::{BadRequestError, Error, SummaResult, ValidationError};
-use crate::requests::{CreateConsumerRequest, CreateIndexRequest};
+use crate::errors::{BadRequestError, SummaResult, ValidationError};
+use crate::requests::{CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
 use crate::search_engine::IndexHolder;
 use crate::services::AliasService;
+use crate::utils::fs::IndexLayout;
 use crate::utils::sync::{Handler, OwningHandler};
 use futures_util::future::join_all;
-use opentelemetry::metrics::{BatchObserverResult, Unit};
-use opentelemetry::{global, KeyValue};
+
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::fs::DirEntry;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,6 +30,7 @@ pub struct DeleteIndexResult {
     pub deleted_consumers: Vec<String>,
 }
 
+/// The main struct responsible for indices lifecycle.
 impl IndexService {
     pub async fn new(root_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>, alias_service: &AliasService) -> SummaResult<IndexService> {
         let consumer_registry = ConsumerRegistry::new(runtime_config)?;
@@ -55,7 +55,6 @@ impl IndexService {
             consumer_registry,
             index_holders: Arc::new(RwLock::new(index_holders)),
         };
-        index_service.register_meter();
         Ok(index_service)
     }
 
@@ -89,113 +88,79 @@ impl IndexService {
         Ok(index_holder)
     }
 
+    /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<()> {
-        // ToDo: Move validation to CreateIndexRequest class
+        let mut index_holders = self.index_holders.write();
         let index_path = self.root_path.join(&create_index_request.index_name);
-        if index_path.exists() {
-            Err(ValidationError::ExistingIndexError(create_index_request.index_name.clone()))?;
-        }
-        let data_path = index_path.join("data");
-        std::fs::create_dir_all(&data_path).map_err(|e| Error::IOError((e, Some(data_path.clone()))))?;
+        let index_layout = IndexLayout::setup(&index_path)?;
         let index_holder = IndexHolder::new(
             &create_index_request.index_name,
             create_index_request.index_config,
-            &index_path.join("index.yaml"),
-            &data_path,
+            index_layout.config_filepath(),
+            &index_layout.data_path(),
             &create_index_request.schema,
             Vec::new(),
         )?;
-        self.index_holders
-            .write()
-            .insert(create_index_request.index_name.to_string(), OwningHandler::new(index_holder));
+        index_holders.insert(create_index_request.index_name.to_string(), OwningHandler::new(index_holder));
         Ok(())
     }
 
-    pub async fn delete_index(&self, index_name: &str, cascade: bool) -> SummaResult<DeleteIndexResult> {
+    pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaResult<DeleteIndexResult> {
         let index_holders = self.index_holders.upgradable_read();
-        index_holders.get(index_name).ok_or_else(|| BadRequestError::NotFoundError(index_name.to_string()))?;
+        if !index_holders.contains_key(&delete_index_request.index_name) {
+            Err(BadRequestError::NotFoundError(delete_index_request.index_name.to_string()))?;
+        }
 
         let mut delete_index_result = DeleteIndexResult::default();
 
-        let aliases = self.alias_service.get_index_aliases_for_index(index_name);
-        if aliases.len() > 0 {
-            if cascade {
-                self.alias_service.delete_index_aliases(&aliases);
-                delete_index_result.deleted_aliases.extend(aliases);
-            } else {
+        let aliases = self.alias_service.get_index_aliases_for_index(&delete_index_request.index_name);
+        let consumer_configs = self.consumer_registry.get_consumer_configs_for_index(&delete_index_request.index_name);
+        let consumer_config_names: Vec<_> = consumer_configs.keys().map(|x| x.to_string()).collect();
+
+        if delete_index_request.cascade {
+            self.alias_service.delete_index_aliases(&aliases);
+            delete_index_result.deleted_aliases.extend(aliases);
+            self.consumer_registry.delete_consumer_configs(&consumer_config_names);
+            delete_index_result.deleted_consumers.extend(consumer_config_names);
+        } else {
+            if aliases.len() > 0 {
                 Err(BadRequestError::AliasedError(aliases.join(", ")))?;
             }
-        }
-
-        let consumer_configs = self.consumer_registry.get_consumer_configs_for_index(index_name);
-        let consumer_config_names: Vec<_> = consumer_configs.keys().map(|x| x.to_string()).collect();
-        if consumer_configs.len() > 0 {
-            if cascade {
-                self.consumer_registry.delete_consumer_configs(&consumer_config_names);
-                delete_index_result.deleted_consumers.extend(consumer_config_names);
-            } else {
+            if consumer_configs.len() > 0 {
                 Err(BadRequestError::ExistingConsumersError(consumer_config_names.join(", ")))?;
             }
         }
 
         let index = RwLockUpgradableReadGuard::<'_, HashMap<String, OwningHandler<IndexHolder>>>::upgrade(index_holders)
-            .remove(index_name)
+            .remove(&delete_index_request.index_name)
             .unwrap();
+
         let inner = tokio::task::spawn_blocking(move || index.into_inner()).await?;
         inner.delete().await?;
         Ok(delete_index_result)
     }
 
+    /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     pub async fn create_consumer(&self, create_consumer_request: CreateConsumerRequest) -> SummaResult<()> {
+        let index_holder = self.get_index_holder(&create_consumer_request.index_name)?;
+        if self.consumer_registry.get_consumer_config(&create_consumer_request.consumer_name).is_ok() {
+            Err(ValidationError::ExistingConsumerError(create_consumer_request.consumer_name.to_string()))?
+        };
+        let kafka_consumer = KafkaConsumer::new(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config).await?;
+        index_holder.index_updater().write().add_consumer(kafka_consumer)?;
         self.consumer_registry
             .insert_consumer_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?;
-        let index_holder = self.get_index_holder(&create_consumer_request.index_name)?;
-        index_holder
-            .index_updater()
-            .write()
-            .add_consumer(KafkaConsumer::new(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config).await?)?;
         Ok(())
     }
 
-    pub async fn delete_consumer(&self, consumer_name: &str) -> SummaResult<()> {
-        let consumer_config = self.consumer_registry.delete_consumer_config(consumer_name)?;
-        let index_holder = self.get_index_holder(&consumer_config.index_name)?;
-        index_holder.index_updater().write().delete_consumer(consumer_name).await?;
+    /// Delete consumer from the consumer registry and from `IndexHolder` afterwards.
+    pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaResult<()> {
+        let index_name = self.consumer_registry.get_consumer_config(&delete_consumer_request.consumer_name)?.index_name;
+        let index_holder = self.get_index_holder(&index_name)?;
+        self.consumer_registry.delete_consumer_config(&delete_consumer_request.consumer_name)?;
+        index_holder.index_updater().write().delete_consumer(&delete_consumer_request.consumer_name).await?;
         Ok(())
     }
-
-    fn register_meter(&self) {
-        let meter = global::meter("summa");
-        let index_holders = self.index_holders.clone();
-        meter.batch_observer(move |batch| {
-            let index_holders = index_holders.clone();
-            let total_memory_usage = batch
-                .u64_value_observer("total_memory_usage")
-                .with_description("Total memory usage in bytes, including all large subcomponents. Does not account for smaller things like meta.json")
-                .with_unit(Unit::new("bytes"))
-                .init();
-            let document_count = batch.u64_value_observer("document_count").with_description("Total document count").init();
-            let segment_count = batch.u64_value_observer("segment_count").with_description("Total segment count").init();
-
-            move |result: BatchObserverResult| {
-                for index_holder in index_holders.read().values() {
-                    let space_usage = index_holder.space_usage();
-                    let segments = space_usage.segments();
-
-                    result.observe(
-                        &[KeyValue::new("index_name", index_holder.index_name().to_string())],
-                        &[
-                            document_count.observation(index_holder.count().try_into().unwrap()),
-                            total_memory_usage.observation(space_usage.total().try_into().unwrap()),
-                            segment_count.observation(segments.len().try_into().unwrap()),
-                        ],
-                    );
-                }
-            }
-        });
-    }
-
-    /// Reading consumers configs and injecting consumers into appropriate indices
 
     /// Stopping index holders
     pub async fn stop(self) -> SummaResult<()> {

@@ -20,8 +20,8 @@ pub enum BadRequestError {
 pub enum ValidationError {
     #[error("existing_consumer_error: {0}")]
     ExistingConsumerError(String),
-    #[error("existing_index_error: {0}")]
-    ExistingIndexError(String),
+    #[error("existing_path_error: {0}")]
+    ExistingPathError(String),
     #[error("invalid_memory_error: {0}")]
     InvalidMemoryError(u64),
     #[error("invalid_threads_number_error: {0}")]

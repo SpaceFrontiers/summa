@@ -16,8 +16,8 @@ use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::Schema;
-use tantivy::space_usage::SearcherSpaceUsage;
-use tantivy::{Index, IndexReader, IndexSettings};
+
+use tantivy::{Index, IndexReader, IndexSettings, LeasedItem, Searcher};
 use tokio::sync::oneshot;
 use tokio::time;
 use tracing::{info, instrument, warn};
@@ -139,12 +139,12 @@ impl IndexHolder {
         &self.index_name
     }
 
-    pub(crate) fn count(&self) -> u64 {
-        self.index_reader.searcher().num_docs()
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
     }
 
-    pub(crate) fn space_usage(&self) -> SearcherSpaceUsage {
-        self.index_reader.searcher().space_usage().unwrap()
+    pub(crate) fn searcher(&self) -> LeasedItem<Searcher> {
+        self.index_reader.searcher()
     }
 
     pub(crate) fn index_updater(&self) -> &Arc<RwLock<IndexUpdater>> {

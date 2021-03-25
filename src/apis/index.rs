@@ -4,7 +4,7 @@
 
 use crate::errors::SummaResult;
 use crate::proto;
-use crate::requests::CreateIndexRequest;
+use crate::requests::{CreateIndexRequest, DeleteIndexRequest};
 use crate::services::{AliasService, IndexService};
 
 use tonic::{Request, Response, Status};
@@ -59,7 +59,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn delete_index(&self, proto_request: Request<proto::DeleteIndexRequest>) -> Result<Response<proto::DeleteIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let delete_index_result = self.index_service.delete_index(&proto_request.index_name, proto_request.cascade).await?;
+        let delete_index_request = DeleteIndexRequest::from_proto(proto_request)?;
+        let delete_index_result = self.index_service.delete_index(delete_index_request).await?;
         let response = proto::DeleteIndexResponse {
             deleted_index_aliases: delete_index_result.deleted_aliases,
             deleted_consumer_names: delete_index_result.deleted_consumers,

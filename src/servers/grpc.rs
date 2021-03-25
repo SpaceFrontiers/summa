@@ -6,7 +6,7 @@ use crate::errors::SummaResult;
 use crate::proto::consumer_api_server::ConsumerApiServer;
 use crate::proto::index_api_server::IndexApiServer;
 use crate::proto::search_api_server::SearchApiServer;
-use crate::services::{AliasService, IndexService};
+use crate::services::{AliasService, IndexService, MetricsService};
 use crate::utils::random::generate_request_id;
 use crate::utils::signal_channel::signal_channel;
 use futures::FutureExt;
@@ -64,15 +64,19 @@ impl GrpcServer {
         )
     }
 
+    /// New GRPC server
     pub async fn new(addr: SocketAddr, data_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>) -> SummaResult<GrpcServer> {
         let alias_service = AliasService::new(runtime_config);
         let index_service = IndexService::new(data_path, runtime_config, &alias_service).await?;
+        let _ = MetricsService::new(&index_service);
         Ok(GrpcServer {
             addr,
             alias_service,
             index_service,
         })
     }
+
+    /// Starts all nested services and start serving requests
     #[instrument(skip(self))]
     pub async fn start(self) -> SummaResult<()> {
         let consumer_api = ConsumerApiImpl::new(&self.index_service)?;
