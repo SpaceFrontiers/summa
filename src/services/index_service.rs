@@ -3,12 +3,11 @@ use crate::consumers::kafka::KafkaConsumer;
 use crate::consumers::ConsumerRegistry;
 use crate::errors::{BadRequestError, SummaResult, ValidationError};
 use crate::requests::{CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
+use crate::search_engine::index_layout::IndexLayout;
 use crate::search_engine::IndexHolder;
 use crate::services::AliasService;
-use crate::utils::fs::IndexLayout;
 use crate::utils::sync::{Handler, OwningHandler};
 use futures_util::future::join_all;
-
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::fs::DirEntry;
@@ -36,17 +35,14 @@ impl IndexService {
         let consumer_registry = ConsumerRegistry::new(runtime_config)?;
         let mut index_holders: HashMap<String, OwningHandler<IndexHolder>> = HashMap::new();
         for index_path in IndexService::indices_on_disk(root_path)? {
-            let index_config_filepath = index_path.path().join("index.yaml");
+            let index_layout = IndexLayout::setup(&index_path.path()).await?;
             let index_name = String::from(index_path.file_name().to_str().unwrap());
             let consumer_configs = consumer_registry.get_consumer_configs_for_index(&index_name);
             let consumers = consumer_configs
                 .iter()
                 .map(|(consumer_name, consumer_config)| KafkaConsumer::new(consumer_name, consumer_config));
             let consumers: SummaResult<Vec<_>> = join_all(consumers).await.into_iter().collect();
-            index_holders.insert(
-                index_name.clone(),
-                OwningHandler::new(IndexHolder::open(&index_name, &index_config_filepath, &index_path.path().join("data"), consumers?)?),
-            );
+            index_holders.insert(index_name.clone(), OwningHandler::new(IndexHolder::open(&index_name, &index_layout, consumers?)?));
         }
 
         let index_service = IndexService {
@@ -92,12 +88,11 @@ impl IndexService {
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<()> {
         let mut index_holders = self.index_holders.write();
         let index_path = self.root_path.join(&create_index_request.index_name);
-        let index_layout = IndexLayout::setup(&index_path)?;
+        let index_layout = IndexLayout::setup(&index_path).await?;
         let index_holder = IndexHolder::new(
             &create_index_request.index_name,
             create_index_request.index_config,
-            index_layout.config_filepath(),
-            &index_layout.data_path(),
+            &index_layout,
             &create_index_request.schema,
             Vec::new(),
         )?;

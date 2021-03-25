@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Wrapper on file storage for managing consumers
 #[derive(Clone, Debug)]
 pub struct ConsumerRegistry {
     runtime_config: Arc<RwLock<RuntimeConfigHolder>>,

@@ -10,6 +10,7 @@ use rdkafka::message::BorrowedMessage;
 use std::str;
 use tracing::{info, instrument};
 
+/// Manages multiple consuming Kafka threads
 #[derive(Clone, Debug)]
 pub(crate) struct KafkaConsumer {
     consumer_name: String,

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{info, instrument, trace_span, warn, Instrument};
 
+/// Long-living container for Kafka consuming thread
 #[derive(Clone)]
 pub struct KafkaConsumerThreadController {
     thread_name: String,

@@ -9,7 +9,6 @@ use crate::proto;
 use crate::search_engine::IndexUpdater;
 use crate::utils::thread_handler::ThreadHandler;
 use parking_lot::RwLock;
-use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +16,7 @@ use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::Schema;
 
+use crate::search_engine::index_layout::IndexLayout;
 use tantivy::{Index, IndexReader, IndexSettings, LeasedItem, Searcher};
 use tokio::sync::oneshot;
 use tokio::time;
@@ -24,8 +24,8 @@ use tracing::{info, instrument, warn};
 
 pub struct IndexHolder {
     index_name: String,
+    index_layout: IndexLayout,
     schema: Schema,
-    data_path: PathBuf,
     index: Index,
     index_config: IndexConfigHolder,
     index_reader: IndexReader,
@@ -34,35 +34,28 @@ pub struct IndexHolder {
 }
 
 impl IndexHolder {
-    pub(crate) fn new(
-        index_name: &str,
-        index_config: IndexConfig,
-        config_filepath: &Path,
-        data_path: &Path,
-        schema: &Schema,
-        consumers: Vec<KafkaConsumer>,
-    ) -> SummaResult<IndexHolder> {
-        IndexHolder::create(index_config, config_filepath, data_path, schema)?;
-        IndexHolder::open(index_name, config_filepath, data_path, consumers)
+    pub(crate) fn new(index_name: &str, index_config: IndexConfig, index_layout: &IndexLayout, schema: &Schema, consumers: Vec<KafkaConsumer>) -> SummaResult<IndexHolder> {
+        IndexHolder::create(index_config, index_layout, schema)?;
+        IndexHolder::open(index_name, index_layout, consumers)
     }
 
     #[instrument]
-    fn create(index_config: IndexConfig, config_filepath: &Path, data_path: &Path, schema: &Schema) -> SummaResult<()> {
-        let index_config_holder = ConfigHolder::new(index_config.clone(), &config_filepath)?;
+    fn create(index_config: IndexConfig, index_layout: &IndexLayout, schema: &Schema) -> SummaResult<()> {
+        let index_config_holder = ConfigHolder::new(index_config.clone(), index_layout.config_filepath())?;
         index_config_holder.save()?;
         let settings = IndexSettings {
             docstore_compression: index_config.compression,
             ..Default::default()
         };
-        Index::builder().schema(schema.clone()).settings(settings).create_in_dir(data_path)?;
+        Index::builder().schema(schema.clone()).settings(settings).create_in_dir(index_layout.data_path())?;
         Ok(())
     }
 
     #[instrument]
-    pub(crate) fn open(index_name: &str, config_filepath: &Path, data_path: &Path, consumers: Vec<KafkaConsumer>) -> SummaResult<IndexHolder> {
-        let index_config: IndexConfigHolder = ConfigHolder::from_file(config_filepath, None, true)?;
+    pub(crate) fn open(index_name: &str, index_layout: &IndexLayout, consumers: Vec<KafkaConsumer>) -> SummaResult<IndexHolder> {
+        let index_config: IndexConfigHolder = ConfigHolder::from_file(index_layout.config_filepath(), None, true)?;
 
-        let index = Index::open_in_dir(data_path)?;
+        let index = Index::open_in_dir(index_layout.data_path())?;
         let schema = index.schema();
         for (tokenizer_name, tokenizer) in &default_tokenizers() {
             index.tokenizers().register(tokenizer_name, tokenizer.clone())
@@ -108,7 +101,7 @@ impl IndexHolder {
         Ok(IndexHolder {
             index_name: String::from(index_name),
             schema,
-            data_path: data_path.to_path_buf(),
+            index_layout: index_layout.clone(),
             index,
             index_reader,
             index_config,
@@ -127,11 +120,9 @@ impl IndexHolder {
 
     #[instrument(skip(self))]
     pub(crate) async fn delete(self) -> SummaResult<()> {
-        let data_path = self.data_path.clone();
+        let index_layout = self.index_layout.clone();
         self.stop().await?;
-        let index_path = data_path.parent().unwrap();
-        info!(action = "delete_directory", index_path = ?index_path);
-        std::fs::remove_dir_all(&index_path).map_err(|e| Error::IOError((e, Some(index_path.to_path_buf()))))?;
+        index_layout.delete().await?;
         Ok(())
     }
 
