@@ -1,8 +1,12 @@
 #![crate_name = "summa"]
 //! Fast full-text search server with following features:
 //!
-//! - Simple GRPC API
-//! - Indexing documents through Kafka
+//! - Simple GRPC API for managing multiple indices
+//! - Indexing documents through Kafka or directly
+//! - IPFS API for replication (oncoming)
+//! - Exposing metrics in Prometheus format
+//! - Various configurable tokenizers (including CJK)
+//! - Fine CLI on Python
 //!
 //! ## Quickstart
 //! #### Install
