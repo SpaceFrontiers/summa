@@ -1,4 +1,4 @@
-use crate::configurator::configs::RuntimeConfigHolder;
+use crate::configs::RuntimeConfigHolder;
 use crate::consumers::kafka::KafkaConsumer;
 use crate::consumers::ConsumerRegistry;
 use crate::errors::{BadRequestError, SummaResult, ValidationError};
@@ -14,12 +14,13 @@ use std::fs::DirEntry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Indices creation and deletion as well as committing and indexing new documents
+/// The main struct responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone, Debug)]
 pub struct IndexService {
     root_path: PathBuf,
     alias_service: AliasService,
     consumer_registry: ConsumerRegistry,
+    /// RwLock for index modification operations like creating new ones or deleting old ones
     index_holders: Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>>,
 }
 
@@ -29,7 +30,7 @@ pub struct DeleteIndexResult {
     pub deleted_consumers: Vec<String>,
 }
 
-/// The main struct responsible for indices lifecycle.
+///
 impl IndexService {
     pub async fn new(root_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>, alias_service: &AliasService) -> SummaResult<IndexService> {
         let consumer_registry = ConsumerRegistry::new(runtime_config)?;

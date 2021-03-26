@@ -1,13 +1,13 @@
 #![crate_name = "summa"]
 //! Fast full-text search server
 //!
-//! ## Features
-//! - Simple GRPC API for managing multiple indices
+//! ### Features
+//! - Simple GRPC API for managing multiple indices and for search
 //! - Indexing documents through Kafka or directly
-//! - IPFS API for replication (oncoming)
-//! - Exposing metrics in Prometheus format
+//! - Tracing with [OpenTelemetry](https://github.com/open-telemetry/opentelemetry-rust) and exposing metrics in Prometheus format
 //! - Various configurable tokenizers (including CJK)
-//! - Fine CLI on Python
+//! - Fine CLI and asynchronous client library [aiosumma](aiosumma/README.md) written in Python
+//! - IPFS API for replication (soon)
 //!
 //! ## Getting started
 //! - Look at [examples](crate::examples)
@@ -17,7 +17,7 @@
 extern crate lazy_static;
 
 pub mod apis;
-pub mod configurator;
+pub mod configs;
 pub mod consumers;
 pub mod errors;
 mod examples;

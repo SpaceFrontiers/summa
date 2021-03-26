@@ -1,6 +1,6 @@
 use super::consumer_thread::KafkaConsumerThreadController;
 use super::status::{KafkaConsumingError, KafkaConsumingStatus};
-use crate::configurator::configs::KafkaConsumerConfig;
+use crate::configs::KafkaConsumerConfig;
 use crate::errors::SummaResult;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::config::{ClientConfig, FromClientConfig};

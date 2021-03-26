@@ -1,4 +1,4 @@
-use crate::configurator::configs::KafkaConsumerConfig;
+use crate::configs::KafkaConsumerConfig;
 use crate::errors::SummaResult;
 use crate::proto;
 

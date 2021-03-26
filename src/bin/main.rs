@@ -3,8 +3,8 @@ use futures::try_join;
 use clap::{arg, command};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use summa::configurator::configs::ApplicationConfig;
-use summa::configurator::Configurator;
+use summa::configs::ApplicationConfig;
+use summa::configs::GlobalConfig;
 use summa::errors::SummaResult;
 use summa::servers::GrpcServer;
 use summa::servers::MetricsServer;
@@ -15,7 +15,7 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
 struct Application {
-    configurator: Configurator,
+    configurator: GlobalConfig,
 }
 
 const LONG_ABOUT: &str = "
@@ -25,7 +25,7 @@ Fast full-text search server with following features:
 - Indexing documents through Kafka";
 
 impl Application {
-    pub fn new(configurator: Configurator) -> SummaResult<Application> {
+    pub fn new(configurator: GlobalConfig) -> SummaResult<Application> {
         Ok(Application { configurator })
     }
 
@@ -113,7 +113,7 @@ fn main() -> SummaResult<()> {
         }
         Some(("serve", submatches)) => {
             let config_path = submatches.value_of("CONFIG").map(Path::new).unwrap();
-            let configurator = Configurator::new(config_path)?;
+            let configurator = GlobalConfig::new(config_path)?;
             let application_config = configurator.application_config.read();
             let _log_guard = setup_tracing(&application_config.log_path, application_config.debug);
             drop(application_config);

@@ -1,4 +1,4 @@
-use crate::configurator::configs::IndexConfigHolder;
+use crate::configs::IndexConfigHolder;
 use crate::errors::{Error, SummaResult};
 use std::str::from_utf8;
 use tantivy::schema::{Field, Schema};

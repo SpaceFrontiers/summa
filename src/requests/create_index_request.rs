@@ -1,4 +1,4 @@
-use crate::configurator::configs::IndexConfig;
+use crate::configs::IndexConfig;
 
 use crate::errors::{SummaResult, ValidationError};
 use crate::proto;

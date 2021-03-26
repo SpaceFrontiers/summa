@@ -1,11 +1,12 @@
-use crate::configurator::configs::{KafkaConsumerConfig, RuntimeConfigHolder};
+use crate::configs::{KafkaConsumerConfig, RuntimeConfigHolder};
 use crate::errors::{BadRequestError, SummaResult, ValidationError};
 use parking_lot::RwLock;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{info, warn};
 
-/// Wrapper on file storage for managing consumers
+/// Wrapper for the [RuntimeConfigHolder](crate::configurator::RuntimeConfigHolder) using to keep consumers metadata
 #[derive(Clone, Debug)]
 pub struct ConsumerRegistry {
     runtime_config: Arc<RwLock<RuntimeConfigHolder>>,
@@ -19,8 +20,12 @@ impl ConsumerRegistry {
     }
 
     pub fn insert_consumer_config(&self, consumer_name: &str, consumer_config: &KafkaConsumerConfig) -> SummaResult<()> {
+        info!(action = "insert", consumer_name = ?consumer_name);
         match self.runtime_config.write().autosave().consumer_configs.entry(consumer_name.to_string()) {
-            Entry::Occupied(_) => Err(ValidationError::ExistingConsumerError(consumer_name.to_string()))?,
+            Entry::Occupied(current_consumer_config) => {
+                warn!(action = "error", error = "occupied", current_consumer_config = ?current_consumer_config);
+                Err(ValidationError::ExistingConsumerError(consumer_name.to_string()))?
+            }
             Entry::Vacant(v) => v.insert(consumer_config.clone()),
         };
         Ok(())

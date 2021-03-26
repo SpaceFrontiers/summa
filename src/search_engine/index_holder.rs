@@ -1,8 +1,8 @@
 use super::default_tokenizers::default_tokenizers;
 use super::index_writer_holder::IndexWriterHolder;
-use crate::configurator::configs::{IndexConfig, IndexConfigHolder};
-use crate::configurator::ConfigHolder;
-use crate::configurator::Persistable;
+use crate::configs::ConfigHolder;
+use crate::configs::Persistable;
+use crate::configs::{IndexConfig, IndexConfigHolder};
 use crate::consumers::kafka::KafkaConsumer;
 use crate::errors::{Error, SummaResult};
 use crate::proto;

@@ -1,7 +1,7 @@
 use crate::apis::consumer::ConsumerApiImpl;
 use crate::apis::index::IndexApiImpl;
 use crate::apis::search::SearchApiImpl;
-use crate::configurator::configs::RuntimeConfigHolder;
+use crate::configs::RuntimeConfigHolder;
 use crate::errors::SummaResult;
 use crate::proto::consumer_api_server::ConsumerApiServer;
 use crate::proto::index_api_server::IndexApiServer;

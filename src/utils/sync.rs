@@ -4,6 +4,7 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::Arc;
 
+/// `Handler` wraps data with [Arc](std::sync::Arc) and notifies exteriors by channel when dropping
 pub struct Handler<T> {
     data: ManuallyDrop<Arc<T>>,
     sender: Sender<i32>,
@@ -42,34 +43,31 @@ impl<T> Deref for Handler<T> {
     }
 }
 
-impl<T> Deref for OwningHandler<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handler.data
-    }
-}
-
+/// `OwningHandler` is like [Arc](std::sync::Arc) but with additional possibility to wait until
+/// the last strong reference drops and then return wrapped data.
 pub struct OwningHandler<T> {
     handler: Handler<T>,
     receiver: Receiver<i32>,
 }
 
 impl<T> OwningHandler<T> {
+    /// Wraps data with [Arc](std::sync::Arc) and creates a channel for listening drop events
     pub fn new(data: T) -> OwningHandler<T> {
         let (sender, receiver) = bounded(1);
         let handler = Handler::new(data, sender);
         OwningHandler { handler, receiver }
     }
 
+    /// Takes new [Handler](crate::utils::sync::Handler)
     pub fn handler(&self) -> Handler<T> {
         self.handler.clone()
     }
 
-    pub fn destruct(self) -> (Receiver<i32>, Handler<T>) {
+    fn destruct(self) -> (Receiver<i32>, Handler<T>) {
         (self.receiver, self.handler)
     }
 
+    /// Blocks until last strong references drops and return wrapped data afterwards
     pub fn into_inner(self) -> T {
         let (receiver, mut handler) = self.destruct();
         let mut data = unsafe { ManuallyDrop::take(&mut handler.data) };
@@ -82,6 +80,14 @@ impl<T> OwningHandler<T> {
                 }
             }
         }
+    }
+}
+
+impl<T> Deref for OwningHandler<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handler.data
     }
 }
 

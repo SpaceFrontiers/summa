@@ -1,4 +1,4 @@
-use crate::configurator::configs::RuntimeConfigHolder;
+use crate::configs::RuntimeConfigHolder;
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ impl AliasService {
         RwLockReadGuard::map(self.runtime_config.read(), |f| &f.aliases)
     }
 
-    /// Copy aliases for the specific index
+    /// Copy aliases for the index
     pub fn get_index_aliases_for_index(&self, index_name: &str) -> Vec<String> {
         self.index_aliases()
             .iter()

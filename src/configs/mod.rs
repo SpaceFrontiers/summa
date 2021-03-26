@@ -1,6 +1,12 @@
-use crate::configurator::ConfigHolder;
+//! Storing and loading various Summa config files
+
+mod config_holder;
+mod global;
+
 use crate::errors::{Error, SummaResult};
 use colored::Colorize;
+pub use config_holder::{ConfigHolder, Persistable};
+pub use global::GlobalConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;

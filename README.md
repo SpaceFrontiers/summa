@@ -5,12 +5,12 @@
 Fast full-text search server
 
 ### Features
-- Simple GRPC API for managing multiple indices
+- Simple GRPC API for managing multiple indices and search
 - Indexing documents through Kafka or directly
 - IPFS API for replication (oncoming)
-- Exposing metrics in Prometheus format
+- Tracing with [OpenTelemetry](https://github.com/open-telemetry/opentelemetry-rust) and exposing metrics in Prometheus format
 - Various configurable tokenizers (including CJK)
-- Fine CLI on Python
+- Fine CLI and client library written in Python
 
 ### Getting started
 - Look at [examples](src/examples/README.md)
