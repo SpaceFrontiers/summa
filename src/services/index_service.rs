@@ -36,7 +36,7 @@ impl IndexService {
         let consumer_registry = ConsumerRegistry::new(runtime_config)?;
         let mut index_holders: HashMap<String, OwningHandler<IndexHolder>> = HashMap::new();
         for index_path in IndexService::indices_on_disk(root_path)? {
-            let index_layout = IndexLayout::setup(&index_path.path()).await?;
+            let index_layout = IndexLayout::open(&index_path.path()).await?;
             let index_name = String::from(index_path.file_name().to_str().unwrap());
             let consumer_configs = consumer_registry.get_consumer_configs_for_index(&index_name);
             let consumers = consumer_configs
@@ -89,7 +89,7 @@ impl IndexService {
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<()> {
         let mut index_holders = self.index_holders.write();
         let index_path = self.root_path.join(&create_index_request.index_name);
-        let index_layout = IndexLayout::setup(&index_path).await?;
+        let index_layout = IndexLayout::create(&index_path).await?;
         let index_holder = IndexHolder::new(
             &create_index_request.index_name,
             create_index_request.index_config,

@@ -28,6 +28,8 @@ pub enum ValidationError {
     InvalidThreadsNumberError(u64),
     #[error("missing_default_field_error: {0}")]
     MissingDefaultField(String),
+    #[error("missing_path_error: {0}")]
+    MissingPathError(String),
     #[error("missing_primary_key_error: {0:?}")]
     MissingPrimaryKeyError(Option<String>),
 }

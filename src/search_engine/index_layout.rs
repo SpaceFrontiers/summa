@@ -12,13 +12,28 @@ pub struct IndexLayout {
 
 impl IndexLayout {
     /// Creates all directories and initializes paths
-    pub async fn setup(index_path: &Path) -> SummaResult<IndexLayout> {
+    pub async fn create(index_path: &Path) -> SummaResult<IndexLayout> {
         if index_path.exists() {
             Err(ValidationError::ExistingPathError(index_path.to_string_lossy().to_string()))?;
-        };
+        }
+        let index_layout = IndexLayout::new(index_path)?;
+        create_dir_all(&index_layout.data_path())
+            .await
+            .map_err(|e| Error::IOError((e, Some(index_layout.data_path.clone()))))?;
+        Ok(index_layout)
+    }
+    /// Open and validates layout
+    pub async fn open(index_path: &Path) -> SummaResult<IndexLayout> {
+        if !index_path.exists() {
+            Err(ValidationError::MissingPathError(index_path.to_string_lossy().to_string()))?;
+        }
+        IndexLayout::new(index_path)
+    }
+
+    /// Create layout
+    fn new(index_path: &Path) -> SummaResult<IndexLayout> {
         let data_path = index_path.join("data");
         let index_config_path = index_path.join("index.yaml");
-        create_dir_all(&data_path).await.map_err(|e| Error::IOError((e, Some(data_path.clone()))))?;
         Ok(IndexLayout { data_path, index_config_path })
     }
     /// Directory for storing binary index data

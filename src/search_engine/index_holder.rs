@@ -6,17 +6,15 @@ use crate::configs::{IndexConfig, IndexConfigHolder};
 use crate::consumers::kafka::KafkaConsumer;
 use crate::errors::{Error, SummaResult};
 use crate::proto;
+use crate::search_engine::index_layout::IndexLayout;
 use crate::search_engine::IndexUpdater;
+use crate::utils::sync::{Handler, OwningHandler};
 use crate::utils::thread_handler::ThreadHandler;
 use parking_lot::RwLock;
-
-use std::sync::Arc;
 use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::Schema;
-
-use crate::search_engine::index_layout::IndexLayout;
 use tantivy::{Index, IndexReader, IndexSettings, LeasedItem, Searcher};
 use tokio::sync::oneshot;
 use tokio::time;
@@ -29,7 +27,8 @@ pub struct IndexHolder {
     index: Index,
     index_config: IndexConfigHolder,
     index_reader: IndexReader,
-    index_updater: Arc<RwLock<IndexUpdater>>,
+    /// All modifying operations are isolated inside `index_updater`
+    index_updater: OwningHandler<RwLock<IndexUpdater>>,
     autocommit_thread: Option<ThreadHandler>,
 }
 
@@ -65,13 +64,13 @@ impl IndexHolder {
 
         let mut index_updater = IndexUpdater::new(index_writer_holder);
         index_updater.add_consumers(consumers)?;
-        let index_updater = Arc::new(RwLock::new(index_updater));
+        let index_updater = OwningHandler::new(RwLock::new(index_updater));
 
         let autocommit_interval_ms = index_config.autocommit_interval_ms;
 
         let autocommit_thread = match autocommit_interval_ms {
             Some(interval_ms) => {
-                let index_updater = index_updater.clone();
+                let index_updater = index_updater.handler().clone();
                 let (shutdown_trigger, shutdown_tripwire) = oneshot::channel();
                 Some(ThreadHandler::new(
                     tokio::spawn(async move {
@@ -114,7 +113,8 @@ impl IndexHolder {
         if let Some(autocommit_thread) = self.autocommit_thread {
             autocommit_thread.stop().await?;
         }
-        self.index_updater.write().commit(false).await?;
+        let mut index_updater = self.index_updater.into_inner().into_inner();
+        index_updater.commit(false).await?;
         Ok(())
     }
 
@@ -138,8 +138,8 @@ impl IndexHolder {
         self.index_reader.searcher()
     }
 
-    pub(crate) fn index_updater(&self) -> &Arc<RwLock<IndexUpdater>> {
-        &self.index_updater
+    pub(crate) fn index_updater(&self) -> Handler<RwLock<IndexUpdater>> {
+        self.index_updater.handler()
     }
 
     #[instrument(skip(self))]
