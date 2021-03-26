@@ -18,7 +18,9 @@ message CreateConsumerRequest {
   repeated string topics = 5;
   uint32 threads = 6;
 }
-message CreateConsumerResponse {}
+message CreateConsumerResponse {
+  Consumer consumer = 1;
+}
 message DeleteConsumerRequest {
   string consumer_name = 1;
 }

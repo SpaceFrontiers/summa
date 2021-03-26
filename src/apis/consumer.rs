@@ -25,8 +25,12 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     async fn create_consumer(&self, proto_request: Request<proto::CreateConsumerRequest>) -> Result<Response<proto::CreateConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let create_consumer_request = CreateConsumerRequest::from_proto(&proto_request)?;
+        let index_name = create_consumer_request.index_name.clone();
+        let consumer_name = create_consumer_request.consumer_name.clone();
         self.index_service.create_consumer(create_consumer_request).await?;
-        let response = proto::CreateConsumerResponse {};
+        let response = proto::CreateConsumerResponse {
+            consumer: Some(proto::Consumer { consumer_name, index_name }),
+        };
         Ok(Response::new(response))
     }
 

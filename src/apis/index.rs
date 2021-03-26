@@ -39,21 +39,28 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn index_document(&self, request: Request<proto::IndexDocumentRequest>) -> Result<Response<proto::IndexDocumentResponse>, Status> {
         let request = request.into_inner();
-        self.index_service
+        let opstamp = self
+            .index_service
             .get_index_holder(&request.index_name)?
             .index_updater()
             .read()
             .index_document(&request.document, request.reindex)
             .await?;
-        let response = proto::IndexDocumentResponse {};
+        let response = proto::IndexDocumentResponse { opstamp };
         Ok(Response::new(response))
     }
 
     async fn create_index(&self, proto_request: Request<proto::CreateIndexRequest>) -> Result<Response<proto::CreateIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let create_index_request = CreateIndexRequest::from_proto(&proto_request)?;
+        let index_name = create_index_request.index_name.clone();
         self.index_service.create_index(create_index_request).await?;
-        let response = proto::CreateIndexResponse {};
+        let response = proto::CreateIndexResponse {
+            index: Some(proto::Index {
+                index_aliases: vec![],
+                index_name,
+            }),
+        };
         Ok(Response::new(response))
     }
 

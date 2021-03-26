@@ -6,6 +6,7 @@ use crate::proto;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::sync::Arc;
+use tantivy::Opstamp;
 
 /// Index updating through Kafka consumers and via direct invocation
 #[derive(Debug)]
@@ -85,7 +86,7 @@ impl IndexUpdater {
         Ok(())
     }
 
-    pub(crate) async fn index_document(&self, document: &[u8], reindex: bool) -> SummaResult<()> {
+    pub(crate) async fn index_document(&self, document: &[u8], reindex: bool) -> SummaResult<Opstamp> {
         self.index_writer_holder.index_document(document, reindex)
     }
 

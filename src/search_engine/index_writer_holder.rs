@@ -2,7 +2,7 @@ use crate::configurator::configs::IndexConfigHolder;
 use crate::errors::{Error, SummaResult};
 use std::str::from_utf8;
 use tantivy::schema::{Field, Schema};
-use tantivy::{Index, IndexWriter, Term};
+use tantivy::{Index, IndexWriter, Opstamp, Term};
 use tracing::info;
 
 /// Managing write operations to index
@@ -30,7 +30,7 @@ impl IndexWriterHolder {
         &self.schema
     }
 
-    pub fn index_document(&self, raw_document: &[u8], reindex: bool) -> SummaResult<()> {
+    pub fn index_document(&self, raw_document: &[u8], reindex: bool) -> SummaResult<Opstamp> {
         let text_document = from_utf8(raw_document).map_err(|e| Error::Utf8Error(e))?;
         let tantivy_document = self.schema().parse_document(text_document).map_err(|e| Error::ParseError(e))?;
         if reindex {
@@ -39,8 +39,7 @@ impl IndexWriterHolder {
                     .delete_term(Term::from_field_i64(primary_key, tantivy_document.get_first(primary_key).unwrap().as_i64().unwrap()));
             }
         }
-        self.index_writer.add_document(tantivy_document)?;
-        Ok(())
+        Ok(self.index_writer.add_document(tantivy_document)?)
     }
 
     pub fn commit(&mut self) -> SummaResult<()> {
