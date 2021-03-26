@@ -94,5 +94,5 @@ mod services;
 mod utils;
 
 pub mod proto {
-    tonic::include_proto!("summa");
+    tonic::include_proto!("summa.proto");
 }

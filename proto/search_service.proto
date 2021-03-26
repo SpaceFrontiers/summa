@@ -1,5 +1,5 @@
 syntax = "proto3";
-package summa;
+package summa.proto;
 
 service SearchApi {
   rpc search (SearchRequest) returns (SearchResponse) {}

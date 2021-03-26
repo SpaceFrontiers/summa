@@ -1,5 +1,5 @@
 syntax = "proto3";
-package summa;
+package summa.proto;
 
 message Index {
   string index_name = 1;
