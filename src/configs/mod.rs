@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tantivy::schema::Field;
+use tantivy::IndexSortByField;
 use textwrap::indent;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,12 +63,13 @@ impl Default for MetricsConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct IndexConfig {
     pub autocommit_interval_ms: Option<u64>,
     pub compression: tantivy::store::Compressor,
     pub default_fields: Vec<Field>,
     pub primary_key: Option<Field>,
+    pub sort_by_field: Option<IndexSortByField>,
     pub writer_heap_size_bytes: u64,
     pub writer_threads: u64,
 }
@@ -111,6 +113,12 @@ pub struct RuntimeConfig {
 impl std::fmt::Display for ApplicationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}\n{}", "Summa Config:".green().bold(), indent(&serde_yaml::to_string(&self).unwrap(), "  "),)
+    }
+}
+
+impl std::fmt::Debug for IndexConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", &serde_yaml::to_string(&self).unwrap())
     }
 }
 

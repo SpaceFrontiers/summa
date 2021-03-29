@@ -21,8 +21,12 @@ struct Application {
 const LONG_ABOUT: &str = "
 Fast full-text search server with following features:
 
-- Simple GRPC API
-- Indexing documents through Kafka";
+- Simple GRPC API for managing multiple indices and for search
+- Indexing documents through Kafka or directly
+- Tracing with OpenTelemetry and exposing metrics in Prometheus format
+- Various configurable tokenizers (including CJK)
+- Fine CLI and asynchronous client library written in Python
+";
 
 impl Application {
     pub fn new(configurator: GlobalConfig) -> SummaResult<Application> {

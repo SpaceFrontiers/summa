@@ -12,7 +12,7 @@ async def client_cli(endpoint):
         await client.start_and_wait()
         return client.get_interface()
     except asyncio.exceptions.TimeoutError:
-        # ToDo: process exception through fire.core.FiteError
+        # ToDo: process exception through fire.core.FireError
         print(traceback.format_exc())
         sys.exit(1)
 

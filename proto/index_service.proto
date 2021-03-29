@@ -19,6 +19,14 @@ message CommitIndexRequest {
 }
 message CommitIndexResponse {}
 
+enum Order {
+  Asc = 0;
+  Desc = 1;
+}
+message SortByField {
+  string field = 1;
+  Order order = 2;
+}
 message CreateIndexRequest {
   string index_name = 1;
   string schema = 2;
@@ -28,6 +36,7 @@ message CreateIndexRequest {
   optional uint64 writer_heap_size_bytes = 6;
   optional uint64 writer_threads = 7;
   optional uint64 autocommit_interval_ms = 8;
+  optional SortByField sort_by_field = 9;
 }
 message CreateIndexResponse {
   Index index = 1;

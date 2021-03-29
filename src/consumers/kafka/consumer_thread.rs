@@ -53,16 +53,23 @@ impl KafkaConsumerThreadController {
                 let counter = meter.u64_counter("consume").with_description("Number of consumed events").init();
                 let mut message_stream = stream.take_until(shutdown_tripwire);
                 info!(action = "started");
-                while let Some(message) = message_stream.next().await {
-                    match processor(message) {
-                        Ok(_) => counter.add(1, &[KeyValue::new("status", "ok"), KeyValue::new("thread_name", thread_name.clone())]),
-                        Err(error) => {
-                            warn!(action = "error", error = ?error);
-                            counter.add(1, &[KeyValue::new("status", "error"), KeyValue::new("thread_name", thread_name.clone())]);
+                loop {
+                    match message_stream.next().await {
+                        Some(message) => {
+                            match processor(message) {
+                                Ok(_) => counter.add(1, &[KeyValue::new("status", "ok"), KeyValue::new("thread_name", thread_name.clone())]),
+                                Err(error) => {
+                                    warn!(action = "error", error = ?error);
+                                    counter.add(1, &[KeyValue::new("status", "error"), KeyValue::new("thread_name", thread_name.clone())]);
+                                }
+                            };
                         }
-                    };
+                        None => {
+                            info!(action = "stopped");
+                            break;
+                        }
+                    }
                 }
-                info!(action = "stopped");
                 Ok(())
             }
         }

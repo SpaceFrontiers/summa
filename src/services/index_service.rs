@@ -143,7 +143,7 @@ impl IndexService {
             Err(ValidationError::ExistingConsumerError(create_consumer_request.consumer_name.to_string()))?
         };
         let kafka_consumer = KafkaConsumer::new(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config).await?;
-        index_holder.index_updater().write().add_consumer(kafka_consumer)?;
+        index_holder.index_updater().add_consumer(kafka_consumer)?;
         self.consumer_registry
             .insert_consumer_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?;
         Ok(())
@@ -154,7 +154,7 @@ impl IndexService {
         let index_name = self.consumer_registry.get_consumer_config(&delete_consumer_request.consumer_name)?.index_name;
         let index_holder = self.get_index_holder(&index_name)?;
         self.consumer_registry.delete_consumer_config(&delete_consumer_request.consumer_name)?;
-        index_holder.index_updater().write().delete_consumer(&delete_consumer_request.consumer_name).await?;
+        index_holder.index_updater().delete_consumer(&delete_consumer_request.consumer_name).await?;
         Ok(())
     }
 

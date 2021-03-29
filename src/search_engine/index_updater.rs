@@ -3,14 +3,21 @@ use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus}
 use crate::consumers::kafka::KafkaConsumer;
 use crate::errors::{Error, SummaResult};
 use crate::proto;
+use parking_lot::RwLock;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::sync::Arc;
 use tantivy::Opstamp;
+use tracing::warn;
 
 /// Index updating through Kafka consumers and via direct invocation
 #[derive(Debug)]
 pub(crate) struct IndexUpdater {
+    inner: RwLock<InnerIndexUpdater>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InnerIndexUpdater {
     consumers: Vec<KafkaConsumer>,
     index_writer_holder: Arc<IndexWriterHolder>,
 }
@@ -30,16 +37,7 @@ fn process_message(index_writer_holder: &IndexWriterHolder, message: Result<Borr
     }
 }
 
-impl IndexUpdater {
-    pub(crate) fn new(index_writer_holder: IndexWriterHolder) -> IndexUpdater {
-        let index_writer_holder = Arc::new(index_writer_holder);
-        let index_updater = IndexUpdater {
-            consumers: Vec::new(),
-            index_writer_holder,
-        };
-        index_updater
-    }
-
+impl InnerIndexUpdater {
     async fn stop_consumers(&mut self) -> SummaResult<()> {
         for consumer in &self.consumers {
             consumer.stop().await?;
@@ -69,13 +67,6 @@ impl IndexUpdater {
         Ok(())
     }
 
-    pub(crate) fn add_consumers(&mut self, mut consumers: Vec<KafkaConsumer>) -> SummaResult<()> {
-        for consumer in consumers.drain(..) {
-            self.add_consumer(consumer)?;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn delete_consumer(&mut self, consumer_name: &str) -> SummaResult<()> {
         self.commit(false).await?;
 
@@ -99,5 +90,59 @@ impl IndexUpdater {
             self.start_consumers().await?;
         }
         Ok(())
+    }
+}
+
+impl IndexUpdater {
+    pub(crate) fn new(index_writer_holder: IndexWriterHolder) -> IndexUpdater {
+        let index_writer_holder = Arc::new(index_writer_holder);
+        let index_updater = IndexUpdater {
+            inner: RwLock::new(InnerIndexUpdater {
+                consumers: Vec::new(),
+                index_writer_holder,
+            }),
+        };
+        index_updater
+    }
+
+    pub(crate) fn add_consumer(&self, consumer: KafkaConsumer) -> SummaResult<()> {
+        self.inner.write().add_consumer(consumer)
+    }
+
+    pub(crate) fn add_consumers(&self, mut consumers: Vec<KafkaConsumer>) -> SummaResult<()> {
+        let mut inner_index_updater = self.inner.write();
+        for consumer in consumers.drain(..) {
+            inner_index_updater.add_consumer(consumer)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn delete_consumer(&self, consumer_name: &str) -> SummaResult<()> {
+        self.inner.write().delete_consumer(consumer_name).await
+    }
+
+    pub(crate) async fn index_document(&self, document: &[u8], reindex: bool) -> SummaResult<Opstamp> {
+        self.inner.read().index_document(document, reindex).await
+    }
+
+    pub async fn try_commit(&self, restart_consumers: bool) -> Option<SummaResult<()>> {
+        match self.inner.try_write() {
+            Some(mut inner_index_updater) => Some(inner_index_updater.commit(restart_consumers).await),
+            None => None,
+        }
+    }
+
+    pub async fn try_commit_and_log(&self, restart_consumers: bool) {
+        match self.try_commit(restart_consumers).await {
+            Some(result) => match result {
+                Ok(_) => (),
+                Err(error) => warn!(action = "commit", error = ?error),
+            },
+            None => warn!(error = "index_updater_busy"),
+        };
+    }
+
+    pub async fn last_commit(self) -> SummaResult<()> {
+        self.inner.into_inner().commit(false).await
     }
 }

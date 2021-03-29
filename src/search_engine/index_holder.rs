@@ -10,7 +10,6 @@ use crate::search_engine::index_layout::IndexLayout;
 use crate::search_engine::IndexUpdater;
 use crate::utils::sync::{Handler, OwningHandler};
 use crate::utils::thread_handler::ThreadHandler;
-use parking_lot::RwLock;
 use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -28,7 +27,7 @@ pub struct IndexHolder {
     index_config: IndexConfigHolder,
     index_reader: IndexReader,
     /// All modifying operations are isolated inside `index_updater`
-    index_updater: OwningHandler<RwLock<IndexUpdater>>,
+    index_updater: OwningHandler<IndexUpdater>,
     autocommit_thread: Option<ThreadHandler>,
 }
 
@@ -44,7 +43,7 @@ impl IndexHolder {
         index_config_holder.save()?;
         let settings = IndexSettings {
             docstore_compression: index_config.compression,
-            ..Default::default()
+            sort_by_field: index_config.sort_by_field,
         };
         Index::builder().schema(schema.clone()).settings(settings).create_in_dir(index_layout.data_path())?;
         Ok(())
@@ -62,9 +61,9 @@ impl IndexHolder {
         let index_reader = index.reader()?;
         let index_writer_holder = IndexWriterHolder::new(index_name, &index, &index_config)?;
 
-        let mut index_updater = IndexUpdater::new(index_writer_holder);
+        let index_updater = IndexUpdater::new(index_writer_holder);
         index_updater.add_consumers(consumers)?;
-        let index_updater = OwningHandler::new(RwLock::new(index_updater));
+        let index_updater = OwningHandler::new(index_updater);
 
         let autocommit_interval_ms = index_config.autocommit_interval_ms;
 
@@ -78,9 +77,7 @@ impl IndexHolder {
                             let mut interval = time::interval(Duration::from_millis(interval_ms));
                             loop {
                                 interval.tick().await;
-                                if let Err(error) = index_updater.write().commit(true).await {
-                                    warn!(error = ?error)
-                                }
+                                index_updater.try_commit_and_log(true).await;
                             }
                         };
                         tokio::select! {
@@ -113,8 +110,7 @@ impl IndexHolder {
         if let Some(autocommit_thread) = self.autocommit_thread {
             autocommit_thread.stop().await?;
         }
-        let mut index_updater = self.index_updater.into_inner().into_inner();
-        index_updater.commit(false).await?;
+        self.index_updater.into_inner().last_commit().await?;
         Ok(())
     }
 
@@ -138,7 +134,7 @@ impl IndexHolder {
         self.index_reader.searcher()
     }
 
-    pub(crate) fn index_updater(&self) -> Handler<RwLock<IndexUpdater>> {
+    pub(crate) fn index_updater(&self) -> Handler<IndexUpdater> {
         self.index_updater.handler()
     }
 

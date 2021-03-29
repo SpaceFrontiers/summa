@@ -29,10 +29,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn commit_index(&self, request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let request = request.into_inner();
         let index_updater = self.index_service.get_index_holder(&request.index_name)?.index_updater();
-        tokio::spawn(async move {
-            let mut index_updater = index_updater.write();
-            index_updater.commit(true).await.unwrap();
-        });
+        tokio::spawn(async move { index_updater.try_commit_and_log(true).await });
         let response = proto::CommitIndexResponse {};
         Ok(Response::new(response))
     }
@@ -43,7 +40,6 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .index_service
             .get_index_holder(&request.index_name)?
             .index_updater()
-            .read()
             .index_document(&request.document, request.reindex)
             .await?;
         let response = proto::IndexDocumentResponse { opstamp };

@@ -1,4 +1,5 @@
 use crate::configs::IndexConfig;
+use tantivy::{IndexSortByField, Order};
 
 use crate::errors::{SummaResult, ValidationError};
 use crate::proto;
@@ -22,6 +23,17 @@ impl CreateIndexRequest {
                 None => Err(ValidationError::MissingDefaultField(default_field_name.to_string()))?,
             }
         }
+
+        let sort_by_field = match proto_request.sort_by_field {
+            Some(ref sort_by_field) => Some(IndexSortByField {
+                field: sort_by_field.field.clone(),
+                order: match proto::Order::from_i32(sort_by_field.order) {
+                    Some(proto::Order::Asc) | None => Order::Asc,
+                    Some(proto::Order::Desc) => Order::Desc,
+                },
+            }),
+            None => None,
+        };
 
         let primary_key = if let Some(ref primary_key) = proto_request.primary_key {
             Some(
@@ -58,6 +70,7 @@ impl CreateIndexRequest {
             compression: tantivy::store::Compressor::Brotli,
             default_fields,
             primary_key,
+            sort_by_field,
             writer_heap_size_bytes,
             writer_threads,
         };
