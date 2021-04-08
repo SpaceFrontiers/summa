@@ -2,7 +2,7 @@ use super::consumer_thread::KafkaConsumerThreadController;
 use super::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::configs::KafkaConsumerConfig;
 use crate::errors::SummaResult;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::admin::{AdminClient, AdminOptions, AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::config::{ClientConfig, FromClientConfig};
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
@@ -86,19 +86,25 @@ impl KafkaConsumer {
     async fn create_topics(&self) -> SummaResult<()> {
         let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let admin_options = AdminOptions::new().operation_timeout(Some(Timeout::Never));
-        let topics: Vec<_> = self
+        let new_topics: Vec<_> = self
+            .config
+            .topics
+            .iter()
+            .map(|topic_name| NewTopic::new(topic_name.as_str(), self.config.threads.try_into().unwrap(), TopicReplication::Fixed(1)))
+            .collect();
+        let alter_topics: Vec<_> = self
             .config
             .topics
             .iter()
             .map(|topic_name| {
-                NewTopic::new(topic_name.as_str(), self.config.threads.try_into().unwrap(), TopicReplication::Fixed(1))
+                AlterConfig::new(ResourceSpecifier::Topic(topic_name.as_str()))
                     .set("retention.ms", "3600000")
                     .set("retention.bytes", "1073741824")
             })
             .collect();
-        info!(action = "create_topics", topics = ?topics);
-        admin_client.create_topics(&topics, &admin_options).await?;
-        admin_client.alter_configs(&topics, &admin_options).await?;
+        info!(action = "create_topics", topics = ?new_topics);
+        admin_client.create_topics(&new_topics, &admin_options).await?;
+        admin_client.alter_configs(&alter_topics, &admin_options).await?;
         Ok(())
     }
 
