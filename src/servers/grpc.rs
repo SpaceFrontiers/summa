@@ -34,13 +34,13 @@ pub struct GrpcServer {
 
 impl GrpcServer {
     fn on_request(request: &hyper::Request<hyper::Body>, _span: &Span) {
-        info!(target: "grpc", path = ?request.uri().path());
+        info!(path = ?request.uri().path());
     }
     fn on_response<T>(response: &hyper::Response<T>, duration: Duration, _span: &Span) {
-        info!(target: "grpc", duration = ?duration, status = ?response.status().as_u16());
+        info!(duration = ?duration, status = ?response.status().as_u16());
     }
     fn on_failure(error: GrpcFailureClass, duration: Duration, _span: &Span) {
-        warn!(target: "grpc", error = ?error, duration = ?duration);
+        warn!(error = ?error, duration = ?duration);
     }
     fn set_ids(mut request: Request<()>) -> Result<Request<()>, Status> {
         let metadata = request.metadata_mut();
@@ -57,7 +57,6 @@ impl GrpcServer {
 
     fn set_span(request: &hyper::Request<hyper::Body>) -> tracing::Span {
         info_span!(
-            target: "grpc",
             "request",
             request_id = ?request.headers().get("request-id").unwrap(),
             session_id = ?request.headers().get("session-id").unwrap(),
@@ -67,7 +66,7 @@ impl GrpcServer {
     /// New GRPC server
     pub async fn new(addr: SocketAddr, data_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>) -> SummaResult<GrpcServer> {
         let alias_service = AliasService::new(runtime_config);
-        let index_service = IndexService::new(data_path, runtime_config, &alias_service).await?;
+        let index_service = IndexService::new(data_path, &alias_service).await?;
         let _ = MetricsService::new(&index_service);
         Ok(GrpcServer {
             addr,
@@ -77,7 +76,7 @@ impl GrpcServer {
     }
 
     /// Starts all nested services and start serving requests
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn start(self) -> SummaResult<()> {
         let consumer_api = ConsumerApiImpl::new(&self.index_service)?;
         let index_api = IndexApiImpl::new(&self.alias_service, &self.index_service)?;
@@ -102,15 +101,15 @@ impl GrpcServer {
             .add_service(SearchApiServer::new(search_api));
 
         let rx = signal_channel();
-        info!(target: "grpc", action = "starting", addr = ?self.addr);
+        info!(action = "starting", addr = ?self.addr);
         router
             .serve_with_shutdown(self.addr, async move {
                 rx.map(drop).await;
-                info!(target: "grpc", action = "sigterm_received");
+                info!(action = "sigterm_received");
             })
             .await?;
         self.index_service.stop().await?;
-        info!(target: "grpc", action = "terminated");
+        info!(action = "terminated");
         Ok(())
     }
 }

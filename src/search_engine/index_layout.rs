@@ -1,7 +1,7 @@
 use crate::errors::{Error, SummaResult, ValidationError};
 use std::path::{Path, PathBuf};
 use tokio::fs::{create_dir_all, remove_dir_all};
-use tracing::info;
+use tracing::{info, instrument};
 
 /// Physical index layout on the disk
 #[derive(Clone, Debug)]
@@ -22,6 +22,7 @@ impl IndexLayout {
             .map_err(|e| Error::IOError((e, Some(index_layout.data_path.clone()))))?;
         Ok(index_layout)
     }
+
     /// Open and validates layout
     pub async fn open(index_path: &Path) -> SummaResult<IndexLayout> {
         if !index_path.exists() {
@@ -40,14 +41,17 @@ impl IndexLayout {
     pub fn data_path(&self) -> &Path {
         &self.data_path
     }
+
     /// Path for storing an index config
     pub fn config_filepath(&self) -> &Path {
         &self.index_config_path
     }
+
     /// Delete all directories
+    #[instrument]
     pub async fn delete(self) -> SummaResult<()> {
         let index_path = self.data_path.parent().unwrap();
-        info!(action = "delete_directory", index_path = ?index_path);
+        info!(action = "delete_directory");
         remove_dir_all(&index_path).await.map_err(|e| Error::IOError((e, Some(index_path.to_path_buf()))))
     }
 }

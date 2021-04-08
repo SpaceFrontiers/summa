@@ -1,4 +1,5 @@
 use crate::configs::IndexConfig;
+use std::collections::HashMap;
 use tantivy::{IndexSortByField, Order};
 
 use crate::errors::{SummaResult, ValidationError};
@@ -28,7 +29,7 @@ impl CreateIndexRequest {
             Some(ref sort_by_field) => Some(IndexSortByField {
                 field: sort_by_field.field.clone(),
                 order: match proto::Order::from_i32(sort_by_field.order) {
-                    Some(proto::Order::Asc) | None => Order::Asc,
+                    None | Some(proto::Order::Asc) => Order::Asc,
                     Some(proto::Order::Desc) => Order::Desc,
                 },
             }),
@@ -46,7 +47,7 @@ impl CreateIndexRequest {
         };
 
         let writer_threads = if let Some(writer_threads) = proto_request.writer_threads {
-            if writer_threads > 1 {
+            if writer_threads >= 1 {
                 writer_threads
             } else {
                 Err(ValidationError::InvalidThreadsNumberError(writer_threads))?
@@ -56,7 +57,7 @@ impl CreateIndexRequest {
         };
 
         let writer_heap_size_bytes = if let Some(writer_heap_size_bytes) = proto_request.writer_heap_size_bytes {
-            if writer_heap_size_bytes > 1 {
+            if writer_heap_size_bytes >= 1 {
                 writer_heap_size_bytes
             } else {
                 Err(ValidationError::InvalidThreadsNumberError(writer_threads))?
@@ -68,6 +69,7 @@ impl CreateIndexRequest {
         let index_config = IndexConfig {
             autocommit_interval_ms: proto_request.autocommit_interval_ms,
             compression: tantivy::store::Compressor::Brotli,
+            consumer_configs: HashMap::new(),
             default_fields,
             primary_key,
             sort_by_field,

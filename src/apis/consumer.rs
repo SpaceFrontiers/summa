@@ -36,11 +36,14 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
 
     async fn get_consumer(&self, proto_request: Request<proto::GetConsumerRequest>) -> Result<Response<proto::GetConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let consumer_config = self.index_service.consumer_registry().get_consumer_config(&proto_request.consumer_name)?;
+        self.index_service
+            .get_index_holder(&proto_request.index_name)?
+            .get_consumer_config(&proto_request.consumer_name)?;
+
         let response = proto::GetConsumerResponse {
             consumer: Some(proto::Consumer {
                 consumer_name: proto_request.consumer_name.to_string(),
-                index_name: consumer_config.index_name.to_string(),
+                index_name: proto_request.index_name.to_string(),
             }),
         };
         Ok(Response::new(response))
@@ -50,12 +53,11 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
         let response = proto::GetConsumersResponse {
             consumers: self
                 .index_service
-                .consumer_registry()
-                .consumer_configs()
+                .get_consumers()?
                 .iter()
-                .map(|(consumer_name, consumer_config)| proto::Consumer {
-                    consumer_name: consumer_name.to_string(),
-                    index_name: consumer_config.index_name.to_string(),
+                .map(|(index_name, consumer_name)| proto::Consumer {
+                    consumer_name: consumer_name.clone(),
+                    index_name: index_name.clone(),
                 })
                 .collect(),
         };

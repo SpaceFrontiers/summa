@@ -1,4 +1,4 @@
-use crate::errors::{BadRequestError, Error, SummaResult};
+use crate::errors::{Error, SummaResult, ValidationError};
 use config::{Config, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -56,7 +56,7 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> ConfigHolder<TConfig> {
                 config,
             })
         } else {
-            Err(Error::BadRequestError(BadRequestError::ExistingConfigError(config_filepath.to_path_buf())))
+            Err(Error::ValidationError(ValidationError::ExistingConfigError(config_filepath.to_path_buf())))
         }
     }
     pub fn get_config_filepath(&self) -> &Path {

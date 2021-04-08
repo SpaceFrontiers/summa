@@ -4,6 +4,7 @@ import os.path
 from typing import (
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -15,6 +16,10 @@ from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
 from summa.proto import search_service_pb2 as search_service_pb
 from summa.proto.consumer_service_pb2_grpc import ConsumerApiStub
+from summa.proto.index_service_pb2 import (  # noqa
+    Asc,
+    Desc,
+)
 from summa.proto.index_service_pb2_grpc import IndexApiStub
 from summa.proto.search_service_pb2_grpc import SearchApiStub
 
@@ -55,10 +60,10 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def create_consumer(
         self,
+        index_name: str,
         consumer_name: str,
         bootstrap_servers: List[str],
         group_id: str,
-        index_name: str,
         topics: List[str],
         threads: int = None,
         request_id: str = None,
@@ -69,10 +74,10 @@ class SummaClient(BaseGrpcClient):
         The newly created consumer starts immediately after creation
 
         Args:
+            index_name: index name
             consumer_name: consumer name that will be used for topic creation in Kafka too
             bootstrap_servers: list of bootstrap servers
             group_id: group_id for Kafka topic consumption
-            index_name: index name
             topics: list of topics
             threads: number of threads to read topics and number of partitions in Kafka topic
             request_id: request id
@@ -103,6 +108,7 @@ class SummaClient(BaseGrpcClient):
         autocommit_interval_ms: Optional[int] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        sort_by_field: Optional[Tuple] = None
     ) -> index_service_pb.CreateIndexResponse:
         """
         Create index
@@ -119,6 +125,7 @@ class SummaClient(BaseGrpcClient):
                 set by this parameter
             request_id: request id
             session_id: session id
+            sort_by_field: (field_name, order)
         """
         if os.path.exists(schema):
             with open(schema, 'r') as f:
@@ -133,6 +140,10 @@ class SummaClient(BaseGrpcClient):
                 writer_heap_size_bytes=writer_heap_size_bytes,
                 writer_threads=writer_threads,
                 autocommit_interval_ms=autocommit_interval_ms,
+                sort_by_field=index_service_pb.SortByField(
+                    field=sort_by_field[0],
+                    order=sort_by_field[1],
+                ) if sort_by_field else None
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
@@ -140,6 +151,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def delete_consumer(
         self,
+        index_name: str,
         consumer_name: str,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -148,12 +160,13 @@ class SummaClient(BaseGrpcClient):
         Delete consumer by consumer name
 
         Args:
+            index_name: index nam
             consumer_name: consumer name
             request_id: request id
             session_id: session id
         """
         return await self.stubs['consumer_api'].delete_consumer(
-            consumer_service_pb.DeleteConsumerRequest(consumer_name=consumer_name),
+            consumer_service_pb.DeleteConsumerRequest(index_name=index_name, consumer_name=consumer_name),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
@@ -264,11 +277,11 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
-    async def get_aliases(
+    async def get_indices_aliases(
         self,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> index_service_pb.GetIndexAliasesResponse:
+    ) -> index_service_pb.GetIndicesAliasesResponse:
         """
         Get all aliases for all indices
 
@@ -278,7 +291,7 @@ class SummaClient(BaseGrpcClient):
         Returns:
             Aliases list
         """
-        return await self.stubs['index_api'].get_aliases(
+        return await self.stubs['index_api'].get_indices_aliases(
             index_service_pb.GetIndexAliasesRequest(),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
@@ -361,7 +374,7 @@ class SummaClient(BaseGrpcClient):
             request_id: request id
             session_id: session id
         """
-        return await self.stubs['index_api'].set_alias(
+        return await self.stubs['index_api'].set_index_alias(
             index_service_pb.SetIndexAliasRequest(index_alias=index_alias, index_name=index_name),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )

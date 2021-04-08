@@ -1,4 +1,4 @@
-use crate::configs::IndexConfigHolder;
+use crate::configs::IndexConfig;
 use crate::errors::{Error, SummaResult};
 use std::str::from_utf8;
 use tantivy::schema::{Field, Schema};
@@ -14,9 +14,8 @@ pub(crate) struct IndexWriterHolder {
 }
 
 impl IndexWriterHolder {
-    pub fn new(index_name: &str, index: &Index, index_config: &IndexConfigHolder) -> SummaResult<IndexWriterHolder> {
+    pub fn new(index_name: &str, index: &Index, index_config: &IndexConfig) -> SummaResult<IndexWriterHolder> {
         let schema = index.schema();
-        let index_config = index_config;
         let index_writer = index.writer_with_num_threads(index_config.writer_threads.try_into().unwrap(), index_config.writer_heap_size_bytes.try_into().unwrap())?;
         Ok(IndexWriterHolder {
             index_writer,
@@ -42,11 +41,11 @@ impl IndexWriterHolder {
         Ok(self.index_writer.add_document(tantivy_document)?)
     }
 
-    pub fn commit(&mut self) -> SummaResult<()> {
+    pub fn commit(&mut self) -> SummaResult<Opstamp> {
         info!(action = "commit_index", index_name = ?self.index_name);
-        self.index_writer.commit()?;
+        let opstamp = self.index_writer.commit()?;
         info!(action = "commited_index", index_name = ?self.index_name);
-        Ok(())
+        Ok(opstamp)
     }
 }
 

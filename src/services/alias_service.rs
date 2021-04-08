@@ -20,13 +20,13 @@ impl AliasService {
     }
 
     /// All aliases
-    pub fn index_aliases(&self) -> MappedRwLockReadGuard<'_, HashMap<String, String>> {
+    pub fn indices_aliases(&self) -> MappedRwLockReadGuard<'_, HashMap<String, String>> {
         RwLockReadGuard::map(self.runtime_config.read(), |f| &f.aliases)
     }
 
     /// Copy aliases for the index
     pub fn get_index_aliases_for_index(&self, index_name: &str) -> Vec<String> {
-        self.index_aliases()
+        self.indices_aliases()
             .iter()
             .filter(|(_, v)| *v == index_name)
             .map(|(k, _)| k.clone())
@@ -35,7 +35,7 @@ impl AliasService {
 
     /// Find index by alias
     pub fn resolve_index_alias(&self, alias: &str) -> Option<String> {
-        self.index_aliases().get(alias).cloned()
+        self.indices_aliases().get(alias).cloned()
     }
 
     /// Set new alias for index

@@ -3,21 +3,13 @@ use std::path::PathBuf;
 use tracing::warn;
 
 #[derive(thiserror::Error, Debug)]
-pub enum BadRequestError {
+pub enum ValidationError {
     #[error("aliased_error: {0}")]
     AliasedError(String),
     #[error("existing_config_error: {0}")]
     ExistingConfigError(PathBuf),
     #[error("existing_consumers_error: {0}")]
     ExistingConsumersError(String),
-    #[error("not_found_error: {0}")]
-    NotFoundError(String),
-    #[error("utf8_error: {0}")]
-    Utf8Error(std::str::Utf8Error),
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum ValidationError {
     #[error("existing_consumer_error: {0}")]
     ExistingConsumerError(String),
     #[error("existing_path_error: {0}")]
@@ -26,12 +18,18 @@ pub enum ValidationError {
     InvalidMemoryError(u64),
     #[error("invalid_threads_number_error: {0}")]
     InvalidThreadsNumberError(u64),
+    #[error("missing_consumer_error: {0}")]
+    MissingConsumerError(String),
+    #[error("missing_index_error: {0}")]
+    MissingIndexError(String),
     #[error("missing_default_field_error: {0}")]
     MissingDefaultField(String),
     #[error("missing_path_error: {0}")]
     MissingPathError(String),
     #[error("missing_primary_key_error: {0:?}")]
     MissingPrimaryKeyError(Option<String>),
+    #[error("utf8_error: {0}")]
+    Utf8Error(std::str::Utf8Error),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -40,8 +38,6 @@ pub enum Error {
     AddrParseError(std::net::AddrParseError),
     #[error("arc_index_writer_holder_leaked_error")]
     ArcIndexWriterHolderLeakedError,
-    #[error("{0}")]
-    BadRequestError(BadRequestError),
     #[error("canceled_error")]
     CanceledError,
     #[error("config_error: {0}")]
@@ -84,12 +80,6 @@ impl From<ValidationError> for Error {
     }
 }
 
-impl From<BadRequestError> for Error {
-    fn from(error: BadRequestError) -> Self {
-        Error::BadRequestError(error)
-    }
-}
-
 impl From<config::ConfigError> for Error {
     fn from(error: config::ConfigError) -> Self {
         Error::ConfigError(error)
@@ -128,7 +118,7 @@ impl From<std::net::AddrParseError> for Error {
 
 impl From<std::str::Utf8Error> for Error {
     fn from(error: std::str::Utf8Error) -> Self {
-        Error::BadRequestError(BadRequestError::Utf8Error(error))
+        Error::ValidationError(ValidationError::Utf8Error(error))
     }
 }
 
@@ -166,8 +156,8 @@ impl From<Error> for tonic::Status {
                     _ => tonic::Code::Internal,
                 },
                 Error::TantivyError(_) => tonic::Code::InvalidArgument,
-                Error::BadRequestError(BadRequestError::NotFoundError(_)) => tonic::Code::NotFound,
-                Error::BadRequestError(_) => tonic::Code::InvalidArgument,
+                Error::ValidationError(ValidationError::MissingConsumerError(_)) | Error::ValidationError(ValidationError::MissingIndexError(_)) => tonic::Code::NotFound,
+                Error::ValidationError(_) => tonic::Code::InvalidArgument,
                 _ => tonic::Code::Internal,
             },
             format!("{}", error),

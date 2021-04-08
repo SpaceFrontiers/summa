@@ -67,6 +67,8 @@ impl Default for MetricsConfig {
 pub struct IndexConfig {
     pub autocommit_interval_ms: Option<u64>,
     pub compression: tantivy::store::Compressor,
+    #[serde(default = "HashMap::new")]
+    pub consumer_configs: HashMap<String, KafkaConsumerConfig>,
     pub default_fields: Vec<Field>,
     pub primary_key: Option<Field>,
     pub sort_by_field: Option<IndexSortByField>,
@@ -80,13 +82,12 @@ pub struct KafkaConsumerConfig {
     pub create_topics: bool,
     pub delete_topics: bool,
     pub group_id: String,
-    pub index_name: String,
     pub topics: Vec<String>,
     pub threads: u32,
 }
 
 impl KafkaConsumerConfig {
-    pub fn new(bootstrap_servers: &Vec<String>, group_id: &str, index_name: &str, mut threads: u32, topics: &Vec<String>) -> SummaResult<KafkaConsumerConfig> {
+    pub fn new(bootstrap_servers: &Vec<String>, group_id: &str, mut threads: u32, topics: &Vec<String>) -> SummaResult<KafkaConsumerConfig> {
         if threads == 0 {
             threads = 1;
         }
@@ -95,7 +96,6 @@ impl KafkaConsumerConfig {
             create_topics: true,
             delete_topics: true,
             group_id: group_id.to_string(),
-            index_name: index_name.to_string(),
             threads: threads.try_into().map_err(|_| Error::InvalidConfigError("`threads` must be u32 sized".to_string()))?,
             topics: topics.clone(),
         })
@@ -106,8 +106,6 @@ impl KafkaConsumerConfig {
 pub struct RuntimeConfig {
     #[serde(default = "HashMap::new")]
     pub aliases: HashMap<String, String>,
-    #[serde(default = "HashMap::new")]
-    pub consumer_configs: HashMap<String, KafkaConsumerConfig>,
 }
 
 impl std::fmt::Display for ApplicationConfig {

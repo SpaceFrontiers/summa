@@ -38,12 +38,11 @@ impl MetricsServer {
     }
     async fn serve_request(request: Request<Body>, state: Arc<AppState>) -> Result<Response<Body>, hyper::Error> {
         let _span = info_span!(
-            target: "metrics",
             "request",
             request_id = ?request.headers().get("request-id").unwrap_or(&EMPTY_HEADER_VALUE),
             session_id = ?request.headers().get("session-id").unwrap_or(&EMPTY_HEADER_VALUE),
         );
-        info!(target: "metrics", path = ?request.uri().path());
+        info!(path = ?request.uri().path());
         let response = match request.method() {
             &Method::GET => {
                 let mut buffer = vec![];
@@ -72,13 +71,13 @@ impl MetricsServer {
 
         let rx = signal_channel();
         let server = Server::bind(&self.addr).serve(service);
-        info!(target: "metrics", action = "starting", addr = ?self.addr);
+        info!(action = "starting", addr = ?self.addr);
         let graceful = server.with_graceful_shutdown(async {
             rx.await.ok();
-            info!(target: "metrics", action = "sigterm_received");
+            info!(action = "sigterm_received");
         });
         graceful.await?;
-        info!(target: "metrics", action = "terminated");
+        info!(action = "terminated");
         Ok(())
     }
 }

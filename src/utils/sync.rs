@@ -69,8 +69,9 @@ impl<T> OwningHandler<T> {
 
     /// Blocks until last strong references drops and return wrapped data afterwards
     pub fn into_inner(self) -> T {
-        let (receiver, mut handler) = self.destruct();
-        let mut data = unsafe { ManuallyDrop::take(&mut handler.data) };
+        let (receiver, handler) = self.destruct();
+        let mut data: Arc<T> = Arc::clone(&handler.data);
+        std::mem::drop(handler);
         loop {
             match Arc::try_unwrap(data) {
                 Ok(data) => return data,

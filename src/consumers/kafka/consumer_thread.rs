@@ -10,7 +10,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{info, instrument, trace_span, warn, Instrument};
+use tracing::{info, info_span, instrument, warn, Instrument};
 
 /// Long-living container for Kafka consuming thread
 #[derive(Clone)]
@@ -35,12 +35,12 @@ impl KafkaConsumerThreadController {
         }
     }
 
-    #[instrument(skip(self, processor))]
+    #[instrument(skip_all, fields(thread_name=?self.thread_name))]
     pub fn start<TProcessor>(&self, processor: TProcessor)
     where
         TProcessor: 'static + Fn(Result<BorrowedMessage<'_>, KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> + Send,
     {
-        info!(action = "start", thread_name = ?self.thread_name);
+        info!(action = "start");
         let (shutdown_trigger, shutdown_tripwire) = oneshot::channel();
 
         let stream_consumer = self.stream_consumer.clone();
@@ -73,13 +73,13 @@ impl KafkaConsumerThreadController {
                 Ok(())
             }
         }
-        .instrument(trace_span!(parent: None, "consumers", thread_name = ?self.thread_name));
+        .instrument(info_span!(parent: None, "consumer", thread_name = ?self.thread_name));
         *self.thread_handler.lock() = Some(ThreadHandler::new(tokio::spawn(stream_processor), shutdown_trigger));
     }
 
     #[instrument(skip(self))]
-    pub fn commit(&self) -> SummaResult<()> {
-        info!(action = "commit_offsets", thread_name = ?self.thread_name);
+    pub fn commit_offsets(&self) -> SummaResult<()> {
+        info!(action = "commit_consumer_state");
         let result = self.stream_consumer.lock().commit_consumer_state(CommitMode::Sync);
         match result {
             Err(rdkafka::error::KafkaError::ConsumerCommit(rdkafka::error::RDKafkaErrorCode::NoOffset)) => Ok(()),

@@ -7,17 +7,26 @@ service IndexApi {
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
   rpc create_index (CreateIndexRequest) returns (CreateIndexResponse) {}
   rpc delete_index (DeleteIndexRequest) returns (DeleteIndexResponse) {}
-  rpc get_index_aliases (GetIndexAliasesRequest) returns (GetIndexAliasesResponse) {}
+  rpc get_indices_aliases (GetIndicesAliasesRequest) returns (GetIndicesAliasesResponse) {}
   rpc get_index (GetIndexRequest) returns (GetIndexResponse) {}
   rpc get_indices (GetIndicesRequest) returns (GetIndicesResponse) {}
   rpc index_document (IndexDocumentRequest) returns (IndexDocumentResponse) {}
   rpc set_index_alias (SetIndexAliasRequest) returns (SetIndexAliasResponse) {}
 }
 
+enum CommitMode {
+  Async = 0;
+  Sync = 1;
+}
+
 message CommitIndexRequest {
   string index_name = 1;
+  CommitMode commit_mode = 2;
 }
-message CommitIndexResponse {}
+
+message CommitIndexResponse {
+  optional uint64 opstamp = 1;
+}
 
 enum Order {
   Asc = 0;
@@ -47,11 +56,10 @@ message DeleteIndexRequest {
 }
 message DeleteIndexResponse {
   repeated string deleted_index_aliases = 1;
-  repeated string deleted_consumer_names = 2;
 }
-message GetIndexAliasesRequest {}
-message GetIndexAliasesResponse {
-  map<string, string> index_aliases = 1;
+message GetIndicesAliasesRequest {}
+message GetIndicesAliasesResponse {
+  map<string, string> indices_aliases = 1;
 }
 message GetIndexRequest {
   string index_name = 1;
