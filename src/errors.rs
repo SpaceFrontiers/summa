@@ -1,4 +1,4 @@
-use std::convert::From;
+use std::convert::{From, Infallible};
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -6,6 +6,8 @@ use tracing::warn;
 pub enum ValidationError {
     #[error("aliased_error: {0}")]
     AliasedError(String),
+    #[error("empty_argument: {0}")]
+    EmptyArgument(String),
     #[error("existing_config_error: {0}")]
     ExistingConfigError(PathBuf),
     #[error("existing_consumers_error: {0}")]
@@ -13,7 +15,7 @@ pub enum ValidationError {
     #[error("existing_consumer_error: {0}")]
     ExistingConsumerError(String),
     #[error("existing_path_error: {0}")]
-    ExistingPathError(String),
+    ExistingPathError(PathBuf),
     #[error("invalid_memory_error: {0}")]
     InvalidMemoryError(u64),
     #[error("invalid_threads_number_error: {0}")]
@@ -44,6 +46,8 @@ pub enum Error {
     ConfigError(config::ConfigError),
     #[error("hyper_error: {0}")]
     HyperError(hyper::Error),
+    #[error("infallible")]
+    Infallible,
     #[error("internal_error")]
     InternalError,
     #[error("{0:?}")]
@@ -64,6 +68,8 @@ pub enum Error {
     TonicError(tonic::transport::Error),
     #[error("transition_state_error")]
     TransitionStateError,
+    #[error("unbound_document_error")]
+    UnboundDocumentError,
     #[error("unknown_directory_error: {0}")]
     UnknownDirectoryError(String),
     #[error("utf8_error: {0}")]
@@ -146,6 +152,12 @@ impl From<tonic::transport::Error> for Error {
     }
 }
 
+impl From<Infallible> for Error {
+    fn from(_: Infallible) -> Self {
+        Error::Infallible
+    }
+}
+
 impl From<Error> for tonic::Status {
     fn from(error: Error) -> Self {
         warn!(action = "error", error = ?error);
@@ -162,6 +174,12 @@ impl From<Error> for tonic::Status {
             },
             format!("{}", error),
         )
+    }
+}
+
+impl From<ValidationError> for tonic::Status {
+    fn from(error: ValidationError) -> Self {
+        tonic::Status::from(Error::ValidationError(error))
     }
 }
 

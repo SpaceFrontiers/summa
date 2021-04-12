@@ -358,6 +358,28 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
+    async def merge_segments(
+        self,
+        index_name: str,
+        segment_ids: List[str],
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.MergeSegmentsResponse:
+        """
+        Merge a list of segments into a single one
+
+        Args:
+            index_name: index name
+            segment_ids: segment ids
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].merge_segments(
+            index_service_pb.MergeSegmentsRequest(index_name=index_name, segment_ids=segment_ids),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
     async def set_index_alias(
         self,
         index_alias: str,
@@ -376,5 +398,25 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].set_index_alias(
             index_service_pb.SetIndexAliasRequest(index_alias=index_alias, index_name=index_name),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
+    async def vacuum_index(
+        self,
+        index_name: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.VacuumIndexResponse:
+        """
+        Vacuuming index
+
+        Args:
+            index_name: index name
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].vacuum_index(
+            index_service_pb.VacuumIndexRequest(index_name=index_name),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )

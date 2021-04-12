@@ -1,4 +1,4 @@
-use crate::configs::IndexConfig;
+use crate::configs::{IndexConfig, IndexEngine};
 use std::collections::HashMap;
 use tantivy::{IndexSortByField, Order};
 
@@ -21,9 +21,14 @@ impl CreateIndexRequest {
         for default_field_name in proto_request.default_fields.iter() {
             match schema.get_field(default_field_name) {
                 Some(default_field) => default_fields.push(default_field),
-                None => Err(ValidationError::MissingDefaultField(default_field_name.to_string()))?,
+                None => Err(ValidationError::MissingDefaultField(default_field_name.to_owned()))?,
             }
         }
+
+        let index_engine = match proto::IndexEngine::from_i32(proto_request.index_engine) {
+            None | Some(proto::IndexEngine::Memory) => IndexEngine::Memory(schema.clone()),
+            Some(proto::IndexEngine::File) => IndexEngine::File,
+        };
 
         let sort_by_field = match proto_request.sort_by_field {
             Some(ref sort_by_field) => Some(IndexSortByField {
@@ -40,7 +45,7 @@ impl CreateIndexRequest {
             Some(
                 schema
                     .get_field(primary_key)
-                    .ok_or_else(|| ValidationError::MissingPrimaryKeyError(Some(primary_key.to_string())))?,
+                    .ok_or_else(|| ValidationError::MissingPrimaryKeyError(Some(primary_key.to_owned())))?,
             )
         } else {
             None
@@ -71,13 +76,14 @@ impl CreateIndexRequest {
             compression: tantivy::store::Compressor::Brotli,
             consumer_configs: HashMap::new(),
             default_fields,
+            index_engine,
             primary_key,
             sort_by_field,
             writer_heap_size_bytes,
             writer_threads,
         };
         Ok(CreateIndexRequest {
-            index_name: proto_request.index_name.to_string(),
+            index_name: proto_request.index_name.to_owned(),
             index_config,
             schema,
         })

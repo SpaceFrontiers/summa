@@ -46,7 +46,7 @@ impl KafkaConsumer {
         let thread_controllers = thread_controllers?;
 
         Ok(KafkaConsumer {
-            consumer_name: consumer_name.to_string(),
+            consumer_name: consumer_name.to_owned(),
             config: config.clone(),
             kafka_producer_config,
             thread_controllers,

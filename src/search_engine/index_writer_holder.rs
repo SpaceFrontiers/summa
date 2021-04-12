@@ -1,56 +1,49 @@
-use crate::configs::IndexConfig;
-use crate::errors::{Error, SummaResult};
-use std::str::from_utf8;
-use tantivy::schema::{Field, Schema};
-use tantivy::{Index, IndexWriter, Opstamp, Term};
+use crate::errors::SummaResult;
+
+use tantivy::directory::GarbageCollectionResult;
+use tantivy::schema::Field;
+use tantivy::{Document, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
 use tracing::info;
 
 /// Managing write operations to index
 pub(crate) struct IndexWriterHolder {
     index_writer: IndexWriter,
-    index_name: String,
-    schema: Schema,
     primary_key: Option<Field>,
 }
 
 impl IndexWriterHolder {
-    pub fn new(index_name: &str, index: &Index, index_config: &IndexConfig) -> SummaResult<IndexWriterHolder> {
-        let schema = index.schema();
-        let index_writer = index.writer_with_num_threads(index_config.writer_threads.try_into().unwrap(), index_config.writer_heap_size_bytes.try_into().unwrap())?;
-        Ok(IndexWriterHolder {
-            index_writer,
-            index_name: index_name.to_string(),
-            schema,
-            primary_key: index_config.primary_key.clone(),
-        })
+    pub fn new(index_writer: IndexWriter, primary_key: Option<Field>) -> SummaResult<IndexWriterHolder> {
+        Ok(IndexWriterHolder { index_writer, primary_key })
     }
 
-    pub fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    pub fn index_document(&self, raw_document: &[u8], reindex: bool) -> SummaResult<Opstamp> {
-        let text_document = from_utf8(raw_document).map_err(|e| Error::Utf8Error(e))?;
-        let tantivy_document = self.schema().parse_document(text_document).map_err(|e| Error::ParseError(e))?;
+    pub fn index_document(&self, document: Document, reindex: bool) -> SummaResult<Opstamp> {
         if reindex {
             if let Some(primary_key) = self.primary_key {
                 self.index_writer
-                    .delete_term(Term::from_field_i64(primary_key, tantivy_document.get_first(primary_key).unwrap().as_i64().unwrap()));
+                    .delete_term(Term::from_field_i64(primary_key, document.get_first(primary_key).unwrap().as_i64().unwrap()));
             }
         }
-        Ok(self.index_writer.add_document(tantivy_document)?)
+        Ok(self.index_writer.add_document(document)?)
     }
 
-    pub fn commit(&mut self) -> SummaResult<Opstamp> {
-        info!(action = "commit_index", index_name = ?self.index_name);
-        let opstamp = self.index_writer.commit()?;
-        info!(action = "commited_index", index_name = ?self.index_name);
+    pub async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<SegmentMeta> {
+        info!(action = "merge_segments", segment_ids = ?segment_ids);
+        let segment_meta = self.index_writer.merge(segment_ids).await?;
+        info!(action = "merged_segments", segment_ids = ?segment_ids, merged_segment_meta = ?segment_meta);
+        Ok(segment_meta)
+    }
+
+    pub async fn commit(&mut self) -> SummaResult<Opstamp> {
+        info!(action = "commit_index");
+        let opstamp = self.index_writer.prepare_commit()?.commit_async().await?;
+        info!(action = "committed_index");
         Ok(opstamp)
     }
-}
 
-impl std::fmt::Debug for IndexWriterHolder {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self.index_name)
+    pub async fn garbage_collect_files(&self) -> SummaResult<GarbageCollectionResult> {
+        info!(action = "garbage_collect_files");
+        let result = self.index_writer.garbage_collect_files().await?;
+        info!(action = "garbage_collected_files", deleted_files = ?result.deleted_files);
+        Ok(result)
     }
 }

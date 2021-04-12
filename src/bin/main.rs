@@ -8,6 +8,7 @@ use summa::configs::GlobalConfig;
 use summa::errors::SummaResult;
 use summa::servers::GrpcServer;
 use summa::servers::MetricsServer;
+use summa::services::{IndexService, MetricsService};
 use tokio::runtime;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::fmt;
@@ -46,11 +47,13 @@ impl Application {
 
     pub fn run(&self) -> SummaResult<()> {
         let rt = self.create_runtime()?;
+        let application_config = self.configurator.application_config.clone();
         rt.block_on(async {
-            let application_config = self.configurator.application_config.read();
-            let metrics_server = MetricsServer::new(application_config.metrics.endpoint.parse()?)?;
-            let grpc_server = GrpcServer::new(application_config.grpc.endpoint.parse()?, &application_config.data_path, &self.configurator.runtime_config).await?;
-            drop(application_config);
+            let index_service = IndexService::new(&application_config).await?;
+
+            let metrics_server = MetricsServer::new(&self.configurator.application_config)?;
+            let _ = MetricsService::new(&index_service);
+            let grpc_server = GrpcServer::new(&self.configurator.application_config, &index_service).await?;
 
             try_join!(metrics_server.start(), grpc_server.start())?;
             Ok(())
@@ -73,7 +76,7 @@ pub fn setup_tracing(log_path: &PathBuf, debug: bool) -> Vec<WorkerGuard> {
 
     let filter_layer_request = EnvFilter::new("summa::servers::grpc[request]=info,summa::servers::metrics[request]=info");
     let filter_layer_query = EnvFilter::new("query");
-    let filter_layer_summa = EnvFilter::new("summa::services=info,summa::search_engine=info,summa::consumers=info");
+    let filter_layer_summa = EnvFilter::new("summa::services=info,summa::search_engine=info,summa::servers[lifecycle]=info,summa::consumers=info");
 
     if debug {
         let default_layer = fmt::layer().with_level(true).with_target(true).with_thread_names(true).with_filter(filter_layer_summa);
@@ -91,7 +94,7 @@ pub fn setup_tracing(log_path: &PathBuf, debug: bool) -> Vec<WorkerGuard> {
             .with_filter(filter_layer_query);
         let default_layer = fmt::layer()
             .with_thread_names(false)
-            .with_target(false)
+            .with_target(true)
             .with_level(true)
             .with_writer(file_writer_summa)
             .with_filter(filter_layer_summa);
@@ -123,16 +126,17 @@ fn main() -> SummaResult<()> {
     let matches = proceed_args();
     match matches.subcommand() {
         Some(("generate-config", _)) => {
-            let default_config = ApplicationConfig::default();
+            let default_config = ApplicationConfig::new("data");
             println!("{}", serde_yaml::to_string(&default_config).unwrap());
             Ok(())
         }
         Some(("serve", submatches)) => {
             let config_path = submatches.value_of("CONFIG").map(Path::new).unwrap();
             let configurator = GlobalConfig::new(config_path)?;
-            let application_config = configurator.application_config.read();
-            let _log_guard = setup_tracing(&application_config.log_path, application_config.debug);
-            drop(application_config);
+            let _log_guard = {
+                let application_config = configurator.application_config.read();
+                setup_tracing(&application_config.log_path, application_config.debug)
+            };
             let app = Application::new(configurator)?;
             app.run()
         }

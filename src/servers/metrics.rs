@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaResult;
 use crate::utils::signal_channel::signal_channel;
 use hyper::{
@@ -30,10 +31,10 @@ struct AppState {
 }
 
 impl MetricsServer {
-    pub fn new(addr: SocketAddr) -> SummaResult<MetricsServer> {
+    pub fn new(application_config: &ApplicationConfigHolder) -> SummaResult<MetricsServer> {
+        let addr: SocketAddr = application_config.read().metrics.endpoint.parse()?;
         let exporter = opentelemetry_prometheus::exporter().with_host(addr.ip().to_string()).with_port(addr.port()).init();
         global::meter("summa");
-
         Ok(MetricsServer { addr, exporter })
     }
     async fn serve_request(request: Request<Body>, state: Arc<AppState>) -> Result<Response<Body>, hyper::Error> {
@@ -49,7 +50,6 @@ impl MetricsServer {
                 let encoder = TextEncoder::new();
                 let metric_families = state.exporter.registry().gather();
                 encoder.encode(&metric_families[..], &mut buffer).unwrap();
-
                 Response::builder()
                     .status(200)
                     .header(CONTENT_TYPE, encoder.format_type())
@@ -61,7 +61,7 @@ impl MetricsServer {
         Ok(response)
     }
 
-    #[instrument(skip(self))]
+    #[instrument("lifecycle", skip(self))]
     pub async fn start(&self) -> SummaResult<()> {
         let state = Arc::new(AppState { exporter: self.exporter.clone() });
         let service = make_service_fn(move |_conn| {

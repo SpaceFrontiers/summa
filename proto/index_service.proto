@@ -11,7 +11,9 @@ service IndexApi {
   rpc get_index (GetIndexRequest) returns (GetIndexResponse) {}
   rpc get_indices (GetIndicesRequest) returns (GetIndicesResponse) {}
   rpc index_document (IndexDocumentRequest) returns (IndexDocumentResponse) {}
+  rpc merge_segments (MergeSegmentsRequest) returns (MergeSegmentsResponse) {}
   rpc set_index_alias (SetIndexAliasRequest) returns (SetIndexAliasResponse) {}
+  rpc vacuum_index (VacuumIndexRequest) returns (VacuumIndexResponse) {}
 }
 
 enum CommitMode {
@@ -39,6 +41,7 @@ message SortByField {
 message CreateIndexRequest {
   string index_name = 1;
   string schema = 2;
+  IndexEngine index_engine = 10;
   optional string primary_key = 3;
   repeated string default_fields = 4;
   optional string compression = 5;
@@ -79,10 +82,21 @@ message IndexDocumentRequest {
 message IndexDocumentResponse {
   uint64 opstamp = 1;
 }
+message MergeSegmentsRequest {
+  string index_name = 1;
+  repeated string segment_ids = 2;
+}
+message MergeSegmentsResponse {}
 message SetIndexAliasRequest {
   string index_alias = 1;
   string index_name = 2;
 }
 message SetIndexAliasResponse {
   optional string old_index_name = 1;
+}
+message VacuumIndexRequest {
+  string index_name = 1;
+}
+message VacuumIndexResponse {
+  repeated string deleted_files = 1;
 }

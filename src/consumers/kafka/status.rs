@@ -12,6 +12,8 @@ pub enum KafkaConsumingError {
     IndexError(crate::errors::Error),
     #[error("kafka_error: {0}")]
     KafkaError(rdkafka::error::KafkaError),
+    #[error("parse_document_error: {0}")]
+    ParseDocumentError(crate::errors::Error),
     #[error("proto_decode_error: {0}")]
     ProtoDecodeError(prost::DecodeError),
 }

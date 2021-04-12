@@ -1,38 +1,47 @@
 use super::index_writer_holder::IndexWriterHolder;
-use crate::configs::{IndexConfigHolder, KafkaConsumerConfig};
+use crate::configs::{IndexConfig, KafkaConsumerConfig};
 use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::consumers::kafka::KafkaConsumer;
-use crate::errors::{Error, SummaResult, ValidationError};
+use crate::errors::{Error, SummaResult};
 use crate::proto;
+use crate::search_engine::SummaDocument;
 use parking_lot::RwLock;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
+
 use std::sync::Arc;
-use tantivy::Opstamp;
+use tantivy::directory::GarbageCollectionResult;
+use tantivy::schema::Schema;
+use tantivy::{Opstamp, SegmentId, SegmentMeta};
 use tracing::{instrument, warn};
 
 /// Index updating through Kafka consumers and via direct invocation
-#[derive(Debug)]
 pub(crate) struct IndexUpdater {
     inner: RwLock<InnerIndexUpdater>,
 }
 
-#[derive(Debug)]
 pub(crate) struct InnerIndexUpdater {
     consumers: Vec<KafkaConsumer>,
-    index_config: IndexConfigHolder,
     index_writer_holder: Arc<IndexWriterHolder>,
+    schema: Schema,
 }
 
-fn process_message(index_writer_holder: &IndexWriterHolder, message: Result<BorrowedMessage<'_>, rdkafka::error::KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
+fn process_message(
+    schema: &Schema,
+    index_writer_holder: &IndexWriterHolder,
+    message: Result<BorrowedMessage<'_>, rdkafka::error::KafkaError>,
+) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
     let message = message.map_err(|e| KafkaConsumingError::KafkaError(e))?;
     let payload = message.payload().ok_or(KafkaConsumingError::EmptyPayloadError)?;
     let proto_message: proto::IndexOperation = prost::Message::decode(payload).map_err(|e| KafkaConsumingError::ProtoDecodeError(e))?;
     let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperationError)?;
     match index_operation {
         proto::index_operation::Operation::IndexDocument(index_document_operation) => {
+            let parsed_document = SummaDocument::BoundJsonBytes((schema, &index_document_operation.document))
+                .try_into()
+                .map_err(|e| KafkaConsumingError::ParseDocumentError(e))?;
             index_writer_holder
-                .index_document(&index_document_operation.document, index_document_operation.reindex)
+                .index_document(parsed_document, index_document_operation.reindex)
                 .map_err(|e| KafkaConsumingError::IndexError(e))?;
             Ok(KafkaConsumingStatus::Consumed)
         }
@@ -40,7 +49,7 @@ fn process_message(index_writer_holder: &IndexWriterHolder, message: Result<Borr
 }
 
 impl InnerIndexUpdater {
-    pub fn new(index_config: IndexConfigHolder, index_writer_holder: IndexWriterHolder) -> SummaResult<InnerIndexUpdater> {
+    pub fn new(schema: &Schema, index_config: &IndexConfig, index_writer_holder: IndexWriterHolder) -> SummaResult<InnerIndexUpdater> {
         let index_writer_holder = Arc::new(index_writer_holder);
         let consumers = index_config
             .consumer_configs
@@ -50,8 +59,8 @@ impl InnerIndexUpdater {
             .collect();
         let mut inner_index_updater = InnerIndexUpdater {
             consumers,
-            index_config,
             index_writer_holder,
+            schema: schema.clone(),
         };
         inner_index_updater.start_consumers()?;
         Ok(inner_index_updater)
@@ -66,7 +75,8 @@ impl InnerIndexUpdater {
     fn start_consumers(&mut self) -> SummaResult<()> {
         for consumer in &self.consumers {
             let index_writer_holder = self.index_writer_holder.clone();
-            consumer.start(move |message| process_message(&index_writer_holder, message))?;
+            let schema = self.schema.clone();
+            consumer.start(move |message| process_message(&schema, &index_writer_holder, message))?;
         }
         Ok(())
     }
@@ -80,33 +90,26 @@ impl InnerIndexUpdater {
 
     pub(crate) fn attach_consumer(&mut self, consumer: KafkaConsumer) -> SummaResult<()> {
         let index_writer_holder = self.index_writer_holder.clone();
-        consumer.start(move |message| process_message(&index_writer_holder, message))?;
+        let schema = self.schema.clone();
+        consumer.start(move |message| process_message(&schema, &index_writer_holder, message))?;
         self.consumers.push(consumer);
         Ok(())
     }
 
     pub(crate) async fn create_consumer(&mut self, consumer_name: &str, consumer_config: KafkaConsumerConfig) -> SummaResult<()> {
-        if self.index_config.consumer_configs.contains_key(consumer_name) {
-            Err(ValidationError::ExistingConsumerError(consumer_name.to_string()))?
-        }
         let consumer = KafkaConsumer::new(consumer_name, &consumer_config)?;
         consumer.on_create().await?;
         self.attach_consumer(consumer)?;
-        self.index_config.autosave().consumer_configs.insert(consumer_name.to_string(), consumer_config);
         Ok(())
     }
 
     async fn inner_delete_consumer(&mut self, consumer_name: &str) -> SummaResult<()> {
-        self.index_config.autosave().consumer_configs.remove(consumer_name);
         let position = self.consumers.iter().position(|consumer| consumer.consumer_name() == consumer_name).unwrap();
         self.consumers.swap_remove(position).on_delete().await?;
         Ok(())
     }
 
     pub(crate) async fn delete_consumer(&mut self, consumer_name: &str) -> SummaResult<()> {
-        if !self.index_config.consumer_configs.contains_key(consumer_name) {
-            Err(ValidationError::MissingConsumerError(consumer_name.to_string()))?
-        }
         self.commit(false).await?;
         self.inner_delete_consumer(consumer_name).await?;
         self.start_consumers()?;
@@ -115,43 +118,55 @@ impl InnerIndexUpdater {
 
     pub(crate) async fn delete_all_consumers(&mut self) -> SummaResult<()> {
         self.commit(false).await?;
-        self.index_config.autosave().consumer_configs.clear();
         for consumer in self.consumers.drain(..) {
             consumer.on_delete().await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn index_document(&self, document: &[u8], reindex: bool) -> SummaResult<Opstamp> {
+    pub(crate) fn has_consumers(&self) -> bool {
+        self.consumers.len() > 0
+    }
+
+    pub(crate) fn index_document(&self, document: SummaDocument<'_>, reindex: bool) -> SummaResult<Opstamp> {
+        let document = document.bound_with(&self.schema).try_into()?;
         self.index_writer_holder.index_document(document, reindex)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
+    pub(crate) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<SegmentMeta> {
+        self.stop_consumers().await?;
+        let index_writer_holder = Arc::<IndexWriterHolder>::get_mut(&mut self.index_writer_holder).ok_or(Error::ArcIndexWriterHolderLeakedError)?;
+        let segment_meta = index_writer_holder.merge(segment_ids).await?;
+        index_writer_holder.commit().await?;
+        self.commit_offsets()?;
+        self.start_consumers()?;
+        Ok(segment_meta)
+    }
+
+    #[instrument(skip_all)]
     pub(crate) async fn commit(&mut self, restart_consumers: bool) -> SummaResult<Opstamp> {
         self.stop_consumers().await?;
         let index_writer_holder = Arc::<IndexWriterHolder>::get_mut(&mut self.index_writer_holder).ok_or(Error::ArcIndexWriterHolderLeakedError)?;
-        let opstamp = index_writer_holder.commit()?;
+        let opstamp = index_writer_holder.commit().await?;
         self.commit_offsets()?;
         if restart_consumers {
             self.start_consumers()?;
         }
         Ok(opstamp)
     }
+
+    #[instrument(skip_all)]
+    pub(crate) async fn vacuum(&self) -> SummaResult<GarbageCollectionResult> {
+        self.index_writer_holder.garbage_collect_files().await
+    }
 }
 
 impl IndexUpdater {
-    pub(crate) fn new(index_config: IndexConfigHolder, index_writer_holder: IndexWriterHolder) -> SummaResult<IndexUpdater> {
+    pub(crate) fn new(schema: &Schema, index_config: &IndexConfig, index_writer_holder: IndexWriterHolder) -> SummaResult<IndexUpdater> {
         Ok(IndexUpdater {
-            inner: RwLock::new(InnerIndexUpdater::new(index_config, index_writer_holder)?),
+            inner: RwLock::new(InnerIndexUpdater::new(schema, index_config, index_writer_holder)?),
         })
-    }
-
-    pub(crate) fn get_consumer_config(&self, consumer_name: &str) -> Option<KafkaConsumerConfig> {
-        self.inner.read().index_config.consumer_configs.get(consumer_name).map(|x| x.clone())
-    }
-
-    pub(crate) fn get_consumers_names(&self) -> Vec<String> {
-        self.inner.read().index_config.consumer_configs.keys().map(|x| x.clone()).collect()
     }
 
     pub(crate) async fn create_consumer(&self, consumer_name: &str, consumer_config: KafkaConsumerConfig) -> SummaResult<()> {
@@ -166,8 +181,12 @@ impl IndexUpdater {
         self.inner.write().delete_all_consumers().await
     }
 
-    pub(crate) async fn index_document(&self, document: &[u8], reindex: bool) -> SummaResult<Opstamp> {
-        self.inner.read().index_document(document, reindex).await
+    pub(crate) fn has_consumers(&self) -> bool {
+        self.inner.read().has_consumers()
+    }
+
+    pub(crate) fn index_document(&self, document: SummaDocument<'_>, reindex: bool) -> SummaResult<Opstamp> {
+        self.inner.read().index_document(document, reindex)
     }
 
     pub async fn try_commit(&self, restart_consumers: bool) -> Option<SummaResult<Opstamp>> {
@@ -191,6 +210,14 @@ impl IndexUpdater {
                 None
             }
         }
+    }
+
+    pub async fn vacuum(&self) -> SummaResult<GarbageCollectionResult> {
+        self.inner.read().vacuum().await
+    }
+
+    pub async fn merge(&self, segment_ids: &[SegmentId]) -> SummaResult<SegmentMeta> {
+        self.inner.write().merge(segment_ids).await
     }
 
     pub async fn commit(&self) -> SummaResult<Opstamp> {

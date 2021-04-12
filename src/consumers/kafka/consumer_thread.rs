@@ -29,7 +29,7 @@ impl std::fmt::Debug for KafkaConsumerThreadController {
 impl KafkaConsumerThreadController {
     pub fn new(thread_name: &str, stream_consumer: StreamConsumer) -> KafkaConsumerThreadController {
         KafkaConsumerThreadController {
-            thread_name: thread_name.to_string(),
+            thread_name: thread_name.to_owned(),
             thread_handler: Arc::new(Mutex::new(None)),
             stream_consumer: Arc::new(Mutex::new(stream_consumer)),
         }

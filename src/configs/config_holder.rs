@@ -1,12 +1,13 @@
-use crate::errors::{Error, SummaResult, ValidationError};
+use crate::errors::{Error, SummaResult};
 use config::{Config, Environment, File};
+
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 pub trait Persistable {
-    fn from_file(config_filepath: &Path, env_prefix: Option<&str>, mandatory: bool) -> SummaResult<Self>
+    fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<Self>
     where
         Self: Sized;
     fn save(&self) -> SummaResult<&Self>;
@@ -44,23 +45,19 @@ impl<'a, T: Persistable> DerefMut for AutosaveLockWriteGuard<'a, T> {
 
 #[derive(Clone, Debug)]
 pub struct ConfigHolder<TConfig: Serialize> {
-    config_filepath: PathBuf,
     config: TConfig,
+    config_filepath: Option<PathBuf>,
 }
 
 impl<'a, TConfig: Serialize + Deserialize<'a>> ConfigHolder<TConfig> {
-    pub fn new(config: TConfig, config_filepath: &Path) -> SummaResult<Self> {
-        if !config_filepath.exists() {
-            Ok(ConfigHolder {
-                config_filepath: config_filepath.to_path_buf(),
-                config,
-            })
-        } else {
-            Err(Error::ValidationError(ValidationError::ExistingConfigError(config_filepath.to_path_buf())))
+    pub fn file(config: TConfig, config_filepath: &Path) -> Self {
+        ConfigHolder {
+            config,
+            config_filepath: Some(config_filepath.to_path_buf()),
         }
     }
-    pub fn get_config_filepath(&self) -> &Path {
-        &self.config_filepath
+    pub fn memory(config: TConfig) -> Self {
+        ConfigHolder { config, config_filepath: None }
     }
     pub fn autosave(&mut self) -> AutosaveLockWriteGuard<ConfigHolder<TConfig>> {
         AutosaveLockWriteGuard::new(self)
@@ -68,26 +65,28 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> ConfigHolder<TConfig> {
 }
 
 impl<'a, TConfig: Serialize + Deserialize<'a>> Persistable for ConfigHolder<TConfig> {
-    fn from_file(config_filepath: &Path, env_prefix: Option<&str>, mandatory: bool) -> SummaResult<ConfigHolder<TConfig>> {
+    fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<ConfigHolder<TConfig>> {
         let mut s = Config::builder();
-        if config_filepath.exists() || mandatory {
+        if config_filepath.exists() {
             s = s.add_source(File::from(config_filepath));
         }
         if let Some(env_prefix) = env_prefix {
             s = s.add_source(Environment::with_prefix(env_prefix).separator("."));
         }
         let config: TConfig = s.build()?.try_deserialize().map_err(|e| Error::ConfigError(e))?;
-        let config_holder = ConfigHolder {
-            config_filepath: config_filepath.to_path_buf(),
-            config,
-        };
+        let config_holder = ConfigHolder::file(config, config_filepath);
         Ok(config_holder)
     }
 
     fn save(&self) -> SummaResult<&Self> {
-        std::fs::File::create(&self.config_filepath)
-            .and_then(|mut file| file.write_all(&serde_yaml::to_vec(&self.config).unwrap()))
-            .map_err(|e| Error::IOError((e, Some(self.config_filepath.to_path_buf()))))?;
+        match self.config_filepath {
+            Some(ref config_filepath) => {
+                std::fs::File::create(config_filepath)
+                    .and_then(|mut file| file.write_all(&serde_yaml::to_vec(&self.config).unwrap()))
+                    .map_err(|e| Error::IOError((e, Some(config_filepath.to_path_buf()))))?;
+            }
+            None => (),
+        };
         Ok(self)
     }
 }

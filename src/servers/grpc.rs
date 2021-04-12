@@ -1,19 +1,15 @@
 use crate::apis::consumer::ConsumerApiImpl;
 use crate::apis::index::IndexApiImpl;
 use crate::apis::search::SearchApiImpl;
-use crate::configs::RuntimeConfigHolder;
+use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaResult;
 use crate::proto::consumer_api_server::ConsumerApiServer;
 use crate::proto::index_api_server::IndexApiServer;
 use crate::proto::search_api_server::SearchApiServer;
-use crate::services::{AliasService, IndexService, MetricsService};
+use crate::services::IndexService;
 use crate::utils::random::generate_request_id;
 use crate::utils::signal_channel::signal_channel;
 use futures::FutureExt;
-use parking_lot::RwLock;
-use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor;
@@ -27,8 +23,7 @@ use tracing::{info, info_span, instrument, warn, Span};
 
 /// GRPC server exposing [API](crate::apis)
 pub struct GrpcServer {
-    addr: SocketAddr,
-    alias_service: AliasService,
+    application_config: ApplicationConfigHolder,
     index_service: IndexService,
 }
 
@@ -64,26 +59,23 @@ impl GrpcServer {
     }
 
     /// New GRPC server
-    pub async fn new(addr: SocketAddr, data_path: &Path, runtime_config: &Arc<RwLock<RuntimeConfigHolder>>) -> SummaResult<GrpcServer> {
-        let alias_service = AliasService::new(runtime_config);
-        let index_service = IndexService::new(data_path, &alias_service).await?;
-        let _ = MetricsService::new(&index_service);
+    pub async fn new(application_config: &ApplicationConfigHolder, index_service: &IndexService) -> SummaResult<GrpcServer> {
         Ok(GrpcServer {
-            addr,
-            alias_service,
-            index_service,
+            application_config: application_config.clone(),
+            index_service: index_service.clone(),
         })
     }
 
     /// Starts all nested services and start serving requests
-    #[instrument(skip_all)]
+    #[instrument("lifecycle", skip_all)]
     pub async fn start(self) -> SummaResult<()> {
         let consumer_api = ConsumerApiImpl::new(&self.index_service)?;
-        let index_api = IndexApiImpl::new(&self.alias_service, &self.index_service)?;
+        let index_api = IndexApiImpl::new(&self.application_config, &self.index_service)?;
         let search_api = SearchApiImpl::new(&self.index_service)?;
+        let grpc_config = self.application_config.read().grpc.clone();
 
         let layer = ServiceBuilder::new()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(grpc_config.timeout_seconds))
             .layer(interceptor(GrpcServer::set_ids))
             .layer(
                 TraceLayer::new_for_grpc()
@@ -101,9 +93,10 @@ impl GrpcServer {
             .add_service(SearchApiServer::new(search_api));
 
         let rx = signal_channel();
-        info!(action = "starting", addr = ?self.addr);
+        let addr = grpc_config.endpoint.parse()?;
+        info!(action = "starting", addr = ?addr);
         router
-            .serve_with_shutdown(self.addr, async move {
+            .serve_with_shutdown(addr, async move {
                 rx.map(drop).await;
                 info!(action = "sigterm_received");
             })

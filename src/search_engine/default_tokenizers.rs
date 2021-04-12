@@ -5,14 +5,14 @@ use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, StopWord
 pub fn default_tokenizers() -> [(String, TextAnalyzer); 2] {
     [
         (
-            "summa".to_string(),
+            "summa".to_owned(),
             TextAnalyzer::from(SummaTokenizer)
                 .filter(RemoveLongFilter::limit(200))
                 .filter(LowerCaser)
                 .filter(StopWordFilter::remove(STOP_WORDS.iter().map(|x| x.to_string()).collect())),
         ),
         (
-            "default".to_string(),
+            "default".to_owned(),
             TextAnalyzer::from(SimpleTokenizer)
                 .filter(RemoveLongFilter::limit(200))
                 .filter(LowerCaser)

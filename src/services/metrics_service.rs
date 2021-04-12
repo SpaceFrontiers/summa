@@ -19,11 +19,12 @@ impl MetricsService {
 
     fn register_meter(&self) {
         let meter = global::meter("summa");
-
         let index_service = self.index_service.clone();
         meter.batch_observer(move |batch| {
             let index_service = index_service.clone();
             let documents_count = batch.u64_value_observer("documents_count").with_description("Documents count").init();
+            let deleted_documents_count = batch.u64_value_observer("deleted_documents_count").with_description("Documents count").init();
+
             let deleted_memory_usage = batch
                 .u64_value_observer("deleted_memory_usage")
                 .with_unit(Unit::new("bytes"))
@@ -48,7 +49,7 @@ impl MetricsService {
                     let segment_readers = searcher.segment_readers();
                     let mut per_fields = HashMap::new();
                     for segment_reader in segment_readers {
-                        let segment_short_id = segment_reader.segment_id().short_uuid_string();
+                        let segment_id = segment_reader.segment_id().uuid_string();
                         let segment_space_usage = segment_reader.space_usage().unwrap();
                         for (field, field_usage) in iter::empty()
                             .chain(segment_space_usage.fast_fields().fields())
@@ -63,10 +64,11 @@ impl MetricsService {
                         batch_observer_result.observe(
                             &[
                                 KeyValue::new("index_name", index_holder.index_name().to_string()),
-                                KeyValue::new("segment_short_id", segment_short_id.to_string()),
+                                KeyValue::new("segment_id", segment_id.to_string()),
                             ],
                             &[
                                 documents_count.observation(segment_space_usage.num_docs() as u64),
+                                deleted_documents_count.observation(segment_reader.num_deleted_docs() as u64),
                                 deleted_memory_usage.observation(segment_space_usage.deletes() as u64),
                                 store_memory_usage.observation(segment_space_usage.store().total() as u64),
                             ],
