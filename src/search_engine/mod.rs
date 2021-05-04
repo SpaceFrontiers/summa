@@ -1,6 +1,9 @@
 //! Search engine internal parts
 
+pub mod collectors;
+mod custom_serializer;
 mod default_tokenizers;
+mod fruit_extractors;
 mod index_holder;
 mod index_updater;
 mod index_writer_holder;

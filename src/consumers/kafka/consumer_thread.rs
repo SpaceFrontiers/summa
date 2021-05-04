@@ -14,21 +14,21 @@ use tracing::{info, info_span, instrument, warn, Instrument};
 
 /// Long-living container for Kafka consuming thread
 #[derive(Clone)]
-pub struct KafkaConsumerThreadController {
+pub struct ConsumerThread {
     thread_name: String,
     thread_handler: Arc<Mutex<Option<ThreadHandler>>>,
     stream_consumer: Arc<Mutex<StreamConsumer>>,
 }
 
-impl std::fmt::Debug for KafkaConsumerThreadController {
+impl std::fmt::Debug for ConsumerThread {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self.thread_name)
+        f.debug_struct("ConsumerThread").field("thread_name", &self.thread_name).finish()
     }
 }
 
-impl KafkaConsumerThreadController {
-    pub fn new(thread_name: &str, stream_consumer: StreamConsumer) -> KafkaConsumerThreadController {
-        KafkaConsumerThreadController {
+impl ConsumerThread {
+    pub fn new(thread_name: &str, stream_consumer: StreamConsumer) -> ConsumerThread {
+        ConsumerThread {
             thread_name: thread_name.to_owned(),
             thread_handler: Arc::new(Mutex::new(None)),
             stream_consumer: Arc::new(Mutex::new(stream_consumer)),
@@ -51,10 +51,10 @@ impl KafkaConsumerThreadController {
                 let stream = stream_consumer.stream();
                 let meter = global::meter("summa");
                 let counter = meter.u64_counter("consume").with_description("Number of consumed events").init();
-                let mut message_stream = stream.take_until(shutdown_tripwire);
+                let mut terminatable_stream = stream.take_until(shutdown_tripwire);
                 info!(action = "started");
                 loop {
-                    match message_stream.next().await {
+                    match terminatable_stream.next().await {
                         Some(message) => {
                             match processor(message) {
                                 Ok(_) => counter.add(1, &[KeyValue::new("status", "ok"), KeyValue::new("thread_name", thread_name.clone())]),
@@ -81,6 +81,7 @@ impl KafkaConsumerThreadController {
     pub fn commit_offsets(&self) -> SummaResult<()> {
         info!(action = "commit_consumer_state");
         let result = self.stream_consumer.lock().commit_consumer_state(CommitMode::Sync);
+        info!(action = "committed_consumer_state", result = ?result);
         match result {
             Err(rdkafka::error::KafkaError::ConsumerCommit(rdkafka::error::RDKafkaErrorCode::NoOffset)) => Ok(()),
             left => left,

@@ -1,28 +1,28 @@
-use super::consumer_thread::KafkaConsumerThreadController;
+use super::consumer_thread::ConsumerThread;
 use super::status::{KafkaConsumingError, KafkaConsumingStatus};
-use crate::configs::KafkaConsumerConfig;
+use crate::configs::ConsumerConfig;
 use crate::errors::SummaResult;
 use rdkafka::admin::{AdminClient, AdminOptions, AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::config::{ClientConfig, FromClientConfig};
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{Consumer as KafkaConsumer, StreamConsumer as KafkaStreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
 use std::str;
 use tracing::{info, instrument};
 
-/// Manages multiple consuming Kafka threads
+/// Manages multiple consuming threads
 #[derive(Clone, Debug)]
-pub(crate) struct KafkaConsumer {
+pub(crate) struct Consumer {
     consumer_name: String,
-    config: KafkaConsumerConfig,
+    config: ConsumerConfig,
     kafka_producer_config: ClientConfig,
-    thread_controllers: Vec<KafkaConsumerThreadController>,
+    consumer_threads: Vec<ConsumerThread>,
 }
 
-impl KafkaConsumer {
+impl Consumer {
     #[instrument]
-    pub fn new(consumer_name: &str, config: &KafkaConsumerConfig) -> SummaResult<KafkaConsumer> {
+    pub fn new(consumer_name: &str, config: &ConsumerConfig) -> SummaResult<Consumer> {
         let mut kafka_consumer_config = ClientConfig::new();
         kafka_consumer_config
             .set("group.id", &config.group_id)
@@ -35,21 +35,21 @@ impl KafkaConsumer {
         let mut kafka_producer_config = ClientConfig::new();
         kafka_producer_config.set("bootstrap.servers", config.bootstrap_servers.join(","));
 
-        let thread_controllers: SummaResult<Vec<KafkaConsumerThreadController>> = (0..config.threads)
+        let thread_controllers: SummaResult<Vec<ConsumerThread>> = (0..config.threads)
             .map(|n| {
-                let stream_consumer: StreamConsumer = kafka_consumer_config.create()?;
+                let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create()?;
                 stream_consumer.subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
-                Ok(KafkaConsumerThreadController::new(&format!("{}-{}", consumer_name, n), stream_consumer))
+                Ok(ConsumerThread::new(&format!("{}-{}", consumer_name, n), stream_consumer))
             })
             .collect();
 
         let thread_controllers = thread_controllers?;
 
-        Ok(KafkaConsumer {
+        Ok(Consumer {
             consumer_name: consumer_name.to_owned(),
             config: config.clone(),
             kafka_producer_config,
-            thread_controllers,
+            consumer_threads: thread_controllers,
         })
     }
 
@@ -61,7 +61,7 @@ impl KafkaConsumer {
     where
         TProcessor: 'static + Fn(Result<BorrowedMessage<'_>, KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> + Send + Sync + Clone,
     {
-        for thread_controller in self.thread_controllers.iter() {
+        for thread_controller in self.consumer_threads.iter() {
             let processor = processor.clone();
             thread_controller.start(processor);
         }
@@ -69,14 +69,14 @@ impl KafkaConsumer {
     }
 
     pub fn commit_offsets(&self) -> SummaResult<()> {
-        for thread_controller in self.thread_controllers.iter() {
+        for thread_controller in self.consumer_threads.iter() {
             thread_controller.commit_offsets()?;
         }
         Ok(())
     }
 
     pub async fn stop(&self) -> SummaResult<()> {
-        for thread_controller in self.thread_controllers.iter() {
+        for thread_controller in self.consumer_threads.iter() {
             thread_controller.stop().await?;
         }
         Ok(())
@@ -102,9 +102,10 @@ impl KafkaConsumer {
                     .set("retention.bytes", "1073741824")
             })
             .collect();
-        info!(action = "create_topics", topics = ?new_topics);
-        admin_client.create_topics(&new_topics, &admin_options).await?;
-        admin_client.alter_configs(&alter_topics, &admin_options).await?;
+        let response = admin_client.create_topics(&new_topics, &admin_options).await?;
+        info!(action = "create_topics", topics = ?new_topics, response = ?response);
+        let response = admin_client.alter_configs(&alter_topics, &admin_options).await?;
+        info!(action = "alter_configs", topics = ?new_topics, response = ?response);
         Ok(())
     }
 
@@ -112,8 +113,8 @@ impl KafkaConsumer {
     async fn delete_topics(&self) -> SummaResult<()> {
         let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let topics: Vec<_> = self.config.topics.iter().map(String::as_str).collect();
-        info!(action = "delete_topics", topics = ?topics);
-        admin_client.delete_topics(&topics, &AdminOptions::new().operation_timeout(Some(Timeout::Never))).await?;
+        let response = admin_client.delete_topics(&topics, &AdminOptions::new().operation_timeout(Some(Timeout::Never))).await?;
+        info!(action = "delete_topics", topics = ?topics, response = ?response);
         Ok(())
     }
 
@@ -126,7 +127,7 @@ impl KafkaConsumer {
         }
     }
 
-    #[instrument]
+    #[instrument(skip(self), fields(consumer_name = ?self.consumer_name))]
     pub async fn on_delete(&self) -> SummaResult<()> {
         if self.config.delete_topics {
             self.delete_topics().await

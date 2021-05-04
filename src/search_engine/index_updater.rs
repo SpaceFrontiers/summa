@@ -1,30 +1,18 @@
 use super::index_writer_holder::IndexWriterHolder;
-use crate::configs::{IndexConfig, KafkaConsumerConfig};
+use crate::configs::{ConsumerConfig, IndexConfigProxy};
 use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
-use crate::consumers::kafka::KafkaConsumer;
-use crate::errors::{Error, SummaResult};
+use crate::consumers::kafka::Consumer;
+use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use crate::search_engine::SummaDocument;
-use parking_lot::RwLock;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
-
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tantivy::directory::GarbageCollectionResult;
 use tantivy::schema::Schema;
 use tantivy::{Opstamp, SegmentId, SegmentMeta};
-use tracing::{instrument, warn};
-
-/// Index updating through Kafka consumers and via direct invocation
-pub(crate) struct IndexUpdater {
-    inner: RwLock<InnerIndexUpdater>,
-}
-
-pub(crate) struct InnerIndexUpdater {
-    consumers: Vec<KafkaConsumer>,
-    index_writer_holder: Arc<IndexWriterHolder>,
-    schema: Schema,
-}
+use tracing::instrument;
 
 fn process_message(
     schema: &Schema,
@@ -40,24 +28,33 @@ fn process_message(
             let parsed_document = SummaDocument::BoundJsonBytes((schema, &index_document_operation.document))
                 .try_into()
                 .map_err(|e| KafkaConsumingError::ParseDocumentError(e))?;
-            index_writer_holder
-                .index_document(parsed_document, index_document_operation.reindex)
-                .map_err(|e| KafkaConsumingError::IndexError(e))?;
+            index_writer_holder.index_document(parsed_document).map_err(|e| KafkaConsumingError::IndexError(e))?;
             Ok(KafkaConsumingStatus::Consumed)
         }
     }
 }
 
-impl InnerIndexUpdater {
-    pub fn new(schema: &Schema, index_config: &IndexConfig, index_writer_holder: IndexWriterHolder) -> SummaResult<InnerIndexUpdater> {
+/// Index updating through consumers and via direct invocation
+pub(crate) struct IndexUpdater {
+    index_config_proxy: IndexConfigProxy,
+    consumers: Vec<Consumer>,
+    index_writer_holder: Arc<IndexWriterHolder>,
+    schema: Schema,
+}
+
+impl IndexUpdater {
+    /// Creates new `IndexUpdater`
+    pub(super) fn new(schema: &Schema, index_config_proxy: IndexConfigProxy, index_writer_holder: IndexWriterHolder) -> SummaResult<IndexUpdater> {
         let index_writer_holder = Arc::new(index_writer_holder);
-        let consumers = index_config
+        let consumers = index_config_proxy
+            .read()
             .consumer_configs
             .iter()
-            .map(|(consumer_name, consumer_config)| KafkaConsumer::new(consumer_name, consumer_config).unwrap())
+            .map(|(consumer_name, consumer_config)| Consumer::new(consumer_name, consumer_config).unwrap())
             .into_iter()
             .collect();
-        let mut inner_index_updater = InnerIndexUpdater {
+        let mut inner_index_updater = IndexUpdater {
+            index_config_proxy,
             consumers,
             index_writer_holder,
             schema: schema.clone(),
@@ -65,13 +62,16 @@ impl InnerIndexUpdater {
         inner_index_updater.start_consumers()?;
         Ok(inner_index_updater)
     }
-    async fn stop_consumers(&mut self) -> SummaResult<()> {
+
+    /// Stops all consumers
+    async fn stop_consumers(&mut self) -> SummaResult<&mut IndexWriterHolder> {
         for consumer in &self.consumers {
             consumer.stop().await?;
         }
-        Ok(())
+        Arc::get_mut(&mut self.index_writer_holder).ok_or(Error::ArcIndexWriterHolderLeakedError)
     }
 
+    /// Starts all consumers
     fn start_consumers(&mut self) -> SummaResult<()> {
         for consumer in &self.consumers {
             let index_writer_holder = self.index_writer_holder.clone();
@@ -81,14 +81,8 @@ impl InnerIndexUpdater {
         Ok(())
     }
 
-    fn commit_offsets(&self) -> SummaResult<()> {
-        for consumer in &self.consumers {
-            consumer.commit_offsets()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn attach_consumer(&mut self, consumer: KafkaConsumer) -> SummaResult<()> {
+    /// Add consumer and starts it
+    pub(super) fn attach_consumer(&mut self, consumer: Consumer) -> SummaResult<()> {
         let index_writer_holder = self.index_writer_holder.clone();
         let schema = self.schema.clone();
         consumer.start(move |message| process_message(&schema, &index_writer_holder, message))?;
@@ -96,8 +90,17 @@ impl InnerIndexUpdater {
         Ok(())
     }
 
-    pub(crate) async fn create_consumer(&mut self, consumer_name: &str, consumer_config: KafkaConsumerConfig) -> SummaResult<()> {
-        let consumer = KafkaConsumer::new(consumer_name, &consumer_config)?;
+    /// Create new consumer and attaches it to the `IndexUpdater`
+    #[instrument(skip(self, consumer_config))]
+    pub(crate) async fn create_consumer(&mut self, consumer_name: &str, consumer_config: &ConsumerConfig) -> SummaResult<()> {
+        match self.index_config_proxy.write().autosave().get_mut().consumer_configs.entry(consumer_name.to_owned()) {
+            Entry::Occupied(o) => Err(ValidationError::ExistingConsumerError(o.key().to_owned())),
+            Entry::Vacant(v) => {
+                v.insert(consumer_config.clone());
+                Ok(())
+            }
+        }?;
+        let consumer = Consumer::new(consumer_name, consumer_config)?;
         consumer.on_create().await?;
         self.attach_consumer(consumer)?;
         Ok(())
@@ -109,34 +112,56 @@ impl InnerIndexUpdater {
         Ok(())
     }
 
+    /// Deletes consumer
+    ///
+    /// Stops and commit all consumers. Required due to parallel nature of consuming because it prevents the possibility to commit every
+    /// consumer separately.
+    #[instrument(skip(self))]
     pub(crate) async fn delete_consumer(&mut self, consumer_name: &str) -> SummaResult<()> {
-        self.commit(false).await?;
+        self.stop_consumers().await?.commit().await?;
+        self.commit_offsets()?;
+        self.index_config_proxy
+            .write()
+            .autosave()
+            .get_mut()
+            .consumer_configs
+            .remove(consumer_name)
+            .ok_or(ValidationError::MissingConsumerError(consumer_name.to_owned()))?;
         self.inner_delete_consumer(consumer_name).await?;
         self.start_consumers()?;
         Ok(())
     }
 
-    pub(crate) async fn delete_all_consumers(&mut self) -> SummaResult<()> {
-        self.commit(false).await?;
+    /// Deletes all consumers in a faster way than separate deletion of every consumer by their names
+    #[instrument(skip(self))]
+    pub(crate) async fn delete_all_consumers(&mut self) -> SummaResult<Vec<String>> {
+        self.stop_consumers().await?.commit().await?;
+        self.commit_offsets()?;
+        let mut deleted_consumers_names: Vec<_> = Vec::new();
         for consumer in self.consumers.drain(..) {
             consumer.on_delete().await?;
+            deleted_consumers_names.push(consumer.consumer_name().to_owned());
         }
-        Ok(())
+        Ok(deleted_consumers_names)
     }
 
+    /// Check if any consumers for the `IndexUpdater` exists
     pub(crate) fn has_consumers(&self) -> bool {
         self.consumers.len() > 0
     }
 
-    pub(crate) fn index_document(&self, document: SummaDocument<'_>, reindex: bool) -> SummaResult<Opstamp> {
+    /// Index generic `SummaDocument`
+    ///
+    /// `IndexUpdater` bounds unbounded `SummaDocument` inside
+    pub(crate) fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<Opstamp> {
         let document = document.bound_with(&self.schema).try_into()?;
-        self.index_writer_holder.index_document(document, reindex)
+        self.index_writer_holder.index_document(document)
     }
 
-    #[instrument(skip_all)]
+    /// Merges multiple segments, see `IndexWriterHolder::merge` for details
+    #[instrument(skip(self))]
     pub(crate) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<SegmentMeta> {
-        self.stop_consumers().await?;
-        let index_writer_holder = Arc::<IndexWriterHolder>::get_mut(&mut self.index_writer_holder).ok_or(Error::ArcIndexWriterHolderLeakedError)?;
+        let index_writer_holder = self.stop_consumers().await?;
         let segment_meta = index_writer_holder.merge(segment_ids).await?;
         index_writer_holder.commit().await?;
         self.commit_offsets()?;
@@ -144,87 +169,43 @@ impl InnerIndexUpdater {
         Ok(segment_meta)
     }
 
-    #[instrument(skip_all)]
-    pub(crate) async fn commit(&mut self, restart_consumers: bool) -> SummaResult<Opstamp> {
-        self.stop_consumers().await?;
-        let index_writer_holder = Arc::<IndexWriterHolder>::get_mut(&mut self.index_writer_holder).ok_or(Error::ArcIndexWriterHolderLeakedError)?;
-        let opstamp = index_writer_holder.commit().await?;
-        self.commit_offsets()?;
-        if restart_consumers {
-            self.start_consumers()?;
+    /// Commits Kafka offsets
+    #[instrument(skip(self))]
+    fn commit_offsets(&self) -> SummaResult<()> {
+        for consumer in &self.consumers {
+            consumer.commit_offsets()?;
         }
+        Ok(())
+    }
+
+    /// Commit Tantivy index and Kafka offsets
+    #[instrument(skip(self))]
+    pub(crate) async fn commit(&mut self) -> SummaResult<Opstamp> {
+        let opstamp = self.stop_consumers().await?.commit().await?;
+        self.commit_offsets()?;
+        self.start_consumers()?;
         Ok(opstamp)
     }
 
-    #[instrument(skip_all)]
+    /// Vacuums garbage files and compacts segments (to be done)
+    #[instrument(skip(self))]
     pub(crate) async fn vacuum(&self) -> SummaResult<GarbageCollectionResult> {
         self.index_writer_holder.garbage_collect_files().await
     }
-}
 
-impl IndexUpdater {
-    pub(crate) fn new(schema: &Schema, index_config: &IndexConfig, index_writer_holder: IndexWriterHolder) -> SummaResult<IndexUpdater> {
-        Ok(IndexUpdater {
-            inner: RwLock::new(InnerIndexUpdater::new(schema, index_config, index_writer_holder)?),
-        })
+    /// Stops consumers
+    #[instrument(skip(self))]
+    pub(super) async fn stop(mut self) -> SummaResult<()> {
+        self.stop_consumers().await?;
+        Ok(())
     }
 
-    pub(crate) async fn create_consumer(&self, consumer_name: &str, consumer_config: KafkaConsumerConfig) -> SummaResult<()> {
-        self.inner.write().create_consumer(consumer_name, consumer_config).await
-    }
-
-    pub(crate) async fn delete_consumer(&self, consumer_name: &str) -> SummaResult<()> {
-        self.inner.write().delete_consumer(consumer_name).await
-    }
-
-    pub async fn delete_all_consumers(&self) -> SummaResult<()> {
-        self.inner.write().delete_all_consumers().await
-    }
-
-    pub(crate) fn has_consumers(&self) -> bool {
-        self.inner.read().has_consumers()
-    }
-
-    pub(crate) fn index_document(&self, document: SummaDocument<'_>, reindex: bool) -> SummaResult<Opstamp> {
-        self.inner.read().index_document(document, reindex)
-    }
-
-    pub async fn try_commit(&self, restart_consumers: bool) -> Option<SummaResult<Opstamp>> {
-        match self.inner.try_write() {
-            Some(mut inner_index_updater) => Some(inner_index_updater.commit(restart_consumers).await),
-            None => None,
-        }
-    }
-
-    pub async fn try_commit_and_log(&self, restart_consumers: bool) -> Option<Opstamp> {
-        match self.try_commit(restart_consumers).await {
-            Some(result) => match result {
-                Ok(opstamp) => Some(opstamp),
-                Err(error) => {
-                    warn!(action = "failed_commit", error = ?error);
-                    None
-                }
-            },
-            None => {
-                warn!(error = "index_updater_busy");
-                None
-            }
-        }
-    }
-
-    pub async fn vacuum(&self) -> SummaResult<GarbageCollectionResult> {
-        self.inner.read().vacuum().await
-    }
-
-    pub async fn merge(&self, segment_ids: &[SegmentId]) -> SummaResult<SegmentMeta> {
-        self.inner.write().merge(segment_ids).await
-    }
-
-    pub async fn commit(&self) -> SummaResult<Opstamp> {
-        self.inner.write().commit(true).await
-    }
-
-    pub async fn last_commit(self) -> SummaResult<Opstamp> {
-        self.inner.into_inner().commit(false).await
+    /// Stops consumers, commits Tantivy and Kafka offsets
+    #[instrument(skip(self))]
+    pub(super) async fn stop_consumers_and_commit(mut self) -> SummaResult<Opstamp> {
+        self.stop_consumers().await?;
+        let opstamp = self.stop_consumers().await?.commit().await?;
+        self.commit_offsets()?;
+        Ok(opstamp)
     }
 }

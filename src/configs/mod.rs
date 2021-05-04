@@ -12,6 +12,6 @@ pub use application_config::{ApplicationConfig, ApplicationConfigHolder};
 pub use config_holder::{ConfigHolder, Persistable};
 pub use global::GlobalConfig;
 pub use grpc_config::GrpcConfig;
-pub use index_config::{IndexConfig, IndexEngine};
-pub use kafka_consumer_config::KafkaConsumerConfig;
+pub use index_config::{IndexConfig, IndexConfigBuilder, IndexConfigProxy, IndexConfigWriteProxy, IndexEngine};
+pub use kafka_consumer_config::ConsumerConfig;
 pub use metrics_config::MetricsConfig;

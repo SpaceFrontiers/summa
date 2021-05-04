@@ -94,6 +94,6 @@ impl<T> Deref for OwningHandler<T> {
 
 impl<T: Debug> Debug for OwningHandler<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "OwningHandler({:?})", self.handler.data)
+        f.debug_struct("OwningHandler").field("data", &self.handler.data).finish()
     }
 }

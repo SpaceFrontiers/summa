@@ -2,15 +2,15 @@
 //!
 //! Index GRPC API is using for managing indices
 
-use crate::errors::{SummaResult, ValidationError};
-use crate::proto;
-use crate::requests::{CreateIndexRequest, DeleteIndexRequest};
-use crate::services::IndexService;
-use tantivy::SegmentId;
-
 use crate::configs::ApplicationConfigHolder;
+use crate::errors::SummaResult;
+use crate::proto;
 use crate::search_engine::SummaDocument;
+use crate::services::IndexService;
+use std::ops::Deref;
+use tantivy::SegmentId;
 use tonic::{Request, Response, Status};
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct IndexApiImpl {
@@ -32,15 +32,33 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn commit_index(&self, request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let request = request.into_inner();
         let index_holder = self.index_service.get_index_holder(&request.index_name)?;
+        let index_updater = index_holder.index_updater();
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
-                tokio::spawn(async move { index_holder.try_commit_and_log(true).await });
-                Ok(Response::new(proto::CommitIndexResponse { opstamp: None }))
+                tokio::spawn(async move {
+                    match index_updater.try_write() {
+                        None => warn!(action = "busy"),
+                        Some(mut index_updater) => match index_updater.commit().await {
+                            Ok(_) => (),
+                            Err(error) => warn!(error = ?error),
+                        },
+                    }
+                });
+                Ok(Response::new(proto::CommitIndexResponse {
+                    opstamp: None,
+                    status: "ok".to_owned(),
+                }))
             }
-            Some(proto::CommitMode::Sync) => {
-                let opstamp = index_holder.commit().await?;
-                Ok(Response::new(proto::CommitIndexResponse { opstamp: Some(opstamp) }))
-            }
+            Some(proto::CommitMode::Sync) => match index_updater.try_write() {
+                None => Ok(Response::new(proto::CommitIndexResponse {
+                    opstamp: None,
+                    status: "busy".to_owned(),
+                })),
+                Some(mut index_updater) => Ok(Response::new(proto::CommitIndexResponse {
+                    opstamp: Some(index_updater.commit().await?),
+                    status: "ok".to_owned(),
+                })),
+            },
         }
     }
 
@@ -49,75 +67,42 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let opstamp = self
             .index_service
             .get_index_holder(&request.index_name)?
-            .index_document(SummaDocument::UnboundJsonBytes(&request.document), request.reindex)?;
+            .index_updater()
+            .read()
+            .index_document(SummaDocument::UnboundJsonBytes(&request.document))?;
         let response = proto::IndexDocumentResponse { opstamp };
         Ok(Response::new(response))
     }
 
     async fn create_index(&self, proto_request: Request<proto::CreateIndexRequest>) -> Result<Response<proto::CreateIndexResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let create_index_request = CreateIndexRequest::from_proto(&proto_request)?;
-        let index_name = create_index_request.index_name.clone();
-        let index_config = create_index_request.index_config.clone();
-        self.index_service.create_index(create_index_request).await?;
+        let create_index_request = proto_request.into_inner().try_into()?;
+        let index_holder = self.index_service.create_index(create_index_request).await?;
         let response = proto::CreateIndexResponse {
-            index: Some(proto::Index {
-                index_aliases: vec![],
-                index_name,
-                index_engine: format!("{:?}", &index_config.index_engine),
-            }),
+            index: Some(index_holder.deref().into()),
         };
         Ok(Response::new(response))
     }
 
     async fn delete_index(&self, proto_request: Request<proto::DeleteIndexRequest>) -> Result<Response<proto::DeleteIndexResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let delete_index_request = DeleteIndexRequest::from_proto(proto_request)?;
-        let delete_index_result = self.index_service.delete_index(delete_index_request).await?;
-        let response = proto::DeleteIndexResponse {
-            deleted_index_aliases: delete_index_result.deleted_aliases,
-        };
-        Ok(Response::new(response))
+        Ok(Response::new(self.index_service.delete_index(proto_request.into_inner().into()).await?.into()))
     }
 
     async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let application_config = self.application_config.read();
-        let index_config = application_config
-            .indices
-            .get(&proto_request.index_name)
-            .ok_or(ValidationError::MissingIndexError(proto_request.index_name.to_owned()))?;
-        let response = proto::GetIndexResponse {
-            index: Some(proto::Index {
-                index_aliases: self.application_config.read().get_index_aliases_for_index(&proto_request.index_name),
-                index_name: proto_request.index_name.clone(),
-                index_engine: format!("{:?}", &index_config.index_engine),
-            }),
-        };
-        Ok(Response::new(response))
+        Ok(Response::new(proto::GetIndexResponse {
+            index: Some(self.index_service.get_index_holder(&proto_request.into_inner().index_name)?.deref().into()),
+        }))
     }
 
     async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
-        let application_config = self.application_config.read();
-        let response = proto::GetIndicesResponse {
-            indices: application_config
-                .indices
-                .iter()
-                .map(|(index_name, index_config)| proto::Index {
-                    index_aliases: application_config.get_index_aliases_for_index(index_name),
-                    index_name: index_name.to_owned(),
-                    index_engine: format!("{:?}", &index_config.index_engine),
-                })
-                .collect(),
-        };
-        Ok(Response::new(response))
+        Ok(Response::new(proto::GetIndicesResponse {
+            indices: self.index_service.index_holders().values().map(|index_holder| index_holder.deref().into()).collect(),
+        }))
     }
 
     async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {
-        let response = proto::GetIndicesAliasesResponse {
+        Ok(Response::new(proto::GetIndicesAliasesResponse {
             indices_aliases: self.application_config.read().aliases.clone(),
-        };
-        Ok(Response::new(response))
+        }))
     }
 
     async fn merge_segments(&self, proto_request: Request<proto::MergeSegmentsRequest>) -> Result<Response<proto::MergeSegmentsResponse>, Status> {
@@ -125,7 +110,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let index_holder = self.index_service.get_index_holder(&proto_request.index_name)?;
         tokio::spawn(async move {
             let segment_ids: Vec<_> = proto_request.segment_ids.iter().map(|x| SegmentId::from_uuid_string(x).unwrap()).collect();
-            index_holder.merge(&segment_ids).await
+            index_holder.index_updater().write().merge(&segment_ids).await
         });
         let response = proto::MergeSegmentsResponse {};
         Ok(Response::new(response))

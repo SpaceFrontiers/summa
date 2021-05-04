@@ -4,7 +4,7 @@
 
 use crate::errors::SummaResult;
 use crate::proto;
-use crate::requests::{CreateConsumerRequest, DeleteConsumerRequest};
+use crate::requests::CreateConsumerRequest;
 use crate::services::IndexService;
 use tonic::{Request, Response, Status};
 
@@ -25,11 +25,12 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     async fn create_consumer(&self, proto_request: Request<proto::CreateConsumerRequest>) -> Result<Response<proto::CreateConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let create_consumer_request = CreateConsumerRequest::from_proto(&proto_request)?;
-        let index_name = create_consumer_request.index_name.clone();
-        let consumer_name = create_consumer_request.consumer_name.clone();
-        self.index_service.create_consumer(create_consumer_request).await?;
+        self.index_service.create_consumer(&create_consumer_request).await?;
         let response = proto::CreateConsumerResponse {
-            consumer: Some(proto::Consumer { consumer_name, index_name }),
+            consumer: Some(proto::Consumer {
+                consumer_name: create_consumer_request.consumer_name.to_owned(),
+                index_name: create_consumer_request.index_name.to_owned(),
+            }),
         };
         Ok(Response::new(response))
     }
@@ -62,10 +63,7 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     }
 
     async fn delete_consumer(&self, proto_request: Request<proto::DeleteConsumerRequest>) -> Result<Response<proto::DeleteConsumerResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let delete_consumer_request = DeleteConsumerRequest::from_proto(proto_request)?;
-        self.index_service.delete_consumer(delete_consumer_request).await?;
-        let response = proto::DeleteConsumerResponse {};
-        Ok(Response::new(response))
+        self.index_service.delete_consumer(proto_request.into_inner().into()).await?;
+        Ok(Response::new(proto::DeleteConsumerResponse {}))
     }
 }

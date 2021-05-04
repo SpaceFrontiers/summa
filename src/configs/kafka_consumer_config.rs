@@ -2,7 +2,7 @@ use crate::errors::{Error, SummaResult};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KafkaConsumerConfig {
+pub struct ConsumerConfig {
     pub bootstrap_servers: Vec<String>,
     pub create_topics: bool,
     pub delete_topics: bool,
@@ -11,12 +11,12 @@ pub struct KafkaConsumerConfig {
     pub threads: u32,
 }
 
-impl KafkaConsumerConfig {
-    pub fn new(bootstrap_servers: &Vec<String>, group_id: &str, mut threads: u32, topics: &Vec<String>) -> SummaResult<KafkaConsumerConfig> {
+impl ConsumerConfig {
+    pub fn new(bootstrap_servers: &Vec<String>, group_id: &str, mut threads: u32, topics: &Vec<String>) -> SummaResult<ConsumerConfig> {
         if threads == 0 {
             threads = 1;
         }
-        Ok(KafkaConsumerConfig {
+        Ok(ConsumerConfig {
             bootstrap_servers: bootstrap_servers.clone(),
             create_topics: true,
             delete_topics: true,

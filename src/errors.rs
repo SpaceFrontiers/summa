@@ -1,5 +1,6 @@
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
+use tantivy::schema::FieldType;
 use tracing::warn;
 
 #[derive(thiserror::Error, Debug)]
@@ -14,8 +15,12 @@ pub enum ValidationError {
     ExistingConsumersError(String),
     #[error("existing_consumer_error: {0}")]
     ExistingConsumerError(String),
+    #[error("existing_index_error: {0}")]
+    ExistingIndexError(String),
     #[error("existing_path_error: {0}")]
     ExistingPathError(PathBuf),
+    #[error("invalid_primary_key_type: {0:?}")]
+    InvalidPrimaryKeyType(FieldType),
     #[error("invalid_memory_error: {0}")]
     InvalidMemoryError(u64),
     #[error("invalid_threads_number_error: {0}")]
@@ -26,6 +31,8 @@ pub enum ValidationError {
     MissingIndexError(String),
     #[error("missing_default_field_error: {0}")]
     MissingDefaultField(String),
+    #[error("missing_multi_field_error: {0}")]
+    MissingMultiField(String),
     #[error("missing_path_error: {0}")]
     MissingPathError(String),
     #[error("missing_primary_key_error: {0:?}")]
@@ -44,6 +51,10 @@ pub enum Error {
     CanceledError,
     #[error("config_error: {0}")]
     ConfigError(config::ConfigError),
+    #[error("empty_query_error")]
+    EmptyQueryError,
+    #[error("field_does_not_exist: {0}")]
+    FieldDoesNotExistError(String),
     #[error("hyper_error: {0}")]
     HyperError(hyper::Error),
     #[error("infallible")]
@@ -51,7 +62,9 @@ pub enum Error {
     #[error("internal_error")]
     InternalError,
     #[error("{0:?}")]
-    InvalidSyntaxError((tantivy::query::QueryParserError, String)),
+    InvalidSyntaxError(String),
+    #[error("{0:?}")]
+    InvalidTantivySyntaxError((tantivy::query::QueryParserError, String)),
     #[error("invalid_config_error: {0}")]
     InvalidConfigError(String),
     #[error("{0:?}")]
@@ -170,6 +183,7 @@ impl From<Error> for tonic::Status {
                 Error::TantivyError(_) => tonic::Code::InvalidArgument,
                 Error::ValidationError(ValidationError::MissingConsumerError(_)) | Error::ValidationError(ValidationError::MissingIndexError(_)) => tonic::Code::NotFound,
                 Error::ValidationError(_) => tonic::Code::InvalidArgument,
+                Error::FieldDoesNotExistError(_) => tonic::Code::NotFound,
                 _ => tonic::Code::Internal,
             },
             format!("{}", error),

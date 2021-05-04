@@ -23,7 +23,7 @@ impl MetricsService {
         meter.batch_observer(move |batch| {
             let index_service = index_service.clone();
             let documents_count = batch.u64_value_observer("documents_count").with_description("Documents count").init();
-            let deleted_documents_count = batch.u64_value_observer("deleted_documents_count").with_description("Documents count").init();
+            let deleted_documents_count = batch.u64_value_observer("deleted_documents_count").with_description("Deleted documents count").init();
 
             let deleted_memory_usage = batch
                 .u64_value_observer("deleted_memory_usage")
@@ -45,7 +45,7 @@ impl MetricsService {
                 let index_service = index_service.clone();
                 for index_holder in index_service.index_holders().values() {
                     let schema = index_holder.schema();
-                    let searcher = index_holder.searcher();
+                    let searcher = index_holder.index_reader().searcher();
                     let segment_readers = searcher.segment_readers();
                     let mut per_fields = HashMap::new();
                     for segment_reader in segment_readers {

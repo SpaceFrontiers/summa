@@ -301,7 +301,6 @@ class SummaClient(BaseGrpcClient):
         self,
         index_name: str,
         document: Union[dict, bytes],
-        reindex: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentResponse:
@@ -311,7 +310,6 @@ class SummaClient(BaseGrpcClient):
         Args:
             index_name: index name
             document: bytes
-            reindex: if true then delete document(s) with the same primary key
             request_id: request id
             session_id: session id
         """
@@ -321,7 +319,6 @@ class SummaClient(BaseGrpcClient):
             index_service_pb.IndexDocumentRequest(
                 index_name=index_name,
                 document=document,
-                reindex=reindex,
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
@@ -330,9 +327,8 @@ class SummaClient(BaseGrpcClient):
     async def search(
         self,
         index_alias: str,
-        query: str,
-        limit: Optional[int] = 10,
-        offset: Optional[int] = 0,
+        query: search_service_pb.Query,
+        collectors: Union[search_service_pb.Collector, List[search_service_pb.Collector]],
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> search_service_pb.SearchResponse:
@@ -341,18 +337,18 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_alias: index alias
-            query: text to query
-            limit: maximum amount of documents
-            offset: offset
+            query: structured `Query`
+            collectors:
             request_id: request id
             session_id: session id
         """
+        if not isinstance(collectors, List):
+            collectors = [collectors]
         return await self.stubs['search_api'].search(
             search_service_pb.SearchRequest(
                 index_alias=index_alias,
                 query=query,
-                limit=limit,
-                offset=offset,
+                collectors=collectors
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )

@@ -28,6 +28,7 @@ message CommitIndexRequest {
 
 message CommitIndexResponse {
   optional uint64 opstamp = 1;
+  string status = 2;
 }
 
 enum Order {
@@ -49,6 +50,7 @@ message CreateIndexRequest {
   optional uint64 writer_threads = 7;
   optional uint64 autocommit_interval_ms = 8;
   optional SortByField sort_by_field = 9;
+  repeated string multi_fields = 11;
 }
 message CreateIndexResponse {
   Index index = 1;
@@ -59,6 +61,7 @@ message DeleteIndexRequest {
 }
 message DeleteIndexResponse {
   repeated string deleted_index_aliases = 1;
+  repeated string deleted_index_consumers = 2;
 }
 message GetIndicesAliasesRequest {}
 message GetIndicesAliasesResponse {
@@ -77,7 +80,6 @@ message GetIndicesResponse {
 message IndexDocumentRequest {
   string index_name = 1;
   bytes document = 2;
-  bool reindex = 3;
 }
 message IndexDocumentResponse {
   uint64 opstamp = 1;

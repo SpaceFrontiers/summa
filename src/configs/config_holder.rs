@@ -1,16 +1,18 @@
 use crate::errors::{Error, SummaResult};
 use config::{Config, Environment, File};
-
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 pub trait Persistable {
+    fn save(&self) -> SummaResult<&Self>;
+}
+
+pub trait Loadable {
     fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<Self>
     where
         Self: Sized;
-    fn save(&self) -> SummaResult<&Self>;
 }
 
 pub struct AutosaveLockWriteGuard<'a, T: Persistable> {
@@ -64,7 +66,7 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> ConfigHolder<TConfig> {
     }
 }
 
-impl<'a, TConfig: Serialize + Deserialize<'a>> Persistable for ConfigHolder<TConfig> {
+impl<'a, TConfig: Serialize + Deserialize<'a>> Loadable for ConfigHolder<TConfig> {
     fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<ConfigHolder<TConfig>> {
         let mut s = Config::builder();
         if config_filepath.exists() {
@@ -77,7 +79,9 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> Persistable for ConfigHolder<TCon
         let config_holder = ConfigHolder::file(config, config_filepath);
         Ok(config_holder)
     }
+}
 
+impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
     fn save(&self) -> SummaResult<&Self> {
         match self.config_filepath {
             Some(ref config_filepath) => {

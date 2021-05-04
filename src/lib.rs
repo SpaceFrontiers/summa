@@ -14,6 +14,8 @@
 //! - Explore [Docs.rs](https://docs.rs/crate/summa/latest)
 
 #[macro_use]
+extern crate derive_builder;
+#[macro_use]
 extern crate lazy_static;
 
 pub mod apis;

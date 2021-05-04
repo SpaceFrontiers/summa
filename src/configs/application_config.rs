@@ -1,7 +1,6 @@
 use super::ConfigHolder;
 use super::GrpcConfig;
 use super::MetricsConfig;
-
 use crate::configs::IndexConfig;
 use crate::errors::{SummaResult, ValidationError};
 use colored::Colorize;
@@ -43,10 +42,8 @@ impl ApplicationConfig {
             metrics: MetricsConfig::default(),
         }
     }
-    pub fn get_path_for_index_data<P>(&self, index_name: P) -> PathBuf
-    where
-        P: AsRef<Path>,
-    {
+
+    pub fn get_path_for_index_data(&self, index_name: &str) -> PathBuf {
         self.data_path.join(index_name)
     }
 

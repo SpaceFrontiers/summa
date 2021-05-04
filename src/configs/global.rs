@@ -1,8 +1,7 @@
 pub use super::ApplicationConfigHolder;
-use crate::configs::config_holder::Persistable;
+use crate::configs::config_holder::Loadable;
 use crate::configs::{ApplicationConfig, ConfigHolder};
 use crate::errors::{Error, SummaResult};
-
 use std::path::Path;
 
 #[derive(Clone)]

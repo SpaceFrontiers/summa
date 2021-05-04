@@ -1,6 +1,7 @@
 use futures::try_join;
 
 use clap::{arg, command};
+use opentelemetry::global;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use summa::configs::ApplicationConfig;
@@ -46,15 +47,14 @@ impl Application {
     }
 
     pub fn run(&self) -> SummaResult<()> {
+        let _ = global::meter("summa");
         let rt = self.create_runtime()?;
         let application_config = self.configurator.application_config.clone();
         rt.block_on(async {
             let index_service = IndexService::new(&application_config).await?;
-
             let metrics_server = MetricsServer::new(&self.configurator.application_config)?;
             let _ = MetricsService::new(&index_service);
             let grpc_server = GrpcServer::new(&self.configurator.application_config, &index_service).await?;
-
             try_join!(metrics_server.start(), grpc_server.start())?;
             Ok(())
         })
@@ -76,7 +76,8 @@ pub fn setup_tracing(log_path: &PathBuf, debug: bool) -> Vec<WorkerGuard> {
 
     let filter_layer_request = EnvFilter::new("summa::servers::grpc[request]=info,summa::servers::metrics[request]=info");
     let filter_layer_query = EnvFilter::new("query");
-    let filter_layer_summa = EnvFilter::new("summa::services=info,summa::search_engine=info,summa::servers[lifecycle]=info,summa::consumers=info");
+    let filter_layer_summa =
+        EnvFilter::new("librdkafka=trace,rdkafka::client=debug,summa::services=info,summa::search_engine=info,summa::servers[lifecycle]=info,summa::consumers=info,tantivy=info");
 
     if debug {
         let default_layer = fmt::layer().with_level(true).with_target(true).with_thread_names(true).with_filter(filter_layer_summa);
