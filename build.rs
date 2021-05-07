@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "summa/proto/consumer_service.proto",
             "summa/proto/index.proto",
             "summa/proto/index_service.proto",
+            "summa/proto/reflection_service.proto",
             "summa/proto/search_service.proto",
         ],
         &[&out_dir],

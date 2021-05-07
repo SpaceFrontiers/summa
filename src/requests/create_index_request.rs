@@ -9,15 +9,17 @@ pub struct CreateIndexRequest {
     pub index_engine: proto::IndexEngine,
     pub schema: Schema,
     #[builder(default = "None")]
-    pub primary_key: Option<String>,
+    pub autocommit_interval_ms: Option<u64>,
     #[builder(default = "Vec::new()")]
     pub default_fields: Vec<String>,
     #[builder(default = "Vec::new()")]
     pub multi_fields: Vec<String>,
     #[builder(default = "None")]
+    pub primary_key: Option<String>,
+    #[builder(default = "None")]
     pub sort_by_field: Option<IndexSortByField>,
     #[builder(default = "None")]
-    pub autocommit_interval_ms: Option<u64>,
+    pub stop_words: Option<Vec<String>>,
     #[builder(default = "None")]
     pub writer_threads: Option<u64>,
     #[builder(default = "None")]
@@ -70,6 +72,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
                 }),
                 None => None,
             },
+            stop_words: if proto_request.stop_words.len() > 0 { Some(proto_request.stop_words) } else { None },
             autocommit_interval_ms: proto_request.autocommit_interval_ms,
             writer_threads: proto_request.writer_threads,
             writer_heap_size_bytes: proto_request.writer_heap_size_bytes,

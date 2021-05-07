@@ -7,7 +7,7 @@ use crate::utils::sync::{Handler, OwningHandler};
 use futures_util::future::join_all;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tantivy::directory::GarbageCollectionResult;
 use tracing::instrument;
@@ -72,8 +72,8 @@ impl IndexService {
 
     /// Returns `Handler` to `IndexHolder`.
     ///
-    /// It is safe to keep `IndexHolder` cause `Index` won't be deleted until `Handler` is alive.
-    /// Though, `IndexHolder` can be removed from `index_holders` to prevent new queries
+    /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
+    /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
     pub fn get_index_holder(&self, index_alias_or_name: &str) -> SummaResult<Handler<IndexHolder>> {
         let index_name = self.application_config.read().resolve_index_alias(index_alias_or_name);
         let index_name = index_name.as_deref().unwrap_or(index_alias_or_name);
@@ -96,6 +96,8 @@ impl IndexService {
             })
             .primary_key(create_index_request.primary_key.to_owned())
             .default_fields(create_index_request.default_fields.clone())
+            .multi_fields(HashSet::from_iter(create_index_request.multi_fields.clone().into_iter()))
+            .stop_words(create_index_request.stop_words.clone())
             .sort_by_field(create_index_request.sort_by_field.clone())
             .autocommit_interval_ms(create_index_request.autocommit_interval_ms);
         if let Some(writer_threads) = create_index_request.writer_threads {

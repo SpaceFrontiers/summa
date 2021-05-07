@@ -89,10 +89,12 @@ impl Collector for ReservoirSampling {
                         // `total_reservoir[0; self.limit - taken_from_current_segment]`
                         //  and `total_reservoir[self.limit - taken_from_current_segment; self.limit]`
                         // The first one contains previously collected documents and the second one contains document from the current segment.
-                        let right_margin = self.limit - taken_from_current_segment;
-                        let position_to_swap = (rng.next_u32() as usize) % right_margin;
-                        total_reservoir.swap(right_margin, position_to_swap);
-                        total_reservoir[right_margin] = *doc;
+                        let pivot_index = self.limit - taken_from_current_segment;
+                        if pivot_index > 0 {
+                            let position_to_swap = (rng.next_u32() as usize) % pivot_index;
+                            total_reservoir.swap(pivot_index, position_to_swap);
+                        }
+                        total_reservoir[pivot_index] = *doc;
                     }
                 }
             }

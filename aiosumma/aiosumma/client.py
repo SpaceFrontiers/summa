@@ -14,6 +14,7 @@ from aiogrpcclient import (
 )
 from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
+from summa.proto import reflection_service_pb2 as reflection_service_pb
 from summa.proto import search_service_pb2 as search_service_pb
 from summa.proto.consumer_service_pb2_grpc import ConsumerApiStub
 from summa.proto.index_service_pb2 import (  # noqa
@@ -21,6 +22,7 @@ from summa.proto.index_service_pb2 import (  # noqa
     Desc,
 )
 from summa.proto.index_service_pb2_grpc import IndexApiStub
+from summa.proto.reflection_service_pb2_grpc import ReflectionApiStub
 from summa.proto.search_service_pb2_grpc import SearchApiStub
 
 
@@ -28,6 +30,7 @@ class SummaClient(BaseGrpcClient):
     stub_clses = {
         'consumer_api': ConsumerApiStub,
         'index_api': IndexApiStub,
+        'reflection_api': ReflectionApiStub,
         'search_api': SearchApiStub,
     }
 
@@ -102,6 +105,8 @@ class SummaClient(BaseGrpcClient):
         schema: str,
         primary_key: Optional[str] = None,
         default_fields: Optional[List[str]] = None,
+        multi_fields: Optional[List[str]] = None,
+        stop_words: Optional[List[str]] = None,
         compression: Optional[str] = None,
         writer_heap_size_bytes: Optional[int] = None,
         writer_threads: Optional[int] = None,
@@ -118,6 +123,7 @@ class SummaClient(BaseGrpcClient):
             schema: Tantivy index schema
             primary_key: primary key is used during insertion to check duplicates
             default_fields: fields that are used to search by default
+            stop_words: list of words that won't be parsed
             compression: Tantivy index compression
             writer_heap_size_bytes: Tantivy writer heap size in bytes, shared between all threads
             writer_threads: Tantivy writer threads
@@ -136,6 +142,8 @@ class SummaClient(BaseGrpcClient):
                 schema=schema,
                 primary_key=primary_key,
                 default_fields=default_fields,
+                multi_fields=multi_fields,
+                stop_words=stop_words,
                 compression=compression,
                 writer_heap_size_bytes=writer_heap_size_bytes,
                 writer_threads=writer_threads,
@@ -414,5 +422,31 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].vacuum_index(
             index_service_pb.VacuumIndexRequest(index_name=index_name),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
+    async def get_top_terms(
+        self,
+        index_name: str,
+        field_name: str,
+        top_k: int,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.VacuumIndexResponse:
+        """
+        Vacuuming index
+
+        Args:
+            index_name: index name
+            field_name: field name
+            top_k: extract top-K terms
+        """
+        return await self.stubs['reflection_api'].get_top_terms(
+            reflection_service_pb.GetTopTermsRequest(
+                index_name=index_name,
+                field_name=field_name,
+                top_k=top_k,
+            ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )

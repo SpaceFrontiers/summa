@@ -51,6 +51,7 @@ message CreateIndexRequest {
   optional uint64 autocommit_interval_ms = 8;
   optional SortByField sort_by_field = 9;
   repeated string multi_fields = 11;
+  repeated string stop_words = 12;
 }
 message CreateIndexResponse {
   Index index = 1;

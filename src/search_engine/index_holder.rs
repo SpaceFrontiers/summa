@@ -1,25 +1,22 @@
 use super::default_tokenizers::default_tokenizers;
 use super::index_writer_holder::IndexWriterHolder;
-use crate::configs::IndexConfigProxy;
 use crate::configs::IndexEngine;
-use crate::errors::Error::InvalidSyntaxError;
+use crate::configs::{IndexConfig, IndexConfigProxy};
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use crate::search_engine::collectors::ReservoirSampling;
 use crate::search_engine::fruit_extractors::{self, FruitExtractor};
+use crate::search_engine::query_parser::QueryParser;
 use crate::search_engine::IndexUpdater;
 use crate::utils::sync::{Handler, OwningHandler};
 use crate::utils::thread_handler::ThreadHandler;
 use parking_lot::RwLock;
 use std::collections::HashSet;
-use std::ops::Bound::Unbounded;
-use std::ops::{Bound, Deref};
-use std::str::FromStr;
+use std::ops::Deref;
 use std::time::Duration;
 use tantivy::collector::{Count, MultiCollector, TopDocs};
-use tantivy::query::{AllQuery, BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery, RegexQuery, TermQuery};
-use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
-use tantivy::{Index, IndexReader, IndexSettings, Opstamp, ReloadPolicy, Term};
+use tantivy::schema::{Field, Schema};
+use tantivy::{Index, IndexReader, IndexSettings, Opstamp, ReloadPolicy};
 use tokio::fs::remove_dir_all;
 use tokio::sync::oneshot;
 use tokio::time;
@@ -28,7 +25,6 @@ use tracing::{info, info_span, instrument, warn, Instrument};
 pub struct IndexHolder {
     index_name: String,
     index_config_proxy: IndexConfigProxy,
-    index: Index,
     cached_schema: Schema,
     index_reader: IndexReader,
     query_parser: QueryParser,
@@ -42,18 +38,18 @@ impl IndexHolder {
     /// Sets up standard Summa tokenizers
     ///
     /// The set of tokenizers includes standard Tantivy tokenizers as well as `SummaTokenizer` that supports CJK
-    fn register_default_tokenizers(index: &Index) {
-        for (tokenizer_name, tokenizer) in &default_tokenizers() {
+    fn register_default_tokenizers(index: &Index, index_config: &IndexConfig) {
+        for (tokenizer_name, tokenizer) in &default_tokenizers(index_config) {
             index.tokenizers().register(tokenizer_name, tokenizer.clone())
         }
     }
 
     /// Sets up `IndexHolder`
     ///
-    /// Creates the autocommitting thread and consumers
+    /// Creates the auto committing thread and consumers
     async fn setup(index_name: &str, index: Index, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexHolder> {
         let index_config = index_config_proxy.read().deref().clone();
-        IndexHolder::register_default_tokenizers(&index);
+        IndexHolder::register_default_tokenizers(&index, &index_config);
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
         let index_updater = OwningHandler::new(RwLock::new(IndexUpdater::new(
             &index.schema(),
@@ -112,7 +108,6 @@ impl IndexHolder {
             query_parser: QueryParser::for_index(&index, index_config.default_fields.iter().map(|x| cached_schema.get_field(x).unwrap()).collect()),
             multi_fields: index_config.multi_fields.iter().map(|x| cached_schema.get_field(x).unwrap()).collect(),
             cached_schema,
-            index,
             index_reader,
             index_updater,
             index_config_proxy,
@@ -173,14 +168,6 @@ impl IndexHolder {
         &self.cached_schema
     }
 
-    /// Index schema
-    #[inline]
-    pub(crate) fn field_and_field_entry(&self, field_name: &str) -> SummaResult<(Field, &FieldEntry)> {
-        let field = self.cached_schema.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
-        let field_entry = self.cached_schema.get_field_entry(field);
-        Ok((field, field_entry))
-    }
-
     /// Stops `IndexHolder` instance
     ///
     /// Both autocommitting thread and consumers are stopped
@@ -211,102 +198,10 @@ impl IndexHolder {
         Ok(())
     }
 
-    fn cast_value_to_term(&self, field: Field, field_type: &FieldType, value: &str) -> SummaResult<Term> {
-        // ToDo: more errors and types
-        Ok(match field_type {
-            FieldType::Str(_) => Term::from_field_text(field, value),
-            FieldType::I64(_) => Term::from_field_i64(field, i64::from_str(value).map_err(|_e| InvalidSyntaxError("cannot parse i64".to_owned()))?),
-            FieldType::U64(_) => Term::from_field_u64(field, u64::from_str(value).map_err(|_e| InvalidSyntaxError("cannot parse u64".to_owned()))?),
-            FieldType::F64(_) => Term::from_field_f64(field, f64::from_str(value).map_err(|_e| InvalidSyntaxError("cannot parse f64".to_owned()))?),
-            _ => return Err(InvalidSyntaxError("invalid range type".to_owned()))?,
-        })
-    }
-
-    fn cast_value_to_bound_term(&self, field: Field, field_type: &FieldType, value: &str, including: bool) -> SummaResult<Bound<Term>> {
-        Ok(match value {
-            "*" => Unbounded,
-            value => {
-                let casted_value = self.cast_value_to_term(field, field_type, value)?;
-                if including {
-                    Bound::Included(casted_value)
-                } else {
-                    Bound::Excluded(casted_value)
-                }
-            }
-        })
-    }
-
-    fn parse_query(&self, query: &proto::Query) -> SummaResult<Box<dyn Query>> {
-        Ok(match &query.query {
-            None | Some(proto::query::Query::All(_)) => Box::new(AllQuery),
-            Some(proto::query::Query::Bool(boolean_query)) => {
-                let mut subqueries = vec![];
-                for subquery in &boolean_query.subqueries {
-                    subqueries.push((
-                        match proto::Occur::from_i32(subquery.occur) {
-                            None | Some(proto::Occur::Should) => Occur::Should,
-                            Some(proto::Occur::Must) => Occur::Must,
-                            Some(proto::Occur::MustNot) => Occur::MustNot,
-                        },
-                        self.parse_query(subquery.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
-                    ))
-                }
-                Box::new(BooleanQuery::new(subqueries))
-            }
-            Some(proto::query::Query::Match(match_query_proto)) => match self.query_parser.parse_query(&match_query_proto.value) {
-                Ok(parsed_query) => Ok(parsed_query),
-                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::FieldDoesNotExistError(field)),
-                Err(e) => Err(Error::InvalidTantivySyntaxError((e, match_query_proto.value.to_owned()))),
-            }?,
-            Some(proto::query::Query::Range(range_query_proto)) => {
-                let (field, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
-                let value = range_query_proto.value.as_ref().unwrap();
-                let left = self.cast_value_to_bound_term(field, field_entry.field_type(), &value.left, value.including_left)?;
-                let right = self.cast_value_to_bound_term(field, field_entry.field_type(), &value.right, value.including_right)?;
-                Box::new(RangeQuery::new_term_bounds(field, field_entry.field_type().value_type(), &left, &right))
-            }
-            Some(proto::query::Query::Boost(boost_query_proto)) => Box::new(BoostQuery::new(
-                self.parse_query(boost_query_proto.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
-                f32::from_str(&boost_query_proto.score).map_err(|_e| InvalidSyntaxError("cannot parse f32".to_owned()))?,
-            )),
-            Some(proto::query::Query::Regex(regex_query_proto)) => {
-                let (field, _) = self.field_and_field_entry(&regex_query_proto.field)?;
-                Box::new(RegexQuery::from_pattern(&regex_query_proto.value, field)?)
-            }
-            Some(proto::query::Query::Phrase(phrase_query_proto)) => {
-                let (field, field_entry) = self.field_and_field_entry(&phrase_query_proto.field)?;
-                let tokenizer = self.index.tokenizer_for_field(field)?;
-                let mut token_stream = tokenizer.token_stream(&phrase_query_proto.value);
-                let mut terms = vec![];
-                while let Some(token) = token_stream.next() {
-                    terms.push(self.cast_value_to_term(field, field_entry.field_type(), &token.text)?)
-                }
-                if terms.len() == 1 {
-                    Box::new(TermQuery::new(
-                        terms[0].clone(),
-                        field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
-                    ))
-                } else {
-                    let mut phrase_query = PhraseQuery::new(terms);
-                    phrase_query.set_slop(phrase_query_proto.slop);
-                    Box::new(phrase_query)
-                }
-            }
-            Some(proto::query::Query::Term(term_query_proto)) => {
-                let (field, field_entry) = self.field_and_field_entry(&term_query_proto.field)?;
-                Box::new(TermQuery::new(
-                    self.cast_value_to_term(field, field_entry.field_type(), &term_query_proto.value)?,
-                    field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
-                ))
-            }
-            Some(proto::query::Query::MoreLikeThis(_)) => Box::new(AllQuery),
-        })
-    }
-
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
     pub(crate) async fn search(&self, query: &proto::Query, collectors: &Vec<proto::Collector>) -> SummaResult<Vec<proto::CollectorResult>> {
         let searcher = self.index_reader.searcher();
-        let parsed_query = self.parse_query(query)?;
+        let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let mut extractors: Vec<Box<dyn FruitExtractor>> = collectors
             .iter()

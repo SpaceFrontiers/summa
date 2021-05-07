@@ -29,6 +29,7 @@ impl Consumer {
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
+            .set("max.poll.interval.ms", "1800000")
             .set("auto.offset.reset", "earliest")
             .set("allow.auto.create.topics", "true");
 

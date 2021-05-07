@@ -1,10 +1,12 @@
 use crate::apis::consumer::ConsumerApiImpl;
 use crate::apis::index::IndexApiImpl;
+use crate::apis::reflection::ReflectionApiImpl;
 use crate::apis::search::SearchApiImpl;
 use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaResult;
 use crate::proto::consumer_api_server::ConsumerApiServer;
 use crate::proto::index_api_server::IndexApiServer;
+use crate::proto::reflection_api_server::ReflectionApiServer;
 use crate::proto::search_api_server::SearchApiServer;
 use crate::services::IndexService;
 use crate::utils::random::generate_request_id;
@@ -71,6 +73,7 @@ impl GrpcServer {
     pub async fn start(self) -> SummaResult<()> {
         let consumer_api = ConsumerApiImpl::new(&self.index_service)?;
         let index_api = IndexApiImpl::new(&self.application_config, &self.index_service)?;
+        let reflection_api = ReflectionApiImpl::new(&self.index_service)?;
         let search_api = SearchApiImpl::new(&self.index_service)?;
         let grpc_config = self.application_config.read().grpc.clone();
 
@@ -90,6 +93,7 @@ impl GrpcServer {
             .layer(layer)
             .add_service(ConsumerApiServer::new(consumer_api))
             .add_service(IndexApiServer::new(index_api))
+            .add_service(ReflectionApiServer::new(reflection_api))
             .add_service(SearchApiServer::new(search_api));
 
         let rx = signal_channel();

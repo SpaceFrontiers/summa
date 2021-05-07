@@ -7,6 +7,7 @@ mod fruit_extractors;
 mod index_holder;
 mod index_updater;
 mod index_writer_holder;
+mod query_parser;
 mod stop_words;
 mod summa_document;
 mod summa_tokenizer;

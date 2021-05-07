@@ -26,6 +26,7 @@ maintenance = { status = "actively-developed" }
 tonic-build = { version = "0.6.2", default-features = false, features = ["prost", "transport"] }
 
 [dependencies]
+base64 = "0.13.0"
 clap = { version = "3.1.6", features = ["cargo"] }
 colored = "2.0.0"
 config = "0.12.0"

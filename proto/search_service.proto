@@ -100,7 +100,17 @@ message BoostQuery {
   string score = 2;
 }
 
-message MoreLikeThisQuery {}
+message MoreLikeThisQuery {
+  string document = 1;
+  optional uint64 min_doc_frequency = 2;
+  optional uint64 max_doc_frequency = 3;
+  optional uint64 min_term_frequency = 4;
+  optional uint64 max_query_terms = 5;
+  optional uint64 min_word_length = 6;
+  optional uint64 max_word_length = 7;
+  optional float boost_factor = 8;
+  repeated string stop_words = 9;
+}
 
 message PhraseQuery {
   string field = 1;
