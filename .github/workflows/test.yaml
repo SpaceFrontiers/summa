@@ -1,0 +1,31 @@
+name: Test
+
+on: [ push, pull_request ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2.4.0
+
+      - uses: actions/cache@v2.1.6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - uses: actions-rs/toolchain@v1.0.7
+        with:
+          toolchain: stable
+
+      - uses: actions-rs/cargo@v1.0.3
+        with:
+          command: test
+          args: --verbose
