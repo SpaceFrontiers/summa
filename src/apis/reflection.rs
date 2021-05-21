@@ -8,7 +8,6 @@ use crate::services::IndexService;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use tonic::{Request, Response, Status};
-use tracing::log::warn;
 
 pub struct ReflectionApiImpl {
     index_service: IndexService,
