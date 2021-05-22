@@ -12,12 +12,17 @@ pub trait FruitExtractor: Sync + Send {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorResult;
 }
 
-pub fn build_fruit_extractor(collector_proto: &proto::Collector, schema: &Schema, multi_collector: &mut MultiCollector) -> SummaResult<Box<dyn FruitExtractor>> {
+pub fn build_fruit_extractor(
+    collector_proto: &proto::Collector,
+    schema: &Schema,
+    multi_collector: &mut MultiCollector,
+) -> SummaResult<Box<dyn FruitExtractor>> {
     match &collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => Ok(match top_docs_collector_proto.scorer {
             None | Some(proto::Scorer { scorer: None }) => Box::new(TopDocs::new(
                 multi_collector.add_collector(
-                    tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap()).and_offset(top_docs_collector_proto.offset.try_into().unwrap()),
+                    tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
+                        .and_offset(top_docs_collector_proto.offset.try_into().unwrap()),
                 ),
                 top_docs_collector_proto.limit.try_into().unwrap(),
             )) as Box<dyn FruitExtractor>,
@@ -103,14 +108,16 @@ impl FruitExtractor for ReservoirSampling {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorResult {
         let schema = searcher.schema();
         proto::CollectorResult {
-            collector_result: Some(proto::collector_result::CollectorResult::ReservoirSampling(proto::ReservoirSamplingCollectorResult {
-                documents: self
-                    .0
-                    .extract(multi_fruit)
-                    .iter()
-                    .map(|doc_address| NamedFieldDocument::from_document(schema, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json())
-                    .collect(),
-            })),
+            collector_result: Some(proto::collector_result::CollectorResult::ReservoirSampling(
+                proto::ReservoirSamplingCollectorResult {
+                    documents: self
+                        .0
+                        .extract(multi_fruit)
+                        .iter()
+                        .map(|doc_address| NamedFieldDocument::from_document(schema, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json())
+                        .collect(),
+                },
+            )),
         }
     }
 }

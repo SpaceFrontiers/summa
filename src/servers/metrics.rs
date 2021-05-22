@@ -69,7 +69,9 @@ impl MetricsServer {
     #[instrument("lifecycle", skip_all)]
     pub fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
         let metrics_config = self.application_config.read().metrics.clone();
-        let state = Arc::new(AppState { exporter: self.exporter.clone() });
+        let state = Arc::new(AppState {
+            exporter: self.exporter.clone(),
+        });
         let service = make_service_fn(move |_conn| {
             let state = state.clone();
             async move { Ok::<_, Infallible>(service_fn(move |request| MetricsServer::serve_request(request, state.clone()))) }

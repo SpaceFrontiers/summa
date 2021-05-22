@@ -4,7 +4,11 @@ pub mod shortcuts {
 
     pub fn top_docs_collector(limit: u32) -> proto::Collector {
         proto::Collector {
-            collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector { limit, offset: 0, scorer: None })),
+            collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
+                limit,
+                offset: 0,
+                scorer: None,
+            })),
         }
     }
 

@@ -204,7 +204,9 @@ impl From<Error> for tonic::Status {
                     _ => tonic::Code::Internal,
                 },
                 Error::TantivyError(_) => tonic::Code::InvalidArgument,
-                Error::ValidationError(ValidationError::MissingConsumerError(_)) | Error::ValidationError(ValidationError::MissingIndexError(_)) => tonic::Code::NotFound,
+                Error::ValidationError(ValidationError::MissingConsumerError(_)) | Error::ValidationError(ValidationError::MissingIndexError(_)) => {
+                    tonic::Code::NotFound
+                }
                 Error::ValidationError(_) => tonic::Code::InvalidArgument,
                 Error::FieldDoesNotExistError(_) => tonic::Code::NotFound,
                 _ => tonic::Code::Internal,

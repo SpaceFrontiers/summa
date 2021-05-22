@@ -39,7 +39,9 @@ impl Consumer {
         let consumer_threads: Vec<ConsumerThread> = (0..config.threads)
             .map(|n| {
                 let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create()?;
-                stream_consumer.subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+                stream_consumer
+                    .subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>())
+                    .unwrap();
                 Ok(ConsumerThread::new(&format!("{}-{}", consumer_name, n), stream_consumer))
             })
             .collect::<SummaResult<_>>()?;
@@ -112,7 +114,9 @@ impl Consumer {
     async fn delete_topics(&self) -> SummaResult<()> {
         let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let topics: Vec<_> = self.config.topics.iter().map(String::as_str).collect();
-        let response = admin_client.delete_topics(&topics, &AdminOptions::new().operation_timeout(Some(Timeout::Never))).await?;
+        let response = admin_client
+            .delete_topics(&topics, &AdminOptions::new().operation_timeout(Some(Timeout::Never)))
+            .await?;
         info!(action = "delete_topics", topics = ?topics, response = ?response);
         Ok(())
     }

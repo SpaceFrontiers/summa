@@ -1,8 +1,6 @@
 syntax = "proto3";
 package summa.proto;
 
-import "summa/proto/index.proto";
-
 service IndexApi {
   rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
@@ -16,6 +14,36 @@ service IndexApi {
   rpc merge_segments (MergeSegmentsRequest) returns (MergeSegmentsResponse) {}
   rpc set_index_alias (SetIndexAliasRequest) returns (SetIndexAliasResponse) {}
   rpc vacuum_index (VacuumIndexRequest) returns (VacuumIndexResponse) {}
+}
+
+enum Compression {
+  None = 0;
+  Brotli = 1;
+  Lz4 = 2;
+  Snappy = 3;
+}
+
+enum IndexEngine {
+  File = 0;
+  Memory = 1;
+}
+
+message Index {
+  string index_name = 1;
+  repeated string index_aliases = 2;
+  string index_engine = 3;
+  uint64 num_docs = 4;
+  Compression compression = 5;
+}
+
+message IndexDocumentOperation {
+  bytes document = 1;
+}
+
+message IndexOperation {
+ oneof operation {
+   IndexDocumentOperation index_document = 2;
+ }
 }
 
 enum CommitMode {

@@ -66,7 +66,10 @@ impl QueryParser {
     pub fn for_index(index_name: &str, index: &Index, default_fields: Vec<Field>) -> QueryParser {
         let nested_query_parser = tantivy::query::QueryParser::for_index(index, default_fields);
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
-        let subquery_counter = global::meter("summa").u64_counter("subquery_counter").with_description("Sub-queries counter").init();
+        let subquery_counter = global::meter("summa")
+            .u64_counter("subquery_counter")
+            .with_description("Sub-queries counter")
+            .init();
 
         QueryParser {
             cached_schema: index.schema(),
@@ -80,14 +83,22 @@ impl QueryParser {
 
     #[inline]
     pub(crate) fn field_and_field_entry(&self, field_name: &str) -> SummaResult<(Field, &FieldEntry)> {
-        let field = self.cached_schema.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
+        let field = self
+            .cached_schema
+            .get_field(field_name)
+            .ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
         let field_entry = self.cached_schema.get_field_entry(field);
         Ok((field, field_entry))
     }
 
     fn parse_subquery(&self, query: &proto::Query) -> SummaResult<Box<dyn Query>> {
-        self.subquery_counter
-            .add(1, &[KeyValue::new("index_name", self.index_name.to_owned()), KeyValue::new("query", query.to_label())]);
+        self.subquery_counter.add(
+            1,
+            &[
+                KeyValue::new("index_name", self.index_name.to_owned()),
+                KeyValue::new("query", query.to_label()),
+            ],
+        );
         Ok(match &query.query {
             None | Some(proto::query::Query::All(_)) => Box::new(AllQuery),
             Some(proto::query::Query::Bool(boolean_query)) => {
@@ -180,7 +191,8 @@ impl QueryParser {
                     query_builder = query_builder.with_max_word_length(max_word_length.try_into().unwrap());
                 }
                 if let Some(ref boost) = more_like_this_query_proto.boost {
-                    query_builder = query_builder.with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as f32", boost)))?);
+                    query_builder = query_builder
+                        .with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as f32", boost)))?);
                 }
                 query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words.clone());
                 Box::new(query_builder.with_document_fields(field_values))
@@ -189,8 +201,13 @@ impl QueryParser {
     }
 
     pub fn parse_query(&self, query: &proto::Query) -> SummaResult<Box<dyn Query>> {
-        self.query_counter
-            .add(1, &[KeyValue::new("index_name", self.index_name.to_owned()), KeyValue::new("query", query.to_label())]);
+        self.query_counter.add(
+            1,
+            &[
+                KeyValue::new("index_name", self.index_name.to_owned()),
+                KeyValue::new("query", query.to_label()),
+            ],
+        );
         self.parse_subquery(query)
     }
 }

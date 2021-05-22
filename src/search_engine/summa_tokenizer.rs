@@ -99,7 +99,10 @@ pub mod tests {
     #[test]
     fn test_en_tokenizer() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
+        tokenizer_manager.register(
+            "tokenizer",
+            TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser),
+        );
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
@@ -117,7 +120,10 @@ pub mod tests {
     #[test]
     fn test_zh_tokenizer() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
+        tokenizer_manager.register(
+            "tokenizer",
+            TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser),
+        );
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
@@ -139,7 +145,10 @@ pub mod tests {
     #[test]
     fn test_zh_tokenizer_2() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
+        tokenizer_manager.register(
+            "tokenizer",
+            TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser),
+        );
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
@@ -168,7 +177,10 @@ pub mod tests {
     #[test]
     fn test_zh_tokenizer_3() {
         let tokenizer_manager = TokenizerManager::default();
-        tokenizer_manager.register("tokenizer", TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser));
+        tokenizer_manager.register(
+            "tokenizer",
+            TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(40)).filter(LowerCaser),
+        );
         let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {

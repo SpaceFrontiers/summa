@@ -1,0 +1,66 @@
+load("@pip_modules//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+
+package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "aiosumma",
+    srcs = glob(["aiosumma/**/*.py"]),
+    imports = [".", "summa/proto"],
+    srcs_version = "PY3",
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("aiogrpcclient"),
+        requirement("en_core_web_sm"),
+        requirement("izihawa_nlptools"),
+        requirement("orjson"),
+        requirement("ply"),
+        "//summa/proto:summa_py",
+    ],
+)
+
+py_binary(
+    name = "cli",
+    srcs = glob(["aiosumma/**/*.py"]),
+    main = "cli.py",
+    srcs_version = "PY3",
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("fire"),
+        ":aiosumma",
+    ],
+)
+
+py_wheel(
+    name = "aiosumma-wheel",
+    author = "Pasha Podolsky",
+    author_email = "ppodolsky@me.com",
+    classifiers = [
+        "Programming Language :: Python :: 3.9",
+        "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    ],
+    distribution = "aiosumma",
+    entry_points = {"console_scripts": ["summa-cli = aiosumma.cli:main"]},
+    homepage = "https://github.com/izihawa/aiosumma",
+    license = "MIT License",
+    python_requires = ">=3.6,<=3.9",
+    python_tag = "py3",
+    requires = [
+        "aiogrpcclient >= 1.0.4",
+        "fire >= 0.3.1",
+        "izihawa_nlptools >= 1.0.0",
+        "izihawa_types >= 0.1.2",
+        "orjson >= 3.6.8",
+        "ply >= 3.11",
+    ],
+    strip_path_prefixes = [
+        "summa/proto/summa_py_pb",
+        "aiosumma",
+    ],
+    version = "2.1.3",
+    deps = [
+        ":aiosumma",
+        "//summa/proto:summa_py",
+    ],
+)

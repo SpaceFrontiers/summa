@@ -1,0 +1,44 @@
+load("@crate_index//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cargo_build_script(
+    name = "proto_grpc_rust",
+    srcs = ["build.rs"],
+    build_script_env = {
+        "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
+    },
+    data = [
+        "//summa/proto",
+        "@com_google_protobuf//:protoc",
+        "@com_google_protobuf//:well_known_protos",
+    ],
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(build = True),
+    edition = "2021",
+)
+
+rust_library(
+    name = "summa",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    edition = "2021",
+    deps = all_crate_deps() + [":proto_grpc_rust"],
+)
+
+rust_binary(
+    name = "summa-server",
+    srcs = glob(["src/bin/**/*.rs"]),
+    edition = "2021",
+    deps = [":summa"],
+)
+
+rust_test(
+    name = "test",
+    crate = ":summa",
+    deps = all_crate_deps(normal_dev = True),
+)

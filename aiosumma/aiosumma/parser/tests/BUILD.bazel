@@ -1,0 +1,13 @@
+load("@pip_modules//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "tests",
+    srcs = glob(["**/*.py"]),
+    main = "test.py",
+    deps = [
+        requirement("pytest"),
+        "//aiosumma",
+    ],
+    legacy_create_init = False,
+)

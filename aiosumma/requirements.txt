@@ -1,0 +1,8 @@
+aiogrpcclient>=1.0.4
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.3.0/en_core_web_sm-3.3.0-py3-none-any.whl
+fire>=0.3.1
+izihawa_nlptools>=1.0.0
+izihawa_types>=0.1.2
+orjson>=3.6.8
+ply>=3.11
+pytest>=7.1.2

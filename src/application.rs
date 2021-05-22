@@ -10,7 +10,6 @@ use crate::utils::thread_handler::ControlMessage;
 use async_broadcast::Receiver;
 use clap::{arg, command};
 use futures::try_join;
-
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -150,7 +149,11 @@ mod tests {
         Ok((thread_handler, client))
     }
 
-    async fn create_index(index_api_client: &mut IndexApiClient<Channel>, index_name: &str, schema: &str) -> Result<tonic::Response<proto::CreateIndexResponse>, tonic::Status> {
+    async fn create_index(
+        index_api_client: &mut IndexApiClient<Channel>,
+        index_name: &str,
+        schema: &str,
+    ) -> Result<tonic::Response<proto::CreateIndexResponse>, tonic::Status> {
         index_api_client
             .create_index(tonic::Request::new(proto::CreateIndexRequest {
                 index_name: index_name.to_owned(),
@@ -202,7 +205,11 @@ mod tests {
 
         let (thread_handler_2, mut index_api_client_2) = create_client_server(root_path.path()).await?;
         assert_eq!(
-            index_api_client_2.get_indices(tonic::Request::new(proto::GetIndicesRequest {})).await.unwrap().into_inner(),
+            index_api_client_2
+                .get_indices(tonic::Request::new(proto::GetIndicesRequest {}))
+                .await
+                .unwrap()
+                .into_inner(),
             proto::GetIndicesResponse {
                 indices: vec![proto::Index {
                     index_name: "test_index".to_owned(),

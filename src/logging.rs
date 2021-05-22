@@ -24,7 +24,11 @@ fn create_writer(log_path: &PathBuf, name: &str, guards: &mut Vec<WorkerGuard>) 
 }
 
 pub fn default() {
-    let default_layer = fmt::layer().with_level(true).with_target(true).with_thread_names(true).with_filter(env_filter());
+    let default_layer = fmt::layer()
+        .with_level(true)
+        .with_target(true)
+        .with_thread_names(true)
+        .with_filter(env_filter());
     tracing_subscriber::registry().with(default_layer).init();
 }
 

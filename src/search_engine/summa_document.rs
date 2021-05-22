@@ -142,7 +142,8 @@ impl<'a> SummaDocument<'a> {
 
     /// Build a document object from a json-object.
     pub fn parse_document(&self, schema: &Schema, doc_json: &str) -> SummaResult<Document> {
-        let json_obj: serde_json::Map<String, JsonValue> = serde_json::from_str(doc_json).map_err(|_| DocumentParsingError::InvalidJson(doc_json.to_owned()))?;
+        let json_obj: serde_json::Map<String, JsonValue> =
+            serde_json::from_str(doc_json).map_err(|_| DocumentParsingError::InvalidJson(doc_json.to_owned()))?;
         self.json_object_to_doc(schema, json_obj)
     }
 

@@ -51,7 +51,11 @@ impl ApplicationConfig {
 
     /// Copy aliases for the index
     pub fn get_index_aliases_for_index(&self, index_name: &str) -> Vec<String> {
-        self.aliases.iter().filter(|(_, v)| *v == index_name).map(|(k, _)| k.clone()).collect::<Vec<String>>()
+        self.aliases
+            .iter()
+            .filter(|(_, v)| *v == index_name)
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<String>>()
     }
 
     /// Find index by alias
@@ -80,7 +84,12 @@ impl ApplicationConfig {
 
 impl std::fmt::Display for ApplicationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}\n{}", "Summa Config:".green().bold(), indent(&serde_yaml::to_string(&self).unwrap(), "  "),)
+        write!(
+            f,
+            "{}\n{}",
+            "Summa Config:".green().bold(),
+            indent(&serde_yaml::to_string(&self).unwrap(), "  "),
+        )
     }
 }
 
@@ -94,9 +103,15 @@ impl ApplicationConfigHolder {
         Ok(ApplicationConfigHolder::from_config_holder(application_config))
     }
     pub fn with_path<P: AsRef<Path>>(application_config: ApplicationConfig, application_config_filepath: P) -> ApplicationConfigHolder {
-        ApplicationConfigHolder(Arc::new(RwLock::new(ConfigHolder::file(application_config, application_config_filepath.as_ref()))))
+        ApplicationConfigHolder(Arc::new(RwLock::new(ConfigHolder::file(
+            application_config,
+            application_config_filepath.as_ref(),
+        ))))
     }
-    pub fn from_path_or<P: AsRef<Path>, F: FnOnce() -> ApplicationConfig>(application_config_filepath: P, application_config_fn: F) -> SummaResult<ApplicationConfigHolder> {
+    pub fn from_path_or<P: AsRef<Path>, F: FnOnce() -> ApplicationConfig>(
+        application_config_filepath: P,
+        application_config_fn: F,
+    ) -> SummaResult<ApplicationConfigHolder> {
         if application_config_filepath.as_ref().exists() {
             ApplicationConfigHolder::from_path(application_config_filepath)
         } else {
@@ -113,7 +128,9 @@ impl ApplicationConfigHolder {
 
 impl Default for ApplicationConfigHolder {
     fn default() -> Self {
-        ApplicationConfigHolder(Arc::new(RwLock::new(ConfigHolder::memory(ApplicationConfigBuilder::default().build().unwrap()))))
+        ApplicationConfigHolder(Arc::new(RwLock::new(ConfigHolder::memory(
+            ApplicationConfigBuilder::default().build().unwrap(),
+        ))))
     }
 }
 

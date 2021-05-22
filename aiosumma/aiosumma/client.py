@@ -16,7 +16,6 @@ from aiogrpcclient import (
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from summa.proto import consumer_service_pb2 as consumer_service_pb
-from summa.proto import index_pb2 as index_pb
 from summa.proto import index_service_pb2 as index_service_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
 from summa.proto import search_service_pb2 as search_service_pb
@@ -124,7 +123,7 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].alter_index(
             index_service_pb.AlterIndexRequest(
                 index_name=index_name,
-                compression=index_pb.Compression.Value(compression) if compression is not None else None,
+                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
                 sort_by_field=index_service_pb.SortByField(
                     field=sort_by_field[0],
                     order=sort_by_field[1],
@@ -180,7 +179,7 @@ class SummaClient(BaseGrpcClient):
                 default_fields=default_fields,
                 multi_fields=multi_fields,
                 stop_words=stop_words,
-                compression=index_pb.Compression.Value(compression) if compression is not None else None,
+                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
                 writer_heap_size_bytes=writer_heap_size_bytes,
                 writer_threads=writer_threads,
                 autocommit_interval_ms=autocommit_interval_ms,

@@ -16,7 +16,13 @@ pub struct SegmentEvalScorer {
 
 impl SegmentEvalScorer {
     #[inline]
-    pub fn for_segment(segment_reader: &SegmentReader, schema: &Schema, parser: &fasteval2::Parser, eval_expr: &str, var_names: &Vec<String>) -> SummaResult<SegmentEvalScorer> {
+    pub fn for_segment(
+        segment_reader: &SegmentReader,
+        schema: &Schema,
+        parser: &fasteval2::Parser,
+        eval_expr: &str,
+        var_names: &Vec<String>,
+    ) -> SummaResult<SegmentEvalScorer> {
         let mut slab = fasteval2::Slab::new();
 
         let mut namespace = |name: &str, args: Vec<f64>| -> Option<f64> {
@@ -55,7 +61,10 @@ impl SegmentEvalScorer {
                 slab.ps.add_unsafe_var(var_name.to_owned(), fast_fields_iterators.last().unwrap().value());
             }
         }
-        let compiled = parser.parse(eval_expr, &mut slab.ps)?.from(&slab.ps).compile(&slab.ps, &mut slab.cs, &mut namespace);
+        let compiled = parser
+            .parse(eval_expr, &mut slab.ps)?
+            .from(&slab.ps)
+            .compile(&slab.ps, &mut slab.cs, &mut namespace);
 
         Ok(SegmentEvalScorer {
             slab,

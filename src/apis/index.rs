@@ -110,7 +110,12 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
         Ok(Response::new(proto::GetIndicesResponse {
-            indices: self.index_service.index_holders().values().map(|index_holder| index_holder.deref().into()).collect(),
+            indices: self
+                .index_service
+                .index_holders()
+                .values()
+                .map(|index_holder| index_holder.deref().into())
+                .collect(),
         }))
     }
 

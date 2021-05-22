@@ -1,0 +1,19 @@
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@rules_proto_grpc//python:defs.bzl", "python_grpc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "proto",
+    srcs = glob([
+        "*.proto",
+    ]),
+    deps = [
+        "@com_google_protobuf//:empty_proto",
+    ],
+)
+
+python_grpc_library(
+    name = "summa_py",
+    protos = [":proto"],
+)

@@ -83,7 +83,11 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .default_fields(default_fields)
             .multi_fields(multi_fields)
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
-            .stop_words(if proto_request.stop_words.len() > 0 { Some(proto_request.stop_words) } else { None })
+            .stop_words(if proto_request.stop_words.len() > 0 {
+                Some(proto_request.stop_words)
+            } else {
+                None
+            })
             .autocommit_interval_ms(proto_request.autocommit_interval_ms)
             .writer_threads(proto_request.writer_threads)
             .writer_heap_size_bytes(proto_request.writer_heap_size_bytes)

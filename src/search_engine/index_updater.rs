@@ -27,7 +27,9 @@ fn process_message(
             let parsed_document = SummaDocument::BoundJsonBytes((schema, &index_document_operation.document))
                 .try_into()
                 .map_err(|e| KafkaConsumingError::ParseDocumentError(e))?;
-            index_writer_holder.index_document(parsed_document).map_err(|e| KafkaConsumingError::IndexError(e))?;
+            index_writer_holder
+                .index_document(parsed_document)
+                .map_err(|e| KafkaConsumingError::IndexError(e))?;
             Ok(KafkaConsumingStatus::Consumed)
         }
     }
@@ -47,7 +49,10 @@ impl IndexUpdater {
     pub(super) fn new(index: Index, index_name: &str, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexUpdater> {
         let index_config = index_config_proxy.read().get().clone();
         let index_writer_holder = Arc::new(IndexWriterHolder::new(
-            index.writer_with_num_threads(index_config.writer_threads.try_into().unwrap(), index_config.writer_heap_size_bytes.try_into().unwrap())?,
+            index.writer_with_num_threads(
+                index_config.writer_threads.try_into().unwrap(),
+                index_config.writer_heap_size_bytes.try_into().unwrap(),
+            )?,
             match index_config.primary_key {
                 Some(ref primary_key) => index.schema().get_field(primary_key).clone(),
                 None => None,
@@ -113,7 +118,14 @@ impl IndexUpdater {
     #[instrument(skip(self, consumer_config))]
     pub(crate) async fn create_consumer(&mut self, consumer_name: &str, consumer_config: &ConsumerConfig) -> SummaResult<()> {
         {
-            match self.index_config_proxy.write().autosave().get_mut().consumer_configs.entry(consumer_name.to_owned()) {
+            match self
+                .index_config_proxy
+                .write()
+                .autosave()
+                .get_mut()
+                .consumer_configs
+                .entry(consumer_name.to_owned())
+            {
                 Entry::Occupied(o) => Err(ValidationError::ExistingConsumerError(o.key().to_owned())),
                 Entry::Vacant(v) => {
                     v.insert(consumer_config.clone());

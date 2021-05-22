@@ -214,7 +214,12 @@ impl IndexService {
         let application_config = self.application_config.read();
         let mut result = Vec::new();
         for (index_name, index_config) in &application_config.indices {
-            result.extend(index_config.consumer_configs.keys().map(|consumer_name| (index_name.to_owned(), consumer_name.to_owned())))
+            result.extend(
+                index_config
+                    .consumer_configs
+                    .keys()
+                    .map(|consumer_name| (index_name.to_owned(), consumer_name.to_owned())),
+            )
         }
         Ok(result)
     }

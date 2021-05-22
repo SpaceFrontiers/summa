@@ -119,7 +119,12 @@ impl IndexHolder {
 
     /// Creates index and sets it up via `setup`
     #[instrument(skip_all, fields(index_name = index_name))]
-    pub(crate) async fn create(index_name: &str, schema: &Schema, index_config_proxy: IndexConfigProxy, index_settings: IndexSettings) -> SummaResult<IndexHolder> {
+    pub(crate) async fn create(
+        index_name: &str,
+        schema: &Schema,
+        index_config_proxy: IndexConfigProxy,
+        index_settings: IndexSettings,
+    ) -> SummaResult<IndexHolder> {
         let index = {
             let index_config = index_config_proxy.read();
             info!(action = "create", engine = ?index_config.get().index_engine, index_settings = ?index_settings);
@@ -204,7 +209,9 @@ impl IndexHolder {
             IndexEngine::Memory(_) => (),
             IndexEngine::File(ref index_path) => {
                 info!(action = "delete_directory");
-                remove_dir_all(index_path).await.map_err(|e| Error::IOError((e, Some(index_path.to_path_buf()))))?;
+                remove_dir_all(index_path)
+                    .await
+                    .map_err(|e| Error::IOError((e, Some(index_path.to_path_buf()))))?;
             }
         };
         Ok(())
@@ -381,7 +388,9 @@ pub(crate) mod tests {
         index_holder.index_updater().write().commit().await?;
         index_holder.index_reader().reload()?;
         assert_eq!(
-            index_holder.search(&match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "issued_at")]).await?,
+            index_holder
+                .search(&match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "issued_at")])
+                .await?,
             vec![top_docs_collector_result(
                 vec![
                     scored_doc(
@@ -389,7 +398,11 @@ pub(crate) mod tests {
                         110.0,
                         0
                     ),
-                    scored_doc("{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}", 100.0, 1)
+                    scored_doc(
+                        "{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}",
+                        100.0,
+                        1
+                    )
                 ],
                 false
             )]
@@ -400,7 +413,11 @@ pub(crate) mod tests {
                 .await?,
             vec![top_docs_collector_result(
                 vec![
-                    scored_doc("{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}", -100.0, 0),
+                    scored_doc(
+                        "{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}",
+                        -100.0,
+                        0
+                    ),
                     scored_doc(
                         "{\"body\":\"term1 term7 term8 term9 term10\",\"id\":2,\"issued_at\":110,\"title\":\"term2 term3\"}",
                         -110.0,

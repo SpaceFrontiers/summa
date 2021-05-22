@@ -11,7 +11,12 @@ pub struct CreateConsumerRequest {
 
 impl CreateConsumerRequest {
     pub fn from_proto(proto_request: &proto::CreateConsumerRequest) -> SummaResult<CreateConsumerRequest> {
-        let consumer_config = ConsumerConfig::new(&proto_request.bootstrap_servers, &proto_request.group_id, proto_request.threads, &proto_request.topics)?;
+        let consumer_config = ConsumerConfig::new(
+            &proto_request.bootstrap_servers,
+            &proto_request.group_id,
+            proto_request.threads,
+            &proto_request.topics,
+        )?;
         Ok(CreateConsumerRequest {
             consumer_name: proto_request.consumer_name.clone(),
             consumer_config,

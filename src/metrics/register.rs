@@ -11,7 +11,10 @@ pub fn register_meter(index_service: &IndexService) {
     meter.batch_observer(move |batch| {
         let index_service = index_service.clone();
         let documents_count = batch.u64_value_observer("documents_count").with_description("Documents count").init();
-        let deleted_documents_count = batch.u64_value_observer("deleted_documents_count").with_description("Deleted documents count").init();
+        let deleted_documents_count = batch
+            .u64_value_observer("deleted_documents_count")
+            .with_description("Deleted documents count")
+            .init();
 
         let deleted_memory_usage = batch
             .u64_value_observer("deleted_memory_usage")
