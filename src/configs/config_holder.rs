@@ -27,7 +27,10 @@ impl<'a, T: Persistable> AutosaveLockWriteGuard<'a, T> {
 
 impl<'a, T: Persistable> Drop for AutosaveLockWriteGuard<'a, T> {
     fn drop(&mut self) {
-        self.data.save().unwrap();
+        match self.data.save() {
+            Ok(_) | Err(Error::MissingPathError) => (),
+            Err(e) => panic!("{:?}", e),
+        };
     }
 }
 
@@ -83,15 +86,15 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> Loadable for ConfigHolder<TConfig
 
 impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
     fn save(&self) -> SummaResult<&Self> {
-        match self.config_filepath {
-            Some(ref config_filepath) => {
+        self.config_filepath
+            .as_ref()
+            .map(|config_filepath| {
                 std::fs::File::create(config_filepath)
                     .and_then(|mut file| file.write_all(&serde_yaml::to_vec(&self.config).unwrap()))
                     .map_err(|e| Error::IOError((e, Some(config_filepath.to_path_buf()))))?;
-            }
-            None => (),
-        };
-        Ok(self)
+                Ok(self)
+            })
+            .ok_or(Error::MissingPathError)?
     }
 }
 

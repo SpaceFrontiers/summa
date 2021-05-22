@@ -6,11 +6,11 @@ import fire
 from aiosumma import SummaClient
 
 
-async def client_cli(endpoint):
+async def client_cli(endpoint, format='yaml'):
     try:
         client = SummaClient(endpoint=endpoint, connection_timeout=3.0)
         await client.start_and_wait()
-        return client.get_interface()
+        return client.get_interface(format=format)
     except asyncio.exceptions.TimeoutError:
         # ToDo: process exception through fire.core.FireError
         print(traceback.format_exc())

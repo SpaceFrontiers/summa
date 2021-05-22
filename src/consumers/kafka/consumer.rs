@@ -25,32 +25,30 @@ impl Consumer {
     pub fn new(consumer_name: &str, config: &ConsumerConfig) -> SummaResult<Consumer> {
         let mut kafka_consumer_config = ClientConfig::new();
         kafka_consumer_config
-            .set("group.id", &config.group_id)
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
+            .set("group.id", &config.group_id)
             .set("enable.partition.eof", "false")
-            .set("session.timeout.ms", "6000")
-            .set("max.poll.interval.ms", "1800000")
+            .set("session.timeout.ms", config.session_timeout_ms.to_string())
+            .set("max.poll.interval.ms", config.max_poll_interval_ms.to_string())
             .set("auto.offset.reset", "earliest")
             .set("allow.auto.create.topics", "true");
 
         let mut kafka_producer_config = ClientConfig::new();
         kafka_producer_config.set("bootstrap.servers", config.bootstrap_servers.join(","));
 
-        let thread_controllers: SummaResult<Vec<ConsumerThread>> = (0..config.threads)
+        let consumer_threads: Vec<ConsumerThread> = (0..config.threads)
             .map(|n| {
                 let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create()?;
                 stream_consumer.subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
                 Ok(ConsumerThread::new(&format!("{}-{}", consumer_name, n), stream_consumer))
             })
-            .collect();
-
-        let thread_controllers = thread_controllers?;
+            .collect::<SummaResult<_>>()?;
 
         Ok(Consumer {
             consumer_name: consumer_name.to_owned(),
             config: config.clone(),
             kafka_producer_config,
-            consumer_threads: thread_controllers,
+            consumer_threads,
         })
     }
 

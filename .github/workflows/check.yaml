@@ -1,3 +1,5 @@
+# yamllint disable
+
 name: Check
 
 on: [ pull_request ]

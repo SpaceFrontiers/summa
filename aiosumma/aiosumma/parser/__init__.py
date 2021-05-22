@@ -1,5 +1,3 @@
-from .processor import (
-    QueryProcessor,
-)
+from .parser import default_parser
 
-__all__ = ['QueryProcessor']
+__all__ = ['default_parser']

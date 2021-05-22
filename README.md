@@ -1,16 +1,20 @@
 ![Maintenance](https://img.shields.io/badge/maintenance-activly--developed-brightgreen.svg)
+[![Crates.io](https://img.shields.io/crates/v/summa.svg)](https://crates.io/crates/summa)
+[![Docs](https://docs.rs/summa/badge.svg)](https://docs.rs/crate/summa/)
 
-# summa
+# Summa
 
-Fast full-text search server
+Fast full-text search server written in Rust with CLI and client library in Python.
+Index documents and do search queries through Python client, CLI and/or GRPC API
 
 ### Features
-- Simple GRPC API for managing multiple indices and search
-- Indexing documents through Kafka or directly
-- IPFS API for replication (oncoming)
+- Indexing documents directly through GRPC API or Kafka
+- Fine CLI and asynchronous client library [aiosumma](aiosumma/README.md) written in Python
+- Simple GRPC API for managing multiple indices and for search
+- Extendable query parsing. Add synonyms and build query context with Python library
+- Fast document ranking with custom and/or user-defined scoring functions
 - Tracing with [OpenTelemetry](https://github.com/open-telemetry/opentelemetry-rust) and exposing metrics in Prometheus format
-- Various configurable tokenizers (including CJK)
-- Fine CLI and client library written in Python
+- Reflection API for deep insights about text data
 
 ### Getting started
 - Look at [examples](src/examples/README.md)

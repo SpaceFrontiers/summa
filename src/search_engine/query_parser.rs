@@ -1,16 +1,24 @@
 use crate::errors::{Error, SummaResult};
+use crate::metrics::ToLabel;
 use crate::proto;
+use opentelemetry::metrics::Counter;
+use opentelemetry::{global, KeyValue};
 use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
 use tantivy::query::{AllQuery, BooleanQuery, BoostQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
-use tantivy::{Index, Term};
+use tantivy::{DateTime, Index, Term};
 
+/// Responsible for casting `crate::proto::Query` message to `tantivy::query::Query`
 pub struct QueryParser {
     cached_schema: Schema,
     index: Index,
+    index_name: String,
     nested_query_parser: tantivy::query::QueryParser,
+    // Counters
+    query_counter: Counter<u64>,
+    subquery_counter: Counter<u64>,
 }
 
 fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> SummaResult<Term> {
@@ -32,9 +40,9 @@ fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> Summ
             field,
             &base64::decode(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as bytes", value)))?,
         ),
-        FieldType::Date(_) => Term::from_field_f64(
+        FieldType::Date(_) => Term::from_field_date(
             field,
-            f64::from_str(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as date", value)))?,
+            DateTime::from_unix_timestamp(i64::from_str(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as date", value)))?),
         ),
         _ => return Err(Error::InvalidSyntaxError("invalid range type".to_owned()))?,
     })
@@ -55,12 +63,18 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
 }
 
 impl QueryParser {
-    pub fn for_index(index: &Index, default_fields: Vec<Field>) -> QueryParser {
+    pub fn for_index(index_name: &str, index: &Index, default_fields: Vec<Field>) -> QueryParser {
         let nested_query_parser = tantivy::query::QueryParser::for_index(index, default_fields);
+        let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
+        let subquery_counter = global::meter("summa").u64_counter("subquery_counter").with_description("Sub-queries counter").init();
+
         QueryParser {
             cached_schema: index.schema(),
             index: index.clone(),
+            index_name: index_name.to_owned(),
             nested_query_parser,
+            query_counter,
+            subquery_counter,
         }
     }
 
@@ -71,7 +85,9 @@ impl QueryParser {
         Ok((field, field_entry))
     }
 
-    pub fn parse_query(&self, query: &proto::Query) -> SummaResult<Box<dyn Query>> {
+    fn parse_subquery(&self, query: &proto::Query) -> SummaResult<Box<dyn Query>> {
+        self.subquery_counter
+            .add(1, &[KeyValue::new("index_name", self.index_name.to_owned()), KeyValue::new("query", query.to_label())]);
         Ok(match &query.query {
             None | Some(proto::query::Query::All(_)) => Box::new(AllQuery),
             Some(proto::query::Query::Bool(boolean_query)) => {
@@ -83,7 +99,7 @@ impl QueryParser {
                             Some(proto::Occur::Must) => Occur::Must,
                             Some(proto::Occur::MustNot) => Occur::MustNot,
                         },
-                        self.parse_query(subquery.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
+                        self.parse_subquery(subquery.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
                     ))
                 }
                 Box::new(BooleanQuery::new(subqueries))
@@ -91,7 +107,7 @@ impl QueryParser {
             Some(proto::query::Query::Match(match_query_proto)) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
                 Ok(parsed_query) => Ok(parsed_query),
                 Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::FieldDoesNotExistError(field)),
-                Err(e) => Err(Error::InvalidTantivySyntaxError((e, match_query_proto.value.to_owned()))),
+                Err(e) => Err(Error::InvalidTantivySyntaxError(e, match_query_proto.value.to_owned())),
             }?,
             Some(proto::query::Query::Range(range_query_proto)) => {
                 let (field, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
@@ -101,7 +117,7 @@ impl QueryParser {
                 Box::new(RangeQuery::new_term_bounds(field, field_entry.field_type().value_type(), &left, &right))
             }
             Some(proto::query::Query::Boost(boost_query_proto)) => Box::new(BoostQuery::new(
-                self.parse_query(boost_query_proto.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
+                self.parse_subquery(boost_query_proto.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
                 f32::from_str(&boost_query_proto.score).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as f32", boost_query_proto.score)))?,
             )),
             Some(proto::query::Query::Regex(regex_query_proto)) => {
@@ -163,12 +179,18 @@ impl QueryParser {
                 if let Some(max_word_length) = more_like_this_query_proto.max_word_length {
                     query_builder = query_builder.with_max_word_length(max_word_length.try_into().unwrap());
                 }
-                if let Some(boost_factor) = more_like_this_query_proto.boost_factor {
-                    query_builder = query_builder.with_boost_factor(boost_factor.try_into().unwrap());
+                if let Some(ref boost) = more_like_this_query_proto.boost {
+                    query_builder = query_builder.with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as f32", boost)))?);
                 }
                 query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words.clone());
                 Box::new(query_builder.with_document_fields(field_values))
             }
         })
+    }
+
+    pub fn parse_query(&self, query: &proto::Query) -> SummaResult<Box<dyn Query>> {
+        self.query_counter
+            .add(1, &[KeyValue::new("index_name", self.index_name.to_owned()), KeyValue::new("query", query.to_label())]);
+        self.parse_subquery(query)
     }
 }

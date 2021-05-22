@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Builder, Clone, Debug, Serialize, Deserialize)]
+#[builder(default)]
 pub struct GrpcConfig {
     pub endpoint: String,
     pub timeout_seconds: u64,

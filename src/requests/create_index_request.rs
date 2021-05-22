@@ -1,7 +1,7 @@
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use tantivy::schema::Schema;
-use tantivy::{IndexSortByField, Order};
+use tantivy::IndexSortByField;
 
 #[derive(Builder)]
 pub struct CreateIndexRequest {
@@ -10,6 +10,8 @@ pub struct CreateIndexRequest {
     pub schema: Schema,
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
+    #[builder(default = "tantivy::store::Compressor::None")]
+    pub compression: tantivy::store::Compressor,
     #[builder(default = "Vec::new()")]
     pub default_fields: Vec<String>,
     #[builder(default = "Vec::new()")]
@@ -26,56 +28,66 @@ pub struct CreateIndexRequest {
     pub writer_heap_size_bytes: Option<u64>,
 }
 
+impl CreateIndexRequest {
+    fn parse_schema(schema: &str) -> SummaResult<Schema> {
+        serde_yaml::from_str(schema).map_err(|_| Error::ValidationError(ValidationError::InvalidSchemaError(schema.to_owned())))
+    }
+
+    fn parse_default_fields(schema: &Schema, default_fields: &Vec<String>) -> SummaResult<Vec<String>> {
+        Ok(default_fields
+            .iter()
+            .map(|default_field_name| match schema.get_field(default_field_name) {
+                Some(_) => Ok(default_field_name.to_owned()),
+                None => Err(ValidationError::MissingDefaultField(default_field_name.to_owned())),
+            })
+            .collect::<Result<_, _>>()?)
+    }
+
+    fn parse_primary_key(schema: &Schema, primary_key: &Option<String>) -> SummaResult<Option<String>> {
+        Ok(match primary_key {
+            Some(primary_key) => Some(match schema.get_field(primary_key) {
+                Some(_) => primary_key.to_owned(),
+                None => Err(ValidationError::MissingPrimaryKeyError(Some(primary_key.to_owned())))?,
+            }),
+            None => None,
+        })
+    }
+}
+
 impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
     type Error = Error;
 
     fn try_from(proto_request: proto::CreateIndexRequest) -> SummaResult<CreateIndexRequest> {
-        let schema: Schema = serde_yaml::from_str(&proto_request.schema)?;
-        Ok(CreateIndexRequest {
-            index_name: proto_request.index_name.to_owned(),
-            index_engine: proto::IndexEngine::from_i32(proto_request.index_engine).unwrap(),
-            schema: schema.clone(),
-            primary_key: match proto_request.primary_key {
-                Some(primary_key) => Some(match schema.get_field(&primary_key) {
-                    Some(_) => primary_key.to_owned(),
-                    None => Err(ValidationError::MissingPrimaryKeyError(Some(primary_key.to_owned())))?,
-                }),
-                None => None,
-            },
-            default_fields: proto_request
-                .default_fields
-                .iter()
-                .map(|default_field_name| match schema.get_field(default_field_name) {
-                    Some(_) => Ok(default_field_name.to_owned()),
-                    None => Err(ValidationError::MissingDefaultField(default_field_name.to_owned())),
-                })
-                .collect::<Vec<Result<_, _>>>()
-                .into_iter()
-                .collect::<Result<_, _>>()?,
-            multi_fields: proto_request
-                .multi_fields
-                .iter()
-                .map(|multi_field_name| match schema.get_field(multi_field_name) {
-                    Some(_) => Ok(multi_field_name.to_owned()),
-                    None => Err(ValidationError::MissingMultiField(multi_field_name.to_owned())),
-                })
-                .collect::<Vec<Result<_, _>>>()
-                .into_iter()
-                .collect::<Result<_, _>>()?,
-            sort_by_field: match proto_request.sort_by_field {
-                Some(ref sort_by_field) => Some(IndexSortByField {
-                    field: sort_by_field.field.clone(),
-                    order: match proto::Order::from_i32(sort_by_field.order) {
-                        None | Some(proto::Order::Asc) => Order::Asc,
-                        Some(proto::Order::Desc) => Order::Desc,
-                    },
-                }),
-                None => None,
-            },
-            stop_words: if proto_request.stop_words.len() > 0 { Some(proto_request.stop_words) } else { None },
-            autocommit_interval_ms: proto_request.autocommit_interval_ms,
-            writer_threads: proto_request.writer_threads,
-            writer_heap_size_bytes: proto_request.writer_heap_size_bytes,
-        })
+        let schema = CreateIndexRequest::parse_schema(&proto_request.schema)?;
+        let default_fields = CreateIndexRequest::parse_default_fields(&schema, &proto_request.default_fields)?;
+        let primary_key = CreateIndexRequest::parse_primary_key(&schema, &proto_request.primary_key)?;
+        let compression = proto::Compression::from_i32(proto_request.compression)
+            .map(proto::Compression::into)
+            .unwrap_or(tantivy::store::Compressor::None);
+        let multi_fields = proto_request
+            .multi_fields
+            .iter()
+            .map(|multi_field_name| match schema.get_field(multi_field_name) {
+                Some(_) => Ok(multi_field_name.to_owned()),
+                None => Err(ValidationError::MissingMultiField(multi_field_name.to_owned())),
+            })
+            .collect::<Vec<Result<_, _>>>()
+            .into_iter()
+            .collect::<Result<_, _>>()?;
+        Ok(CreateIndexRequestBuilder::default()
+            .index_name(proto_request.index_name)
+            .index_engine(proto::IndexEngine::from_i32(proto_request.index_engine).unwrap())
+            .schema(schema.clone())
+            .primary_key(primary_key)
+            .compression(compression)
+            .default_fields(default_fields)
+            .multi_fields(multi_fields)
+            .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
+            .stop_words(if proto_request.stop_words.len() > 0 { Some(proto_request.stop_words) } else { None })
+            .autocommit_interval_ms(proto_request.autocommit_interval_ms)
+            .writer_threads(proto_request.writer_threads)
+            .writer_heap_size_bytes(proto_request.writer_heap_size_bytes)
+            .build()
+            .unwrap())
     }
 }

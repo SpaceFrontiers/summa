@@ -11,6 +11,8 @@
 .idea/**/usage.statistics.xml
 .idea/**/dictionaries
 .idea/**/shelf
+.DS_Store
+BUILD.bazel
 
 # AWS User-specific
 .idea/**/aws.xml

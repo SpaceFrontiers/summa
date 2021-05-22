@@ -9,7 +9,7 @@ use rdkafka::consumer::{CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 /// Long-living container for Kafka consuming thread
@@ -41,7 +41,7 @@ impl ConsumerThread {
         TProcessor: 'static + Fn(Result<BorrowedMessage<'_>, KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> + Send,
     {
         info!(action = "start");
-        let (shutdown_trigger, shutdown_tripwire) = oneshot::channel();
+        let (shutdown_trigger, mut shutdown_tripwire) = async_broadcast::broadcast(1);
 
         let stream_consumer = self.stream_consumer.clone();
         let thread_name = self.thread_name.clone();
@@ -51,7 +51,7 @@ impl ConsumerThread {
                 let stream = stream_consumer.stream();
                 let meter = global::meter("summa");
                 let counter = meter.u64_counter("consume").with_description("Number of consumed events").init();
-                let mut terminatable_stream = stream.take_until(shutdown_tripwire);
+                let mut terminatable_stream = stream.take_until(shutdown_tripwire.recv());
                 info!(action = "started");
                 loop {
                     match terminatable_stream.next().await {

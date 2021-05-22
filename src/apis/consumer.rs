@@ -25,11 +25,11 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     async fn create_consumer(&self, proto_request: Request<proto::CreateConsumerRequest>) -> Result<Response<proto::CreateConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let create_consumer_request = CreateConsumerRequest::from_proto(&proto_request)?;
-        self.index_service.create_consumer(&create_consumer_request).await?;
+        let index_name = self.index_service.create_consumer(&create_consumer_request).await?;
         let response = proto::CreateConsumerResponse {
             consumer: Some(proto::Consumer {
                 consumer_name: create_consumer_request.consumer_name.to_owned(),
-                index_name: create_consumer_request.index_name.to_owned(),
+                index_name,
             }),
         };
         Ok(Response::new(response))
@@ -37,11 +37,11 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
 
     async fn get_consumer(&self, proto_request: Request<proto::GetConsumerRequest>) -> Result<Response<proto::GetConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        self.index_service.get_consumer_config(&proto_request.index_name, &proto_request.consumer_name)?;
+        self.index_service.get_consumer_config(&proto_request.index_alias, &proto_request.consumer_name)?;
         let response = proto::GetConsumerResponse {
             consumer: Some(proto::Consumer {
                 consumer_name: proto_request.consumer_name.to_owned(),
-                index_name: proto_request.index_name.to_owned(),
+                index_name: proto_request.index_alias.to_owned(),
             }),
         };
         Ok(Response::new(response))

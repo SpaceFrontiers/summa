@@ -4,12 +4,14 @@ package summa.proto;
 import "summa/proto/index.proto";
 
 service IndexApi {
+  rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
   rpc create_index (CreateIndexRequest) returns (CreateIndexResponse) {}
   rpc delete_index (DeleteIndexRequest) returns (DeleteIndexResponse) {}
   rpc get_indices_aliases (GetIndicesAliasesRequest) returns (GetIndicesAliasesResponse) {}
   rpc get_index (GetIndexRequest) returns (GetIndexResponse) {}
   rpc get_indices (GetIndicesRequest) returns (GetIndicesResponse) {}
+  rpc index_bulk (IndexBulkRequest) returns (IndexBulkResponse) {}
   rpc index_document (IndexDocumentRequest) returns (IndexDocumentResponse) {}
   rpc merge_segments (MergeSegmentsRequest) returns (MergeSegmentsResponse) {}
   rpc set_index_alias (SetIndexAliasRequest) returns (SetIndexAliasResponse) {}
@@ -21,14 +23,23 @@ enum CommitMode {
   Sync = 1;
 }
 
-message CommitIndexRequest {
+message AlterIndexRequest {
   string index_name = 1;
+  optional Compression compression = 2;
+  optional SortByField sort_by_field = 3;
+}
+
+message AlterIndexResponse {
+  Index index = 1;
+}
+
+message CommitIndexRequest {
+  string index_alias = 1;
   CommitMode commit_mode = 2;
 }
 
 message CommitIndexResponse {
   optional uint64 opstamp = 1;
-  string status = 2;
 }
 
 enum Order {
@@ -45,7 +56,7 @@ message CreateIndexRequest {
   IndexEngine index_engine = 10;
   optional string primary_key = 3;
   repeated string default_fields = 4;
-  optional string compression = 5;
+  Compression compression = 5;
   optional uint64 writer_heap_size_bytes = 6;
   optional uint64 writer_threads = 7;
   optional uint64 autocommit_interval_ms = 8;
@@ -69,7 +80,7 @@ message GetIndicesAliasesResponse {
   map<string, string> indices_aliases = 1;
 }
 message GetIndexRequest {
-  string index_name = 1;
+  string index_alias = 1;
 }
 message GetIndexResponse {
   Index index = 1;
@@ -78,15 +89,23 @@ message GetIndicesRequest {}
 message GetIndicesResponse {
   repeated Index indices = 1;
 }
+message IndexBulkRequest {
+  string index_alias = 1;
+  repeated bytes documents = 2;
+}
+message IndexBulkResponse {
+  uint64 success_docs = 1;
+  uint64 failed_docs = 2;
+}
 message IndexDocumentRequest {
-  string index_name = 1;
+  string index_alias = 1;
   bytes document = 2;
 }
 message IndexDocumentResponse {
   uint64 opstamp = 1;
 }
 message MergeSegmentsRequest {
-  string index_name = 1;
+  string index_alias = 1;
   repeated string segment_ids = 2;
 }
 message MergeSegmentsResponse {}
@@ -98,8 +117,8 @@ message SetIndexAliasResponse {
   optional string old_index_name = 1;
 }
 message VacuumIndexRequest {
-  string index_name = 1;
+  string index_alias = 1;
 }
 message VacuumIndexResponse {
-  repeated string deleted_files = 1;
+  // repeated string deleted_files = 1;
 }

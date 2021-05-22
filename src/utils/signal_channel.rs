@@ -1,9 +1,11 @@
+use crate::utils::thread_handler::ControlMessage;
+use async_broadcast::{broadcast, Receiver};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::oneshot;
 use tokio::task;
 
-pub fn signal_channel() -> oneshot::Receiver<()> {
-    let (tx, rx) = oneshot::channel::<()>();
+/// Spawns a thread for processing `SignalKind` and returns `oneshot::Receiver` for a signal event
+pub fn signal_channel() -> Receiver<ControlMessage> {
+    let (sender, receiver) = broadcast::<ControlMessage>(1);
     task::spawn(async move {
         let mut sigint = signal(SignalKind::interrupt()).unwrap();
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
@@ -11,7 +13,7 @@ pub fn signal_channel() -> oneshot::Receiver<()> {
             _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
         }
-        tx.send(()).unwrap();
+        sender.broadcast(ControlMessage::Shutdown).await.unwrap()
     });
-    rx
+    receiver
 }

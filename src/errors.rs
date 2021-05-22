@@ -1,3 +1,4 @@
+use crate::search_engine::DocumentParsingError;
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
 use tantivy::schema::FieldType;
@@ -19,10 +20,12 @@ pub enum ValidationError {
     ExistingIndexError(String),
     #[error("existing_path_error: {0}")]
     ExistingPathError(PathBuf),
-    #[error("invalid_primary_key_type: {0:?}")]
-    InvalidPrimaryKeyType(FieldType),
     #[error("invalid_memory_error: {0}")]
     InvalidMemoryError(u64),
+    #[error("invalid_primary_key_type: {0:?}")]
+    InvalidPrimaryKeyType(FieldType),
+    #[error("invalid_schema_error: {0}")]
+    InvalidSchemaError(String),
     #[error("invalid_threads_number_error: {0}")]
     InvalidThreadsNumberError(u64),
     #[error("missing_consumer_error: {0}")]
@@ -51,8 +54,12 @@ pub enum Error {
     CanceledError,
     #[error("config_error: {0}")]
     ConfigError(config::ConfigError),
+    #[error("document_parsing_error: {0}")]
+    DocumentParsingError(crate::search_engine::DocumentParsingError),
     #[error("empty_query_error")]
     EmptyQueryError,
+    #[error("fast_eval_error: {0:?}")]
+    FastEvalError(fasteval2::Error),
     #[error("field_does_not_exist: {0}")]
     FieldDoesNotExistError(String),
     #[error("hyper_error: {0}")]
@@ -61,16 +68,20 @@ pub enum Error {
     Infallible,
     #[error("internal_error")]
     InternalError,
+    #[error("{0:?}: {1:?}")]
+    InvalidFieldTypeError(String, FieldType),
     #[error("{0:?}")]
     InvalidSyntaxError(String),
-    #[error("{0:?}")]
-    InvalidTantivySyntaxError((tantivy::query::QueryParserError, String)),
+    #[error("{0:?} for {1:?}")]
+    InvalidTantivySyntaxError(tantivy::query::QueryParserError, String),
     #[error("invalid_config_error: {0}")]
     InvalidConfigError(String),
     #[error("{0:?}")]
     IOError((std::io::Error, Option<PathBuf>)),
     #[error("{0}")]
     KafkaError(rdkafka::error::KafkaError),
+    #[error("missing_path_error")]
+    MissingPathError,
     #[error("parse_error: {0}")]
     ParseError(tantivy::schema::DocParsingError),
     #[error("tantivy_error: {0}")]
@@ -114,6 +125,12 @@ impl From<hyper::Error> for Error {
 impl From<rdkafka::error::KafkaError> for Error {
     fn from(error: rdkafka::error::KafkaError) -> Self {
         Error::KafkaError(error)
+    }
+}
+
+impl From<DocumentParsingError> for Error {
+    fn from(error: DocumentParsingError) -> Self {
+        Error::DocumentParsingError(error)
     }
 }
 
@@ -162,6 +179,12 @@ impl From<tokio::task::JoinError> for Error {
 impl From<tonic::transport::Error> for Error {
     fn from(error: tonic::transport::Error) -> Self {
         Error::TonicError(error)
+    }
+}
+
+impl From<fasteval2::Error> for Error {
+    fn from(error: fasteval2::Error) -> Self {
+        Error::FastEvalError(error)
     }
 }
 

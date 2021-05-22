@@ -3,6 +3,7 @@ use crate::proto;
 #[derive(Builder)]
 pub struct DeleteIndexRequest {
     pub index_name: String,
+    #[builder(default = "false")]
     pub cascade: bool,
 }
 

@@ -1,20 +1,20 @@
 //! HTTP server exposing metrics in Prometheus format
 
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::sync::Arc;
-
+use super::base::BaseServer;
 use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaResult;
-use crate::utils::signal_channel::signal_channel;
+use crate::utils::thread_handler::ControlMessage;
+use async_broadcast::Receiver;
 use hyper::{
     header::{HeaderValue, CONTENT_TYPE},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
-use opentelemetry::global;
 use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
+use std::convert::Infallible;
+use std::future::Future;
+use std::sync::Arc;
 use tracing::{info, info_span, instrument};
 
 lazy_static! {
@@ -22,9 +22,11 @@ lazy_static! {
 }
 
 pub struct MetricsServer {
-    addr: SocketAddr,
+    application_config: ApplicationConfigHolder,
     exporter: PrometheusExporter,
 }
+
+impl BaseServer for MetricsServer {}
 
 struct AppState {
     exporter: PrometheusExporter,
@@ -32,10 +34,13 @@ struct AppState {
 
 impl MetricsServer {
     pub fn new(application_config: &ApplicationConfigHolder) -> SummaResult<MetricsServer> {
-        let addr: SocketAddr = application_config.read().metrics.endpoint.parse()?;
-        let exporter = opentelemetry_prometheus::exporter().with_host(addr.ip().to_string()).with_port(addr.port()).init();
-        global::meter("summa");
-        Ok(MetricsServer { addr, exporter })
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_default_histogram_boundaries(vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0])
+            .init();
+        Ok(MetricsServer {
+            application_config: application_config.clone(),
+            exporter,
+        })
     }
     async fn serve_request(request: Request<Body>, state: Arc<AppState>) -> Result<Response<Body>, hyper::Error> {
         let _span = info_span!(
@@ -61,23 +66,26 @@ impl MetricsServer {
         Ok(response)
     }
 
-    #[instrument("lifecycle", skip(self))]
-    pub async fn start(&self) -> SummaResult<()> {
+    #[instrument("lifecycle", skip_all)]
+    pub fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
+        let metrics_config = self.application_config.read().metrics.clone();
         let state = Arc::new(AppState { exporter: self.exporter.clone() });
         let service = make_service_fn(move |_conn| {
             let state = state.clone();
             async move { Ok::<_, Infallible>(service_fn(move |request| MetricsServer::serve_request(request, state.clone()))) }
         });
 
-        let rx = signal_channel();
-        let server = Server::bind(&self.addr).serve(service);
-        info!(action = "starting", addr = ?self.addr);
-        let graceful = server.with_graceful_shutdown(async {
-            rx.await.ok();
+        let server = Server::bind(&metrics_config.endpoint.parse()?).serve(service);
+
+        let graceful = server.with_graceful_shutdown(async move {
+            terminator.recv().await.unwrap();
             info!(action = "sigterm_received");
         });
-        graceful.await?;
-        info!(action = "terminated");
-        Ok(())
+
+        Ok(async move {
+            graceful.await.unwrap();
+            info!(action = "terminated");
+            Ok(())
+        })
     }
 }

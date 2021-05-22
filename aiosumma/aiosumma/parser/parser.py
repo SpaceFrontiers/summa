@@ -3,11 +3,11 @@ import re
 
 import ply.lex as lex
 import ply.yacc as yacc
-from aiosumma.parser.errors import ParseError
-from aiosumma.parser.tree import (
+from aiosumma.parser.elements import (
     QUOTE_RE,
     QUOTES,
     Boost,
+    Doi,
     Fuzzy,
     Group,
     Minus,
@@ -19,6 +19,11 @@ from aiosumma.parser.tree import (
     SearchField,
     Word,
 )
+from aiosumma.parser.errors import ParseError
+from izihawa_nlptools.regex import (
+    DOI_REGEX_TEXT,
+    URL_REGEX_TEXT,
+)
 
 reserved = {
     'TO': 'TO',
@@ -28,7 +33,9 @@ reserved = {
 
 # tokens of our grammar
 tokens = (
-    ['TERM',
+    ['URL',
+     'DOI',
+     'TERM',
      'PHRASE',
      'REGEX',
      'APPROX',
@@ -72,6 +79,18 @@ precedence = (
 # Inspired by the original lucene parser:
 # https://github.com/apache/lucene-solr/blob/master/lucene/queryparser/src/java/org/apache/lucene/queryparser/surround/parser/QueryParser.jj#L189
 # We do allow the wildcards operators ('*' and '?') as our parser doesn't deal with them.
+
+URL_RE = fr'''
+(?P<url>
+  {URL_REGEX_TEXT}
+)
+'''
+
+DOI_RE = fr'''
+(?P<doi>
+  {DOI_REGEX_TEXT}
+)
+'''
 
 TERM_RE = fr'''
 (?P<term>  # group term
@@ -131,6 +150,19 @@ def t_IGNORE_MAD_COLUMNS(t):
 def t_SEPARATOR(t):
     r"""\s+"""
     pass  # discard separators
+
+
+@lex.TOKEN(URL_RE)
+def t_URL(t):
+    t.value = Word(t.value)
+    return t
+
+
+@lex.TOKEN(DOI_RE)
+def t_DOI(t):
+    doi_r = re.match(DOI_RE, t.value, re.VERBOSE)
+    t.value = Doi((doi_r[2] + '/' + doi_r[3]).lower())
+    return t
 
 
 @lex.TOKEN(TERM_RE)
@@ -209,7 +241,10 @@ def p_expression_unary(p):
 
 def p_grouping(p):
     """unary_expression : LPAREN expression RPAREN"""
-    p[0] = Group(p[2])  # Will p_field_search will transform as FieldGroup if necessary
+    if isinstance(p[2], Group):
+        p[0] = p[2]
+    else:
+        p[0] = Group(p[2])
 
 
 def p_range(p):
@@ -240,7 +275,9 @@ def p_boosting(p):
 
 
 def p_terms(p):
-    """unary_expression : TERM"""
+    """unary_expression : URL
+                        | DOI
+                        | TERM"""
     p[0] = p[1]
 
 

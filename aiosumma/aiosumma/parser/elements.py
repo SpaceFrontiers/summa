@@ -6,7 +6,7 @@ or get a tree as the result of parsing a query string.
 import re
 from decimal import Decimal
 
-from aiosumma.parser.errors import UnsupportedQueryError
+from aiosumma.errors import UnsupportedQueryError
 
 _MARKER = object()
 NON_DEFAULT_QUOTES = r''''“”‘«»„`'''
@@ -15,35 +15,17 @@ QUOTE_RE = re.compile(f'[{QUOTES}]')
 NON_DEFAULT_QUOTE_RE = re.compile(f'[{NON_DEFAULT_QUOTES}]')
 
 
-class Item(object):
+class Item:
     """Base class for all items that compose the parse tree.
     An item is a part of a request.
     """
-
-    # /!\ Note on Item (and subclasses) __magic__ methods: /!\
-    #
-    # Since we're dealing with recursive structures, we must avoid using
-    # the builtin helper methods when dealing with nested objects in
-    # __magic__ methods.
-    #
-    # As the helper usually calls the relevant method, we end up with two
-    # function calls instead of one, and end up hitting python's max recursion
-    # limit twice as fast!
-    #
-    # This is why we're calling c.__repr__ instead of repr(c) in the __repr__
-    # method. Same thing applies for all magic methods (__str__, __eq__, and any
-    # other we might add in the future).
 
     _equality_attrs = []
 
     @property
     def children(self):
         """As base of a tree structure, an item may have children"""
-        # empty by default
         return []
-
-    def __init__(self, final=False):
-        self.final = final
 
     def __repr__(self):
         children = ", ".join(c.__repr__() for c in self.children)
@@ -60,6 +42,9 @@ class Item(object):
                 )
                 and all(c.__eq__(d) for c, d in zip(self.children, other.children)))
 
+    def to_summa_query(self):
+        return {'match': {'value': str(self)}}
+
 
 class SearchField(Item):
     """Indicate wich field the search expression operates on
@@ -69,8 +54,8 @@ class SearchField(Item):
     """
     _equality_attrs = ['name']
 
-    def __init__(self, name, expr, final=False):
-        super().__init__(final=final)
+    def __init__(self, name, expr):
+        super().__init__()
         self.name = name
         self.expr = expr
 
@@ -80,15 +65,17 @@ class SearchField(Item):
     def __repr__(self):
         return "SearchField(%r, %s)" % (self.name, self.expr.__repr__())
 
-    def json(self):
+    def to_summa_query(self):
         if isinstance(self.expr, Range):
-            return {'range': {'field': self.name, 'value': self.expr.partial_json()}}
-        elif isinstance(self.expr, Word):
+            return {'range': {'field': self.name, 'value': self.expr.to_partial_summa_query()}}
+        elif isinstance(self.expr, (Doi, Word)):
             return {'term': {'field': self.name, 'value': self.expr.value}}
         elif isinstance(self.expr, Phrase):
             return {'phrase': {'field': self.name, 'value': self.expr.value}}
         elif isinstance(self.expr, Regex):
             return {'regex': {'field': self.name, 'value': self.expr.value}}
+        elif isinstance(self.expr, Proximity):
+            return {'phrase': {'field': self.name, 'value': self.expr.term, 'slop': self.expr.slop}}
         else:
             raise UnsupportedQueryError(error=f'{self.expr} in search field `{self.name}`')
 
@@ -104,22 +91,26 @@ class Group(Item):
     like OR and AND
     :param operands: expressions to apply operation on
     """
-    def __init__(self, *operands, final=False):
-        super().__init__(final=final)
+    def __init__(self, *operands):
+        super().__init__()
         self.operands = operands
 
     def __str__(self):
         return f'({" ".join(str(o) for o in self.operands)})'
 
-    def json(self):
+    def to_summa_query(self):
         subqueries = []
+        if not self.operands:
+            return {'all': {}}
         for operand in self.operands:
             if isinstance(operand, Plus):
-                subqueries.append({'occur': 'must', 'query': operand.a.json()})
+                subqueries.append({'occur': 'must', 'query': operand.a.to_summa_query()})
             elif isinstance(operand, Minus):
-                subqueries.append({'occur': 'must_not', 'query': operand.a.json()})
+                subqueries.append({'occur': 'must_not', 'query': operand.a.to_summa_query()})
             else:
-                subqueries.append({'occur': 'should', 'query': operand.json()})
+                query = operand.to_summa_query()
+                if query:
+                    subqueries.append({'occur': 'should', 'query': query})
         return {'bool': {'subqueries': subqueries}}
 
     @property
@@ -140,8 +131,8 @@ class Range(Item):
     LEFT_CHAR = {True: '[', False: '{'}
     RIGHT_CHAR = {True: ']', False: '}'}
 
-    def __init__(self, left, right, including_left=True, including_right=True, final=False):
-        super().__init__(final=final)
+    def __init__(self, left, right, including_left=True, including_right=True):
+        super().__init__()
         self.left = left
         self.right = right
         self.including_left = including_left
@@ -159,7 +150,7 @@ class Range(Item):
             self.right.__str__(),
             self.RIGHT_CHAR[self.including_right])
 
-    def partial_json(self):
+    def to_partial_summa_query(self):
         return {
             'left': str(self.left),
             'right': str(self.right),
@@ -179,8 +170,8 @@ class Term(Item):
 
     _equality_attrs = ['value']
 
-    def __init__(self, value, final=False):
-        super().__init__(final=final)
+    def __init__(self, value):
+        super().__init__()
         self.value = value
 
     @property
@@ -213,26 +204,21 @@ class Term(Item):
         return self.value
 
     def __repr__(self):
-        return "%s(%r)" % (self.__class__.__name__, str(self))
-
-    def json(self):
-        return {'match': {'value': str(self)}}
+        return "%s(%r)" % (self.__class__.__name__, self.value)
 
 
 class Word(Term):
-    """A single word term
-    :param str value: the value
-    """
-    def __init__(self, value, final=False):
-        super().__init__(value, final=final)
+    pass
+
+
+class Doi(Term):
+    pass
 
 
 class Phrase(Term):
     """A phrase term, that is a sequence of words enclose in quotes
     :param str value: the value, including the quotes. Eg. ``'"my phrase"'``
     """
-    def __init__(self, value, final=False):
-        super().__init__(value, final=final)
 
     def __str__(self):
         return f'"{self.value}"'
@@ -240,27 +226,13 @@ class Phrase(Term):
 
 class Regex(Term):
     """A regex term, that is a sequence of words enclose in slashes
-    :param str value: the value, including the slashes. Eg. ``'/my regex/'``
+    :param str value: the value, including without slashes
     """
-    def __init__(self, value, final=False):
-        super(Regex, self).__init__(value, final=final)
+    def __init__(self, value):
+        super(Regex, self).__init__(value)
 
     def __str__(self):
         return f'/{self.value}/'
-
-
-class Doi(Word):
-    """A DOI term
-    """
-    def __init__(self, value, final=False):
-        super().__init__(value, final=final)
-
-
-class Url(Word):
-    """A URL term
-    """
-    def __init__(self, value, final=False):
-        super().__init__(value, final=final)
 
 
 class BaseApprox(Item):
@@ -281,8 +253,8 @@ class Fuzzy(BaseApprox):
     :param Word term: the approximated term
     :param degree: the degree which will be converted to :py:class:`decimal.Decimal`.
     """
-    def __init__(self, term, degree=None, final=False):
-        super().__init__(final=final)
+    def __init__(self, term, degree=None):
+        super().__init__()
         self.term = term
         if degree is None:
             degree = 0.5
@@ -294,18 +266,18 @@ class Fuzzy(BaseApprox):
 
 class Proximity(BaseApprox):
     """Proximity search on phrase
-    :param Phrase term: the approximated phrase
-    :param degree: the degree which will be converted to :py:func:`int`.
+    :param phrase: the approximated phrase
+    :param slop: the degree which will be converted to :py:func:`int`.
     """
-    def __init__(self, term, degree=None, final=False):
-        super().__init__(final=final)
+    def __init__(self, term, slop=None):
+        super().__init__()
         self.term = term
-        if degree is None:
-            degree = 1
-        self.degree = int(degree)
+        if slop is None:
+            slop = 1
+        self.slop = int(slop)
 
     def __str__(self):
-        return "%s~" % self.term + ("%d" % self.degree if self.degree is not None else "")
+        return "%s~" % self.term + ("%d" % self.slop if self.slop is not None else "")
 
 
 class Boost(Item):
@@ -313,8 +285,8 @@ class Boost(Item):
     :param expr: the boosted expression
     :param force: boosting force, will be converted to :py:class:`decimal.Decimal`
     """
-    def __init__(self, expr, score, final=False):
-        super().__init__(final=final)
+    def __init__(self, expr, score):
+        super().__init__()
         self.expr = expr
         if score is None:
             score = 1.0
@@ -332,8 +304,8 @@ class Boost(Item):
     def __str__(self):
         return "%s^%s" % (self.expr.__str__(), self.score)
 
-    def json(self):
-        return {'boost': {'query': self.expr.json(), 'score': str(self.score)}}
+    def to_summa_query(self):
+        return {'boost': {'query': self.expr.to_summa_query(), 'score':  f'{round(self.score, 5)}'}}
 
 
 class Unary(Item):
@@ -341,15 +313,14 @@ class Unary(Item):
     :param a: the expression the operator applies on
     """
 
-    def __init__(self, a, final=False):
-        super().__init__(final=final)
+    def __init__(self, a):
         self.a = a
 
     def __str__(self):
         return "%s%s" % (self.op, self.a.__str__())
 
-    def json(self):
-        return {'bool': {'subqueries': [{'occur': 'should', 'query': self.a.json()}]}}
+    def to_summa_query(self):
+        return {'bool': {'subqueries': [{'occur': 'should', 'query': self.a.to_summa_query()}]}}
 
     @property
     def children(self):
@@ -361,8 +332,8 @@ class Plus(Unary):
     """
     op = "+"
 
-    def json(self):
-        return {'bool': {'subqueries': [{'occur': 'must', 'query': self.a.json()}]}}
+    def to_summa_query(self):
+        return {'bool': {'subqueries': [{'occur': 'must', 'query': self.a.to_summa_query()}]}}
 
 
 class Minus(Unary):
@@ -370,5 +341,5 @@ class Minus(Unary):
     """
     op = "-"
 
-    def json(self):
-        return {'bool': {'subqueries': [{'occur': 'must_not', 'query': self.a.json()}]}}
+    def to_summa_query(self):
+        return {'bool': {'subqueries': [{'occur': 'must_not', 'query': self.a.to_summa_query()}]}}

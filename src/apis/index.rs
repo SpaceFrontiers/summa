@@ -10,7 +10,8 @@ use crate::services::IndexService;
 use std::ops::Deref;
 use tantivy::SegmentId;
 use tonic::{Request, Response, Status};
-use tracing::warn;
+use tracing::{info_span, warn};
+use tracing_futures::Instrument;
 
 #[derive(Clone)]
 pub struct IndexApiImpl {
@@ -31,7 +32,7 @@ impl IndexApiImpl {
 impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn commit_index(&self, request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let request = request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&request.index_name)?;
+        let index_holder = self.index_service.get_index_holder(&request.index_alias)?;
         let index_updater = index_holder.index_updater();
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
@@ -44,19 +45,12 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                         },
                     }
                 });
-                Ok(Response::new(proto::CommitIndexResponse {
-                    opstamp: None,
-                    status: "ok".to_owned(),
-                }))
+                Ok(Response::new(proto::CommitIndexResponse { opstamp: None }))
             }
             Some(proto::CommitMode::Sync) => match index_updater.try_write() {
-                None => Ok(Response::new(proto::CommitIndexResponse {
-                    opstamp: None,
-                    status: "busy".to_owned(),
-                })),
+                None => Err(Status::failed_precondition("busy")),
                 Some(mut index_updater) => Ok(Response::new(proto::CommitIndexResponse {
                     opstamp: Some(index_updater.commit().await?),
-                    status: "ok".to_owned(),
                 })),
             },
         }
@@ -66,11 +60,32 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let request = request.into_inner();
         let opstamp = self
             .index_service
-            .get_index_holder(&request.index_name)?
+            .get_index_holder(&request.index_alias)?
             .index_updater()
             .read()
             .index_document(SummaDocument::UnboundJsonBytes(&request.document))?;
         let response = proto::IndexDocumentResponse { opstamp };
+        Ok(Response::new(response))
+    }
+
+    async fn index_bulk(&self, request: Request<proto::IndexBulkRequest>) -> Result<Response<proto::IndexBulkResponse>, Status> {
+        let request = request.into_inner();
+        let (success_docs, failed_docs) = self
+            .index_service
+            .get_index_holder(&request.index_alias)?
+            .index_updater()
+            .read()
+            .index_bulk(&request.documents);
+        let response = proto::IndexBulkResponse { success_docs, failed_docs };
+        Ok(Response::new(response))
+    }
+
+    async fn alter_index(&self, proto_request: Request<proto::AlterIndexRequest>) -> Result<Response<proto::AlterIndexResponse>, Status> {
+        let alter_index_request = proto_request.into_inner().try_into()?;
+        let index_holder = self.index_service.alter_index(alter_index_request).await?;
+        let response = proto::AlterIndexResponse {
+            index: Some(index_holder.deref().into()),
+        };
         Ok(Response::new(response))
     }
 
@@ -89,7 +104,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
         Ok(Response::new(proto::GetIndexResponse {
-            index: Some(self.index_service.get_index_holder(&proto_request.into_inner().index_name)?.deref().into()),
+            index: Some(self.index_service.get_index_holder(&proto_request.into_inner().index_alias)?.deref().into()),
         }))
     }
 
@@ -107,10 +122,17 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn merge_segments(&self, proto_request: Request<proto::MergeSegmentsRequest>) -> Result<Response<proto::MergeSegmentsResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_name)?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias)?;
         tokio::spawn(async move {
+            let index_name = index_holder.index_name();
             let segment_ids: Vec<_> = proto_request.segment_ids.iter().map(|x| SegmentId::from_uuid_string(x).unwrap()).collect();
-            index_holder.index_updater().write().merge(&segment_ids).await
+            index_holder
+                .index_updater()
+                .write()
+                .merge(&segment_ids)
+                .instrument(info_span!("merge", index_name = ?index_name))
+                .await
+                .unwrap()
         });
         let response = proto::MergeSegmentsResponse {};
         Ok(Response::new(response))
@@ -129,10 +151,18 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn vacuum_index(&self, proto_request: Request<proto::VacuumIndexRequest>) -> Result<Response<proto::VacuumIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let garbage_collection_result = self.index_service.vacuum_index(&proto_request.index_name).await?;
-        let response = proto::VacuumIndexResponse {
-            deleted_files: garbage_collection_result.deleted_files.iter().map(|x| x.to_string_lossy().to_string()).collect(),
-        };
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias)?;
+        tokio::spawn(async move {
+            let index_name = index_holder.index_name();
+            index_holder
+                .index_updater()
+                .write()
+                .vacuum()
+                .instrument(info_span!("vacuum", index_name = ?index_name))
+                .await
+                .unwrap();
+        });
+        let response = proto::VacuumIndexResponse {};
         Ok(Response::new(response))
     }
 }

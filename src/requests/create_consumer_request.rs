@@ -6,7 +6,7 @@ use crate::proto;
 pub struct CreateConsumerRequest {
     pub consumer_name: String,
     pub consumer_config: ConsumerConfig,
-    pub index_name: String,
+    pub index_alias: String,
 }
 
 impl CreateConsumerRequest {
@@ -15,7 +15,7 @@ impl CreateConsumerRequest {
         Ok(CreateConsumerRequest {
             consumer_name: proto_request.consumer_name.clone(),
             consumer_config,
-            index_name: proto_request.index_name.clone(),
+            index_alias: proto_request.index_alias.clone(),
         })
     }
 }

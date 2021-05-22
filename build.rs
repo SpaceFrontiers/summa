@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let original_path = canonicalize("proto").unwrap();
     create_dir_all(&proto_prefix).unwrap();
     symlink(original_path, proto_prefix.to_string() + "/proto").unwrap();
-    tonic_build::configure().compile(
+    tonic_build::configure().file_descriptor_set_path(out_dir.to_owned() + "/summa.bin").compile(
         &[
             "summa/proto/consumer.proto",
             "summa/proto/consumer_service.proto",

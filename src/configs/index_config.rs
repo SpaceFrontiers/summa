@@ -9,7 +9,6 @@ use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::PathBuf;
 use tantivy::schema::Schema;
-use tantivy::IndexSortByField;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum IndexEngine {
@@ -34,8 +33,6 @@ impl Debug for IndexEngine {
 pub struct IndexConfig {
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
-    #[builder(default = "tantivy::store::Compressor::Brotli")]
-    pub compression: tantivy::store::Compressor,
     #[builder(default = "HashMap::new()")]
     pub consumer_configs: HashMap<String, ConsumerConfig>,
     #[builder(default = "Vec::new()")]
@@ -46,8 +43,6 @@ pub struct IndexConfig {
     #[builder(default = "HashSet::new()")]
     pub multi_fields: HashSet<String>,
     #[builder(default = "None")]
-    pub sort_by_field: Option<IndexSortByField>,
-    #[builder(default = "None")]
     pub stop_words: Option<Vec<String>>,
     #[builder(default = "128 * 1024 * 1024")]
     pub writer_heap_size_bytes: u64,
@@ -55,8 +50,8 @@ pub struct IndexConfig {
     pub writer_threads: u64,
 }
 
-impl std::fmt::Debug for IndexConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl Debug for IndexConfig {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "{}", &serde_yaml::to_string(&self).unwrap())
     }
 }

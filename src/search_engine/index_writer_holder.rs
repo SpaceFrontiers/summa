@@ -1,9 +1,8 @@
 use crate::errors::SummaResult;
 use crate::errors::ValidationError;
 use crate::errors::ValidationError::MissingPrimaryKeyError;
-use tantivy::directory::GarbageCollectionResult;
 use tantivy::schema::{Field, FieldType};
-use tantivy::{Document, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
+use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
 use tracing::info;
 
 /// Managing write operations to index
@@ -26,6 +25,11 @@ impl IndexWriterHolder {
             }?
         }
         Ok(IndexWriterHolder { index_writer, primary_key })
+    }
+
+    /// Tantivy `Index`
+    pub(super) fn index(&self) -> &Index {
+        self.index_writer.index()
     }
 
     /// Put document to the index. Before comes searchable it must be committed
@@ -63,15 +67,5 @@ impl IndexWriterHolder {
         let result = self.index_writer.prepare_commit()?.commit_future().await;
         info!(action = "committed_index", result = ?result);
         Ok(result?)
-    }
-
-    /// Remove non-used files
-    ///
-    /// Basically, it dones automatically so there is no need to call it manually
-    pub(super) async fn garbage_collect_files(&self) -> SummaResult<GarbageCollectionResult> {
-        info!(action = "garbage_collect_files");
-        let result = self.index_writer.garbage_collect_files().await?;
-        info!(action = "garbage_collected_files", deleted_files = ?result.deleted_files);
-        Ok(result)
     }
 }

@@ -1,6 +1,10 @@
-from typing import List, Set, Tuple
+from typing import (
+    List,
+    Set,
+    Tuple,
+)
 
-from aiosumma.parser.tree_visitor import TreeTransformer
+from aiosumma.tree_visitor import TreeTransformer
 
 
 class ValuePredicateWordTransformer:
@@ -10,12 +14,8 @@ class ValuePredicateWordTransformer:
     def transform(self, node, context, parents, predicate_result):
         raise NotImplementedError()
 
-    def apply(self, node, context, parents):
-        if predicate_result := self.node_predicate(node):
-            return self.transform(node, context, parents, predicate_result)
 
-
-class ValueWordWordTransformer(ValuePredicateWordTransformer):
+class ValueWordTransformer(ValuePredicateWordTransformer):
     def __init__(self, node_value):
         if isinstance(node_value, (List, Set, Tuple)):
             node_value_set = set(node_value)
@@ -24,17 +24,17 @@ class ValueWordWordTransformer(ValuePredicateWordTransformer):
             self.predicate = lambda node: node.value == node_value
 
     def node_predicate(self, node):
-        return self.predicate(node.value)
+        return self.predicate(node)
 
 
-class ContextWordTransformer(ValueWordWordTransformer):
+class ContextWordTransformer(ValueWordTransformer):
     def __init__(self, node_value, context_transform):
         super().__init__(node_value=node_value)
         self.context_transform = context_transform
 
     def transform(self, node, context, parents, predicate_result):
         self.context_transform(context)
-        return node
+        return None
 
 
 class ValuesWordTransformer(TreeTransformer):
@@ -44,4 +44,6 @@ class ValuesWordTransformer(TreeTransformer):
 
     def visit_word(self, node, context, parents=None):
         for word_transformer in self.word_transformers:
-            word_transformer.apply(node, context, parents=parents)
+            if predicate_result := word_transformer.node_predicate(node):
+                return word_transformer.transform(node, context, parents, predicate_result), True
+        return node, False

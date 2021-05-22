@@ -1,25 +1,26 @@
 use crate::errors::SummaResult;
-use tokio::sync::oneshot;
+use async_broadcast::Sender;
 use tokio::task::JoinHandle;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ControlMessage {
     Shutdown,
 }
 
+/// Holds `JoinHandle` together with its `shutdown_trigger`
 #[derive(Debug)]
 pub struct ThreadHandler {
     join_handle: JoinHandle<SummaResult<()>>,
-    shutdown_trigger: oneshot::Sender<ControlMessage>,
+    shutdown_trigger: Sender<ControlMessage>,
 }
 
 impl ThreadHandler {
-    pub fn new(join_handle: JoinHandle<SummaResult<()>>, shutdown_trigger: oneshot::Sender<ControlMessage>) -> ThreadHandler {
+    pub fn new(join_handle: JoinHandle<SummaResult<()>>, shutdown_trigger: Sender<ControlMessage>) -> ThreadHandler {
         ThreadHandler { join_handle, shutdown_trigger }
     }
 
     pub async fn stop(self) -> SummaResult<()> {
-        self.shutdown_trigger.send(ControlMessage::Shutdown).unwrap();
+        self.shutdown_trigger.broadcast(ControlMessage::Shutdown).await.unwrap();
         self.join_handle.await?
     }
 }
