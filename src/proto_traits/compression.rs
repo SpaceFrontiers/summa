@@ -7,6 +7,7 @@ impl From<proto::Compression> for tantivy::store::Compressor {
             proto::Compression::Brotli => tantivy::store::Compressor::Brotli,
             proto::Compression::Lz4 => tantivy::store::Compressor::Lz4,
             proto::Compression::Snappy => tantivy::store::Compressor::Snappy,
+            proto::Compression::Zstd => tantivy::store::Compressor::Zstd,
         }
     }
 }
@@ -18,6 +19,7 @@ impl Into<proto::Compression> for tantivy::store::Compressor {
             tantivy::store::Compressor::Brotli => proto::Compression::Brotli,
             tantivy::store::Compressor::Lz4 => proto::Compression::Lz4,
             tantivy::store::Compressor::Snappy => proto::Compression::Snappy,
+            tantivy::store::Compressor::Zstd => proto::Compression::Zstd,
         }
     }
 }

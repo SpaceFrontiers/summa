@@ -9,7 +9,6 @@ use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader};
 /// `ReservoirSampling` collector collects `k` random documents using `O(k)` memory
 ///
 /// ```rust
-/// extern crate tantivy_nightly as tantivy;
 /// use summa::search_engine::collectors::ReservoirSampling;
 /// use tantivy::collector::Count;
 /// use tantivy::query::QueryParser;

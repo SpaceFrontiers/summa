@@ -1,8 +1,18 @@
 load("@crate_index//:defs.bzl", "aliases", "all_crate_deps")
+load("@io_bazel_rules_docker//container:container.bzl", "container_push")
+load("@io_bazel_rules_docker//rust:image.bzl", "rust_image")
 load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
+
+platform(
+    name = "x86_64_linux",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
 
 cargo_build_script(
     name = "proto_grpc_rust",
@@ -41,4 +51,20 @@ rust_test(
     name = "test",
     crate = ":summa",
     deps = all_crate_deps(normal_dev = True),
+)
+
+rust_image(
+    name = "summa-server-image",
+    srcs = glob(["src/bin/**/*.rs"]),
+    edition = "2021",
+    deps = [":summa"],
+)
+
+container_push(
+   name = "push-summa",
+   image = ":summa-server-image",
+   format = "Docker",
+   registry = "index.docker.io",
+   repository = "izihawa/summa-server",
+   tag = "latest",
 )

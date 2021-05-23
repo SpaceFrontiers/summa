@@ -50,7 +50,7 @@ impl Application {
             .subcommand_required(true)
             .arg_required_else_help(true)
             .about(LONG_ABOUT)
-            .version("0.5.0")
+            .version(option_env!("CARGO_PKG_VERSION").unwrap_or("master"))
             .author("Pasha Podolsky")
             .arg(arg!(-v --verbose ... "Level of verbosity"))
             .subcommand(command!("generate-config").about("Generate default config file"))

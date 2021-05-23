@@ -132,6 +132,7 @@ impl IndexService {
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression.clone(),
             sort_by_field: create_index_request.sort_by_field.clone(),
+            ..Default::default()
         };
         let owning_handler = OwningHandler::new(
             IndexHolder::create(
