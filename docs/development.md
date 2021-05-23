@@ -1,3 +1,8 @@
+---
+layout: page
+subtitle: Development
+permalink: /development
+---
 Summa is armed with both Cargo and Bazel build systems. 
 Feel free to use what is fit to you.
 
