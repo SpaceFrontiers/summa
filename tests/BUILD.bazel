@@ -1,0 +1,7 @@
+test_suite(
+    name = "tests",
+    tests = [
+        "//:test",
+        "//aiosumma/tests",
+    ],
+)

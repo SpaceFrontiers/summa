@@ -6,14 +6,6 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-platform(
-    name = "x86_64_linux",
-    constraint_values = [
-        "@platforms//os:linux",
-        "@platforms//cpu:x86_64",
-    ],
-)
-
 cargo_build_script(
     name = "proto_grpc_rust",
     srcs = ["build.rs"],
