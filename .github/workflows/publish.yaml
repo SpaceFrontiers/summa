@@ -3,7 +3,7 @@
 name: Release
 #on:
   #release: {}
-on: [ push, pull_request ]
+on: [ release ]
 env:
   CARGO_TERM_COLOR: always
 jobs:
@@ -13,7 +13,9 @@ jobs:
       - uses: actions/checkout@v3
       - uses: bazelbuild/setup-bazelisk@v2
       - name: Install Protoc
-        run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
+        uses: arduino/setup-protoc@v1
+      - name: Install Protobuf Headers
+        run: sudo apt-get install -y libprotobuf-dev
       - name: Mount bazel cache
         uses: actions/cache@v3
         with:
@@ -59,4 +61,4 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - run: DOCKER_CONFIG=/etc/docker bazel run -c opt //:push-summa
+      - run: DOCKER_CONFIG=$HOME/.docker bazel run -c opt //:push-summa

@@ -10,7 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Install Protoc
-        run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
+        uses: arduino/setup-protoc@v1
+      - name: Install Protobuf Headers
+        run: sudo apt-get install -y libprotobuf-dev
       - uses: bazelbuild/setup-bazelisk@v2
       - name: Mount bazel cache
         uses: actions/cache@v3
