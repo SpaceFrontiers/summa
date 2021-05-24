@@ -37,14 +37,14 @@ py_wheel(
     author = "Pasha Podolsky",
     author_email = "ppodolsky@me.com",
     classifiers = [
-        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
         "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
     ],
     distribution = "aiosumma",
     entry_points = {"console_scripts": ["summa-cli = aiosumma.cli:main"]},
     homepage = "https://github.com/izihawa/aiosumma",
     license = "MIT License",
-    python_requires = ">=3.6,<=3.9",
+    python_requires = ">=3.9",
     python_tag = "py3",
     requires = [
         "aiogrpcclient >= 1.0.4",
@@ -58,7 +58,7 @@ py_wheel(
         "summa/proto/summa_py_pb",
         "aiosumma",
     ],
-    version = "2.1.4",
+    version = "2.1.5",
     deps = [
         ":aiosumma",
         "//summa/proto:summa_py",
