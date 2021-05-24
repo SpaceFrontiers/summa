@@ -78,7 +78,7 @@ impl MetricsServer {
         });
 
         let server = Server::bind(&metrics_config.endpoint.parse()?).serve(service);
-
+        info!(action = "binded", endpoint = ?metrics_config.endpoint);
         let graceful = server.with_graceful_shutdown(async move {
             terminator.recv().await.unwrap();
             info!(action = "sigterm_received");

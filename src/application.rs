@@ -1,9 +1,8 @@
-use crate::configs::{ApplicationConfig, ApplicationConfigHolder};
+use crate::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, MetricsConfigBuilder};
 use crate::errors::SummaResult;
 use crate::logging;
 use crate::metrics::register_meter;
-use crate::servers::GrpcServer;
-use crate::servers::MetricsServer;
+use crate::servers::{GrpcServer, MetricsServer};
 use crate::services::IndexService;
 use crate::utils::signal_channel::signal_channel;
 use crate::utils::thread_handler::ControlMessage;
@@ -49,7 +48,21 @@ impl Application {
             .subcommand(
                 command!("generate-config")
                     .about("Generate default config file")
-                    .arg(arg!(-d <DATA_PATH> "Path for storing configs and data").required(false).takes_value(true)))
+                    .arg(arg!(-d <DATA_PATH> "Path for storing configs and data")
+                        .default_value("data")
+                        .required(false)
+                        .takes_value(true))
+                    .arg(
+                        arg!(-g <GRPC_ENDPOINT> "GRPC listen endpoint")
+                            .default_value("127.0.0.1:8082")
+                            .required(false)
+                            .takes_value(true))
+                    .arg(
+                        arg!(-m <METRICS_ENDPOINT> "Metrics listen endpoint")
+                            .default_value("127.0.0.1:8084")
+                            .required(false)
+                            .takes_value(true)),
+            )
             .subcommand(
                 command!("serve")
                     .about("Launch search server")
@@ -59,8 +72,16 @@ impl Application {
 
         match matches.subcommand() {
             Some(("generate-config", submatches)) => {
-                let data_path = Path::new(submatches.value_of("DATA_PATH").unwrap_or("data"));
-                let default_config = ApplicationConfig::new(data_path);
+                let data_path = Path::new(submatches.value_of("DATA_PATH").unwrap());
+                let grpc_endpoint = submatches.value_of("GRPC_ENDPOINT").unwrap();
+                let metrics_endpoint = submatches.value_of("METRICS_ENDPOINT").unwrap();
+                let default_config = ApplicationConfigBuilder::default()
+                    .data_path(data_path.join("bin"))
+                    .logs_path(data_path.join("logs"))
+                    .grpc(GrpcConfigBuilder::default().endpoint(grpc_endpoint.to_owned()).build().unwrap())
+                    .metrics(MetricsConfigBuilder::default().endpoint(metrics_endpoint.to_owned()).build().unwrap())
+                    .build()
+                    .unwrap();
                 println!("{}", serde_yaml::to_string(&default_config).unwrap());
                 Ok(())
             }
@@ -70,8 +91,7 @@ impl Application {
                 let _guards = {
                     let application_config = application_config_holder.read();
                     if application_config.debug {
-                        logging::default();
-                        vec![]
+                        logging::default()
                     } else {
                         logging::file(&application_config.log_path)
                     }

@@ -17,7 +17,8 @@ Prebuilt image: [izihawa/summa-server](https://hub.docker.com/repository/docker/
 
 ```bash
 # Generate config for `summa-server`
-docker run izihawa/summa-server generate-config -d /data
+docker run izihawa/summa-server generate-config -d /data \
+-g 0.0.0.0:8082 -m 0.0.0.0:8084 > summa.yaml
 # Launch with mounting
 
 ```

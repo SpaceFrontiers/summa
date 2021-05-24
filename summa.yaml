@@ -1,0 +1,13 @@
+---
+aliases: {}
+data_path: /Users/pasha/data/bin
+debug: true
+grpc:
+  endpoint: "0.0.0.0:8082"
+  timeout_seconds: 10
+  workers: 1
+indices: {}
+log_path: "/Users/pasha/data/logs"
+metrics:
+  endpoint: "0.0.0.0:8084"
+

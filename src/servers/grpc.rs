@@ -100,6 +100,7 @@ impl GrpcServer {
             .add_service(SearchApiServer::new(search_api));
 
         let listener = GrpcServer::set_listener(&grpc_config.endpoint)?;
+        info!(action = "binded", endpoint = ?grpc_config.endpoint);
         let server = async move {
             router
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {

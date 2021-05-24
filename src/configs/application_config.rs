@@ -1,7 +1,7 @@
 use super::ConfigHolder;
 use super::GrpcConfig;
 use super::MetricsConfig;
-use crate::configs::{IndexConfig, Loadable};
+use crate::configs::{GrpcConfigBuilder, IndexConfig, Loadable, MetricsConfigBuilder};
 use crate::errors::{Error, SummaResult, ValidationError};
 use colored::Colorize;
 use parking_lot::RwLock;
@@ -14,37 +14,37 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use textwrap::indent;
 
-#[derive(Builder, Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default)]
 pub struct ApplicationConfig {
     #[serde(default = "HashMap::new")]
     pub aliases: HashMap<String, String>,
+    #[builder(setter(custom))]
     pub data_path: PathBuf,
     pub debug: bool,
     pub grpc: GrpcConfig,
     #[serde(default = "HashMap::new")]
     pub indices: HashMap<String, IndexConfig>,
+    #[builder(setter(custom))]
     pub log_path: PathBuf,
     pub metrics: MetricsConfig,
 }
 
-impl ApplicationConfig {
-    pub fn new<P>(data_path: P) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        let data_path = Absolutize::absolutize(data_path.as_ref()).unwrap();
+impl Default for ApplicationConfig {
+    fn default() -> Self {
         ApplicationConfig {
             aliases: HashMap::new(),
-            data_path: data_path.join("bin"),
+            data_path: PathBuf::new(),
             debug: true,
-            grpc: GrpcConfig::default(),
+            grpc: GrpcConfigBuilder::default().build().unwrap(),
             indices: HashMap::new(),
-            log_path: data_path.join("logs"),
-            metrics: MetricsConfig::default(),
+            log_path: PathBuf::new(),
+            metrics: MetricsConfigBuilder::default().build().unwrap()
         }
     }
+}
 
+impl ApplicationConfig {
     pub fn get_path_for_index_data(&self, index_name: &str) -> PathBuf {
         self.data_path.join(index_name)
     }
@@ -81,6 +81,19 @@ impl ApplicationConfig {
         }
     }
 }
+
+impl ApplicationConfigBuilder {
+    pub fn data_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self {
+        self.data_path = Some(Absolutize::absolutize(value.as_ref()).unwrap().to_path_buf());
+        self
+    }
+
+    pub fn logs_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self  {
+        self.data_path = Some(Absolutize::absolutize(value.as_ref()).unwrap().to_path_buf());
+        self
+    }
+}
+
 
 impl std::fmt::Display for ApplicationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
