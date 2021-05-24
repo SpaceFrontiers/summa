@@ -17,6 +17,7 @@ from aiosumma.parser.elements import (
     Range,
     Regex,
     SearchField,
+    Url,
     Word,
 )
 from aiosumma.parser.errors import ParseError
@@ -154,7 +155,7 @@ def t_SEPARATOR(t):
 
 @lex.TOKEN(URL_RE)
 def t_URL(t):
-    t.value = Word(t.value)
+    t.value = Url(t.value)
     return t
 
 

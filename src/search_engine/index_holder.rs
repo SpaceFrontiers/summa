@@ -226,7 +226,7 @@ impl IndexHolder {
             .iter()
             .map(|collector_proto| build_fruit_extractor(collector_proto, &self.cached_schema, &mut multi_collector))
             .collect::<SummaResult<_>>()?;
-        info!(target: "query", index_name = ?self.index_name, query = ?parsed_query);
+        info!(target: "query", index_name = ?self.index_name);
         let multi_fields = self.multi_fields.clone();
         let index_name = self.index_name.to_owned();
 

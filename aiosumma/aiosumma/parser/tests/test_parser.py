@@ -10,6 +10,7 @@ from aiosumma.parser.elements import (
     Proximity,
     Regex,
     SearchField,
+    Url,
     Word,
 )
 from aiosumma.parser.errors import ParseError
@@ -116,3 +117,8 @@ def test_proximity():
 def test_doi():
     parsed_query = default_parser.parse('10.1385/nmm:9:1:17')
     assert parsed_query == Doi('10.1385/nmm:9:1:17')
+
+
+def test_url():
+    parsed_query = default_parser.parse('https://doi.org/10.1101/2022.05.26.493559')
+    assert parsed_query == Url('https://doi.org/10.1101/2022.05.26.493559')

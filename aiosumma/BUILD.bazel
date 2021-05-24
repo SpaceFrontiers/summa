@@ -58,7 +58,7 @@ py_wheel(
         "summa/proto/summa_py_pb",
         "aiosumma",
     ],
-    version = "2.1.5",
+    version = "2.1.6",
     deps = [
         ":aiosumma",
         "//summa/proto:summa_py",

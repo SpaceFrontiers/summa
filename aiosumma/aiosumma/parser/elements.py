@@ -68,7 +68,7 @@ class SearchField(Item):
     def to_summa_query(self):
         if isinstance(self.expr, Range):
             return {'range': {'field': self.name, 'value': self.expr.to_partial_summa_query()}}
-        elif isinstance(self.expr, (Doi, Word)):
+        elif isinstance(self.expr, Word):
             return {'term': {'field': self.name, 'value': self.expr.value}}
         elif isinstance(self.expr, Phrase):
             return {'phrase': {'field': self.name, 'value': self.expr.value}}
@@ -211,7 +211,11 @@ class Word(Term):
     pass
 
 
-class Doi(Term):
+class Doi(Word):
+    pass
+
+
+class Url(Word):
     pass
 
 
