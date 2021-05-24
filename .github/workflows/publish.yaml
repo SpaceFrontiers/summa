@@ -1,9 +1,9 @@
 # yamllint disable
 
 name: Release
-#on:
-  #release: {}
-on: [ release ]
+on:
+  release:
+    types: [ published ]
 env:
   CARGO_TERM_COLOR: always
 jobs:
@@ -62,3 +62,21 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - run: DOCKER_CONFIG=$HOME/.docker bazel run -c opt //:push-summa-server
+  twine-upload:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2.4.0
+      - uses: actions/checkout@v3
+      - uses: bazelbuild/setup-bazelisk@v2
+      - name: Mount bazel cache
+        uses: actions/cache@v3
+        with:
+          path: "~/.cache/bazel"
+          key: bazel
+      - uses: actions/setup-python@v1
+      - uses: BSFishy/pip-action@v1
+        with:
+          packages: |
+            twine
+      - run: bazel build -c opt //aiosumma:aiosumma-wheel && twine upload bazel-bin/aiosumma/*.whl
