@@ -79,4 +79,4 @@ jobs:
         with:
           packages: |
             twine
-      - run: bazel build -c opt //aiosumma:aiosumma-wheel && twine upload bazel-bin/aiosumma/*.whl
+      - run: bazel build -c opt //aiosumma:aiosumma-wheel && TWINE_USERNAME=${{ secrets.TWINE_USERNAME }} TWINE_PASSWORD=${{ secrets.TWINE_PASSWORD }} twine upload bazel-bin/aiosumma/*.whl

@@ -4,9 +4,9 @@ subtitle: Quick Start
 permalink: /quick-start
 ---
 ## Table of Contents
-1. [Setup](#setup)
-2. [Fill With Documents](#fill)
-3. [Query](#query)
+- [Setup](#setup)
+- [Fill With Documents](#fill)
+- [Query](#query)
 
 ### Setup <a name="setup"></a>
 Both server and client are distributed through the package systems, `Cargo` and `pip`.
