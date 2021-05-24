@@ -1,4 +1,4 @@
-use crate::errors::{Error, SummaResult};
+use crate::errors::{Error, SummaResult, ValidationError};
 use config::{Config, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -28,7 +28,7 @@ impl<'a, T: Persistable> AutosaveLockWriteGuard<'a, T> {
 impl<'a, T: Persistable> Drop for AutosaveLockWriteGuard<'a, T> {
     fn drop(&mut self) {
         match self.data.save() {
-            Ok(_) | Err(Error::MissingPathError) => (),
+            Ok(_) | Err(Error::ValidationError(ValidationError::MissingPathError(_))) => (),
             Err(e) => panic!("{:?}", e),
         };
     }
@@ -72,6 +72,9 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> ConfigHolder<TConfig> {
 impl<'a, TConfig: Serialize + Deserialize<'a>> Loadable for ConfigHolder<TConfig> {
     fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<ConfigHolder<TConfig>> {
         let mut s = Config::builder();
+        if !config_filepath.exists() {
+            Err(ValidationError::MissingPathError(config_filepath.to_path_buf()))?;
+        }
         if config_filepath.exists() {
             s = s.add_source(File::from(config_filepath));
         }
@@ -94,7 +97,7 @@ impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
                     .map_err(|e| Error::IOError((e, Some(config_filepath.to_path_buf()))))?;
                 Ok(self)
             })
-            .ok_or(Error::MissingPathError)?
+            .unwrap()
     }
 }
 

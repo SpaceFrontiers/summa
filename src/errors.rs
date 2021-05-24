@@ -37,7 +37,7 @@ pub enum ValidationError {
     #[error("missing_multi_field_error: {0}")]
     MissingMultiField(String),
     #[error("missing_path_error: {0}")]
-    MissingPathError(String),
+    MissingPathError(PathBuf),
     #[error("missing_primary_key_error: {0:?}")]
     MissingPrimaryKeyError(Option<String>),
     #[error("utf8_error: {0}")]
@@ -55,7 +55,7 @@ pub enum Error {
     #[error("config_error: {0}")]
     ConfigError(config::ConfigError),
     #[error("document_parsing_error: {0}")]
-    DocumentParsingError(crate::search_engine::DocumentParsingError),
+    DocumentParsingError(DocumentParsingError),
     #[error("empty_query_error")]
     EmptyQueryError,
     #[error("fast_eval_error: {0:?}")]
@@ -80,8 +80,6 @@ pub enum Error {
     IOError((std::io::Error, Option<PathBuf>)),
     #[error("{0}")]
     KafkaError(rdkafka::error::KafkaError),
-    #[error("missing_path_error")]
-    MissingPathError,
     #[error("parse_error: {0}")]
     ParseError(tantivy::schema::DocParsingError),
     #[error("tantivy_error: {0}")]

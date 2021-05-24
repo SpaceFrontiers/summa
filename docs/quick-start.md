@@ -14,9 +14,12 @@ Also, there is a prebuilt `summa-server` Docker image hosted on
 
 ### Docker Way
 Prebuilt image: [izihawa/summa-server](https://hub.docker.com/repository/docker/izihawa/summa-server)
+
 ```bash
-# Launch `summa-server`
-docker run izihawa/summa-server
+# Generate config for `summa-server`
+docker run izihawa/summa-server generate-config -d /data
+# Launch with mounting
+
 ```
 
 ### Native
