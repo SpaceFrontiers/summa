@@ -1,4 +1,5 @@
 import pytest
+
 from aiosumma.parser import default_parser
 from aiosumma.parser.elements import (
     Boost,

@@ -3,6 +3,11 @@ import re
 
 import ply.lex as lex
 import ply.yacc as yacc
+from izihawa_nlptools.regex import (
+    DOI_REGEX_TEXT,
+    URL_REGEX_TEXT,
+)
+
 from aiosumma.parser.elements import (
     QUOTE_RE,
     QUOTES,
@@ -21,10 +26,6 @@ from aiosumma.parser.elements import (
     Word,
 )
 from aiosumma.parser.errors import ParseError
-from izihawa_nlptools.regex import (
-    DOI_REGEX_TEXT,
-    URL_REGEX_TEXT,
-)
 
 reserved = {
     'TO': 'TO',

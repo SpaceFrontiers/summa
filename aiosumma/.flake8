@@ -1,0 +1,11 @@
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    venv,
+    build,
+    dist,
+    *_pb2.py,
+    *_pb2_grpc.py
+ignore = I, W503
+max-line-length = 140

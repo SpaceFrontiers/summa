@@ -1,7 +1,8 @@
-from aiosumma.context import QueryContext
-from aiosumma.parser import default_parser
 from izihawa_nlptools.language_detect import detect_language
 from izihawa_nlptools.utils import despace_full
+
+from aiosumma.context import QueryContext
+from aiosumma.parser import default_parser
 
 
 class ProcessedQuery:

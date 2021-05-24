@@ -1,5 +1,6 @@
 from aiosumma import QueryProcessor
 from aiosumma.transformers import (
+    DoiTransformer,
     ExactMatchTransformer,
     MorphyTransformer,
     OptimizingTransformer,
@@ -124,3 +125,17 @@ def test_exact_match_transformers():
             'phrase': {'field': 'title', 'value': 'search engine'}}, 'score': '1.00000'}}
          }
     ]}}
+
+
+def test_doi_transformer():
+    query_processor = QueryProcessor(
+        transformers=[
+            DoiTransformer(),
+        ]
+    )
+    processed_query = query_processor.process('https://doi.org/10.1101/2022.05.26.493559', 'en')
+    assert processed_query.to_summa_query() == {'term': {'field': 'doi', 'value': '10.1101/2022.05.26.493559/10.1101'}}
+    processed_query = query_processor.process('https://google.com/?query=one+two+three', 'en')
+    assert processed_query.to_summa_query() == {'match': {'value': 'https://google.com/?query=one+two+three'}}
+    processed_query = query_processor.process('https://doi.org/10.1101', 'en')
+    assert processed_query.to_summa_query() == {'match': {'value': 'https://doi.org/10.1101'}}

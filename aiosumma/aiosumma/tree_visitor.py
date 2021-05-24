@@ -1,4 +1,7 @@
-from typing import Optional, Tuple
+from typing import (
+    Optional,
+    Tuple,
+)
 
 from izihawa_utils.text import camel_to_snake
 

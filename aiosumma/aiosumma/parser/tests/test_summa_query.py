@@ -1,4 +1,5 @@
 import pytest
+
 from aiosumma.errors import UnsupportedQueryError
 from aiosumma.parser import default_parser
 

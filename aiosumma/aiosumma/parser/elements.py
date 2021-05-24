@@ -309,7 +309,7 @@ class Boost(Item):
         return "%s^%s" % (self.expr.__str__(), self.score)
 
     def to_summa_query(self):
-        return {'boost': {'query': self.expr.to_summa_query(), 'score':  f'{round(self.score, 5)}'}}
+        return {'boost': {'query': self.expr.to_summa_query(), 'score': f'{round(self.score, 5)}'}}
 
 
 class Unary(Item):

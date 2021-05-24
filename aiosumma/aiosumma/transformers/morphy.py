@@ -1,10 +1,11 @@
+from izihawa_nlptools.morph import EnglishMorphology
+
 from aiosumma.parser.elements import (
     Boost,
     Group,
     Word,
 )
 from aiosumma.tree_visitor import TreeTransformer
-from izihawa_nlptools.morph import EnglishMorphology
 
 
 class MorphyTransformer(TreeTransformer):
