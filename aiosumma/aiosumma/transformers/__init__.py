@@ -1,4 +1,7 @@
-from .doi import DoiTransformer
+from .doi import (
+    DoiTransformer,
+    DoiWildcardWordTransformer,
+)
 from .exact_match import ExactMatchTransformer
 from .field import FieldTransformer
 from .morphy import MorphyTransformer
@@ -12,7 +15,8 @@ from .values import (
     ValueWordTransformer,
 )
 
-__all__ = ['DoiTransformer', 'ContextWordTransformer', 'ExactMatchTransformer', 'FieldTransformer', 'MorphyTransformer',
+__all__ = ['DoiTransformer', 'DoiWildcardWordTransformer',
+           'ContextWordTransformer', 'ExactMatchTransformer', 'FieldTransformer', 'MorphyTransformer',
            'OptimizingTransformer', 'OrderByTransformer',
            'ValuePredicateWordTransformer', 'ValueWordTransformer', 'ValuesWordTransformer',
            'TantivyTransformer']
