@@ -29,7 +29,7 @@ class DoiTransformer(TreeTransformer):
     def visit_url(self, node, context, parents):
         if match := re.search(DOI_REGEX, node.value):
             if parents is None or len(parents) == 0 or isinstance(parents[-1], Group):
-                doi = (match[0] + '/' + match[1]).lower()
+                doi = (match[1] + '/' + match[2]).lower()
                 context.dois.append(doi)
                 context.is_exploration = False
                 return SearchField('doi', Doi(doi)), True
