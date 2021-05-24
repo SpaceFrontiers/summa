@@ -46,7 +46,10 @@ impl Application {
             .version(option_env!("CARGO_PKG_VERSION").unwrap_or("master"))
             .author("Pasha Podolsky")
             .arg(arg!(-v --verbose ... "Level of verbosity"))
-            .subcommand(command!("generate-config").about("Generate default config file"))
+            .subcommand(
+                command!("generate-config")
+                    .about("Generate default config file")
+                    .arg(arg!(-d <DATA_PATH> "Path for storing configs and data").required(false).takes_value(true)))
             .subcommand(
                 command!("serve")
                     .about("Launch search server")
@@ -55,8 +58,9 @@ impl Application {
             .get_matches();
 
         match matches.subcommand() {
-            Some(("generate-config", _)) => {
-                let default_config = ApplicationConfig::new("data");
+            Some(("generate-config", submatches)) => {
+                let data_path = Path::new(submatches.value_of("DATA_PATH").unwrap_or("data"));
+                let default_config = ApplicationConfig::new(data_path);
                 println!("{}", serde_yaml::to_string(&default_config).unwrap());
                 Ok(())
             }

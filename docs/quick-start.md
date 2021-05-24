@@ -8,10 +8,20 @@ permalink: /quick-start
 - [Fill With Documents](#fill)
 - [Query](#query)
 
-### Setup <a name="setup"></a>
+## Setup <a name="setup"></a>
 Both server and client are distributed through the package systems, `Cargo` and `pip`.
 Also, there is a prebuilt `summa-server` Docker image hosted on
 
-### Configure Cargo
-### Fill With Documents <a name="fill"></a>
-### Query <a name="query"></a>
+### Docker Way
+Prebuilt image: [izihawa/summa-server](https://hub.docker.com/repository/docker/izihawa/summa-server)
+```bash
+# Launch `summa-server`
+docker run izihawa/summa-server
+```
+
+### Native
+
+#### Configure Cargo
+
+## Fill With Documents <a name="fill"></a>
+## Query <a name="query"></a>
