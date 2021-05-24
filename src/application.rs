@@ -48,20 +48,24 @@ impl Application {
             .subcommand(
                 command!("generate-config")
                     .about("Generate default config file")
-                    .arg(arg!(-d <DATA_PATH> "Path for storing configs and data")
-                        .default_value("data")
-                        .required(false)
-                        .takes_value(true))
+                    .arg(
+                        arg!(-d <DATA_PATH> "Path for storing configs and data")
+                            .default_value("data")
+                            .required(false)
+                            .takes_value(true),
+                    )
                     .arg(
                         arg!(-g <GRPC_ENDPOINT> "GRPC listen endpoint")
                             .default_value("127.0.0.1:8082")
                             .required(false)
-                            .takes_value(true))
+                            .takes_value(true),
+                    )
                     .arg(
                         arg!(-m <METRICS_ENDPOINT> "Metrics listen endpoint")
                             .default_value("127.0.0.1:8084")
                             .required(false)
-                            .takes_value(true)),
+                            .takes_value(true),
+                    ),
             )
             .subcommand(
                 command!("serve")

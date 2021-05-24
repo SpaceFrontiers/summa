@@ -67,6 +67,8 @@ pub mod tests {
 
     static INIT: Once = Once::new();
     pub fn initialize_default_once() {
-        INIT.call_once(super::default);
+        INIT.call_once(|| {
+            super::default();
+        });
     }
 }

@@ -39,7 +39,7 @@ impl Default for ApplicationConfig {
             grpc: GrpcConfigBuilder::default().build().unwrap(),
             indices: HashMap::new(),
             log_path: PathBuf::new(),
-            metrics: MetricsConfigBuilder::default().build().unwrap()
+            metrics: MetricsConfigBuilder::default().build().unwrap(),
         }
     }
 }
@@ -88,12 +88,11 @@ impl ApplicationConfigBuilder {
         self
     }
 
-    pub fn logs_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self  {
+    pub fn logs_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self {
         self.data_path = Some(Absolutize::absolutize(value.as_ref()).unwrap().to_path_buf());
         self
     }
 }
-
 
 impl std::fmt::Display for ApplicationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

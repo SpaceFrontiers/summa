@@ -97,7 +97,7 @@ impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
                     .map_err(|e| Error::IOError((e, Some(config_filepath.to_path_buf()))))?;
                 Ok(self)
             })
-            .unwrap()
+            .unwrap_or(Err(Error::ValidationError(ValidationError::MissingPathError(PathBuf::new()))))
     }
 }
 
