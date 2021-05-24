@@ -1,5 +1,5 @@
 load("@crate_index//:defs.bzl", "aliases", "all_crate_deps")
-load("@io_bazel_rules_docker//container:container.bzl", "container_push")
+load("@io_bazel_rules_docker//container:container.bzl", "container_image", "container_push")
 load("@io_bazel_rules_docker//rust:image.bzl", "rust_image")
 load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
@@ -30,6 +30,7 @@ rust_library(
     ),
     edition = "2021",
     deps = all_crate_deps() + [":proto_grpc_rust"],
+    version = "0.5.2",
 )
 
 rust_binary(
@@ -45,15 +46,21 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
+container_image(
+    name = "base-image",
+    tars = ["@izihawa_base_image//image:dockerfile_image.tar"],
+)
+
 rust_image(
     name = "summa-server-image",
     srcs = glob(["src/bin/**/*.rs"]),
+    base = "@izihawa-base-image//image",
     edition = "2021",
     deps = [":summa"],
 )
 
 container_push(
-   name = "push-summa",
+   name = "push-summa-server",
    image = ":summa-server-image",
    format = "Docker",
    registry = "index.docker.io",

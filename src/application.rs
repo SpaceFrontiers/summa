@@ -20,16 +20,9 @@ pub struct Application {
 }
 
 const LONG_ABOUT: &str = "
-Fast full-text search server with following features:
+Fast full-text search server.
 
-- Fine CLI and asynchronous client library written in Python
-- Simple GRPC API for managing multiple indices and for search
-- Extendable query parsing on Python client side
-- Ranking documents with custom and/or user-defined scoring functions
-- Indexing documents through Kafka or directly
-- Tracing with OpenTelemetry and exposing metrics in Prometheus format
-- Reflection API for deep insights about text data
-- Configurable tokenizers (including CJK)
+Documentation: https://izihawa.github.io/summa
 ";
 
 impl Application {

@@ -56,7 +56,7 @@ rules_rust_dependencies()
 rust_register_toolchains()
 load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
 crate_universe_dependencies(bootstrap = True)
-load("@rules_rust//crate_universe:defs.bzl", "crate", "crates_repository")
+load("@rules_rust//crate_universe:defs.bzl", "crate", "crates_repository", "render_config")
 crates_repository(
     name = "crate_index",
     lockfile = "//:Cargo.lock",
@@ -92,7 +92,7 @@ crates_repository(
                 "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
             },
         )],
-    },
+    }
 )
 load("@crate_index//:defs.bzl", "crate_repositories")
 crate_repositories()
@@ -126,5 +126,9 @@ load("@io_bazel_rules_docker//repositories:repositories.bzl", container_reposito
 container_repositories()
 load("@io_bazel_rules_docker//repositories:deps.bzl", container_deps = "deps")
 container_deps()
-load("@io_bazel_rules_docker//rust:image.bzl", rust_image_repos = "repositories")
-rust_image_repos()
+load("@io_bazel_rules_docker//container:container.bzl", "container_pull")
+container_pull(
+    name = "izihawa-base-image",
+    registry = "index.docker.io",
+    repository = "izihawa/base-image",
+)

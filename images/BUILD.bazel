@@ -1,0 +1,10 @@
+load("@io_bazel_rules_docker//container:container.bzl", "container_push")
+
+container_push(
+   name = "push-base-image",
+   image = "@izihawa-base-image//image",
+   format = "Docker",
+   registry = "index.docker.io",
+   repository = "izihawa/base-image",
+   tag = "latest",
+)
