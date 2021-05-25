@@ -7,6 +7,8 @@
 Fast full-text search server written in Rust with CLI and client library in Python.
 Index documents and do search queries through Python client, CLI and/or GRPC API
 
+Documentation: [Github.io](https://izihawa.github.io/summa/) and [docs.rs](https://docs.rs/crate/summa/latest)
+
 ### Features
 - Indexing documents directly through GRPC API or Kafka
 - Fine CLI and asynchronous client library [aiosumma](aiosumma/README.md) written in Python
@@ -17,5 +19,5 @@ Index documents and do search queries through Python client, CLI and/or GRPC API
 - Reflection API for deep insights about text data
 
 ### Getting started
-- Look at [examples](src/examples/README.md)
+- Quick start [guide](https://izihawa.github.io/summa/quick-start)
 - Explore [Docs.rs](https://docs.rs/crate/summa/latest)
