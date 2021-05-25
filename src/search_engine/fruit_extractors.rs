@@ -4,7 +4,7 @@ use crate::search_engine::custom_serializer::NamedFieldDocument;
 use crate::search_engine::scorers::EvalScorer;
 use std::collections::HashSet;
 use tantivy::collector::{FruitHandle, MultiCollector, MultiFruit};
-use tantivy::schema::{Field, Schema};
+use tantivy::schema::{Field, Schema as Fields};
 use tantivy::{DocAddress, DocId, LeasedItem, Score, Searcher, SegmentReader};
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorResult`
@@ -14,7 +14,7 @@ pub trait FruitExtractor: Sync + Send {
 
 pub fn build_fruit_extractor(
     collector_proto: &proto::Collector,
-    schema: &Schema,
+    fields: &Fields,
     multi_collector: &mut MultiCollector,
 ) -> SummaResult<Box<dyn FruitExtractor>> {
     match &collector_proto.collector {
@@ -29,7 +29,7 @@ pub fn build_fruit_extractor(
             Some(proto::Scorer {
                 scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
             }) => {
-                let eval_scorer_seed = EvalScorer::new(eval_expr, &schema)?;
+                let eval_scorer_seed = EvalScorer::new(eval_expr, &fields)?;
                 let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                     .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
                     .tweak_score(move |segment_reader: &SegmentReader| {
@@ -44,7 +44,7 @@ pub fn build_fruit_extractor(
             Some(proto::Scorer {
                 scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
             }) => {
-                let field = schema.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
+                let field = fields.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
                 let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                     .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
                     .order_by_u64_field(field);
@@ -79,12 +79,12 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
 
 impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for TopDocs<T> {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorResult {
-        let schema = searcher.schema();
+        let fields = searcher.schema();
         let fruit = self.handle.extract(multi_fruit);
         let scored_documents_iter = fruit.iter().enumerate().map(|(position, (score, doc_address))| {
             let document = searcher.doc(*doc_address).unwrap();
             proto::ScoredDocument {
-                document: NamedFieldDocument::from_document(schema, multi_fields, &document).to_json(),
+                document: NamedFieldDocument::from_document(fields, multi_fields, &document).to_json(),
                 score: Some((*score).into()),
                 position: position.try_into().unwrap(),
             }
@@ -106,7 +106,7 @@ pub struct ReservoirSampling(pub FruitHandle<Vec<DocAddress>>);
 
 impl FruitExtractor for ReservoirSampling {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorResult {
-        let schema = searcher.schema();
+        let fields = searcher.schema();
         proto::CollectorResult {
             collector_result: Some(proto::collector_result::CollectorResult::ReservoirSampling(
                 proto::ReservoirSamplingCollectorResult {
@@ -114,7 +114,7 @@ impl FruitExtractor for ReservoirSampling {
                         .0
                         .extract(multi_fruit)
                         .iter()
-                        .map(|doc_address| NamedFieldDocument::from_document(schema, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json())
+                        .map(|doc_address| NamedFieldDocument::from_document(fields, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json())
                         .collect(),
                 },
             )),

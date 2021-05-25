@@ -27,7 +27,7 @@ impl proto::reflection_api_server::ReflectionApi for ReflectionApiImpl {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias)?;
         let field = index_holder
-            .schema()
+            .fields()
             .get_field(&proto_request.field_name)
             .ok_or(Error::FieldDoesNotExistError(proto_request.field_name.to_owned()))?;
 

@@ -45,11 +45,12 @@ cargo run -r serve summa.yaml
 pip install -U aiosumma
 ```
 
-
 ## Fill With Documents <a name="fill"></a>
 ```bash
 # Download sample dataset
+wget https://dumps.wikimedia.org/other/cirrussearch/current/enwikibooks-20220523-cirrussearch-content.json.gz
 # Create schema
+
 # Upload documents 
 ```
 ## Query <a name="query"></a>

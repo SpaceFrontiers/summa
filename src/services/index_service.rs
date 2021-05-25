@@ -100,7 +100,7 @@ impl IndexService {
         let mut index_config_builder = IndexConfigBuilder::default();
         index_config_builder
             .index_engine(match create_index_request.index_engine {
-                proto::IndexEngine::Memory => IndexEngine::Memory(create_index_request.schema.clone()),
+                proto::IndexEngine::Memory => IndexEngine::Memory(create_index_request.fields.clone()),
                 proto::IndexEngine::File => IndexEngine::File(application_config.get_path_for_index_data(&create_index_request.index_name)),
             })
             .primary_key(create_index_request.primary_key.to_owned())
@@ -137,7 +137,7 @@ impl IndexService {
         let owning_handler = OwningHandler::new(
             IndexHolder::create(
                 &create_index_request.index_name,
-                &create_index_request.schema,
+                &create_index_request.fields,
                 IndexConfigProxy::new(&self.application_config, &create_index_request.index_name),
                 index_settings,
             )
@@ -268,7 +268,7 @@ pub(crate) mod tests {
     use crate::configs::application_config::tests::create_test_application_config_holder;
     use crate::logging;
     use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
-    use crate::search_engine::index_holder::tests::create_test_schema;
+    use crate::search_engine::index_holder::tests::create_test_fields;
     use std::path::Path;
 
     pub(crate) async fn create_test_index_service(data_path: &Path) -> IndexService {
@@ -284,7 +284,7 @@ pub(crate) mod tests {
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .index_engine(proto::IndexEngine::Memory)
-                    .schema(create_test_schema())
+                    .fields(create_test_fields())
                     .build()
                     .unwrap()
             )
@@ -296,7 +296,7 @@ pub(crate) mod tests {
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .index_engine(proto::IndexEngine::Memory)
-                    .schema(create_test_schema())
+                    .fields(create_test_fields())
                     .build()
                     .unwrap()
             )
@@ -317,7 +317,7 @@ pub(crate) mod tests {
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .index_engine(proto::IndexEngine::Memory)
-                    .schema(create_test_schema())
+                    .fields(create_test_fields())
                     .build()
                     .unwrap()
             )
@@ -332,7 +332,7 @@ pub(crate) mod tests {
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .index_engine(proto::IndexEngine::Memory)
-                    .schema(create_test_schema())
+                    .fields(create_test_fields())
                     .build()
                     .unwrap()
             )

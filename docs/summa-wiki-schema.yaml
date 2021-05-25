@@ -1,0 +1,167 @@
+---
+# yamllint disable rule:key-ordering
+- name: id
+  type: i64
+  options:
+    fast: single
+    fieldnorms: false
+    indexed: true
+    stored: true
+- name: authors
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: position
+      tokenizer: summa
+    stored: true
+- name: cu
+  type: text
+  options:
+    indexing: null
+    stored: true
+- name: cu_suf
+  type: text
+  options:
+    indexing: null
+    stored: true
+- name: description
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: position
+      tokenizer: summa
+    stored: true
+- name: doi
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: basic
+      tokenizer: raw
+    stored: true
+- name: edition
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: basic
+      tokenizer: raw
+    stored: true
+- name: fiction_id
+  type: i64
+  options:
+    fieldnorms: false
+    indexed: false
+    stored: true
+- name: filesize
+  type: i64
+  options:
+    fieldnorms: false
+    indexed: false
+    stored: true
+- name: ipfs_multihashes
+  type: text
+  options:
+    fieldnorms: false
+    indexed: false
+    stored: true
+- name: isbns
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: basic
+      tokenizer: raw
+    stored: true
+- name: issued_at
+  type: i64
+  options:
+    fast: single
+    fieldnorms: false
+    indexed: true
+    stored: true
+- name: has_duplicates
+  type: i64
+  options:
+    fieldnorms: false
+    indexed: false
+    stored: true
+- name: language
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: basic
+      tokenizer: raw
+    stored: true
+- name: libgen_id
+  type: i64
+  options:
+    fieldnorms: false
+    indexed: false
+    stored: true
+- name: original_id
+  type: i64
+  options:
+    fieldnorms: false
+    indexed: true
+    stored: true
+- name: pages
+  type: i64
+  options:
+    indexed: false
+    stored: true
+- name: extension
+  type: text
+  options:
+    indexing: null
+    stored: true
+- name: md5
+  type: text
+  options:
+    indexing: null
+    stored: true
+- name: series
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: position
+      tokenizer: summa
+    stored: true
+- name: tags
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: position
+      tokenizer: summa
+    stored: true
+- name: title
+  type: text
+  options:
+    indexing:
+      fieldnorms: true
+      record: position
+      tokenizer: summa
+    stored: true
+- name: updated_at
+  type: i64
+  options:
+    fast: single
+    fieldnorms: false
+    indexed: true
+    stored: true
+- name: volume
+  type: text
+  options:
+    indexing: null
+    stored: true
+- name: year
+  type: i64
+  options:
+    fieldnorms: true
+    indexed: true
+    stored: true

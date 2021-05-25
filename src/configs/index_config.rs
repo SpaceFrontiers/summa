@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::PathBuf;
-use tantivy::schema::Schema;
+use tantivy::schema::Schema as Fields;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum IndexEngine {
     File(PathBuf),
-    Memory(Schema),
+    Memory(Fields),
 }
 
 impl Debug for IndexEngine {
