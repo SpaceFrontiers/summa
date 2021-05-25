@@ -4,6 +4,7 @@ use fasteval2::{Compiler, Evaler, Instruction};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tantivy::schema::{FieldType, Schema};
 use tantivy::{DocId, Score, SegmentReader};
+use tracing::debug;
 
 pub struct SegmentEvalScorer {
     slab: fasteval2::Slab,
@@ -66,6 +67,7 @@ impl SegmentEvalScorer {
             .from(&slab.ps)
             .compile(&slab.ps, &mut slab.cs, &mut namespace);
 
+        debug!(action = "compiled", parsed = ?slab.ps, compiled = ?slab.cs);
         Ok(SegmentEvalScorer {
             slab,
             compiled,

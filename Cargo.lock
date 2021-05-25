@@ -559,9 +559,9 @@ checksum = "25c7df09945d65ea8d70b3321547ed414bbc540aad5bac6883d021b970f35b04"
 
 [[package]]
 name = "fasteval2"
-version = "2.0.2"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecadc30ced4221c59ddd899e8a678152733d1c0ed9642831173dcf7d027b8808"
+checksum = "cd7d5c9e2fb96ea7b093da40c584cb3060eddbe0d4db8abcea655b197156d94e"
 
 [[package]]
 name = "fastfield_codecs"

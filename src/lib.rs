@@ -26,7 +26,6 @@ pub mod application;
 pub mod configs;
 pub mod consumers;
 pub mod errors;
-mod examples;
 pub(crate) mod logging;
 mod metrics;
 mod proto_traits;
