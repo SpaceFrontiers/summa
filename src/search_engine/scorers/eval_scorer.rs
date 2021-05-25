@@ -6,7 +6,7 @@ use tantivy::schema::Schema;
 use tantivy::SegmentReader;
 
 lazy_static! {
-    static ref RESERVED_WORDS: HashSet<&'static str> = HashSet::from(["now", "original_score", "gauss", "fastsigm", "sigma_squared",]);
+    static ref RESERVED_WORDS: HashSet<&'static str> = HashSet::from(["now", "original_score", "fastsigm"]);
 }
 
 /// Instantiates `SegmentEvalScorer` for each segment
