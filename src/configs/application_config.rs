@@ -89,7 +89,7 @@ impl ApplicationConfigBuilder {
     }
 
     pub fn logs_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self {
-        self.data_path = Some(Absolutize::absolutize(value.as_ref()).unwrap().to_path_buf());
+        self.log_path = Some(Absolutize::absolutize(value.as_ref()).unwrap().to_path_buf());
         self
     }
 }

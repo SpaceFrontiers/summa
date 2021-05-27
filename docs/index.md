@@ -8,8 +8,8 @@ Index documents directly or through Kafka and do search queries through Python c
 ## Documentation
 ### Mandatory
 - [Quick Start](/summa/quick-start)
-- [Index Schema](/summa/schema)
 - [Query DSL](/summa/query-dsl)
+- [Index Schema](/summa/schema)
 
 ### Further
 - [Python API](/summa/python-api)

@@ -11,9 +11,39 @@ combine nested queries and modify their scores like `BoostQuery` or `BooleanQuer
 
 ## TermQuery
 
+The most basic kind of query. 
+`TermQuery` scores and returns documents that contain the specific word inside specific field.
+The list of documents are ranged according to BM25 score.
+```json 
+{"term": {
+    "field": "title", 
+    "value": "astronomy"
+}}
+```
+
 ## BooleanQuery
 
+`BooleanQuery` allowes to combine multiple queries into a single one.
+```json 
+{"boolean": {"subqueries": [
+    {"occur": "astronomy", "query": {
+        "term": {
+            "field": "title",
+            "value": "astronomy"
+        }
+    }},
+    {"occur": "must", "query": {
+        "term": {
+            "field": "title",
+            "value": "nebula"
+        }
+    }}
+]}}
+```
+
 ## BoostQuery
+
+`BoostQuery` modifies scores produced by a nested query
 
 ## MatchQuery
 

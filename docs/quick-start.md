@@ -33,7 +33,8 @@ izihawa/summa-server serve /summa.yaml
 # Install through `cargo`
 cargo install summa
 # Generate config for `summa-server`
-cargo run -r summa generate-config > summa.yaml
+cargo run -r summa generate-config -d /data \
+-g 0.0.0.0:8082 -m 0.0.0.0:8084 > summa.yaml
 # Launch `summa-server`
 cargo run -r serve summa.yaml
 ```
