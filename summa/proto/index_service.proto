@@ -37,7 +37,7 @@ message CommitIndexRequest {
 
 message CommitIndexResponse {
   optional uint64 opstamp = 1;
-  double elapsed_secs = 2;
+  optional double elapsed_secs = 2;
 }
 
 enum Order {

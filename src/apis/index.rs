@@ -64,7 +64,10 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                         },
                     }
                 });
-                Ok(Response::new(proto::CommitIndexResponse { opstamp: None }))
+                Ok(Response::new(proto::CommitIndexResponse {
+                    opstamp: None,
+                    elapsed_secs: None,
+                }))
             }
             Some(proto::CommitMode::Sync) => match index_updater.try_write() {
                 None => Err(Status::failed_precondition("busy")),
@@ -99,12 +102,16 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let (mut success_docs, mut failed_docs) = (0u64, 0u64);
         let mut elapsed_secs = 0f64;
         let mut in_stream = request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&chunk.index_alias)?.index_updater().read();
         while let Some(chunk) = in_stream.next().await {
             match chunk {
                 Ok(chunk) => {
                     let now = Instant::now();
-                    let (success_bulk_docs, failed_bulk_docs) = index_holder.index_bulk(&chunk.documents);
+                    let (success_bulk_docs, failed_bulk_docs) = self
+                        .index_service
+                        .get_index_holder(&chunk.index_alias)?
+                        .index_updater()
+                        .read()
+                        .index_bulk(&chunk.documents);
                     elapsed_secs += now.elapsed().as_secs_f64();
                     success_docs += success_bulk_docs;
                     failed_docs += failed_bulk_docs;

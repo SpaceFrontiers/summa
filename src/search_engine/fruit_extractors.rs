@@ -3,7 +3,7 @@ use crate::proto;
 use crate::search_engine::custom_serializer::NamedFieldDocument;
 use crate::search_engine::scorers::EvalScorer;
 use std::collections::HashSet;
-use tantivy::collector::{FruitHandle, MultiCollector, MultiFruit};
+use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::schema::{Field, Schema as Fields};
 use tantivy::{DocAddress, DocId, LeasedItem, Score, Searcher, SegmentReader};
 
@@ -58,9 +58,16 @@ pub fn build_fruit_extractor(
             let reservoir_sampling_collector: crate::search_engine::collectors::ReservoirSampling = reservoir_sampling_collector_proto.into();
             Ok(Box::new(ReservoirSampling(multi_collector.add_collector(reservoir_sampling_collector))) as Box<dyn FruitExtractor>)
         }
-        Some(proto::collector::Collector::Count(count_collector_proto)) => {
-            let count_collector: tantivy::collector::Count = count_collector_proto.into();
-            Ok(Box::new(Count(multi_collector.add_collector(count_collector))) as Box<dyn FruitExtractor>)
+        Some(proto::collector::Collector::Count(_)) => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
+        Some(proto::collector::Collector::Facet(facet_collector_proto)) => {
+            let field = fields
+                .get_field(&facet_collector_proto.field)
+                .ok_or(Error::FieldDoesNotExistError(facet_collector_proto.field.to_owned()))?;
+            let mut facet_collector = tantivy::collector::FacetCollector::for_field(field);
+            for facet in &facet_collector_proto.facets {
+                facet_collector.add_facet(facet);
+            }
+            Ok(Box::new(Facet(multi_collector.add_collector(facet_collector))) as Box<dyn FruitExtractor>)
         }
         None => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
     }
@@ -90,8 +97,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             }
         });
         let len = scored_documents_iter.len();
-        let right_bound = std::cmp::min(self.limit, len);
-        let scored_documents = scored_documents_iter.take(right_bound).collect();
+        let scored_documents = scored_documents_iter.take(std::cmp::min(self.limit, len)).collect();
         let has_next = len > self.limit;
         proto::CollectorResult {
             collector_result: Some(proto::collector_result::CollectorResult::TopDocs(proto::TopDocsCollectorResult {
@@ -129,6 +135,18 @@ impl FruitExtractor for Count {
         proto::CollectorResult {
             collector_result: Some(proto::collector_result::CollectorResult::Count(proto::CountCollectorResult {
                 count: self.0.extract(multi_fruit) as u32,
+            })),
+        }
+    }
+}
+
+pub struct Facet(pub FruitHandle<FacetCounts>);
+
+impl FruitExtractor for Facet {
+    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorResult {
+        proto::CollectorResult {
+            collector_result: Some(proto::collector_result::CollectorResult::Facet(proto::FacetCollectorResult {
+                facet_counts: self.0.extract(multi_fruit).get("").map(|(facet, count)| (facet.to_string(), count)).collect(),
             })),
         }
     }

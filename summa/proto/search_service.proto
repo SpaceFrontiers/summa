@@ -92,29 +92,17 @@ message TermQuery {
 
 // Extra structures
 
-message Collector {
-  oneof collector {
-    TopDocsCollector top_docs = 1;
-    ReservoirSamplingCollector reservoir_sampling = 2;
-    CountCollector count = 3;
-  }
-}
-
-message CollectorResult {
-  oneof collector_result {
-    TopDocsCollectorResult top_docs = 1;
-    ReservoirSamplingCollectorResult reservoir_sampling = 2;
-    CountCollectorResult count = 3;
-  }
-}
-
-message CountCollector {}
-message CountCollectorResult { uint32 count = 1; }
-
 enum Occur {
   should = 0;
   must = 1;
   must_not = 2;
+}
+
+message Range {
+  string left = 1;
+  string right = 2;
+  bool including_left = 3;
+  bool including_right = 4;
 }
 
 message ScoredDocument {
@@ -137,6 +125,47 @@ message Scorer {
   }
 }
 
+message Collector {
+  oneof collector {
+    TopDocsCollector top_docs = 1;
+    ReservoirSamplingCollector reservoir_sampling = 2;
+    CountCollector count = 3;
+    FacetCollector facet = 4;
+  }
+}
+
+message CollectorResult {
+  oneof collector_result {
+    TopDocsCollectorResult top_docs = 1;
+    ReservoirSamplingCollectorResult reservoir_sampling = 2;
+    CountCollectorResult count = 3;
+    FacetCollectorResult facet = 4;
+  }
+}
+
+// Collectors and CollectorResults
+
+message CountCollector {}
+
+message CountCollectorResult { uint32 count = 1; }
+
+message FacetCollector {
+  string field = 1;
+  repeated string facets = 2;
+}
+
+message FacetCollectorResult {
+  map<string, uint64> facet_counts = 1;
+}
+
+message ReservoirSamplingCollector {
+  uint32 limit = 1;
+}
+
+message ReservoirSamplingCollectorResult {
+  repeated string documents = 1;
+}
+
 message TopDocsCollector {
   uint32 limit = 1;
   uint32 offset = 2;
@@ -146,19 +175,4 @@ message TopDocsCollector {
 message TopDocsCollectorResult {
   repeated ScoredDocument scored_documents = 1;
   bool has_next = 2;
-}
-
-message Range {
-  string left = 1;
-  string right = 2;
-  bool including_left = 3;
-  bool including_right = 4;
-}
-
-message ReservoirSamplingCollector {
-  uint32 limit = 1;
-}
-
-message ReservoirSamplingCollectorResult {
-  repeated string documents = 1;
 }
