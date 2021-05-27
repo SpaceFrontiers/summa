@@ -96,7 +96,7 @@ message ReservoirSamplingCollectorResult {
 
 message Query {
   oneof query {
-    BooleanQuery bool = 1;
+    BoolQuery bool = 1;
     MatchQuery match = 2;
     RegexQuery regex = 3;
     TermQuery term = 4;
@@ -142,13 +142,13 @@ message MatchQuery {
   string value = 1;
 }
 
-message BooleanSubquery {
+message BoolSubquery {
   Occur occur = 1;
   Query query = 2;
 }
 
-message BooleanQuery {
-  repeated BooleanSubquery subqueries = 1;
+message BoolQuery {
+  repeated BoolSubquery subqueries = 1;
 }
 
 message RegexQuery {

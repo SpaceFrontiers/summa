@@ -3,10 +3,19 @@ title: Summa Search Engine
 ---
 
 Fast full-text search server written in Rust with CLI and client library in Python.
-Index documents and do search queries through Python client, CLI and/or GRPC API
+Index documents directly or through Kafka and do search queries through Python client, CLI and/or GRPC API
 
+## Documentation
+### Mandatory
 - [Quick Start](/summa/quick-start)
 - [Index Schema](/summa/schema)
 - [Query DSL](/summa/query-dsl)
+
+### Further
 - [Python API](/summa/python-api)
+- [Kafka Consuming API](/summa/kafka-consuming-api)
+- [IPFS Replication](/summa/ipfs-replication)
+
+### Expert
+- [Architecture](/summa/architecture)
 - [Development Guide](/summa/development)

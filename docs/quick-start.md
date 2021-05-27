@@ -10,7 +10,7 @@ permalink: /quick-start
 
 ## Setup <a name="setup"></a>
 Both server and client are distributed through the package systems, `Cargo` and `pip`.
-Also, there is a prebuilt `summa-server` Docker image hosted on
+Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub.
 
 ### Summa Server
 #### Docker Way
@@ -48,15 +48,20 @@ pip install -U aiosumma
 ## Fill With Documents <a name="fill"></a>
 ```bash
 # Download sample dataset
-wget https://dumps.wikimedia.org/other/cirrussearch/current/enwikibooks-20220523-cirrussearch-content.json.gz
-# Create schema
-echo "
+wget https://dumps.wikimedia.org/other/cirrussearch/20220523/enwikibooks-20220523-cirrussearch-content.json.gz
+gunzip enwikibooks-20220523-cirrussearch-content.json.gz
+# Create index schema in file
+cat << EOF
 {% include_relative files/summa-wiki-schema.yaml %}
-" > schema.yaml
+EOF
+> schema.yaml
+# Create index
 summa-cli localhost:8082 - create-index schema.yaml
-# Upload documents 
+# Upload documents
+
 ```
 ## Query <a name="query"></a>
 ```bash
-
+# Do a match query
+summa-cli localhost:8082 - search page '{"match": {"value": "astronomy"}}' '[{"top_docs": {"limit": 10}}, {"count": {}}]'
 ```

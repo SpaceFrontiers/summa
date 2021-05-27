@@ -6,7 +6,7 @@ use opentelemetry::{global, KeyValue};
 use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
-use tantivy::query::{AllQuery, BooleanQuery, BoostQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery};
+use tantivy::query::{AllQuery, BoolQuery, BoostQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema as Fields};
 use tantivy::{DateTime, Index, Term};
 
@@ -113,7 +113,7 @@ impl QueryParser {
                         self.parse_subquery(subquery.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
                     ))
                 }
-                Box::new(BooleanQuery::new(subqueries))
+                Box::new(BoolQuery::new(subqueries))
             }
             Some(proto::query::Query::Match(match_query_proto)) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
                 Ok(parsed_query) => Ok(parsed_query),

@@ -1,5 +1,6 @@
 import sys
 from typing import (
+    Iterable,
     List,
     Optional,
     Tuple,
@@ -338,7 +339,8 @@ class SummaClient(BaseGrpcClient):
     async def index_document_stream(
         self,
         index_alias: str,
-        documents: Union[List[Union[dict, bytes, str]], str] = None,
+        documents: Union[Iterable[str], str] = None,
+        bulk_size: int = 1000,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentStreamResponse:
@@ -348,29 +350,34 @@ class SummaClient(BaseGrpcClient):
         Args:
             index_alias: index alias
             documents: list of bytes
+            bulk_size: document portion size to send
             request_id: request id
             session_id: session id
         """
-        if isinstance(documents, list):
-            documents = [json.dumps(document) if isinstance(document, dict) else document for document in documents]
-        elif isinstance(documents, str):
-            filename = documents
-            documents = []
-            with open(filename, 'rb') as file:
-                for line in file:
-                    documents.append(line.strip())
-        elif documents is None and not sys.stdin.isatty():
-            documents = []
-            for line in sys.stdin:
-                documents.append(line.strip().encode())
-        else:
-            raise ValueError('Pass documents `documents` with file, stdin or directly with a `list`')
+        if documents is None and not sys.stdin.isatty():
+            def documents_iter():
+                for line in sys.stdin:
+                    yield line.strip().encode()
+            documents = documents_iter()
 
-        return await self.stubs['index_api'].index_bulk(
-            index_service_pb.IndexBulkRequest(
-                index_alias=index_alias,
-                documents=documents,
-            ),
+        def documents_portion_iter():
+            documents_portion = []
+            for document in documents:
+                documents_portion.append(document)
+                if len(documents_portion) > bulk_size:
+                    yield index_service_pb.IndexDocumentStreamRequest(
+                        index_alias=index_alias,
+                        documents=documents_portion,
+                    )
+                    documents_portion = []
+            if documents_portion:
+                yield index_service_pb.IndexDocumentStreamRequest(
+                    index_alias=index_alias,
+                    documents=documents_portion,
+                )
+
+        return await self.stubs['index_api'].index_document_stream(
+            documents_portion_iter,
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
