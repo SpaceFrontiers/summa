@@ -377,7 +377,7 @@ class SummaClient(BaseGrpcClient):
                 )
 
         return await self.stubs['index_api'].index_document_stream(
-            documents_portion_iter,
+            documents_portion_iter(),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 

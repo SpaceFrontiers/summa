@@ -3,7 +3,7 @@
 index_name: page
 compression: Zstd
 multi_fields: ["category"]
-fields:
+fields: >
   - name: category
     type: text
     options:

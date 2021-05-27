@@ -55,9 +55,9 @@ cat << EOF > schema.yaml
 {% include_relative files/summa-wiki-schema.yaml %}
 EOF
 # Create index
-summa-cli localhost:8082 - create-index schema.yaml
+summa-cli localhost:8082 - create-index-from-file schema.yaml
 # Upload documents
-
+awk 'NR%2==0' enwikibooks-20220523-cirrussearch-content.json | summa-cli localhost:8082 - index-document-stream page
 ```
 ## Query <a name="query"></a>
 ```bash
