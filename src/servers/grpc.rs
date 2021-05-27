@@ -92,6 +92,7 @@ impl GrpcServer {
 
         let router = Server::builder()
             .layer(layer)
+            .max_frame_size(grpc_config.max_frame_size_bytes)
             .add_service(grpc_reflection_service)
             .add_service(ConsumerApiServer::new(consumer_api))
             .add_service(IndexApiServer::new(index_api))
