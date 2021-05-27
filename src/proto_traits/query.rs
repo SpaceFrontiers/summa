@@ -6,7 +6,7 @@ impl ToLabel for proto::Query {
         match &self.query {
             None => "none",
             Some(proto::query::Query::All(_)) => "all",
-            Some(proto::query::Query::Bool(_)) => "bool",
+            Some(proto::query::Query::Boolean(_)) => "boolean",
             Some(proto::query::Query::Match(_)) => "match",
             Some(proto::query::Query::Range(_)) => "range",
             Some(proto::query::Query::Boost(_)) => "boost",

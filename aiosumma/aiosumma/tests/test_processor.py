@@ -23,12 +23,12 @@ class MarkWordTransformer(ValueWordTransformer):
 def test_optimizing_query_processor():
     query_processor = QueryProcessor(transformers=[])
     processed_query = query_processor.process('search engine', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}}
     ]}}
     processed_query = query_processor.process('(search (dog cat))', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'match': {'value': 'dog'}}},
         {'occur': 'should', 'query': {'match': {'value': 'cat'}}},
@@ -44,7 +44,7 @@ def test_order_by_query_processor():
         valid_fields=frozenset(['field1', 'field2', 'field3']),
     )])
     processed_query = query_processor.process('term1 term2 order_by:f1', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'term1'}}},
         {'occur': 'should', 'query': {'match': {'value': 'term2'}}}
     ]}}
@@ -56,7 +56,7 @@ def test_values_processor():
         ValuesWordTransformer(word_transformers=[MarkWordTransformer()]),
     ])
     processed_query = query_processor.process('term1 term2 mark', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'term1'}}},
         {'occur': 'should', 'query': {'match': {'value': 'term2'}}}
     ]}}
@@ -70,20 +70,20 @@ def test_production_chain():
         OptimizingTransformer(),
     ])
     processed_query = query_processor.process('search engine', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85000'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
         {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85000'}}}
     ]}}
     processed_query = query_processor.process('author:Smith +"title book"', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'term': {'field': 'author', 'value': 'smith'}}},
         {'occur': 'should', 'query':
             {'boost': {'query': {'term': {'field': 'author', 'value': 'smiths'}}, 'score': '0.85000'}}},
         {'occur': 'must', 'query': {'match': {'value': '"title book"'}}}]}}
     processed_query = query_processor.process('science +year:[2010 TO *]', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'science'}}},
         {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'sciences'}}, 'score': '0.85000'}}},
         {'occur': 'must', 'query': {'range': {
@@ -94,7 +94,7 @@ def test_production_chain():
 def test_unknown_language_transformer():
     query_processor = QueryProcessor(transformers=[MorphyTransformer(enable_morph=True), OptimizingTransformer()])
     processed_query = query_processor.process('search engine', 'zz')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85000'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
@@ -105,7 +105,7 @@ def test_unknown_language_transformer():
 def test_unknown_query_language_transformer():
     query_processor = QueryProcessor(transformers=[MorphyTransformer(enable_morph=True), OptimizingTransformer()])
     processed_query = query_processor.process('kavanaba mutagor', 'zz')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'kavanaba'}}},
         {'occur': 'should', 'query': {'match': {'value': 'mutagor'}}}
     ]}}
@@ -118,7 +118,7 @@ def test_exact_match_transformers():
         ]
     )
     processed_query = query_processor.process('search engine', 'en')
-    assert processed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
         {'occur': 'should', 'query': {'boost': {'query': {

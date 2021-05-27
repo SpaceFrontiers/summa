@@ -7,7 +7,7 @@ from aiosumma.parser import default_parser
 def test_default():
     parsed_query = default_parser.parse('search engine')
     assert parsed_query.to_summa_query() == {
-        'bool': {'subqueries': [
+        'boolean': {'subqueries': [
             {'occur': 'should', 'query': {'match': {'value': 'search'}}},
             {'occur': 'should', 'query': {'match': {'value': 'engine'}}}
         ]}}
@@ -15,7 +15,7 @@ def test_default():
 
 def test_plus_minus():
     parsed_query = default_parser.parse('-search +engine')
-    assert parsed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert parsed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'must_not', 'query': {'match': {'value': 'search'}}},
         {'occur': 'must', 'query': {'match': {'value': 'engine'}}}
     ]}}
@@ -48,7 +48,7 @@ def test_free_regex():
 
 def test_free_with_slash_regex():
     parsed_query = default_parser.parse('/pyth/.*/')
-    assert parsed_query.to_summa_query() == {'bool': {'subqueries': [
+    assert parsed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': '/pyth/'}}},
         {'occur': 'should', 'query': {'match': {'value': '.*/'}}}
     ]}}
@@ -79,7 +79,7 @@ def test_boost():
 
 def test_boost_group():
     parsed_query = default_parser.parse('(kolobok babushka)^3.0')
-    assert parsed_query.to_summa_query() == {'boost': {'query': {'bool': {'subqueries': [
+    assert parsed_query.to_summa_query() == {'boost': {'query': {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'kolobok'}}},
         {'occur': 'should', 'query': {'match': {'value': 'babushka'}}}
     ]}}, 'score': '3.00000'}}

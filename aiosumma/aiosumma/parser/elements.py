@@ -111,7 +111,7 @@ class Group(Item):
                 query = operand.to_summa_query()
                 if query:
                     subqueries.append({'occur': 'should', 'query': query})
-        return {'bool': {'subqueries': subqueries}}
+        return {'boolean': {'subqueries': subqueries}}
 
     @property
     def children(self):
@@ -324,7 +324,7 @@ class Unary(Item):
         return "%s%s" % (self.op, self.a.__str__())
 
     def to_summa_query(self):
-        return {'bool': {'subqueries': [{'occur': 'should', 'query': self.a.to_summa_query()}]}}
+        return {'boolean': {'subqueries': [{'occur': 'should', 'query': self.a.to_summa_query()}]}}
 
     @property
     def children(self):
@@ -337,7 +337,7 @@ class Plus(Unary):
     op = "+"
 
     def to_summa_query(self):
-        return {'bool': {'subqueries': [{'occur': 'must', 'query': self.a.to_summa_query()}]}}
+        return {'boolean': {'subqueries': [{'occur': 'must', 'query': self.a.to_summa_query()}]}}
 
 
 class Minus(Unary):
@@ -346,4 +346,4 @@ class Minus(Unary):
     op = "-"
 
     def to_summa_query(self):
-        return {'bool': {'subqueries': [{'occur': 'must_not', 'query': self.a.to_summa_query()}]}}
+        return {'boolean': {'subqueries': [{'occur': 'must_not', 'query': self.a.to_summa_query()}]}}
