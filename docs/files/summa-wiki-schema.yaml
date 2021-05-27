@@ -1,0 +1,105 @@
+---
+# yamllint disable rule:key-ordering
+index_name: page
+compression: Zstd
+multi_fields: ["category"]
+fields:
+  - name: category
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: summa
+      stored: true
+  - name: content_model
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: basic
+        tokenizer: raw
+      stored: true
+  - name: opening_text
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: summa
+      stored: true
+  - name: opening_text
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: summa
+      stored: true
+  - name: auxiliary_text
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: summa
+      stored: true
+  - name: language
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: basic
+        tokenizer: raw
+      stored: true
+  - name: title
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: summa
+      stored: true
+  - name: text
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: summa
+      stored: true
+  - name: timestamp
+    type: date
+    options:
+      fast: single
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: create_timestamp
+    type: date
+    options:
+      fast: single
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: popularity_score
+    type: f64
+    options:
+      fast: single
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: incoming_links
+    type: u64
+    options:
+      fast: single
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: namespace
+    type: u64
+    options:
+      fast: single
+      fieldnorms: false
+      indexed: true
+      stored: true

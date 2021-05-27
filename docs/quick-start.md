@@ -50,7 +50,10 @@ pip install -U aiosumma
 # Download sample dataset
 wget https://dumps.wikimedia.org/other/cirrussearch/current/enwikibooks-20220523-cirrussearch-content.json.gz
 # Create schema
-
+echo "
+{% include_relative files/summa-wiki-schema.yaml %}
+" > schema.yaml
+summa-cli localhost:8082 - create-index schema.yaml
 # Upload documents 
 ```
 ## Query <a name="query"></a>

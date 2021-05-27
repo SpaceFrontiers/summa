@@ -1,4 +1,4 @@
-aiogrpcclient==1.0.4
+aiogrpcclient==1.0.5
 aiokit==1.0.2
 attrs==21.4.0
 blis==0.7.7
