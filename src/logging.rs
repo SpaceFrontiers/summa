@@ -10,7 +10,8 @@ const ENV_FILTER: &str = "librdkafka=trace,\
     summa::search_engine=info,\
     summa::servers[lifecycle]=info,\
     summa::consumers=info,\
-    tantivy=info";
+    tantivy=info,\
+    warn";
 
 const REQUEST_ENV_FILTER: &str = "summa::servers::grpc[request]=info,summa::servers::metrics[request]=info";
 

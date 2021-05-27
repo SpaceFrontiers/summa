@@ -4,7 +4,6 @@ data_path: /data/logs
 debug: true
 grpc:
   endpoint: "0.0.0.0:8082"
-  timeout_seconds: 10
   workers: 1
 indices: {}
 log_path: ""

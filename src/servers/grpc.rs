@@ -75,7 +75,6 @@ impl GrpcServer {
         let grpc_config = self.application_config.read().grpc.clone();
 
         let layer = ServiceBuilder::new()
-            .timeout(Duration::from_secs(grpc_config.timeout_seconds))
             .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("request-id"), |_: &_| {
                 Some(HeaderValue::from_str(&generate_request_id()).unwrap())
             }))
