@@ -11,6 +11,7 @@ cargo_build_script(
     srcs = ["build.rs"],
     build_script_env = {
         "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
+        "PROTOC_NO_VENDOR": "1",
     },
     data = [
         "//summa/proto",
@@ -30,7 +31,7 @@ rust_library(
     ),
     edition = "2021",
     deps = all_crate_deps() + [":proto_grpc_rust"],
-    version = "0.7.1",
+    version = "0.7.4",
 )
 
 rust_binary(

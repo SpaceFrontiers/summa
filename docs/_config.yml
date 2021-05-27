@@ -1,3 +1,5 @@
 title: Summa Search Engine
 theme: jekyll-theme-hacker
 description: Fast full-text search server
+sass:
+  sass_dir: _sass
