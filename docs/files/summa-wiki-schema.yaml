@@ -3,6 +3,9 @@
 index_name: page
 compression: Zstd
 multi_fields: ["category"]
+default_fields: ["opening_text", "title", "text"]
+writer_heap_size_bytes: 1073741824
+writer_threads: 4
 fields: >
   - name: category
     type: text
