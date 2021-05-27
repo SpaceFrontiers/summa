@@ -67,6 +67,4 @@ summa-cli localhost:8082 - commit-index page --commit-mode Sync
 ```bash
 # Do a match query that returns top-10 documents and its total count
 summa-cli localhost:8082 - search page '{"match": {"value": "astronomy"}}' '[{"top_docs": {"limit": 10}}, {"count": {}}]'
-# Do a faceted search query
-summa-cli localhost:8082 - search page '{"match": {"value": "astronomy"}}' '[{"facet": {"field": "category", facets: ["Book:Wikibooks Stacks/Shelves", "Cookbook"]}}]'
 ```
