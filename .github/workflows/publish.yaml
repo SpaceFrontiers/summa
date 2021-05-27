@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2.4.0
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
       - uses: actions/cache@v2.1.6
         with:
           path: |
