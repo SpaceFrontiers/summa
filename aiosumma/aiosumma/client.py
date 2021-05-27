@@ -40,6 +40,7 @@ class SummaClient(BaseGrpcClient):
     async def commit_index(
         self,
         index_alias: str,
+        commit_mode: Union[str, index_service_pb.CommitMode],
         request_id: str = None,
         session_id: str = None,
     ) -> index_service_pb.CommitIndexResponse:
@@ -50,6 +51,7 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_alias: index alias
+            commit_mode: Sync | Async
             request_id: request id
             session_id: session id
         Returns:
@@ -58,6 +60,7 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].commit_index(
             index_service_pb.CommitIndexRequest(
                 index_alias=index_alias,
+                commit_mode=commit_mode,
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
