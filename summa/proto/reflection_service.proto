@@ -1,15 +1,21 @@
 syntax = "proto3";
 package summa.proto;
 
+// API
+
 service ReflectionApi {
   rpc get_top_terms (GetTopTermsRequest) returns (GetTopTermsResponse) {}
 }
+
+// Requests
 
 message GetTopTermsRequest {
   string index_alias = 1;
   string field_name = 2;
   uint32 top_k = 3;
 }
+
+// Extra structures
 
 message GetTopTermsResponse {
   map<string, SegmentTerms> per_segment = 1;

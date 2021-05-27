@@ -1,6 +1,8 @@
 syntax = "proto3";
 package summa.proto;
 
+// API
+
 service IndexApi {
   rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
@@ -15,6 +17,133 @@ service IndexApi {
   rpc set_index_alias (SetIndexAliasRequest) returns (SetIndexAliasResponse) {}
   rpc vacuum_index (VacuumIndexRequest) returns (VacuumIndexResponse) {}
 }
+
+// Requests
+
+message AlterIndexRequest {
+  string index_name = 1;
+  optional Compression compression = 2;
+  optional SortByField sort_by_field = 3;
+}
+
+message AlterIndexResponse {
+  Index index = 1;
+}
+
+message CommitIndexRequest {
+  string index_alias = 1;
+  CommitMode commit_mode = 2;
+}
+
+message CommitIndexResponse {
+  optional uint64 opstamp = 1;
+  double elapsed_secs = 2;
+}
+
+enum Order {
+  Asc = 0;
+  Desc = 1;
+}
+
+message SortByField {
+  string field = 1;
+  Order order = 2;
+}
+
+message CreateIndexRequest {
+  string index_name = 1;
+  string fields = 2;
+  IndexEngine index_engine = 10;
+  optional string primary_key = 3;
+  repeated string default_fields = 4;
+  Compression compression = 5;
+  optional uint64 writer_heap_size_bytes = 6;
+  optional uint64 writer_threads = 7;
+  optional uint64 autocommit_interval_ms = 8;
+  optional SortByField sort_by_field = 9;
+  repeated string multi_fields = 11;
+  repeated string stop_words = 12;
+}
+
+message CreateIndexResponse {
+  Index index = 1;
+}
+
+message DeleteIndexRequest {
+  string index_name = 1;
+  bool cascade = 2;
+}
+
+message DeleteIndexResponse {
+  repeated string deleted_index_aliases = 1;
+  repeated string deleted_index_consumers = 2;
+}
+
+message GetIndicesAliasesRequest {}
+
+message GetIndicesAliasesResponse {
+  map<string, string> indices_aliases = 1;
+}
+
+message GetIndexRequest {
+  string index_alias = 1;
+}
+
+message GetIndexResponse {
+  Index index = 1;
+}
+
+message GetIndicesRequest {}
+
+message GetIndicesResponse {
+  repeated Index indices = 1;
+}
+
+message IndexDocumentStreamRequest {
+  string index_alias = 1;
+  repeated bytes documents = 2;
+}
+
+message IndexDocumentStreamResponse {
+  uint64 success_docs = 1;
+  uint64 failed_docs = 2;
+  double elapsed_secs = 3;
+}
+
+message IndexDocumentRequest {
+  string index_alias = 1;
+  bytes document = 2;
+}
+
+message IndexDocumentResponse {
+  uint64 opstamp = 1;
+}
+
+message MergeSegmentsRequest {
+  string index_alias = 1;
+  repeated string segment_ids = 2;
+}
+
+message MergeSegmentsResponse {}
+
+message SetIndexAliasRequest {
+  string index_alias = 1;
+  string index_name = 2;
+}
+
+message SetIndexAliasResponse {
+  optional string old_index_name = 1;
+}
+
+message VacuumIndexRequest {
+  string index_alias = 1;
+}
+
+message VacuumIndexResponse {
+  // repeated string deleted_files = 1;
+}
+
+// Extra structures
 
 enum Compression {
   None = 0;
@@ -36,7 +165,6 @@ message Index {
   uint64 num_docs = 4;
   Compression compression = 5;
 }
-
 message IndexDocumentOperation {
   bytes document = 1;
 }
@@ -50,104 +178,4 @@ message IndexOperation {
 enum CommitMode {
   Async = 0;
   Sync = 1;
-}
-
-message AlterIndexRequest {
-  string index_name = 1;
-  optional Compression compression = 2;
-  optional SortByField sort_by_field = 3;
-}
-
-message AlterIndexResponse {
-  Index index = 1;
-}
-
-message CommitIndexRequest {
-  string index_alias = 1;
-  CommitMode commit_mode = 2;
-}
-
-message CommitIndexResponse {
-  optional uint64 opstamp = 1;
-}
-
-enum Order {
-  Asc = 0;
-  Desc = 1;
-}
-message SortByField {
-  string field = 1;
-  Order order = 2;
-}
-message CreateIndexRequest {
-  string index_name = 1;
-  string fields = 2;
-  IndexEngine index_engine = 10;
-  optional string primary_key = 3;
-  repeated string default_fields = 4;
-  Compression compression = 5;
-  optional uint64 writer_heap_size_bytes = 6;
-  optional uint64 writer_threads = 7;
-  optional uint64 autocommit_interval_ms = 8;
-  optional SortByField sort_by_field = 9;
-  repeated string multi_fields = 11;
-  repeated string stop_words = 12;
-}
-message CreateIndexResponse {
-  Index index = 1;
-}
-message DeleteIndexRequest {
-  string index_name = 1;
-  bool cascade = 2;
-}
-message DeleteIndexResponse {
-  repeated string deleted_index_aliases = 1;
-  repeated string deleted_index_consumers = 2;
-}
-message GetIndicesAliasesRequest {}
-message GetIndicesAliasesResponse {
-  map<string, string> indices_aliases = 1;
-}
-message GetIndexRequest {
-  string index_alias = 1;
-}
-message GetIndexResponse {
-  Index index = 1;
-}
-message GetIndicesRequest {}
-message GetIndicesResponse {
-  repeated Index indices = 1;
-}
-message IndexDocumentStreamRequest {
-  string index_alias = 1;
-  repeated bytes documents = 2;
-}
-message IndexDocumentStreamResponse {
-  uint64 success_docs = 1;
-  uint64 failed_docs = 2;
-}
-message IndexDocumentRequest {
-  string index_alias = 1;
-  bytes document = 2;
-}
-message IndexDocumentResponse {
-  uint64 opstamp = 1;
-}
-message MergeSegmentsRequest {
-  string index_alias = 1;
-  repeated string segment_ids = 2;
-}
-message MergeSegmentsResponse {}
-message SetIndexAliasRequest {
-  string index_alias = 1;
-  string index_name = 2;
-}
-message SetIndexAliasResponse {
-  optional string old_index_name = 1;
-}
-message VacuumIndexRequest {
-  string index_alias = 1;
-}
-message VacuumIndexResponse {
-  // repeated string deleted_files = 1;
 }

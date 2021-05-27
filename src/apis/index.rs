@@ -10,6 +10,7 @@ use crate::services::IndexService;
 use std::error::Error;
 use std::io::ErrorKind;
 use std::ops::Deref;
+use std::time::Instant;
 use tantivy::SegmentId;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -67,9 +68,14 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             }
             Some(proto::CommitMode::Sync) => match index_updater.try_write() {
                 None => Err(Status::failed_precondition("busy")),
-                Some(mut index_updater) => Ok(Response::new(proto::CommitIndexResponse {
-                    opstamp: Some(index_updater.commit().await?),
-                })),
+                Some(mut index_updater) => {
+                    let now = Instant::now();
+                    let opstamp = index_updater.commit().await?;
+                    Ok(Response::new(proto::CommitIndexResponse {
+                        opstamp: Some(opstamp),
+                        elapsed_secs: Some(now.elapsed().as_secs_f64()),
+                    }))
+                }
             },
         }
     }
@@ -91,16 +97,15 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         request: Request<Streaming<proto::IndexDocumentStreamRequest>>,
     ) -> Result<Response<proto::IndexDocumentStreamResponse>, Status> {
         let (mut success_docs, mut failed_docs) = (0u64, 0u64);
+        let mut elapsed_secs = 0f64;
         let mut in_stream = request.into_inner();
+        let index_holder = self.index_service.get_index_holder(&chunk.index_alias)?.index_updater().read();
         while let Some(chunk) = in_stream.next().await {
             match chunk {
                 Ok(chunk) => {
-                    let (success_bulk_docs, failed_bulk_docs) = self
-                        .index_service
-                        .get_index_holder(&chunk.index_alias)?
-                        .index_updater()
-                        .read()
-                        .index_bulk(&chunk.documents);
+                    let now = Instant::now();
+                    let (success_bulk_docs, failed_bulk_docs) = index_holder.index_bulk(&chunk.documents);
+                    elapsed_secs += now.elapsed().as_secs_f64();
                     success_docs += success_bulk_docs;
                     failed_docs += failed_bulk_docs;
                 }
@@ -113,7 +118,11 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 }
             }
         }
-        let response = proto::IndexDocumentStreamResponse { success_docs, failed_docs };
+        let response = proto::IndexDocumentStreamResponse {
+            success_docs,
+            failed_docs,
+            elapsed_secs,
+        };
         Ok(Response::new(response))
     }
 

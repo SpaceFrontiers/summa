@@ -2,10 +2,12 @@ syntax = "proto3";
 package summa.proto;
 
 
-// Service
+// API
 service SearchApi {
   rpc search (SearchRequest) returns (SearchResponse) {}
 }
+
+// Requests
 
 message SearchRequest {
   string index_alias = 1;
@@ -19,7 +21,76 @@ message SearchResponse {
   double elapsed_secs = 3;
 }
 
-// Utils
+// Query DSL
+
+message Query {
+  oneof query {
+    BooleanQuery boolean = 1;
+    MatchQuery match = 2;
+    RegexQuery regex = 3;
+    TermQuery term = 4;
+    PhraseQuery phrase = 5;
+    RangeQuery range = 6;
+    AllQuery all = 7;
+    MoreLikeThisQuery more_like_this = 8;
+    BoostQuery boost = 9;
+  }
+}
+
+message AllQuery {}
+
+message BoostQuery {
+  Query query = 1;
+  string score = 2;
+}
+
+message MoreLikeThisQuery {
+  string document = 1;
+  optional uint64 min_doc_frequency = 2;
+  optional uint64 max_doc_frequency = 3;
+  optional uint64 min_term_frequency = 4;
+  optional uint64 max_query_terms = 5;
+  optional uint64 min_word_length = 6;
+  optional uint64 max_word_length = 7;
+  optional string boost = 8;
+  repeated string stop_words = 9;
+}
+
+message PhraseQuery {
+  string field = 1;
+  string value = 2;
+  uint32 slop = 3;
+}
+
+message RangeQuery {
+  string field = 1;
+  Range value = 2;
+}
+
+message MatchQuery {
+  string value = 1;
+}
+
+message BooleanSubquery {
+  Occur occur = 1;
+  Query query = 2;
+}
+
+message BooleanQuery {
+  repeated BooleanSubquery subqueries = 1;
+}
+
+message RegexQuery {
+  string field = 1;
+  string value = 2;
+}
+
+message TermQuery {
+  string field = 1;
+  string value = 2;
+}
+
+// Extra structures
 
 message Collector {
   oneof collector {
@@ -90,73 +161,4 @@ message ReservoirSamplingCollector {
 
 message ReservoirSamplingCollectorResult {
   repeated string documents = 1;
-}
-
-// Queries
-
-message Query {
-  oneof query {
-    BooleanQuery boolean = 1;
-    MatchQuery match = 2;
-    RegexQuery regex = 3;
-    TermQuery term = 4;
-    PhraseQuery phrase = 5;
-    RangeQuery range = 6;
-    AllQuery all = 7;
-    MoreLikeThisQuery more_like_this = 8;
-    BoostQuery boost = 9;
-  }
-}
-
-message AllQuery {}
-
-message BoostQuery {
-  Query query = 1;
-  string score = 2;
-}
-
-message MoreLikeThisQuery {
-  string document = 1;
-  optional uint64 min_doc_frequency = 2;
-  optional uint64 max_doc_frequency = 3;
-  optional uint64 min_term_frequency = 4;
-  optional uint64 max_query_terms = 5;
-  optional uint64 min_word_length = 6;
-  optional uint64 max_word_length = 7;
-  optional string boost = 8;
-  repeated string stop_words = 9;
-}
-
-message PhraseQuery {
-  string field = 1;
-  string value = 2;
-  uint32 slop = 3;
-}
-
-message RangeQuery {
-  string field = 1;
-  Range value = 2;
-}
-
-message MatchQuery {
-  string value = 1;
-}
-
-message BooleanSubquery {
-  Occur occur = 1;
-  Query query = 2;
-}
-
-message BooleanQuery {
-  repeated BooleanSubquery subqueries = 1;
-}
-
-message RegexQuery {
-  string field = 1;
-  string value = 2;
-}
-
-message TermQuery {
-  string field = 1;
-  string value = 2;
 }
