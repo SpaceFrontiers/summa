@@ -46,11 +46,6 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
-container_image(
-    name = "base-image",
-    tars = ["@izihawa_base_image//image:dockerfile_image.tar"],
-)
-
 rust_image(
     name = "summa-server-image",
     srcs = glob(["src/bin/**/*.rs"]),
