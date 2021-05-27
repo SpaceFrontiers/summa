@@ -26,7 +26,7 @@ The list of documents are ranged according to BM25 score.
 `BooleanQuery` allowes to combine multiple queries into a single one.
 ```json 
 {"boolean": {"subqueries": [
-    {"occur": "astronomy", "query": {
+    {"occur": "should", "query": {
         "term": {
             "field": "title",
             "value": "astronomy"
@@ -47,7 +47,11 @@ The list of documents are ranged according to BM25 score.
 
 ## MatchQuery
 
+`MatchQuery` uses Tantivy parser to create tree of other queries
+
 ## PhraseQuery
+
+`PhraseQuery` matches documents containing exact occurrence of the phrase
 
 ## RegexQuery
 
