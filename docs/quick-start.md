@@ -12,42 +12,35 @@ permalink: /quick-start
 Both server and client are distributed through the package systems, `Cargo` and `pip`.
 Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub.
 
-### Summa Server
-#### Docker Way
-Prebuilt image: [izihawa/summa-server](https://hub.docker.com/repository/docker/izihawa/summa-server)
+### Aiosumma
+
+#### Through Pip
 
 ```bash
+# (Optional) Create virtual env for `aiosumma`
+python3 -m venv venv
+source venv/bin/acticate
+# Install aiosumma
+pip3 install -U aiosumma
+```
+
+### Summa Server
+
+```bash
+# Create diectory for storing index
+mkdir data
+
+# Pull actual image for `summa-server`
+docker pull izihawa/summa-server
+
 # Generate config for `summa-server`
 docker run izihawa/summa-server generate-config -d /data \
 -g 0.0.0.0:8082 -m 0.0.0.0:8084 > summa.yaml
-
-# Create diectory for storing index
-mkdir data
 
 # Launch `summa-server`
 docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data \
 -p 8082:8082 -p 8084:8084 \
 izihawa/summa-server serve /summa.yaml
-```
-
-#### Cargo Way
-```bash
-# Install through `cargo`
-cargo install summa
-
-# Generate config for `summa-server`
-cargo run -r summa generate-config -d /data \
--g 0.0.0.0:8082 -m 0.0.0.0:8084 > summa.yaml
-
-# Launch `summa-server`
-cargo run -r serve summa.yaml
-```
-
-### Aiosumma
-
-#### Pip way
-```bash 
-pip install -U aiosumma
 ```
 
 ## Fill With Documents <a name="fill"></a>
