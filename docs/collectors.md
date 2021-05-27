@@ -10,6 +10,8 @@ permalink: /collectors
 
 ## Custom Expression 
 
+# Facets
+
 # Count
 
 # Reservoir

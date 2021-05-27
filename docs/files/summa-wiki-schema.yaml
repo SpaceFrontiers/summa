@@ -8,12 +8,8 @@ writer_heap_size_bytes: 1073741824
 writer_threads: 4
 fields: >
   - name: category
-    type: text
+    type: facet
     options:
-      indexing:
-        fieldnorms: true
-        record: position
-        tokenizer: summa
       stored: true
   - name: content_model
     type: text
