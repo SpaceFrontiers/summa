@@ -30,7 +30,7 @@ rust_library(
     ),
     edition = "2021",
     deps = all_crate_deps() + [":proto_grpc_rust"],
-    version = "0.6.2",
+    version = "0.7.0",
 )
 
 rust_binary(
