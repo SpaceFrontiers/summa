@@ -51,10 +51,9 @@ pip install -U aiosumma
 wget https://dumps.wikimedia.org/other/cirrussearch/20220523/enwikibooks-20220523-cirrussearch-content.json.gz
 gunzip enwikibooks-20220523-cirrussearch-content.json.gz
 # Create index schema in file
-cat << EOF
+cat << EOF > schema.yaml
 {% include_relative files/summa-wiki-schema.yaml %}
 EOF
-> schema.yaml
 # Create index
 summa-cli localhost:8082 - create-index schema.yaml
 # Upload documents
