@@ -1,5 +1,3 @@
-import os
-import os.path
 import sys
 from typing import (
     List,
@@ -132,11 +130,11 @@ class SummaClient(BaseGrpcClient):
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
-    @expose
+    @expose(with_from_file=True)
     async def create_index(
         self,
         index_name: str,
-        schema: str,
+        fields: str,
         primary_key: Optional[str] = None,
         default_fields: Optional[List[str]] = None,
         multi_fields: Optional[List[str]] = None,
@@ -145,16 +143,16 @@ class SummaClient(BaseGrpcClient):
         writer_heap_size_bytes: Optional[int] = None,
         writer_threads: Optional[int] = None,
         autocommit_interval_ms: Optional[int] = None,
+        sort_by_field: Optional[Tuple] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
-        sort_by_field: Optional[Tuple] = None
     ) -> index_service_pb.CreateIndexResponse:
         """
         Create index
 
         Args:
             index_name: index name
-            schema: Tantivy index schema
+            fields: Tantivy index schema
             primary_key: primary key is used during insertion to check duplicates
             default_fields: fields that are used to search by default
             multi_fields: fields that can have multiple values
@@ -168,13 +166,10 @@ class SummaClient(BaseGrpcClient):
             session_id: session id
             sort_by_field: (field_name, order)
         """
-        if os.path.exists(schema):
-            with open(schema, 'r') as f:
-                schema = f.read()
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
-                schema=schema,
+                fields=fields,
                 primary_key=primary_key,
                 default_fields=default_fields,
                 multi_fields=multi_fields,
@@ -340,13 +335,13 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
-    async def index_bulk(
+    async def index_document_stream(
         self,
         index_alias: str,
         documents: Union[List[Union[dict, bytes, str]], str] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> index_service_pb.IndexBulkResponse:
+    ) -> index_service_pb.IndexDocumentStreamResponse:
         """
         Index documents bulky
 

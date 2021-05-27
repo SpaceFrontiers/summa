@@ -2,9 +2,8 @@ use super::fast_field_iterator::{FastFieldIterator, FastFieldIteratorImpl};
 use crate::errors::{Error, SummaResult};
 use fasteval2::{Compiler, Evaler, Instruction};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tantivy::schema::{FieldType, Schema};
+use tantivy::schema::{FieldType, Schema as Fields};
 use tantivy::{DocId, Score, SegmentReader};
-use tracing::debug;
 
 pub struct SegmentEvalScorer {
     slab: fasteval2::Slab,
@@ -19,7 +18,7 @@ impl SegmentEvalScorer {
     #[inline]
     pub fn for_segment(
         segment_reader: &SegmentReader,
-        schema: &Schema,
+        fields: &Fields,
         parser: &fasteval2::Parser,
         eval_expr: &str,
         var_names: &Vec<String>,
@@ -50,8 +49,8 @@ impl SegmentEvalScorer {
 
         // Set fast fields
         for var_name in var_names.iter() {
-            let field = schema.get_field(&var_name).ok_or(Error::FieldDoesNotExistError(var_name.to_owned()))?;
-            fast_fields_iterators.push(match schema.get_field_entry(field).field_type() {
+            let field = fields.get_field(&var_name).ok_or(Error::FieldDoesNotExistError(var_name.to_owned()))?;
+            fast_fields_iterators.push(match fields.get_field_entry(field).field_type() {
                 FieldType::U64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().u64(field).unwrap()),
                 FieldType::I64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().i64(field).unwrap()),
                 FieldType::F64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().f64(field).unwrap()),
@@ -67,7 +66,6 @@ impl SegmentEvalScorer {
             .from(&slab.ps)
             .compile(&slab.ps, &mut slab.cs, &mut namespace);
 
-        debug!(action = "compiled", parsed = ?slab.ps, compiled = ?slab.cs);
         Ok(SegmentEvalScorer {
             slab,
             compiled,

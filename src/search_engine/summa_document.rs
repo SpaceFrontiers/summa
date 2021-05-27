@@ -1,7 +1,7 @@
 use crate::errors::{Error, SummaResult};
 use serde_json::Value as JsonValue;
 use std::str::from_utf8;
-use tantivy::schema::{Facet, FieldType, Schema, Value};
+use tantivy::schema::{Facet, FieldType, Schema as Fields, Value};
 use tantivy::tokenizer::PreTokenizedString;
 use tantivy::{DateTime, Document};
 use time::format_description::well_known::Rfc3339;
@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 
 /// Wrapper for carrying `tantivy::Document` from various sources
 pub enum SummaDocument<'a> {
-    BoundJsonBytes((&'a Schema, &'a [u8])),
+    BoundJsonBytes((&'a Fields, &'a [u8])),
     UnboundJsonBytes(&'a [u8]),
     TantivyDocument(Document),
 }
@@ -41,7 +41,7 @@ pub enum DocumentParsingError {
 }
 
 impl<'a> SummaDocument<'a> {
-    pub fn bound_with(self, schema: &'a Schema) -> SummaDocument {
+    pub fn bound_with(self, schema: &'a Fields) -> SummaDocument {
         match self {
             SummaDocument::UnboundJsonBytes(json_bytes) => SummaDocument::BoundJsonBytes((schema, json_bytes)),
             SummaDocument::BoundJsonBytes((_, json_bytes)) => SummaDocument::BoundJsonBytes((schema, json_bytes)),
@@ -141,14 +141,14 @@ impl<'a> SummaDocument<'a> {
     }
 
     /// Build a document object from a json-object.
-    pub fn parse_document(&self, schema: &Schema, doc_json: &str) -> SummaResult<Document> {
+    pub fn parse_document(&self, schema: &Fields, doc_json: &str) -> SummaResult<Document> {
         let json_obj: serde_json::Map<String, JsonValue> =
             serde_json::from_str(doc_json).map_err(|_| DocumentParsingError::InvalidJson(doc_json.to_owned()))?;
         self.json_object_to_doc(schema, json_obj)
     }
 
     /// Build a document object from a json-object.
-    pub fn json_object_to_doc(&self, schema: &Schema, json_obj: serde_json::Map<String, JsonValue>) -> SummaResult<Document> {
+    pub fn json_object_to_doc(&self, schema: &Fields, json_obj: serde_json::Map<String, JsonValue>) -> SummaResult<Document> {
         let mut doc = Document::default();
         for (field_name, json_value) in json_obj {
             if let Some(field) = schema.get_field(&field_name) {

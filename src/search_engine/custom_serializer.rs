@@ -1,6 +1,6 @@
 use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, HashSet};
-use tantivy::schema::{Field, Schema};
+use tantivy::schema::{Field, Schema as Fields};
 use tantivy::Document;
 
 #[derive(Debug)]
@@ -19,10 +19,10 @@ pub enum Value {
 pub struct NamedFieldDocument(pub BTreeMap<String, Value>);
 
 impl NamedFieldDocument {
-    pub fn from_document(schema: &Schema, multi_fields: &HashSet<Field>, document: &Document) -> Self {
+    pub fn from_document(fields: &Fields, multi_fields: &HashSet<Field>, document: &Document) -> Self {
         let mut field_map = BTreeMap::new();
         for (field, field_values) in document.get_sorted_field_values() {
-            let field_name = schema.get_field_name(field);
+            let field_name = fields.get_field_name(field);
             let values = if multi_fields.contains(&field) {
                 Value::MultipleValue(field_values.into_iter().cloned().collect())
             } else {

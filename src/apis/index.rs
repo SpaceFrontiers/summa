@@ -7,9 +7,12 @@ use crate::errors::SummaResult;
 use crate::proto;
 use crate::search_engine::SummaDocument;
 use crate::services::IndexService;
+use std::error::Error;
+use std::io::ErrorKind;
 use std::ops::Deref;
 use tantivy::SegmentId;
-use tonic::{Request, Response, Status};
+use tokio_stream::StreamExt;
+use tonic::{Request, Response, Status, Streaming};
 use tracing::{info_span, warn};
 use tracing_futures::Instrument;
 
@@ -25,6 +28,21 @@ impl IndexApiImpl {
             application_config: application_config.clone(),
             index_service: index_service.clone(),
         })
+    }
+}
+
+fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
+    let mut err: &(dyn Error + 'static) = err_status;
+
+    loop {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            return Some(io_err);
+        }
+
+        err = match err.source() {
+            Some(err) => err,
+            None => return None,
+        };
     }
 }
 
@@ -68,15 +86,34 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         Ok(Response::new(response))
     }
 
-    async fn index_bulk(&self, request: Request<proto::IndexBulkRequest>) -> Result<Response<proto::IndexBulkResponse>, Status> {
-        let request = request.into_inner();
-        let (success_docs, failed_docs) = self
-            .index_service
-            .get_index_holder(&request.index_alias)?
-            .index_updater()
-            .read()
-            .index_bulk(&request.documents);
-        let response = proto::IndexBulkResponse { success_docs, failed_docs };
+    async fn index_document_stream(
+        &self,
+        request: Request<Streaming<proto::IndexDocumentStreamRequest>>,
+    ) -> Result<Response<proto::IndexDocumentStreamResponse>, Status> {
+        let (mut success_docs, mut failed_docs) = (0u64, 0u64);
+        let mut in_stream = request.into_inner();
+        while let Some(chunk) = in_stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    let (success_bulk_docs, failed_bulk_docs) = self
+                        .index_service
+                        .get_index_holder(&chunk.index_alias)?
+                        .index_updater()
+                        .read()
+                        .index_bulk(&chunk.documents);
+                    success_docs += success_bulk_docs;
+                    failed_docs += failed_bulk_docs;
+                }
+                Err(err) => {
+                    if let Some(io_err) = match_for_io_error(&err) {
+                        if io_err.kind() == ErrorKind::BrokenPipe {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let response = proto::IndexDocumentStreamResponse { success_docs, failed_docs };
         Ok(Response::new(response))
     }
 

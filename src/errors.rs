@@ -25,7 +25,7 @@ pub enum ValidationError {
     #[error("invalid_primary_key_type: {0:?}")]
     InvalidPrimaryKeyType(FieldType),
     #[error("invalid_schema_error: {0}")]
-    InvalidSchemaError(String),
+    InvalidFieldsError(String),
     #[error("invalid_threads_number_error: {0}")]
     InvalidThreadsNumberError(u64),
     #[error("missing_consumer_error: {0}")]

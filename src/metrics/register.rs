@@ -35,7 +35,7 @@ pub fn register_meter(index_service: &IndexService) {
         move |batch_observer_result: BatchObserverResult| {
             let index_service = index_service.clone();
             for index_holder in index_service.index_holders().values() {
-                let schema = index_holder.schema();
+                let fields = index_holder.fields();
                 let searcher = index_holder.index_reader().searcher();
                 let segment_readers = searcher.segment_readers();
                 let mut per_fields = HashMap::new();
@@ -49,7 +49,7 @@ pub fn register_meter(index_service: &IndexService) {
                         .chain(segment_space_usage.postings().fields())
                         .chain(segment_space_usage.termdict().fields())
                     {
-                        let counter = per_fields.entry(schema.get_field_name(*field)).or_insert(0u64);
+                        let counter = per_fields.entry(fields.get_field_name(*field)).or_insert(0u64);
                         *counter += field_usage.total() as u64;
                     }
                     batch_observer_result.observe(

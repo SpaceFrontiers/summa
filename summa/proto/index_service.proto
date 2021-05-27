@@ -9,7 +9,7 @@ service IndexApi {
   rpc get_indices_aliases (GetIndicesAliasesRequest) returns (GetIndicesAliasesResponse) {}
   rpc get_index (GetIndexRequest) returns (GetIndexResponse) {}
   rpc get_indices (GetIndicesRequest) returns (GetIndicesResponse) {}
-  rpc index_bulk (IndexBulkRequest) returns (IndexBulkResponse) {}
+  rpc index_document_stream (stream IndexDocumentStreamRequest) returns (IndexDocumentStreamResponse) {}
   rpc index_document (IndexDocumentRequest) returns (IndexDocumentResponse) {}
   rpc merge_segments (MergeSegmentsRequest) returns (MergeSegmentsResponse) {}
   rpc set_index_alias (SetIndexAliasRequest) returns (SetIndexAliasResponse) {}
@@ -81,7 +81,7 @@ message SortByField {
 }
 message CreateIndexRequest {
   string index_name = 1;
-  string schema = 2;
+  string fields = 2;
   IndexEngine index_engine = 10;
   optional string primary_key = 3;
   repeated string default_fields = 4;
@@ -118,11 +118,11 @@ message GetIndicesRequest {}
 message GetIndicesResponse {
   repeated Index indices = 1;
 }
-message IndexBulkRequest {
+message IndexDocumentStreamRequest {
   string index_alias = 1;
   repeated bytes documents = 2;
 }
-message IndexBulkResponse {
+message IndexDocumentStreamResponse {
   uint64 success_docs = 1;
   uint64 failed_docs = 2;
 }
