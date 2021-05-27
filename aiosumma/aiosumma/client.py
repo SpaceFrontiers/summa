@@ -40,9 +40,9 @@ class SummaClient(BaseGrpcClient):
     async def commit_index(
         self,
         index_alias: str,
-        commit_mode: Union[str, index_service_pb.CommitMode],
-        request_id: str = None,
-        session_id: str = None,
+        commit_mode: Optional[str] = None,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> index_service_pb.CommitIndexResponse:
         """
         Commit index asynchronously. A commit will be scheduled and be done eventually.
