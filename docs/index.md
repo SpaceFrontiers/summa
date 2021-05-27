@@ -10,12 +10,15 @@ Index documents directly or through Kafka and do search queries through Python c
 - [Quick Start](/summa/quick-start)
 - [Query DSL](/summa/query-dsl)
 - [Index Schema](/summa/schema)
+- [Collectors](/summa/collectors)
 
 ### Further
 - [Python API](/summa/python-api)
 - [Kafka Consuming API](/summa/kafka-consuming-api)
-- [IPFS Replication](/summa/ipfs-replication)
+- [Metrics API](/summa/metrics-api)
+- [Reflection API](/summa/metrics-api)
 
 ### Expert
+- [IPFS Replication](/summa/ipfs-replication)
 - [Architecture](/summa/architecture)
 - [Development Guide](/summa/development)

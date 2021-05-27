@@ -9,12 +9,10 @@ permalink: /quick-start
 - [Query](#query)
 
 ## Setup <a name="setup"></a>
-Both server and client are distributed through the package systems, `Cargo` and `pip`.
+Both server `summa-server` and client `aiosumma` are distributed through the package systems, `Cargo` and `pip`.
 Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub.
 
 ### Aiosumma
-
-#### Through Pip
 
 ```bash
 # (Optional) Create virtual env for `aiosumma`

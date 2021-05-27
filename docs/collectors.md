@@ -23,7 +23,26 @@ Top documents order by `EvalExpr`
 ```
 
 # Facets
+Facet search on facet field
+
+```json
+{
+  "facet": {
+    "field": "category",
+    "facets": ["/genre/fiction", "/topic/biology"]
+  }
+}
+```
+
 
 # Count
+Counts the number of documents exactly and returns it
+```json 
+{"count": {}}
+```
 
 # Reservoir
+Select `limit` random items corresponding to the query and returns them
+```json
+{"reservoir": {"limit": 10}}
+```
