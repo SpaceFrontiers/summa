@@ -18,6 +18,7 @@ Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub.
 # (Optional) Create virtual env for `aiosumma`
 python3 -m venv venv
 source venv/bin/acticate
+
 # Install aiosumma
 pip3 install -U aiosumma
 ```

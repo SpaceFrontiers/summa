@@ -7,19 +7,38 @@ permalink: /collectors
 ## Default Scoring
 Plain BM25 with limit anf offset (can be omitted)
 ```json
-{"top_docs": {"limit": 10, "offset": 200}}
+{
+  "top_docs": {
+    "limit": 10, 
+    "offset": 200
+  }
+}
 ```
 
 ## Order By
 Top documents order by `FastField`
 ```json
-{"top_docs": {"limit": 10, "scorer": {"order_by": "popularity_score"}}}
+{
+  "top_docs": {
+    "limit": 10,
+    "scorer": {
+      "order_by": "popularity_score"
+    }
+  }
+}
 ```
 
 ## Eval Expression
 Top documents order by `EvalExpr`
 ```json
-{"top_docs": {"limit": 10, "scorer": {"eval_expr": "original_score * log(e(), 1 + popularity_score)"}}}
+{
+  "top_docs": {
+    "limit": 10, 
+    "scorer": {
+      "eval_expr": "original_score * log(e(), 1 + popularity_score)"
+    }
+  }
+}
 ```
 
 # Facets
