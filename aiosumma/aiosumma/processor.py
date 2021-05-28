@@ -2,7 +2,9 @@ from izihawa_nlptools.language_detect import detect_language
 from izihawa_nlptools.utils import despace_full
 
 from aiosumma.context import QueryContext
+from aiosumma.errors import ParserError
 from aiosumma.parser import default_parser
+from aiosumma.parser.errors import ParseError
 
 
 class ProcessedQuery:
@@ -23,7 +25,11 @@ class QueryProcessor:
 
     def process(self, query, language):
         query = despace_full(query)
-        structured_query = default_parser.parse(query.lower()) if query else None
+        query = query.lower() if query else None
+        try:
+            structured_query = default_parser.parse(query) if query else None
+        except ParseError as error:
+            raise ParserError(query=query, nested_error=error)
         context = QueryContext(language=detect_language(query) or language)
         for transformer in self.transformers:
             structured_query = transformer.visit(structured_query, context=context)
