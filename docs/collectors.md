@@ -3,8 +3,14 @@ layout: page
 subtitle: Collectors
 permalink: /collectors
 ---
-# TopDocs
-## Default Scoring
+Collectors are responsible for processing the stream of documents that matched the query. 
+Every collector ingests this stream and derives output based on what ingested.
+Simple collectors such as `Count` just counting documents in the stream, other collectors such as `TopDocs` maintaining a bounded set of documents havinng highest scores to return them to user.
+The main goal of every collector is reducing the amount of data that should be returned to the requestor.
+Though collectors looks through the whole set of matched documents, they are limiting the output in various ways.
+
+## TopDocs
+### Default Scoring
 Plain BM25 with limit anf offset (can be omitted)
 ```json
 {
@@ -15,7 +21,7 @@ Plain BM25 with limit anf offset (can be omitted)
 }
 ```
 
-## Order By
+### Order By
 Top documents order by `FastField`
 ```json
 {
@@ -28,7 +34,7 @@ Top documents order by `FastField`
 }
 ```
 
-## Eval Expression
+### Eval Expression
 Top documents order by `EvalExpr`
 ```json
 {
@@ -41,7 +47,7 @@ Top documents order by `EvalExpr`
 }
 ```
 
-# Facets
+## Facets
 Facet search on facet field
 
 ```json
@@ -54,13 +60,13 @@ Facet search on facet field
 ```
 
 
-# Count
+## Count
 Counts the number of documents exactly and returns it
 ```json 
 {"count": {}}
 ```
 
-# Reservoir
+## Reservoir
 Select `limit` random items corresponding to the query and returns them
 ```json
 {"reservoir": {"limit": 10}}
