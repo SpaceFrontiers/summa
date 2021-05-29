@@ -3,6 +3,7 @@ from izihawa_nlptools.utils import despace_full
 
 from aiosumma.context import QueryContext
 from aiosumma.errors import ParserError
+from aiosumma.paren_matcher import remove_unmatched_parens
 from aiosumma.parser import default_parser
 from aiosumma.parser.errors import ParseError
 
@@ -25,7 +26,7 @@ class QueryProcessor:
 
     def process(self, query, language):
         query = despace_full(query)
-        query = query.lower() if query else None
+        query = remove_unmatched_parens(query.lower()) if query else None
         try:
             structured_query = default_parser.parse(query) if query else None
         except ParseError as error:
