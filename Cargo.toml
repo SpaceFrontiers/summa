@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "summa"
-version = "0.7.4"
+version = "0.7.5"
 license-file = "LICENSE"
 description = "Fast full-text search server"
 homepage = "https://github.com/izihawa/summa"
@@ -47,7 +47,7 @@ parking_lot = { version = "0.12.0", features = ["send_guard"] }
 path-absolutize = "3.0.13"
 prometheus = "0.13.0"
 prost = "0.10.4"
-prost-build = "0.10.4"
+prost-build = { version = "0.10.4", features = ["vendored"] }
 prost-types = "0.10.1"
 rand = "0.8.5"
 rdkafka = "0.28.0"
