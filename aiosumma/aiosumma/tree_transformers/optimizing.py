@@ -1,8 +1,8 @@
-from aiosumma.parser.elements import Group
-from aiosumma.tree_visitor import TreeTransformer
+from ..parser.elements import Group
+from .base import TreeTransformer
 
 
-class OptimizingTransformer(TreeTransformer):
+class OptimizingTreeTransformer(TreeTransformer):
     """
     Removes redundant groups
     """

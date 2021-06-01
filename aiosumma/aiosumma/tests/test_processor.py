@@ -1,17 +1,20 @@
 from aiosumma import QueryProcessor
-from aiosumma.transformers import (
-    DoiTransformer,
-    ExactMatchTransformer,
-    MorphyTransformer,
-    OptimizingTransformer,
-    OrderByTransformer,
-    TantivyTransformer,
-    ValuesWordTransformer,
-    ValueWordTransformer,
+from aiosumma.text_transformers import (
+    LowerTextTransformer,
+)
+from aiosumma.tree_transformers import (
+    DoiTreeTransformer,
+    ExactMatchTreeTransformer,
+    MorphyTreeTransformer,
+    OptimizingTreeTransformer,
+    OrderByTreeTransformer,
+    TantivyTreeTransformer,
+    ValuesWordTreeTransformer,
+    ValueWordTreeTransformer,
 )
 
 
-class MarkWordTransformer(ValueWordTransformer):
+class MarkWordTransformer(ValueWordTreeTransformer):
     def __init__(self):
         super().__init__(node_value='mark')
 
@@ -21,7 +24,7 @@ class MarkWordTransformer(ValueWordTransformer):
 
 
 def test_optimizing_query_processor():
-    query_processor = QueryProcessor(transformers=[])
+    query_processor = QueryProcessor()
     processed_query = query_processor.process('search engine', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
@@ -36,13 +39,15 @@ def test_optimizing_query_processor():
 
 
 def test_order_by_query_processor():
-    query_processor = QueryProcessor(transformers=[OrderByTransformer(
-        field_aliases={
-            'f1': 'field1',
-            'f2': 'field2',
-        },
-        valid_fields=frozenset(['field1', 'field2', 'field3']),
-    )])
+    query_processor = QueryProcessor(
+        tree_transformers=[OrderByTreeTransformer(
+            field_aliases={
+                'f1': 'field1',
+                'f2': 'field2',
+            },
+            valid_fields=frozenset(['field1', 'field2', 'field3']),
+        )],
+    )
     processed_query = query_processor.process('term1 term2 order_by:f1', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'term1'}}},
@@ -52,8 +57,8 @@ def test_order_by_query_processor():
 
 
 def test_values_processor():
-    query_processor = QueryProcessor(transformers=[
-        ValuesWordTransformer(word_transformers=[MarkWordTransformer()]),
+    query_processor = QueryProcessor(tree_transformers=[
+        ValuesWordTreeTransformer(word_transformers=[MarkWordTransformer()]),
     ])
     processed_query = query_processor.process('term1 term2 mark', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
@@ -64,11 +69,14 @@ def test_values_processor():
 
 
 def test_production_chain():
-    query_processor = QueryProcessor(transformers=[
-        MorphyTransformer(enable_morph=True),
-        TantivyTransformer(),
-        OptimizingTransformer(),
-    ])
+    query_processor = QueryProcessor(
+        text_transformers=[LowerTextTransformer()],
+        tree_transformers=[
+            MorphyTreeTransformer(enable_morph=True),
+            TantivyTreeTransformer(),
+            OptimizingTreeTransformer(),
+        ],
+    )
     processed_query = query_processor.process('search engine', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
@@ -92,7 +100,7 @@ def test_production_chain():
 
 
 def test_unknown_language_transformer():
-    query_processor = QueryProcessor(transformers=[MorphyTransformer(enable_morph=True), OptimizingTransformer()])
+    query_processor = QueryProcessor(tree_transformers=[MorphyTreeTransformer(enable_morph=True), OptimizingTreeTransformer()])
     processed_query = query_processor.process('search engine', 'zz')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
@@ -103,7 +111,7 @@ def test_unknown_language_transformer():
 
 
 def test_unknown_query_language_transformer():
-    query_processor = QueryProcessor(transformers=[MorphyTransformer(enable_morph=True), OptimizingTransformer()])
+    query_processor = QueryProcessor(tree_transformers=[MorphyTreeTransformer(enable_morph=True), OptimizingTreeTransformer()])
     processed_query = query_processor.process('kavanaba mutagor', 'zz')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'kavanaba'}}},
@@ -113,8 +121,8 @@ def test_unknown_query_language_transformer():
 
 def test_exact_match_transformers():
     query_processor = QueryProcessor(
-        transformers=[
-            ExactMatchTransformer('title'),
+        tree_transformers=[
+            ExactMatchTreeTransformer('title'),
         ]
     )
     processed_query = query_processor.process('search engine', 'en')
@@ -129,8 +137,8 @@ def test_exact_match_transformers():
 
 def test_doi_transformer():
     query_processor = QueryProcessor(
-        transformers=[
-            DoiTransformer(),
+        tree_transformers=[
+            DoiTreeTransformer(),
         ]
     )
     processed_query = query_processor.process('https://doi.org/10.1101/2022.05.26.493559', 'en')

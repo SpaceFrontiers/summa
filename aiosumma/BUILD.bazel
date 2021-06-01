@@ -16,6 +16,7 @@ py_library(
         requirement("izihawa_nlptools"),
         requirement("orjson"),
         requirement("ply"),
+        requirement("textblob"),
         "//summa/proto:summa_py",
     ],
 )
@@ -53,6 +54,7 @@ py_wheel(
         "izihawa_types >= 0.1.2",
         "orjson >= 3.6.8",
         "ply >= 3.11",
+        "textblob",
     ],
     strip_path_prefixes = [
         "summa/proto/summa_py_pb",

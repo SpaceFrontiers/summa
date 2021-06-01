@@ -5,7 +5,7 @@ from izihawa_nlptools.regex import (
     DOI_WILDCARD_REGEX_TEXT,
 )
 
-from aiosumma.parser.elements import (
+from ..parser.elements import (
     Doi,
     Group,
     Minus,
@@ -13,12 +13,11 @@ from aiosumma.parser.elements import (
     Regex,
     SearchField,
 )
-from aiosumma.tree_visitor import TreeTransformer
+from .base import TreeTransformer
+from .values import ValuePredicateWordTreeTransformer
 
-from .values import ValuePredicateWordTransformer
 
-
-class DoiTransformer(TreeTransformer):
+class DoiTreeTransformer(TreeTransformer):
     def visit_doi(self, node, context, parents):
         if parents is None or len(parents) == 0 or isinstance(parents[-1], Group):
             context.dois.append(node.value)
@@ -36,7 +35,7 @@ class DoiTransformer(TreeTransformer):
         return node, False
 
 
-class DoiWildcardWordTransformer(ValuePredicateWordTransformer):
+class DoiWildcardWordTreeTransformer(ValuePredicateWordTreeTransformer):
     def node_predicate(self, node):
         return re.search(DOI_WILDCARD_REGEX_TEXT, node.value)
 

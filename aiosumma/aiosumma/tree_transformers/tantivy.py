@@ -1,4 +1,4 @@
-from aiosumma.parser.elements import (
+from ..parser.elements import (
     Boost,
     Group,
     Minus,
@@ -6,10 +6,10 @@ from aiosumma.parser.elements import (
     SearchField,
     Word,
 )
-from aiosumma.tree_visitor import TreeTransformer
+from .base import TreeTransformer
 
 
-class TantivyTransformer(TreeTransformer):
+class TantivyTreeTransformer(TreeTransformer):
     def visit_phrase(self, node, context, parents=None):
         splitted = node.value.split()
         if len(splitted) == 0:

@@ -1,13 +1,13 @@
-from aiosumma.parser.elements import (
+from ..parser.elements import (
     Boost,
     Phrase,
     SearchField,
     Word,
 )
-from aiosumma.tree_visitor import TreeTransformer
+from .base import TreeTransformer
 
 
-class ExactMatchTransformer(TreeTransformer):
+class ExactMatchTreeTransformer(TreeTransformer):
     def __init__(self, default_phrase_field=None, score=1.0, ignore_nodes=None):
         super().__init__(ignore_nodes=ignore_nodes)
         self.default_phrase_field = default_phrase_field

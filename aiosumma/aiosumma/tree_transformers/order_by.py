@@ -1,8 +1,8 @@
-from aiosumma.parser.elements import Word
-from aiosumma.tree_visitor import TreeTransformer
+from ..parser.elements import Word
+from .base import TreeTransformer
 
 
-class OrderByTransformer(TreeTransformer):
+class OrderByTreeTransformer(TreeTransformer):
     """
     Set order_by in `QueryContext` and removes corresponding node from the query
     """

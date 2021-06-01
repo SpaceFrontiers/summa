@@ -6,3 +6,4 @@ izihawa_types>=0.1.2
 orjson>=3.6.8
 ply>=3.11
 pytest>=7.1.2
+textblob>=0.17.1

@@ -4,10 +4,10 @@ from typing import (
     Tuple,
 )
 
-from aiosumma.tree_visitor import TreeTransformer
+from .base import TreeTransformer
 
 
-class ValuePredicateWordTransformer:
+class ValuePredicateWordTreeTransformer:
     def node_predicate(self, node):
         raise NotImplementedError()
 
@@ -15,7 +15,7 @@ class ValuePredicateWordTransformer:
         raise NotImplementedError()
 
 
-class ValueWordTransformer(ValuePredicateWordTransformer):
+class ValueWordTreeTransformer(ValuePredicateWordTreeTransformer):
     def __init__(self, node_value):
         if isinstance(node_value, (List, Set, Tuple)):
             node_value_set = set(node_value)
@@ -27,7 +27,7 @@ class ValueWordTransformer(ValuePredicateWordTransformer):
         return self.predicate(node)
 
 
-class ContextWordTransformer(ValueWordTransformer):
+class ContextWordTreeTransformer(ValueWordTreeTransformer):
     def __init__(self, node_value, context_transform):
         super().__init__(node_value=node_value)
         self.context_transform = context_transform
@@ -37,7 +37,7 @@ class ContextWordTransformer(ValueWordTransformer):
         return None
 
 
-class ValuesWordTransformer(TreeTransformer):
+class ValuesWordTreeTransformer(TreeTransformer):
     def __init__(self, word_transformers, ignore_nodes=None):
         super().__init__(ignore_nodes=ignore_nodes)
         self.word_transformers = word_transformers

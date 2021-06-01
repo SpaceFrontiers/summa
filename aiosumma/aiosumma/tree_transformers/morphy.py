@@ -1,14 +1,14 @@
 from izihawa_nlptools.morph import EnglishMorphology
 
-from aiosumma.parser.elements import (
+from ..parser.elements import (
     Boost,
     Group,
     Word,
 )
-from aiosumma.tree_visitor import TreeTransformer
+from .base import TreeTransformer
 
 
-class MorphyTransformer(TreeTransformer):
+class MorphyTreeTransformer(TreeTransformer):
     """
     Creates forms of words
     """
