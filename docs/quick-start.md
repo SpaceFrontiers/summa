@@ -21,6 +21,9 @@ source venv/bin/acticate
 
 # Install aiosumma
 pip3 install -U aiosumma
+
+# Install spaCy models
+pip3 install -U https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.3.0/en_core_web_sm-3.3.0-py3-none-any.whl
 ```
 
 ### Summa Server
