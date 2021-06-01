@@ -25,6 +25,7 @@ impl Consumer {
     pub fn new(consumer_name: &str, config: &ConsumerConfig) -> SummaResult<Consumer> {
         let mut kafka_consumer_config = ClientConfig::new();
         kafka_consumer_config
+            .set("broker.address.ttl", "1000")
             .set("bootstrap.servers", config.bootstrap_servers.join(","))
             .set("group.id", &config.group_id)
             .set("enable.partition.eof", "false")

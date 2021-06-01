@@ -1,7 +1,7 @@
 ---
 # yamllint disable rule:key-ordering
 index_name: page
-compression: Zstd
+compression: None
 multi_fields: ["category"]
 default_fields: ["opening_text", "title", "text"]
 writer_heap_size_bytes: 1073741824
@@ -13,7 +13,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: position
-        tokenizer: summa
+        tokenizer: default
       stored: true
   - name: content_model
     type: text
@@ -21,7 +21,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: basic
-        tokenizer: raw
+        tokenizer: default
       stored: true
   - name: opening_text
     type: text
@@ -29,7 +29,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: position
-        tokenizer: summa
+        tokenizer: default
       stored: true
   - name: opening_text
     type: text
@@ -37,7 +37,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: position
-        tokenizer: summa
+        tokenizer: default
       stored: true
   - name: auxiliary_text
     type: text
@@ -45,7 +45,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: position
-        tokenizer: summa
+        tokenizer: default
       stored: true
   - name: language
     type: text
@@ -53,7 +53,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: basic
-        tokenizer: raw
+        tokenizer: default
       stored: true
   - name: title
     type: text
@@ -61,7 +61,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: position
-        tokenizer: summa
+        tokenizer: default
       stored: true
   - name: text
     type: text
@@ -69,7 +69,7 @@ fields: >
       indexing:
         fieldnorms: true
         record: position
-        tokenizer: summa
+        tokenizer: default
       stored: true
   - name: timestamp
     type: date

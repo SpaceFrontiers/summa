@@ -80,12 +80,13 @@ impl ConsumerThread {
     #[instrument(skip(self))]
     pub fn commit_offsets(&self) -> SummaResult<()> {
         info!(action = "commit_consumer_state");
-        let result = self.stream_consumer.lock().commit_consumer_state(CommitMode::Sync);
-        info!(action = "committed_consumer_state", result = ?result);
+        let stream_consumer = self.stream_consumer.lock();
+        let result = stream_consumer.commit_consumer_state(CommitMode::Sync);
         match result {
             Err(rdkafka::error::KafkaError::ConsumerCommit(rdkafka::error::RDKafkaErrorCode::NoOffset)) => Ok(()),
             left => left,
         }?;
+        info!(action = "committed_consumer_state", result = ?result);
         Ok(())
     }
 

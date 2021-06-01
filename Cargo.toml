@@ -63,7 +63,7 @@ time = { version = "0.3.9", features = ["serde-well-known"] }
 thiserror = "1.0.30"
 tokio = { version = "1.17.0", features = ["full", "time"] }
 tokio-stream = { version = "0.1.8", features = ["net"] }
-tonic = "0.7.2"
+tonic = { version = "0.7.2" }
 tonic-reflection = "0.4.0"
 tower = "0.4.12"
 tower-http = { version = "0.3.3", features = ["set-header", "trace"] }

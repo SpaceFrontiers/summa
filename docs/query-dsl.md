@@ -11,7 +11,7 @@ combine nested queries and modify their scores like `BoostQuery` or `BooleanQuer
 
 ## TermQuery
 The most basic kind of query. 
-`TermQuery` scores and returns documents that contain the specific word inside specific field.
+Match documents that contain the specific word inside specific field.
 The list of documents are ranged according to BM25 score.
 
 ```json 
@@ -24,7 +24,7 @@ The list of documents are ranged according to BM25 score.
 ```
 
 ## BooleanQuery
-`BooleanQuery` allowes to combine multiple queries into a single one.
+Allowes to combine multiple queries into a single one.
 ```json 
 {
   "boolean": {
@@ -50,7 +50,7 @@ The list of documents are ranged according to BM25 score.
 ```
 
 ## BoostQuery
-`BoostQuery` modifies scores produced by a nested query. It is useful in `BooleanQuery` to penalize or boost
+Modifies scores produced by a nested query. It is useful in `BooleanQuery` to penalize or boost
 parts of the query.
 ```json
 {
@@ -82,7 +82,7 @@ parts of the query.
 ```
 
 ## MatchQuery
-`MatchQuery` uses Tantivy parser to create tree of other queries. 
+Uses Tantivy parser to create tree of other queries. 
 ```json
 {
   "match": {
@@ -92,7 +92,7 @@ parts of the query.
 ```
 
 ## PhraseQuery
-`PhraseQuery` matches documents containing exact occurrence of the phrase
+Documents containing exact occurrence of the phrase
 ```json
 {
   "phrase": {
@@ -103,7 +103,7 @@ parts of the query.
 ```
 
 ## RegexQuery
-`RegexQuery` returns documents that has field value matched against the regular expression
+Documents that have field value matched against the regular expression
 ```json
 {
   "regex": {
@@ -114,7 +114,7 @@ parts of the query.
 ```
 
 ## RangeQuery
-`RangeQuery` returns documents where the requested field lays between the range
+Documents where the requested field lays between the range
 
 ```json
 {
@@ -129,12 +129,21 @@ parts of the query.
 ```
 
 ## MoreLikeThisQuery
-`MoreLikeThisQuery` returns documents that looks like passed document
+Documents that look like passed document
 
 ```json
 {
   "more_like_this": {
     "document": "{\"title\": \"astronomy\"}"
   }
+}
+```
+
+## AllQuery
+All documents
+
+```json
+{
+  "all": {}
 }
 ```

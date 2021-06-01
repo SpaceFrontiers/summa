@@ -24,7 +24,7 @@ impl ConsumerConfig {
             delete_topics: true,
             group_id: group_id.to_owned(),
             max_poll_interval_ms: 1800000,
-            session_timeout_ms: 6000,
+            session_timeout_ms: 300000,
             threads: threads
                 .try_into()
                 .map_err(|_| Error::InvalidConfigError("`threads` must be u32 sized".to_owned()))?,
