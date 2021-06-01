@@ -54,13 +54,13 @@ py_wheel(
         "izihawa_types >= 0.1.2",
         "orjson >= 3.6.8",
         "ply >= 3.11",
-        "textblob",
+        "textblob > 0.17.1",
     ],
     strip_path_prefixes = [
         "summa/proto/summa_py_pb",
         "aiosumma",
     ],
-    version = "2.1.19",
+    version = "2.1.20",
     deps = [
         ":aiosumma",
         "//summa/proto:summa_py",
