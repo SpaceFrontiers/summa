@@ -43,7 +43,7 @@ class SynonymTreeTransformer(TreeTransformer):
         return self.mapping.get(term)
 
     def visit_word(self, node, context, parents=None):
-        if parents is None or isinstance(parents[-1], Group):
+        if not parents or isinstance(parents[-1], Group):
             synset_list = self.synonyms(node.value)
             if synset_list is not None:
                 words = list(map(lambda x: Phrase(x), synset_list))
