@@ -4,12 +4,18 @@ load("@rules_python//python:packaging.bzl", "py_wheel")
 
 package(default_visibility = ["//visibility:public"])
 
+filegroup(
+    name = "data",
+    srcs = glob(["aiosumma/data/synsets/**"]),
+)
+
 py_library(
     name = "aiosumma",
     srcs = glob(["aiosumma/**/*.py"]),
     imports = [".", "summa/proto"],
     srcs_version = "PY3",
     visibility = ["//visibility:public"],
+    data = [":data"],
     deps = [
         requirement("aiogrpcclient"),
         requirement("en_core_web_sm"),
@@ -17,6 +23,7 @@ py_library(
         requirement("orjson"),
         requirement("ply"),
         requirement("textblob"),
+        "@rules_python//python/runfiles",
         "//summa/proto:summa_py",
     ],
 )
@@ -48,7 +55,7 @@ py_wheel(
     python_requires = ">=3.9",
     python_tag = "py3",
     requires = [
-        "aiogrpcclient >= 1.1.0",
+        "aiogrpcclient >= 1.1.3",
         "fire >= 0.3.1",
         "izihawa_nlptools >= 1.0.1",
         "izihawa_types >= 0.1.2",
@@ -63,6 +70,7 @@ py_wheel(
     version = "2.1.21",
     deps = [
         ":aiosumma",
+        ":data",
         "//summa/proto:summa_py",
     ],
 )

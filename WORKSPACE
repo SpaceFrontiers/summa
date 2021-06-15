@@ -24,9 +24,8 @@ http_archive(
 )
 http_archive(
     name = "rules_rust",
-    sha256 = "d0f505b8801e05900b126e239259152062a6ee523b4f2013c0d7ca332b915a26",
-    strip_prefix = "rules_rust-0.5.0",
-    urls = ["https://github.com/bazelbuild/rules_rust/archive/0.5.0.tar.gz"],
+    strip_prefix = "rules_rust-0.6.0",
+    urls = ["https://github.com/bazelbuild/rules_rust/archive/0.6.0.tar.gz"],
 )
 http_archive(
     name = "rules_proto_grpc",
@@ -36,9 +35,9 @@ http_archive(
 )
 http_archive(
     name = "rules_python",
-    sha256 = "cdf6b84084aad8f10bf20b46b77cb48d83c319ebe6458a18e9d2cebf57807cdd",
-    strip_prefix = "rules_python-0.8.1",
-    urls = ["https://github.com/bazelbuild/rules_python/archive/0.8.1.tar.gz"],
+    sha256 = "5fa3c738d33acca3b97622a13a741129f67ef43f5fdfcec63b29374cc0574c29",
+    strip_prefix = "rules_python-0.9.0",
+    urls = ["https://github.com/bazelbuild/rules_python/archive/0.9.0.tar.gz"],
 )
 
 # GRPC

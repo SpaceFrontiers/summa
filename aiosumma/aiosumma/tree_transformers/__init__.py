@@ -8,6 +8,7 @@ from .morphy import MorphyTreeTransformer
 from .optimizing import OptimizingTreeTransformer
 from .order_by import OrderByTreeTransformer
 from .spellcheck import SpellcheckTreeTransformer
+from .synonym import SynonymTreeTransformer
 from .tantivy import TantivyTreeTransformer
 from .values import (
     ContextWordTreeTransformer,
@@ -20,4 +21,4 @@ __all__ = ['DoiTreeTransformer', 'DoiWildcardWordTreeTransformer',
            'ContextWordTreeTransformer', 'ExactMatchTreeTransformer', 'FieldTreeTransformer', 'MorphyTreeTransformer',
            'OptimizingTreeTransformer', 'OrderByTreeTransformer',
            'ValuePredicateWordTreeTransformer', 'ValueWordTreeTransformer', 'ValuesWordTreeTransformer',
-           'SpellcheckTreeTransformer', 'TantivyTreeTransformer']
+           'SpellcheckTreeTransformer', 'SynonymTreeTransformer', 'TantivyTreeTransformer']

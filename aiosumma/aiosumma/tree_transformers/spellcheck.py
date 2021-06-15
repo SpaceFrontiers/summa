@@ -13,4 +13,5 @@ class SpellcheckTreeTransformer(TreeTransformer):
                     if corrected_value != operand.value:
                         operand = Group(Word(corrected_value), Word(operand.value))
                 corrected_operands.append(operand)
+            return Group(*corrected_operands), True
         return node, False
