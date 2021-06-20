@@ -8,7 +8,7 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   test:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
       - uses: bazelbuild/setup-bazelisk@v2
@@ -22,7 +22,7 @@ jobs:
       - run: bazel test -c opt //tests
   cargo-publish:
     needs: test
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
       - name: Install Protoc
@@ -45,7 +45,7 @@ jobs:
           args: --verbose
   push-to-docker:
     needs: test
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
       - uses: bazelbuild/setup-bazelisk@v2
@@ -64,7 +64,7 @@ jobs:
       - run: DOCKER_CONFIG=$HOME/.docker bazel run -c opt //:push-summa-server
   twine-upload:
     needs: test
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
       - uses: bazelbuild/setup-bazelisk@v2
