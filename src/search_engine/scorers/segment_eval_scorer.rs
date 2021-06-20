@@ -18,31 +18,23 @@ fn fast_field_to_iter(fields: &Fields, segment_reader: &SegmentReader, field_nam
     let field = fields.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
     let field_type = fields.get_field_entry(field).field_type();
     let fast_field = match field_type {
-        FieldType::U64(_) => FastFieldIteratorImpl::new(
-            segment_reader
-                .fast_fields()
-                .u64(field)
-                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
-        ),
-        FieldType::I64(_) => FastFieldIteratorImpl::new(
-            segment_reader
-                .fast_fields()
-                .i64(field)
-                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
-        ),
-        FieldType::F64(_) => FastFieldIteratorImpl::new(
-            segment_reader
-                .fast_fields()
-                .f64(field)
-                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
-        ),
-        FieldType::Date(_) => FastFieldIteratorImpl::new(
-            segment_reader
-                .fast_fields()
-                .date(field)
-                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
-        ),
-        field_type => Err(Error::InvalidFieldTypeError(field_name.to_owned(), field_type.to_owned()))?
+        FieldType::U64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().u64(field).map_err(|_| ValidationError::InvalidFastFieldType {
+            field: field_name.to_owned(),
+            field_type: field_type.to_owned(),
+        })?),
+        FieldType::I64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().i64(field).map_err(|_| ValidationError::InvalidFastFieldType {
+            field: field_name.to_owned(),
+            field_type: field_type.to_owned(),
+        })?),
+        FieldType::F64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().f64(field).map_err(|_| ValidationError::InvalidFastFieldType {
+            field: field_name.to_owned(),
+            field_type: field_type.to_owned(),
+        })?),
+        FieldType::Date(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().date(field).map_err(|_| ValidationError::InvalidFastFieldType {
+            field: field_name.to_owned(),
+            field_type: field_type.to_owned(),
+        })?),
+        field_type => Err(Error::InvalidFieldTypeError(field_name.to_owned(), field_type.to_owned()))?,
     };
     Ok(fast_field)
 }
