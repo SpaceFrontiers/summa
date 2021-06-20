@@ -36,11 +36,11 @@ impl proto::search_api_server::SearchApi for SearchApiImpl {
         };
 
         let now = Instant::now();
-        let collector_results = index_holder.search(&query, proto_request.collectors).await?;
+        let collector_outputs = index_holder.search(&query, proto_request.collectors).await?;
         let elapsed_secs = now.elapsed().as_secs_f64();
         Ok(Response::new(proto::SearchResponse {
             index_name: index_holder.index_name().to_owned(),
-            collector_results,
+            collector_outputs,
             elapsed_secs,
         }))
     }

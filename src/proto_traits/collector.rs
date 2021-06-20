@@ -34,9 +34,9 @@ pub mod shortcuts {
         }
     }
 
-    pub fn top_docs_collector_result(scored_documents: Vec<proto::ScoredDocument>, has_next: bool) -> proto::CollectorResult {
-        proto::CollectorResult {
-            collector_result: Some(proto::collector_result::CollectorResult::TopDocs(proto::TopDocsCollectorResult {
+    pub fn top_docs_collector_output(scored_documents: Vec<proto::ScoredDocument>, has_next: bool) -> proto::CollectorOutput {
+        proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
                 scored_documents,
                 has_next,
             })),

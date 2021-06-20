@@ -218,7 +218,7 @@ impl IndexHolder {
     }
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
-    pub(crate) async fn search(&self, query: &proto::Query, collectors: Vec<proto::Collector>) -> SummaResult<Vec<proto::CollectorResult>> {
+    pub(crate) async fn search(&self, query: &proto::Query, collectors: Vec<proto::Collector>) -> SummaResult<Vec<proto::CollectorOutput>> {
         let searcher = self.index_reader.searcher();
         let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
@@ -231,7 +231,7 @@ impl IndexHolder {
         let index_name = self.index_name.to_owned();
 
         let search_times_meter = self.search_times_meter.clone();
-        Ok(tokio::task::spawn_blocking(move || -> SummaResult<Vec<proto::CollectorResult>> {
+        Ok(tokio::task::spawn_blocking(move || -> SummaResult<Vec<proto::CollectorOutput>> {
             let start_time = Instant::now();
             let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
             search_times_meter.record(start_time.elapsed().as_secs_f64(), &[KeyValue::new("index_name", index_name)]);
@@ -265,7 +265,7 @@ impl Into<proto::Index> for &IndexHolder {
 pub(crate) mod tests {
     use super::*;
     use crate::logging;
-    use crate::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_result, top_docs_collector_with_eval_expr};
+    use crate::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
     use crate::proto_traits::query::shortcuts::match_query;
     use crate::requests::CreateIndexRequestBuilder;
     use crate::search_engine::SummaDocument;
@@ -340,7 +340,7 @@ pub(crate) mod tests {
         index_holder.index_reader().reload()?;
         assert_eq!(
             index_holder.search(&match_query("headcrabs"), vec![top_docs_collector(10)]).await?,
-            vec![top_docs_collector_result(
+            vec![top_docs_collector_output(
                 vec![scored_doc(
                     "{\
                         \"body\":\"Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient \
@@ -391,7 +391,7 @@ pub(crate) mod tests {
             index_holder
                 .search(&match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "issued_at")])
                 .await?,
-            vec![top_docs_collector_result(
+            vec![top_docs_collector_output(
                 vec![
                     scored_doc(
                         "{\"body\":\"term1 term7 term8 term9 term10\",\"id\":2,\"issued_at\":110,\"title\":\"term2 term3\"}",
@@ -411,7 +411,7 @@ pub(crate) mod tests {
             index_holder
                 .search(&match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "-issued_at")])
                 .await?,
-            vec![top_docs_collector_result(
+            vec![top_docs_collector_output(
                 vec![
                     scored_doc(
                         "{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}",

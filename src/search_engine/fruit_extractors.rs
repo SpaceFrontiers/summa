@@ -9,9 +9,9 @@ use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::schema::{Field, Schema as Fields};
 use tantivy::{DocAddress, DocId, LeasedItem, Score, Searcher, SegmentReader};
 
-/// Extracts data from `MultiFruit` and moving it to the `proto::CollectorResult`
+/// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
 pub trait FruitExtractor: Sync + Send {
-    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorResult;
+    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorOutput;
 }
 
 pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
@@ -110,7 +110,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
 }
 
 impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for TopDocs<T> {
-    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorResult {
+    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorOutput {
         let fields = searcher.schema();
         let fruit = self.handle.extract(multi_fruit);
         let scored_documents_iter = fruit.iter().enumerate().map(|(position, (score, doc_address))| {
@@ -124,8 +124,8 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let len = scored_documents_iter.len();
         let scored_documents = scored_documents_iter.take(std::cmp::min(self.limit, len)).collect();
         let has_next = len > self.limit;
-        proto::CollectorResult {
-            collector_result: Some(proto::collector_result::CollectorResult::TopDocs(proto::TopDocsCollectorResult {
+        proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
                 scored_documents,
                 has_next,
             })),
@@ -136,11 +136,11 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
 pub struct ReservoirSampling(pub FruitHandle<Vec<DocAddress>>);
 
 impl FruitExtractor for ReservoirSampling {
-    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorResult {
+    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &LeasedItem<Searcher>, multi_fields: &HashSet<Field>) -> proto::CollectorOutput {
         let fields = searcher.schema();
-        proto::CollectorResult {
-            collector_result: Some(proto::collector_result::CollectorResult::ReservoirSampling(
-                proto::ReservoirSamplingCollectorResult {
+        proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::ReservoirSampling(
+                proto::ReservoirSamplingCollectorOutput {
                     documents: self
                         .0
                         .extract(multi_fruit)
@@ -156,9 +156,9 @@ impl FruitExtractor for ReservoirSampling {
 pub struct Count(pub FruitHandle<usize>);
 
 impl FruitExtractor for Count {
-    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorResult {
-        proto::CollectorResult {
-            collector_result: Some(proto::collector_result::CollectorResult::Count(proto::CountCollectorResult {
+    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorOutput {
+        proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::Count(proto::CountCollectorOutput {
                 count: self.0.extract(multi_fruit) as u32,
             })),
         }
@@ -168,9 +168,9 @@ impl FruitExtractor for Count {
 pub struct Facet(pub FruitHandle<FacetCounts>);
 
 impl FruitExtractor for Facet {
-    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorResult {
-        proto::CollectorResult {
-            collector_result: Some(proto::collector_result::CollectorResult::Facet(proto::FacetCollectorResult {
+    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorOutput {
+        proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::Facet(proto::FacetCollectorOutput {
                 facet_counts: self.0.extract(multi_fruit).get("").map(|(facet, count)| (facet.to_string(), count)).collect(),
             })),
         }
@@ -180,9 +180,9 @@ impl FruitExtractor for Facet {
 pub struct Aggregation(pub FruitHandle<AggregationResults>);
 
 impl FruitExtractor for Aggregation {
-    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorResult {
-        proto::CollectorResult {
-            collector_result: Some(proto::collector_result::CollectorResult::Aggregation(proto::AggregationCollectorResult {
+    fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorOutput {
+        proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::Aggregation(proto::AggregationCollectorOutput {
                 aggregation_results: parse_aggregation_results(self.0.extract(multi_fruit).0),
             })),
         }
