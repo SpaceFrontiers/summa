@@ -1,13 +1,13 @@
+use crate::errors::ValidationError::InvalidAggregationError;
 use crate::errors::{Error, SummaResult};
 use crate::proto;
 use crate::search_engine::custom_serializer::NamedFieldDocument;
 use crate::search_engine::scorers::EvalScorer;
 use std::collections::{HashMap, HashSet};
-use tantivy::aggregation::agg_result::{AggregationResults};
+use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::schema::{Field, Schema as Fields};
 use tantivy::{DocAddress, DocId, LeasedItem, Score, Searcher, SegmentReader};
-use crate::errors::ValidationError::InvalidAggregationError;
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorResult`
 pub trait FruitExtractor: Sync + Send {
@@ -15,27 +15,29 @@ pub trait FruitExtractor: Sync + Send {
 }
 
 pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
-    let aggregations = aggregations.into_iter().map(|(name, aggregation)| {
-        let aggregation = match aggregation.aggregation {
-            None => Err(Error::ValidationError(InvalidAggregationError)),
-            Some(a) => a.try_into()
-        }?;
-        Ok((name.to_string(), aggregation))
-    }).collect::<SummaResult<Vec<_>>>()?;
+    let aggregations = aggregations
+        .into_iter()
+        .map(|(name, aggregation)| {
+            let aggregation = match aggregation.aggregation {
+                None => Err(Error::ValidationError(InvalidAggregationError)),
+                Some(a) => a.try_into(),
+            }?;
+            Ok((name.to_string(), aggregation))
+        })
+        .collect::<SummaResult<Vec<_>>>()?;
     Ok(HashMap::from_iter(aggregations.into_iter()))
 }
 
-fn parse_aggregation_results(aggregation_results: HashMap<String, tantivy::aggregation::agg_result::AggregationResult>) -> HashMap<String, proto::AggregationResult> {
-    aggregation_results.into_iter().map(|(name, aggregation_result)| {
-        (name.to_string(), aggregation_result.into())
-    }).collect()
+fn parse_aggregation_results(
+    aggregation_results: HashMap<String, tantivy::aggregation::agg_result::AggregationResult>,
+) -> HashMap<String, proto::AggregationResult> {
+    aggregation_results
+        .into_iter()
+        .map(|(name, aggregation_result)| (name.to_string(), aggregation_result.into()))
+        .collect()
 }
 
-pub fn build_fruit_extractor(
-    collector_proto: proto::Collector,
-    fields: &Fields,
-    multi_collector: &mut MultiCollector,
-) -> SummaResult<Box<dyn FruitExtractor>> {
+pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields, multi_collector: &mut MultiCollector) -> SummaResult<Box<dyn FruitExtractor>> {
     match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => Ok(match top_docs_collector_proto.scorer {
             None | Some(proto::Scorer { scorer: None }) => Box::new(TopDocs::new(
@@ -46,8 +48,8 @@ pub fn build_fruit_extractor(
                 top_docs_collector_proto.limit.try_into().unwrap(),
             )) as Box<dyn FruitExtractor>,
             Some(proto::Scorer {
-                     scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
-                 }) => {
+                scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
+            }) => {
                 let eval_scorer_seed = EvalScorer::new(eval_expr, &fields)?;
                 let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                     .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
@@ -61,8 +63,8 @@ pub fn build_fruit_extractor(
                 )) as Box<dyn FruitExtractor>
             }
             Some(proto::Scorer {
-                     scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
-                 }) => {
+                scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
+            }) => {
                 let field = fields.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
                 let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                     .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
@@ -181,7 +183,7 @@ impl FruitExtractor for Aggregation {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, _searcher: &LeasedItem<Searcher>, _multi_fields: &HashSet<Field>) -> proto::CollectorResult {
         proto::CollectorResult {
             collector_result: Some(proto::collector_result::CollectorResult::Aggregation(proto::AggregationCollectorResult {
-                aggregation_results: parse_aggregation_results(self.0.extract(multi_fruit).0)
+                aggregation_results: parse_aggregation_results(self.0.extract(multi_fruit).0),
             })),
         }
     }
