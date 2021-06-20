@@ -19,13 +19,13 @@ from summa.proto import index_service_pb2 as index_service_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
 from summa.proto import search_service_pb2 as search_service_pb
 from summa.proto.consumer_service_pb2_grpc import ConsumerApiStub
-from summa.proto.index_service_pb2 import (  # noqa
-    Asc,
-    Desc,
-)
 from summa.proto.index_service_pb2_grpc import IndexApiStub
 from summa.proto.reflection_service_pb2_grpc import ReflectionApiStub
 from summa.proto.search_service_pb2_grpc import SearchApiStub
+from summa.proto.utils_pb2 import (  # noqa
+    Asc,
+    Desc,
+)
 
 
 class SummaClient(BaseGrpcClient):
