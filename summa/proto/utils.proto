@@ -1,0 +1,7 @@
+syntax = "proto3";
+package summa.proto;
+
+enum Order {
+  Asc = 0;
+  Desc = 1;
+}

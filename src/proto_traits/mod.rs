@@ -1,3 +1,4 @@
+mod aggregation;
 pub mod collector;
 mod compression;
 pub mod query;

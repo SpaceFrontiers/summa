@@ -1,8 +1,12 @@
 syntax = "proto3";
 package summa.proto;
 
+import "google/protobuf/empty.proto";
+import "utils.proto";
+
 
 // API
+
 service SearchApi {
   rpc search (SearchRequest) returns (SearchResponse) {}
 }
@@ -90,7 +94,96 @@ message TermQuery {
   string value = 2;
 }
 
+// Aggregation
+
+message Aggregation {
+  oneof aggregation {
+    BucketAggregation bucket = 1;
+    MetricAggregation metric = 2;
+  }
+}
+
+message BucketAggregation {
+  oneof bucket_agg {
+    RangeAggregation range = 1;
+    HistogramAggregation histogram = 2;
+    TermsAggregation terms = 3;
+  };
+  map<string, Aggregation> sub_aggregation = 4;
+}
+
+message RangeAggregation {
+  string field = 1;
+  repeated RangeAggregationRange ranges = 2;
+}
+
+message RangeAggregationRange {
+  optional double from = 1;
+  optional double to = 2;
+}
+
+message HistogramAggregation {
+    string field = 1;
+    double interval = 2;
+    optional double offset = 3;
+    optional uint64 min_doc_count = 4;
+    optional HistogramBounds hard_bounds = 5;
+    optional HistogramBounds extended_bounds = 6;
+}
+
+message HistogramBounds {
+  double min = 1;
+  double max = 2;
+}
+
+message TermsAggregation {
+    string field = 1;
+    optional uint32 size = 2;
+    optional uint32 split_size = 3;
+    optional uint32 segment_size = 4;
+    optional bool show_term_doc_count_error = 5;
+    optional uint64 min_doc_count = 6;
+    optional CustomOrder order = 7;
+}
+
+message CustomOrder {
+    oneof order_target {
+      google.protobuf.Empty key = 1;
+      google.protobuf.Empty count = 2;
+      string sub_aggregation = 3;
+    };
+    Order order = 4;
+}
+
+message MetricAggregation {
+  oneof metric_aggregation {
+    AverageAggregation average_aggregation = 1;
+    StatsAggregation stats_aggregation = 2;
+  }
+}
+
+message AverageAggregation {
+  string field = 1;
+}
+
+message StatsAggregation {
+  string field = 1;
+}
+
 // Extra structures
+
+message BucketEntry {
+  Key key = 1;
+  uint64 doc_count = 2;
+  map<string, AggregationResult> sub_aggregation = 3;
+}
+
+message Key {
+  oneof key {
+    string str = 1;
+    double f64 = 2;
+  }
+}
 
 enum Occur {
   should = 0;
@@ -105,10 +198,12 @@ message Range {
   bool including_right = 4;
 }
 
-message ScoredDocument {
-  string document = 1;
-  Score score = 2;
-  uint32 position = 3;
+message RangeBucketEntry {
+  Key key = 1;
+  uint64 doc_count = 2;
+  map<string, AggregationResult> sub_aggregation = 3;
+  optional double from = 4;
+  optional double to = 5;
 }
 
 message Score {
@@ -118,6 +213,13 @@ message Score {
   }
 }
 
+
+message ScoredDocument {
+  string document = 1;
+  Score score = 2;
+  uint32 position = 3;
+}
+
 message Scorer {
   oneof scorer {
     string eval_expr = 1;
@@ -125,12 +227,15 @@ message Scorer {
   }
 }
 
+// Collectors and CollectorResults
+
 message Collector {
   oneof collector {
     TopDocsCollector top_docs = 1;
     ReservoirSamplingCollector reservoir_sampling = 2;
     CountCollector count = 3;
     FacetCollector facet = 4;
+    AggregationCollector aggregation = 5;
   }
 }
 
@@ -140,10 +245,9 @@ message CollectorResult {
     ReservoirSamplingCollectorResult reservoir_sampling = 2;
     CountCollectorResult count = 3;
     FacetCollectorResult facet = 4;
+    AggregationCollectorResult aggregation = 5;
   }
 }
-
-// Collectors and CollectorResults
 
 message CountCollector {}
 
@@ -175,4 +279,61 @@ message TopDocsCollector {
 message TopDocsCollectorResult {
   repeated ScoredDocument scored_documents = 1;
   bool has_next = 2;
+}
+
+message AggregationCollector {
+  map<string, Aggregation> aggregations = 1;
+}
+
+message AggregationCollectorResult {
+  map<string, AggregationResult> aggregation_results = 1;
+}
+
+message AggregationResult {
+  oneof aggregation_result {
+    BucketResult bucket = 1;
+    MetricResult metric = 2;
+  }
+}
+
+message BucketResult {
+  oneof bucket_result {
+    RangeResult range = 1;
+    HistogramResult histogram = 2;
+    TermsResult terms = 3;
+  }
+}
+
+message RangeResult {
+  repeated RangeBucketEntry buckets = 1;
+}
+
+message HistogramResult {
+  repeated BucketEntry buckets = 1;
+}
+
+message TermsResult {
+  repeated BucketEntry buckets = 1;
+  uint64 sum_other_doc_count = 2;
+  optional uint64 doc_count_error_upper_bound = 3;
+}
+
+message MetricResult {
+  oneof metric_result {
+    SingleMetricResult single_metric = 1;
+    StatsResult stats = 2;
+  }
+}
+
+message SingleMetricResult {
+  optional double value = 1;
+}
+
+message StatsResult {
+    uint64 count = 1;
+    double sum = 2;
+    optional double standard_deviation = 3;
+    optional double min = 4;
+    optional double max = 5;
+    optional double avg = 6;
 }

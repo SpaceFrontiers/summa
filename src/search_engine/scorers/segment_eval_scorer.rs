@@ -1,5 +1,5 @@
 use super::fast_field_iterator::{FastFieldIterator, FastFieldIteratorImpl};
-use crate::errors::{Error, SummaResult};
+use crate::errors::{Error, SummaResult, ValidationError};
 use fasteval2::{Compiler, Evaler, Instruction};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tantivy::schema::{FieldType, Schema as Fields};
@@ -12,6 +12,39 @@ pub struct SegmentEvalScorer {
     _boxed_now: Box<f64>,
     fast_fields_iterators: Vec<Box<dyn FastFieldIterator>>,
     namespace: fn(&str, Vec<f64>) -> Option<f64>,
+}
+
+fn fast_field_to_iter(fields: &Fields, segment_reader: &SegmentReader, field_name: &str) -> SummaResult<Box<dyn FastFieldIterator>> {
+    let field = fields.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
+    let field_type = fields.get_field_entry(field).field_type();
+    let fast_field = match field_type {
+        FieldType::U64(_) => FastFieldIteratorImpl::new(
+            segment_reader
+                .fast_fields()
+                .u64(field)
+                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
+        ),
+        FieldType::I64(_) => FastFieldIteratorImpl::new(
+            segment_reader
+                .fast_fields()
+                .i64(field)
+                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
+        ),
+        FieldType::F64(_) => FastFieldIteratorImpl::new(
+            segment_reader
+                .fast_fields()
+                .f64(field)
+                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
+        ),
+        FieldType::Date(_) => FastFieldIteratorImpl::new(
+            segment_reader
+                .fast_fields()
+                .date(field)
+                .map_err(|_| ValidationError::InvalidFastFieldType { field: field_name.to_owned(), field_type: field_type.to_owned() })?
+        ),
+        field_type => Err(Error::InvalidFieldTypeError(field_name.to_owned(), field_type.to_owned()))?
+    };
+    Ok(fast_field)
 }
 
 impl SegmentEvalScorer {
@@ -48,15 +81,8 @@ impl SegmentEvalScorer {
         let mut fast_fields_iterators = vec![];
 
         // Set fast fields
-        for var_name in var_names.iter() {
-            let field = fields.get_field(&var_name).ok_or(Error::FieldDoesNotExistError(var_name.to_owned()))?;
-            fast_fields_iterators.push(match fields.get_field_entry(field).field_type() {
-                FieldType::U64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().u64(field).unwrap()),
-                FieldType::I64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().i64(field).unwrap()),
-                FieldType::F64(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().f64(field).unwrap()),
-                FieldType::Date(_) => FastFieldIteratorImpl::new(segment_reader.fast_fields().date(field).unwrap()),
-                field_type => return Err(Error::InvalidFieldTypeError(var_name.to_owned(), field_type.to_owned()))?,
-            });
+        for var_name in var_names {
+            fast_fields_iterators.push(fast_field_to_iter(fields, segment_reader, var_name)?);
             unsafe {
                 slab.ps.add_unsafe_var(var_name.to_owned(), fast_fields_iterators.last().unwrap().value());
             }

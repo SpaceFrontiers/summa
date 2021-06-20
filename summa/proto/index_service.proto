@@ -1,6 +1,8 @@
 syntax = "proto3";
 package summa.proto;
 
+import "utils.proto";
+
 // API
 
 service IndexApi {
@@ -38,11 +40,6 @@ message CommitIndexRequest {
 message CommitIndexResponse {
   optional uint64 opstamp = 1;
   optional double elapsed_secs = 2;
-}
-
-enum Order {
-  Asc = 0;
-  Desc = 1;
 }
 
 message SortByField {
