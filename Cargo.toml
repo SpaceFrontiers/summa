@@ -2,6 +2,7 @@
 edition = "2021"
 name = "summa"
 version = "0.8.2"
+license = "MIT"
 license-file = "LICENSE"
 description = "Fast full-text search server"
 homepage = "https://github.com/izihawa/summa"
