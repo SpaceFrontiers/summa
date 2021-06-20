@@ -1,8 +1,17 @@
 import csv
 import os.path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import (
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+)
 
-from ..parser.elements import Group, Phrase
+from ..parser.elements import (
+    Group,
+    Phrase,
+)
 from .base import TreeTransformer
 
 

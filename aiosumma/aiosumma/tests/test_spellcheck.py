@@ -1,7 +1,5 @@
 from aiosumma import QueryProcessor
-from aiosumma.tree_transformers import (
-    SpellcheckTreeTransformer
-)
+from aiosumma.tree_transformers import SpellcheckTreeTransformer
 
 
 def test_spell_check():
@@ -24,7 +22,7 @@ def test_spell_check():
                 'occur': 'should',
                 'query': {'match': {'value': 'embedded'}}}, {
                 'occur': 'should',
-                'query': {'match': {'value': 'embeded'}}}]}}},{
+                'query': {'match': {'value': 'embeded'}}}]}}}, {
             'occur': 'should',
             'query': {'boolean': {'subqueries': [{
                 'occur': 'should',

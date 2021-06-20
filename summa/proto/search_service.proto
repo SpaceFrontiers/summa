@@ -26,11 +26,11 @@ message SearchResponse {
   string index_name = 1;
   // An array of collector outputs
   repeated CollectorOutput collector_outputs = 2;
+  // Time spent inside of `search` handler
   double elapsed_secs = 3;
 }
 
-// Query DSL
-
+// Recursive query DSL
 message Query {
   oneof query {
     BooleanQuery boolean = 1;
@@ -99,7 +99,6 @@ message TermQuery {
 }
 
 // Aggregation
-
 message Aggregation {
   oneof aggregation {
     BucketAggregation bucket = 1;

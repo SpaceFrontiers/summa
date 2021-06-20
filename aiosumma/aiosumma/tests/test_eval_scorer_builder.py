@@ -1,5 +1,6 @@
-from aiosumma.eval_scorer_builder import EvalScorerBuilder
 from datetime import timedelta
+
+from aiosumma.eval_scorer_builder import EvalScorerBuilder
 
 
 def test_eval_scorer_builder():
