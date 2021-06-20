@@ -157,8 +157,8 @@ message CustomOrder {
 
 message MetricAggregation {
   oneof metric_aggregation {
-    AverageAggregation average_aggregation = 1;
-    StatsAggregation stats_aggregation = 2;
+    AverageAggregation average = 1;
+    StatsAggregation stats = 2;
   }
 }
 

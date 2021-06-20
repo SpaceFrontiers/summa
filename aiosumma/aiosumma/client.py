@@ -14,6 +14,8 @@ from aiogrpcclient import (
 )
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
+from izihawa_utils.pb_to_json import MessageToDict, ParseDict
+
 from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
@@ -432,13 +434,29 @@ class SummaClient(BaseGrpcClient):
         """
         if not isinstance(collectors, List):
             collectors = [collectors]
+
+        d = MessageToDict(search_service_pb.SearchRequest(
+            index_alias='scitech',
+            collectors=[search_service_pb.Collector(aggregation=search_service_pb.AggregationCollector(
+                aggregations={
+                    'kek1': search_service_pb.Aggregation(
+                        metric=search_service_pb.MetricAggregation(
+                            average=search_service_pb.AverageAggregation(
+                                field='name',
+                            )
+                        )
+                    )
+                }
+            ))]
+        ))
+
         try:
             return await self.stubs['search_api'].search(
-                search_service_pb.SearchRequest(
-                    index_alias=index_alias,
-                    query=query,
-                    collectors=collectors
-                ),
+                ParseDict({
+                    'index_alias': index_alias,
+                    'query': query,
+                    'collectors': collectors
+                }, search_service_pb.SearchRequest()),
                 metadata=(('request-id', request_id), ('session-id', session_id)),
             )
         except AioRpcError as e:

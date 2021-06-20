@@ -167,7 +167,7 @@ impl SegmentCollector for SegmentReservoirSamplingCollector {
     }
 }
 
-impl Into<ReservoirSampling> for &proto::ReservoirSamplingCollector {
+impl Into<ReservoirSampling> for proto::ReservoirSamplingCollector {
     fn into(self) -> ReservoirSampling {
         ReservoirSampling::with_limit(self.limit.try_into().unwrap())
     }

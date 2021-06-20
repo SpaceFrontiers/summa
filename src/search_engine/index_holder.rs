@@ -223,7 +223,7 @@ impl IndexHolder {
         let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let mut extractors: Vec<Box<dyn FruitExtractor>> = collectors
-            .iter()
+            .into_iter()
             .map(|collector_proto| build_fruit_extractor(collector_proto, &self.cached_fields, &mut multi_collector))
             .collect::<SummaResult<_>>()?;
         info!(target: "query", index_name = ?self.index_name);

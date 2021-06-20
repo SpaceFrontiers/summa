@@ -90,14 +90,14 @@ impl TryFrom<proto::aggregation::Aggregation> for Aggregation {
             }
             proto::aggregation::Aggregation::Metric(metric_aggregation) => {
                 match metric_aggregation.metric_aggregation {
-                    Some(proto::metric_aggregation::MetricAggregation::AverageAggregation(average_aggregation)) => {
+                    Some(proto::metric_aggregation::MetricAggregation::Average(average_aggregation)) => {
                         Aggregation::Metric(
                             MetricAggregation::Average {
                                 0: AverageAggregation::from_field_name(average_aggregation.field)
                             }
                         )
                     }
-                    Some(proto::metric_aggregation::MetricAggregation::StatsAggregation(stats_aggregation)) => {
+                    Some(proto::metric_aggregation::MetricAggregation::Stats(stats_aggregation)) => {
                         Aggregation::Metric(
                             MetricAggregation::Stats {
                                 0: StatsAggregation::from_field_name(stats_aggregation.field)
