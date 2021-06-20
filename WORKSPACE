@@ -24,6 +24,7 @@ http_archive(
 )
 http_archive(
     name = "rules_rust",
+    sha256 = "a1bd33f21e3880af177007d32729d67a6cc02c95f336b9513d0ab22e28345167",
     strip_prefix = "rules_rust-0.6.0",
     urls = ["https://github.com/bazelbuild/rules_rust/archive/0.6.0.tar.gz"],
 )
