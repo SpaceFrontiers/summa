@@ -6,11 +6,11 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
+      - name: Install Protobuf Headers
+        run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
       - name: Install Protobuf Headers
         run: sudo apt-get install -y libprotobuf-dev
       - uses: bazelbuild/setup-bazelisk@v2

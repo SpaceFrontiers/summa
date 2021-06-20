@@ -8,14 +8,12 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
       - uses: bazelbuild/setup-bazelisk@v2
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
       - name: Install Protobuf Headers
-        run: sudo apt-get install -y libprotobuf-dev
+        run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
       - name: Mount bazel cache
         uses: actions/cache@v3
         with:
@@ -24,9 +22,9 @@ jobs:
       - run: bazel test -c opt //tests
   cargo-publish:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2.4.0
+      - uses: actions/checkout@v3
       - name: Install Protoc
         uses: arduino/setup-protoc@v1
       - uses: actions/cache@v2.1.6
@@ -47,7 +45,7 @@ jobs:
           args: --verbose
   push-to-docker:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
       - uses: bazelbuild/setup-bazelisk@v2
@@ -66,9 +64,8 @@ jobs:
       - run: DOCKER_CONFIG=$HOME/.docker bazel run -c opt //:push-summa-server
   twine-upload:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2.4.0
       - uses: actions/checkout@v3
       - uses: bazelbuild/setup-bazelisk@v2
       - name: Mount bazel cache
