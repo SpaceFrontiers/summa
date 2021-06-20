@@ -2,7 +2,7 @@ syntax = "proto3";
 package summa.proto;
 
 import "google/protobuf/empty.proto";
-import "utils.proto";
+import "summa/proto/utils.proto";
 
 
 // API
