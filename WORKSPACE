@@ -128,7 +128,7 @@ container_deps()
 load("@io_bazel_rules_docker//container:container.bzl", "container_pull")
 container_pull(
     name = "izihawa-base-image",
-    digest = "sha256:35c28ae225732f94830d8d6fe4e27f5b360e834b8a71fa6283d82e84b80e1533",
+    digest = "sha256:1abfc30f238c88a51683831e6b66f06b55b8dd9d0cec8cad16eb401cf408d5a3",
     registry = "index.docker.io",
     repository = "izihawa/base-image",
 )

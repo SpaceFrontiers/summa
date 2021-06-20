@@ -1,4 +1,4 @@
-FROM ubuntu:latest as build-env
+FROM ubuntu:22.04 as build-env
 RUN apt install zlib1g
 
 FROM gcr.io/distroless/cc
