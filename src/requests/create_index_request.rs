@@ -30,10 +30,10 @@ pub struct CreateIndexRequest {
 
 impl CreateIndexRequest {
     fn parse_fields(fields: &str) -> SummaResult<Fields> {
-        serde_yaml::from_str(fields).map_err(|_| Error::ValidationError(ValidationError::InvalidFieldsError(fields.to_owned())))
+        serde_yaml::from_str(fields).map_err(|_| Error::Validation(ValidationError::InvalidFields(fields.to_owned())))
     }
 
-    fn parse_default_fields(fields: &Fields, default_fields: &Vec<String>) -> SummaResult<Vec<String>> {
+    fn parse_default_fields(fields: &Fields, default_fields: &[String]) -> SummaResult<Vec<String>> {
         Ok(default_fields
             .iter()
             .map(|default_field_name| match fields.get_field(default_field_name) {
@@ -47,7 +47,7 @@ impl CreateIndexRequest {
         Ok(match primary_key {
             Some(primary_key) => Some(match fields.get_field(primary_key) {
                 Some(_) => primary_key.to_owned(),
-                None => Err(ValidationError::MissingPrimaryKeyError(Some(primary_key.to_owned())))?,
+                None => return Err(ValidationError::MissingPrimaryKey(Some(primary_key.to_owned())).into()),
             }),
             None => None,
         })
@@ -77,13 +77,13 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
         Ok(CreateIndexRequestBuilder::default()
             .index_name(proto_request.index_name)
             .index_engine(proto::IndexEngine::from_i32(proto_request.index_engine).unwrap())
-            .fields(fields.clone())
+            .fields(fields)
             .primary_key(primary_key)
             .compression(compression)
             .default_fields(default_fields)
             .multi_fields(multi_fields)
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
-            .stop_words(if proto_request.stop_words.len() > 0 {
+            .stop_words(if !proto_request.stop_words.is_empty() {
                 Some(proto_request.stop_words)
             } else {
                 None

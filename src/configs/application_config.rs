@@ -65,11 +65,11 @@ impl ApplicationConfig {
 
     /// Set new alias for index
     pub fn set_index_alias(&mut self, alias: &str, index_name: &str) -> SummaResult<Option<String>> {
-        if alias == "" {
-            Err(ValidationError::EmptyArgument("alias".to_owned()))?
+        if alias.is_empty() {
+            return Err(ValidationError::EmptyArgument("alias".to_owned()).into());
         }
         if !self.indices.contains_key(index_name) {
-            Err(ValidationError::MissingIndexError(index_name.to_owned()))?
+            return Err(ValidationError::MissingIndex(index_name.to_owned()).into());
         }
         Ok(self.aliases.insert(alias.to_owned(), index_name.to_owned()))
     }
@@ -111,7 +111,7 @@ pub struct ApplicationConfigHolder(Arc<RwLock<ConfigHolder<ApplicationConfig>>>)
 impl ApplicationConfigHolder {
     pub fn from_path<P: AsRef<Path>>(application_config_filepath: P) -> SummaResult<ApplicationConfigHolder> {
         let application_config = ConfigHolder::<ApplicationConfig>::from_file(application_config_filepath.as_ref(), None)?;
-        std::fs::create_dir_all(&application_config.data_path).map_err(|e| Error::IOError((e, Some(application_config.data_path.clone()))))?;
+        std::fs::create_dir_all(&application_config.data_path).map_err(|e| Error::IO((e, Some(application_config.data_path.clone()))))?;
         Ok(ApplicationConfigHolder::from_config_holder(application_config))
     }
     pub fn with_path<P: AsRef<Path>>(application_config: ApplicationConfig, application_config_filepath: P) -> ApplicationConfigHolder {

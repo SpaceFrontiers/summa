@@ -1,4 +1,4 @@
-use crate::errors::{Error, SummaResult};
+use crate::errors::{Error, SummaResult, ValidationError};
 use serde_json::Value as JsonValue;
 use std::str::from_utf8;
 use tantivy::schema::{Facet, FieldType, Schema as Fields, Value};
@@ -160,14 +160,14 @@ impl<'a> SummaDocument<'a> {
                             match self.value_from_json(field_type, json_item) {
                                 Ok(value) => doc.add_field_value(field, value),
                                 Err(ValueParsingError::NullValueError) => continue,
-                                Err(error) => Err(DocumentParsingError::ValueError(field_name.to_owned(), error))?,
+                                Err(error) => return Err(DocumentParsingError::ValueError(field_name.to_owned(), error).into()),
                             }
                         }
                     }
                     _ => match self.value_from_json(field_type, json_value) {
                         Ok(value) => doc.add_field_value(field, value),
                         Err(ValueParsingError::NullValueError) => continue,
-                        Err(error) => Err(DocumentParsingError::ValueError(field_name.to_owned(), error))?,
+                        Err(error) => return Err(DocumentParsingError::ValueError(field_name.to_owned(), error).into()),
                     },
                 }
             }
@@ -182,10 +182,10 @@ impl<'a> TryInto<Document> for SummaDocument<'a> {
     fn try_into(self) -> SummaResult<Document> {
         match self {
             SummaDocument::BoundJsonBytes((schema, json_bytes)) => {
-                let text_document = from_utf8(json_bytes).map_err(|e| Error::Utf8Error(e))?;
+                let text_document = from_utf8(json_bytes).map_err(ValidationError::Utf8)?;
                 Ok(self.parse_document(schema, text_document)?)
             }
-            SummaDocument::UnboundJsonBytes(_) => Err(Error::UnboundDocumentError)?,
+            SummaDocument::UnboundJsonBytes(_) => Err(Error::UnboundDocument),
             SummaDocument::TantivyDocument(document) => Ok(document),
         }
     }
@@ -193,6 +193,6 @@ impl<'a> TryInto<Document> for SummaDocument<'a> {
 
 impl<'a> From<&'a Vec<u8>> for SummaDocument<'a> {
     fn from(v: &'a Vec<u8>) -> Self {
-        SummaDocument::UnboundJsonBytes(&v)
+        SummaDocument::UnboundJsonBytes(v)
     }
 }

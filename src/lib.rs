@@ -39,5 +39,5 @@ pub use application::Application;
 
 pub mod proto {
     tonic::include_proto!("summa.proto");
-    pub(crate) const FILE_DESCRIPTOR_SET: &'static [u8] = tonic::include_file_descriptor_set!("summa");
+    pub(crate) const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("summa");
 }

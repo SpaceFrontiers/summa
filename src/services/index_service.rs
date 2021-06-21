@@ -29,11 +29,11 @@ pub struct DeleteIndexResult {
     pub deleted_index_consumers: Vec<String>,
 }
 
-impl Into<proto::DeleteIndexResponse> for DeleteIndexResult {
-    fn into(self) -> proto::DeleteIndexResponse {
+impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
+    fn from(delete_index_request: DeleteIndexResult) -> Self {
         proto::DeleteIndexResponse {
-            deleted_index_aliases: self.deleted_index_aliases,
-            deleted_index_consumers: self.deleted_index_consumers,
+            deleted_index_aliases: delete_index_request.deleted_index_aliases,
+            deleted_index_consumers: delete_index_request.deleted_index_consumers,
         }
     }
 }
@@ -51,7 +51,7 @@ impl IndexService {
     /// Create `IndexHolder`s from config
     pub(crate) async fn setup_index_holders(&self) -> SummaResult<()> {
         let mut index_holders = HashMap::new();
-        for (index_name, _index_config) in &self.application_config.read().indices {
+        for index_name in self.application_config.read().indices.keys() {
             index_holders.insert(
                 index_name.clone(),
                 OwningHandler::new(IndexHolder::open(index_name, IndexConfigProxy::new(&self.application_config, index_name)).await?),
@@ -78,7 +78,7 @@ impl IndexService {
             .index_holders
             .read()
             .get(index_name)
-            .ok_or_else(|| Error::ValidationError(ValidationError::MissingIndexError(index_name.to_owned())))?
+            .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_name.to_owned())))?
             .handler())
     }
     /// Returns `Handler` to `IndexHolder`.
@@ -116,7 +116,7 @@ impl IndexService {
         }
         let index_config = index_config_builder.build().unwrap();
         match application_config.autosave().indices.entry(create_index_request.index_name.to_owned()) {
-            Entry::Occupied(o) => Err(ValidationError::ExistingIndexError(o.key().to_owned())),
+            Entry::Occupied(o) => Err(ValidationError::ExistingIndex(o.key().to_owned())),
             Entry::Vacant(v) => {
                 v.insert(index_config);
                 Ok(())
@@ -130,7 +130,7 @@ impl IndexService {
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<Handler<IndexHolder>> {
         self.insert_config(&create_index_request)?;
         let index_settings = IndexSettings {
-            docstore_compression: create_index_request.compression.clone(),
+            docstore_compression: create_index_request.compression,
             sort_by_field: create_index_request.sort_by_field.clone(),
             ..Default::default()
         };
@@ -167,12 +167,12 @@ impl IndexService {
         Ok(index_holder)
     }
 
-    fn check_delete_conditions(&self, aliases: &Vec<String>, index_holder: &IndexHolder) -> SummaResult<()> {
-        if aliases.len() > 0 {
-            Err(ValidationError::AliasedError(aliases.join(", ")))?;
+    fn check_delete_conditions(&self, aliases: &[String], index_holder: &IndexHolder) -> SummaResult<()> {
+        if !aliases.is_empty() {
+            return Err(ValidationError::Aliased(aliases.join(", ")).into());
         }
         if index_holder.index_updater().read().has_consumers() {
-            Err(ValidationError::ExistingConsumersError(index_holder.index_name().to_owned()))?;
+            return Err(ValidationError::ExistingConsumers(index_holder.index_name().to_owned()).into());
         }
         Ok(())
     }
@@ -201,7 +201,7 @@ impl IndexService {
         let mut index_holders = self.index_holders.write();
         let index_holder_entry = match index_holders.entry(delete_index_request.index_name.to_owned()) {
             Entry::Occupied(entry) => entry,
-            Entry::Vacant(_) => Err(ValidationError::MissingIndexError(delete_index_request.index_name.to_owned()))?,
+            Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
         };
         let delete_index_result = self.prepare_delete(&delete_index_request, index_holder_entry.get()).await?;
         let index_holder = index_holder_entry.remove();
@@ -258,7 +258,7 @@ impl IndexService {
 
     /// Returns `ConsumerConfig`
     pub(crate) fn get_consumer_config(&self, index_alias: &str, consumer_name: &str) -> SummaResult<ConsumerConfig> {
-        Ok(self.get_index_holder(index_alias)?.get_consumer_config(consumer_name)?)
+        self.get_index_holder(index_alias)?.get_consumer_config(consumer_name)
     }
 }
 

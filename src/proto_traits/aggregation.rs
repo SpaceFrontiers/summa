@@ -11,7 +11,7 @@ impl TryFrom<proto::Aggregation> for Aggregation {
 
     fn try_from(value: proto::Aggregation) -> SummaResult<Self> {
         match value.aggregation {
-            None => Err(ValidationError::InvalidAggregationError)?,
+            None => Err(ValidationError::InvalidAggregation.into()),
             Some(aggregation) => aggregation.try_into(),
         }
     }
@@ -67,7 +67,7 @@ impl TryFrom<proto::aggregation::Aggregation> for Aggregation {
                             },
                         }),
                     }),
-                    None => Err(ValidationError::InvalidAggregationError)?,
+                    None => return Err(ValidationError::InvalidAggregation.into()),
                 },
                 sub_aggregation: bucket_aggregation
                     .sub_aggregation
@@ -76,22 +76,22 @@ impl TryFrom<proto::aggregation::Aggregation> for Aggregation {
                     .collect::<SummaResult<_>>()?,
             }),
             proto::aggregation::Aggregation::Metric(metric_aggregation) => match metric_aggregation.metric_aggregation {
-                Some(proto::metric_aggregation::MetricAggregation::Average(average_aggregation)) => Aggregation::Metric(MetricAggregation::Average {
-                    0: AverageAggregation::from_field_name(average_aggregation.field),
-                }),
-                Some(proto::metric_aggregation::MetricAggregation::Stats(stats_aggregation)) => Aggregation::Metric(MetricAggregation::Stats {
-                    0: StatsAggregation::from_field_name(stats_aggregation.field),
-                }),
-                None => Err(ValidationError::InvalidAggregationError)?,
+                Some(proto::metric_aggregation::MetricAggregation::Average(average_aggregation)) => {
+                    Aggregation::Metric(MetricAggregation::Average(AverageAggregation::from_field_name(average_aggregation.field)))
+                }
+                Some(proto::metric_aggregation::MetricAggregation::Stats(stats_aggregation)) => {
+                    Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(stats_aggregation.field)))
+                }
+                None => return Err(ValidationError::InvalidAggregation.into()),
             },
         })
     }
 }
 
-impl Into<proto::AggregationResult> for AggregationResult {
-    fn into(self) -> proto::AggregationResult {
+impl From<AggregationResult> for proto::AggregationResult {
+    fn from(aggregation_result: AggregationResult) -> Self {
         proto::AggregationResult {
-            aggregation_result: Some(match self {
+            aggregation_result: Some(match aggregation_result {
                 AggregationResult::BucketResult(bucket_result) => proto::aggregation_result::AggregationResult::Bucket(proto::BucketResult {
                     bucket_result: Some(match bucket_result {
                         BucketResult::Range { buckets } => proto::bucket_result::BucketResult::Range(proto::RangeResult {
@@ -131,9 +131,9 @@ impl Into<proto::AggregationResult> for AggregationResult {
     }
 }
 
-impl Into<proto::Key> for Key {
-    fn into(self) -> proto::Key {
-        match self {
+impl From<Key> for proto::Key {
+    fn from(key: Key) -> proto::Key {
+        match key {
             Key::Str(s) => proto::Key {
                 key: Some(proto::key::Key::Str(s)),
             },
@@ -144,12 +144,12 @@ impl Into<proto::Key> for Key {
     }
 }
 
-impl Into<proto::BucketEntry> for BucketEntry {
-    fn into(self) -> proto::BucketEntry {
+impl From<BucketEntry> for proto::BucketEntry {
+    fn from(bucket_entry: BucketEntry) -> Self {
         proto::BucketEntry {
-            key: Some(self.key.into()),
-            doc_count: self.doc_count,
-            sub_aggregation: self
+            key: Some(bucket_entry.key.into()),
+            doc_count: bucket_entry.doc_count,
+            sub_aggregation: bucket_entry
                 .sub_aggregation
                 .0
                 .into_iter()
@@ -159,19 +159,19 @@ impl Into<proto::BucketEntry> for BucketEntry {
     }
 }
 
-impl Into<proto::RangeBucketEntry> for RangeBucketEntry {
-    fn into(self) -> proto::RangeBucketEntry {
+impl From<RangeBucketEntry> for proto::RangeBucketEntry {
+    fn from(range_bucket_entry: RangeBucketEntry) -> Self {
         proto::RangeBucketEntry {
-            key: Some(self.key.into()),
-            doc_count: self.doc_count,
-            sub_aggregation: self
+            key: Some(range_bucket_entry.key.into()),
+            doc_count: range_bucket_entry.doc_count,
+            sub_aggregation: range_bucket_entry
                 .sub_aggregation
                 .0
                 .into_iter()
                 .map(|(name, aggregation_result)| (name, aggregation_result.into()))
                 .collect(),
-            from: self.from,
-            to: self.to,
+            from: range_bucket_entry.from,
+            to: range_bucket_entry.to,
         }
     }
 }

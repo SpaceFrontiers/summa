@@ -1,4 +1,4 @@
-use crate::errors::ValidationError::InvalidAggregationError;
+use crate::errors::ValidationError::InvalidAggregation;
 use crate::errors::{Error, SummaResult};
 use crate::proto;
 use crate::search_engine::custom_serializer::NamedFieldDocument;
@@ -19,10 +19,10 @@ pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> 
         .into_iter()
         .map(|(name, aggregation)| {
             let aggregation = match aggregation.aggregation {
-                None => Err(Error::ValidationError(InvalidAggregationError)),
+                None => Err(Error::Validation(InvalidAggregation)),
                 Some(a) => a.try_into(),
             }?;
-            Ok((name.to_string(), aggregation))
+            Ok((name, aggregation))
         })
         .collect::<SummaResult<Vec<_>>>()?;
     Ok(HashMap::from_iter(aggregations.into_iter()))
@@ -33,7 +33,7 @@ fn parse_aggregation_results(
 ) -> HashMap<String, proto::AggregationResult> {
     aggregation_results
         .into_iter()
-        .map(|(name, aggregation_result)| (name.to_string(), aggregation_result.into()))
+        .map(|(name, aggregation_result)| (name, aggregation_result.into()))
         .collect()
 }
 
@@ -50,7 +50,7 @@ pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields,
             Some(proto::Scorer {
                 scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
             }) => {
-                let eval_scorer_seed = EvalScorer::new(eval_expr, &fields)?;
+                let eval_scorer_seed = EvalScorer::new(eval_expr, fields)?;
                 let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                     .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
                     .tweak_score(move |segment_reader: &SegmentReader| {
@@ -65,7 +65,7 @@ pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields,
             Some(proto::Scorer {
                 scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
             }) => {
-                let field = fields.get_field(field_name).ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
+                let field = fields.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
                 let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                     .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
                     .order_by_u64_field(field);
@@ -83,7 +83,7 @@ pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields,
         Some(proto::collector::Collector::Facet(facet_collector_proto)) => {
             let field = fields
                 .get_field(&facet_collector_proto.field)
-                .ok_or(Error::FieldDoesNotExistError(facet_collector_proto.field.to_owned()))?;
+                .ok_or_else(|| Error::FieldDoesNotExist(facet_collector_proto.field.to_owned()))?;
             let mut facet_collector = tantivy::collector::FacetCollector::for_field(field);
             for facet in &facet_collector_proto.facets {
                 facet_collector.add_facet(facet);

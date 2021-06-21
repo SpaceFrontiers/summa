@@ -153,12 +153,10 @@ impl SegmentCollector for SegmentReservoirSamplingCollector {
         if self.reservoir.len() < self.limit as usize {
             // Initial filling of the reservoir
             self.reservoir.push(DocAddress::new(self.segment_ord, doc_id));
-        } else {
-            if self.seen_segment_docs == self.next_element {
-                self.reservoir[(self.rng.next_u32() as usize) % self.limit] = DocAddress::new(self.segment_ord, doc_id);
-                self.w *= w_mul(self.limit, &mut self.rng);
-                self.next_element += gd_gap(self.w, &mut self.rng);
-            }
+        } else if self.seen_segment_docs == self.next_element {
+            self.reservoir[(self.rng.next_u32() as usize) % self.limit] = DocAddress::new(self.segment_ord, doc_id);
+            self.w *= w_mul(self.limit, &mut self.rng);
+            self.next_element += gd_gap(self.w, &mut self.rng);
         }
     }
 
@@ -167,9 +165,9 @@ impl SegmentCollector for SegmentReservoirSamplingCollector {
     }
 }
 
-impl Into<ReservoirSampling> for proto::ReservoirSamplingCollector {
-    fn into(self) -> ReservoirSampling {
-        ReservoirSampling::with_limit(self.limit.try_into().unwrap())
+impl From<proto::ReservoirSamplingCollector> for ReservoirSampling {
+    fn from(reservoir_sampling_collector: proto::ReservoirSamplingCollector) -> Self {
+        ReservoirSampling::with_limit(reservoir_sampling_collector.limit.try_into().unwrap())
     }
 }
 

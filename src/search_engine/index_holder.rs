@@ -60,9 +60,9 @@ impl IndexHolder {
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
         let index_updater = OwningHandler::new(RwLock::new(IndexUpdater::new(index, index_name, index_config_proxy.clone())?));
 
-        let autocommit_thread = match index_config.autocommit_interval_ms.clone() {
+        let autocommit_thread = match index_config.autocommit_interval_ms {
             Some(interval_ms) => {
-                let index_updater = index_updater.handler().clone();
+                let index_updater = index_updater.handler();
                 let index_name = index_name.to_owned();
                 let (shutdown_trigger, mut shutdown_tripwire) = async_broadcast::broadcast(1);
                 let mut tick_task = time::interval(Duration::from_millis(interval_ms));
@@ -132,7 +132,7 @@ impl IndexHolder {
                 IndexEngine::Memory(fields) => Index::builder().schema(fields.clone()).settings(index_settings).create_in_ram()?,
                 IndexEngine::File(index_path) => {
                     if index_path.exists() {
-                        Err(ValidationError::ExistingPathError(index_path.to_owned()))?;
+                        return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
                     }
                     std::fs::create_dir_all(index_path)?;
                     Index::builder().schema(fields.clone()).settings(index_settings).create_in_dir(index_path)?
@@ -180,7 +180,7 @@ impl IndexHolder {
             .get()
             .consumer_configs
             .get(consumer_name)
-            .ok_or(ValidationError::MissingConsumerError(consumer_name.to_owned()))?
+            .ok_or_else(|| ValidationError::MissingConsumer(consumer_name.to_owned()))?
             .clone())
     }
 
@@ -209,9 +209,7 @@ impl IndexHolder {
             IndexEngine::Memory(_) => (),
             IndexEngine::File(ref index_path) => {
                 info!(action = "delete_directory");
-                remove_dir_all(index_path)
-                    .await
-                    .map_err(|e| Error::IOError((e, Some(index_path.to_path_buf()))))?;
+                remove_dir_all(index_path).await.map_err(|e| Error::IO((e, Some(index_path.to_path_buf()))))?;
             }
         };
         Ok(())
@@ -231,13 +229,13 @@ impl IndexHolder {
         let index_name = self.index_name.to_owned();
 
         let search_times_meter = self.search_times_meter.clone();
-        Ok(tokio::task::spawn_blocking(move || -> SummaResult<Vec<proto::CollectorOutput>> {
+        tokio::task::spawn_blocking(move || -> SummaResult<Vec<proto::CollectorOutput>> {
             let start_time = Instant::now();
             let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
             search_times_meter.record(start_time.elapsed().as_secs_f64(), &[KeyValue::new("index_name", index_name)]);
             Ok(extractors.drain(..).map(|e| e.extract(&mut multi_fruit, &searcher, &multi_fields)).collect())
         })
-        .await??)
+        .await?
     }
 }
 
@@ -247,15 +245,15 @@ impl std::fmt::Debug for IndexHolder {
     }
 }
 
-impl Into<proto::Index> for &IndexHolder {
-    fn into(self) -> proto::Index {
-        let index_config_proxy = self.index_config_proxy.read();
-        let compression: proto::Compression = self.index_updater().read().index().settings().docstore_compression.into();
+impl From<&IndexHolder> for proto::Index {
+    fn from(index_holder: &IndexHolder) -> Self {
+        let index_config_proxy = index_holder.index_config_proxy.read();
+        let compression: proto::Compression = index_holder.index_updater().read().index().settings().docstore_compression.into();
         proto::Index {
-            index_aliases: index_config_proxy.application_config().get_index_aliases_for_index(&self.index_name),
-            index_name: self.index_name.to_owned(),
+            index_aliases: index_config_proxy.application_config().get_index_aliases_for_index(&index_holder.index_name),
+            index_name: index_holder.index_name.to_owned(),
             index_engine: format!("{:?}", index_config_proxy.get().index_engine),
-            num_docs: self.index_reader().searcher().num_docs(),
+            num_docs: index_holder.index_reader().searcher().num_docs(),
             compression: compression as i32,
         }
     }
