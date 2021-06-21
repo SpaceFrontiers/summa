@@ -1,5 +1,5 @@
 ---
 layout: page
-subtitle: Reflection API
+title: Reflection API
 permalink: /reflection-api
 ---

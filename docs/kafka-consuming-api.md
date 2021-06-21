@@ -1,6 +1,6 @@
 ---
 layout: page
-subtitle: Kafka Consuming API
+title: Kafka Consuming API
 permalink: /kafka-consuming-api
 ---
 ## Consumer API

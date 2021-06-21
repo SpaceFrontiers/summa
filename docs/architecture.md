@@ -1,5 +1,5 @@
 ---
 layout: page
-subtitle: Architecture
+title: Architecture
 permalink: /architecture
 ---

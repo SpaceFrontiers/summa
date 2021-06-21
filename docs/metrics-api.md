@@ -1,6 +1,6 @@
 ---
 layout: page
-subtitle: Metrics
+title: Metrics
 permalink: /metrics-api
 ---
 ## Metrics API

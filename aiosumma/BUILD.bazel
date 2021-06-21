@@ -55,19 +55,19 @@ py_wheel(
     python_requires = ">=3.9",
     python_tag = "py3",
     requires = [
-        "aiogrpcclient >= 1.1.3",
+        "aiogrpcclient >= 1.1.9",
         "fire >= 0.3.1",
         "izihawa_nlptools >= 1.0.1",
         "izihawa_types >= 0.1.2",
         "orjson >= 3.6.8",
         "ply >= 3.11",
-        "textblob > 0.17.1",
+        "textblob >= 0.17.1",
     ],
     strip_path_prefixes = [
         "summa/proto/summa_py_pb",
         "aiosumma",
     ],
-    version = "2.3.3",
+    version = "2.3.4",
     deps = [
         ":aiosumma",
         ":data",

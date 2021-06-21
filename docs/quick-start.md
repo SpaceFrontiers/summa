@@ -1,6 +1,6 @@
 ---
 layout: page
-subtitle: Quick Start
+title: Quick Start
 permalink: /quick-start
 ---
 {% include quick-start-snippet.md %}
