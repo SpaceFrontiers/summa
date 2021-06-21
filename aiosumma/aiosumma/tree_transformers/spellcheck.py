@@ -1,5 +1,9 @@
 from textblob import Word as TextBlobWord
-from ..parser.elements import Group, Word
+
+from ..parser.elements import (
+    Group,
+    Word,
+)
 from .base import TreeTransformer
 
 

@@ -5,7 +5,7 @@ use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, StopWord
 pub fn default_tokenizers(index_config: &IndexConfig) -> [(String, TextAnalyzer); 2] {
     let mut summa_tokenizer = TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(100)).filter(LowerCaser);
     let mut default_tokenizer = TextAnalyzer::from(SimpleTokenizer).filter(RemoveLongFilter::limit(100)).filter(LowerCaser);
-    if let Some(stop_words) = index_config.stop_words.as_ref().map(|stop_words| stop_words.clone()) {
+    if let Some(stop_words) = index_config.stop_words.as_ref().cloned() {
         summa_tokenizer = summa_tokenizer.filter(StopWordFilter::remove(stop_words.clone()));
         default_tokenizer = default_tokenizer.filter(StopWordFilter::remove(stop_words));
     }

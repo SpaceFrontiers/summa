@@ -1,6 +1,6 @@
 use crate::errors::SummaResult;
 use crate::errors::ValidationError;
-use crate::errors::ValidationError::MissingPrimaryKeyError;
+use crate::errors::ValidationError::MissingPrimaryKey;
 use tantivy::schema::{Field, FieldType};
 use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
 use tracing::info;
@@ -39,7 +39,7 @@ impl IndexWriterHolder {
                 primary_key,
                 document
                     .get_first(primary_key)
-                    .ok_or_else(|| MissingPrimaryKeyError(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(&document)))))?
+                    .ok_or_else(|| MissingPrimaryKey(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(&document)))))?
                     .as_i64()
                     .unwrap(),
             ));

@@ -20,8 +20,7 @@ impl TryFrom<proto::AlterIndexRequest> for AlterIndexRequest {
         alter_index_request_builder.compression(
             proto_request
                 .compression
-                .map(|compression| proto::Compression::from_i32(compression).map(proto::Compression::into))
-                .flatten(),
+                .and_then(|compression| proto::Compression::from_i32(compression).map(proto::Compression::into)),
         );
         alter_index_request_builder.sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into));
         Ok(alter_index_request_builder.build().unwrap())

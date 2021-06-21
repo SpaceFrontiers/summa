@@ -28,7 +28,7 @@ impl<'a, T: Persistable> AutosaveLockWriteGuard<'a, T> {
 impl<'a, T: Persistable> Drop for AutosaveLockWriteGuard<'a, T> {
     fn drop(&mut self) {
         match self.data.save() {
-            Ok(_) | Err(Error::ValidationError(ValidationError::MissingPathError(_))) => (),
+            Ok(_) | Err(Error::Validation(ValidationError::MissingPath(_))) => (),
             Err(e) => panic!("{:?}", e),
         };
     }
@@ -73,7 +73,7 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> Loadable for ConfigHolder<TConfig
     fn from_file(config_filepath: &Path, env_prefix: Option<&str>) -> SummaResult<ConfigHolder<TConfig>> {
         let mut s = Config::builder();
         if !config_filepath.exists() {
-            Err(ValidationError::MissingPathError(config_filepath.to_path_buf()))?;
+            return Err(ValidationError::MissingPath(config_filepath.to_path_buf()).into());
         }
         if config_filepath.exists() {
             s = s.add_source(File::from(config_filepath));
@@ -81,7 +81,7 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> Loadable for ConfigHolder<TConfig
         if let Some(env_prefix) = env_prefix {
             s = s.add_source(Environment::with_prefix(env_prefix).separator("."));
         }
-        let config: TConfig = s.build()?.try_deserialize().map_err(|e| Error::ConfigError(e))?;
+        let config: TConfig = s.build()?.try_deserialize().map_err(Error::Config)?;
         let config_holder = ConfigHolder::file(config, config_filepath);
         Ok(config_holder)
     }
@@ -94,10 +94,10 @@ impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
             .map(|config_filepath| {
                 std::fs::File::create(config_filepath)
                     .and_then(|mut file| file.write_all(&serde_yaml::to_vec(&self.config).unwrap()))
-                    .map_err(|e| Error::IOError((e, Some(config_filepath.to_path_buf()))))?;
+                    .map_err(|e| Error::IO((e, Some(config_filepath.to_path_buf()))))?;
                 Ok(self)
             })
-            .unwrap_or(Err(Error::ValidationError(ValidationError::MissingPathError(PathBuf::new()))))
+            .unwrap_or_else(|| Err(Error::Validation(ValidationError::MissingPath(PathBuf::new()))))
     }
 }
 

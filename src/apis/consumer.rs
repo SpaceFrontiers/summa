@@ -42,7 +42,7 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
         let response = proto::GetConsumerResponse {
             consumer: Some(proto::Consumer {
                 consumer_name: proto_request.consumer_name.to_owned(),
-                index_name: proto_request.index_alias.to_owned(),
+                index_name: proto_request.index_alias,
             }),
         };
         Ok(Response::new(response))

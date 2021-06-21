@@ -26,25 +26,25 @@ fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> Summ
         FieldType::Str(_) => Term::from_field_text(field, value),
         FieldType::I64(_) => Term::from_field_i64(
             field,
-            i64::from_str(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as i64", value)))?,
+            i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as i64", value)))?,
         ),
         FieldType::U64(_) => Term::from_field_u64(
             field,
-            u64::from_str(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as u64", value)))?,
+            u64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as u64", value)))?,
         ),
         FieldType::F64(_) => Term::from_field_f64(
             field,
-            f64::from_str(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as f64", value)))?,
+            f64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f64", value)))?,
         ),
         FieldType::Bytes(_) => Term::from_field_bytes(
             field,
-            &base64::decode(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as bytes", value)))?,
+            &base64::decode(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as bytes", value)))?,
         ),
         FieldType::Date(_) => Term::from_field_date(
             field,
-            DateTime::from_unix_timestamp(i64::from_str(value).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as date", value)))?),
+            DateTime::from_unix_timestamp(i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as date", value)))?),
         ),
-        _ => return Err(Error::InvalidSyntaxError("invalid range type".to_owned()))?,
+        _ => return Err(Error::InvalidSyntax("invalid range type".to_owned())),
     })
 }
 
@@ -86,7 +86,7 @@ impl QueryParser {
         let field = self
             .cached_fields
             .get_field(field_name)
-            .ok_or(Error::FieldDoesNotExistError(field_name.to_owned()))?;
+            .ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
         let field_entry = self.cached_fields.get_field_entry(field);
         Ok((field, field_entry))
     }
@@ -110,15 +110,15 @@ impl QueryParser {
                             Some(proto::Occur::Must) => Occur::Must,
                             Some(proto::Occur::MustNot) => Occur::MustNot,
                         },
-                        self.parse_subquery(subquery.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
+                        self.parse_subquery(subquery.query.as_ref().ok_or(Error::EmptyQuery)?)?,
                     ))
                 }
                 Box::new(BooleanQuery::new(subqueries))
             }
             Some(proto::query::Query::Match(match_query_proto)) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
                 Ok(parsed_query) => Ok(parsed_query),
-                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::FieldDoesNotExistError(field)),
-                Err(e) => Err(Error::InvalidTantivySyntaxError(e, match_query_proto.value.to_owned())),
+                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::FieldDoesNotExist(field)),
+                Err(e) => Err(Error::InvalidTantivySyntax(e, match_query_proto.value.to_owned())),
             }?,
             Some(proto::query::Query::Range(range_query_proto)) => {
                 let (field, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
@@ -128,8 +128,8 @@ impl QueryParser {
                 Box::new(RangeQuery::new_term_bounds(field, field_entry.field_type().value_type(), &left, &right))
             }
             Some(proto::query::Query::Boost(boost_query_proto)) => Box::new(BoostQuery::new(
-                self.parse_subquery(boost_query_proto.query.as_ref().ok_or(Error::EmptyQueryError)?)?,
-                f32::from_str(&boost_query_proto.score).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as f32", boost_query_proto.score)))?,
+                self.parse_subquery(boost_query_proto.query.as_ref().ok_or(Error::EmptyQuery)?)?,
+                f32::from_str(&boost_query_proto.score).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", boost_query_proto.score)))?,
             )),
             Some(proto::query::Query::Regex(regex_query_proto)) => {
                 let (field, _) = self.field_and_field_entry(&regex_query_proto.field)?;
@@ -165,7 +165,7 @@ impl QueryParser {
                 let document = self
                     .cached_fields
                     .parse_document(&more_like_this_query_proto.document)
-                    .map_err(|_e| Error::InvalidSyntaxError("bad document".to_owned()))?;
+                    .map_err(|_e| Error::InvalidSyntax("bad document".to_owned()))?;
                 let field_values = document
                     .get_sorted_field_values()
                     .into_iter()
@@ -191,8 +191,8 @@ impl QueryParser {
                     query_builder = query_builder.with_max_word_length(max_word_length.try_into().unwrap());
                 }
                 if let Some(ref boost) = more_like_this_query_proto.boost {
-                    query_builder = query_builder
-                        .with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntaxError(format!("cannot parse {} as f32", boost)))?);
+                    query_builder =
+                        query_builder.with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", boost)))?);
                 }
                 query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words.clone());
                 Box::new(query_builder.with_document_fields(field_values))

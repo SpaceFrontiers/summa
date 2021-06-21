@@ -1,7 +1,5 @@
 from aiosumma import QueryProcessor
-from aiosumma.tree_transformers import (
-    SynonymTreeTransformer
-)
+from aiosumma.tree_transformers import SynonymTreeTransformer
 
 
 def test_synonyms():

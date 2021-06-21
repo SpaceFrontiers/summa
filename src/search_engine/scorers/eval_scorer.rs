@@ -26,7 +26,7 @@ impl EvalScorer {
         let parsed = parser.parse(eval_expr, &mut slab.ps)?.from(&slab.ps);
         let mut var_names = vec![];
         for var_name in parsed.var_names(&slab).iter().filter(|var_name| !RESERVED_WORDS.contains((*var_name).as_str())) {
-            fields.get_field(&var_name).ok_or(Error::FieldDoesNotExistError(var_name.to_owned()))?;
+            fields.get_field(var_name).ok_or_else(|| Error::FieldDoesNotExist(var_name.to_owned()))?;
             var_names.push(var_name.to_owned());
         }
 

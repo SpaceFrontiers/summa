@@ -1,7 +1,5 @@
 from aiosumma import QueryProcessor
-from aiosumma.text_transformers import (
-    LowerTextTransformer,
-)
+from aiosumma.text_transformers import LowerTextTransformer
 from aiosumma.tree_transformers import (
     DoiTreeTransformer,
     ExactMatchTreeTransformer,

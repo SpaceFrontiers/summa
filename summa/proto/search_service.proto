@@ -5,28 +5,32 @@ import "google/protobuf/empty.proto";
 import "summa/proto/utils.proto";
 
 
-// API
-
+// Main entrypoint for `Summa` that accepts queries to execute
 service SearchApi {
   rpc search (SearchRequest) returns (SearchResponse) {}
 }
 
 // Requests
-
 message SearchRequest {
+  // The index name or alias
   string index_alias = 1;
+  // Query DSL. Use `MatchQuery` to pass a free-form query
   Query query = 2;
+  // Every collector is responsible of processing and storing documents and/or their derivatives (like counters)
+  // to return them to the caller
   repeated Collector collectors = 3;
 }
 
 message SearchResponse {
+  // The real index name got through alias resolution
   string index_name = 1;
-  repeated CollectorResult collector_results = 2;
+  // An array of collector outputs
+  repeated CollectorOutput collector_outputs = 2;
+  // Time spent inside of `search` handler
   double elapsed_secs = 3;
 }
 
-// Query DSL
-
+// Recursive query DSL
 message Query {
   oneof query {
     BooleanQuery boolean = 1;
@@ -95,7 +99,6 @@ message TermQuery {
 }
 
 // Aggregation
-
 message Aggregation {
   oneof aggregation {
     BucketAggregation bucket = 1;
@@ -227,7 +230,7 @@ message Scorer {
   }
 }
 
-// Collectors and CollectorResults
+// Collectors and CollectorOutputs
 
 message Collector {
   oneof collector {
@@ -239,26 +242,26 @@ message Collector {
   }
 }
 
-message CollectorResult {
-  oneof collector_result {
-    TopDocsCollectorResult top_docs = 1;
-    ReservoirSamplingCollectorResult reservoir_sampling = 2;
-    CountCollectorResult count = 3;
-    FacetCollectorResult facet = 4;
-    AggregationCollectorResult aggregation = 5;
+message CollectorOutput {
+  oneof collector_output {
+    TopDocsCollectorOutput top_docs = 1;
+    ReservoirSamplingCollectorOutput reservoir_sampling = 2;
+    CountCollectorOutput count = 3;
+    FacetCollectorOutput facet = 4;
+    AggregationCollectorOutput aggregation = 5;
   }
 }
 
 message CountCollector {}
 
-message CountCollectorResult { uint32 count = 1; }
+message CountCollectorOutput { uint32 count = 1; }
 
 message FacetCollector {
   string field = 1;
   repeated string facets = 2;
 }
 
-message FacetCollectorResult {
+message FacetCollectorOutput {
   map<string, uint64> facet_counts = 1;
 }
 
@@ -266,7 +269,7 @@ message ReservoirSamplingCollector {
   uint32 limit = 1;
 }
 
-message ReservoirSamplingCollectorResult {
+message ReservoirSamplingCollectorOutput {
   repeated string documents = 1;
 }
 
@@ -276,7 +279,7 @@ message TopDocsCollector {
   optional Scorer scorer = 3;
 }
 
-message TopDocsCollectorResult {
+message TopDocsCollectorOutput {
   repeated ScoredDocument scored_documents = 1;
   bool has_next = 2;
 }
@@ -285,7 +288,7 @@ message AggregationCollector {
   map<string, Aggregation> aggregations = 1;
 }
 
-message AggregationCollectorResult {
+message AggregationCollectorOutput {
   map<string, AggregationResult> aggregation_results = 1;
 }
 

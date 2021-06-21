@@ -13,7 +13,7 @@ pub(crate) struct FastFieldIteratorImpl<T: FastValue + SafeIntoF64> {
 }
 
 impl<T: FastValue + SafeIntoF64> FastFieldIteratorImpl<T> {
-    pub fn new(ff: DynamicFastFieldReader<T>) -> Box<dyn FastFieldIterator> {
+    pub fn from_fast_field_reader(ff: DynamicFastFieldReader<T>) -> Box<dyn FastFieldIterator> {
         Box::new(FastFieldIteratorImpl { value: 0f64, ff })
     }
 }

@@ -18,18 +18,16 @@ fn process_message(
     index_writer_holder: &IndexWriterHolder,
     message: Result<BorrowedMessage<'_>, rdkafka::error::KafkaError>,
 ) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
-    let message = message.map_err(|e| KafkaConsumingError::KafkaError(e))?;
-    let payload = message.payload().ok_or(KafkaConsumingError::EmptyPayloadError)?;
-    let proto_message: proto::IndexOperation = prost::Message::decode(payload).map_err(|e| KafkaConsumingError::ProtoDecodeError(e))?;
-    let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperationError)?;
+    let message = message.map_err(KafkaConsumingError::Kafka)?;
+    let payload = message.payload().ok_or(KafkaConsumingError::EmptyPayload)?;
+    let proto_message: proto::IndexOperation = prost::Message::decode(payload).map_err(KafkaConsumingError::ProtoDecode)?;
+    let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperation)?;
     match index_operation {
         proto::index_operation::Operation::IndexDocument(index_document_operation) => {
             let parsed_document = SummaDocument::BoundJsonBytes((fields, &index_document_operation.document))
                 .try_into()
-                .map_err(|e| KafkaConsumingError::ParseDocumentError(e))?;
-            index_writer_holder
-                .index_document(parsed_document)
-                .map_err(|e| KafkaConsumingError::IndexError(e))?;
+                .map_err(KafkaConsumingError::ParseDocument)?;
+            index_writer_holder.index_document(parsed_document).map_err(KafkaConsumingError::Index)?;
             Ok(KafkaConsumingStatus::Consumed)
         }
     }
@@ -54,7 +52,7 @@ impl IndexUpdater {
                 index_config.writer_heap_size_bytes.try_into().unwrap(),
             )?,
             match index_config.primary_key {
-                Some(ref primary_key) => index.schema().get_field(primary_key).clone(),
+                Some(ref primary_key) => index.schema().get_field(primary_key),
                 None => None,
             },
         )?);
@@ -92,7 +90,7 @@ impl IndexUpdater {
         for consumer in &self.consumers {
             consumer.stop().await?;
         }
-        Arc::get_mut(&mut self.index_writer_holder).ok_or(Error::ArcIndexWriterHolderLeakedError)
+        Arc::get_mut(&mut self.index_writer_holder).ok_or(Error::ArcIndexWriterHolderLeaked)
     }
 
     /// Starts all consumers
@@ -126,7 +124,7 @@ impl IndexUpdater {
                 .consumer_configs
                 .entry(consumer_name.to_owned())
             {
-                Entry::Occupied(o) => Err(ValidationError::ExistingConsumerError(o.key().to_owned())),
+                Entry::Occupied(o) => Err(ValidationError::ExistingConsumer(o.key().to_owned())),
                 Entry::Vacant(v) => {
                     v.insert(consumer_config.clone());
                     Ok(())
@@ -159,7 +157,7 @@ impl IndexUpdater {
             .get_mut()
             .consumer_configs
             .remove(consumer_name)
-            .ok_or(ValidationError::MissingConsumerError(consumer_name.to_owned()))?;
+            .ok_or_else(|| ValidationError::MissingConsumer(consumer_name.to_owned()))?;
         self.inner_delete_consumer(consumer_name).await?;
         self.start_consumers()?;
         Ok(())
@@ -180,7 +178,7 @@ impl IndexUpdater {
 
     /// Check if any consumers for the `IndexUpdater` exists
     pub(crate) fn has_consumers(&self) -> bool {
-        self.consumers.len() > 0
+        !self.consumers.is_empty()
     }
 
     /// Index generic `SummaDocument`

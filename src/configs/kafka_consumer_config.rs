@@ -1,4 +1,4 @@
-use crate::errors::{Error, SummaResult};
+use crate::errors::SummaResult;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -14,21 +14,19 @@ pub struct ConsumerConfig {
 }
 
 impl ConsumerConfig {
-    pub fn new(bootstrap_servers: &Vec<String>, group_id: &str, mut threads: u32, topics: &Vec<String>) -> SummaResult<ConsumerConfig> {
+    pub fn new(bootstrap_servers: &[String], group_id: &str, mut threads: u32, topics: &[String]) -> SummaResult<ConsumerConfig> {
         if threads == 0 {
             threads = 1;
         }
         Ok(ConsumerConfig {
-            bootstrap_servers: bootstrap_servers.clone(),
+            bootstrap_servers: bootstrap_servers.to_owned(),
             create_topics: true,
             delete_topics: true,
             group_id: group_id.to_owned(),
             max_poll_interval_ms: 1800000,
             session_timeout_ms: 300000,
-            threads: threads
-                .try_into()
-                .map_err(|_| Error::InvalidConfigError("`threads` must be u32 sized".to_owned()))?,
-            topics: topics.clone(),
+            threads,
+            topics: topics.to_owned(),
         })
     }
 }
