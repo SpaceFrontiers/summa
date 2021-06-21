@@ -25,6 +25,9 @@ class ProcessedQuery:
     def to_summa_query(self):
         return self.parsed_query.to_summa_query() if self.parsed_query else {'all': {}}
 
+    def __repr__(self):
+        return repr(self.parsed_query)
+
 
 class QueryProcessor:
     """
