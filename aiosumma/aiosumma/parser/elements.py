@@ -98,6 +98,9 @@ class Group(Item):
     def __str__(self):
         return f'({" ".join(str(o) for o in self.operands)})'
 
+    def __len__(self):
+        return len(self.operands)
+
     def to_summa_query(self):
         subqueries = []
         if not self.operands:

@@ -128,7 +128,7 @@ def test_exact_match_transformers():
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
         {'occur': 'should', 'query': {'boost': {'query': {
-            'phrase': {'field': 'title', 'value': 'search engine'}}, 'score': '1.00000'}}
+            'phrase': {'field': 'title', 'value': 'search engine'}}, 'score': '2.00000'}}
          }
     ]}}
 
