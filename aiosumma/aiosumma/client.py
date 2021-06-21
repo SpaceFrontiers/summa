@@ -336,7 +336,7 @@ class SummaClient(BaseGrpcClient):
             Aliases list
         """
         return await self.stubs['index_api'].get_indices_aliases(
-            index_service_pb.GetIndexAliasesRequest(),
+            index_service_pb.GetIndicesAliasesRequest(),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
@@ -415,9 +415,9 @@ class SummaClient(BaseGrpcClient):
     async def search(
         self,
         index_alias: str,
-        query: search_service_pb.Query,
-        collectors: Union[search_service_pb.Collector, List[search_service_pb.Collector]],
-        tags: Optional[Dict] = None,
+        query: dict,
+        collectors: Union[dict, List[dict]],
+        tags: Optional[Dict[str, str]] = None,
         ignore_not_found: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -429,6 +429,7 @@ class SummaClient(BaseGrpcClient):
             index_alias: index alias
             query: parsed `Query`
             collectors: search_service_pb.Collector list
+            tags: extra dict for logging purposes
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id
