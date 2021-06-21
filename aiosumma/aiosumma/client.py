@@ -1,5 +1,6 @@
 import sys
 from typing import (
+    Dict,
     Iterable,
     List,
     Optional,
@@ -14,10 +15,7 @@ from aiogrpcclient import (
 )
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
-from izihawa_utils.pb_to_json import (
-    MessageToDict,
-    ParseDict,
-)
+from izihawa_utils.pb_to_json import ParseDict
 from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
@@ -419,6 +417,7 @@ class SummaClient(BaseGrpcClient):
         index_alias: str,
         query: search_service_pb.Query,
         collectors: Union[search_service_pb.Collector, List[search_service_pb.Collector]],
+        tags: Optional[Dict] = None,
         ignore_not_found: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -442,7 +441,8 @@ class SummaClient(BaseGrpcClient):
                 ParseDict({
                     'index_alias': index_alias,
                     'query': query,
-                    'collectors': collectors
+                    'collectors': collectors,
+                    'tags': tags,
                 }, search_service_pb.SearchRequest()),
                 metadata=(('request-id', request_id), ('session-id', session_id)),
             )
