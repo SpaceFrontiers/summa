@@ -79,29 +79,29 @@ def test_production_chain():
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
             {'occur': 'must', 'query': {'match': {'value': 'search'}}},
-            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85000'}}},
+            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85'}}},
             {'occur': 'must', 'query': {'match': {'value': 'engine'}}},
-            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85000'}}},
+            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85'}}},
             {'occur': 'must_not', 'query': {'match': {'value': 'car'}}},
-            {'occur': 'must_not', 'query': {'boost': {'query': {'match': {'value': 'cars'}}, 'score': '0.85000'}}}]}}
+            {'occur': 'must_not', 'query': {'boost': {'query': {'match': {'value': 'cars'}}, 'score': '0.85'}}}]}}
 
     processed_query = query_processor.process('search engine', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85000'}}},
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85000'}}}
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85'}}}
     ]}}
     processed_query = query_processor.process('author:Smith +"title book"', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'term': {'field': 'author', 'value': 'smith'}}},
         {'occur': 'should', 'query':
-            {'boost': {'query': {'term': {'field': 'author', 'value': 'smiths'}}, 'score': '0.85000'}}},
+            {'boost': {'query': {'term': {'field': 'author', 'value': 'smiths'}}, 'score': '0.85'}}},
         {'occur': 'must', 'query': {'match': {'value': '"title book"'}}}]}}
     processed_query = query_processor.process('science +year:[2010 TO *]', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'science'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'sciences'}}, 'score': '0.85000'}}},
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'sciences'}}, 'score': '0.85'}}},
         {'occur': 'must', 'query': {'range': {
             'field': 'year', 'value': {'including_left': True, 'including_right': True, 'left': '2010', 'right': '*'}}}}
     ]}}
@@ -112,9 +112,9 @@ def test_unknown_language_transformer():
     processed_query = query_processor.process('search engine', 'zz')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85000'}}},
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85000'}}}
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85'}}}
     ]}}
 
 
@@ -138,7 +138,7 @@ def test_exact_match_transformers():
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
         {'occur': 'should', 'query': {'boost': {'query': {
-            'phrase': {'field': 'title', 'value': 'search engine'}}, 'score': '2.00000'}}
+            'phrase': {'field': 'title', 'value': 'search engine'}}, 'score': '2'}}
          }
     ]}}
 
