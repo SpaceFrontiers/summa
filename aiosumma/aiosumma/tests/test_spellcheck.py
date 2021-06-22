@@ -12,23 +12,23 @@ def test_spell_check():
             'occur': 'should',
             'query': {'boolean': {'subqueries': [{
                 'occur': 'should',
-                'query': {'match': {'value': 'designed'}}}, {
+                'query': {'match': {'value': 'desinged'}}}, {
                 'occur': 'should',
-                'query': {'match': {'value': 'desinged'}}}]}}}, {
+                'query': {'match': {'value': 'designed'}}}]}}}, {
             'occur': 'should',
             'query': {'match': {'value': 'fro'}}}, {
             'occur': 'should',
             'query': {'boolean': {'subqueries': [{
                 'occur': 'should',
-                'query': {'match': {'value': 'embedded'}}}, {
+                'query': {'match': {'value': 'embeded'}}}, {
                 'occur': 'should',
-                'query': {'match': {'value': 'embeded'}}}]}}}, {
+                'query': {'match': {'value': 'embedded'}}}]}}}, {
             'occur': 'should',
             'query': {'boolean': {'subqueries': [{
                 'occur': 'should',
-                'query': {'match': {'value': 'using'}}}, {
+                'query': {'match': {'value': 'usin'}}}, {
                 'occur': 'should',
-                'query': {'match': {'value': 'usin'}}}]}}}]},
+                'query': {'match': {'value': 'using'}}}]}}}]},
     }
     processed_query = query_processor.process('covid-19 haemophilia', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [

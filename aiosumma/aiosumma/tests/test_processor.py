@@ -6,6 +6,8 @@ from aiosumma.tree_transformers import (
     MorphyTreeTransformer,
     OptimizingTreeTransformer,
     OrderByTreeTransformer,
+    SpellcheckTreeTransformer,
+    SynonymTreeTransformer,
     TantivyTreeTransformer,
     ValuesWordTreeTransformer,
     ValueWordTreeTransformer,
@@ -70,11 +72,37 @@ def test_production_chain():
     query_processor = QueryProcessor(
         text_transformers=[LowerTextTransformer()],
         tree_transformers=[
-            MorphyTreeTransformer(enable_morph=True),
+            SpellcheckTreeTransformer(),
+            MorphyTreeTransformer(),
+            SynonymTreeTransformer.drugs(),
             TantivyTreeTransformer(),
-            OptimizingTreeTransformer()
+            OptimizingTreeTransformer(),
         ],
     )
+    processed_query = query_processor.process('Claudio rugarli', 'en')
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [{'occur': 'should',
+                                    'query': {'match': {'value': 'claudio'}}},
+                                   {'occur': 'should',
+                                    'query': {'boost': {'query': {'match': {'value': 'claudios'}},
+                                                        'score': '0.85'}}},
+                                   {'occur': 'should',
+                                    'query': {'match': {'value': 'claude'}}},
+                                   {'occur': 'should',
+                                    'query': {'boost': {'query': {'match': {'value': 'clauded'}},
+                                                        'score': '0.85'}}},
+                                   {'occur': 'should',
+                                    'query': {'boost': {'query': {'match': {'value': 'claudes'}},
+                                                        'score': '0.85'}}},
+                                   {'occur': 'should',
+                                    'query': {'boost': {'query': {'match': {'value': 'clauding'}},
+                                                        'score': '0.85'}}},
+                                   {'occur': 'should',
+                                    'query': {'match': {'value': 'rugarli'}}},
+                                   {'occur': 'should',
+                                    'query': {'boost': {'query': {'match': {'value': 'rugarlis'}},
+                                                        'score': '0.85'}}}]},
+    }
     processed_query = query_processor.process('+(search engine) -car', 'en')
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
