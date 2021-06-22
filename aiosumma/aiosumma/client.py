@@ -1,5 +1,6 @@
 import sys
 from typing import (
+    Dict,
     Iterable,
     List,
     Optional,
@@ -14,10 +15,7 @@ from aiogrpcclient import (
 )
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
-from izihawa_utils.pb_to_json import (
-    MessageToDict,
-    ParseDict,
-)
+from izihawa_utils.pb_to_json import ParseDict
 from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
@@ -338,7 +336,7 @@ class SummaClient(BaseGrpcClient):
             Aliases list
         """
         return await self.stubs['index_api'].get_indices_aliases(
-            index_service_pb.GetIndexAliasesRequest(),
+            index_service_pb.GetIndicesAliasesRequest(),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
@@ -417,8 +415,9 @@ class SummaClient(BaseGrpcClient):
     async def search(
         self,
         index_alias: str,
-        query: search_service_pb.Query,
-        collectors: Union[search_service_pb.Collector, List[search_service_pb.Collector]],
+        query: dict,
+        collectors: Union[dict, List[dict]],
+        tags: Optional[Dict[str, str]] = None,
         ignore_not_found: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -430,6 +429,7 @@ class SummaClient(BaseGrpcClient):
             index_alias: index alias
             query: parsed `Query`
             collectors: search_service_pb.Collector list
+            tags: extra dict for logging purposes
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id
@@ -442,7 +442,8 @@ class SummaClient(BaseGrpcClient):
                 ParseDict({
                     'index_alias': index_alias,
                     'query': query,
-                    'collectors': collectors
+                    'collectors': collectors,
+                    'tags': tags,
                 }, search_service_pb.SearchRequest()),
                 metadata=(('request-id', request_id), ('session-id', session_id)),
             )

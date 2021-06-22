@@ -1,6 +1,6 @@
 ---
 layout: page
-subtitle: Collectors
+title: Collectors
 permalink: /collectors
 ---
 Collectors are responsible for processing the stream of documents that matched the query. 
@@ -70,4 +70,10 @@ Counts the number of documents exactly and returns it
 Select `limit` random items corresponding to the query and returns them
 ```json
 {"reservoir": {"limit": 10}}
+```
+
+## Aggregation
+Select `limit` random items corresponding to the query and returns them
+```json
+{"aggregation": {"aggregations": {"year_stats": {"metric": {"stats": {"field": "issued_at"}}}}}}
 ```

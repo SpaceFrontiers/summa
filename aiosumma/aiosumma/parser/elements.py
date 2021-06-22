@@ -85,7 +85,7 @@ class SearchField(Item):
         return [self.expr]
 
 
-class Group(Item):
+class BaseGroup(Item):
     """
     Parent class for binary operations are binary operation used to join expressions,
     like OR and AND
@@ -97,6 +97,9 @@ class Group(Item):
 
     def __str__(self):
         return f'({" ".join(str(o) for o in self.operands)})'
+
+    def __len__(self):
+        return len(self.operands)
 
     def to_summa_query(self):
         subqueries = []
@@ -118,6 +121,14 @@ class Group(Item):
         """children are left and right expressions
         """
         return self.operands
+
+
+class Group(BaseGroup):
+    pass
+
+
+class SynonymsGroup(BaseGroup):
+    pass
 
 
 class Range(Item):

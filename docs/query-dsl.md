@@ -1,6 +1,6 @@
 ---
 layout: page
-subtitle: Query DSL
+title: Query DSL
 permalink: /query-dsl
 ---
 

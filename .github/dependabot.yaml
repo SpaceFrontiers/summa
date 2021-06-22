@@ -11,7 +11,7 @@ updates:
     reviewers: [ ppodolsky ]
     labels: [ dependencies, automatic ]
     schedule:
-      interval: daily
+      interval: weekly
       time: "10:00"
       timezone: Europe/Moscow
   - package-ecosystem: github-actions
@@ -21,6 +21,6 @@ updates:
     reviewers: [ ppodolsky ]
     labels: [ dependencies, automatic ]
     schedule:
-      interval: daily
+      interval: weekly
       time: "10:00"
       timezone: Europe/Moscow

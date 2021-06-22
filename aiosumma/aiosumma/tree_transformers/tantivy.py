@@ -1,4 +1,5 @@
 from ..parser.elements import (
+    BaseGroup,
     Boost,
     Group,
     Minus,
@@ -20,7 +21,7 @@ class TantivyTreeTransformer(TreeTransformer):
         return node, False
 
     def visit_minus(self, node, context, parents=None):
-        if isinstance(node.a, Group):
+        if isinstance(node.a, BaseGroup):
             op = node.a
             new_operands = []
             for operand in op.operands:
@@ -30,7 +31,7 @@ class TantivyTreeTransformer(TreeTransformer):
         return node, False
 
     def visit_plus(self, node, context, parents=None):
-        if isinstance(node.a, Group):
+        if isinstance(node.a, BaseGroup):
             op = node.a
             new_operands = []
             for operand in op.operands:
@@ -41,7 +42,7 @@ class TantivyTreeTransformer(TreeTransformer):
 
     def visit_search_field(self, node, context, parents=None):
         context.is_exploration = False
-        if isinstance(node.expr, Group):
+        if isinstance(node.expr, BaseGroup):
             return Group(*[
                 SearchField(node.name, operand) for operand in node.expr.operands
             ]), False

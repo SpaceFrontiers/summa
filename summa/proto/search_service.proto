@@ -19,6 +19,8 @@ message SearchRequest {
   // Every collector is responsible of processing and storing documents and/or their derivatives (like counters)
   // to return them to the caller
   repeated Collector collectors = 3;
+  // Extra fields used only for logging purposes
+  map<string, string> tags = 4;
 }
 
 message SearchResponse {

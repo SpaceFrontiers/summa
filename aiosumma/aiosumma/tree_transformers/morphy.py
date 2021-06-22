@@ -2,7 +2,7 @@ from izihawa_nlptools.morph import EnglishMorphology
 
 from ..parser.elements import (
     Boost,
-    Group,
+    SynonymsGroup,
     Word,
 )
 from .base import TreeTransformer
@@ -34,4 +34,5 @@ class MorphyTreeTransformer(TreeTransformer):
 
         if len(forms) == 1:
             return node, True
-        return Group(*forms), True
+
+        return SynonymsGroup(*forms), True

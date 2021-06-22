@@ -1,5 +1,5 @@
 ---
 layout: page
-subtitle: IPFS
+title: IPFS
 permalink: /ipfs-replication
 ---

@@ -1,7 +1,7 @@
 ---
 layout: page
-subtitle: Schema
+title: Schema
 permalink: /schema
 ---
 ## Schema
-Schema concept in inherited from Tantivy/
+Schema concept in inherited from Tantivy

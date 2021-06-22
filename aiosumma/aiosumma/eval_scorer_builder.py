@@ -1,7 +1,5 @@
 from datetime import timedelta
 
-from summa.proto import search_service_pb2 as search_service_pb
-
 
 class EvalScorerBuilder:
     def __init__(self):
@@ -28,5 +26,5 @@ class EvalScorerBuilder:
 
     def build(self):
         if not self.ops:
-            return search_service_pb.Scorer()
-        return search_service_pb.Scorer(eval_expr=' * '.join(self.ops))
+            return {}
+        return {'eval_expr': ' * '.join(self.ops)}

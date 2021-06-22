@@ -11,6 +11,7 @@ from typing import (
 from ..parser.elements import (
     Group,
     Phrase,
+    SynonymsGroup,
 )
 from .base import TreeTransformer
 
@@ -56,5 +57,5 @@ class SynonymTreeTransformer(TreeTransformer):
             synset_list = self.synonyms(node.value)
             if synset_list is not None:
                 words = list(map(lambda x: Phrase(x), synset_list))
-                return Group(*words), True
+                return SynonymsGroup(*words), True
         return node, False

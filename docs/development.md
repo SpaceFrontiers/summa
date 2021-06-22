@@ -1,6 +1,6 @@
 ---
 layout: page
-subtitle: Development
+title: Development
 permalink: /development
 ---
 Summa is armed with both Cargo and Bazel build systems. 
@@ -25,7 +25,7 @@ bazel build -c opt summa-server
 
 ```bash
 # Launch all tests
-bazel test ...
+bazel test //tests
 ```
 
 ## Publish

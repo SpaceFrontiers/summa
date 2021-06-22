@@ -1,6 +1,6 @@
 ---
 layout: page
-subtitle: Schema
+title: Schema
 permalink: /python-api
 ---
 
