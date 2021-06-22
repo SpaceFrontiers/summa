@@ -57,7 +57,7 @@ py_wheel(
     requires = [
         "aiogrpcclient >= 1.1.9",
         "fire >= 0.3.1",
-        "izihawa_nlptools >= 1.0.2",
+        "izihawa_nlptools >= 1.0.3",
         "izihawa_types >= 0.1.2",
         "orjson >= 3.6.8",
         "ply >= 3.11",
@@ -67,7 +67,7 @@ py_wheel(
         "summa/proto/summa_py_pb",
         "aiosumma",
     ],
-    version = "2.3.13",
+    version = "2.3.14",
     deps = [
         ":aiosumma",
         ":data",
