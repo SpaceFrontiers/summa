@@ -4,6 +4,7 @@ from ..parser.elements import (
     Boost,
     Phrase,
     SearchField,
+    SynonymsGroup,
     Word,
 )
 from .base import TreeTransformer
@@ -25,10 +26,14 @@ class ExactMatchTreeTransformer(TreeTransformer):
         if len(node) <= 1:
             return node, False
         for operand in node.operands:
-            if not isinstance(operand, Word):
+            if isinstance(operand, Word):
+                words.append(operand)
+                phrase.append(operand.value)
+            elif isinstance(operand, SynonymsGroup):
+                words.append(operand.operands[0])
+                phrase.append(operand.operands[0].value)
+            else:
                 return node, False
-            words.append(operand)
-            phrase.append(operand.value)
         phrase = ' '.join(phrase)
 
         score = self.score

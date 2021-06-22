@@ -96,9 +96,7 @@ class TreeTransformer(TreeVisitor):
         Recursively traverses the tree and replace nodes with the appropriate
         visitor method's return values.
         """
-        if not node:
-            return node
-        if self.ignore_nodes and isinstance(node, self.ignore_nodes):
+        if not node or (self.ignore_nodes and isinstance(node, self.ignore_nodes)):
             return node
         parents = parents or []
         method = self._get_method(node)

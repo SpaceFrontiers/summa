@@ -85,7 +85,7 @@ class SearchField(Item):
         return [self.expr]
 
 
-class Group(Item):
+class BaseGroup(Item):
     """
     Parent class for binary operations are binary operation used to join expressions,
     like OR and AND
@@ -121,6 +121,14 @@ class Group(Item):
         """children are left and right expressions
         """
         return self.operands
+
+
+class Group(BaseGroup):
+    pass
+
+
+class SynonymsGroup(BaseGroup):
+    pass
 
 
 class Range(Item):

@@ -66,7 +66,7 @@ class QueryProcessor:
 
         query = self.apply_text_transformers(query=query)
         parsed_query = self.parse(query=query)
-        context = QueryContext(language=detect_language(query) or language)
+        context = QueryContext(language=detect_language(query, threshold=0.5) or language)
         parsed_query = self.apply_tree_transformers(parsed_query=parsed_query, context=context)
 
         return ProcessedQuery(parsed_query=parsed_query, context=context)

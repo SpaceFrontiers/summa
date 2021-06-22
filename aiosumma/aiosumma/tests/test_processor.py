@@ -72,9 +72,19 @@ def test_production_chain():
         tree_transformers=[
             MorphyTreeTransformer(enable_morph=True),
             TantivyTreeTransformer(),
-            OptimizingTreeTransformer(),
+            OptimizingTreeTransformer()
         ],
     )
+    processed_query = query_processor.process('+(search engine) -car', 'en')
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [
+            {'occur': 'must', 'query': {'match': {'value': 'search'}}},
+            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85000'}}},
+            {'occur': 'must', 'query': {'match': {'value': 'engine'}}},
+            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85000'}}},
+            {'occur': 'must_not', 'query': {'match': {'value': 'car'}}},
+            {'occur': 'must_not', 'query': {'boost': {'query': {'match': {'value': 'cars'}}, 'score': '0.85000'}}}]}}
+
     processed_query = query_processor.process('search engine', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
