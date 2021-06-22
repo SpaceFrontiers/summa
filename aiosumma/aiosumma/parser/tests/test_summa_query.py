@@ -73,7 +73,7 @@ def test_boost():
     parsed_query = default_parser.parse('title:kolobok^3.0')
     assert parsed_query.to_summa_query() == {'boost': {
         'query': {'term': {'field': 'title', 'value': 'kolobok'}},
-        'score': '3.00000'
+        'score': '3'
     }}
 
 
@@ -82,7 +82,7 @@ def test_boost_group():
     assert parsed_query.to_summa_query() == {'boost': {'query': {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'kolobok'}}},
         {'occur': 'should', 'query': {'match': {'value': 'babushka'}}}
-    ]}}, 'score': '3.00000'}}
+    ]}}, 'score': '3'}}
 
 
 def test_proximity():

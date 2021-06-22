@@ -10,12 +10,12 @@ from ..parser.elements import (
 from .base import TreeTransformer
 
 
-def _default_scorer(node, context) -> float:
-    return float(len(node))
+def _default_scorer(node, context) -> str:
+    return str(len(node))
 
 
 class ExactMatchTreeTransformer(TreeTransformer):
-    def __init__(self, default_phrase_field=None, score: Union[float, Callable] = _default_scorer, ignore_nodes=None):
+    def __init__(self, default_phrase_field=None, score: Union[str, Callable] = _default_scorer, ignore_nodes=None):
         super().__init__(ignore_nodes=ignore_nodes)
         self.default_phrase_field = default_phrase_field
         self.score = score

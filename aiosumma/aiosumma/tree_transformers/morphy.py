@@ -30,7 +30,7 @@ class MorphyTreeTransformer(TreeTransformer):
         if self.enable_morph and context.language in self.morphology:
             for w in self.morphology[context.language].derive_forms(node.value):
                 if node.value != w:
-                    forms.append(Boost(Word(w), score=0.85))
+                    forms.append(Boost(Word(w), score='0.85'))
 
         if len(forms) == 1:
             return node, True

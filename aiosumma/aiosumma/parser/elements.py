@@ -300,11 +300,11 @@ class Boost(Item):
     :param expr: the boosted expression
     :param force: boosting force, will be converted to :py:class:`decimal.Decimal`
     """
-    def __init__(self, expr, score):
+    def __init__(self, expr, score: str):
         super().__init__()
         self.expr = expr
         if score is None:
-            score = 1.0
+            score = '1.0'
         self.score = Decimal(score).normalize()
 
     @property
@@ -314,13 +314,13 @@ class Boost(Item):
         return [self.expr]
 
     def __repr__(self):  # pragma: no cover
-        return "%s(%s, %s)" % (self.__class__.__name__, self.expr.__repr__(), self.score)
+        return "%s(%s, %s)" % (self.__class__.__name__, self.expr.__repr__(), str(self.score))
 
     def __str__(self):
-        return "%s^%s" % (self.expr.__str__(), self.score)
+        return "%s^%s" % (self.expr.__str__(), str(self.score))
 
     def to_summa_query(self):
-        return {'boost': {'query': self.expr.to_summa_query(), 'score': f'{round(self.score, 5)}'}}
+        return {'boost': {'query': self.expr.to_summa_query(), 'score': str(self.score)}}
 
 
 class Unary(Item):
