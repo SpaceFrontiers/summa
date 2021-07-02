@@ -219,6 +219,7 @@ impl IndexUpdater {
         for consumer in &self.consumers {
             consumer.commit_offsets()?;
         }
+        warn!(action = "committed_offsets");
         Ok(())
     }
 
