@@ -253,10 +253,10 @@ class Regex(Term):
 class BaseApprox(Item):
     """Base for approximations, that is fuzziness and proximity
     """
-    _equality_attrs = ['term', 'degree']
+    _equality_attrs = ['term', 'slop']
 
     def __repr__(self):  # pragma: no cover
-        return "%s(%s, %s)" % (self.__class__.__name__, self.term.__repr__(), self.degree)
+        return "%s(%s, %s)" % (self.__class__.__name__, self.term.__repr__(), self.slop)
 
     @property
     def children(self):
@@ -266,17 +266,17 @@ class BaseApprox(Item):
 class Fuzzy(BaseApprox):
     """Fuzzy search on word
     :param Word term: the approximated term
-    :param degree: the degree which will be converted to :py:class:`decimal.Decimal`.
+    :param slop: the degree which will be converted to :py:class:`decimal.Decimal`.
     """
-    def __init__(self, term, degree=None):
+    def __init__(self, term, slop=None):
         super().__init__()
         self.term = term
-        if degree is None:
-            degree = 0.5
-        self.degree = Decimal(degree).normalize()
+        if slop is None:
+            slop = 0.5
+        self.slop = Decimal(slop).normalize()
 
     def __str__(self):
-        return "%s~%s" % (self.term, self.degree)
+        return "%s~%s" % (self.term, self.slop)
 
 
 class Proximity(BaseApprox):

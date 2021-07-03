@@ -123,7 +123,7 @@ PHRASE_RE = fr'''
 
 # r'(?P<phrase>"(?:[^\\"]|\\"|\\[^"])*")' # this is quite complicated to handle \"
 # modifiers after term or phrase
-APPROX_RE = r'~(?P<degree>[0-9.]+)?'
+APPROX_RE = r'~(?P<slop>[0-9.]+)?'
 BOOST_RE = r'\^(?P<score>[0-9.]+)?'
 
 # regex
@@ -199,7 +199,7 @@ def t_REGEX(t):
 @lex.TOKEN(APPROX_RE)
 def t_APPROX(t):
     m = re.match(APPROX_RE, t.value)
-    t.value = m.group("degree")
+    t.value = m.group("slop")
     return t
 
 
