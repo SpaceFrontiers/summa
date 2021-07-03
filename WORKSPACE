@@ -36,9 +36,9 @@ http_archive(
 )
 http_archive(
     name = "rules_python",
-    sha256 = "5fa3c738d33acca3b97622a13a741129f67ef43f5fdfcec63b29374cc0574c29",
-    strip_prefix = "rules_python-0.9.0",
-    urls = ["https://github.com/bazelbuild/rules_python/archive/0.9.0.tar.gz"],
+    sha256 = "95525d542c925bc2f4a7ac9b68449fc96ca52cfba15aa883f7193cdf745c38ff",
+    strip_prefix = "rules_python-cccbfb920c8b100744c53c0c03900f1be4040fe8",
+    url = "https://github.com/ppodolsky/rules_python/archive/cccbfb920c8b100744c53c0c03900f1be4040fe8.tar.gz",
 )
 
 # GRPC

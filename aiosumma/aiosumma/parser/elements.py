@@ -75,7 +75,7 @@ class SearchField(Item):
         elif isinstance(self.expr, Regex):
             return {'regex': {'field': self.name, 'value': self.expr.value}}
         elif isinstance(self.expr, Proximity):
-            return {'phrase': {'field': self.name, 'value': self.expr.term, 'slop': self.expr.slop}}
+            return {'phrase': {'field': self.name, 'value': self.expr.term.value, 'slop': self.expr.slop}}
         else:
             raise UnsupportedQueryError(error=f'{self.expr} in search field `{self.name}`')
 

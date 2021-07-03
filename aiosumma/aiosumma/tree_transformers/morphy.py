@@ -16,7 +16,7 @@ class MorphyTreeTransformer(TreeTransformer):
         'en': EnglishMorphology('en_core_web_sm'),
     }
 
-    def __init__(self, enable_morph=True, enable_accent=True, ignore_nodes=None):
+    def __init__(self, enable_morph=True, enable_accent=True, score: str = '0.65', ignore_nodes=None):
         super().__init__(ignore_nodes=ignore_nodes)
         self.enable_morph = enable_morph
         self.enable_accent = enable_accent
@@ -30,7 +30,7 @@ class MorphyTreeTransformer(TreeTransformer):
         if self.enable_morph and context.language in self.morphology:
             for w in self.morphology[context.language].derive_forms(node.value):
                 if node.value != w:
-                    forms.append(Boost(Word(w), score='0.85'))
+                    forms.append(Boost(Word(w), score=score))
 
         if len(forms) == 1:
             return node, True
