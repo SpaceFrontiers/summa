@@ -34,7 +34,7 @@ base64 = "0.13.0"
 clap = { version = "3.2.6", features = ["cargo"] }
 colored = "2.0.0"
 config = "0.13.1"
-crossbeam-channel = "0.5.4"
+crossbeam-channel = "0.5.5"
 derive_builder = "0.11.2"
 fasteval2 = { version = "2.0.3", features = ["unsafe-vars"] }
 futures = "0.3.21"
