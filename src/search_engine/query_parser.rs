@@ -138,18 +138,19 @@ impl QueryParser {
             Some(proto::query::Query::Phrase(phrase_query_proto)) => {
                 let (field, field_entry) = self.field_and_field_entry(&phrase_query_proto.field)?;
                 let tokenizer = self.index.tokenizer_for_field(field)?;
+
                 let mut token_stream = tokenizer.token_stream(&phrase_query_proto.value);
-                let mut terms = vec![];
+                let mut terms: Vec<(usize, Term)> = vec![];
                 while let Some(token) = token_stream.next() {
-                    terms.push(cast_value_to_term(field, field_entry.field_type(), &token.text)?)
+                    terms.push((token.position, cast_value_to_term(field, field_entry.field_type(), &token.text)?))
                 }
                 if terms.len() == 1 {
                     Box::new(TermQuery::new(
-                        terms[0].clone(),
+                        terms[0].1.clone(),
                         field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
                     ))
                 } else {
-                    let mut phrase_query = PhraseQuery::new(terms);
+                    let mut phrase_query = PhraseQuery::new_with_offset(terms);
                     phrase_query.set_slop(phrase_query_proto.slop);
                     Box::new(phrase_query)
                 }
