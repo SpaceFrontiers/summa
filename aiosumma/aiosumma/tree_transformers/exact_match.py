@@ -36,6 +36,8 @@ class ExactMatchTreeTransformer(TreeTransformer):
                 phrase.append(operand.value)
             elif isinstance(operand, SynonymsGroup):
                 phrase.append(operand.operands[0].value)
+            elif isinstance(operand, SearchField):
+                continue
             else:
                 return node, False
         phrase = ' '.join(phrase)
