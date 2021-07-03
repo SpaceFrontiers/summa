@@ -53,7 +53,7 @@ rand = "0.8.5"
 rdkafka = "0.28.0"
 serde = { version = "1.0.17", features = ["derive"] }
 serde_derive = "1.0.137"
-serde_json = "1.0.81"
+serde_json = "1.0.82"
 serde_yaml = "0.8.24"
 signal-hook = "0.3.14"
 tantivy = { version = "0.18.0", features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
