@@ -21,6 +21,8 @@ class TantivyTreeTransformer(TreeTransformer):
         return node, False
 
     def visit_minus(self, node, context, parents=None):
+        if parents is None:
+            return node.a, False
         if isinstance(node.a, BaseGroup):
             op = node.a
             new_operands = []

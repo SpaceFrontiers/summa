@@ -40,6 +40,10 @@ class ExactMatchTreeTransformer(TreeTransformer):
                 continue
             else:
                 return node, False
+
+        if not phrase:
+            return node, False
+
         phrase = ' '.join(phrase)
 
         score = self.score
