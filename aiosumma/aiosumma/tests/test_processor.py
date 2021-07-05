@@ -85,51 +85,51 @@ def test_production_chain():
                                     'query': {'match': {'value': 'claudio'}}},
                                    {'occur': 'should',
                                     'query': {'boost': {'query': {'match': {'value': 'claudios'}},
-                                                        'score': '0.85'}}},
+                                                        'score': '0.65'}}},
                                    {'occur': 'should',
                                     'query': {'match': {'value': 'claude'}}},
                                    {'occur': 'should',
                                     'query': {'boost': {'query': {'match': {'value': 'clauded'}},
-                                                        'score': '0.85'}}},
+                                                        'score': '0.65'}}},
                                    {'occur': 'should',
                                     'query': {'boost': {'query': {'match': {'value': 'claudes'}},
-                                                        'score': '0.85'}}},
+                                                        'score': '0.65'}}},
                                    {'occur': 'should',
                                     'query': {'boost': {'query': {'match': {'value': 'clauding'}},
-                                                        'score': '0.85'}}},
+                                                        'score': '0.65'}}},
                                    {'occur': 'should',
                                     'query': {'match': {'value': 'rugarli'}}},
                                    {'occur': 'should',
                                     'query': {'boost': {'query': {'match': {'value': 'rugarlis'}},
-                                                        'score': '0.85'}}}]},
+                                                        'score': '0.65'}}}]},
     }
     processed_query = query_processor.process('+(search engine) -car', 'en')
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
             {'occur': 'must', 'query': {'match': {'value': 'search'}}},
-            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85'}}},
+            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.65'}}},
             {'occur': 'must', 'query': {'match': {'value': 'engine'}}},
-            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85'}}},
+            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.65'}}},
             {'occur': 'must_not', 'query': {'match': {'value': 'car'}}},
-            {'occur': 'must_not', 'query': {'boost': {'query': {'match': {'value': 'cars'}}, 'score': '0.85'}}}]}}
+            {'occur': 'must_not', 'query': {'boost': {'query': {'match': {'value': 'cars'}}, 'score': '0.65'}}}]}}
 
     processed_query = query_processor.process('search engine', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85'}}},
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.65'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85'}}}
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.65'}}}
     ]}}
     processed_query = query_processor.process('author:Smith +"title book"', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'term': {'field': 'author', 'value': 'smith'}}},
         {'occur': 'should', 'query':
-            {'boost': {'query': {'term': {'field': 'author', 'value': 'smiths'}}, 'score': '0.85'}}},
+            {'boost': {'query': {'term': {'field': 'author', 'value': 'smiths'}}, 'score': '0.65'}}},
         {'occur': 'must', 'query': {'match': {'value': '"title book"'}}}]}}
     processed_query = query_processor.process('science +year:[2010 TO *]', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'science'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'sciences'}}, 'score': '0.85'}}},
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'sciences'}}, 'score': '0.65'}}},
         {'occur': 'must', 'query': {'range': {
             'field': 'year', 'value': {'including_left': True, 'including_right': True, 'left': '2010', 'right': '*'}}}}
     ]}}
@@ -140,9 +140,9 @@ def test_unknown_language_transformer():
     processed_query = query_processor.process('search engine', 'zz')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.85'}}},
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.65'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.85'}}}
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.65'}}}
     ]}}
 
 
