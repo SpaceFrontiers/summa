@@ -57,8 +57,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             None | Some(proto::CommitMode::Async) => {
                 tokio::spawn(async move {
                     match index_updater.try_write() {
-                        None => warn!(action = "busy"),
-                        Some(mut index_updater) => match index_updater.commit().await {
+                        Err(_) => warn!(action = "busy"),
+                        Ok(mut index_updater) => match index_updater.commit().await {
                             Ok(_) => (),
                             Err(error) => warn!(error = ?error),
                         },
@@ -70,8 +70,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 }))
             }
             Some(proto::CommitMode::Sync) => match index_updater.try_write() {
-                None => Err(Status::failed_precondition("busy")),
-                Some(mut index_updater) => {
+                Err(_) => Err(Status::failed_precondition("busy")),
+                Ok(mut index_updater) => {
                     let now = Instant::now();
                     let opstamp = index_updater.commit().await?;
                     Ok(Response::new(proto::CommitIndexResponse {
@@ -90,6 +90,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .get_index_holder(&request.index_alias)?
             .index_updater()
             .read()
+            .await
             .delete_document(request.primary_key)?;
         let response = proto::DeleteDocumentResponse { opstamp: Some(opstamp) };
         Ok(Response::new(response))
@@ -102,6 +103,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .get_index_holder(&request.index_alias)?
             .index_updater()
             .read()
+            .await
             .index_document(SummaDocument::UnboundJsonBytes(&request.document))?;
         let response = proto::IndexDocumentResponse { opstamp };
         Ok(Response::new(response))
@@ -123,6 +125,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                         .get_index_holder(&chunk.index_alias)?
                         .index_updater()
                         .read()
+                        .await
                         .index_bulk(&chunk.documents);
                     elapsed_secs += now.elapsed().as_secs_f64();
                     success_docs += success_bulk_docs;
@@ -199,6 +202,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             index_holder
                 .index_updater()
                 .write()
+                .await
                 .merge(&segment_ids)
                 .instrument(info_span!("merge", index_name = ?index_name))
                 .await
@@ -227,6 +231,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             index_holder
                 .index_updater()
                 .write()
+                .await
                 .vacuum()
                 .instrument(info_span!("vacuum", index_name = ?index_name))
                 .await

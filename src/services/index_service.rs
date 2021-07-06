@@ -153,7 +153,7 @@ impl IndexService {
     pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaResult<Handler<IndexHolder>> {
         let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name)?;
         let index_updater = index_holder.index_updater();
-        let mut index_updater = index_updater.write();
+        let mut index_updater = index_updater.write().await;
         if let Some(compression) = alter_index_request.compression {
             index_updater.index_mut().settings_mut().docstore_compression = compression
         }
@@ -167,11 +167,11 @@ impl IndexService {
         Ok(index_holder)
     }
 
-    fn check_delete_conditions(&self, aliases: &[String], index_holder: &IndexHolder) -> SummaResult<()> {
+    async fn check_delete_conditions(&self, aliases: &[String], index_holder: &IndexHolder) -> SummaResult<()> {
         if !aliases.is_empty() {
             return Err(ValidationError::Aliased(aliases.join(", ")).into());
         }
-        if index_holder.index_updater().read().has_consumers() {
+        if index_holder.index_updater().read().await.has_consumers() {
             return Err(ValidationError::ExistingConsumers(index_holder.index_name().to_owned()).into());
         }
         Ok(())
@@ -183,13 +183,13 @@ impl IndexService {
         let aliases = application_config.get_index_aliases_for_index(&delete_index_request.index_name);
 
         if delete_index_request.cascade {
-            let consumers = index_holder.index_updater().write().delete_all_consumers().await?;
+            let consumers = index_holder.index_updater().write().await.delete_all_consumers().await?;
             delete_index_result.deleted_index_consumers.extend(consumers);
 
             application_config.autosave().delete_index_aliases(&aliases);
             delete_index_result.deleted_index_aliases.extend(aliases);
         } else {
-            self.check_delete_conditions(&aliases, index_holder)?;
+            self.check_delete_conditions(&aliases, index_holder).await?;
         }
 
         Ok(delete_index_result)
@@ -232,6 +232,7 @@ impl IndexService {
         index_holder
             .index_updater()
             .write()
+            .await
             .create_consumer(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)
             .await?;
         Ok(index_holder.index_name().to_owned())
@@ -243,6 +244,7 @@ impl IndexService {
         self.get_index_holder(&delete_consumer_request.index_alias)?
             .index_updater()
             .write()
+            .await
             .delete_consumer(&delete_consumer_request.consumer_name)
             .await
     }

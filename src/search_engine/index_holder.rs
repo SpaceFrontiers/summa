@@ -9,7 +9,7 @@ use crate::utils::sync::{Handler, OwningHandler};
 use crate::utils::thread_handler::ThreadHandler;
 use opentelemetry::metrics::{Unit, ValueRecorder};
 use opentelemetry::{global, KeyValue};
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 use std::collections::HashSet;
 use std::time::Duration;
 use tantivy::collector::MultiCollector;
@@ -32,6 +32,7 @@ pub struct IndexHolder {
     autocommit_thread: Option<ThreadHandler>,
     /// Counters
     search_times_meter: ValueRecorder<f64>,
+    compression: proto::Compression,
 }
 
 /// Sets up standard Summa tokenizers
@@ -76,7 +77,7 @@ impl IndexHolder {
                                 tokio::select! {
                                     _ = tick_task.tick() => {
                                         info!(action = "autocommit_thread_tick");
-                                        if let Some(mut index_updater) = index_updater.try_write() {
+                                        if let Ok(mut index_updater) = index_updater.try_write() {
                                             if let Err(error) = index_updater.commit().await {
                                                 warn!(error = ?error);
                                             }
@@ -104,6 +105,8 @@ impl IndexHolder {
             .with_description("Search times")
             .init();
 
+        let compression = index_updater.read().await.index().settings().docstore_compression.into();
+
         Ok(IndexHolder {
             index_name: String::from(index_name),
             autocommit_thread,
@@ -114,6 +117,7 @@ impl IndexHolder {
             index_updater,
             index_config_proxy,
             search_times_meter,
+            compression,
         })
     }
 
@@ -253,7 +257,7 @@ impl std::fmt::Debug for IndexHolder {
 impl From<&IndexHolder> for proto::Index {
     fn from(index_holder: &IndexHolder) -> Self {
         let index_config_proxy = index_holder.index_config_proxy.read();
-        let compression: proto::Compression = index_holder.index_updater().read().index().settings().docstore_compression.into();
+        let compression = index_holder.compression.clone();
         proto::Index {
             index_aliases: index_config_proxy.application_config().get_index_aliases_for_index(&index_holder.index_name),
             index_name: index_holder.index_name.to_owned(),

@@ -34,7 +34,7 @@ impl IndexWriterHolder {
                 primary_key,
                 document
                     .get_first(primary_key)
-                    .ok_or_else(|| MissingPrimaryKey(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(&document)))))?
+                    .ok_or_else(|| MissingPrimaryKey(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(document)))))?
                     .as_i64()
                     .unwrap(),
             ));
