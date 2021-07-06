@@ -4,12 +4,12 @@ use crate::utils::thread_handler::ThreadHandler;
 use futures::StreamExt;
 use opentelemetry::{global, KeyValue};
 use parking_lot::Mutex;
-use tokio::sync::{Mutex as AsyncMutex};
 use rdkafka::consumer::stream_consumer::StreamConsumer;
 use rdkafka::consumer::{CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 
 use tracing::{info, info_span, instrument, warn, Instrument};
 
