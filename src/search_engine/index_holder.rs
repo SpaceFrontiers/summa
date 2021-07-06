@@ -331,7 +331,7 @@ pub(crate) mod tests {
         let index_service = create_test_index_service(&data_path).await;
         let index_holder = create_test_index_holder(&index_service, &fields).await?;
 
-        index_holder.index_updater().read().index_document(SummaDocument::TantivyDocument(doc!(
+        index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
             fields.get_field("id").unwrap() => 1i64,
             fields.get_field("title").unwrap() => "Headcrab",
             fields.get_field("body").unwrap() => "Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient to dispatch them. \
@@ -343,7 +343,7 @@ pub(crate) mod tests {
             Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
             fields.get_field("issued_at").unwrap() => 1652986134i64
         )))?;
-        index_holder.index_updater().write().commit().await?;
+        index_holder.index_updater().write().await.commit().await?;
         index_holder.index_reader().reload()?;
         assert_eq!(
             index_holder.search(&match_query("headcrabs"), vec![top_docs_collector(10)]).await?,
@@ -380,19 +380,19 @@ pub(crate) mod tests {
         let index_service = create_test_index_service(&data_path).await;
         let index_holder = create_test_index_holder(&index_service, &fields).await?;
 
-        index_holder.index_updater().read().index_document(SummaDocument::TantivyDocument(doc!(
+        index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
             fields.get_field("id").unwrap() => 1i64,
             fields.get_field("title").unwrap() => "term1 term2",
             fields.get_field("body").unwrap() => "term3 term4 term5 term6",
             fields.get_field("issued_at").unwrap() => 100i64
         )))?;
-        index_holder.index_updater().read().index_document(SummaDocument::TantivyDocument(doc!(
+        index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
             fields.get_field("id").unwrap() => 2i64,
             fields.get_field("title").unwrap() => "term2 term3",
             fields.get_field("body").unwrap() => "term1 term7 term8 term9 term10",
             fields.get_field("issued_at").unwrap() => 110i64
         )))?;
-        index_holder.index_updater().write().commit().await?;
+        index_holder.index_updater().write().await.commit().await?;
         index_holder.index_reader().reload()?;
         assert_eq!(
             index_holder
