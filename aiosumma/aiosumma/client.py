@@ -145,7 +145,7 @@ class SummaClient(BaseGrpcClient):
         default_fields: Optional[List[str]] = None,
         multi_fields: Optional[List[str]] = None,
         stop_words: Optional[List[str]] = None,
-        compression: Optional[str, int] = None,
+        compression: Optional[Union[str, int]] = None,
         writer_heap_size_bytes: Optional[int] = None,
         writer_threads: Optional[int] = None,
         autocommit_interval_ms: Optional[int] = None,
@@ -215,6 +215,31 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['consumer_api'].delete_consumer(
             consumer_service_pb.DeleteConsumerRequest(index_alias=index_alias, consumer_name=consumer_name),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
+    async def delete_document(
+        self,
+        index_alias: str,
+        primary_key: int,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.IndexDocumentResponse:
+        """
+        Delete document with primary key
+
+        Args:
+            index_alias: index alias
+            primary_key: bytes
+            request_id:
+            session_id:
+        """
+        return await self.stubs['index_api'].delete_document(
+            index_service_pb.DeleteDocumentRequest(
+                index_alias=index_alias,
+                primary_key=primary_key,
+            ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 

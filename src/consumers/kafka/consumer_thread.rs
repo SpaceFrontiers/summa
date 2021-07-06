@@ -81,9 +81,7 @@ impl ConsumerThread {
     pub async fn commit_offsets(&self) -> SummaResult<()> {
         info!(action = "commit_consumer_state");
         let stream_consumer = self.stream_consumer.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            stream_consumer.lock().commit_consumer_state(CommitMode::Sync)
-        }).await?;
+        let result = tokio::task::spawn_blocking(move || stream_consumer.lock().commit_consumer_state(CommitMode::Sync)).await?;
         info!(action = "committed_consumer_state", result = ?result);
         match result {
             Err(KafkaError::ConsumerCommit(rdkafka::error::RDKafkaErrorCode::NoOffset)) => Ok(()),

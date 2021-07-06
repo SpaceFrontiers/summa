@@ -27,13 +27,8 @@ impl IndexWriterHolder {
         Ok(IndexWriterHolder { index_writer, primary_key })
     }
 
-    /// Tantivy `Index`
-    pub(super) fn index(&self) -> &Index {
-        self.index_writer.index()
-    }
-
-    /// Put document to the index. Before comes searchable it must be committed
-    pub(super) fn index_document(&self, document: Document) -> SummaResult<Opstamp> {
+    /// Delete index by its primary key
+    pub(super) fn delete_document(&self, document: &Document) -> SummaResult<()> {
         if let Some(primary_key) = self.primary_key {
             self.index_writer.delete_term(Term::from_field_i64(
                 primary_key,
@@ -44,6 +39,26 @@ impl IndexWriterHolder {
                     .unwrap(),
             ));
         }
+        Ok(())
+    }
+
+    /// Delete index by its primary key
+    pub(super) fn delete_document_by_primary_key(&self, primary_key_value: i64) -> SummaResult<Opstamp> {
+        if let Some(primary_key) = self.primary_key {
+            Ok(self.index_writer.delete_term(Term::from_field_i64(primary_key, primary_key_value)))
+        } else {
+            Err(MissingPrimaryKey(None).into())
+        }
+    }
+
+    /// Tantivy `Index`
+    pub(super) fn index(&self) -> &Index {
+        self.index_writer.index()
+    }
+
+    /// Put document to the index. Before comes searchable it must be committed
+    pub(super) fn index_document(&self, document: Document) -> SummaResult<Opstamp> {
+        self.delete_document(&document)?;
         Ok(self.index_writer.add_document(document)?)
     }
 

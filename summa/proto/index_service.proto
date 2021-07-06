@@ -9,6 +9,7 @@ service IndexApi {
   rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
   rpc create_index (CreateIndexRequest) returns (CreateIndexResponse) {}
+  rpc delete_document (DeleteDocumentRequest) returns (DeleteDocumentResponse) {}
   rpc delete_index (DeleteIndexRequest) returns (DeleteIndexResponse) {}
   rpc get_indices_aliases (GetIndicesAliasesRequest) returns (GetIndicesAliasesResponse) {}
   rpc get_index (GetIndexRequest) returns (GetIndexResponse) {}
@@ -64,6 +65,15 @@ message CreateIndexRequest {
 
 message CreateIndexResponse {
   Index index = 1;
+}
+
+message DeleteDocumentRequest {
+  string index_alias = 1;
+  int64 primary_key = 2;
+}
+
+message DeleteDocumentResponse {
+  optional uint64 opstamp = 1;
 }
 
 message DeleteIndexRequest {

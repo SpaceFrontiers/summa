@@ -83,6 +83,18 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         }
     }
 
+    async fn delete_document(&self, request: Request<proto::DeleteDocumentRequest>) -> Result<Response<proto::DeleteDocumentResponse>, Status> {
+        let request = request.into_inner();
+        let opstamp = self
+            .index_service
+            .get_index_holder(&request.index_alias)?
+            .index_updater()
+            .read()
+            .delete_document(request.primary_key)?;
+        let response = proto::DeleteDocumentResponse { opstamp: Some(opstamp) };
+        Ok(Response::new(response))
+    }
+
     async fn index_document(&self, request: Request<proto::IndexDocumentRequest>) -> Result<Response<proto::IndexDocumentResponse>, Status> {
         let request = request.into_inner();
         let opstamp = self

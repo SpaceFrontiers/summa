@@ -86,6 +86,8 @@ pub enum Error {
     Kafka(rdkafka::error::KafkaError),
     #[error("tantivy_error: {0}")]
     Tantivy(tantivy::TantivyError),
+    #[error("poison")]
+    Poison,
     #[error("timeout_error")]
     Timeout,
     #[error("tonic_error: {0}")]
@@ -129,6 +131,12 @@ impl From<rdkafka::error::KafkaError> for Error {
 impl From<DocumentParsingError> for Error {
     fn from(error: DocumentParsingError) -> Self {
         Error::DocumentParsing(error)
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(_: std::sync::PoisonError<T>) -> Self {
+        Error::Poison
     }
 }
 

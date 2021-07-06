@@ -11,7 +11,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tantivy::schema::Schema as Fields;
 use tantivy::{Index, Opstamp, SegmentId, SegmentMeta};
-use tracing::{instrument, info, warn};
+use tracing::{info, instrument, warn};
 
 fn process_message(
     fields: &Fields,
@@ -179,6 +179,11 @@ impl IndexUpdater {
     /// Check if any consumers for the `IndexUpdater` exists
     pub(crate) fn has_consumers(&self) -> bool {
         !self.consumers.is_empty()
+    }
+
+    /// Delete `SummaDocument` by `primary_key`
+    pub(crate) fn delete_document(&self, primary_key_value: i64) -> SummaResult<Opstamp> {
+        self.index_writer_holder.delete_document_by_primary_key(primary_key_value)
     }
 
     /// Index generic `SummaDocument`

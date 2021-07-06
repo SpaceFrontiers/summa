@@ -120,7 +120,7 @@ impl Consumer {
                 &topics,
                 &AdminOptions::new()
                     .operation_timeout(Some(Timeout::Never))
-                    .request_timeout(Some(Timeout::Never))
+                    .request_timeout(Some(Timeout::Never)),
             )
             .await?;
         info!(action = "delete_topics", topics = ?topics, response = ?response);
@@ -130,7 +130,7 @@ impl Consumer {
     #[instrument]
     pub async fn on_create(&self) -> SummaResult<()> {
         if self.config.create_topics {
-            return Ok(self.create_topics().await?)
+            return self.create_topics().await;
         }
         Ok(())
     }
@@ -138,7 +138,7 @@ impl Consumer {
     #[instrument(skip(self), fields(consumer_name = ?self.consumer_name))]
     pub async fn on_delete(&self) -> SummaResult<()> {
         if self.config.delete_topics {
-            return Ok(self.delete_topics().await?)
+            return self.delete_topics().await;
         }
         Ok(())
     }
