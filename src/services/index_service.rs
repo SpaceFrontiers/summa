@@ -126,7 +126,7 @@ impl IndexService {
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<Handler<IndexHolder>> {
         self.insert_config(&create_index_request)?;
         let index_settings = IndexSettings {
@@ -149,7 +149,7 @@ impl IndexService {
     }
 
     /// Alters index
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
     pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaResult<Handler<IndexHolder>> {
         let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name)?;
         let index_updater = index_holder.index_updater();
@@ -196,7 +196,7 @@ impl IndexService {
     }
 
     /// Delete index, optionally with all its aliases and consumers
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(index_name = ?delete_index_request.index_name))]
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaResult<DeleteIndexResult> {
         let mut index_holders = self.index_holders.write();
         let index_holder_entry = match index_holders.entry(delete_index_request.index_name.to_owned()) {

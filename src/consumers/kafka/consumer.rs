@@ -70,9 +70,9 @@ impl Consumer {
         Ok(())
     }
 
-    pub fn commit_offsets(&self) -> SummaResult<()> {
+    pub async fn commit_offsets(&self) -> SummaResult<()> {
         for thread_controller in self.consumer_threads.iter() {
-            thread_controller.commit_offsets()?;
+            thread_controller.commit_offsets().await?;
         }
         Ok(())
     }
@@ -116,7 +116,12 @@ impl Consumer {
         let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let topics: Vec<_> = self.config.topics.iter().map(String::as_str).collect();
         let response = admin_client
-            .delete_topics(&topics, &AdminOptions::new().operation_timeout(Some(Timeout::Never)))
+            .delete_topics(
+                &topics,
+                &AdminOptions::new()
+                    .operation_timeout(Some(Timeout::Never))
+                    .request_timeout(Some(Timeout::Never))
+            )
             .await?;
         info!(action = "delete_topics", topics = ?topics, response = ?response);
         Ok(())
@@ -125,18 +130,16 @@ impl Consumer {
     #[instrument]
     pub async fn on_create(&self) -> SummaResult<()> {
         if self.config.create_topics {
-            self.create_topics().await
-        } else {
-            Ok(())
+            return Ok(self.create_topics().await?)
         }
+        Ok(())
     }
 
     #[instrument(skip(self), fields(consumer_name = ?self.consumer_name))]
     pub async fn on_delete(&self) -> SummaResult<()> {
         if self.config.delete_topics {
-            self.delete_topics().await
-        } else {
-            Ok(())
+            return Ok(self.delete_topics().await?)
         }
+        Ok(())
     }
 }

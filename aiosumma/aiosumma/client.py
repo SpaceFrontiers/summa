@@ -145,7 +145,7 @@ class SummaClient(BaseGrpcClient):
         default_fields: Optional[List[str]] = None,
         multi_fields: Optional[List[str]] = None,
         stop_words: Optional[List[str]] = None,
-        compression: Optional[str] = None,
+        compression: Optional[str, int] = None,
         writer_heap_size_bytes: Optional[int] = None,
         writer_threads: Optional[int] = None,
         autocommit_interval_ms: Optional[int] = None,
@@ -172,6 +172,10 @@ class SummaClient(BaseGrpcClient):
             session_id: session id
             sort_by_field: (field_name, order)
         """
+        if isinstance(compression, str):
+            compression = index_service_pb.Compression.Value(compression)
+        elif isinstance(compression, int):
+            compression = index_service_pb.Compression.Name(compression)
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
@@ -180,7 +184,7 @@ class SummaClient(BaseGrpcClient):
                 default_fields=default_fields,
                 multi_fields=multi_fields,
                 stop_words=stop_words,
-                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
+                compression=compression,
                 writer_heap_size_bytes=writer_heap_size_bytes,
                 writer_threads=writer_threads,
                 autocommit_interval_ms=autocommit_interval_ms,
