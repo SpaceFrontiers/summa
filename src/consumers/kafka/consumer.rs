@@ -9,6 +9,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
 use std::str;
+use std::time::Duration;
 use tracing::{info, instrument};
 
 /// Manages multiple consuming threads
@@ -120,7 +121,7 @@ impl Consumer {
                 &topics,
                 &AdminOptions::new()
                     .operation_timeout(Some(Timeout::Never))
-                    .request_timeout(Some(Timeout::Never)),
+                    .request_timeout(Some(Timeout::After(Duration::from_secs(600)))),
             )
             .await?;
         info!(action = "delete_topics", topics = ?topics, response = ?response);
