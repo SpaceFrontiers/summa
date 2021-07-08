@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 
 from izihawa_nlptools.regex import (
     DOI_REGEX,
@@ -6,6 +7,7 @@ from izihawa_nlptools.regex import (
 )
 
 from ..parser.elements import (
+    Boost,
     Doi,
     Group,
     Minus,
@@ -18,11 +20,15 @@ from .values import ValuePredicateWordTreeTransformer
 
 
 class DoiTreeTransformer(TreeTransformer):
+    def __init__(self, score: str = '1.0', ignore_nodes: Optional[tuple] = None):
+        super().__init__(ignore_nodes=ignore_nodes)
+        self.score = score
+
     def visit_doi(self, node, context, parents):
         if parents is None or len(parents) == 0 or isinstance(parents[-1], Group):
             context.dois.append(node.value)
             context.is_exploration = False
-            return SearchField('doi', node), True
+            return Boost(SearchField('doi', node), score=self.score), True
         return node, False
 
     def visit_url(self, node, context, parents):
@@ -31,7 +37,7 @@ class DoiTreeTransformer(TreeTransformer):
                 doi = (match[1] + '/' + match[2]).lower()
                 context.dois.append(doi)
                 context.is_exploration = False
-                return SearchField('doi', Doi(doi)), True
+                return Boost(SearchField('doi', Doi(doi)), score=self.score), True
         return node, False
 
 
