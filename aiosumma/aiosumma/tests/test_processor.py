@@ -178,7 +178,10 @@ def test_doi_transformer():
         ]
     )
     processed_query = query_processor.process('https://doi.org/10.1101/2022.05.26.493559', 'en')
-    assert processed_query.to_summa_query() == {'term': {'field': 'doi', 'value': '10.1101/2022.05.26.493559'}}
+    assert processed_query.to_summa_query() == {'boost': {'query': {'term': {
+        'field': 'doi',
+        'value': '10.1101/2022.05.26.493559',
+    }}, 'score': '1.0'}}
     processed_query = query_processor.process('https://google.com/?query=one+two+three', 'en')
     assert processed_query.to_summa_query() == {'match': {'value': 'https://google.com/?query=one+two+three'}}
     processed_query = query_processor.process('https://doi.org/10.1101', 'en')
