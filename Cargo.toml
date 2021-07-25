@@ -31,7 +31,7 @@ tempdir = "0.3.7"
 [dependencies]
 async-broadcast = "0.4.0"
 base64 = "0.13.0"
-clap = { version = "3.2.6", features = ["cargo"] }
+clap = { version = "3.2.15", features = ["cargo"] }
 colored = "2.0.0"
 config = "0.13.1"
 crossbeam-channel = "0.5.5"
