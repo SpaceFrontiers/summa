@@ -3,13 +3,12 @@ use crate::errors::SummaResult;
 use crate::utils::thread_handler::ThreadHandler;
 use futures::StreamExt;
 use opentelemetry::{global, KeyValue};
-use parking_lot::Mutex;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
 use rdkafka::consumer::{CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Mutex;
 
 use tracing::{info, info_span, instrument, warn, Instrument};
 
@@ -18,7 +17,7 @@ use tracing::{info, info_span, instrument, warn, Instrument};
 pub struct ConsumerThread {
     thread_name: String,
     thread_handler: Arc<Mutex<Option<ThreadHandler>>>,
-    stream_consumer: Arc<AsyncMutex<StreamConsumer>>,
+    stream_consumer: Arc<Mutex<StreamConsumer>>,
 }
 
 impl std::fmt::Debug for ConsumerThread {
@@ -32,12 +31,12 @@ impl ConsumerThread {
         ConsumerThread {
             thread_name: thread_name.to_owned(),
             thread_handler: Arc::new(Mutex::new(None)),
-            stream_consumer: Arc::new(AsyncMutex::new(stream_consumer)),
+            stream_consumer: Arc::new(Mutex::new(stream_consumer)),
         }
     }
 
     #[instrument(skip_all, fields(thread_name=?self.thread_name))]
-    pub fn start<TProcessor>(&self, processor: TProcessor)
+    pub async fn start<TProcessor>(&self, processor: TProcessor)
     where
         TProcessor: 'static + Fn(Result<BorrowedMessage<'_>, KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> + Send,
     {
@@ -75,15 +74,18 @@ impl ConsumerThread {
             }
         }
         .instrument(info_span!(parent: None, "consumer", thread_name = ?self.thread_name));
-        *self.thread_handler.lock() = Some(ThreadHandler::new(tokio::spawn(stream_processor), shutdown_trigger));
+        *self.thread_handler.lock().await = Some(ThreadHandler::new(tokio::spawn(stream_processor), shutdown_trigger));
     }
 
     #[instrument(skip(self))]
     pub async fn commit_offsets(&self) -> SummaResult<()> {
-        info!(action = "commit_consumer_state");
         let stream_consumer = self.stream_consumer.clone().lock_owned().await;
+        info!(action = "commit_consumer_state", position = ?stream_consumer.position());
         let result = tokio::task::spawn_blocking(move || stream_consumer.commit_consumer_state(CommitMode::Sync)).await?;
-        info!(action = "committed_consumer_state", result = ?result);
+        info!(
+            action = "committed_consumer_state",
+            result = ?result,
+        );
         match result {
             Err(KafkaError::ConsumerCommit(rdkafka::error::RDKafkaErrorCode::NoOffset)) => Ok(()),
             left => left,
@@ -94,7 +96,7 @@ impl ConsumerThread {
     #[instrument(skip(self))]
     pub async fn stop(&self) -> SummaResult<()> {
         info!(action = "stop", thread_name = ?self.thread_name);
-        if let Some(thread_handler) = self.thread_handler.lock().take() {
+        if let Some(thread_handler) = self.thread_handler.lock().await.take() {
             thread_handler.stop().await?;
         }
         Ok(())

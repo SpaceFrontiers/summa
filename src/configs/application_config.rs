@@ -4,7 +4,6 @@ use super::MetricsConfig;
 use crate::configs::{GrpcConfigBuilder, IndexConfig, Loadable, MetricsConfigBuilder};
 use crate::errors::{Error, SummaResult, ValidationError};
 use colored::Colorize;
-use parking_lot::RwLock;
 use path_absolutize::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use textwrap::indent;
+use tokio::sync::RwLock;
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default)]

@@ -3,11 +3,11 @@ use opentelemetry::metrics::{BatchObserverResult, Unit};
 use opentelemetry::{global, KeyValue};
 use std::collections::HashMap;
 use std::iter;
+use tokio::runtime::Handle;
 
 /// Tracing `IndexHolder`s in Prometheus format
 pub fn register_meter(index_service: &IndexService) {
     let meter = global::meter("summa");
-    let index_service = index_service.clone();
     meter.batch_observer(move |batch| {
         let index_service = index_service.clone();
         let documents_count = batch.u64_value_observer("documents_count").with_description("Documents count").init();
@@ -34,7 +34,8 @@ pub fn register_meter(index_service: &IndexService) {
 
         move |batch_observer_result: BatchObserverResult| {
             let index_service = index_service.clone();
-            for index_holder in index_service.index_holders().values() {
+            let index_holders = Handle::current().block_on(index_service.index_holders());
+            for index_holder in index_holders.values() {
                 let fields = index_holder.fields();
                 let searcher = index_holder.index_reader().searcher();
                 let segment_readers = searcher.segment_readers();

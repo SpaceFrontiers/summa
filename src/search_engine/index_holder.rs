@@ -49,7 +49,7 @@ impl IndexHolder {
     ///
     /// Creates the auto committing thread and consumers
     async fn setup(index_name: &str, index: Index, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexHolder> {
-        let index_config = index_config_proxy.read().get().clone();
+        let index_config = index_config_proxy.read().await.get().clone();
         register_default_tokenizers(&index, &index_config);
 
         let cached_fields = index.schema();
@@ -59,7 +59,7 @@ impl IndexHolder {
             index_config.default_fields.iter().map(|x| cached_fields.get_field(x).unwrap()).collect(),
         );
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
-        let index_updater = OwningHandler::new(RwLock::new(IndexUpdater::new(index, index_name, index_config_proxy.clone())?));
+        let index_updater = OwningHandler::new(RwLock::new(IndexUpdater::new(index, index_name, index_config_proxy.clone()).await?));
 
         let autocommit_thread = match index_config.autocommit_interval_ms {
             Some(interval_ms) => {
@@ -130,7 +130,7 @@ impl IndexHolder {
         index_settings: IndexSettings,
     ) -> SummaResult<IndexHolder> {
         let index = {
-            let index_config = index_config_proxy.read();
+            let index_config = index_config_proxy.read().await;
             info!(action = "create", engine = ?index_config.get().index_engine, index_settings = ?index_settings);
             match &index_config.get().index_engine {
                 IndexEngine::Memory(fields) => Index::builder().schema(fields.clone()).settings(index_settings).create_in_ram()?,
@@ -149,11 +149,21 @@ impl IndexHolder {
     /// Opens index and sets it up via `setup`
     #[instrument(skip_all, fields(index_name = index_name))]
     pub(crate) async fn open(index_name: &str, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexHolder> {
-        let index = match &index_config_proxy.read().get().index_engine {
+        let index = match &index_config_proxy.read().await.get().index_engine {
             IndexEngine::Memory(fields) => Index::create_in_ram(fields.clone()),
             IndexEngine::File(index_path) => Index::open_in_dir(index_path)?,
         };
         IndexHolder::setup(index_name, index, index_config_proxy).await
+    }
+
+    /// Compression
+    pub(crate) fn compression(&self) -> &proto::Compression {
+        &self.compression
+    }
+
+    /// Index name
+    pub(crate) fn index_config_proxy(&self) -> &IndexConfigProxy {
+        &self.index_config_proxy
     }
 
     /// Index name
@@ -177,10 +187,11 @@ impl IndexHolder {
     }
 
     /// Consumer configs
-    pub(crate) fn get_consumer_config(&self, consumer_name: &str) -> SummaResult<ConsumerConfig> {
+    pub(crate) async fn get_consumer_config(&self, consumer_name: &str) -> SummaResult<ConsumerConfig> {
         Ok(self
             .index_config_proxy
             .read()
+            .await
             .get()
             .consumer_configs
             .get(consumer_name)
@@ -209,7 +220,7 @@ impl IndexHolder {
             autocommit_thread.stop().await?;
         };
         self.index_updater.into_inner().into_inner().stop().await?;
-        match self.index_config_proxy.delete().index_engine {
+        match self.index_config_proxy.delete().await.index_engine {
             IndexEngine::Memory(_) => (),
             IndexEngine::File(ref index_path) => {
                 info!(action = "delete_directory");
@@ -251,20 +262,6 @@ impl IndexHolder {
 impl std::fmt::Debug for IndexHolder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("IndexHolder").field("index_name", &self.index_name).finish()
-    }
-}
-
-impl From<&IndexHolder> for proto::Index {
-    fn from(index_holder: &IndexHolder) -> Self {
-        let index_config_proxy = index_holder.index_config_proxy.read();
-        let compression = index_holder.compression.clone();
-        proto::Index {
-            index_aliases: index_config_proxy.application_config().get_index_aliases_for_index(&index_holder.index_name),
-            index_name: index_holder.index_name.to_owned(),
-            index_engine: format!("{:?}", index_config_proxy.get().index_engine),
-            num_docs: index_holder.index_reader().searcher().num_docs(),
-            compression: compression as i32,
-        }
     }
 }
 

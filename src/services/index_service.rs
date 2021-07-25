@@ -5,11 +5,11 @@ use crate::requests::{AlterIndexRequest, CreateConsumerRequest, CreateIndexReque
 use crate::search_engine::IndexHolder;
 use crate::utils::sync::{Handler, OwningHandler};
 use futures_util::future::join_all;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tantivy::IndexSettings;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::instrument;
 
 /// The main struct responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
@@ -24,17 +24,11 @@ pub struct IndexService {
 }
 
 #[derive(Default)]
-pub struct DeleteIndexResult {
-    pub deleted_index_aliases: Vec<String>,
-    pub deleted_index_consumers: Vec<String>,
-}
+pub struct DeleteIndexResult {}
 
 impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
-    fn from(delete_index_request: DeleteIndexResult) -> Self {
-        proto::DeleteIndexResponse {
-            deleted_index_aliases: delete_index_request.deleted_index_aliases,
-            deleted_index_consumers: delete_index_request.deleted_index_consumers,
-        }
+    fn from(_delete_index_request: DeleteIndexResult) -> Self {
+        proto::DeleteIndexResponse {}
     }
 }
 
@@ -51,32 +45,32 @@ impl IndexService {
     /// Create `IndexHolder`s from config
     pub(crate) async fn setup_index_holders(&self) -> SummaResult<()> {
         let mut index_holders = HashMap::new();
-        for index_name in self.application_config.read().indices.keys() {
+        for index_name in self.application_config.read().await.indices.keys() {
             index_holders.insert(
                 index_name.clone(),
                 OwningHandler::new(IndexHolder::open(index_name, IndexConfigProxy::new(&self.application_config, index_name)).await?),
             );
         }
-        *self.index_holders.write() = index_holders;
+        *self.index_holders_mut().await = index_holders;
         Ok(())
     }
 
     /// Read-locked `HashMap` of all indices
-    pub fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
-        self.index_holders.read()
+    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
+        self.index_holders.read().await
     }
 
     /// Write-locked `HashMap` of all indices
     ///
     /// Taking this lock means locking metadata modification
-    pub fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
-        self.index_holders.write()
+    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
+        self.index_holders.write().await
     }
 
-    fn get_index_holder_by_name(&self, index_name: &str) -> SummaResult<Handler<IndexHolder>> {
+    async fn get_index_holder_by_name(&self, index_name: &str) -> SummaResult<Handler<IndexHolder>> {
         Ok(self
-            .index_holders
-            .read()
+            .index_holders()
+            .await
             .get(index_name)
             .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_name.to_owned())))?
             .handler())
@@ -85,18 +79,20 @@ impl IndexService {
     ///
     /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
     /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
-    pub fn get_index_holder(&self, index_alias_or_name: &str) -> SummaResult<Handler<IndexHolder>> {
+    pub async fn get_index_holder(&self, index_alias_or_name: &str) -> SummaResult<Handler<IndexHolder>> {
         self.get_index_holder_by_name(
             self.application_config
                 .read()
+                .await
                 .resolve_index_alias(index_alias_or_name)
                 .as_deref()
                 .unwrap_or(index_alias_or_name),
         )
+        .await
     }
 
-    fn insert_config(&self, create_index_request: &CreateIndexRequest) -> SummaResult<()> {
-        let mut application_config = self.application_config.write();
+    async fn insert_config(&self, create_index_request: &CreateIndexRequest) -> SummaResult<()> {
+        let mut application_config = self.application_config.write().await;
         let mut index_config_builder = IndexConfigBuilder::default();
         index_config_builder
             .index_engine(match create_index_request.index_engine {
@@ -128,7 +124,7 @@ impl IndexService {
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<Handler<IndexHolder>> {
-        self.insert_config(&create_index_request)?;
+        self.insert_config(&create_index_request).await?;
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression,
             sort_by_field: create_index_request.sort_by_field.clone(),
@@ -144,14 +140,16 @@ impl IndexService {
             .await?,
         );
         let handler = owning_handler.handler();
-        self.index_holders.write().insert(create_index_request.index_name.to_owned(), owning_handler);
+        self.index_holders_mut()
+            .await
+            .insert(create_index_request.index_name.to_owned(), owning_handler);
         Ok(handler)
     }
 
     /// Alters index
     #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
     pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaResult<Handler<IndexHolder>> {
-        let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name)?;
+        let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name).await?;
         let index_updater = index_holder.index_updater();
         let mut index_updater = index_updater.write().await;
         if let Some(compression) = alter_index_request.compression {
@@ -167,52 +165,37 @@ impl IndexService {
         Ok(index_holder)
     }
 
-    async fn check_delete_conditions(&self, aliases: &[String], index_holder: &IndexHolder) -> SummaResult<()> {
-        if !aliases.is_empty() {
-            return Err(ValidationError::Aliased(aliases.join(", ")).into());
-        }
-        if index_holder.index_updater().read().await.has_consumers() {
-            return Err(ValidationError::ExistingConsumers(index_holder.index_name().to_owned()).into());
-        }
-        Ok(())
-    }
-
-    async fn prepare_delete(&self, delete_index_request: &DeleteIndexRequest, index_holder: &IndexHolder) -> SummaResult<DeleteIndexResult> {
-        let mut application_config = self.application_config.write();
-        let mut delete_index_result = DeleteIndexResult::default();
-        let aliases = application_config.get_index_aliases_for_index(&delete_index_request.index_name);
-
-        if delete_index_request.cascade {
-            let consumers = index_holder.index_updater().write().await.delete_all_consumers().await?;
-            delete_index_result.deleted_index_consumers.extend(consumers);
-
-            application_config.autosave().delete_index_aliases(&aliases);
-            delete_index_result.deleted_index_aliases.extend(aliases);
-        } else {
-            self.check_delete_conditions(&aliases, index_holder).await?;
-        }
-
-        Ok(delete_index_result)
-    }
-
     /// Delete index, optionally with all its aliases and consumers
     #[instrument(skip_all, fields(index_name = ?delete_index_request.index_name))]
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaResult<DeleteIndexResult> {
-        let mut index_holders = self.index_holders.write();
-        let index_holder_entry = match index_holders.entry(delete_index_request.index_name.to_owned()) {
-            Entry::Occupied(entry) => entry,
+        let application_config = self.application_config.write().await;
+
+        let index_holder = match self.index_holders_mut().await.entry(delete_index_request.index_name.to_owned()) {
+            Entry::Occupied(entry) => {
+                let index_holder = entry.get();
+                let aliases = application_config.get_index_aliases_for_index(&delete_index_request.index_name);
+                let consumer_names = index_holder.index_updater().read().await.consumer_names();
+
+                if !aliases.is_empty() {
+                    return Err(ValidationError::Aliased(aliases.join(", ")).into());
+                }
+                if !consumer_names.is_empty() {
+                    return Err(ValidationError::ExistingConsumers(consumer_names.join(", ")).into());
+                }
+                entry.remove()
+            }
             Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
         };
-        let delete_index_result = self.prepare_delete(&delete_index_request, index_holder_entry.get()).await?;
-        let index_holder = index_holder_entry.remove();
+
         let inner = tokio::task::spawn_blocking(move || index_holder.into_inner()).await?;
         inner.delete().await?;
-        Ok(delete_index_result)
+
+        Ok(DeleteIndexResult::default())
     }
 
     /// Returns all existent consumers for all indices
-    pub fn get_consumers(&self) -> SummaResult<Vec<(String, String)>> {
-        let application_config = self.application_config.read();
+    pub async fn get_consumers(&self) -> SummaResult<Vec<(String, String)>> {
+        let application_config = self.application_config.read().await;
         let mut result = Vec::new();
         for (index_name, index_config) in &application_config.indices {
             result.extend(
@@ -228,7 +211,7 @@ impl IndexService {
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?create_consumer_request.consumer_name))]
     pub async fn create_consumer(&self, create_consumer_request: &CreateConsumerRequest) -> SummaResult<String> {
-        let index_holder = self.get_index_holder(&create_consumer_request.index_alias)?;
+        let index_holder = self.get_index_holder(&create_consumer_request.index_alias).await?;
         index_holder
             .index_updater()
             .write()
@@ -241,7 +224,8 @@ impl IndexService {
     /// Delete consumer from the consumer registry and from `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?delete_consumer_request.consumer_name))]
     pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaResult<()> {
-        self.get_index_holder(&delete_consumer_request.index_alias)?
+        self.get_index_holder(&delete_consumer_request.index_alias)
+            .await?
             .index_updater()
             .write()
             .await
@@ -251,7 +235,7 @@ impl IndexService {
 
     /// Stopping index holders
     pub async fn stop(self) -> SummaResult<()> {
-        join_all(self.index_holders_mut().drain().map(|(_, index_holder)| index_holder.into_inner().stop()))
+        join_all(self.index_holders_mut().await.drain().map(|(_, index_holder)| index_holder.into_inner().stop()))
             .await
             .into_iter()
             .collect::<SummaResult<Vec<_>>>()?;
@@ -259,8 +243,8 @@ impl IndexService {
     }
 
     /// Returns `ConsumerConfig`
-    pub(crate) fn get_consumer_config(&self, index_alias: &str, consumer_name: &str) -> SummaResult<ConsumerConfig> {
-        self.get_index_holder(index_alias)?.get_consumer_config(consumer_name)
+    pub(crate) async fn get_consumer_config(&self, index_alias: &str, consumer_name: &str) -> SummaResult<ConsumerConfig> {
+        self.get_index_holder(index_alias).await?.get_consumer_config(consumer_name).await
     }
 }
 

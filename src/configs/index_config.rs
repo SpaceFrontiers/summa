@@ -2,13 +2,13 @@ use super::ConsumerConfig;
 use crate::configs::config_holder::AutosaveLockWriteGuard;
 use crate::configs::{ApplicationConfig, ApplicationConfigHolder, ConfigHolder, Persistable};
 use crate::errors::SummaResult;
-use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::PathBuf;
 use tantivy::schema::Schema as Fields;
+use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum IndexEngine {
@@ -70,22 +70,22 @@ impl IndexConfigProxy {
         }
     }
 
-    pub fn read(&self) -> IndexConfigReadProxy {
+    pub async fn read(&self) -> IndexConfigReadProxy {
         IndexConfigReadProxy {
-            application_config: self.application_config.read(),
+            application_config: self.application_config.read().await,
             index_name: self.index_name.to_owned(),
         }
     }
 
-    pub fn write(&self) -> IndexConfigWriteProxy {
+    pub async fn write(&self) -> IndexConfigWriteProxy {
         IndexConfigWriteProxy {
-            application_config: self.application_config.write(),
+            application_config: self.application_config.write().await,
             index_name: self.index_name.to_owned(),
         }
     }
 
-    pub fn delete(self) -> IndexConfig {
-        self.application_config.write().autosave().indices.remove(&self.index_name).unwrap()
+    pub async fn delete(self) -> IndexConfig {
+        self.application_config.write().await.autosave().indices.remove(&self.index_name).unwrap()
     }
 }
 

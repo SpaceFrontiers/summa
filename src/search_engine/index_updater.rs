@@ -44,8 +44,8 @@ pub(crate) struct IndexUpdater {
 
 impl IndexUpdater {
     /// Creates new `IndexUpdater`
-    pub(super) fn new(index: Index, index_name: &str, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexUpdater> {
-        let index_config = index_config_proxy.read().get().clone();
+    pub(super) async fn new(index: Index, index_name: &str, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexUpdater> {
+        let index_config = index_config_proxy.read().await.get().clone();
         let index_writer_holder = Arc::new(IndexWriterHolder::new(
             index.writer_with_num_threads(
                 index_config.writer_threads.try_into().unwrap(),
@@ -58,6 +58,7 @@ impl IndexUpdater {
         )?);
         let consumers = index_config_proxy
             .read()
+            .await
             .get()
             .consumer_configs
             .iter()
@@ -71,7 +72,7 @@ impl IndexUpdater {
             index_name: index_name.to_owned(),
             index_writer_holder,
         };
-        inner_index_updater.start_consumers()?;
+        inner_index_updater.start_consumers().await?;
         Ok(inner_index_updater)
     }
 
@@ -94,20 +95,20 @@ impl IndexUpdater {
     }
 
     /// Starts all consumers
-    fn start_consumers(&mut self) -> SummaResult<()> {
+    async fn start_consumers(&mut self) -> SummaResult<()> {
         for consumer in &self.consumers {
             let index_writer_holder = self.index_writer_holder.clone();
             let fields = self.index.schema();
-            consumer.start(move |message| process_message(&fields, &index_writer_holder, message))?;
+            consumer.start(move |message| process_message(&fields, &index_writer_holder, message)).await?;
         }
         Ok(())
     }
 
     /// Add consumer and starts it
-    pub(super) fn attach_consumer(&mut self, consumer: Consumer) -> SummaResult<()> {
+    pub(super) async fn attach_consumer(&mut self, consumer: Consumer) -> SummaResult<()> {
         let index_writer_holder = self.index_writer_holder.clone();
         let fields = self.index.schema();
-        consumer.start(move |message| process_message(&fields, &index_writer_holder, message))?;
+        consumer.start(move |message| process_message(&fields, &index_writer_holder, message)).await?;
         self.consumers.push(consumer);
         Ok(())
     }
@@ -119,6 +120,7 @@ impl IndexUpdater {
             match self
                 .index_config_proxy
                 .write()
+                .await
                 .autosave()
                 .get_mut()
                 .consumer_configs
@@ -133,7 +135,7 @@ impl IndexUpdater {
         }
         let consumer = Consumer::new(consumer_name, consumer_config)?;
         consumer.on_create().await?;
-        self.attach_consumer(consumer)?;
+        self.attach_consumer(consumer).await?;
         Ok(())
     }
 
@@ -153,13 +155,14 @@ impl IndexUpdater {
         self.commit_offsets().await?;
         self.index_config_proxy
             .write()
+            .await
             .autosave()
             .get_mut()
             .consumer_configs
             .remove(consumer_name)
             .ok_or_else(|| ValidationError::MissingConsumer(consumer_name.to_owned()))?;
         self.inner_delete_consumer(consumer_name).await?;
-        self.start_consumers()?;
+        self.start_consumers().await?;
         Ok(())
     }
 
@@ -176,9 +179,9 @@ impl IndexUpdater {
         Ok(deleted_consumers_names)
     }
 
-    /// Check if any consumers for the `IndexUpdater` exists
-    pub(crate) fn has_consumers(&self) -> bool {
-        !self.consumers.is_empty()
+    /// Return consumer names
+    pub(crate) fn consumer_names(&self) -> Vec<String> {
+        self.consumers.iter().map(|x| x.consumer_name().to_owned()).collect()
     }
 
     /// Delete `SummaDocument` by `primary_key`
@@ -214,7 +217,7 @@ impl IndexUpdater {
     pub(crate) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<SegmentMeta> {
         let index_writer_holder = self.stop_consumers().await?;
         let segment_meta = index_writer_holder.merge(segment_ids).await?;
-        self.start_consumers()?;
+        self.start_consumers().await?;
         Ok(segment_meta)
     }
 
@@ -233,7 +236,7 @@ impl IndexUpdater {
     pub(crate) async fn commit(&mut self) -> SummaResult<Opstamp> {
         let opstamp = self.stop_consumers().await?.commit().await?;
         self.commit_offsets().await?;
-        self.start_consumers()?;
+        self.start_consumers().await?;
         Ok(opstamp)
     }
 
@@ -251,7 +254,7 @@ impl IndexUpdater {
         index_writer_holder.commit().await?;
 
         self.commit_offsets().await?;
-        self.start_consumers()?;
+        self.start_consumers().await?;
         Ok(())
     }
 

@@ -11,8 +11,6 @@ use clap::{arg, command};
 use futures::try_join;
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::runtime;
 
 pub struct Application {
     config: ApplicationConfigHolder,
@@ -35,7 +33,7 @@ impl Application {
         Application { config }
     }
 
-    pub fn proceed_args() -> SummaResult<()> {
+    pub async fn proceed_args() -> SummaResult<()> {
         let matches = command!()
             .name("summa")
             .override_usage("summa-server [OPTIONS] <SUBCOMMAND>")
@@ -93,7 +91,7 @@ impl Application {
                 let config_path = submatches.value_of("CONFIG").map(Path::new).unwrap();
                 let application_config_holder = ApplicationConfigHolder::from_path(config_path)?;
                 let _guards = {
-                    let application_config = application_config_holder.read();
+                    let application_config = application_config_holder.read().await;
                     if application_config.debug {
                         logging::default()
                     } else {
@@ -101,28 +99,17 @@ impl Application {
                     }
                 };
                 let app = Application::from_application_config_holder(application_config_holder);
-                app.run()
+                app.run().await
             }
             _ => unreachable!("Exhausted list of subcommands and subcommand_required prevents `None`"),
         }
     }
 
-    pub fn create_runtime(&self) -> SummaResult<runtime::Runtime> {
-        Ok(runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name_fn(|| {
-                static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
-                let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
-                format!("tokio-runtime-workers-{}", id)
-            })
-            .build()?)
-    }
-
-    pub fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
-        let metrics_server_future = MetricsServer::new(&self.config)?.start(terminator.clone())?;
+    pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
+        let metrics_server_future = MetricsServer::new(&self.config)?.start(terminator.clone()).await?;
 
         let index_service = IndexService::new(&self.config);
-        let grpc_server_future = GrpcServer::new(&self.config, &index_service)?.start(terminator.clone())?;
+        let grpc_server_future = GrpcServer::new(&self.config, &index_service)?.start(terminator.clone()).await?;
 
         Ok(async move {
             index_service.setup_index_holders().await?;
@@ -132,13 +119,10 @@ impl Application {
         })
     }
 
-    fn run(&self) -> SummaResult<()> {
-        let runtime = self.create_runtime()?;
-        runtime.block_on(async move {
-            let receiver = signal_channel();
-            let server = self.serve(&receiver)?;
-            server.await
-        })
+    async fn run(&self) -> SummaResult<()> {
+        let receiver = signal_channel();
+        let server = self.serve(&receiver).await?;
+        server.await
     }
 }
 
@@ -160,10 +144,10 @@ mod tests {
 
     async fn create_client_server(root_path: &Path) -> SummaResult<(ThreadHandler, IndexApiClient<Channel>)> {
         let config_holder = ApplicationConfigHolder::from_path_or(root_path.join("summa.yaml"), || create_test_application_config(&root_path.join("data")))?;
-        let grpc_endpoint = config_holder.read().grpc.endpoint.clone();
+        let grpc_endpoint = config_holder.read().await.grpc.endpoint.clone();
         let (server_terminator, receiver) = broadcast::<ControlMessage>(1);
         let thread_handler = ThreadHandler::new(
-            tokio::spawn(Application::from_application_config_holder(config_holder).serve(&receiver)?),
+            tokio::spawn(Application::from_application_config_holder(config_holder).serve(&receiver).await?),
             server_terminator,
         );
         let client = create_index_api_client(&format!("http://{}", &grpc_endpoint)).await;

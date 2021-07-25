@@ -140,9 +140,9 @@ def test_unknown_language_transformer():
     processed_query = query_processor.process('search engine', 'zz')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.65'}}},
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.65'}}}
+        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}}}}
     ]}}
 
 
@@ -181,7 +181,7 @@ def test_doi_transformer():
     assert processed_query.to_summa_query() == {'boost': {'query': {'term': {
         'field': 'doi',
         'value': '10.1101/2022.05.26.493559',
-    }}, 'score': '1.0'}}
+    }}, 'score': '1'}}
     processed_query = query_processor.process('https://google.com/?query=one+two+three', 'en')
     assert processed_query.to_summa_query() == {'match': {'value': 'https://google.com/?query=one+two+three'}}
     processed_query = query_processor.process('https://doi.org/10.1101', 'en')

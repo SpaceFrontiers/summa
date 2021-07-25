@@ -62,7 +62,7 @@ impl GrpcServer {
 
     /// Starts all nested services and start serving requests
     #[instrument("lifecycle", skip_all)]
-    pub fn start(self, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
+    pub async fn start(self, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
         let consumer_api = ConsumerApiImpl::new(&self.index_service)?;
         let index_api = IndexApiImpl::new(&self.application_config, &self.index_service)?;
         let reflection_api = ReflectionApiImpl::new(&self.index_service)?;
@@ -72,7 +72,7 @@ impl GrpcServer {
             .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
             .build()
             .unwrap();
-        let grpc_config = self.application_config.read().grpc.clone();
+        let grpc_config = self.application_config.read().await.grpc.clone();
 
         let layer = ServiceBuilder::new()
             .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("request-id"), |_: &_| {

@@ -247,7 +247,6 @@ class SummaClient(BaseGrpcClient):
     async def delete_index(
         self,
         index_name: str,
-        cascade: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.DeleteIndexResponse:
@@ -256,12 +255,11 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            cascade: if set then delete both consumers and aliases too
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].delete_index(
-            index_service_pb.DeleteIndexRequest(index_name=index_name, cascade=cascade),
+            index_service_pb.DeleteIndexRequest(index_name=index_name),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 

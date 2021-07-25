@@ -5,7 +5,7 @@
 use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaResult;
 use crate::proto;
-use crate::search_engine::SummaDocument;
+use crate::search_engine::{IndexHolder, SummaDocument};
 use crate::services::IndexService;
 use std::error::Error;
 use std::io::ErrorKind;
@@ -32,6 +32,17 @@ impl IndexApiImpl {
     }
 }
 
+async fn cast(index_holder: &IndexHolder) -> proto::Index {
+    let index_config_proxy = index_holder.index_config_proxy().read().await;
+    proto::Index {
+        index_aliases: index_config_proxy.application_config().get_index_aliases_for_index(index_holder.index_name()),
+        index_name: index_holder.index_name().to_owned(),
+        index_engine: format!("{:?}", index_config_proxy.get().index_engine),
+        num_docs: index_holder.index_reader().searcher().num_docs(),
+        compression: *index_holder.compression() as i32,
+    }
+}
+
 fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
     let mut err: &(dyn Error + 'static) = err_status;
 
@@ -51,7 +62,7 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn commit_index(&self, request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let request = request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&request.index_alias)?;
+        let index_holder = self.index_service.get_index_holder(&request.index_alias).await?;
         let index_updater = index_holder.index_updater();
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
@@ -87,7 +98,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let request = request.into_inner();
         let opstamp = self
             .index_service
-            .get_index_holder(&request.index_alias)?
+            .get_index_holder(&request.index_alias)
+            .await?
             .index_updater()
             .read()
             .await
@@ -100,7 +112,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let request = request.into_inner();
         let opstamp = self
             .index_service
-            .get_index_holder(&request.index_alias)?
+            .get_index_holder(&request.index_alias)
+            .await?
             .index_updater()
             .read()
             .await
@@ -122,7 +135,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                     let now = Instant::now();
                     let (success_bulk_docs, failed_bulk_docs) = self
                         .index_service
-                        .get_index_holder(&chunk.index_alias)?
+                        .get_index_holder(&chunk.index_alias)
+                        .await?
                         .index_updater()
                         .read()
                         .await
@@ -152,7 +166,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let alter_index_request = proto_request.into_inner().try_into()?;
         let index_holder = self.index_service.alter_index(alter_index_request).await?;
         let response = proto::AlterIndexResponse {
-            index: Some(index_holder.deref().into()),
+            index: Some(cast(index_holder.deref()).await),
         };
         Ok(Response::new(response))
     }
@@ -161,7 +175,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let create_index_request = proto_request.into_inner().try_into()?;
         let index_holder = self.index_service.create_index(create_index_request).await?;
         let response = proto::CreateIndexResponse {
-            index: Some(index_holder.deref().into()),
+            index: Some(cast(index_holder.deref()).await),
         };
         Ok(Response::new(response))
     }
@@ -172,30 +186,28 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
         Ok(Response::new(proto::GetIndexResponse {
-            index: Some(self.index_service.get_index_holder(&proto_request.into_inner().index_alias)?.deref().into()),
+            index: Some(cast(self.index_service.get_index_holder(&proto_request.into_inner().index_alias).await?.deref()).await),
         }))
     }
 
     async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
-        Ok(Response::new(proto::GetIndicesResponse {
-            indices: self
-                .index_service
-                .index_holders()
-                .values()
-                .map(|index_holder| index_holder.deref().into())
-                .collect(),
-        }))
+        let index_holders = self.index_service.index_holders().await;
+        let mut indices = Vec::with_capacity(index_holders.len());
+        for index_holder in index_holders.values() {
+            indices.push(cast(index_holder).await)
+        }
+        Ok(Response::new(proto::GetIndicesResponse { indices }))
     }
 
     async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {
         Ok(Response::new(proto::GetIndicesAliasesResponse {
-            indices_aliases: self.application_config.read().aliases.clone(),
+            indices_aliases: self.application_config.read().await.aliases.clone(),
         }))
     }
 
     async fn merge_segments(&self, proto_request: Request<proto::MergeSegmentsRequest>) -> Result<Response<proto::MergeSegmentsResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias)?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         tokio::spawn(async move {
             let index_name = index_holder.index_name();
             let segment_ids: Vec<_> = proto_request.segment_ids.iter().map(|x| SegmentId::from_uuid_string(x).unwrap()).collect();
@@ -217,6 +229,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let old_index_name = self
             .application_config
             .write()
+            .await
             .autosave()
             .set_index_alias(&proto_request.index_alias, &proto_request.index_name)?;
         let response = proto::SetIndexAliasResponse { old_index_name };
@@ -225,7 +238,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn vacuum_index(&self, proto_request: Request<proto::VacuumIndexRequest>) -> Result<Response<proto::VacuumIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias)?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         tokio::spawn(async move {
             let index_name = index_holder.index_name();
             index_holder

@@ -33,7 +33,7 @@ class TantivyTreeTransformer(TreeTransformer):
         return node, False
 
     def visit_plus(self, node, context, parents=None):
-        if isinstance(node.a, BaseGroup):
+        if isinstance(node.a, Group):
             op = node.a
             new_operands = []
             for operand in op.operands:

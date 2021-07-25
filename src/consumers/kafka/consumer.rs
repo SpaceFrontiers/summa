@@ -60,13 +60,13 @@ impl Consumer {
         &self.consumer_name
     }
 
-    pub fn start<TProcessor>(&self, processor: TProcessor) -> SummaResult<()>
+    pub async fn start<TProcessor>(&self, processor: TProcessor) -> SummaResult<()>
     where
         TProcessor: 'static + Fn(Result<BorrowedMessage<'_>, KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> + Send + Sync + Clone,
     {
         for thread_controller in self.consumer_threads.iter() {
             let processor = processor.clone();
-            thread_controller.start(processor);
+            thread_controller.start(processor).await;
         }
         Ok(())
     }

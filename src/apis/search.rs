@@ -27,7 +27,7 @@ impl SearchApiImpl {
 impl proto::search_api_server::SearchApi for SearchApiImpl {
     async fn search(&self, proto_request: Request<proto::SearchRequest>) -> Result<Response<proto::SearchResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias)?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
 
         let query = proto_request.query.unwrap_or(proto::Query {
             query: Some(proto::query::Query::All(proto::AllQuery {})),

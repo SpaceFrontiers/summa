@@ -67,8 +67,8 @@ impl MetricsServer {
     }
 
     #[instrument("lifecycle", skip_all)]
-    pub fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
-        let metrics_config = self.application_config.read().metrics.clone();
+    pub async fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
+        let metrics_config = self.application_config.read().await.metrics.clone();
         let state = Arc::new(AppState {
             exporter: self.exporter.clone(),
         });
