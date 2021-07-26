@@ -27,7 +27,6 @@ class DoiTreeTransformer(TreeTransformer):
     def visit_doi(self, node, context, parents):
         if parents is None or len(parents) == 0 or isinstance(parents[-1], Group):
             context.dois.append(node.value)
-            context.is_exploration = False
             return Boost(SearchField('doi', node), score=self.score), True
         return node, False
 
@@ -36,7 +35,6 @@ class DoiTreeTransformer(TreeTransformer):
             if parents is None or len(parents) == 0 or isinstance(parents[-1], Group):
                 doi = (match[1] + '/' + match[2]).lower()
                 context.dois.append(doi)
-                context.is_exploration = False
                 return Boost(SearchField('doi', Doi(doi)), score=self.score), True
         return node, False
 
@@ -48,9 +46,7 @@ class DoiWildcardWordTreeTransformer(ValuePredicateWordTreeTransformer):
     def transform(self, node, context, parents, predicate_result):
         doi_prefix = predicate_result[0].lower()
         if parents is None or len(parents) == 0 or isinstance(parents[-1], Group):
-            context.is_exploration = False
             return Plus(SearchField('doi', Regex(doi_prefix)))
         if isinstance(parents[-1], (Plus, Minus)):
-            context.is_exploration = False
             return SearchField('doi', Regex(doi_prefix))
         return node

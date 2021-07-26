@@ -16,7 +16,6 @@ class FieldTreeTransformer(TreeTransformer):
             node.name = self.field_aliases[node.name]
 
         if node.name in self.valid_fields:
-            context.is_exploration = False
             return node, False
 
         return Group(Word(node.name), node.expr), False

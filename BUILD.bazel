@@ -2,7 +2,7 @@ load("@crate_index//:defs.bzl", "aliases", "all_crate_deps")
 load("@io_bazel_rules_docker//container:container.bzl", "container_image", "container_push")
 load("@io_bazel_rules_docker//rust:image.bzl", "rust_image")
 load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -34,13 +34,6 @@ rust_library(
     version = "0.9.0",
 )
 
-rust_binary(
-    name = "summa-server",
-    srcs = glob(["src/bin/**/*.rs"]),
-    edition = "2021",
-    deps = ["@crate_index//:tokio", ":summa"],
-)
-
 rust_test(
     name = "test",
     crate = ":summa",
@@ -52,7 +45,7 @@ rust_image(
     srcs = glob(["src/bin/**/*.rs"]),
     base = "@izihawa-base-image//image",
     edition = "2021",
-    deps = [":summa"],
+    deps = ["@crate_index//:tokio", ":summa"],
 )
 
 container_push(

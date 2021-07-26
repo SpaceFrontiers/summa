@@ -123,8 +123,10 @@ impl QueryParser {
                     .iter()
                     .map(|disjunct| self.parse_subquery(disjunct))
                     .collect::<SummaResult<Vec<_>>>()?,
-                f32::from_str(&disjunction_max_proto.tie_breaker)
-                    .map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", disjunction_max_proto.tie_breaker)))?,
+                match disjunction_max_proto.tie_breaker.as_str() {
+                    "" => 0.0,
+                    s => f32::from_str(s).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", disjunction_max_proto.tie_breaker)))?,
+                },
             )),
             Some(proto::query::Query::Match(match_query_proto)) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
                 Ok(parsed_query) => Ok(parsed_query),

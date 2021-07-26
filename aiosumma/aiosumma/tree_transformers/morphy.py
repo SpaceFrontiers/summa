@@ -1,4 +1,4 @@
-from typing import Union, Callable
+from typing import Callable, Optional, Union
 from izihawa_nlptools.morph import EnglishMorphology, RussianMorphology
 
 from ..parser.elements import (
@@ -7,10 +7,6 @@ from ..parser.elements import (
     Word,
 )
 from .base import TreeTransformer
-
-
-def default_score(word, all_words):
-    return "{:.3f}".format(1 / len(all_words))
 
 
 class MorphyTreeTransformer(TreeTransformer):
@@ -22,7 +18,7 @@ class MorphyTreeTransformer(TreeTransformer):
         'ru': RussianMorphology()
     }
 
-    def __init__(self, enable_morph=True, enable_accent=True, score: Union[str, Callable] = default_score, ignore_nodes=None):
+    def __init__(self, enable_morph=True, enable_accent=True, score: Optional[Union[str, Callable]] = None, ignore_nodes=None):
         super().__init__(ignore_nodes=ignore_nodes)
         self.enable_morph = enable_morph
         self.enable_accent = enable_accent
@@ -44,9 +40,11 @@ class MorphyTreeTransformer(TreeTransformer):
 
         forms = [node]
         for syn_form in syn_forms:
-            if callable(self.score):
+            if self.score is None:
+                forms.append(syn_form)
+            elif callable(self.score):
                 forms.append(Boost(syn_form, score=self.score(syn_form, syn_forms)))
-            else:
+            elif isinstance(self.score, str):
                 forms.append(Boost(syn_form, score=self.score))
 
         return SynonymsGroup(*forms), True

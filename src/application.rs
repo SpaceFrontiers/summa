@@ -1,7 +1,6 @@
 use crate::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, MetricsConfigBuilder};
 use crate::errors::SummaResult;
 use crate::logging;
-use crate::metrics::register_meter;
 use crate::servers::{GrpcServer, MetricsServer};
 use crate::services::IndexService;
 use crate::utils::signal_channel::signal_channel;
@@ -106,14 +105,12 @@ impl Application {
     }
 
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
-        let metrics_server_future = MetricsServer::new(&self.config)?.start(terminator.clone()).await?;
-
         let index_service = IndexService::new(&self.config);
+        let metrics_server_future = MetricsServer::new(&self.config)?.start(&index_service, terminator.clone()).await?;
         let grpc_server_future = GrpcServer::new(&self.config, &index_service)?.start(terminator.clone()).await?;
 
         Ok(async move {
             index_service.setup_index_holders().await?;
-            register_meter(&index_service);
             try_join!(metrics_server_future, grpc_server_future)?;
             Ok(())
         })

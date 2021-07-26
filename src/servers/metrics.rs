@@ -3,6 +3,8 @@
 use super::base::BaseServer;
 use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaResult;
+use crate::search_engine::IndexMeter;
+use crate::services::IndexService;
 use crate::utils::thread_handler::ControlMessage;
 use async_broadcast::Receiver;
 use hyper::{
@@ -21,6 +23,7 @@ lazy_static! {
     static ref EMPTY_HEADER_VALUE: HeaderValue = HeaderValue::from_static("");
 }
 
+#[derive(Clone)]
 pub struct MetricsServer {
     application_config: ApplicationConfigHolder,
     exporter: PrometheusExporter,
@@ -30,6 +33,8 @@ impl BaseServer for MetricsServer {}
 
 struct AppState {
     exporter: PrometheusExporter,
+    index_service: IndexService,
+    index_meter: IndexMeter,
 }
 
 impl MetricsServer {
@@ -51,6 +56,10 @@ impl MetricsServer {
         info!(path = ?request.uri().path());
         let response = match request.method() {
             &Method::GET => {
+                for index_holder in state.index_service.index_holders().await.values() {
+                    state.index_meter.record_metrics(index_holder)
+                }
+
                 let mut buffer = vec![];
                 let encoder = TextEncoder::new();
                 let metric_families = state.exporter.registry().gather();
@@ -67,10 +76,12 @@ impl MetricsServer {
     }
 
     #[instrument("lifecycle", skip_all)]
-    pub async fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
+    pub async fn start(&self, index_service: &IndexService, mut terminator: Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
         let metrics_config = self.application_config.read().await.metrics.clone();
         let state = Arc::new(AppState {
             exporter: self.exporter.clone(),
+            index_service: index_service.clone(),
+            index_meter: IndexMeter::new(),
         });
         let service = make_service_fn(move |_conn| {
             let state = state.clone();

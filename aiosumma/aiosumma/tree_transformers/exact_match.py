@@ -50,8 +50,8 @@ class ExactMatchTreeTransformer(TreeTransformer):
         if callable(score):
             score = score(node, context)
         if self.default_phrase_field:
-            new_operands.append(Boost(SearchField(self.default_phrase_field, Proximity(Phrase(phrase), slop=3)), score))
+            new_operands.append(Boost(SearchField(self.default_phrase_field, Proximity(Phrase(phrase), slop=1)), score))
         else:
-            new_operands.append(Boost(Proximity(Phrase(phrase), slop=3), score))
+            new_operands.append(Boost(Proximity(Phrase(phrase), slop=1), score))
         node.operands = new_operands
         return node, False

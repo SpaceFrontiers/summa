@@ -1,4 +1,4 @@
-from ..parser.elements import BaseGroup
+from ..parser.elements import Group
 from .base import TreeTransformer
 
 
@@ -6,13 +6,13 @@ class OptimizingTreeTransformer(TreeTransformer):
     """
     Removes redundant groups
     """
-    def visit_base_group(self, node, context, parents=None):
+    def visit_group(self, node, context, parents=None):
         merged_new_group = True
         while merged_new_group:
             new_operands = []
             merged_new_group = False
             for operand in node.operands:
-                if isinstance(operand, BaseGroup):
+                if isinstance(operand, Group):
                     merged_new_group = True
                     new_operands.extend(operand.operands)
                 else:

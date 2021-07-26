@@ -48,7 +48,6 @@ impl proto::reflection_api_server::ReflectionApi for ReflectionApiImpl {
                 }
             }
 
-            print!("{:?}", top_k_heap);
             per_segment.insert(
                 segment_reader.segment_id().short_uuid_string(),
                 proto::SegmentTerms {
