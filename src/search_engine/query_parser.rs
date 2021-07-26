@@ -6,7 +6,9 @@ use opentelemetry::{global, KeyValue};
 use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
-use tantivy::query::{AllQuery, BooleanQuery, BoostQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery};
+use tantivy::query::{
+    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
+};
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema as Fields};
 use tantivy::{DateTime, Index, Term};
 
@@ -42,7 +44,7 @@ fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> Summ
         ),
         FieldType::Date(_) => Term::from_field_date(
             field,
-            DateTime::from_unix_timestamp(i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as date", value)))?),
+            DateTime::from_timestamp_secs(i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as date", value)))?),
         ),
         _ => return Err(Error::InvalidSyntax("invalid range type".to_owned())),
     })
@@ -101,9 +103,9 @@ impl QueryParser {
         );
         Ok(match &query.query {
             None | Some(proto::query::Query::All(_)) => Box::new(AllQuery),
-            Some(proto::query::Query::Boolean(boolean_query)) => {
+            Some(proto::query::Query::Boolean(boolean_query_proto)) => {
                 let mut subqueries = vec![];
-                for subquery in &boolean_query.subqueries {
+                for subquery in &boolean_query_proto.subqueries {
                     subqueries.push((
                         match proto::Occur::from_i32(subquery.occur) {
                             None | Some(proto::Occur::Should) => Occur::Should,
@@ -115,6 +117,15 @@ impl QueryParser {
                 }
                 Box::new(BooleanQuery::new(subqueries))
             }
+            Some(proto::query::Query::DisjunctionMax(disjunction_max_proto)) => Box::new(DisjunctionMaxQuery::with_tie_breaker(
+                disjunction_max_proto
+                    .disjuncts
+                    .iter()
+                    .map(|disjunct| self.parse_subquery(disjunct))
+                    .collect::<SummaResult<Vec<_>>>()?,
+                f32::from_str(&disjunction_max_proto.tie_breaker)
+                    .map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", disjunction_max_proto.tie_breaker)))?,
+            )),
             Some(proto::query::Query::Match(match_query_proto)) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
                 Ok(parsed_query) => Ok(parsed_query),
                 Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::FieldDoesNotExist(field)),

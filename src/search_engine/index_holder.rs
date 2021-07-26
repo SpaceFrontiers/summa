@@ -143,6 +143,7 @@ impl IndexHolder {
                 }
             }
         };
+        info!(action = "created", index = ?index);
         IndexHolder::setup(index_name, index, index_config_proxy).await
     }
 

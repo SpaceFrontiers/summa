@@ -168,28 +168,28 @@ impl IndexService {
     /// Delete index, optionally with all its aliases and consumers
     #[instrument(skip_all, fields(index_name = ?delete_index_request.index_name))]
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaResult<DeleteIndexResult> {
-        let application_config = self.application_config.write().await;
+        let index_holder = {
+            let application_config = self.application_config.write().await;
+            match self.index_holders_mut().await.entry(delete_index_request.index_name.to_owned()) {
+                Entry::Occupied(entry) => {
+                    let index_holder = entry.get();
+                    let aliases = application_config.get_index_aliases_for_index(&delete_index_request.index_name);
+                    let consumer_names = index_holder.index_updater().read().await.consumer_names();
 
-        let index_holder = match self.index_holders_mut().await.entry(delete_index_request.index_name.to_owned()) {
-            Entry::Occupied(entry) => {
-                let index_holder = entry.get();
-                let aliases = application_config.get_index_aliases_for_index(&delete_index_request.index_name);
-                let consumer_names = index_holder.index_updater().read().await.consumer_names();
-
-                if !aliases.is_empty() {
-                    return Err(ValidationError::Aliased(aliases.join(", ")).into());
+                    if !aliases.is_empty() {
+                        return Err(ValidationError::Aliased(aliases.join(", ")).into());
+                    }
+                    if !consumer_names.is_empty() {
+                        return Err(ValidationError::ExistingConsumers(consumer_names.join(", ")).into());
+                    }
+                    entry.remove()
                 }
-                if !consumer_names.is_empty() {
-                    return Err(ValidationError::ExistingConsumers(consumer_names.join(", ")).into());
-                }
-                entry.remove()
+                Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
             }
-            Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
         };
 
         let inner = tokio::task::spawn_blocking(move || index_holder.into_inner()).await?;
         inner.delete().await?;
-
         Ok(DeleteIndexResult::default())
     }
 

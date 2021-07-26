@@ -128,7 +128,15 @@ class Group(BaseGroup):
 
 
 class SynonymsGroup(BaseGroup):
-    pass
+    def to_summa_query(self):
+        disjuncts = []
+        if not self.operands:
+            return {'all': {}}
+        for operand in self.operands:
+            query = operand.to_summa_query()
+            if query:
+                disjuncts.append(query)
+        return {'disjunction_max': {'disjuncts': disjuncts}}
 
 
 class Range(Item):

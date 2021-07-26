@@ -1,5 +1,5 @@
 use crate::proto;
-use tantivy::store::Compressor;
+use tantivy::store::{Compressor, ZstdCompressor};
 
 impl From<proto::Compression> for Compressor {
     fn from(compression: proto::Compression) -> Self {
@@ -8,7 +8,7 @@ impl From<proto::Compression> for Compressor {
             proto::Compression::Brotli => Compressor::Brotli,
             proto::Compression::Lz4 => Compressor::Lz4,
             proto::Compression::Snappy => Compressor::Snappy,
-            proto::Compression::Zstd => Compressor::Zstd,
+            proto::Compression::Zstd => Compressor::Zstd(ZstdCompressor { compression_level: None }),
         }
     }
 }
@@ -20,7 +20,7 @@ impl From<Compressor> for proto::Compression {
             Compressor::Brotli => proto::Compression::Brotli,
             Compressor::Lz4 => proto::Compression::Lz4,
             Compressor::Snappy => proto::Compression::Snappy,
-            Compressor::Zstd => proto::Compression::Zstd,
+            Compressor::Zstd(_) => proto::Compression::Zstd,
         }
     }
 }

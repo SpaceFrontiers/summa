@@ -1,7 +1,7 @@
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use tantivy::aggregation::agg_req::{Aggregation, BucketAggregation, BucketAggregationType, MetricAggregation, RangeAggregation};
-use tantivy::aggregation::agg_result::{AggregationResult, BucketEntry, BucketResult, MetricResult, RangeBucketEntry};
+use tantivy::aggregation::agg_result::{AggregationResult, BucketEntries, BucketEntry, BucketResult, MetricResult, RangeBucketEntry};
 use tantivy::aggregation::bucket::{CustomOrder, HistogramAggregation, HistogramBounds, Order, OrderTarget, RangeAggregationRange, TermsAggregation};
 use tantivy::aggregation::metric::{AverageAggregation, StatsAggregation};
 use tantivy::aggregation::Key;
@@ -36,6 +36,7 @@ impl TryFrom<proto::aggregation::Aggregation> for Aggregation {
                             min: extended_bounds.min,
                             max: extended_bounds.max,
                         }),
+                        keyed: false,
                     }),
                     Some(proto::bucket_aggregation::BucketAgg::Range(range_aggregation)) => BucketAggregationType::Range(RangeAggregation {
                         field: range_aggregation.field,
@@ -47,6 +48,7 @@ impl TryFrom<proto::aggregation::Aggregation> for Aggregation {
                                 to: range.to,
                             })
                             .collect(),
+                        keyed: false,
                     }),
                     Some(proto::bucket_aggregation::BucketAgg::Terms(terms_aggregation)) => BucketAggregationType::Terms(TermsAggregation {
                         field: terms_aggregation.field,
@@ -95,10 +97,16 @@ impl From<AggregationResult> for proto::AggregationResult {
                 AggregationResult::BucketResult(bucket_result) => proto::aggregation_result::AggregationResult::Bucket(proto::BucketResult {
                     bucket_result: Some(match bucket_result {
                         BucketResult::Range { buckets } => proto::bucket_result::BucketResult::Range(proto::RangeResult {
-                            buckets: buckets.into_iter().map(|bucket| bucket.into()).collect(),
+                            buckets: match buckets {
+                                BucketEntries::Vec(vec) => vec.into_iter().map(|bucket| bucket.into()).collect(),
+                                BucketEntries::HashMap(hm) => hm.into_iter().map(|bucket| bucket.1.into()).collect(),
+                            },
                         }),
                         BucketResult::Histogram { buckets } => proto::bucket_result::BucketResult::Histogram(proto::HistogramResult {
-                            buckets: buckets.into_iter().map(|bucket| bucket.into()).collect(),
+                            buckets: match buckets {
+                                BucketEntries::Vec(vec) => vec.into_iter().map(|bucket| bucket.into()).collect(),
+                                BucketEntries::HashMap(hm) => hm.into_iter().map(|bucket| bucket.1.into()).collect(),
+                            },
                         }),
                         BucketResult::Terms {
                             buckets,

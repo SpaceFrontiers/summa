@@ -66,6 +66,10 @@ impl<'a> SummaDocument<'a> {
                     expected: "an integer",
                     json: JsonValue::String(field_text),
                 }),
+                FieldType::Bool(_) => Err(ValueParsingError::TypeError {
+                    expected: "a boolean",
+                    json: JsonValue::String(field_text),
+                }),
                 FieldType::Facet(_) => Ok(Value::Facet(Facet::from(&field_text))),
                 FieldType::Bytes(_) => base64::decode(&field_text)
                     .map(Value::Bytes)
@@ -106,6 +110,10 @@ impl<'a> SummaDocument<'a> {
                         })
                     }
                 }
+                FieldType::Bool(_) => Err(ValueParsingError::TypeError {
+                    expected: "a boolean",
+                    json: JsonValue::Number(field_val_num),
+                }),
                 FieldType::Str(_) | FieldType::Facet(_) | FieldType::Bytes(_) => Err(ValueParsingError::TypeError {
                     expected: "a string",
                     json: JsonValue::Number(field_val_num),
@@ -130,6 +138,13 @@ impl<'a> SummaDocument<'a> {
                 _ => Err(ValueParsingError::TypeError {
                     expected: field_type.value_type().name(),
                     json: JsonValue::Object(json_map),
+                }),
+            },
+            JsonValue::Bool(json_bool_val) => match field_type {
+                FieldType::Bool(_) => Ok(Value::Bool(json_bool_val)),
+                _ => Err(ValueParsingError::TypeError {
+                    expected: field_type.value_type().name(),
+                    json: JsonValue::Bool(json_bool_val),
                 }),
             },
             JsonValue::Null => Err(ValueParsingError::NullValueError),

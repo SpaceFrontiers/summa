@@ -24,6 +24,6 @@ impl SafeIntoF64 for f64 {
 
 impl SafeIntoF64 for DateTime {
     fn safe_into_f64(self) -> f64 {
-        self.into_unix_timestamp() as f64
+        self.into_timestamp_secs() as f64
     }
 }

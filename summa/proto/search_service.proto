@@ -44,6 +44,7 @@ message Query {
     AllQuery all = 7;
     MoreLikeThisQuery more_like_this = 8;
     BoostQuery boost = 9;
+    DisjunctionMaxQuery disjunction_max = 10;
   }
 }
 
@@ -52,6 +53,11 @@ message AllQuery {}
 message BoostQuery {
   Query query = 1;
   string score = 2;
+}
+
+message DisjunctionMaxQuery {
+  repeated Query disjuncts = 1;
+  string tie_breaker = 2;
 }
 
 message MoreLikeThisQuery {
