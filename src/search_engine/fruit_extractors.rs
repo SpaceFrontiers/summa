@@ -6,8 +6,9 @@ use crate::search_engine::scorers::EvalScorer;
 use std::collections::{HashMap, HashSet};
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
+use tantivy::query::Query;
 use tantivy::schema::{Field, Schema as Fields};
-use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader};
+use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerator};
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
 pub trait FruitExtractor: Sync + Send {
@@ -37,7 +38,12 @@ fn parse_aggregation_results(
         .collect()
 }
 
-pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields, multi_collector: &mut MultiCollector) -> SummaResult<Box<dyn FruitExtractor>> {
+pub fn build_fruit_extractor(
+    collector_proto: proto::Collector,
+    query: &dyn Query,
+    fields: &Fields,
+    multi_collector: &mut MultiCollector,
+) -> SummaResult<Box<dyn FruitExtractor>> {
     match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => Ok(match top_docs_collector_proto.scorer {
             None | Some(proto::Scorer { scorer: None }) => Box::new(TopDocs::new(
@@ -45,7 +51,9 @@ pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields,
                     tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                         .and_offset(top_docs_collector_proto.offset.try_into().unwrap()),
                 ),
+                query,
                 top_docs_collector_proto.limit.try_into().unwrap(),
+                top_docs_collector_proto.snippets,
             )) as Box<dyn FruitExtractor>,
             Some(proto::Scorer {
                 scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
@@ -59,7 +67,9 @@ pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields,
                     });
                 Box::new(TopDocs::new(
                     multi_collector.add_collector(top_docs_collector),
+                    query,
                     top_docs_collector_proto.limit.try_into().unwrap(),
+                    top_docs_collector_proto.snippets,
                 )) as Box<dyn FruitExtractor>
             }
             Some(proto::Scorer {
@@ -71,7 +81,9 @@ pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields,
                     .order_by_u64_field(field);
                 Box::new(TopDocs::new(
                     multi_collector.add_collector(top_docs_collector),
+                    query,
                     top_docs_collector_proto.limit.try_into().unwrap(),
+                    top_docs_collector_proto.snippets,
                 )) as Box<dyn FruitExtractor>
             }
         }),
@@ -102,17 +114,37 @@ pub fn build_fruit_extractor(collector_proto: proto::Collector, fields: &Fields,
 pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
     handle: FruitHandle<Vec<(T, DocAddress)>>,
     limit: usize,
+    snippets: HashMap<String, u32>,
+    query: Box<dyn Query>,
 }
 
 impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
-    pub fn new(handle: FruitHandle<Vec<(T, DocAddress)>>, limit: usize) -> TopDocs<T> {
-        TopDocs { handle, limit }
+    pub fn new(handle: FruitHandle<Vec<(T, DocAddress)>>, query: &dyn Query, limit: usize, snippets: HashMap<String, u32>) -> TopDocs<T> {
+        TopDocs {
+            handle,
+            limit,
+            snippets,
+            query: query.box_clone(),
+        }
+    }
+
+    fn snippet_generators(&self, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
+        self.snippets
+            .iter()
+            .map(|(field_name, max_num_chars)| {
+                let snippet_field = searcher.schema().get_field(field_name).unwrap();
+                let mut snippet_generator = SnippetGenerator::create(searcher, &*self.query, snippet_field).unwrap();
+                snippet_generator.set_max_num_chars(*max_num_chars as usize);
+                (field_name.to_string(), snippet_generator)
+            })
+            .collect()
     }
 }
 
 impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for TopDocs<T> {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &Searcher, multi_fields: &HashSet<Field>) -> proto::CollectorOutput {
         let fields = searcher.schema();
+        let snippet_generators = self.snippet_generators(searcher);
         let fruit = self.handle.extract(multi_fruit);
         let scored_documents_iter = fruit.iter().enumerate().map(|(position, (score, doc_address))| {
             let document = searcher.doc(*doc_address).unwrap();
@@ -120,6 +152,10 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
                 document: NamedFieldDocument::from_document(fields, multi_fields, &document).to_json(),
                 score: Some((*score).into()),
                 position: position.try_into().unwrap(),
+                snippets: snippet_generators
+                    .iter()
+                    .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
+                    .collect(),
             }
         });
         let len = scored_documents_iter.len();

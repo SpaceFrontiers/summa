@@ -224,11 +224,21 @@ message Score {
   }
 }
 
+message Highlight {
+  uint32 from = 1;
+  uint32 to = 2;
+}
+
+message Snippet {
+  string fragment = 1;
+  repeated Highlight highlighted = 2;
+}
 
 message ScoredDocument {
   string document = 1;
   Score score = 2;
   uint32 position = 3;
+  map<string, Snippet> snippets = 4;
 }
 
 message Scorer {
@@ -285,6 +295,7 @@ message TopDocsCollector {
   uint32 limit = 1;
   uint32 offset = 2;
   optional Scorer scorer = 3;
+  map<string, uint32> snippets = 4;
 }
 
 message TopDocsCollectorOutput {

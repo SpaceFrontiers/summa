@@ -1,6 +1,7 @@
 #[cfg(test)]
 pub mod shortcuts {
     use crate::proto;
+    use std::collections::HashMap;
 
     pub fn top_docs_collector(limit: u32) -> proto::Collector {
         proto::Collector {
@@ -8,6 +9,7 @@ pub mod shortcuts {
                 limit,
                 offset: 0,
                 scorer: None,
+                snippets: HashMap::new(),
             })),
         }
     }
@@ -20,6 +22,7 @@ pub mod shortcuts {
                 scorer: Some(proto::Scorer {
                     scorer: Some(proto::scorer::Scorer::EvalExpr(eval_expr.to_owned())),
                 }),
+                snippets: HashMap::new(),
             })),
         }
     }
@@ -31,6 +34,7 @@ pub mod shortcuts {
                 score: Some(proto::score::Score::F64Score(score)),
             }),
             position,
+            snippets: HashMap::new(),
         }
     }
 
