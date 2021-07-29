@@ -39,7 +39,7 @@ derive_builder = "0.11.2"
 fasteval2 = { version = "2.0.3", features = ["unsafe-vars"] }
 futures = "0.3.21"
 futures-util = "0.3.21"
-hyper = "0.14.19"
+hyper = "0.14.20"
 lazy_static = "1.4.0"
 opentelemetry = { version = "0.17.0", features = ["rt-tokio"] }
 opentelemetry-prometheus = "0.10.0"
