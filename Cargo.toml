@@ -29,7 +29,7 @@ tonic-build = { version = "0.7.2", default-features = false, features = ["compre
 tempdir = "0.3.7"
 
 [dependencies]
-async-broadcast = "0.4.0"
+async-broadcast = "0.4.1"
 base64 = "0.13.0"
 clap = { version = "3.2.15", features = ["cargo"] }
 colored = "2.0.0"
