@@ -18,7 +18,7 @@ use tokio::fs::remove_dir_all;
 use tokio::sync::RwLock;
 use tokio::time;
 use tokio::time::Instant;
-use tracing::{info, info_span, instrument, warn, Instrument};
+use tracing::{info, info_span, instrument, warn, Instrument, trace};
 
 pub struct IndexHolder {
     index_name: String,
@@ -240,7 +240,7 @@ impl IndexHolder {
             .into_iter()
             .map(|collector_proto| build_fruit_extractor(collector_proto, &parsed_query, &self.cached_fields, &mut multi_collector))
             .collect::<SummaResult<_>>()?;
-        info!(
+        trace!(
             target: "query",
             index_name = ?self.index_name,
             query = ?query,

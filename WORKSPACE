@@ -83,7 +83,6 @@ crates_repository(
             ],
             build_script_env = {
                 "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
-                "PROTOC_NO_VENDOR": "1",
             },
         )],
         "tonic-reflection": [crate.annotation(

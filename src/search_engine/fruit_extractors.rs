@@ -142,6 +142,7 @@ pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
     limit: u32,
     snippets: HashMap<String, u32>,
     query: Box<dyn Query>,
+    #[builder(default = "false")]
     explain: bool,
 }
 

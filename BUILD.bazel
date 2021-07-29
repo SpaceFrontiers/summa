@@ -11,7 +11,6 @@ cargo_build_script(
     srcs = ["build.rs"],
     build_script_env = {
         "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
-        "PROTOC_NO_VENDOR": "1",
     },
     data = [
         "//summa/proto",
