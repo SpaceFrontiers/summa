@@ -1,4 +1,5 @@
 use crate::search_engine::DocumentParsingError;
+use derive_builder::UninitializedFieldError;
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
 use tantivy::schema::FieldType;
@@ -8,6 +9,8 @@ use tracing::warn;
 pub enum ValidationError {
     #[error("aliased_error: {0}")]
     Aliased(String),
+    #[error("builder_error: {0}")]
+    BuilderError(String),
     #[error("empty_argument_error: {0}")]
     EmptyArgument(String),
     #[error("existing_config_error: {0}")]
@@ -44,6 +47,8 @@ pub enum ValidationError {
     MissingPath(PathBuf),
     #[error("missing_primary_key_error: {0:?}")]
     MissingPrimaryKey(Option<String>),
+    #[error("missing_snippet_field: {0}")]
+    MissingSnippetField(String),
     #[error("utf8_error: {0}")]
     Utf8(std::str::Utf8Error),
 }
@@ -98,7 +103,7 @@ pub enum Error {
     UnboundDocument,
     #[error("unknown_directory_error: {0}")]
     UnknownDirectory(String),
-    #[error("vaildation_error: {0}")]
+    #[error("{0}")]
     Validation(ValidationError),
     #[error("yaml_error: {0}")]
     Yaml(serde_yaml::Error),
@@ -107,6 +112,12 @@ pub enum Error {
 impl From<ValidationError> for Error {
     fn from(error: ValidationError) -> Self {
         Error::Validation(error)
+    }
+}
+
+impl From<UninitializedFieldError> for ValidationError {
+    fn from(ufe: UninitializedFieldError) -> ValidationError {
+        ValidationError::BuilderError(ufe.to_string())
     }
 }
 

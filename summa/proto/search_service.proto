@@ -296,6 +296,7 @@ message TopDocsCollector {
   uint32 offset = 2;
   optional Scorer scorer = 3;
   map<string, uint32> snippets = 4;
+  bool explain = 5;
 }
 
 message TopDocsCollectorOutput {

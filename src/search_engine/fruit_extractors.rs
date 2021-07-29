@@ -1,5 +1,5 @@
 use crate::errors::ValidationError::InvalidAggregation;
-use crate::errors::{Error, SummaResult};
+use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use crate::search_engine::custom_serializer::NamedFieldDocument;
 use crate::search_engine::scorers::EvalScorer;
@@ -9,6 +9,7 @@ use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema as Fields};
 use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerator};
+use tracing::info;
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
 pub trait FruitExtractor: Sync + Send {
@@ -38,6 +39,15 @@ fn parse_aggregation_results(
         .collect()
 }
 
+fn check_snippets(fields: &Fields, snippets: &HashMap<String, u32>) -> SummaResult<()> {
+    for snippet_field in snippets.keys() {
+        if fields.get_field(snippet_field).is_none() {
+            return Err(ValidationError::MissingSnippetField(snippet_field.to_string()).into());
+        }
+    }
+    Ok(())
+}
+
 pub fn build_fruit_extractor(
     collector_proto: proto::Collector,
     query: &dyn Query,
@@ -45,48 +55,62 @@ pub fn build_fruit_extractor(
     multi_collector: &mut MultiCollector,
 ) -> SummaResult<Box<dyn FruitExtractor>> {
     match collector_proto.collector {
-        Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => Ok(match top_docs_collector_proto.scorer {
-            None | Some(proto::Scorer { scorer: None }) => Box::new(TopDocs::new(
-                multi_collector.add_collector(
-                    tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
-                        .and_offset(top_docs_collector_proto.offset.try_into().unwrap()),
-                ),
-                query,
-                top_docs_collector_proto.limit.try_into().unwrap(),
-                top_docs_collector_proto.snippets,
-            )) as Box<dyn FruitExtractor>,
-            Some(proto::Scorer {
-                scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
-            }) => {
-                let eval_scorer_seed = EvalScorer::new(eval_expr, fields)?;
-                let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
-                    .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
-                    .tweak_score(move |segment_reader: &SegmentReader| {
-                        let mut eval_scorer = eval_scorer_seed.get_for_segment_reader(segment_reader).unwrap();
-                        move |doc_id: DocId, original_score: Score| eval_scorer.score(doc_id, original_score)
-                    });
-                Box::new(TopDocs::new(
-                    multi_collector.add_collector(top_docs_collector),
-                    query,
-                    top_docs_collector_proto.limit.try_into().unwrap(),
-                    top_docs_collector_proto.snippets,
-                )) as Box<dyn FruitExtractor>
-            }
-            Some(proto::Scorer {
-                scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
-            }) => {
-                let field = fields.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
-                let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
-                    .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
-                    .order_by_u64_field(field);
-                Box::new(TopDocs::new(
-                    multi_collector.add_collector(top_docs_collector),
-                    query,
-                    top_docs_collector_proto.limit.try_into().unwrap(),
-                    top_docs_collector_proto.snippets,
-                )) as Box<dyn FruitExtractor>
-            }
-        }),
+        Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
+            check_snippets(fields, &top_docs_collector_proto.snippets)?;
+            Ok(match top_docs_collector_proto.scorer {
+                None | Some(proto::Scorer { scorer: None }) => Box::new(
+                    TopDocsBuilder::default()
+                        .handle(
+                            multi_collector.add_collector(
+                                tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
+                                    .and_offset(top_docs_collector_proto.offset.try_into().unwrap()),
+                            ),
+                        )
+                        .query(query.box_clone())
+                        .explain(top_docs_collector_proto.explain)
+                        .limit(top_docs_collector_proto.limit)
+                        .snippets(top_docs_collector_proto.snippets)
+                        .build()?,
+                ) as Box<dyn FruitExtractor>,
+                Some(proto::Scorer {
+                    scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
+                }) => {
+                    let eval_scorer_seed = EvalScorer::new(eval_expr, fields)?;
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
+                        .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
+                        .tweak_score(move |segment_reader: &SegmentReader| {
+                            let mut eval_scorer = eval_scorer_seed.get_for_segment_reader(segment_reader).unwrap();
+                            move |doc_id: DocId, original_score: Score| eval_scorer.score(doc_id, original_score)
+                        });
+                    Box::new(
+                        TopDocsBuilder::default()
+                            .handle(multi_collector.add_collector(top_docs_collector))
+                            .query(query.box_clone())
+                            .explain(top_docs_collector_proto.explain)
+                            .limit(top_docs_collector_proto.limit)
+                            .snippets(top_docs_collector_proto.snippets)
+                            .build()?,
+                    ) as Box<dyn FruitExtractor>
+                }
+                Some(proto::Scorer {
+                    scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
+                }) => {
+                    let field = fields.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
+                        .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
+                        .order_by_u64_field(field);
+                    Box::new(
+                        TopDocsBuilder::default()
+                            .handle(multi_collector.add_collector(top_docs_collector))
+                            .query(query.box_clone())
+                            .explain(top_docs_collector_proto.explain)
+                            .limit(top_docs_collector_proto.limit)
+                            .snippets(top_docs_collector_proto.snippets)
+                            .build()?,
+                    ) as Box<dyn FruitExtractor>
+                }
+            })
+        }
         Some(proto::collector::Collector::ReservoirSampling(reservoir_sampling_collector_proto)) => {
             let reservoir_sampling_collector: crate::search_engine::collectors::ReservoirSampling = reservoir_sampling_collector_proto.into();
             Ok(Box::new(ReservoirSampling(multi_collector.add_collector(reservoir_sampling_collector))) as Box<dyn FruitExtractor>)
@@ -111,23 +135,17 @@ pub fn build_fruit_extractor(
     }
 }
 
+#[derive(Builder)]
+#[builder(pattern = "owned", build_fn(error = "ValidationError"))]
 pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
     handle: FruitHandle<Vec<(T, DocAddress)>>,
-    limit: usize,
+    limit: u32,
     snippets: HashMap<String, u32>,
     query: Box<dyn Query>,
+    explain: bool,
 }
 
 impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
-    pub fn new(handle: FruitHandle<Vec<(T, DocAddress)>>, query: &dyn Query, limit: usize, snippets: HashMap<String, u32>) -> TopDocs<T> {
-        TopDocs {
-            handle,
-            limit,
-            snippets,
-            query: query.box_clone(),
-        }
-    }
-
     fn snippet_generators(&self, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
         self.snippets
             .iter()
@@ -148,10 +166,13 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let fruit = self.handle.extract(multi_fruit);
         let scored_documents_iter = fruit.iter().enumerate().map(|(position, (score, doc_address))| {
             let document = searcher.doc(*doc_address).unwrap();
+            if self.explain {
+                info!(action = "explain", query = ?self.query, document = ?document, explanation = ?self.query.explain(searcher, *doc_address));
+            }
             proto::ScoredDocument {
                 document: NamedFieldDocument::from_document(fields, multi_fields, &document).to_json(),
                 score: Some((*score).into()),
-                position: position.try_into().unwrap(),
+                position: position as u32,
                 snippets: snippet_generators
                     .iter()
                     .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
@@ -159,8 +180,8 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             }
         });
         let len = scored_documents_iter.len();
-        let scored_documents = scored_documents_iter.take(std::cmp::min(self.limit, len)).collect();
-        let has_next = len > self.limit;
+        let scored_documents = scored_documents_iter.take(std::cmp::min(self.limit as usize, len)).collect();
+        let has_next = len > self.limit as usize;
         proto::CollectorOutput {
             collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
                 scored_documents,

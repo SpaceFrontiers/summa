@@ -1,5 +1,13 @@
-from typing import Callable, Optional, Union
-from izihawa_nlptools.morph import EnglishMorphology, RussianMorphology
+from typing import (
+    Callable,
+    Optional,
+    Union,
+)
+
+from izihawa_nlptools.morph import (
+    EnglishMorphology,
+    RussianMorphology,
+)
 
 from ..parser.elements import (
     Boost,

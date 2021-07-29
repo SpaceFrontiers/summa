@@ -76,7 +76,7 @@ iniconfig==1.1.1
     # via
     #   -r requirements.txt
     #   pytest
-izihawa-nlptools==1.1.1
+izihawa-nlptools==1.1.2
     # via -r requirements.txt
 izihawa-types==0.1.3
     # via -r requirements.txt

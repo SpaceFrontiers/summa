@@ -449,7 +449,7 @@ class SummaClient(BaseGrpcClient):
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> search_service_pb.SearchResponse:
-        """
+        """pu
         Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
 
         Args:

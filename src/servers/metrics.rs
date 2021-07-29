@@ -12,9 +12,13 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
+use opentelemetry::metrics::Descriptor;
+use opentelemetry::sdk::export::metrics::{Aggregator, AggregatorSelector};
+use opentelemetry::sdk::metrics::aggregators;
 use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
 use std::convert::Infallible;
+use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
 use tracing::{info, info_span, instrument};
@@ -37,11 +41,25 @@ struct AppState {
     index_meter: IndexMeter,
 }
 
+#[derive(Debug)]
+struct CustomAgg;
+
+impl AggregatorSelector for CustomAgg {
+    fn aggregator_for(&self, descriptor: &Descriptor) -> Option<Arc<dyn Aggregator + Send + Sync>> {
+        match descriptor.unit() {
+            Some("bytes") => Some(Arc::new(aggregators::last_value())),
+            Some("seconds") => Some(Arc::new(aggregators::histogram(
+                descriptor,
+                &[0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+            ))),
+            _ => Some(Arc::new(aggregators::last_value())),
+        }
+    }
+}
+
 impl MetricsServer {
     pub fn new(application_config: &ApplicationConfigHolder) -> SummaResult<MetricsServer> {
-        let exporter = opentelemetry_prometheus::exporter()
-            .with_default_histogram_boundaries(vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0])
-            .init();
+        let exporter = opentelemetry_prometheus::exporter().with_aggregator_selector(CustomAgg).init();
         Ok(MetricsServer {
             application_config: application_config.clone(),
             exporter,
