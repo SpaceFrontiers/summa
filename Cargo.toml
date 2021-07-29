@@ -46,7 +46,7 @@ opentelemetry-prometheus = "0.10.0"
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
 path-absolutize = "3.0.13"
 prometheus = "0.13.1"
-prost = "0.10.4"
+prost = "0.11.0"
 prost-build = { version = "0.10.4", features = ["vendored"] }
 prost-types = "0.10.1"
 rand = "0.8.5"
