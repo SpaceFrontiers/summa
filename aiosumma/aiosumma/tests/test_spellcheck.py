@@ -8,27 +8,17 @@ def test_spell_check():
     )
     processed_query = query_processor.process('desinged fro embeded usin', 'en')
     assert processed_query.to_summa_query() == {
-        'boolean': {'subqueries': [{
-            'occur': 'should',
-            'query': {'boolean': {'subqueries': [{
-                'occur': 'should',
-                'query': {'match': {'value': 'desinged'}}}, {
-                'occur': 'should',
-                'query': {'match': {'value': 'designed'}}}]}}}, {
-            'occur': 'should',
-            'query': {'match': {'value': 'fro'}}}, {
-            'occur': 'should',
-            'query': {'boolean': {'subqueries': [{
-                'occur': 'should',
-                'query': {'match': {'value': 'embeded'}}}, {
-                'occur': 'should',
-                'query': {'match': {'value': 'embedded'}}}]}}}, {
-            'occur': 'should',
-            'query': {'boolean': {'subqueries': [{
-                'occur': 'should',
-                'query': {'match': {'value': 'usin'}}}, {
-                'occur': 'should',
-                'query': {'match': {'value': 'using'}}}]}}}]},
+        'boolean': {'subqueries': [{'occur': 'should',
+                                    'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'desinged'}},
+                                                                                {'match': {'value': 'designed'}}]}}},
+                                   {'occur': 'should',
+                                    'query': {'match': {'value': 'fro'}}},
+                                   {'occur': 'should',
+                                    'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'embeded'}},
+                                                                                {'match': {'value': 'embedded'}}]}}},
+                                   {'occur': 'should',
+                                    'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'usin'}},
+                                                                                {'match': {'value': 'using'}}]}}}]},
     }
     processed_query = query_processor.process('covid-19 haemophilia', 'en')
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [

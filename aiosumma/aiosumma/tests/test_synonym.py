@@ -9,34 +9,23 @@ def test_synonyms():
     processed_query = query_processor.process('aspirin test', 'en')
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [{'occur': 'should',
-                                    'query': {'boolean': {'subqueries': [{'occur': 'should',
-                                                                          'query': {
-                                                                              'match': {'value': '"acetylsalicylic '
-                                                                                                 'acid"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {
-                                                                              'match': {'value': '"acetylsalisylic '
-                                                                                                 'acid"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {'match': {'value': '"aspirin"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {'match': {'value': '"aspirin '
-                                                                                                       'sodium"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {'match': {'value': '"aspirin '
-                                                                                                       'magnesium"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {'match': {'value': '"aspirin '
-                                                                                                       'potassium"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {'match': {'value': '"aspirin '
-                                                                                                       'calcium"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {'match': {'value': '"aspirin '
-                                                                                                       'anhydride"'}}},
-                                                                         {'occur': 'should',
-                                                                          'query': {'match': {'value': '"aspirin '
-                                                                                                       'lysine"'}}}]}}},
+                                    'query': {'disjunction_max': {'disjuncts': [{'match': {'value': '"acetylsalicylic '
+                                                                                                    'acid"'}},
+                                                                                {'match': {'value': '"acetylsalisylic '
+                                                                                                    'acid"'}},
+                                                                                {'match': {'value': '"aspirin"'}},
+                                                                                {'match': {'value': '"aspirin '
+                                                                                                    'sodium"'}},
+                                                                                {'match': {'value': '"aspirin '
+                                                                                                    'magnesium"'}},
+                                                                                {'match': {'value': '"aspirin '
+                                                                                                    'potassium"'}},
+                                                                                {'match': {'value': '"aspirin '
+                                                                                                    'calcium"'}},
+                                                                                {'match': {'value': '"aspirin '
+                                                                                                    'anhydride"'}},
+                                                                                {'match': {'value': '"aspirin '
+                                                                                                    'lysine"'}}]}}},
                                    {'occur': 'should',
                                     'query': {'match': {'value': 'test'}}}]},
     }

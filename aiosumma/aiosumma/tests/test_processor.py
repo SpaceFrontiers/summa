@@ -72,7 +72,6 @@ def test_production_chain():
     query_processor = QueryProcessor(
         text_transformers=[LowerTextTransformer()],
         tree_transformers=[
-            SpellcheckTreeTransformer(),
             MorphyTreeTransformer(),
             SynonymTreeTransformer.drugs(),
             TantivyTreeTransformer(),
@@ -81,80 +80,84 @@ def test_production_chain():
     )
     processed_query = query_processor.process('Claudio rugarli', 'en')
     assert processed_query.to_summa_query() == {
-        'boolean': {'subqueries': [{'occur': 'should',
-                                    'query': {'match': {'value': 'claudio'}}},
-                                   {'occur': 'should',
-                                    'query': {'boost': {'query': {'match': {'value': 'claudios'}},
-                                                        'score': '0.65'}}},
-                                   {'occur': 'should',
-                                    'query': {'match': {'value': 'claude'}}},
-                                   {'occur': 'should',
-                                    'query': {'boost': {'query': {'match': {'value': 'clauded'}},
-                                                        'score': '0.65'}}},
-                                   {'occur': 'should',
-                                    'query': {'boost': {'query': {'match': {'value': 'claudes'}},
-                                                        'score': '0.65'}}},
-                                   {'occur': 'should',
-                                    'query': {'boost': {'query': {'match': {'value': 'clauding'}},
-                                                        'score': '0.65'}}},
-                                   {'occur': 'should',
-                                    'query': {'match': {'value': 'rugarli'}}},
-                                   {'occur': 'should',
-                                    'query': {'boost': {'query': {'match': {'value': 'rugarlis'}},
-                                                        'score': '0.65'}}}]},
-    }
+        'boolean': {'subqueries': [
+            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'claudio'}},
+                                                                     {'match': {'value': 'claudios'}}]}}},
+            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'rugarli'}},
+                                                                            {'match': {'value': 'rugarlis'}}]}}}]}}
     processed_query = query_processor.process('+(search engine) -car', 'en')
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
-            {'occur': 'must', 'query': {'match': {'value': 'search'}}},
-            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.65'}}},
-            {'occur': 'must', 'query': {'match': {'value': 'engine'}}},
-            {'occur': 'must', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.65'}}},
-            {'occur': 'must_not', 'query': {'match': {'value': 'car'}}},
-            {'occur': 'must_not', 'query': {'boost': {'query': {'match': {'value': 'cars'}}, 'score': '0.65'}}}]}}
+            {'occur': 'must', 'query': {'disjunction_max': {'disjuncts': [
+                {'match': {'value': 'search'}},
+                {'match': {'value': 'searches'}}]}}},
+            {'occur': 'must', 'query': {'disjunction_max': {'disjuncts': [
+                {'match': {'value': 'engine'}},
+                {'match': {'value': 'engines'}}]}}},
+            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [
+                {'boolean': {'subqueries': [{'occur': 'must_not', 'query': {'match': {'value': 'car'}}}]}},
+                {'boolean': {'subqueries': [{'occur': 'must_not', 'query': {'match': {'value': 'cars'}}}]}}]}}}]},
+    }
 
     processed_query = query_processor.process('search engine', 'en')
-    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
-        {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}, 'score': '0.65'}}},
-        {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}, 'score': '0.65'}}}
-    ]}}
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [
+            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [
+                {'match': {'value': 'search'}},
+                {'match': {'value': 'searches'}}]}}},
+            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [
+                {'match': {'value': 'engine'}},
+                {'match': {'value': 'engines'}}]}}},
+        ]}
+    }
     processed_query = query_processor.process('author:Smith +"title book"', 'en')
-    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
-        {'occur': 'should', 'query': {'term': {'field': 'author', 'value': 'smith'}}},
-        {'occur': 'should', 'query':
-            {'boost': {'query': {'term': {'field': 'author', 'value': 'smiths'}}, 'score': '0.65'}}},
-        {'occur': 'must', 'query': {'match': {'value': '"title book"'}}}]}}
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [{'occur': 'should',
+                                    'query': {'term': {'field': 'author',
+                                                       'value': 'smith'}}},
+                                   {'occur': 'should',
+                                    'query': {'term': {'field': 'author',
+                                                       'value': 'smiths'}}},
+                                   {'occur': 'must',
+                                    'query': {'match': {'value': '"title book"'}}}]},
+    }
     processed_query = query_processor.process('science +year:[2010 TO *]', 'en')
-    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
-        {'occur': 'should', 'query': {'match': {'value': 'science'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'sciences'}}, 'score': '0.65'}}},
-        {'occur': 'must', 'query': {'range': {
-            'field': 'year', 'value': {'including_left': True, 'including_right': True, 'left': '2010', 'right': '*'}}}}
-    ]}}
-    processed_query = query_processor.process('Star Wars Coding Projects: A Step-by-Step Visual Guide to Coding Your Own Animations, Games, Simulations, and More!')
-    assert processed_query.to_summa_query() == {}
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [{'occur': 'should',
+                                    'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'science'}},
+                                                                                {'match': {'value': 'sciences'}}]}}},
+                                   {'occur': 'must',
+                                    'query': {'range': {'field': 'year',
+                                                        'value': {'including_left': True,
+                                                                  'including_right': True,
+                                                                  'left': '2010',
+                                                                  'right': '*'}}}}]},
+    }
 
 
 def test_unknown_language_transformer():
     query_processor = QueryProcessor(tree_transformers=[MorphyTreeTransformer(enable_morph=True), OptimizingTreeTransformer()])
     processed_query = query_processor.process('search engine', 'zz')
-    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
-        {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'searches'}}}}},
-        {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {'match': {'value': 'engines'}}}}}
-    ]}}
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [
+            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [
+                {'match': {'value': 'search'}},
+                {'match': {'value': 'searches'}}]}}},
+            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [
+                {'match': {'value': 'engine'}},
+                {'match': {'value': 'engines'}}]}}},
+        ]}
+    }
 
 
 def test_unknown_query_language_transformer():
     query_processor = QueryProcessor(tree_transformers=[MorphyTreeTransformer(enable_morph=True), OptimizingTreeTransformer()])
     processed_query = query_processor.process('kavanaba mutagor', 'zz')
-    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
-        {'occur': 'should', 'query': {'match': {'value': 'kavanaba'}}},
-        {'occur': 'should', 'query': {'match': {'value': 'mutagor'}}}
-    ]}}
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [
+            {'occur': 'should', 'query': {'match': {'value': 'kavanaba'}}},
+            {'occur': 'should', 'query': {'match': {'value': 'mutagor'}}}]},
+    }
 
 
 def test_exact_match_transformers():
@@ -164,13 +167,18 @@ def test_exact_match_transformers():
         ]
     )
     processed_query = query_processor.process('search engine', 'en')
-    assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
-        {'occur': 'should', 'query': {'match': {'value': 'search'}}},
-        {'occur': 'should', 'query': {'match': {'value': 'engine'}}},
-        {'occur': 'should', 'query': {'boost': {'query': {
-            'phrase': {'field': 'title', 'slop': 1, 'value': 'search engine'}}, 'score': '2'}}
-         }
-    ]}}
+    assert processed_query.to_summa_query() == {
+        'boolean': {'subqueries': [{'occur': 'should',
+                                    'query': {'match': {'value': 'search'}}},
+                                   {'occur': 'should',
+                                    'query': {'match': {'value': 'engine'}}},
+                                   {'occur': 'should',
+                                    'query': {'boost': {'query': {'phrase': {'field': 'title',
+                                                                             'slop': 1,
+                                                                             'value': 'search '
+                                                                                      'engine'}},
+                                                        'score': '2'}}}]},
+    }
 
 
 def test_doi_transformer():
