@@ -163,11 +163,12 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
 impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for TopDocs<T> {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit, searcher: &Searcher, multi_fields: &HashSet<Field>) -> proto::CollectorOutput {
         let fields = searcher.schema();
+        let id_field = fields.get_field("id").unwrap();
         let snippet_generators = self.snippet_generators(searcher);
         let fruit = self.handle.extract(multi_fruit);
         let scored_documents_iter = fruit.iter().enumerate().map(|(position, (score, doc_address))| {
             let document = searcher.doc(*doc_address).unwrap();
-            if self.explain {
+            if self.explain && document.get_first(id_field).unwrap().as_i64().unwrap() == 207236496 {
                 info!(action = "explain", query = ?self.query, document = ?document, explanation = ?self.query.explain(searcher, *doc_address));
             }
             proto::ScoredDocument {

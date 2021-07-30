@@ -12,7 +12,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
-use opentelemetry::metrics::Descriptor;
+use opentelemetry::metrics::{Descriptor, InstrumentKind};
 use opentelemetry::sdk::export::metrics::{Aggregator, AggregatorSelector};
 use opentelemetry::sdk::metrics::aggregators;
 use opentelemetry_prometheus::PrometheusExporter;
@@ -46,13 +46,16 @@ struct CustomAgg;
 
 impl AggregatorSelector for CustomAgg {
     fn aggregator_for(&self, descriptor: &Descriptor) -> Option<Arc<dyn Aggregator + Send + Sync>> {
-        match descriptor.unit() {
-            Some("bytes") => Some(Arc::new(aggregators::last_value())),
-            Some("seconds") => Some(Arc::new(aggregators::histogram(
-                descriptor,
-                &[0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
-            ))),
-            _ => Some(Arc::new(aggregators::last_value())),
+        match descriptor.instrument_kind() {
+            InstrumentKind::Counter => Some(Arc::new(aggregators::sum())),
+            _ => match descriptor.unit() {
+                Some("bytes") => Some(Arc::new(aggregators::last_value())),
+                Some("seconds") => Some(Arc::new(aggregators::histogram(
+                    descriptor,
+                    &[0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+                ))),
+                _ => Some(Arc::new(aggregators::last_value())),
+            },
         }
     }
 }

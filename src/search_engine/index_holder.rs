@@ -18,7 +18,7 @@ use tokio::fs::remove_dir_all;
 use tokio::sync::RwLock;
 use tokio::time;
 use tokio::time::Instant;
-use tracing::{info, info_span, instrument, warn, Instrument, trace};
+use tracing::{info, info_span, instrument, trace, warn, Instrument};
 
 pub struct IndexHolder {
     index_name: String,

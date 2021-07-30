@@ -1,6 +1,7 @@
 use crate::errors::{Error, SummaResult, ValidationError};
 use config::{Config, Environment, File};
 use serde::{Deserialize, Serialize};
+use serde_yaml::to_writer;
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -93,7 +94,11 @@ impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
             .as_ref()
             .map(|config_filepath| {
                 std::fs::File::create(config_filepath)
-                    .and_then(|mut file| file.write_all(&serde_yaml::to_vec(&self.config).unwrap()))
+                    .and_then(|mut file| {
+                        let mut vec = Vec::with_capacity(128);
+                        to_writer(&mut vec, &self.config).unwrap();
+                        file.write_all(&vec)
+                    })
                     .map_err(|e| Error::IO((e, Some(config_filepath.to_path_buf()))))?;
                 Ok(self)
             })

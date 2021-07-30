@@ -23,7 +23,7 @@ doc = true
 maintenance = { status = "actively-developed" }
 
 [build-dependencies]
-tonic-build = { version = "0.7.2", default-features = false, features = ["compression", "prost", "transport"] }
+tonic-build = { version = "0.8.0", default-features = false, features = ["prost", "transport"] }
 
 [dev-dependencies]
 tempdir = "0.3.7"
@@ -31,10 +31,10 @@ tempdir = "0.3.7"
 [dependencies]
 async-broadcast = "0.4.1"
 base64 = "0.13.0"
-clap = { version = "3.2.15", features = ["cargo"] }
+clap = { version = "3.2.16", features = ["cargo"] }
 colored = "2.0.0"
 config = "0.13.1"
-crossbeam-channel = "0.5.5"
+crossbeam-channel = "0.5.6"
 derive_builder = "0.11.2"
 fasteval2 = { version = "2.0.3", features = ["unsafe-vars"] }
 futures = "0.3.21"
@@ -47,14 +47,14 @@ parking_lot = { version = "0.12.1", features = ["send_guard"] }
 path-absolutize = "3.0.13"
 prometheus = "0.13.1"
 prost = "0.11.0"
-prost-build = { version = "0.10.4", features = ["vendored"] }
-prost-types = "0.10.1"
+prost-build = { version = "0.11.0" }
+prost-types = "0.11.0"
 rand = "0.8.5"
 rdkafka = "0.28.0"
-serde = { version = "1.0.17", features = ["derive"] }
-serde_derive = "1.0.137"
+serde = { version = "1.0.140", features = ["derive"] }
+serde_derive = "1.0.140"
 serde_json = "1.0.82"
-serde_yaml = "0.8.25"
+serde_yaml = "0.9.2"
 signal-hook = "0.3.14"
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/dismax" , features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
 # tantivy = { version = "0.18.0", features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
@@ -62,13 +62,13 @@ tantivy-fst = "0.3.0"
 textwrap = "0.15.0"
 time = { version = "0.3.12", features = ["serde-well-known"] }
 thiserror = "1.0.31"
-tokio = { version = "1.19.2", features = ["full", "time"] }
+tokio = { version = "1.20.1", features = ["full", "time"] }
 tokio-stream = { version = "0.1.9", features = ["net"] }
-tonic = { version = "0.7.2", features = ["compression"] }
-tonic-reflection = "0.4.0"
+tonic = { version = "0.8.0", features = ["gzip"] }
+tonic-reflection = "0.5.0"
 tower = "0.4.13"
 tower-http = { version = "0.3.4", features = ["set-header", "trace"] }
 tracing = "0.1.36"
 tracing-appender = "0.2.2"
 tracing-futures = "0.2.5"
-tracing-subscriber = { version = "0.3.14", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.15", features = ["env-filter", "json"] }
