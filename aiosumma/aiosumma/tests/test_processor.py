@@ -133,6 +133,8 @@ def test_production_chain():
         {'occur': 'must', 'query': {'range': {
             'field': 'year', 'value': {'including_left': True, 'including_right': True, 'left': '2010', 'right': '*'}}}}
     ]}}
+    processed_query = query_processor.process('Star Wars Coding Projects: A Step-by-Step Visual Guide to Coding Your Own Animations, Games, Simulations, and More!')
+    assert processed_query.to_summa_query() == {}
 
 
 def test_unknown_language_transformer():

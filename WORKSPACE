@@ -2,31 +2,38 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "ab21448cef298740765f33a7f5acee0607203e4ea321219f2a4c85a6e0fb0a27",
-    urls = ["https://github.com/bazelbuild/rules_go/releases/download/v0.32.0/rules_go-v0.32.0.zip"],
+    urls = ["https://github.com/bazelbuild/rules_go/releases/download/v0.34.0/rules_go-v0.34.0.zip"],
 )
 http_archive(
     name = "bazel_gazelle",
-    sha256 = "5982e5463f171da99e3bdaeff8c0f48283a7a5f396ec5282910b9e8a49c0dd7e",
-    urls = ["https://github.com/bazelbuild/bazel-gazelle/releases/download/v0.25.0/bazel-gazelle-v0.25.0.tar.gz"],
+    sha256 = "501deb3d5695ab658e82f6f6f549ba681ea3ca2a5fb7911154b5aa45596183fa",
+    urls = ["https://github.com/bazelbuild/bazel-gazelle/releases/download/v0.26.0/bazel-gazelle-v0.26.0.tar.gz"],
 )
 http_archive(
     name = "com_github_grpc_grpc",
-    sha256 = "291db3c4e030164421b89833ee761a2e6ca06b1d1f8e67953df762665d89439d",
-    strip_prefix = "grpc-1.46.1",
-    urls = ["https://github.com/grpc/grpc/archive/v1.46.1.tar.gz"],
+    sha256 = "9b1f348b15a7637f5191e4e673194549384f2eccf01fcef7cc1515864d71b424",
+    strip_prefix = "grpc-1.48.0",
+    urls = ["https://github.com/grpc/grpc/archive/v1.48.0.tar.gz"],
 )
 http_archive(
     name = "io_bazel_rules_docker",
-    sha256 = "59536e6ae64359b716ba9c46c39183403b01eabfbd57578e84398b4829ca499a",
-    strip_prefix = "rules_docker-0.22.0",
-    urls = ["https://github.com/bazelbuild/rules_docker/releases/download/v0.22.0/rules_docker-v0.22.0.tar.gz"],
+    sha256 = "b1e80761a8a8243d03ebca8845e9cc1ba6c82ce7c5179ce2b295cd36f7e394bf",
+    urls = ["https://github.com/bazelbuild/rules_docker/releases/download/v0.25.0/rules_docker-v0.25.0.tar.gz"],
 )
 http_archive(
     name = "rules_rust",
-    sha256 = "a1bd33f21e3880af177007d32729d67a6cc02c95f336b9513d0ab22e28345167",
-    strip_prefix = "rules_rust-0.6.0",
-    urls = ["https://github.com/bazelbuild/rules_rust/archive/0.6.0.tar.gz"],
+    sha256 = "f3d443e9ad1eca99fbcade1c649adbd8200753cf22e47846b3105a43a550273b",
+    strip_prefix = "rules_rust-0.8.1",
+    urls = ["https://github.com/bazelbuild/rules_rust/archive/0.8.1.tar.gz"],
+)
+http_archive(
+    name = "com_google_protobuf",
+    sha256 = "85d42d4485f36f8cec3e475a3b9e841d7d78523cd775de3a86dba77081f4ca25",
+    strip_prefix = "protobuf-3.21.4",
+    urls = [
+        "https://mirror.bazel.build/github.com/protocolbuffers/protobuf/archive/v3.21.4.tar.gz",
+        "https://github.com/protocolbuffers/protobuf/archive/v3.21.4.tar.gz",
+    ],
 )
 http_archive(
     name = "rules_proto_grpc",
@@ -36,10 +43,14 @@ http_archive(
 )
 http_archive(
     name = "rules_python",
-    sha256 = "95525d542c925bc2f4a7ac9b68449fc96ca52cfba15aa883f7193cdf745c38ff",
-    strip_prefix = "rules_python-cccbfb920c8b100744c53c0c03900f1be4040fe8",
-    url = "https://github.com/ppodolsky/rules_python/archive/cccbfb920c8b100744c53c0c03900f1be4040fe8.tar.gz",
+    sha256 = "f5f26431f86ab8dc991644d1577d6129e2707e6ae580ee9b500d1eb27547a265",
+    strip_prefix = "rules_python-ffab6b87dd8b85822c7d1f60a3fef42bc464485e",
+    url = "https://github.com/ppodolsky/rules_python/archive/ffab6b87dd8b85822c7d1f60a3fef42bc464485e.tar.gz",
 )
+
+# Proto
+load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
+protobuf_deps()
 
 # GRPC
 load("@rules_proto_grpc//:repositories.bzl", "rules_proto_grpc_repos", "rules_proto_grpc_toolchains")
@@ -61,7 +72,7 @@ crate_universe_dependencies(bootstrap = True)
 load("@rules_rust//crate_universe:defs.bzl", "crate", "crates_repository", "render_config")
 crates_repository(
     name = "crate_index",
-    lockfile = "//:Cargo.lock",
+    cargo_lockfile = "//:Cargo.lock",
     manifests = ["//:Cargo.toml"],
     generator = "@cargo_bazel_bootstrap//:cargo-bazel",
     supported_platform_triples = [
