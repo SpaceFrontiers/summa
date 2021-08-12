@@ -230,8 +230,8 @@ message Highlight {
 }
 
 message Snippet {
-  string fragment = 1;
-  repeated Highlight highlighted = 2;
+  bytes fragment = 1;
+  repeated Highlight highlights = 2;
 }
 
 message ScoredDocument {
@@ -239,6 +239,7 @@ message ScoredDocument {
   Score score = 2;
   uint32 position = 3;
   map<string, Snippet> snippets = 4;
+  string index_alias = 5;
 }
 
 message Scorer {

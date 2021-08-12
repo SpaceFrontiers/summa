@@ -232,7 +232,12 @@ impl IndexHolder {
     }
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
-    pub(crate) async fn search(&self, query: &proto::Query, collectors: Vec<proto::Collector>) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub(crate) async fn search(
+        &self,
+        external_index_alias: &str,
+        query: &proto::Query,
+        collectors: Vec<proto::Collector>,
+    ) -> SummaResult<Vec<proto::CollectorOutput>> {
         let searcher = self.index_reader.searcher();
         let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
@@ -248,13 +253,17 @@ impl IndexHolder {
         );
         let multi_fields = self.multi_fields.clone();
         let index_name = self.index_name.to_owned();
+        let external_index_alias = external_index_alias.to_string();
 
         let search_times_meter = self.search_times_meter.clone();
         tokio::task::spawn_blocking(move || -> SummaResult<Vec<proto::CollectorOutput>> {
             let start_time = Instant::now();
             let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
             search_times_meter.record(start_time.elapsed().as_secs_f64(), &[KeyValue::new("index_name", index_name)]);
-            Ok(extractors.drain(..).map(|e| e.extract(&mut multi_fruit, &searcher, &multi_fields)).collect())
+            Ok(extractors
+                .drain(..)
+                .map(|e| e.extract(&external_index_alias, &mut multi_fruit, &searcher, &multi_fields))
+                .collect())
         })
         .await?
     }

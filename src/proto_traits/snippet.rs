@@ -5,8 +5,8 @@ use crate::proto;
 impl From<tantivy::Snippet> for proto::Snippet {
     fn from(snippet: tantivy::Snippet) -> Self {
         proto::Snippet {
-            fragment: snippet.fragment().to_string(),
-            highlighted: snippet
+            fragment: snippet.fragment().as_bytes().to_vec(),
+            highlights: snippet
                 .highlighted()
                 .iter()
                 .map(|r| proto::Highlight {

@@ -35,7 +35,7 @@ impl proto::search_api_server::SearchApi for SearchApiImpl {
         let now = Instant::now();
 
         let collector_outputs = index_holder
-            .search(&query, proto_request.collectors)
+            .search(&proto_request.index_alias, &query, proto_request.collectors)
             .instrument(info_span!("search", tags = ?proto_request.tags))
             .await?;
         let elapsed_secs = now.elapsed().as_secs_f64();

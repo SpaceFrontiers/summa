@@ -79,14 +79,14 @@ impl IndexService {
     ///
     /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
     /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
-    pub async fn get_index_holder(&self, index_alias_or_name: &str) -> SummaResult<Handler<IndexHolder>> {
+    pub async fn get_index_holder(&self, index_alias: &str) -> SummaResult<Handler<IndexHolder>> {
         self.get_index_holder_by_name(
             self.application_config
                 .read()
                 .await
-                .resolve_index_alias(index_alias_or_name)
+                .resolve_index_alias(index_alias)
                 .as_deref()
-                .unwrap_or(index_alias_or_name),
+                .unwrap_or(index_alias),
         )
         .await
     }

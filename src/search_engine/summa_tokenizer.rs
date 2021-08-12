@@ -42,7 +42,7 @@ impl<'a> SummaTokenStream<'a> {
                 *cci = Some((offset, c));
                 (offset, c)
             })
-            .filter(|&(_, ref c)| !c.is_alphanumeric() || is_cjk(c))
+            .filter(|&(_, ref c)| !(c.is_alphanumeric() || *c == '#' || *c == '+') || is_cjk(c))
             .map(|(offset, _)| offset)
             .next()
             .unwrap_or(self.text.len())
@@ -55,15 +55,15 @@ impl<'a> TokenStream for SummaTokenStream<'a> {
         self.token.position = self.token.position.wrapping_add(1);
         while let Some((offset_from, c)) = self.current_char_index {
             if c.is_alphanumeric() {
-                let offset_to = if is_cjk(&c) {
-                    self.current_char_index = self.chars.next();
-                    offset_from + c.len_utf8()
-                } else {
+                let offset_to = if !is_cjk(&c) {
                     let offset_to = self.search_token_end();
                     if !is_cjk(&self.current_char_index.unwrap().1) {
                         self.current_char_index = self.chars.next();
                     }
                     offset_to
+                } else {
+                    self.current_char_index = self.chars.next();
+                    offset_from + c.len_utf8()
                 };
                 self.token.offset_from = offset_from;
                 self.token.offset_to = offset_to;
