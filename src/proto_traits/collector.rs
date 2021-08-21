@@ -10,6 +10,7 @@ pub mod shortcuts {
                 offset: 0,
                 scorer: None,
                 snippets: HashMap::new(),
+                explain: false,
             })),
         }
     }
@@ -23,12 +24,14 @@ pub mod shortcuts {
                     scorer: Some(proto::scorer::Scorer::EvalExpr(eval_expr.to_owned())),
                 }),
                 snippets: HashMap::new(),
+                explain: false,
             })),
         }
     }
 
     pub fn scored_doc(document: &str, score: f64, position: u32) -> proto::ScoredDocument {
         proto::ScoredDocument {
+            index_alias: "index".to_string(),
             document: document.to_owned(),
             score: Some(proto::Score {
                 score: Some(proto::score::Score::F64Score(score)),

@@ -6,7 +6,7 @@ def test_synonyms():
     query_processor = QueryProcessor(
         tree_transformers=[SynonymTreeTransformer.drugs()],
     )
-    processed_query = query_processor.process('aspirin test', 'en')
+    processed_query = query_processor.process('aspirin test', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [{'occur': 'should',
                                     'query': {'disjunction_max': {'disjuncts': [{'match': {'value': '"acetylsalicylic '
@@ -30,7 +30,7 @@ def test_synonyms():
                                     'query': {'match': {'value': 'test'}}}]},
     }
 
-    processed_query = query_processor.process('walking on the road', 'en')
+    processed_query = query_processor.process('walking on the road', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [{
             'occur': 'should', 'query': {'match': {'value': 'walking'}}}, {

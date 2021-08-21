@@ -7,7 +7,7 @@ use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema as Fields};
 use tantivy::{DateTime, Index, Term};
@@ -103,6 +103,7 @@ impl QueryParser {
         );
         Ok(match &query.query {
             None | Some(proto::query::Query::All(_)) => Box::new(AllQuery),
+            Some(proto::query::Query::Empty(_)) => Box::new(EmptyQuery),
             Some(proto::query::Query::Boolean(boolean_query_proto)) => {
                 let mut subqueries = vec![];
                 for subquery in &boolean_query_proto.subqueries {
@@ -157,15 +158,15 @@ impl QueryParser {
                 while let Some(token) = token_stream.next() {
                     terms.push((token.position, cast_value_to_term(field, field_entry.field_type(), &token.text)?))
                 }
-                if terms.len() == 1 {
+                if terms.is_empty() {
+                    Box::new(EmptyQuery)
+                } else if terms.len() == 1 {
                     Box::new(TermQuery::new(
                         terms[0].1.clone(),
                         field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
                     ))
                 } else {
-                    let mut phrase_query = PhraseQuery::new_with_offset(terms);
-                    phrase_query.set_slop(phrase_query_proto.slop);
-                    Box::new(phrase_query)
+                    Box::new(PhraseQuery::new_with_offset_and_slop(terms, phrase_query_proto.slop))
                 }
             }
             Some(proto::query::Query::Term(term_query_proto)) => {

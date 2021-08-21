@@ -38,8 +38,8 @@ class MorphyTreeTransformer(TreeTransformer):
         if self.enable_accent and 'ё' in node.value:
             syn_forms.append(Word(node.value.replace('ё', 'е')))
 
-        if self.enable_morph and context.language in self.morphology:
-            for w in self.morphology[context.language].derive_forms(node.value):
+        if self.enable_morph and context.query_language in self.morphology:
+            for w in self.morphology[context.query_language].derive_forms(node.value):
                 if node.value != w:
                     syn_forms.append(Word(w))
 

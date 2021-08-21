@@ -206,7 +206,7 @@ pub struct ReservoirSampling(pub FruitHandle<Vec<DocAddress>>);
 impl FruitExtractor for ReservoirSampling {
     fn extract(
         self: Box<Self>,
-        _external_index_alias: &str,
+        external_index_alias: &str,
         multi_fruit: &mut MultiFruit,
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
@@ -215,11 +215,15 @@ impl FruitExtractor for ReservoirSampling {
         proto::CollectorOutput {
             collector_output: Some(proto::collector_output::CollectorOutput::ReservoirSampling(
                 proto::ReservoirSamplingCollectorOutput {
-                    documents: self
+                    random_documents: self
                         .0
                         .extract(multi_fruit)
                         .iter()
-                        .map(|doc_address| NamedFieldDocument::from_document(fields, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json())
+                        .map(|doc_address| proto::RandomDocument {
+                            index_alias: external_index_alias.to_string(),
+                            document: NamedFieldDocument::from_document(fields, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json(),
+                            score: Some((1.0).into()),
+                        })
                         .collect(),
                 },
             )),

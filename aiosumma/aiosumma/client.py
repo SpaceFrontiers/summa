@@ -461,17 +461,23 @@ class SummaClient(BaseGrpcClient):
             request_id: request id
             session_id: session id
         """
-        if not isinstance(collectors, List):
+        if isinstance(collectors, (Dict, search_service_pb.Collector)):
             collectors = [collectors]
 
         try:
+            search_request = search_service_pb.SearchRequest(
+                index_alias=index_alias,
+                query=query,
+                tags=tags,
+            )
+            for collector in collectors:
+                if isinstance(collector, Dict):
+                    dict_collector = collector
+                    collector = search_service_pb.Collector()
+                    ParseDict(dict_collector, collector)
+                search_request.collectors.append(collector)
             return await self.stubs['search_api'].search(
-                ParseDict({
-                    'index_alias': index_alias,
-                    'query': query,
-                    'collectors': collectors,
-                    'tags': tags,
-                }, search_service_pb.SearchRequest()),
+                search_request,
                 metadata=(('request-id', request_id), ('session-id', session_id)),
             )
         except AioRpcError as e:

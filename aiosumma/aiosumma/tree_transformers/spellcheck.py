@@ -10,7 +10,7 @@ from .base import TreeTransformer
 
 class SpellcheckTreeTransformer(TreeTransformer):
     def visit_group(self, node, context, parents=None):
-        if context.language == 'en':
+        if context.query_language == 'en':
             corrected_operands = []
             for operand in node.operands:
                 if isinstance(operand, Word):

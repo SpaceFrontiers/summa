@@ -45,10 +45,12 @@ message Query {
     MoreLikeThisQuery more_like_this = 8;
     BoostQuery boost = 9;
     DisjunctionMaxQuery disjunction_max = 10;
+    EmptyQuery empty = 11;
   }
 }
 
 message AllQuery {}
+message EmptyQuery {}
 
 message BoostQuery {
   Query query = 1;

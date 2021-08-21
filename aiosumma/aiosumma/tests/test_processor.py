@@ -6,7 +6,6 @@ from aiosumma.tree_transformers import (
     MorphyTreeTransformer,
     OptimizingTreeTransformer,
     OrderByTreeTransformer,
-    SpellcheckTreeTransformer,
     SynonymTreeTransformer,
     TantivyTreeTransformer,
     ValuesWordTreeTransformer,
@@ -25,12 +24,12 @@ class MarkWordTransformer(ValueWordTreeTransformer):
 
 def test_optimizing_query_processor():
     query_processor = QueryProcessor()
-    processed_query = query_processor.process('search engine', 'en')
+    processed_query = query_processor.process('search engine', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'match': {'value': 'engine'}}}
     ]}}
-    processed_query = query_processor.process('(search (dog cat))', 'en')
+    processed_query = query_processor.process('(search (dog cat))', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'search'}}},
         {'occur': 'should', 'query': {'match': {'value': 'dog'}}},
@@ -48,7 +47,7 @@ def test_order_by_query_processor():
             valid_fields=frozenset(['field1', 'field2', 'field3']),
         )],
     )
-    processed_query = query_processor.process('term1 term2 order_by:f1', 'en')
+    processed_query = query_processor.process('term1 term2 order_by:f1', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'term1'}}},
         {'occur': 'should', 'query': {'match': {'value': 'term2'}}}
@@ -60,7 +59,7 @@ def test_values_processor():
     query_processor = QueryProcessor(tree_transformers=[
         ValuesWordTreeTransformer(word_transformers=[MarkWordTransformer()]),
     ])
-    processed_query = query_processor.process('term1 term2 mark', 'en')
+    processed_query = query_processor.process('term1 term2 mark', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'term1'}}},
         {'occur': 'should', 'query': {'match': {'value': 'term2'}}}
@@ -78,14 +77,15 @@ def test_production_chain():
             OptimizingTreeTransformer(),
         ],
     )
-    processed_query = query_processor.process('Claudio rugarli', 'en')
+    processed_query = query_processor.process('Claudio rugarli', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
-            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'claudio'}},
-                                                                     {'match': {'value': 'claudios'}}]}}},
-            {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'rugarli'}},
-                                                                            {'match': {'value': 'rugarlis'}}]}}}]}}
-    processed_query = query_processor.process('+(search engine) -car', 'en')
+            {'occur': 'should', 'query': {'match': {'value': 'claudio'}}},
+            {'occur': 'should', 'query': {'match': {'value': 'rugarli'}}},
+        ]}
+    }
+
+    processed_query = query_processor.process('+(search engine) -car', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
             {'occur': 'must', 'query': {'disjunction_max': {'disjuncts': [
@@ -99,7 +99,7 @@ def test_production_chain():
                 {'boolean': {'subqueries': [{'occur': 'must_not', 'query': {'match': {'value': 'cars'}}}]}}]}}}]},
     }
 
-    processed_query = query_processor.process('search engine', 'en')
+    processed_query = query_processor.process('search engine', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
             {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [
@@ -110,7 +110,7 @@ def test_production_chain():
                 {'match': {'value': 'engines'}}]}}},
         ]}
     }
-    processed_query = query_processor.process('author:Smith +"title book"', 'en')
+    processed_query = query_processor.process('author:Smith +"title book"', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [{'occur': 'should',
                                     'query': {'term': {'field': 'author',
@@ -121,7 +121,7 @@ def test_production_chain():
                                    {'occur': 'must',
                                     'query': {'match': {'value': '"title book"'}}}]},
     }
-    processed_query = query_processor.process('science +year:[2010 TO *]', 'en')
+    processed_query = query_processor.process('science +year:[2010 TO *]', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [{'occur': 'should',
                                     'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'science'}},
@@ -137,7 +137,7 @@ def test_production_chain():
 
 def test_unknown_language_transformer():
     query_processor = QueryProcessor(tree_transformers=[MorphyTreeTransformer(enable_morph=True), OptimizingTreeTransformer()])
-    processed_query = query_processor.process('search engine', 'zz')
+    processed_query = query_processor.process('search engine', languages={'zz': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
             {'occur': 'should', 'query': {'disjunction_max': {'disjuncts': [
@@ -152,7 +152,7 @@ def test_unknown_language_transformer():
 
 def test_unknown_query_language_transformer():
     query_processor = QueryProcessor(tree_transformers=[MorphyTreeTransformer(enable_morph=True), OptimizingTreeTransformer()])
-    processed_query = query_processor.process('kavanaba mutagor', 'zz')
+    processed_query = query_processor.process('kavanaba mutagor', languages={'zz': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [
             {'occur': 'should', 'query': {'match': {'value': 'kavanaba'}}},
@@ -166,7 +166,7 @@ def test_exact_match_transformers():
             ExactMatchTreeTransformer('title'),
         ]
     )
-    processed_query = query_processor.process('search engine', 'en')
+    processed_query = query_processor.process('search engine', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [{'occur': 'should',
                                     'query': {'match': {'value': 'search'}}},
@@ -187,12 +187,12 @@ def test_doi_transformer():
             DoiTreeTransformer(),
         ]
     )
-    processed_query = query_processor.process('https://doi.org/10.1101/2022.05.26.493559', 'en')
+    processed_query = query_processor.process('https://doi.org/10.1101/2022.05.26.493559', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'boost': {'query': {'term': {
         'field': 'doi',
         'value': '10.1101/2022.05.26.493559',
     }}, 'score': '1'}}
-    processed_query = query_processor.process('https://google.com/?query=one+two+three', 'en')
+    processed_query = query_processor.process('https://google.com/?query=one+two+three', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'match': {'value': 'https://google.com/?query=one+two+three'}}
-    processed_query = query_processor.process('https://doi.org/10.1101', 'en')
+    processed_query = query_processor.process('https://doi.org/10.1101', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'match': {'value': 'https://doi.org/10.1101'}}

@@ -6,7 +6,7 @@ def test_spell_check():
     query_processor = QueryProcessor(
         tree_transformers=[SpellcheckTreeTransformer()],
     )
-    processed_query = query_processor.process('desinged fro embeded usin', 'en')
+    processed_query = query_processor.process('desinged fro embeded usin', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {
         'boolean': {'subqueries': [{'occur': 'should',
                                     'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'desinged'}},
@@ -20,7 +20,7 @@ def test_spell_check():
                                     'query': {'disjunction_max': {'disjuncts': [{'match': {'value': 'usin'}},
                                                                                 {'match': {'value': 'using'}}]}}}]},
     }
-    processed_query = query_processor.process('covid-19 haemophilia', 'en')
+    processed_query = query_processor.process('covid-19 haemophilia', languages={'en': 1.0})
     assert processed_query.to_summa_query() == {'boolean': {'subqueries': [
         {'occur': 'should', 'query': {'match': {'value': 'covid-19'}}},
         {'occur': 'should', 'query': {'match': {'value': 'haemophilia'}}}]}
