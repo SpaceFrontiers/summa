@@ -19,3 +19,8 @@ class QueryContext:
 
     def set_query_point_of_time(self, year):
         self.query_point_of_time = time.mktime(datetime.date(year, 7, 1).timetuple())
+
+    def blank_query(self):
+        if self.has_invalid_fields:
+            return {'empty': {}}
+        return {'all': {}}

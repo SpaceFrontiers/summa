@@ -20,16 +20,12 @@ class ProcessedQuery:
         self.parsed_query = parsed_query
         self.context = context
 
-    def empty_query(self):
-        if self.context.has_invalid_fields:
-            return
-
     def is_empty(self):
         # Check if there are any nodes in the query
         return not bool(self.parsed_query)
 
     def to_summa_query(self):
-        return self.parsed_query.to_summa_query() if self.parsed_query else self.empty_query()
+        return self.parsed_query.to_summa_query(self.context) if not self.is_empty() else self.context.blank_query()
 
     def __repr__(self):
         return repr(self.parsed_query)

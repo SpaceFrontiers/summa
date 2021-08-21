@@ -42,7 +42,7 @@ class Item:
                 )
                 and all(c.__eq__(d) for c, d in zip(self.children, other.children)))
 
-    def to_summa_query(self):
+    def to_summa_query(self, context):
         return {'match': {'value': str(self)}}
 
 
@@ -65,7 +65,7 @@ class SearchField(Item):
     def __repr__(self):
         return "SearchField(%r, %s)" % (self.name, self.expr.__repr__())
 
-    def to_summa_query(self):
+    def to_summa_query(self, context):
         if isinstance(self.expr, Range):
             return {'range': {'field': self.name, 'value': self.expr.to_partial_summa_query()}}
         elif isinstance(self.expr, Word):
@@ -101,17 +101,17 @@ class BaseGroup(Item):
     def __len__(self):
         return len(self.operands)
 
-    def to_summa_query(self):
+    def to_summa_query(self, context):
         subqueries = []
         if not self.operands:
-            return {'all': {}}
+            return context.blank_query()
         for operand in self.operands:
             if isinstance(operand, Plus):
-                subqueries.append({'occur': 'must', 'query': operand.a.to_summa_query()})
+                subqueries.append({'occur': 'must', 'query': operand.a.to_summa_query(context)})
             elif isinstance(operand, Minus):
-                subqueries.append({'occur': 'must_not', 'query': operand.a.to_summa_query()})
+                subqueries.append({'occur': 'must_not', 'query': operand.a.to_summa_query(context)})
             else:
-                query = operand.to_summa_query()
+                query = operand.to_summa_query(context)
                 if query:
                     subqueries.append({'occur': 'should', 'query': query})
         return {'boolean': {'subqueries': subqueries}}
@@ -128,12 +128,12 @@ class Group(BaseGroup):
 
 
 class SynonymsGroup(BaseGroup):
-    def to_summa_query(self):
+    def to_summa_query(self, context):
         disjuncts = []
         if not self.operands:
-            return {'all': {}}
+            return context.blank_query()
         for operand in self.operands:
-            query = operand.to_summa_query()
+            query = operand.to_summa_query(context)
             if query:
                 disjuncts.append(query)
         return {'disjunction_max': {'disjuncts': disjuncts}}
@@ -327,8 +327,8 @@ class Boost(Item):
     def __str__(self):
         return "%s^%s" % (self.expr.__str__(), str(self.score))
 
-    def to_summa_query(self):
-        return {'boost': {'query': self.expr.to_summa_query(), 'score': str(self.score)}}
+    def to_summa_query(self, context):
+        return {'boost': {'query': self.expr.to_summa_query(context), 'score': str(self.score)}}
 
 
 class Unary(Item):
@@ -342,8 +342,8 @@ class Unary(Item):
     def __str__(self):
         return "%s%s" % (self.op, self.a.__str__())
 
-    def to_summa_query(self):
-        return {'boolean': {'subqueries': [{'occur': 'should', 'query': self.a.to_summa_query()}]}}
+    def to_summa_query(self, context):
+        return {'boolean': {'subqueries': [{'occur': 'should', 'query': self.a.to_summa_query(context)}]}}
 
     @property
     def children(self):
@@ -355,8 +355,8 @@ class Plus(Unary):
     """
     op = "+"
 
-    def to_summa_query(self):
-        return {'boolean': {'subqueries': [{'occur': 'must', 'query': self.a.to_summa_query()}]}}
+    def to_summa_query(self, context):
+        return {'boolean': {'subqueries': [{'occur': 'must', 'query': self.a.to_summa_query(context)}]}}
 
 
 class Minus(Unary):
@@ -364,5 +364,5 @@ class Minus(Unary):
     """
     op = "-"
 
-    def to_summa_query(self):
-        return {'boolean': {'subqueries': [{'occur': 'must_not', 'query': self.a.to_summa_query()}]}}
+    def to_summa_query(self, context):
+        return {'boolean': {'subqueries': [{'occur': 'must_not', 'query': self.a.to_summa_query(context)}]}}

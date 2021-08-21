@@ -12,4 +12,4 @@ def test_eval_scorer_builder():
         offset=timedelta(seconds=10),
         decay=0.5,
     )
-    assert q.build()['eval_expr'] == 'original_score * e() ^ ((log(e(), 0.5) / 50.0) * max(0, abs(x - 100) - 10.0))'
+    assert q.build().eval_expr == 'original_score * e() ^ ((log(e(), 0.5) / 50.0) * max(0, abs(x - 100) - 10.0))'
