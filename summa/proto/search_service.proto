@@ -288,8 +288,14 @@ message ReservoirSamplingCollector {
   uint32 limit = 1;
 }
 
+message RandomDocument {
+  string document = 1;
+  Score score = 2;
+  string index_alias = 3;
+}
+
 message ReservoirSamplingCollectorOutput {
-  repeated string documents = 1;
+  repeated RandomDocument random_documents = 1;
 }
 
 message TopDocsCollector {
