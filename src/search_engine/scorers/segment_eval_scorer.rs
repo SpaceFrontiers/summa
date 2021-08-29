@@ -15,7 +15,9 @@ pub struct SegmentEvalScorer {
 }
 
 fn fast_field_to_iter(schema: &Schema, segment_reader: &SegmentReader, field_name: &str) -> SummaResult<Box<dyn FastFieldIterator>> {
-    let field = schema.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
+    let field = schema
+        .get_field(field_name)
+        .ok_or_else(|| ValidationError::MissingField(field_name.to_owned()))?;
     let field_type = schema.get_field_entry(field).field_type();
     let fast_field = match field_type {
         FieldType::U64(_) => {

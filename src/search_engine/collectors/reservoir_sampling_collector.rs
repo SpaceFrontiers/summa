@@ -1,5 +1,3 @@
-use crate::proto;
-
 use rand::rngs::SmallRng;
 use rand::{Rng, RngCore, SeedableRng};
 use tantivy::collector::Collector;
@@ -162,12 +160,6 @@ impl SegmentCollector for SegmentReservoirSamplingCollector {
 
     fn harvest(self) -> (Vec<DocAddress>, usize) {
         (self.reservoir, self.seen_segment_docs)
-    }
-}
-
-impl From<proto::ReservoirSamplingCollector> for ReservoirSampling {
-    fn from(reservoir_sampling_collector: proto::ReservoirSamplingCollector) -> Self {
-        ReservoirSampling::with_limit(reservoir_sampling_collector.limit.try_into().unwrap())
     }
 }
 

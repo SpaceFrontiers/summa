@@ -1,6 +1,7 @@
 use crate::errors::ValidationError::InvalidAggregation;
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
+use crate::search_engine::collectors;
 use crate::search_engine::custom_serializer::NamedFieldDocument;
 use crate::search_engine::scorers::EvalScorer;
 use std::collections::{HashMap, HashSet};
@@ -44,19 +45,13 @@ fn parse_aggregation_results(
         .collect()
 }
 
-fn check_snippets(schema: &Schema, snippets: &HashMap<String, u32>) -> SummaResult<()> {
-    for snippet_field in snippets.keys() {
-        if schema.get_field(snippet_field).is_none() {
-            return Err(ValidationError::MissingSnippetField(snippet_field.to_string()).into());
-        }
-    }
-    Ok(())
-}
-
-fn get_fields(schema: &Schema, fields: &[String]) -> SummaResult<Option<HashSet<Field>>> {
+fn get_fields<'a, F: Iterator<Item = &'a String>>(schema: &Schema, fields: F) -> SummaResult<Option<HashSet<Field>>> {
     let fields = fields
-        .iter()
-        .map(|field| schema.get_field(field).ok_or_else(|| Error::FieldDoesNotExist(field.to_owned())))
+        .map(|field| {
+            schema
+                .get_field(field)
+                .ok_or_else(|| Error::Validation(ValidationError::MissingField(field.to_owned())))
+        })
         .collect::<SummaResult<HashSet<Field>>>()?;
     Ok((!fields.is_empty()).then(|| fields))
 }
@@ -69,8 +64,8 @@ pub fn build_fruit_extractor(
 ) -> SummaResult<Box<dyn FruitExtractor>> {
     match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
-            check_snippets(schema, &top_docs_collector_proto.snippets)?;
-            let fields = get_fields(schema, &top_docs_collector_proto.fields)?;
+            get_fields(schema, top_docs_collector_proto.snippets.keys())?;
+            let fields = get_fields(schema, top_docs_collector_proto.fields.iter())?;
             Ok(match top_docs_collector_proto.scorer {
                 None | Some(proto::Scorer { scorer: None }) => Box::new(
                     TopDocsBuilder::default()
@@ -111,7 +106,9 @@ pub fn build_fruit_extractor(
                 Some(proto::Scorer {
                     scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
                 }) => {
-                    let order_by_field = schema.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
+                    let order_by_field = schema
+                        .get_field(field_name)
+                        .ok_or_else(|| ValidationError::MissingField(field_name.to_owned()))?;
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                         .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
                         .order_by_u64_field(order_by_field);
@@ -129,14 +126,20 @@ pub fn build_fruit_extractor(
             })
         }
         Some(proto::collector::Collector::ReservoirSampling(reservoir_sampling_collector_proto)) => {
-            let reservoir_sampling_collector: crate::search_engine::collectors::ReservoirSampling = reservoir_sampling_collector_proto.into();
-            Ok(Box::new(ReservoirSampling(multi_collector.add_collector(reservoir_sampling_collector))) as Box<dyn FruitExtractor>)
+            let fields = get_fields(schema, reservoir_sampling_collector_proto.fields.iter())?;
+            let reservoir_sampling_collector = collectors::ReservoirSampling::with_limit(reservoir_sampling_collector_proto.limit.try_into().unwrap());
+            Ok(Box::new(
+                ReservoirSamplingBuilder::default()
+                    .handle(multi_collector.add_collector(reservoir_sampling_collector))
+                    .fields(fields)
+                    .build()?,
+            ) as Box<dyn FruitExtractor>)
         }
         Some(proto::collector::Collector::Count(_)) => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
         Some(proto::collector::Collector::Facet(facet_collector_proto)) => {
             let field = schema
                 .get_field(&facet_collector_proto.field)
-                .ok_or_else(|| Error::FieldDoesNotExist(facet_collector_proto.field.to_owned()))?;
+                .ok_or_else(|| ValidationError::MissingField(facet_collector_proto.field.to_owned()))?;
             let mut facet_collector = tantivy::collector::FacetCollector::for_field(field);
             for facet in &facet_collector_proto.facets {
                 facet_collector.add_facet(facet);
@@ -215,7 +218,13 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
     }
 }
 
-pub struct ReservoirSampling(pub FruitHandle<Vec<DocAddress>>);
+#[derive(Builder)]
+#[builder(pattern = "owned", build_fn(error = "ValidationError"))]
+pub struct ReservoirSampling {
+    handle: FruitHandle<Vec<DocAddress>>,
+    #[builder(default = "None")]
+    fields: Option<HashSet<Field>>,
+}
 
 impl FruitExtractor for ReservoirSampling {
     fn extract(
@@ -230,12 +239,12 @@ impl FruitExtractor for ReservoirSampling {
             collector_output: Some(proto::collector_output::CollectorOutput::ReservoirSampling(
                 proto::ReservoirSamplingCollectorOutput {
                     random_documents: self
-                        .0
+                        .handle
                         .extract(multi_fruit)
                         .iter()
                         .map(|doc_address| proto::RandomDocument {
                             index_alias: external_index_alias.to_string(),
-                            document: NamedFieldDocument::from_document(schema, &None, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json(),
+                            document: NamedFieldDocument::from_document(schema, &self.fields, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json(),
                             score: Some((1.0).into()),
                         })
                         .collect(),

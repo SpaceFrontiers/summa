@@ -1,4 +1,4 @@
-use crate::errors::{Error, SummaResult};
+use crate::errors::{Error, SummaResult, ValidationError};
 use crate::search_engine::scorers::SegmentEvalScorer;
 use fasteval2::Evaler;
 use std::collections::HashSet;
@@ -26,7 +26,11 @@ impl EvalScorer {
         let parsed = parser.parse(eval_expr, &mut slab.ps)?.from(&slab.ps);
         let mut var_names = vec![];
         for var_name in parsed.var_names(&slab).iter().filter(|var_name| !RESERVED_WORDS.contains((*var_name).as_str())) {
-            schema.get_field(var_name).ok_or_else(|| Error::FieldDoesNotExist(var_name.to_owned()))?;
+            let field = schema.get_field(var_name);
+            let field = field.ok_or_else(|| ValidationError::MissingField(var_name.to_owned()))?;
+            if !schema.get_field_entry(field).is_fast() {
+                return Err(Error::Validation(ValidationError::RequiredFastField(var_name.to_owned())));
+            }
             var_names.push(var_name.to_owned());
         }
 

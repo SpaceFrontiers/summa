@@ -41,14 +41,20 @@ pub enum ValidationError {
     MissingIndex(String),
     #[error("missing_default_field_error: {0}")]
     MissingDefaultField(String),
+    #[error("missing_field_error: {0}")]
+    MissingField(String),
     #[error("missing_multi_field_error: {0}")]
     MissingMultiField(String),
     #[error("missing_path_error: {0}")]
     MissingPath(PathBuf),
     #[error("missing_primary_key_error: {0:?}")]
     MissingPrimaryKey(Option<String>),
+    #[error("missing_range")]
+    MissingRange,
     #[error("missing_snippet_field: {0}")]
     MissingSnippetField(String),
+    #[error("required_fast_field: {0}")]
+    RequiredFastField(String),
     #[error("utf8_error: {0}")]
     Utf8(std::str::Utf8Error),
 }
@@ -69,8 +75,6 @@ pub enum Error {
     EmptyQuery,
     #[error("fast_eval_error: {0:?}")]
     FastEval(fasteval2::Error),
-    #[error("field_does_not_exist_error: {0}")]
-    FieldDoesNotExist(String),
     #[error("hyper_error: {0}")]
     Hyper(hyper::Error),
     #[error("infallible")]
@@ -223,7 +227,6 @@ impl From<Error> for tonic::Status {
                 Error::Tantivy(_) => tonic::Code::InvalidArgument,
                 Error::Validation(ValidationError::MissingConsumer(_)) | Error::Validation(ValidationError::MissingIndex(_)) => tonic::Code::NotFound,
                 Error::Validation(_) => tonic::Code::InvalidArgument,
-                Error::FieldDoesNotExist(_) => tonic::Code::NotFound,
                 _ => tonic::Code::Internal,
             },
             format!("{}", error),

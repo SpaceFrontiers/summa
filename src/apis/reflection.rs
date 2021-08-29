@@ -2,7 +2,7 @@
 //!
 //! Reflection GRPC API is using for inspecting indices
 
-use crate::errors::{Error, SummaResult};
+use crate::errors::{SummaResult, ValidationError};
 use crate::proto;
 use crate::services::IndexService;
 use std::cmp::Reverse;
@@ -29,7 +29,7 @@ impl proto::reflection_api_server::ReflectionApi for ReflectionApiImpl {
         let field = index_holder
             .schema()
             .get_field(&proto_request.field_name)
-            .ok_or_else(|| Error::FieldDoesNotExist(proto_request.field_name.to_owned()))?;
+            .ok_or_else(|| ValidationError::MissingField(proto_request.field_name.to_owned()))?;
 
         let top_k = proto_request.top_k.try_into().unwrap();
         let mut per_segment = HashMap::new();

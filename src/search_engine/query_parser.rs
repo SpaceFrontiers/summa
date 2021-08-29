@@ -1,4 +1,4 @@
-use crate::errors::{Error, SummaResult};
+use crate::errors::{Error, SummaResult, ValidationError};
 use crate::metrics::ToLabel;
 use crate::proto;
 use opentelemetry::metrics::Counter;
@@ -88,7 +88,7 @@ impl QueryParser {
         let field = self
             .cached_schema
             .get_field(field_name)
-            .ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
+            .ok_or_else(|| ValidationError::MissingField(field_name.to_owned()))?;
         let field_entry = self.cached_schema.get_field_entry(field);
         Ok((field, field_entry))
     }
@@ -131,12 +131,12 @@ impl QueryParser {
             )),
             Some(proto::query::Query::Match(match_query_proto)) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
                 Ok(parsed_query) => Ok(parsed_query),
-                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::FieldDoesNotExist(field)),
+                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::Validation(ValidationError::MissingField(field))),
                 Err(e) => Err(Error::InvalidTantivySyntax(e, match_query_proto.value.to_owned())),
             }?,
             Some(proto::query::Query::Range(range_query_proto)) => {
                 let (field, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
-                let value = range_query_proto.value.as_ref().unwrap();
+                let value = range_query_proto.value.as_ref().ok_or(ValidationError::MissingRange)?;
                 let left = cast_value_to_bound_term(field, field_entry.field_type(), &value.left, value.including_left)?;
                 let right = cast_value_to_bound_term(field, field_entry.field_type(), &value.right, value.including_right)?;
                 Box::new(RangeQuery::new_term_bounds(field, field_entry.field_type().value_type(), &left, &right))

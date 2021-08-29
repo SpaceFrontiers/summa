@@ -288,6 +288,7 @@ message FacetCollectorOutput {
 
 message ReservoirSamplingCollector {
   uint32 limit = 1;
+  repeated string fields = 2;
 }
 
 message RandomDocument {
