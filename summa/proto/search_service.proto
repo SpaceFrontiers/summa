@@ -306,6 +306,7 @@ message TopDocsCollector {
   optional Scorer scorer = 3;
   map<string, uint32> snippets = 4;
   bool explain = 5;
+  repeated string fields = 6;
 }
 
 message TopDocsCollectorOutput {

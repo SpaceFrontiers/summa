@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import (
     Dict,
     List,
@@ -58,9 +59,13 @@ class QueryProcessor:
         return query
 
     def apply_tree_transformers(self, processed_query: ProcessedQuery):
+        new_processed_query = deepcopy(processed_query)
         for tree_transformer in self.tree_transformers:
-            processed_query.parsed_query = tree_transformer.visit(processed_query.parsed_query, context=processed_query.context)
-        return processed_query
+            new_processed_query.parsed_query = tree_transformer.visit(
+                new_processed_query.parsed_query,
+                context=new_processed_query.context,
+            )
+        return new_processed_query
 
     def process(self, query: str, languages: Optional[Union[Dict[str, float], str]] = None) -> ProcessedQuery:
         if languages is None or languages == '':

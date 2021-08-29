@@ -50,7 +50,7 @@ message SortByField {
 
 message CreateIndexRequest {
   string index_name = 1;
-  string fields = 2;
+  string schema = 2;
   IndexEngine index_engine = 10;
   optional string primary_key = 3;
   repeated string default_fields = 4;

@@ -2,7 +2,7 @@ use super::fast_field_iterator::{FastFieldIterator, FastFieldIteratorImpl};
 use crate::errors::{Error, SummaResult, ValidationError};
 use fasteval2::{Compiler, Evaler, Instruction};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tantivy::schema::{FieldType, Schema as Fields};
+use tantivy::schema::{FieldType, Schema};
 use tantivy::{DocId, Score, SegmentReader};
 
 pub struct SegmentEvalScorer {
@@ -14,9 +14,9 @@ pub struct SegmentEvalScorer {
     namespace: fn(&str, Vec<f64>) -> Option<f64>,
 }
 
-fn fast_field_to_iter(fields: &Fields, segment_reader: &SegmentReader, field_name: &str) -> SummaResult<Box<dyn FastFieldIterator>> {
-    let field = fields.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
-    let field_type = fields.get_field_entry(field).field_type();
+fn fast_field_to_iter(schema: &Schema, segment_reader: &SegmentReader, field_name: &str) -> SummaResult<Box<dyn FastFieldIterator>> {
+    let field = schema.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
+    let field_type = schema.get_field_entry(field).field_type();
     let fast_field = match field_type {
         FieldType::U64(_) => {
             FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().u64(field).map_err(|_| ValidationError::InvalidFastFieldType {
@@ -51,7 +51,7 @@ impl SegmentEvalScorer {
     #[inline]
     pub fn for_segment(
         segment_reader: &SegmentReader,
-        fields: &Fields,
+        schema: &Schema,
         parser: &fasteval2::Parser,
         eval_expr: &str,
         var_names: &Vec<String>,
@@ -82,7 +82,7 @@ impl SegmentEvalScorer {
 
         // Set fast fields
         for var_name in var_names {
-            fast_fields_iterators.push(fast_field_to_iter(fields, segment_reader, var_name)?);
+            fast_fields_iterators.push(fast_field_to_iter(schema, segment_reader, var_name)?);
             unsafe {
                 slab.ps.add_unsafe_var(var_name.to_owned(), fast_fields_iterators.last().unwrap().value());
             }

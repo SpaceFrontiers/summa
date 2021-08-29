@@ -12,7 +12,7 @@ use opentelemetry::{global, KeyValue};
 use std::collections::HashSet;
 use std::time::Duration;
 use tantivy::collector::MultiCollector;
-use tantivy::schema::{Field, Schema as Fields};
+use tantivy::schema::{Field, Schema};
 use tantivy::{Index, IndexReader, IndexSettings, Opstamp, ReloadPolicy};
 use tokio::fs::remove_dir_all;
 use tokio::sync::RwLock;
@@ -23,7 +23,7 @@ use tracing::{info, info_span, instrument, trace, warn, Instrument};
 pub struct IndexHolder {
     index_name: String,
     index_config_proxy: IndexConfigProxy,
-    cached_fields: Fields,
+    cached_schema: Schema,
     index_reader: IndexReader,
     query_parser: QueryParser,
     multi_fields: HashSet<Field>,
@@ -52,11 +52,11 @@ impl IndexHolder {
         let index_config = index_config_proxy.read().await.get().clone();
         register_default_tokenizers(&index, &index_config);
 
-        let cached_fields = index.schema();
+        let cached_schema = index.schema();
         let query_parser = QueryParser::for_index(
             index_name,
             &index,
-            index_config.default_fields.iter().map(|x| cached_fields.get_field(x).unwrap()).collect(),
+            index_config.default_fields.iter().map(|x| cached_schema.get_field(x).unwrap()).collect(),
         );
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
         let index_updater = OwningHandler::new(RwLock::new(IndexUpdater::new(index, index_name, index_config_proxy.clone()).await?));
@@ -111,8 +111,8 @@ impl IndexHolder {
             index_name: String::from(index_name),
             autocommit_thread,
             query_parser,
-            multi_fields: index_config.multi_fields.iter().map(|x| cached_fields.get_field(x).unwrap()).collect(),
-            cached_fields,
+            multi_fields: index_config.multi_fields.iter().map(|x| cached_schema.get_field(x).unwrap()).collect(),
+            cached_schema,
             index_reader,
             index_updater,
             index_config_proxy,
@@ -125,7 +125,7 @@ impl IndexHolder {
     #[instrument(skip_all, fields(index_name = index_name))]
     pub(crate) async fn create(
         index_name: &str,
-        fields: &Fields,
+        schema: &Schema,
         index_config_proxy: IndexConfigProxy,
         index_settings: IndexSettings,
     ) -> SummaResult<IndexHolder> {
@@ -133,13 +133,13 @@ impl IndexHolder {
             let index_config = index_config_proxy.read().await;
             info!(action = "create", engine = ?index_config.get().index_engine, index_settings = ?index_settings);
             match &index_config.get().index_engine {
-                IndexEngine::Memory(fields) => Index::builder().schema(fields.clone()).settings(index_settings).create_in_ram()?,
+                IndexEngine::Memory(schema) => Index::builder().schema(schema.clone()).settings(index_settings).create_in_ram()?,
                 IndexEngine::File(index_path) => {
                     if index_path.exists() {
                         return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
                     }
                     std::fs::create_dir_all(index_path)?;
-                    Index::builder().schema(fields.clone()).settings(index_settings).create_in_dir(index_path)?
+                    Index::builder().schema(schema.clone()).settings(index_settings).create_in_dir(index_path)?
                 }
             }
         };
@@ -151,7 +151,7 @@ impl IndexHolder {
     #[instrument(skip_all, fields(index_name = index_name))]
     pub(crate) async fn open(index_name: &str, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexHolder> {
         let index = match &index_config_proxy.read().await.get().index_engine {
-            IndexEngine::Memory(fields) => Index::create_in_ram(fields.clone()),
+            IndexEngine::Memory(schema) => Index::create_in_ram(schema.clone()),
             IndexEngine::File(index_path) => Index::open_in_dir(index_path)?,
         };
         IndexHolder::setup(index_name, index, index_config_proxy).await
@@ -183,8 +183,8 @@ impl IndexHolder {
     }
 
     /// Index schema
-    pub(crate) fn fields(&self) -> &Fields {
-        &self.cached_fields
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.cached_schema
     }
 
     /// Consumer configs
@@ -243,7 +243,7 @@ impl IndexHolder {
         let mut multi_collector = MultiCollector::new();
         let mut extractors: Vec<Box<dyn FruitExtractor>> = collectors
             .into_iter()
-            .map(|collector_proto| build_fruit_extractor(collector_proto, &parsed_query, &self.cached_fields, &mut multi_collector))
+            .map(|collector_proto| build_fruit_extractor(collector_proto, &parsed_query, &self.cached_schema, &mut multi_collector))
             .collect::<SummaResult<_>>()?;
         trace!(
             target: "query",
@@ -288,26 +288,26 @@ pub(crate) mod tests {
     use tantivy::doc;
     use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
 
-    pub(crate) async fn create_test_index_holder(index_service: &IndexService, fields: &Fields) -> SummaResult<Handler<IndexHolder>> {
+    pub(crate) async fn create_test_index_holder(index_service: &IndexService, schema: &Schema) -> SummaResult<Handler<IndexHolder>> {
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .default_fields(vec!["title".to_owned(), "body".to_owned()])
                     .index_engine(proto::IndexEngine::Memory)
-                    .fields(fields.clone())
+                    .schema(schema.clone())
                     .build()
                     .unwrap(),
             )
             .await
     }
 
-    pub(crate) fn create_test_fields() -> Fields {
-        let mut fields_builder = Fields::builder();
+    pub(crate) fn create_test_schema() -> Schema {
+        let mut schema_builder = Schema::builder();
 
-        fields_builder.add_i64_field("id", FAST | INDEXED | STORED);
-        fields_builder.add_i64_field("issued_at", FAST | INDEXED | STORED);
-        fields_builder.add_text_field(
+        schema_builder.add_i64_field("id", FAST | INDEXED | STORED);
+        schema_builder.add_i64_field("issued_at", FAST | INDEXED | STORED);
+        schema_builder.add_text_field(
             "title",
             TextOptions::default().set_stored().set_indexing_options(
                 TextFieldIndexing::default()
@@ -315,7 +315,7 @@ pub(crate) mod tests {
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
             ),
         );
-        fields_builder.add_text_field(
+        schema_builder.add_text_field(
             "body",
             TextOptions::default().set_stored().set_indexing_options(
                 TextFieldIndexing::default()
@@ -324,31 +324,31 @@ pub(crate) mod tests {
             ),
         );
 
-        fields_builder.build()
+        schema_builder.build()
     }
 
     #[tokio::test]
     async fn test_search() -> SummaResult<()> {
         logging::tests::initialize_default_once();
-        let fields = create_test_fields();
+        let schema = create_test_schema();
 
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
         let data_path = root_path.path().join("data");
 
         let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(&index_service, &fields).await?;
+        let index_holder = create_test_index_holder(&index_service, &schema).await?;
 
         index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
-            fields.get_field("id").unwrap() => 1i64,
-            fields.get_field("title").unwrap() => "Headcrab",
-            fields.get_field("body").unwrap() => "Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient to dispatch them. \
+            schema.get_field("id").unwrap() => 1i64,
+            schema.get_field("title").unwrap() => "Headcrab",
+            schema.get_field("body").unwrap() => "Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient to dispatch them. \
             They are also relatively slow-moving and their attacks inflict very little damage. However, they can leap long distances and heights. \
             Headcrabs seek out larger human hosts, which are converted into zombie-like mutants that attack any living lifeform nearby. \
             The converted humans are more resilient than an ordinary human would be and inherit the headcrab's resilience toward toxic and radioactive materials. \
             Headcrabs and headcrab zombies die slowly when they catch fire. \
             The games also establish that while headcrabs are parasites that prey on humans, they are also the prey of the creatures of their homeworld. \
             Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
-            fields.get_field("issued_at").unwrap() => 1652986134i64
+            schema.get_field("issued_at").unwrap() => 1652986134i64
         )))?;
         index_holder.index_updater().write().await.commit().await?;
         index_holder.index_reader().reload()?;
@@ -379,25 +379,25 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_custom_ranking() -> SummaResult<()> {
         logging::tests::initialize_default_once();
-        let fields = create_test_fields();
+        let schema = create_test_schema();
 
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
         let data_path = root_path.path().join("data");
 
         let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(&index_service, &fields).await?;
+        let index_holder = create_test_index_holder(&index_service, &schema).await?;
 
         index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
-            fields.get_field("id").unwrap() => 1i64,
-            fields.get_field("title").unwrap() => "term1 term2",
-            fields.get_field("body").unwrap() => "term3 term4 term5 term6",
-            fields.get_field("issued_at").unwrap() => 100i64
+            schema.get_field("id").unwrap() => 1i64,
+            schema.get_field("title").unwrap() => "term1 term2",
+            schema.get_field("body").unwrap() => "term3 term4 term5 term6",
+            schema.get_field("issued_at").unwrap() => 100i64
         )))?;
         index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
-            fields.get_field("id").unwrap() => 2i64,
-            fields.get_field("title").unwrap() => "term2 term3",
-            fields.get_field("body").unwrap() => "term1 term7 term8 term9 term10",
-            fields.get_field("issued_at").unwrap() => 110i64
+            schema.get_field("id").unwrap() => 2i64,
+            schema.get_field("title").unwrap() => "term2 term3",
+            schema.get_field("body").unwrap() => "term1 term7 term8 term9 term10",
+            schema.get_field("issued_at").unwrap() => 110i64
         )))?;
         index_holder.index_updater().write().await.commit().await?;
         index_holder.index_reader().reload()?;

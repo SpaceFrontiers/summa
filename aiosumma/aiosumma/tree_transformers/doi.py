@@ -11,6 +11,7 @@ from ..parser.elements import (
     Doi,
     Group,
     Minus,
+    Phrase,
     Plus,
     Regex,
     SearchField,
@@ -36,7 +37,7 @@ class DoiTreeTransformer(TreeTransformer):
                 doi = (match[1] + '/' + match[2]).lower()
                 context.dois.append(doi)
                 return Boost(SearchField('doi', Doi(doi)), score=self.score), True
-        return node, False
+        return Phrase(node.value), False
 
 
 class DoiWildcardWordTreeTransformer(ValuePredicateWordTreeTransformer):

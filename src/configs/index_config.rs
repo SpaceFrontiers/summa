@@ -7,13 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::PathBuf;
-use tantivy::schema::Schema as Fields;
+use tantivy::schema::Schema;
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum IndexEngine {
     File(PathBuf),
-    Memory(Fields),
+    Memory(Schema),
 }
 
 impl Debug for IndexEngine {

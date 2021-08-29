@@ -129,7 +129,7 @@ mod tests {
     use crate::configs::application_config::tests::create_test_application_config;
     use crate::proto;
     use crate::proto::index_api_client::IndexApiClient;
-    use crate::search_engine::index_holder::tests::create_test_fields;
+    use crate::search_engine::index_holder::tests::create_test_schema;
     use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
     use async_broadcast::broadcast;
     use std::default::Default;
@@ -154,22 +154,22 @@ mod tests {
     async fn create_index(
         index_api_client: &mut IndexApiClient<Channel>,
         index_name: &str,
-        fields: &str,
+        schema: &str,
     ) -> Result<tonic::Response<proto::CreateIndexResponse>, tonic::Status> {
         index_api_client
             .create_index(tonic::Request::new(proto::CreateIndexRequest {
                 index_name: index_name.to_owned(),
                 index_engine: proto::IndexEngine::File.into(),
-                fields: fields.to_owned(),
+                schema: schema.to_owned(),
                 ..Default::default()
             }))
             .await
     }
 
     async fn create_default_index(index_api_client: &mut IndexApiClient<Channel>) -> Result<tonic::Response<proto::CreateIndexResponse>, tonic::Status> {
-        let fields = create_test_fields();
-        let fields_str = serde_yaml::to_string(&fields).unwrap();
-        create_index(index_api_client, "test_index", &fields_str).await
+        let schema = create_test_schema();
+        let schema_str = serde_yaml::to_string(&schema).unwrap();
+        create_index(index_api_client, "test_index", &schema_str).await
     }
 
     #[tokio::test]
@@ -178,10 +178,10 @@ mod tests {
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
         let (thread_handler, mut index_api_client) = create_client_server(root_path.path()).await?;
 
-        let fields = create_test_fields();
-        let fields_str = serde_yaml::to_string(&fields).unwrap();
+        let schema = create_test_schema();
+        let schema_str = serde_yaml::to_string(&schema).unwrap();
 
-        let response = create_index(&mut index_api_client, "test_index", &fields_str).await.unwrap();
+        let response = create_index(&mut index_api_client, "test_index", &schema_str).await.unwrap();
         assert_eq!(
             response.into_inner(),
             proto::CreateIndexResponse {

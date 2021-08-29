@@ -32,7 +32,7 @@ pub enum ValidationError {
     #[error("invalid_primary_key_type_error: {0:?}")]
     InvalidPrimaryKeyType(FieldType),
     #[error("invalid_schema_error: {0}")]
-    InvalidFields(String),
+    InvalidSchema(String),
     #[error("invalid_threads_number_error: {0}")]
     InvalidThreadsNumber(u64),
     #[error("missing_consumer_error: {0}")]

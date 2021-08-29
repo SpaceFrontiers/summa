@@ -9,12 +9,12 @@ use std::str::FromStr;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
-use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema as Fields};
+use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
 
 /// Responsible for casting `crate::proto::Query` message to `tantivy::query::Query`
 pub struct QueryParser {
-    cached_fields: Fields,
+    cached_schema: Schema,
     index: Index,
     index_name: String,
     nested_query_parser: tantivy::query::QueryParser,
@@ -74,7 +74,7 @@ impl QueryParser {
             .init();
 
         QueryParser {
-            cached_fields: index.schema(),
+            cached_schema: index.schema(),
             index: index.clone(),
             index_name: index_name.to_owned(),
             nested_query_parser,
@@ -86,10 +86,10 @@ impl QueryParser {
     #[inline]
     pub(crate) fn field_and_field_entry(&self, field_name: &str) -> SummaResult<(Field, &FieldEntry)> {
         let field = self
-            .cached_fields
+            .cached_schema
             .get_field(field_name)
             .ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
-        let field_entry = self.cached_fields.get_field_entry(field);
+        let field_entry = self.cached_schema.get_field_entry(field);
         Ok((field, field_entry))
     }
 
@@ -178,7 +178,7 @@ impl QueryParser {
             }
             Some(proto::query::Query::MoreLikeThis(more_like_this_query_proto)) => {
                 let document = self
-                    .cached_fields
+                    .cached_schema
                     .parse_document(&more_like_this_query_proto.document)
                     .map_err(|_e| Error::InvalidSyntax("bad document".to_owned()))?;
                 let field_values = document

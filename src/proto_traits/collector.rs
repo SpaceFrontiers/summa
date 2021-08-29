@@ -11,6 +11,7 @@ pub mod shortcuts {
                 scorer: None,
                 snippets: HashMap::new(),
                 explain: false,
+                fields: Vec::new(),
             })),
         }
     }
@@ -25,6 +26,7 @@ pub mod shortcuts {
                 }),
                 snippets: HashMap::new(),
                 explain: false,
+                fields: Vec::new(),
             })),
         }
     }

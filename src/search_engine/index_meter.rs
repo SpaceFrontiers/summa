@@ -40,7 +40,7 @@ impl IndexMeter {
     }
 
     pub(crate) fn record_metrics(&self, index_holder: &IndexHolder) {
-        let fields = index_holder.fields();
+        let schema = index_holder.schema();
         let searcher = index_holder.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
         let mut per_fields = HashMap::new();
@@ -54,7 +54,7 @@ impl IndexMeter {
                 .chain(segment_space_usage.postings().fields())
                 .chain(segment_space_usage.termdict().fields())
             {
-                let counter = per_fields.entry(fields.get_field_name(*field)).or_insert(0u64);
+                let counter = per_fields.entry(schema.get_field_name(*field)).or_insert(0u64);
                 *counter += field_usage.total() as u64;
             }
             let segment_keys = &[

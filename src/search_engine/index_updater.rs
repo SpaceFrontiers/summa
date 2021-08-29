@@ -9,12 +9,12 @@ use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use tantivy::schema::Schema as Fields;
+use tantivy::schema::Schema;
 use tantivy::{Index, Opstamp, SegmentId, SegmentMeta};
 use tracing::{info, instrument, warn};
 
 fn process_message(
-    fields: &Fields,
+    schema: &Schema,
     index_writer_holder: &IndexWriterHolder,
     message: Result<BorrowedMessage<'_>, rdkafka::error::KafkaError>,
 ) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
@@ -24,7 +24,7 @@ fn process_message(
     let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperation)?;
     match index_operation {
         proto::index_operation::Operation::IndexDocument(index_document_operation) => {
-            let parsed_document = SummaDocument::BoundJsonBytes((fields, &index_document_operation.document))
+            let parsed_document = SummaDocument::BoundJsonBytes((schema, &index_document_operation.document))
                 .try_into()
                 .map_err(KafkaConsumingError::ParseDocument)?;
             index_writer_holder.index_document(parsed_document).map_err(KafkaConsumingError::Index)?;
@@ -98,8 +98,8 @@ impl IndexUpdater {
     async fn start_consumers(&mut self) -> SummaResult<()> {
         for consumer in &self.consumers {
             let index_writer_holder = self.index_writer_holder.clone();
-            let fields = self.index.schema();
-            consumer.start(move |message| process_message(&fields, &index_writer_holder, message)).await?;
+            let schema = self.index.schema();
+            consumer.start(move |message| process_message(&schema, &index_writer_holder, message)).await?;
         }
         Ok(())
     }
@@ -107,8 +107,8 @@ impl IndexUpdater {
     /// Add consumer and starts it
     pub(super) async fn attach_consumer(&mut self, consumer: Consumer) -> SummaResult<()> {
         let index_writer_holder = self.index_writer_holder.clone();
-        let fields = self.index.schema();
-        consumer.start(move |message| process_message(&fields, &index_writer_holder, message)).await?;
+        let schema = self.index.schema();
+        consumer.start(move |message| process_message(&schema, &index_writer_holder, message)).await?;
         self.consumers.push(consumer);
         Ok(())
     }

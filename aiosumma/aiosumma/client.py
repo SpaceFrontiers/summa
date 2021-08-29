@@ -140,7 +140,7 @@ class SummaClient(BaseGrpcClient):
     async def create_index(
         self,
         index_name: str,
-        fields: str,
+        schema: str,
         primary_key: Optional[str] = None,
         default_fields: Optional[List[str]] = None,
         multi_fields: Optional[List[str]] = None,
@@ -158,7 +158,7 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            fields: Tantivy index schema
+            schema: Tantivy index schema
             primary_key: primary key is used during insertion to check duplicates
             default_fields: fields that are used to search by default
             multi_fields: fields that can have multiple values
@@ -179,7 +179,7 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
-                fields=fields,
+                schema=schema,
                 primary_key=primary_key,
                 default_fields=default_fields,
                 multi_fields=multi_fields,

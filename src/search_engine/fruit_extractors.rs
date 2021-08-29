@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
-use tantivy::schema::{Field, Schema as Fields};
+use tantivy::schema::{Field, Schema};
 use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerator};
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
@@ -44,24 +44,33 @@ fn parse_aggregation_results(
         .collect()
 }
 
-fn check_snippets(fields: &Fields, snippets: &HashMap<String, u32>) -> SummaResult<()> {
+fn check_snippets(schema: &Schema, snippets: &HashMap<String, u32>) -> SummaResult<()> {
     for snippet_field in snippets.keys() {
-        if fields.get_field(snippet_field).is_none() {
+        if schema.get_field(snippet_field).is_none() {
             return Err(ValidationError::MissingSnippetField(snippet_field.to_string()).into());
         }
     }
     Ok(())
 }
 
+fn get_fields(schema: &Schema, fields: &[String]) -> SummaResult<Option<HashSet<Field>>> {
+    let fields = fields
+        .iter()
+        .map(|field| schema.get_field(field).ok_or_else(|| Error::FieldDoesNotExist(field.to_owned())))
+        .collect::<SummaResult<HashSet<Field>>>()?;
+    Ok((!fields.is_empty()).then(|| fields))
+}
+
 pub fn build_fruit_extractor(
     collector_proto: proto::Collector,
     query: &dyn Query,
-    fields: &Fields,
+    schema: &Schema,
     multi_collector: &mut MultiCollector,
 ) -> SummaResult<Box<dyn FruitExtractor>> {
     match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
-            check_snippets(fields, &top_docs_collector_proto.snippets)?;
+            check_snippets(schema, &top_docs_collector_proto.snippets)?;
+            let fields = get_fields(schema, &top_docs_collector_proto.fields)?;
             Ok(match top_docs_collector_proto.scorer {
                 None | Some(proto::Scorer { scorer: None }) => Box::new(
                     TopDocsBuilder::default()
@@ -75,12 +84,13 @@ pub fn build_fruit_extractor(
                         .explain(top_docs_collector_proto.explain)
                         .limit(top_docs_collector_proto.limit)
                         .snippets(top_docs_collector_proto.snippets)
+                        .fields(fields)
                         .build()?,
                 ) as Box<dyn FruitExtractor>,
                 Some(proto::Scorer {
                     scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
                 }) => {
-                    let eval_scorer_seed = EvalScorer::new(eval_expr, fields)?;
+                    let eval_scorer_seed = EvalScorer::new(eval_expr, schema)?;
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                         .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
                         .tweak_score(move |segment_reader: &SegmentReader| {
@@ -94,16 +104,17 @@ pub fn build_fruit_extractor(
                             .explain(top_docs_collector_proto.explain)
                             .limit(top_docs_collector_proto.limit)
                             .snippets(top_docs_collector_proto.snippets)
+                            .fields(fields)
                             .build()?,
                     ) as Box<dyn FruitExtractor>
                 }
                 Some(proto::Scorer {
                     scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
                 }) => {
-                    let field = fields.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
+                    let order_by_field = schema.get_field(field_name).ok_or_else(|| Error::FieldDoesNotExist(field_name.to_owned()))?;
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(top_docs_collector_proto.limit.try_into().unwrap())
                         .and_offset(top_docs_collector_proto.offset.try_into().unwrap())
-                        .order_by_u64_field(field);
+                        .order_by_u64_field(order_by_field);
                     Box::new(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))
@@ -111,6 +122,7 @@ pub fn build_fruit_extractor(
                             .explain(top_docs_collector_proto.explain)
                             .limit(top_docs_collector_proto.limit)
                             .snippets(top_docs_collector_proto.snippets)
+                            .fields(fields)
                             .build()?,
                     ) as Box<dyn FruitExtractor>
                 }
@@ -122,7 +134,7 @@ pub fn build_fruit_extractor(
         }
         Some(proto::collector::Collector::Count(_)) => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
         Some(proto::collector::Collector::Facet(facet_collector_proto)) => {
-            let field = fields
+            let field = schema
                 .get_field(&facet_collector_proto.field)
                 .ok_or_else(|| Error::FieldDoesNotExist(facet_collector_proto.field.to_owned()))?;
             let mut facet_collector = tantivy::collector::FacetCollector::for_field(field);
@@ -149,6 +161,8 @@ pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
     query: Box<dyn Query>,
     #[builder(default = "false")]
     explain: bool,
+    #[builder(default = "None")]
+    fields: Option<HashSet<Field>>,
 }
 
 impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
@@ -173,13 +187,13 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> proto::CollectorOutput {
-        let fields = searcher.schema();
+        let schema = searcher.schema();
         let snippet_generators = self.snippet_generators(searcher);
         let fruit = self.handle.extract(multi_fruit);
         let scored_documents_iter = fruit.iter().enumerate().map(|(position, (score, doc_address))| {
             let document = searcher.doc(*doc_address).unwrap();
             proto::ScoredDocument {
-                document: NamedFieldDocument::from_document(fields, multi_fields, &document).to_json(),
+                document: NamedFieldDocument::from_document(schema, &self.fields, multi_fields, &document).to_json(),
                 score: Some((*score).into()),
                 position: position as u32,
                 snippets: snippet_generators
@@ -211,7 +225,7 @@ impl FruitExtractor for ReservoirSampling {
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> proto::CollectorOutput {
-        let fields = searcher.schema();
+        let schema = searcher.schema();
         proto::CollectorOutput {
             collector_output: Some(proto::collector_output::CollectorOutput::ReservoirSampling(
                 proto::ReservoirSamplingCollectorOutput {
@@ -221,7 +235,7 @@ impl FruitExtractor for ReservoirSampling {
                         .iter()
                         .map(|doc_address| proto::RandomDocument {
                             index_alias: external_index_alias.to_string(),
-                            document: NamedFieldDocument::from_document(fields, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json(),
+                            document: NamedFieldDocument::from_document(schema, &None, multi_fields, &searcher.doc(*doc_address).unwrap()).to_json(),
                             score: Some((1.0).into()),
                         })
                         .collect(),
