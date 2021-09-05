@@ -69,7 +69,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 tokio::spawn(async move {
                     match index_updater.try_write() {
                         Err(_) => warn!(action = "busy"),
-                        Ok(mut index_updater) => match index_updater.commit().await {
+                        Ok(mut index_updater) => match index_updater.commit(request.is_frozen).await {
                             Ok(_) => (),
                             Err(error) => warn!(error = ?error),
                         },
@@ -84,7 +84,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 Err(_) => Err(Status::failed_precondition("busy")),
                 Ok(mut index_updater) => {
                     let now = Instant::now();
-                    let opstamp = index_updater.commit().await?;
+                    let opstamp = index_updater.commit(request.is_frozen).await?;
                     Ok(Response::new(proto::CommitIndexResponse {
                         opstamp: Some(opstamp),
                         elapsed_secs: Some(now.elapsed().as_secs_f64()),

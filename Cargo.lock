@@ -552,8 +552,11 @@ checksum = "cd7d5c9e2fb96ea7b093da40c584cb3060eddbe0d4db8abcea655b197156d94e"
 [[package]]
 name = "fastfield_codecs"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/dismax#71041b231499f04687a0d0db414bb500c8d66d10"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr-dev#7c9cd653e74aa2eed2eb7e10b8652f2be643edda"
 dependencies = [
+ "fastdivide",
+ "log",
+ "ownedbytes",
  "tantivy-bitpacker",
  "tantivy-common",
 ]
@@ -1241,7 +1244,7 @@ dependencies = [
 [[package]]
 name = "ownedbytes"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/dismax#71041b231499f04687a0d0db414bb500c8d66d10"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr-dev#7c9cd653e74aa2eed2eb7e10b8652f2be643edda"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -1944,7 +1947,7 @@ checksum = "20518fe4a4c9acf048008599e464deb21beeae3d3578418951a189c235a7a9a8"
 [[package]]
 name = "tantivy"
 version = "0.18.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/dismax#71041b231499f04687a0d0db414bb500c8d66d10"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr-dev#7c9cd653e74aa2eed2eb7e10b8652f2be643edda"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1998,12 +2001,12 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/dismax#71041b231499f04687a0d0db414bb500c8d66d10"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr-dev#7c9cd653e74aa2eed2eb7e10b8652f2be643edda"
 
 [[package]]
 name = "tantivy-common"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/dismax#71041b231499f04687a0d0db414bb500c8d66d10"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr-dev#7c9cd653e74aa2eed2eb7e10b8652f2be643edda"
 dependencies = [
  "byteorder",
  "ownedbytes",
@@ -2023,7 +2026,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.18.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/dismax#71041b231499f04687a0d0db414bb500c8d66d10"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr-dev#7c9cd653e74aa2eed2eb7e10b8652f2be643edda"
 dependencies = [
  "combine",
  "once_cell",

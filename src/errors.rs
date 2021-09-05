@@ -3,6 +3,7 @@ use derive_builder::UninitializedFieldError;
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
 use tantivy::schema::FieldType;
+use tantivy::TantivyError;
 use tracing::warn;
 
 #[derive(thiserror::Error, Debug)]
@@ -25,8 +26,8 @@ pub enum ValidationError {
     ExistingPath(PathBuf),
     #[error("invalid_aggregation_error")]
     InvalidAggregation,
-    #[error("invalid_fast_field_type_error: ({field:?}, {field_type:?})")]
-    InvalidFastFieldType { field: String, field_type: FieldType },
+    #[error("invalid_fast_field_type_error: ({field:?}, {field_type:?}, {tantivy_error:?})")]
+    InvalidFastFieldType { field: String, field_type: FieldType, tantivy_error: TantivyError },
     #[error("invalid_memory_error: {0}")]
     InvalidMemory(u64),
     #[error("invalid_primary_key_type_error: {0:?}")]

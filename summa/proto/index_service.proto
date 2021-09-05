@@ -36,6 +36,7 @@ message AlterIndexResponse {
 message CommitIndexRequest {
   string index_alias = 1;
   CommitMode commit_mode = 2;
+  optional bool is_frozen = 3;
 }
 
 message CommitIndexResponse {
@@ -61,6 +62,7 @@ message CreateIndexRequest {
   optional SortByField sort_by_field = 9;
   repeated string multi_fields = 11;
   repeated string stop_words = 12;
+  bool is_frozen = 13;
 }
 
 message CreateIndexResponse {

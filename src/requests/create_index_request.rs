@@ -26,6 +26,8 @@ pub struct CreateIndexRequest {
     pub writer_threads: Option<u64>,
     #[builder(default = "None")]
     pub writer_heap_size_bytes: Option<u64>,
+    #[builder(default = "false")]
+    pub is_frozen: bool,
 }
 
 impl CreateIndexRequest {
@@ -80,6 +82,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .schema(schema)
             .primary_key(primary_key)
             .compression(compression)
+            .is_frozen(proto_request.is_frozen)
             .default_fields(default_fields)
             .multi_fields(multi_fields)
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))

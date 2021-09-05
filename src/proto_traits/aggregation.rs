@@ -44,6 +44,7 @@ impl TryFrom<proto::aggregation::Aggregation> for Aggregation {
                             .ranges
                             .into_iter()
                             .map(|range| RangeAggregationRange {
+                                key: range.key,
                                 from: range.from,
                                 to: range.to,
                             })

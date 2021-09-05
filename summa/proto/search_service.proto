@@ -133,6 +133,7 @@ message RangeAggregation {
 message RangeAggregationRange {
   optional double from = 1;
   optional double to = 2;
+  optional string key = 3;
 }
 
 message HistogramAggregation {

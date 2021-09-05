@@ -8,7 +8,7 @@ use futures_util::future::join_all;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tantivy::IndexSettings;
+use tantivy::{IndexSettings, SegmentAttribute, SegmentAttributesConfig};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::instrument;
 
@@ -125,9 +125,14 @@ impl IndexService {
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<Handler<IndexHolder>> {
         self.insert_config(&create_index_request).await?;
+
+        let mut segment_attributes = HashMap::new();
+        segment_attributes.insert("is_frozen".to_string(), SegmentAttribute::ConjunctiveBool(create_index_request.is_frozen));
+
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression,
             sort_by_field: create_index_request.sort_by_field.clone(),
+            segment_attributes_config: SegmentAttributesConfig::new(segment_attributes),
             ..Default::default()
         };
         let owning_handler = OwningHandler::new(
@@ -161,7 +166,7 @@ impl IndexService {
                 _ => Some(sort_by_field),
             }
         }
-        index_updater.commit().await?;
+        index_updater.commit(None).await?;
         Ok(index_holder)
     }
 

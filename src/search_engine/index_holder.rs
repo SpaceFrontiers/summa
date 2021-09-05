@@ -78,7 +78,7 @@ impl IndexHolder {
                                     _ = tick_task.tick() => {
                                         info!(action = "autocommit_thread_tick");
                                         if let Ok(mut index_updater) = index_updater.try_write() {
-                                            if let Err(error) = index_updater.commit().await {
+                                            if let Err(error) = index_updater.commit(None).await {
                                                 warn!(error = ?error);
                                             }
                                         }
@@ -350,7 +350,7 @@ pub(crate) mod tests {
             Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
             schema.get_field("issued_at").unwrap() => 1652986134i64
         )))?;
-        index_holder.index_updater().write().await.commit().await?;
+        index_holder.index_updater().write().await.commit(None).await?;
         index_holder.index_reader().reload()?;
         assert_eq!(
             index_holder.search("index", &match_query("headcrabs"), vec![top_docs_collector(10)]).await?,
@@ -399,7 +399,7 @@ pub(crate) mod tests {
             schema.get_field("body").unwrap() => "term1 term7 term8 term9 term10",
             schema.get_field("issued_at").unwrap() => 110i64
         )))?;
-        index_holder.index_updater().write().await.commit().await?;
+        index_holder.index_updater().write().await.commit(None).await?;
         index_holder.index_reader().reload()?;
         assert_eq!(
             index_holder

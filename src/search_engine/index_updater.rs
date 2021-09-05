@@ -4,13 +4,14 @@ use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus}
 use crate::consumers::kafka::Consumer;
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
+use crate::search_engine::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::search_engine::SummaDocument;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tantivy::schema::Schema;
-use tantivy::{Index, Opstamp, SegmentId, SegmentMeta};
+use tantivy::{Index, Opstamp, SegmentAttribute, SegmentId, SegmentMeta};
 use tracing::{info, instrument, warn};
 
 fn process_message(
@@ -46,11 +47,13 @@ impl IndexUpdater {
     /// Creates new `IndexUpdater`
     pub(super) async fn new(index: Index, index_name: &str, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexUpdater> {
         let index_config = index_config_proxy.read().await.get().clone();
+        let index_writer = index.writer_with_num_threads(
+            index_config.writer_threads.try_into().unwrap(),
+            index_config.writer_heap_size_bytes.try_into().unwrap(),
+        )?;
+        index_writer.set_merge_policy(Box::new(FrozenLogMergePolicy::default()));
         let index_writer_holder = Arc::new(IndexWriterHolder::new(
-            index.writer_with_num_threads(
-                index_config.writer_threads.try_into().unwrap(),
-                index_config.writer_heap_size_bytes.try_into().unwrap(),
-            )?,
+            index_writer,
             match index_config.primary_key {
                 Some(ref primary_key) => index.schema().get_field(primary_key),
                 None => None,
@@ -214,7 +217,7 @@ impl IndexUpdater {
 
     /// Merges multiple segments, see `IndexWriterHolder::merge` for details
     #[instrument(skip(self))]
-    pub(crate) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<SegmentMeta> {
+    pub(crate) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<Option<SegmentMeta>> {
         let index_writer_holder = self.stop_consumers().await?;
         let segment_meta = index_writer_holder.merge(segment_ids).await?;
         self.start_consumers().await?;
@@ -232,8 +235,14 @@ impl IndexUpdater {
     }
 
     /// Commit Tantivy index and Kafka offsets
-    #[instrument(skip(self), fields(index_name = ?self.index_name))]
-    pub(crate) async fn commit(&mut self) -> SummaResult<Opstamp> {
+    #[instrument(skip(self), fields(index_name = ?self.index_name, is_frozen = is_frozen))]
+    pub(crate) async fn commit(&mut self, is_frozen: Option<bool>) -> SummaResult<Opstamp> {
+        if let Some(is_frozen) = is_frozen {
+            self.index
+                .settings_mut()
+                .segment_attributes_config
+                .insert("is_frozen", SegmentAttribute::ConjunctiveBool(is_frozen));
+        }
         let opstamp = self.stop_consumers().await?.commit().await?;
         self.commit_offsets().await?;
         self.start_consumers().await?;

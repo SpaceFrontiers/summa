@@ -3,6 +3,7 @@
 pub mod collectors;
 mod custom_serializer;
 mod default_tokenizers;
+mod frozen_log_merge_policy;
 mod fruit_extractors;
 pub(crate) mod index_holder;
 mod index_meter;

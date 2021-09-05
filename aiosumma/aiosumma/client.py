@@ -43,6 +43,7 @@ class SummaClient(BaseGrpcClient):
         self,
         index_alias: str,
         commit_mode: Optional[str] = None,
+        is_frozen: Optional[bool] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.CommitIndexResponse:
@@ -63,6 +64,7 @@ class SummaClient(BaseGrpcClient):
             index_service_pb.CommitIndexRequest(
                 index_alias=index_alias,
                 commit_mode=commit_mode,
+                is_frozen=is_frozen,
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
@@ -146,6 +148,7 @@ class SummaClient(BaseGrpcClient):
         multi_fields: Optional[List[str]] = None,
         stop_words: Optional[List[str]] = None,
         compression: Optional[Union[str, int]] = None,
+        is_frozen: bool = False,
         writer_heap_size_bytes: Optional[int] = None,
         writer_threads: Optional[int] = None,
         autocommit_interval_ms: Optional[int] = None,
@@ -164,6 +167,7 @@ class SummaClient(BaseGrpcClient):
             multi_fields: fields that can have multiple values
             stop_words: list of words that won't be parsed
             compression: Tantivy index compression
+            is_frozen: Is index frozen
             writer_heap_size_bytes: Tantivy writer heap size in bytes, shared between all threads
             writer_threads: Tantivy writer threads
             autocommit_interval_ms: if true then there will be a separate thread committing index every nth milliseconds
@@ -185,6 +189,7 @@ class SummaClient(BaseGrpcClient):
                 multi_fields=multi_fields,
                 stop_words=stop_words,
                 compression=compression,
+                is_frozen=is_frozen,
                 writer_heap_size_bytes=writer_heap_size_bytes,
                 writer_threads=writer_threads,
                 autocommit_interval_ms=autocommit_interval_ms,
