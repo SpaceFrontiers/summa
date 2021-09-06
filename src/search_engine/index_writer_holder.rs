@@ -2,7 +2,7 @@ use crate::errors::SummaResult;
 use crate::errors::ValidationError;
 use crate::errors::ValidationError::MissingPrimaryKey;
 use tantivy::schema::{Field, FieldType};
-use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
+use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentAttributes, SegmentId, SegmentMeta, Term};
 use tracing::info;
 
 /// Managing write operations to index
@@ -66,9 +66,12 @@ impl IndexWriterHolder {
     ///
     /// Also cleans deleted documents and do recompression. Possible to pass the only segment in `segment_ids` to do recompression or clean up.
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub(super) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<Option<SegmentMeta>> {
+    pub(super) async fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: &Option<SegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
         info!(action = "merge_segments", segment_ids = ?segment_ids);
-        let segment_meta = self.index_writer.merge(segment_ids).await?;
+        let segment_meta = match segment_attributes {
+            Some(segment_attributes) => self.index_writer.merge_with_attributes(segment_ids, segment_attributes.clone()).await?,
+            None => self.index_writer.merge(segment_ids).await?,
+        };
         info!(action = "merged_segments", segment_ids = ?segment_ids, merged_segment_meta = ?segment_meta);
         Ok(segment_meta)
     }

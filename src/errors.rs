@@ -27,7 +27,11 @@ pub enum ValidationError {
     #[error("invalid_aggregation_error")]
     InvalidAggregation,
     #[error("invalid_fast_field_type_error: ({field:?}, {field_type:?}, {tantivy_error:?})")]
-    InvalidFastFieldType { field: String, field_type: FieldType, tantivy_error: TantivyError },
+    InvalidFastFieldType {
+        field: String,
+        field_type: FieldType,
+        tantivy_error: TantivyError,
+    },
     #[error("invalid_memory_error: {0}")]
     InvalidMemory(u64),
     #[error("invalid_primary_key_type_error: {0:?}")]

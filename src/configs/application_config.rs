@@ -1,7 +1,7 @@
 use super::ConfigHolder;
 use super::GrpcConfig;
 use super::MetricsConfig;
-use crate::configs::{GrpcConfigBuilder, IndexConfig, Loadable, MetricsConfigBuilder};
+use crate::configs::{GrpcConfigBuilder, IndexConfig, IpfsConfig, Loadable, MetricsConfigBuilder};
 use crate::errors::{Error, SummaResult, ValidationError};
 use colored::Colorize;
 use path_absolutize::*;
@@ -25,6 +25,7 @@ pub struct ApplicationConfig {
     pub grpc: GrpcConfig,
     #[serde(default = "HashMap::new")]
     pub indices: HashMap<String, IndexConfig>,
+    pub ipfs: Option<IpfsConfig>,
     #[builder(setter(custom))]
     pub log_path: PathBuf,
     pub metrics: MetricsConfig,
@@ -38,6 +39,7 @@ impl Default for ApplicationConfig {
             debug: true,
             grpc: GrpcConfigBuilder::default().build().unwrap(),
             indices: HashMap::new(),
+            ipfs: None,
             log_path: PathBuf::new(),
             metrics: MetricsConfigBuilder::default().build().unwrap(),
         }

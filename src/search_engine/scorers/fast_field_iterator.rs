@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use super::safe_into_f64::SafeIntoF64;
+use std::sync::Arc;
 use tantivy::fastfield::{Column, FastValue};
 use tantivy::DocId;
 

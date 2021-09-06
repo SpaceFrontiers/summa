@@ -4,8 +4,7 @@ package summa.proto;
 
 // Service
 service BeaconApi {
-  rpc attach_index (AttachIndexRequest) returns (AttachIndexResponse) {}
-  rpc get_index_token (GetIndexTokenRequest) returns (GetIndexTokenResponse) {}
+  rpc publish_index (PublishIndexRequest) returns (PublishIndexResponse) {}
 }
 
 message AttachIndexRequest {
@@ -15,11 +14,10 @@ message AttachIndexRequest {
 
 message AttachIndexResponse {}
 
-message GetIndexTokenRequest {
-  string index_name = 1;
+message PublishIndexRequest {
+  string index_alias = 1;
 }
 
-message GetIndexTokenResponse {
-  string index_config = 1;
-  string ipfs_multihash = 2;
+message PublishIndexResponse {
+  string ipfs_multihash = 1;
 }

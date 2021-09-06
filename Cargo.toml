@@ -40,6 +40,8 @@ fasteval2 = { version = "2.0.3", features = ["unsafe-vars"] }
 futures = "0.3.21"
 futures-util = "0.3.21"
 hyper = "0.14.20"
+izihawa-common-multipart = "1.1.3"
+izihawa-hyper-multipart = "1.1.0"
 lazy_static = "1.4.0"
 opentelemetry = { version = "0.17.0", features = ["rt-tokio"] }
 opentelemetry-prometheus = "0.10.0"
@@ -56,7 +58,7 @@ serde_derive = "1.0.140"
 serde_json = "1.0.82"
 serde_yaml = "0.8.25"
 signal-hook = "0.3.14"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr-dev" , features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr" , features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
 # tantivy = { version = "0.18.0", features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
 tantivy-fst = "0.3.0"
 textwrap = "0.15.0"
@@ -64,6 +66,7 @@ time = { version = "0.3.12", features = ["serde-well-known"] }
 thiserror = "1.0.31"
 tokio = { version = "1.20.1", features = ["full", "time"] }
 tokio-stream = { version = "0.1.9", features = ["net"] }
+tokio-util = { version = "0.7.4", features = ["compat"] }
 tonic = { version = "0.8.0", features = ["gzip"] }
 tonic-reflection = "0.5.0"
 tower = "0.4.13"

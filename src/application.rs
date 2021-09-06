@@ -2,7 +2,7 @@ use crate::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationCon
 use crate::errors::SummaResult;
 use crate::logging;
 use crate::servers::{GrpcServer, MetricsServer};
-use crate::services::IndexService;
+use crate::services::{BeaconService, IndexService};
 use crate::utils::signal_channel::signal_channel;
 use crate::utils::thread_handler::ControlMessage;
 use async_broadcast::Receiver;
@@ -105,9 +105,12 @@ impl Application {
     }
 
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaResult<impl Future<Output = SummaResult<()>>> {
+        let beacon_service = self.config.read().await.ipfs.clone().map(BeaconService::new);
         let index_service = IndexService::new(&self.config);
         let metrics_server_future = MetricsServer::new(&self.config)?.start(&index_service, terminator.clone()).await?;
-        let grpc_server_future = GrpcServer::new(&self.config, &index_service)?.start(terminator.clone()).await?;
+        let grpc_server_future = GrpcServer::new(&self.config, beacon_service.as_ref(), &index_service)?
+            .start(terminator.clone())
+            .await?;
 
         Ok(async move {
             index_service.setup_index_holders().await?;

@@ -9,14 +9,12 @@ impl MergePolicy for FrozenLogMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
         let filtered_segments = segments
             .iter()
-            .filter(|segment_meta| {
-                match segment_meta.segment_attributes().get("is_frozen") {
-                    None => false,
-                    Some(iz_frozen) => match iz_frozen {
-                        SegmentAttribute::ConjunctiveBool(value) => *value,
-                        _ => unreachable!()
-                    }
-                }
+            .filter(|segment_meta| match segment_meta.segment_attributes().get("is_frozen") {
+                None => true,
+                Some(is_frozen) => match is_frozen {
+                    SegmentAttribute::ConjunctiveBool(value) => !*value,
+                    _ => unreachable!(),
+                },
             })
             .cloned()
             .collect::<Vec<SegmentMeta>>();

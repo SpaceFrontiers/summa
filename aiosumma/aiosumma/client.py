@@ -16,10 +16,12 @@ from aiogrpcclient import (
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
+from summa.proto import beacon_service_pb2 as beacon_service_pb
 from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
 from summa.proto import search_service_pb2 as search_service_pb
+from summa.proto.beacon_service_pb2_grpc import BeaconApiStub
 from summa.proto.consumer_service_pb2_grpc import ConsumerApiStub
 from summa.proto.index_service_pb2_grpc import IndexApiStub
 from summa.proto.reflection_service_pb2_grpc import ReflectionApiStub
@@ -32,6 +34,7 @@ from summa.proto.utils_pb2 import (  # noqa
 
 class SummaClient(BaseGrpcClient):
     stub_clses = {
+        'beacon_api': BeaconApiStub,
         'consumer_api': ConsumerApiStub,
         'index_api': IndexApiStub,
         'reflection_api': ReflectionApiStub,
@@ -509,6 +512,27 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].merge_segments(
             index_service_pb.MergeSegmentsRequest(index_alias=index_alias, segment_ids=segment_ids),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
+    async def publish_index(
+        self,
+        index_alias: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> beacon_service_pb.PublishIndexResponse:
+        """
+        Merge a list of segments into a single one
+
+        Args:
+            index_alias: index alias
+            segment_ids: segment ids
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['beacon_api'].publish_index(
+            beacon_service_pb.PublishIndexRequest(index_alias=index_alias),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 

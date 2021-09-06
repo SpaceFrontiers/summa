@@ -9,9 +9,11 @@ use crate::search_engine::SummaDocument;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::collections::hash_map::Entry;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tantivy::schema::Schema;
-use tantivy::{Index, Opstamp, SegmentAttribute, SegmentId, SegmentMeta};
+use tantivy::{Index, Opstamp, SegmentAttribute, SegmentAttributes, SegmentComponent, SegmentId, SegmentMeta};
 use tracing::{info, instrument, warn};
 
 fn process_message(
@@ -219,7 +221,7 @@ impl IndexUpdater {
     #[instrument(skip(self))]
     pub(crate) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<Option<SegmentMeta>> {
         let index_writer_holder = self.stop_consumers().await?;
-        let segment_meta = index_writer_holder.merge(segment_ids).await?;
+        let segment_meta = index_writer_holder.merge(segment_ids, &None).await?;
         self.start_consumers().await?;
         Ok(segment_meta)
     }
@@ -251,14 +253,14 @@ impl IndexUpdater {
 
     /// Vacuums garbage files and compacts segments
     #[instrument(skip(self))]
-    pub(crate) async fn vacuum(&mut self) -> SummaResult<()> {
+    pub(crate) async fn vacuum(&mut self, segment_attributes: Option<SegmentAttributes>) -> SummaResult<()> {
         let index_writer_holder = self.stop_consumers().await?;
         index_writer_holder.commit().await?;
 
         let mut segments = index_writer_holder.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
         for segment in segments.iter().filter(|segment| segment.meta().num_deleted_docs() > 0) {
-            index_writer_holder.merge(&[segment.id()]).await?;
+            index_writer_holder.merge(&[segment.id()], &segment_attributes).await?;
         }
         index_writer_holder.commit().await?;
 
@@ -281,6 +283,28 @@ impl IndexUpdater {
         let opstamp = self.stop_consumers().await?.commit().await?;
         self.commit_offsets().await?;
         Ok(opstamp)
+    }
+
+    /// Get frozen segments
+    pub async fn get_frozen_segments(&self) -> SummaResult<Vec<PathBuf>> {
+        Ok(self
+            .index
+            .searchable_segments()?
+            .into_iter()
+            .filter(|segment| match segment.meta().segment_attributes().get("is_frozen") {
+                None => true,
+                Some(is_frozen) => match is_frozen {
+                    SegmentAttribute::ConjunctiveBool(value) => !*value,
+                    _ => unreachable!(),
+                },
+            })
+            .flat_map(|segment| {
+                SegmentComponent::iterator()
+                    .filter(|comp| *comp != &SegmentComponent::TempStore && *comp != &SegmentComponent::Delete)
+                    .map(|component| segment.meta().relative_path(*component))
+                    .collect::<HashSet<PathBuf>>()
+            })
+            .collect())
     }
 }
 

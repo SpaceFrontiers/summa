@@ -245,7 +245,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 .index_updater()
                 .write()
                 .await
-                .vacuum()
+                .vacuum(None)
                 .instrument(info_span!("vacuum", index_name = ?index_name))
                 .await
                 .unwrap();
