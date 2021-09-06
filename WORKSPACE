@@ -12,9 +12,9 @@ http_archive(
 )
 http_archive(
     name = "com_github_grpc_grpc",
-    sha256 = "9b1f348b15a7637f5191e4e673194549384f2eccf01fcef7cc1515864d71b424",
-    strip_prefix = "grpc-1.48.0",
-    urls = ["https://github.com/grpc/grpc/archive/v1.48.0.tar.gz"],
+    sha256 = "320366665d19027cda87b2368c03939006a37e0388bfd1091c8d2a96fbc93bd8",
+    strip_prefix = "grpc-1.48.1",
+    urls = ["https://github.com/grpc/grpc/archive/v1.48.1.tar.gz"],
 )
 http_archive(
     name = "io_bazel_rules_docker",
@@ -23,30 +23,26 @@ http_archive(
 )
 http_archive(
     name = "rules_rust",
-    sha256 = "f3d443e9ad1eca99fbcade1c649adbd8200753cf22e47846b3105a43a550273b",
-    strip_prefix = "rules_rust-0.8.1",
-    urls = ["https://github.com/bazelbuild/rules_rust/archive/0.8.1.tar.gz"],
+     sha256 = "6e507222f313fa675db241a2f8ceb6e1e64df2104d99b1ad4f10d8c3de0cb3f2",
+    strip_prefix = "rules_rust-0.10.0",
+    urls = ["https://github.com/bazelbuild/rules_rust/archive/0.10.0.tar.gz"],
 )
 http_archive(
     name = "com_google_protobuf",
-    sha256 = "85d42d4485f36f8cec3e475a3b9e841d7d78523cd775de3a86dba77081f4ca25",
-    strip_prefix = "protobuf-3.21.4",
-    urls = [
-        "https://mirror.bazel.build/github.com/protocolbuffers/protobuf/archive/v3.21.4.tar.gz",
-        "https://github.com/protocolbuffers/protobuf/archive/v3.21.4.tar.gz",
-    ],
+    sha256 = "d7d204a59fd0d2d2387bd362c2155289d5060f32122c4d1d922041b61191d522",
+    strip_prefix = "protobuf-3.21.5",
+    urls = ["https://github.com/protocolbuffers/protobuf/archive/v3.21.5.tar.gz"],
 )
 http_archive(
     name = "rules_proto_grpc",
-    sha256 = "507e38c8d95c7efa4f3b1c0595a8e8f139c885cb41a76cab7e20e4e67ae87731",
-    strip_prefix = "rules_proto_grpc-4.1.1",
-    urls = ["https://github.com/rules-proto-grpc/rules_proto_grpc/archive/4.1.1.tar.gz"],
+    sha256 = "bbe4db93499f5c9414926e46f9e35016999a4e9f6e3522482d3760dc61011070",
+    strip_prefix = "rules_proto_grpc-4.2.0",
+    urls = ["https://github.com/rules-proto-grpc/rules_proto_grpc/archive/4.2.0.tar.gz"],
 )
 http_archive(
     name = "rules_python",
-    sha256 = "f5f26431f86ab8dc991644d1577d6129e2707e6ae580ee9b500d1eb27547a265",
-    strip_prefix = "rules_python-ffab6b87dd8b85822c7d1f60a3fef42bc464485e",
-    url = "https://github.com/ppodolsky/rules_python/archive/ffab6b87dd8b85822c7d1f60a3fef42bc464485e.tar.gz",
+    strip_prefix = "rules_python-3a34e28c699cacf89e68d33187e8ca4e4fe01382",
+    url = "https://github.com/ppodolsky/rules_python/archive/3a34e28c699cacf89e68d33187e8ca4e4fe01382.tar.gz",
 )
 
 # Proto
@@ -76,15 +72,6 @@ crates_repository(
     cargo_lockfile = "//:Cargo.lock",
     manifests = ["//:Cargo.toml"],
     generator = "@cargo_bazel_bootstrap//:cargo-bazel",
-    supported_platform_triples = [
-        "aarch64-apple-darwin",
-        "i686-apple-darwin",
-        "i686-unknown-linux-gnu",
-        "x86_64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "wasm32-unknown-unknown",
-        "wasm32-wasi",
-    ],
     annotations = {
         "rdkafka-sys": [crate.annotation(
             build_script_env = {"CARGO_MAKEFLAGS": ""},
