@@ -10,7 +10,7 @@ from aiosumma import SummaClient
 async def client_cli(endpoint):
     try:
         client = SummaClient(endpoint=endpoint, connection_timeout=3.0)
-        await client.start_and_wait()
+        await client.start()
         return client.get_interface()
     except asyncio.exceptions.TimeoutError:
         # ToDo: process exception through fire.core.FireError

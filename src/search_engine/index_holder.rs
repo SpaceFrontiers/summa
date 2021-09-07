@@ -1,5 +1,5 @@
 use super::default_tokenizers::default_tokenizers;
-use crate::configs::{ConsumerConfig, IndexConfig, IndexConfigProxy, IndexEngine};
+use crate::configs::{ConsumerConfig, IndexConfigProxy, IndexEngine};
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use crate::search_engine::fruit_extractors::{build_fruit_extractor, FruitExtractor};
@@ -32,14 +32,13 @@ pub struct IndexHolder {
     autocommit_thread: Option<ThreadHandler>,
     /// Counters
     search_times_meter: ValueRecorder<f64>,
-    compression: proto::Compression,
 }
 
 /// Sets up standard Summa tokenizers
 ///
 /// The set of tokenizers includes standard Tantivy tokenizers as well as `SummaTokenizer` that supports CJK
-fn register_default_tokenizers(index: &Index, index_config: &IndexConfig) {
-    for (tokenizer_name, tokenizer) in &default_tokenizers(index_config) {
+fn register_default_tokenizers(index: &Index) {
+    for (tokenizer_name, tokenizer) in &default_tokenizers() {
         index.tokenizers().register(tokenizer_name, tokenizer.clone())
     }
 }
@@ -50,7 +49,7 @@ impl IndexHolder {
     /// Creates the auto committing thread and consumers
     async fn setup(index_name: &str, index: Index, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexHolder> {
         let index_config = index_config_proxy.read().await.get().clone();
-        register_default_tokenizers(&index, &index_config);
+        register_default_tokenizers(&index);
 
         let cached_schema = index.schema();
         let query_parser = QueryParser::for_index(
@@ -78,7 +77,7 @@ impl IndexHolder {
                                     _ = tick_task.tick() => {
                                         info!(action = "autocommit_thread_tick");
                                         if let Ok(mut index_updater) = index_updater.try_write() {
-                                            if let Err(error) = index_updater.commit(None).await {
+                                            if let Err(error) = index_updater.commit().await {
                                                 warn!(error = ?error);
                                             }
                                         }
@@ -105,8 +104,6 @@ impl IndexHolder {
             .with_description("Search times")
             .init();
 
-        let compression = index_updater.read().await.index().settings().docstore_compression.into();
-
         Ok(IndexHolder {
             index_name: String::from(index_name),
             autocommit_thread,
@@ -117,7 +114,6 @@ impl IndexHolder {
             index_updater,
             index_config_proxy,
             search_times_meter,
-            compression,
         })
     }
 
@@ -158,8 +154,8 @@ impl IndexHolder {
     }
 
     /// Compression
-    pub(crate) fn compression(&self) -> &proto::Compression {
-        &self.compression
+    pub(crate) async fn compression(&self) -> proto::Compression {
+        self.index_updater.read().await.index().settings().docstore_compression.into()
     }
 
     /// Index name
@@ -350,7 +346,7 @@ pub(crate) mod tests {
             Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
             schema.get_field("issued_at").unwrap() => 1652986134i64
         )))?;
-        index_holder.index_updater().write().await.commit(None).await?;
+        index_holder.index_updater().write().await.commit().await?;
         index_holder.index_reader().reload()?;
         assert_eq!(
             index_holder.search("index", &match_query("headcrabs"), vec![top_docs_collector(10)]).await?,
@@ -399,7 +395,7 @@ pub(crate) mod tests {
             schema.get_field("body").unwrap() => "term1 term7 term8 term9 term10",
             schema.get_field("issued_at").unwrap() => 110i64
         )))?;
-        index_holder.index_updater().write().await.commit(None).await?;
+        index_holder.index_updater().write().await.commit().await?;
         index_holder.index_reader().reload()?;
         assert_eq!(
             index_holder

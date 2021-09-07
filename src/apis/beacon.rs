@@ -26,9 +26,12 @@ impl proto::beacon_api_server::BeaconApi for BeaconApiImpl {
     async fn publish_index(&self, proto_request: Request<proto::PublishIndexRequest>) -> Result<Response<proto::PublishIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
-        let ipfs_multihash = self.beacon_service.publish_index(index_holder).await?;
+        let key = self.beacon_service.publish_index(index_holder).await?;
         let response = proto::PublishIndexResponse {
-            ipfs_multihash,
+            key: Some(proto::publish_index_response::Key {
+                name: key.name().to_string(),
+                id: key.id().to_string(),
+            }),
         };
         Ok(Response::new(response))
     }

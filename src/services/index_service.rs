@@ -1,4 +1,4 @@
-use crate::configs::{ApplicationConfigHolder, ConsumerConfig, IndexConfigBuilder, IndexConfigProxy, IndexEngine};
+use crate::configs::{ApplicationConfigHolder, ConsumerConfig, IndexConfig, IndexConfigBuilder, IndexConfigProxy, IndexEngine};
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use crate::requests::{AlterIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
@@ -7,10 +7,11 @@ use crate::utils::sync::{Handler, OwningHandler};
 use futures_util::future::join_all;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 use std::sync::Arc;
 use tantivy::{IndexSettings, SegmentAttribute, SegmentAttributesConfig};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tracing::instrument;
+use tracing::{info, instrument};
 
 /// The main struct responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone, Default, Debug)]
@@ -51,6 +52,7 @@ impl IndexService {
                 OwningHandler::new(IndexHolder::open(index_name, IndexConfigProxy::new(&self.application_config, index_name)).await?),
             );
         }
+        info!(action = "index_holders", index_holders = ?index_holders);
         *self.index_holders_mut().await = index_holders;
         Ok(())
     }
@@ -91,30 +93,12 @@ impl IndexService {
         .await
     }
 
-    async fn insert_config(&self, create_index_request: &CreateIndexRequest) -> SummaResult<()> {
+    pub(crate) async fn insert_config(&self, index_name: &str, index_config: &IndexConfig) -> SummaResult<()> {
         let mut application_config = self.application_config.write().await;
-        let mut index_config_builder = IndexConfigBuilder::default();
-        index_config_builder
-            .index_engine(match create_index_request.index_engine {
-                proto::IndexEngine::Memory => IndexEngine::Memory(create_index_request.schema.clone()),
-                proto::IndexEngine::File => IndexEngine::File(application_config.get_path_for_index_data(&create_index_request.index_name)),
-            })
-            .primary_key(create_index_request.primary_key.to_owned())
-            .default_fields(create_index_request.default_fields.clone())
-            .multi_fields(HashSet::from_iter(create_index_request.multi_fields.clone().into_iter()))
-            .stop_words(create_index_request.stop_words.clone())
-            .autocommit_interval_ms(create_index_request.autocommit_interval_ms);
-        if let Some(writer_threads) = create_index_request.writer_threads {
-            index_config_builder.writer_threads(writer_threads);
-        }
-        if let Some(writer_heap_size_bytes) = create_index_request.writer_heap_size_bytes {
-            index_config_builder.writer_heap_size_bytes(writer_heap_size_bytes);
-        }
-        let index_config = index_config_builder.build().unwrap();
-        match application_config.autosave().indices.entry(create_index_request.index_name.to_owned()) {
+        match application_config.autosave().indices.entry(index_name.to_owned()) {
             Entry::Occupied(o) => Err(ValidationError::ExistingIndex(o.key().to_owned())),
             Entry::Vacant(v) => {
-                v.insert(index_config);
+                v.insert(index_config.clone());
                 Ok(())
             }
         }?;
@@ -122,12 +106,57 @@ impl IndexService {
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
+    #[instrument(skip_all, fields(index_name = index_name))]
+    pub async fn attach_index(&self, index_name: &str) -> SummaResult<Handler<IndexHolder>> {
+        let index_path = self.application_config.read().await.get_path_for_index_data(index_name);
+        if !index_path.exists() {
+            return Err(ValidationError::MissingIndex(index_name.to_string()).into());
+        }
+        let index_engine = IndexEngine::File(index_path);
+
+        let index_config = IndexConfigBuilder::default().index_engine(index_engine.clone()).build().unwrap();
+        self.insert_config(index_name, &index_config).await?;
+
+        let index_holder = IndexHolder::open(
+            index_name,
+            IndexConfigProxy::new(&self.application_config, index_name),
+        )
+        .await?;
+
+        let owning_handler = OwningHandler::new(index_holder);
+        let handler = owning_handler.handler();
+        self.index_holders_mut()
+            .await
+            .insert(index_name.to_owned(), owning_handler);
+        Ok(handler)
+    }
+
+    /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaResult<Handler<IndexHolder>> {
-        self.insert_config(&create_index_request).await?;
+        let index_engine = match create_index_request.index_engine {
+            proto::IndexEngine::Memory => IndexEngine::Memory(create_index_request.schema.clone()),
+            proto::IndexEngine::File => IndexEngine::File(self.application_config.read().await.get_path_for_index_data(&create_index_request.index_name)),
+        };
+        let mut index_config_builder = IndexConfigBuilder::default();
+        index_config_builder
+            .index_engine(index_engine.clone())
+            .primary_key(create_index_request.primary_key.to_owned())
+            .default_fields(create_index_request.default_fields.clone())
+            .multi_fields(HashSet::from_iter(create_index_request.multi_fields.clone().into_iter()))
+            .autocommit_interval_ms(create_index_request.autocommit_interval_ms);
+        if let Some(writer_threads) = create_index_request.writer_threads {
+            index_config_builder.writer_threads(writer_threads);
+        }
+        if let Some(writer_heap_size_bytes) = create_index_request.writer_heap_size_bytes {
+            index_config_builder.writer_heap_size_bytes(writer_heap_size_bytes);
+        }
+
+        let index_config = index_config_builder.build().unwrap();
+        self.insert_config(&create_index_request.index_name, &index_config).await?;
 
         let mut segment_attributes = HashMap::new();
-        segment_attributes.insert("is_frozen".to_string(), SegmentAttribute::ConjunctiveBool(create_index_request.is_frozen));
+        segment_attributes.insert("is_frozen".to_string(), SegmentAttribute::ConjunctiveBool(false));
 
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression,
@@ -135,15 +164,15 @@ impl IndexService {
             segment_attributes_config: SegmentAttributesConfig::new(segment_attributes),
             ..Default::default()
         };
-        let owning_handler = OwningHandler::new(
-            IndexHolder::create(
-                &create_index_request.index_name,
-                &create_index_request.schema,
-                IndexConfigProxy::new(&self.application_config, &create_index_request.index_name),
-                index_settings,
-            )
-            .await?,
-        );
+        let index_holder = IndexHolder::create(
+            &create_index_request.index_name,
+            &create_index_request.schema,
+            IndexConfigProxy::new(&self.application_config, &create_index_request.index_name),
+            index_settings,
+        )
+        .await?;
+
+        let owning_handler = OwningHandler::new(index_holder);
         let handler = owning_handler.handler();
         self.index_holders_mut()
             .await
@@ -166,7 +195,7 @@ impl IndexService {
                 _ => Some(sort_by_field),
             }
         }
-        index_updater.commit(None).await?;
+        index_updater.commit().await?;
         Ok(index_holder)
     }
 

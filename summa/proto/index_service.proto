@@ -7,6 +7,7 @@ import "summa/proto/utils.proto";
 
 service IndexApi {
   rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
+  rpc attach_index(AttachIndexRequest) returns (AttachIndexResponse) {}
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
   rpc create_index (CreateIndexRequest) returns (CreateIndexResponse) {}
   rpc delete_document (DeleteDocumentRequest) returns (DeleteDocumentResponse) {}
@@ -33,10 +34,17 @@ message AlterIndexResponse {
   Index index = 1;
 }
 
+message AttachIndexRequest {
+  string index_name = 1;
+}
+
+message AttachIndexResponse {
+  Index index = 1;
+}
+
 message CommitIndexRequest {
   string index_alias = 1;
   CommitMode commit_mode = 2;
-  optional bool is_frozen = 3;
 }
 
 message CommitIndexResponse {
@@ -61,8 +69,6 @@ message CreateIndexRequest {
   optional uint64 autocommit_interval_ms = 8;
   optional SortByField sort_by_field = 9;
   repeated string multi_fields = 11;
-  repeated string stop_words = 12;
-  bool is_frozen = 13;
 }
 
 message CreateIndexResponse {

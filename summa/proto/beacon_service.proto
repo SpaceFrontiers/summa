@@ -7,17 +7,14 @@ service BeaconApi {
   rpc publish_index (PublishIndexRequest) returns (PublishIndexResponse) {}
 }
 
-message AttachIndexRequest {
-  string index_config = 1;
-  string data_path = 2;
-}
-
-message AttachIndexResponse {}
-
 message PublishIndexRequest {
   string index_alias = 1;
 }
 
 message PublishIndexResponse {
-  string ipfs_multihash = 1;
+  message Key {
+    string name = 1;
+    string id = 2;
+  }
+  Key key = 1;
 }

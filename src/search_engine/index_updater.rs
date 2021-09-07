@@ -1,18 +1,21 @@
 use super::index_writer_holder::IndexWriterHolder;
-use crate::configs::{ConsumerConfig, IndexConfigProxy};
+use crate::configs::{ConsumerConfig, IndexConfig, IndexConfigProxy};
 use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::consumers::kafka::Consumer;
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use crate::search_engine::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::search_engine::SummaDocument;
+use crate::services::beacon_service::Key;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::collections::hash_map::Entry;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tantivy::schema::Schema;
+use tantivy::SegmentAttribute::ConjunctiveBool;
 use tantivy::{Index, Opstamp, SegmentAttribute, SegmentAttributes, SegmentComponent, SegmentId, SegmentMeta};
 use tracing::{info, instrument, warn};
 
@@ -36,6 +39,46 @@ fn process_message(
     }
 }
 
+fn create_index_writer_holder(index: &Index, index_config: &IndexConfig) -> SummaResult<IndexWriterHolder> {
+    let index_writer = index.writer_with_num_threads(
+        index_config.writer_threads.try_into().unwrap(),
+        index_config.writer_heap_size_bytes.try_into().unwrap(),
+    )?;
+    index_writer.set_merge_policy(Box::new(FrozenLogMergePolicy::default()));
+    IndexWriterHolder::new(
+        index_writer,
+        match index_config.primary_key {
+            Some(ref primary_key) => index.schema().get_field(primary_key),
+            None => None,
+        },
+    )
+}
+
+fn wait_merging_threads(index_writer_holder: &mut IndexWriterHolder, index: &Index, index_config: &IndexConfig) {
+    take_mut::take(index_writer_holder, |index_writer_holder| {
+        index_writer_holder.wait_merging_threads().unwrap();
+        create_index_writer_holder(index, index_config).unwrap()
+    });
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub(crate) struct IndexFilePath {
+    file_path: PathBuf,
+    is_immutable: bool,
+}
+
+impl IndexFilePath {
+    pub fn new(file_path: PathBuf, is_immutable: bool) -> IndexFilePath {
+        IndexFilePath { file_path, is_immutable }
+    }
+    pub fn path(&self) -> &Path {
+        &self.file_path
+    }
+    pub fn is_immutable(&self) -> bool {
+        self.is_immutable
+    }
+}
+
 /// Index updating through consumers and via direct invocation
 pub(crate) struct IndexUpdater {
     index_config_proxy: IndexConfigProxy,
@@ -49,22 +92,8 @@ impl IndexUpdater {
     /// Creates new `IndexUpdater`
     pub(super) async fn new(index: Index, index_name: &str, index_config_proxy: IndexConfigProxy) -> SummaResult<IndexUpdater> {
         let index_config = index_config_proxy.read().await.get().clone();
-        let index_writer = index.writer_with_num_threads(
-            index_config.writer_threads.try_into().unwrap(),
-            index_config.writer_heap_size_bytes.try_into().unwrap(),
-        )?;
-        index_writer.set_merge_policy(Box::new(FrozenLogMergePolicy::default()));
-        let index_writer_holder = Arc::new(IndexWriterHolder::new(
-            index_writer,
-            match index_config.primary_key {
-                Some(ref primary_key) => index.schema().get_field(primary_key),
-                None => None,
-            },
-        )?);
-        let consumers = index_config_proxy
-            .read()
-            .await
-            .get()
+        let index_writer_holder = Arc::new(create_index_writer_holder(&index, &index_config)?);
+        let consumers = index_config
             .consumer_configs
             .iter()
             .map(|(consumer_name, consumer_config)| Consumer::new(consumer_name, consumer_config).unwrap())
@@ -221,7 +250,7 @@ impl IndexUpdater {
     #[instrument(skip(self))]
     pub(crate) async fn merge(&mut self, segment_ids: &[SegmentId]) -> SummaResult<Option<SegmentMeta>> {
         let index_writer_holder = self.stop_consumers().await?;
-        let segment_meta = index_writer_holder.merge(segment_ids, &None).await?;
+        let segment_meta = index_writer_holder.merge(segment_ids, None).await?;
         self.start_consumers().await?;
         Ok(segment_meta)
     }
@@ -237,14 +266,12 @@ impl IndexUpdater {
     }
 
     /// Commit Tantivy index and Kafka offsets
-    #[instrument(skip(self), fields(index_name = ?self.index_name, is_frozen = is_frozen))]
-    pub(crate) async fn commit(&mut self, is_frozen: Option<bool>) -> SummaResult<Opstamp> {
-        if let Some(is_frozen) = is_frozen {
-            self.index
-                .settings_mut()
-                .segment_attributes_config
-                .insert("is_frozen", SegmentAttribute::ConjunctiveBool(is_frozen));
-        }
+    #[instrument(skip(self), fields(index_name = ?self.index_name))]
+    pub(crate) async fn commit(&mut self) -> SummaResult<Opstamp> {
+        self.index
+            .settings_mut()
+            .segment_attributes_config
+            .insert("is_frozen", SegmentAttribute::ConjunctiveBool(false));
         let opstamp = self.stop_consumers().await?.commit().await?;
         self.commit_offsets().await?;
         self.start_consumers().await?;
@@ -253,15 +280,10 @@ impl IndexUpdater {
 
     /// Vacuums garbage files and compacts segments
     #[instrument(skip(self))]
-    pub(crate) async fn vacuum(&mut self, segment_attributes: Option<SegmentAttributes>) -> SummaResult<()> {
+    pub(crate) async fn vacuum(&mut self) -> SummaResult<()> {
         let index_writer_holder = self.stop_consumers().await?;
         index_writer_holder.commit().await?;
-
-        let mut segments = index_writer_holder.index().searchable_segments()?;
-        segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
-        for segment in segments.iter().filter(|segment| segment.meta().num_deleted_docs() > 0) {
-            index_writer_holder.merge(&[segment.id()], &segment_attributes).await?;
-        }
+        index_writer_holder.vacuum(None).await?;
         index_writer_holder.commit().await?;
 
         self.commit_offsets().await?;
@@ -285,26 +307,50 @@ impl IndexUpdater {
         Ok(opstamp)
     }
 
-    /// Get frozen segments
-    pub async fn get_frozen_segments(&self) -> SummaResult<Vec<PathBuf>> {
+    /// Set attributes
+    pub async fn prepare_index_publishing<Fut>(&mut self, publisher: impl FnOnce(Vec<IndexFilePath>) -> Fut) -> SummaResult<Key>
+    where
+        Fut: Future<Output = SummaResult<Key>>,
+    {
+        let index = self.index.clone();
+        let index_config = self.index_config_proxy.read().await.get().clone();
+
+        let index_writer_holder = self.stop_consumers().await?;
+
+        let is_frozen_attributes = Some(SegmentAttributes::new(HashMap::from_iter(
+            vec![("is_frozen".to_string(), ConjunctiveBool(true))].into_iter(),
+        )));
+
+        index_writer_holder.commit().await?;
+        index_writer_holder.vacuum(is_frozen_attributes.as_ref()).await?;
+        index_writer_holder.commit().await?;
+
+        wait_merging_threads(index_writer_holder, &index, &index_config);
+        self.commit_offsets().await?;
+
+        let mut segment_files = self.get_immutable_segment_files().await?;
+        let meta_json = PathBuf::from("meta.json");
+        segment_files.push(IndexFilePath::new(meta_json, false));
+
+        let result = publisher(segment_files).await?;
+
+        self.start_consumers().await?;
+        Ok(result)
+    }
+
+    /// Get segments
+    async fn get_immutable_segment_files(&self) -> SummaResult<Vec<IndexFilePath>> {
         Ok(self
             .index
             .searchable_segments()?
             .into_iter()
-            .filter(|segment| match segment.meta().segment_attributes().get("is_frozen") {
-                None => true,
-                Some(is_frozen) => match is_frozen {
-                    SegmentAttribute::ConjunctiveBool(value) => !*value,
-                    _ => unreachable!(),
-                },
-            })
             .flat_map(|segment| {
                 SegmentComponent::iterator()
-                    .filter(|comp| *comp != &SegmentComponent::TempStore && *comp != &SegmentComponent::Delete)
-                    .map(|component| segment.meta().relative_path(*component))
-                    .collect::<HashSet<PathBuf>>()
+                    .filter(|segment_component| *segment_component != &SegmentComponent::Delete && *segment_component != &SegmentComponent::TempStore)
+                    .map(|component| IndexFilePath::new(segment.meta().relative_path(*component), true))
+                    .collect::<HashSet<_>>()
             })
-            .collect())
+            .collect::<Vec<_>>())
     }
 }
 

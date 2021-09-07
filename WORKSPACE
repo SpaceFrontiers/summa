@@ -62,7 +62,7 @@ grpc_extra_deps()
 load("@rules_rust//rust:repositories.bzl", "rust_register_toolchains", "rules_rust_dependencies")
 rules_rust_dependencies()
 rust_register_toolchains(
-    version="1.62.0",
+    version="1.63.0",
 )
 load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
 crate_universe_dependencies(bootstrap = True)

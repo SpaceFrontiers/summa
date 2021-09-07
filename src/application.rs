@@ -40,7 +40,6 @@ impl Application {
             .arg_required_else_help(true)
             .about(LONG_ABOUT)
             .version(option_env!("CARGO_PKG_VERSION").unwrap_or("master"))
-            .author("Pasha Podolsky")
             .arg(arg!(-v --verbose ... "Level of verbosity"))
             .subcommand(
                 command!("generate-config")
@@ -120,8 +119,7 @@ impl Application {
     }
 
     async fn run(&self) -> SummaResult<()> {
-        let receiver = signal_channel();
-        let server = self.serve(&receiver).await?;
+        let server = self.serve(&signal_channel()).await?;
         server.await
     }
 }

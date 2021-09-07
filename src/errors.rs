@@ -1,5 +1,6 @@
 use crate::search_engine::DocumentParsingError;
 use derive_builder::UninitializedFieldError;
+use hyper::StatusCode;
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
 use tantivy::schema::FieldType;
@@ -26,6 +27,8 @@ pub enum ValidationError {
     ExistingPath(PathBuf),
     #[error("invalid_aggregation_error")]
     InvalidAggregation,
+    #[error("index_argument_error: {0}")]
+    InvalidArgument(String),
     #[error("invalid_fast_field_type_error: ({field:?}, {field_type:?}, {tantivy_error:?})")]
     InvalidFastFieldType {
         field: String,
@@ -56,6 +59,8 @@ pub enum ValidationError {
     MissingPrimaryKey(Option<String>),
     #[error("missing_range")]
     MissingRange,
+    #[error("missing_schema: {0}")]
+    MissingSchema(String),
     #[error("missing_snippet_field: {0}")]
     MissingSnippetField(String),
     #[error("required_fast_field: {0}")]
@@ -82,6 +87,8 @@ pub enum Error {
     FastEval(fasteval2::Error),
     #[error("hyper_error: {0}")]
     Hyper(hyper::Error),
+    #[error("hyper_http_error: {0}")]
+    HttpHyper(hyper::http::Error),
     #[error("infallible")]
     Infallible,
     #[error("internal_error")]
@@ -96,6 +103,8 @@ pub enum Error {
     InvalidConfig(String),
     #[error("{0:?}")]
     IO((std::io::Error, Option<PathBuf>)),
+    #[error("json_error: {0}")]
+    Json(serde_json::Error),
     #[error("{0}")]
     Kafka(rdkafka::error::KafkaError),
     #[error("tantivy_error: {0}")]
@@ -112,6 +121,10 @@ pub enum Error {
     UnboundDocument,
     #[error("unknown_directory_error: {0}")]
     UnknownDirectory(String),
+    #[error("upstream_http_status_error: {0}")]
+    UpstreamHttpStatus(StatusCode),
+    #[error("utf8_error: {0}")]
+    Utf8(std::str::Utf8Error),
     #[error("{0}")]
     Validation(ValidationError),
     #[error("yaml_error: {0}")]
@@ -142,6 +155,12 @@ impl From<hyper::Error> for Error {
     }
 }
 
+impl From<hyper::http::Error> for Error {
+    fn from(error: hyper::http::Error) -> Self {
+        Error::HttpHyper(error)
+    }
+}
+
 impl From<rdkafka::error::KafkaError> for Error {
     fn from(error: rdkafka::error::KafkaError) -> Self {
         Error::Kafka(error)
@@ -166,6 +185,12 @@ impl From<serde_yaml::Error> for Error {
     }
 }
 
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Error::Json(error)
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Error::IO((error, None))
@@ -178,9 +203,15 @@ impl From<std::net::AddrParseError> for Error {
     }
 }
 
+impl From<std::str::Utf8Error> for ValidationError {
+    fn from(error: std::str::Utf8Error) -> Self {
+        ValidationError::Utf8(error)
+    }
+}
+
 impl From<std::str::Utf8Error> for Error {
     fn from(error: std::str::Utf8Error) -> Self {
-        Error::Validation(ValidationError::Utf8(error))
+        Error::Utf8(error)
     }
 }
 

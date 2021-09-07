@@ -42,8 +42,6 @@ pub struct IndexConfig {
     pub primary_key: Option<String>,
     #[builder(default = "HashSet::new()")]
     pub multi_fields: HashSet<String>,
-    #[builder(default = "None")]
-    pub stop_words: Option<Vec<String>>,
     #[builder(default = "128 * 1024 * 1024")]
     pub writer_heap_size_bytes: u64,
     #[builder(default = "1")]

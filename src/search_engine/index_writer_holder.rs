@@ -1,6 +1,5 @@
 use crate::errors::SummaResult;
 use crate::errors::ValidationError;
-use crate::errors::ValidationError::MissingPrimaryKey;
 use tantivy::schema::{Field, FieldType};
 use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentAttributes, SegmentId, SegmentMeta, Term};
 use tracing::info;
@@ -34,7 +33,7 @@ impl IndexWriterHolder {
                 primary_key,
                 document
                     .get_first(primary_key)
-                    .ok_or_else(|| MissingPrimaryKey(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(document)))))?
+                    .ok_or_else(|| ValidationError::MissingPrimaryKey(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(document)))))?
                     .as_i64()
                     .unwrap(),
             ));
@@ -47,7 +46,7 @@ impl IndexWriterHolder {
         if let Some(primary_key) = self.primary_key {
             Ok(self.index_writer.delete_term(Term::from_field_i64(primary_key, primary_key_value)))
         } else {
-            Err(MissingPrimaryKey(None).into())
+            Err(ValidationError::MissingPrimaryKey(None).into())
         }
     }
 
@@ -66,10 +65,10 @@ impl IndexWriterHolder {
     ///
     /// Also cleans deleted documents and do recompression. Possible to pass the only segment in `segment_ids` to do recompression or clean up.
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub(super) async fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: &Option<SegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
+    pub(super) async fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<SegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
         info!(action = "merge_segments", segment_ids = ?segment_ids);
         let segment_meta = match segment_attributes {
-            Some(segment_attributes) => self.index_writer.merge_with_attributes(segment_ids, segment_attributes.clone()).await?,
+            Some(segment_attributes) => self.index_writer.merge_with_attributes(segment_ids, segment_attributes).await?,
             None => self.index_writer.merge(segment_ids).await?,
         };
         info!(action = "merged_segments", segment_ids = ?segment_ids, merged_segment_meta = ?segment_meta);
@@ -85,5 +84,29 @@ impl IndexWriterHolder {
         let result = self.index_writer.prepare_commit()?.commit_future().await;
         info!(action = "committed_index", result = ?result);
         Ok(result?)
+    }
+
+    pub(super) async fn vacuum(&mut self, segment_attributes: Option<&SegmentAttributes>) -> SummaResult<()> {
+        let mut segments = self.index().searchable_segments()?;
+        segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
+
+        let (small_segments, segments): (Vec<_>, Vec<_>) = segments.into_iter().partition(|segment| segment.meta().num_docs() < 100000);
+
+        if !small_segments.is_empty() {
+            self.merge(
+                &small_segments.into_iter().map(|segment| segment.id()).collect::<Vec<_>>(),
+                segment_attributes.cloned(),
+            )
+            .await?;
+        }
+
+        for segment in segments.iter() {
+            self.merge(&[segment.id()], segment_attributes.cloned()).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn wait_merging_threads(self) -> SummaResult<()> {
+        Ok(self.index_writer.wait_merging_threads()?)
     }
 }
