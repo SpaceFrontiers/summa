@@ -28,6 +28,8 @@ message AlterIndexRequest {
   string index_name = 1;
   optional Compression compression = 2;
   optional SortByField sort_by_field = 3;
+  optional string default_fields = 4;
+  optional string multi_fields = 5;
 }
 
 message AlterIndexResponse {

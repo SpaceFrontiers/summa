@@ -15,7 +15,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tantivy::schema::Schema;
-use tantivy::SegmentAttribute::ConjunctiveBool;
 use tantivy::{Index, Opstamp, SegmentAttribute, SegmentAttributes, SegmentComponent, SegmentId, SegmentMeta};
 use tracing::{info, instrument, warn};
 
@@ -268,10 +267,6 @@ impl IndexUpdater {
     /// Commit Tantivy index and Kafka offsets
     #[instrument(skip(self), fields(index_name = ?self.index_name))]
     pub(crate) async fn commit(&mut self) -> SummaResult<Opstamp> {
-        self.index
-            .settings_mut()
-            .segment_attributes_config
-            .insert("is_frozen", SegmentAttribute::ConjunctiveBool(false));
         let opstamp = self.stop_consumers().await?.commit().await?;
         self.commit_offsets().await?;
         self.start_consumers().await?;
@@ -318,7 +313,7 @@ impl IndexUpdater {
         let index_writer_holder = self.stop_consumers().await?;
 
         let is_frozen_attributes = Some(SegmentAttributes::new(HashMap::from_iter(
-            vec![("is_frozen".to_string(), ConjunctiveBool(true))].into_iter(),
+            vec![("is_frozen".to_string(), SegmentAttribute::ConjunctiveBool(true))].into_iter(),
         )));
 
         index_writer_holder.commit().await?;

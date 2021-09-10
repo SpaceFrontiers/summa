@@ -195,6 +195,12 @@ impl IndexService {
                 _ => Some(sort_by_field),
             }
         }
+        if let Some(default_fields) = alter_index_request.default_fields {
+            *index_holder.index_config_proxy().write().await.autosave().default_fields = default_fields
+        }
+        if let Some(multi_fields) = alter_index_request.multi_fields {
+            *index_holder.index_config_proxy().write().await.autosave().multi_fields = multi_fields
+        }
         index_updater.commit().await?;
         Ok(index_holder)
     }

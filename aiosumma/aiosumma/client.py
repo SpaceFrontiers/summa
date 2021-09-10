@@ -42,6 +42,66 @@ class SummaClient(BaseGrpcClient):
     }
 
     @expose
+    async def alter_index(
+        self,
+        index_name: str,
+        default_fields: Optional[List[str]],
+        multi_fields: Optional[List[str]],
+        compression: Optional[str] = None,
+        sort_by_field: Optional[Tuple] = None,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.CreateIndexResponse:
+        """
+        Alter index settings like default fields, multiple fields, compression, ordering etc
+
+        Args:
+            index_name: index name
+            default_fields: `Phrase` and `Match` queries are searching in these fields
+            multi_fields: every field in Tantivy is list. For consistency, Summa returns
+                            only first values of lists except for fields listed here as multiple
+            compression: Tantivy index compression
+            sort_by_field: (field_name, order)
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].alter_index(
+            index_service_pb.AlterIndexRequest(
+                index_name=index_name,
+                default_fields=default_fields,
+                multi_fields=multi_fields,
+                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
+                sort_by_field=index_service_pb.SortByField(
+                    field=sort_by_field[0],
+                    order=sort_by_field[1],
+                ) if sort_by_field else None
+            ),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
+    async def attach_index(
+        self,
+        index_name: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.AttachIndexResponse:
+        """
+        Attach index to Summa. It must be placed under data directory named as `index_name`
+
+        Args:
+            index_name: index name
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].attach_index(
+            index_service_pb.AttachIndexRequest(
+                index_name=index_name,
+            ),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
     async def commit_index(
         self,
         index_alias: str,
@@ -104,62 +164,6 @@ class SummaClient(BaseGrpcClient):
                 index_alias=index_alias,
                 topics=topics,
                 threads=threads,
-            ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
-        )
-
-    @expose
-    async def alter_index(
-        self,
-        index_name: str,
-        compression: Optional[str] = None,
-        sort_by_field: Optional[Tuple] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> index_service_pb.CreateIndexResponse:
-        """
-        Alter index options like compression and ordering
-
-        Args:
-            index_name: index name
-            compression: Tantivy index compression
-            sort_by_field: (field_name, order)
-            request_id: request id
-            session_id: session id
-        """
-        return await self.stubs['index_api'].alter_index(
-            index_service_pb.AlterIndexRequest(
-                index_name=index_name,
-                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
-                sort_by_field=index_service_pb.SortByField(
-                    field=sort_by_field[0],
-                    order=sort_by_field[1],
-                ) if sort_by_field else None
-            ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
-        )
-
-    @expose
-    async def attach_index(
-        self,
-        index_name: str,
-        index_path: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> index_service_pb.AttachIndexResponse:
-        """
-        Alter index options like compression and ordering
-
-        Args:
-            index_name: index name
-            index_path: index path
-            request_id: request id
-            session_id: session id
-        """
-        return await self.stubs['index_api'].attach_index(
-            index_service_pb.AttachIndexRequest(
-                index_name=index_name,
-                index_path=index_path,
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
@@ -474,8 +478,7 @@ class SummaClient(BaseGrpcClient):
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> search_service_pb.SearchResponse:
-        """pu
-        Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
+        """Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
 
         Args:
             index_alias: index alias
@@ -540,11 +543,10 @@ class SummaClient(BaseGrpcClient):
         session_id: Optional[str] = None,
     ) -> beacon_service_pb.PublishIndexResponse:
         """
-        Merge a list of segments into a single one
+        Publish index into IPFS, require `ipfs` section configured in config
 
         Args:
             index_alias: index alias
-            segment_ids: segment ids
             request_id: request id
             session_id: session id
         """

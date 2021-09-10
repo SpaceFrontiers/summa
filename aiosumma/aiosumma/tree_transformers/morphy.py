@@ -12,7 +12,7 @@ from izihawa_nlptools.morph import (
 from ..parser.elements import (
     Boost,
     SynonymsGroup,
-    Word, Phrase,
+    Word,
 )
 from .base import TreeTransformer
 
