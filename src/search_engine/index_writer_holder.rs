@@ -1,7 +1,7 @@
 use crate::errors::SummaResult;
 use crate::errors::ValidationError;
 use tantivy::schema::{Field, FieldType};
-use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentAttributes, SegmentId, SegmentMeta, Term};
+use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentAttribute, SegmentAttributes, SegmentId, SegmentMeta, Term};
 use tracing::info;
 
 /// Managing write operations to index
@@ -90,7 +90,16 @@ impl IndexWriterHolder {
         let mut segments = self.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
 
-        let (small_segments, segments): (Vec<_>, Vec<_>) = segments.into_iter().partition(|segment| segment.meta().num_docs() < 100000);
+        let (small_segments, segments): (Vec<_>, Vec<_>) = segments
+            .into_iter()
+            .filter(|segment| match segment.meta().segment_attributes().get("is_frozen") {
+                None => true,
+                Some(is_frozen) => match is_frozen {
+                    SegmentAttribute::ConjunctiveBool(value) => !*value,
+                    _ => unreachable!(),
+                },
+            })
+            .partition(|segment| segment.meta().num_docs() < 100000);
 
         if !small_segments.is_empty() {
             self.merge(

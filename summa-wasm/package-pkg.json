@@ -1,0 +1,17 @@
+{
+  "name": "summa-wasm",
+  "collaborators": [
+    "Pasha Podolsky <ppodolsky@me.com>"
+  ],
+  "version": "0.2.10",
+  "files": [
+    "index_bg.wasm",
+    "index.js",
+    "index_bg.js",
+    "index.d.ts",
+    "gate.ts"
+  ],
+  "module": "index.js",
+  "types": "index.d.ts",
+  "sideEffects": false
+}

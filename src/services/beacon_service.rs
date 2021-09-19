@@ -10,7 +10,6 @@ use hyper::http::HeaderValue;
 use hyper::{body, Body, Client, HeaderMap, Method, Request, Response, StatusCode, Uri};
 use itertools::Itertools;
 use izihawa_hyper_multipart::client::multipart;
-use serde::de::DeserializeOwned;
 use serde::{de, Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -72,7 +71,7 @@ pub struct NameResolveResponse {
     path: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PinRmResponse {
     pins: Vec<String>,
@@ -80,8 +79,7 @@ pub struct PinRmResponse {
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct RepoGcResponse {
-    error: String,
+pub struct GcRemovedItem {
     key: HashMap<String, String>,
 }
 
@@ -121,44 +119,66 @@ impl BeaconService {
     where
         B: HttpBody + Send + 'static,
     {
-        if response.status() != StatusCode::OK {
-            return Err(Error::UpstreamHttpStatus(response.status()));
-        }
+        let status = response.status();
         let body = response.into_body();
-        String::from_utf8(body::to_bytes(body).await.map_err(|_| Error::Internal)?.to_vec()).map_err(|e| Error::Utf8(e.utf8_error()))
+        let text = String::from_utf8(body::to_bytes(body).await.map_err(|_| Error::Internal)?.to_vec()).map_err(|e| Error::Utf8(e.utf8_error()))?;
+        if status != StatusCode::OK {
+            return Err(Error::UpstreamHttpStatus(status, text));
+        }
+        Ok(text)
     }
 
-    async fn request<R: DeserializeOwned>(&self, uri: Uri) -> SummaResult<R> {
+    async fn request(&self, uri: Uri) -> SummaResult<Response<Body>> {
         let request = Request::builder().method(Method::POST).uri(uri.clone()).body(Body::empty())?;
         info!(action = "ipfs_request", request = ?request);
-        let response = self.ipfs_client.request(request).await?;
-        let text = self.parse_response(response).await?;
-        Ok(serde_json::from_str::<R>(&text)?)
+        Ok(self.ipfs_client.request(request).await?)
     }
 
     async fn key_gen(&self, name: &str) -> SummaResult<Key> {
-        self.request(self.generate_uri("/api/v0/key/gen", &[("arg", name)])?).await
+        let response = self.request(self.generate_uri("/api/v0/key/gen", &[("arg", name)])?).await?;
+        let text = self.parse_response(response).await?;
+        Ok(serde_json::from_str(&text)?)
     }
 
     async fn key_list(&self) -> SummaResult<KeyListResponse> {
-        self.request(self.generate_uri("/api/v0/key/list", &[])?).await
+        let response = self.request(self.generate_uri("/api/v0/key/list", &[])?).await?;
+        let text = self.parse_response(response).await?;
+        Ok(serde_json::from_str(&text)?)
     }
 
     async fn name_publish(&self, hash: &str, key_name: &str) -> SummaResult<NamePublishResponse> {
-        self.request(self.generate_uri("/api/v0/name/publish", &[("arg", hash), ("key", key_name)])?)
-            .await
+        let response = self
+            .request(self.generate_uri("/api/v0/name/publish", &[("arg", hash), ("key", key_name)])?)
+            .await?;
+        let text = self.parse_response(response).await?;
+        Ok(serde_json::from_str(&text)?)
     }
 
     async fn name_resolve(&self, name: &str) -> SummaResult<NameResolveResponse> {
-        self.request(self.generate_uri("/api/v0/name/resolve", &[("arg", name)])?).await
+        let response = self.request(self.generate_uri("/api/v0/name/resolve", &[("arg", name)])?).await?;
+        let text = self.parse_response(response).await?;
+        Ok(serde_json::from_str(&text)?)
     }
 
-    async fn pin_rm(&self, hash: &str) -> SummaResult<PinRmResponse> {
-        self.request(self.generate_uri("/api/v0/pin/rm", &[("arg", hash)])?).await
+    async fn pin_rm(&self, hash: &str) -> SummaResult<Vec<PinRmResponse>> {
+        let response = self
+            .request(self.generate_uri("/api/v0/pin/rm", &[("arg", hash), ("recursive", "true")])?)
+            .await?;
+        match self.parse_response(response).await {
+            Err(Error::UpstreamHttpStatus(StatusCode::INTERNAL_SERVER_ERROR, _)) => Ok(vec![]),
+            Ok(text) => Ok(serde_json::from_str(&text).unwrap()),
+            Err(e) => Err(e),
+        }
     }
 
-    async fn repo_gc(&self) -> SummaResult<RepoGcResponse> {
-        self.request(self.generate_uri("/api/v0/repo/gc", &[])?).await
+    async fn repo_gc(&self) -> SummaResult<Vec<GcRemovedItem>> {
+        let response = self.request(self.generate_uri("/api/v0/repo/gc", &[])?).await?;
+        let text = self.parse_response(response).await?;
+        Ok(text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect::<Vec<_>>())
     }
 
     async fn add<P1: AsRef<Path> + Debug>(&self, directory: P1, index_file_paths: &[IndexFilePath], no_copy: bool) -> SummaResult<Vec<AddedFile>> {
@@ -168,7 +188,10 @@ impl BeaconService {
 
         info!(action = "prepare_request", directory = ?directory, index_file_paths = ?index_file_paths);
 
-        let uri = self.generate_uri("/api/v0/add", &[("nocopy", "true"), ("cid-version", "1"), ("hash", "blake3")])?;
+        let uri = self.generate_uri(
+            "/api/v0/add",
+            &[("nocopy", if no_copy { "true" } else { "false" }), ("cid-version", "1"), ("hash", "blake3")],
+        )?;
         for index_file_path in index_file_paths {
             let abs_path = full_directory_path.join(index_file_path.path());
 
@@ -219,10 +242,10 @@ impl BeaconService {
         let key = {
             let mut index_updater = index_updater.write().await;
             index_updater
-                .prepare_index_publishing(|files: Vec<IndexFilePath>| async move {
+                .prepare_index_publishing(index_path.clone(), |files: Vec<IndexFilePath>| async move {
                     let mutable_files = files.iter().filter_map(|file| (!file.is_immutable()).then(|| file.clone())).collect::<Vec<_>>();
+                    self.add(&index_path, &mutable_files, false).await?;
                     let added_files = self.add(&index_path, &files, true).await?;
-                    self.add(&index_path, &mutable_files, true).await?;
                     let new_root = added_files.into_iter().find(|added_file| added_file.name == index_name).unwrap();
                     let old_key = self.key_list().await?.keys.into_iter().find(|key| key.name == index_name);
                     let key = match old_key {

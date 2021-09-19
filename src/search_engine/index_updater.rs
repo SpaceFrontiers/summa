@@ -7,6 +7,7 @@ use crate::proto;
 use crate::search_engine::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::search_engine::SummaDocument;
 use crate::services::beacon_service::Key;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::collections::hash_map::Entry;
@@ -14,8 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use summa_directory::hot_cache_directory::write_hotcache;
+use tantivy::directory::MmapDirectory;
 use tantivy::schema::Schema;
-use tantivy::{Index, Opstamp, SegmentAttribute, SegmentAttributes, SegmentComponent, SegmentId, SegmentMeta};
+use tantivy::{Directory, Index, Opstamp, SegmentAttribute, SegmentAttributes, SegmentComponent, SegmentId, SegmentMeta};
 use tracing::{info, instrument, warn};
 
 fn process_message(
@@ -185,7 +188,9 @@ impl IndexUpdater {
     #[instrument(skip(self))]
     pub(crate) async fn delete_consumer(&mut self, consumer_name: &str) -> SummaResult<()> {
         self.stop_consumers().await?.commit().await?;
-        self.commit_offsets().await?;
+        if let Err(error) = self.commit_offsets().await {
+            info!(action = "failed_commit", consumer_name = consumer_name, error = ?error);
+        }
         self.index_config_proxy
             .write()
             .await
@@ -258,7 +263,13 @@ impl IndexUpdater {
     #[instrument(skip(self))]
     async fn commit_offsets(&self) -> SummaResult<()> {
         for consumer in &self.consumers {
-            consumer.commit_offsets().await?;
+            let commit_result = consumer.commit_offsets().await;
+            if let Err(Error::Kafka(KafkaError::ConsumerCommit(RDKafkaErrorCode::AssignmentLost))) = commit_result {
+                consumer.stop().await?;
+                let schema = self.index.schema();
+                let index_writer_holder = self.index_writer_holder.clone();
+                consumer.start(move |message| process_message(&schema, &index_writer_holder, message)).await?;
+            }
         }
         info!(action = "committed_offsets");
         Ok(())
@@ -303,8 +314,9 @@ impl IndexUpdater {
     }
 
     /// Set attributes
-    pub async fn prepare_index_publishing<Fut>(&mut self, publisher: impl FnOnce(Vec<IndexFilePath>) -> Fut) -> SummaResult<Key>
+    pub async fn prepare_index_publishing<P, Fut>(&mut self, index_path: P, publisher: impl FnOnce(Vec<IndexFilePath>) -> Fut) -> SummaResult<Key>
     where
+        P: AsRef<Path>,
         Fut: Future<Output = SummaResult<Key>>,
     {
         let index = self.index.clone();
@@ -323,9 +335,18 @@ impl IndexUpdater {
         wait_merging_threads(index_writer_holder, &index, &index_config);
         self.commit_offsets().await?;
 
+        let mut hotcache_bytes = vec![];
+        let read_directory = MmapDirectory::open(index_path).unwrap();
+        write_hotcache(read_directory, &mut hotcache_bytes).unwrap();
+        index
+            .directory()
+            .atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)
+            .unwrap();
+
         let mut segment_files = self.get_immutable_segment_files().await?;
-        let meta_json = PathBuf::from("meta.json");
-        segment_files.push(IndexFilePath::new(meta_json, false));
+        segment_files.push(IndexFilePath::new(PathBuf::from(".managed.json"), false));
+        segment_files.push(IndexFilePath::new(PathBuf::from("meta.json"), false));
+        segment_files.push(IndexFilePath::new(PathBuf::from("hotcache.bin"), false));
 
         let result = publisher(segment_files).await?;
 
@@ -341,8 +362,15 @@ impl IndexUpdater {
             .into_iter()
             .flat_map(|segment| {
                 SegmentComponent::iterator()
-                    .filter(|segment_component| *segment_component != &SegmentComponent::Delete && *segment_component != &SegmentComponent::TempStore)
-                    .map(|component| IndexFilePath::new(segment.meta().relative_path(*component), true))
+                    .filter_map(|segment_component| {
+                        if *segment_component == SegmentComponent::TempStore
+                            || (*segment_component == SegmentComponent::Delete && !segment.meta().has_deletes())
+                        {
+                            None
+                        } else {
+                            Some(IndexFilePath::new(segment.meta().relative_path(*segment_component), true))
+                        }
+                    })
                     .collect::<HashSet<_>>()
             })
             .collect::<Vec<_>>())

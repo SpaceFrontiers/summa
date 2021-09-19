@@ -23,12 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes};
 use tantivy::error::DataCorruption;
-use tantivy::{AsyncIoResult, Directory, HasLen, Index, IndexReader, ReloadPolicy};
+use tantivy::{Directory, HasLen, Index, IndexReader, ReloadPolicy};
 
 use crate::caching_directory::CachingDirectory;
 use crate::debug_proxy_directory::DebugProxyDirectory;
@@ -64,10 +63,7 @@ impl SliceCacheIndex {
     }
 
     pub fn get(&self, byte_range: Range<usize>) -> Option<usize> {
-        let entry_idx = match self
-            .slices
-            .binary_search_by_key(&byte_range.start, |entry| entry.range().start)
-        {
+        let entry_idx = match self.slices.binary_search_by_key(&byte_range.start, |entry| entry.range().start) {
             Ok(idx) => idx,
             Err(0) => {
                 return None;
@@ -124,7 +120,9 @@ impl StaticDirectoryCacheBuilder {
 }
 
 fn deserialize_cbor<T>(bytes: &mut OwnedBytes) -> serde_cbor::Result<T>
-where T: serde::de::DeserializeOwned {
+where
+    T: serde::de::DeserializeOwned,
+{
     let len = bytes.read_u64();
     let value = serde_cbor::from_reader(&bytes.as_slice()[..len as usize]);
     bytes.advance(len as usize);
@@ -142,12 +140,10 @@ impl StaticDirectoryCache {
         let format_version = bytes.read_u8();
 
         if format_version != 0 {
-            return Err(tantivy::TantivyError::DataCorruption(
-                DataCorruption::comment_only(format!(
-                    "Format version not supported: `{}`",
-                    format_version
-                )),
-            ));
+            return Err(tantivy::TantivyError::DataCorruption(DataCorruption::comment_only(format!(
+                "Format version not supported: `{}`",
+                format_version
+            ))));
         }
 
         let file_lengths: HashMap<PathBuf, u64> = deserialize_cbor(&mut bytes).unwrap();
@@ -165,10 +161,7 @@ impl StaticDirectoryCache {
             })
             .collect::<tantivy::Result<_>>()?;
 
-        Ok(StaticDirectoryCache {
-            file_lengths,
-            slices,
-        })
+        Ok(StaticDirectoryCache { file_lengths, slices })
     }
 
     pub fn get_slice(&self, path: &Path) -> Arc<StaticSliceCache> {
@@ -181,11 +174,7 @@ impl StaticDirectoryCache {
 
     /// return the files and their cached lengths
     pub fn get_stats(&self) -> Vec<(PathBuf, usize)> {
-        let mut entries = self
-            .slices
-            .iter()
-            .map(|(path, cache)| (path.to_owned(), cache.len()))
-            .collect::<Vec<_>>();
+        let mut entries = self.slices.iter().map(|(path, cache)| (path.to_owned(), cache.len())).collect::<Vec<_>>();
 
         entries.sort_by_key(|el| el.0.to_owned());
         entries
@@ -217,12 +206,8 @@ impl StaticSliceCache {
         let body_len = u64::from_le_bytes(body_len_bytes);
         let (body, idx) = body.split(body_len as usize);
         let mut idx_bytes = idx.as_slice();
-        let index: SliceCacheIndex = serde_cbor::from_reader(&mut idx_bytes).map_err(|err| {
-            DataCorruption::comment_only(format!(
-                "Failed to deserialize the slice index: {:?}",
-                err
-            ))
-        })?;
+        let index: SliceCacheIndex =
+            serde_cbor::from_reader(&mut idx_bytes).map_err(|err| DataCorruption::comment_only(format!("Failed to deserialize the slice index: {:?}", err)))?;
         Ok(StaticSliceCache { bytes: body, index })
     }
 
@@ -241,6 +226,10 @@ impl StaticSliceCache {
             return Some(self.bytes.slice(start..start + byte_range.len()));
         }
         None
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.len() == 0
     }
 
     pub fn len(&self) -> usize {
@@ -290,9 +279,7 @@ impl StaticSliceCacheBuilder {
                     segment.range().start
                 )));
             }
-            if last.stop == segment.range().start
-                && (last.addr + last.range().len() == segment.addr)
-            {
+            if last.stop == segment.range().start && (last.addr + last.range().len() == segment.addr) {
                 // We merge the current segment with the previous one
                 last.stop += segment.range().len();
             } else {
@@ -314,8 +301,7 @@ impl StaticSliceCacheBuilder {
             total_len: self.total_len,
             slices: merged_slices,
         };
-        serde_cbor::to_writer(&mut self.wrt, &slices_idx)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        serde_cbor::to_writer(&mut self.wrt, &slices_idx).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         self.wrt.extend_from_slice(&self.offset.to_le_bytes()[..]);
         Ok(self.wrt)
     }
@@ -342,10 +328,7 @@ pub struct HotDirectory {
 
 impl HotDirectory {
     /// Wraps an index, with a static cache serialized into `hot_cache_bytes`.
-    pub fn open<D: Directory>(
-        underlying: D,
-        hot_cache_bytes: OwnedBytes,
-    ) -> tantivy::Result<HotDirectory> {
+    pub fn open<D: Directory>(underlying: D, hot_cache_bytes: OwnedBytes) -> tantivy::Result<HotDirectory> {
         let static_cache = StaticDirectoryCache::open(hot_cache_bytes)?;
         Ok(HotDirectory {
             inner: Arc::new(InnerHotDirectory {
@@ -355,9 +338,7 @@ impl HotDirectory {
         })
     }
     /// Get files and their cached sizes.
-    pub fn get_stats_per_file(
-        hot_cache_bytes: OwnedBytes,
-    ) -> tantivy::Result<Vec<(PathBuf, usize)>> {
+    pub fn get_stats_per_file(hot_cache_bytes: OwnedBytes) -> tantivy::Result<Vec<(PathBuf, usize)>> {
         let static_cache = StaticDirectoryCache::open(hot_cache_bytes)?;
         Ok(static_cache.get_stats())
     }
@@ -369,20 +350,12 @@ struct FileSliceWithCache {
     file_length: u64,
 }
 
-#[async_trait]
 impl FileHandle for FileSliceWithCache {
     fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         if let Some(found_bytes) = self.static_cache.try_read_bytes(byte_range.clone()) {
             return Ok(found_bytes);
         }
         self.underlying.read_bytes_slice(byte_range)
-    }
-
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> AsyncIoResult<OwnedBytes> {
-        if let Some(found_bytes) = self.static_cache.try_read_bytes(byte_range.clone()) {
-            return Ok(found_bytes);
-        }
-        self.underlying.read_bytes_slice_async(byte_range).await
     }
 }
 
@@ -448,11 +421,7 @@ impl Directory for HotDirectory {
 
 fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
     let index_meta = index.load_metas()?;
-    let mut files: HashSet<PathBuf> = index_meta
-        .segments
-        .into_iter()
-        .flat_map(|segment_meta| segment_meta.list_files())
-        .collect();
+    let mut files: HashSet<PathBuf> = index_meta.segments.into_iter().flat_map(|segment_meta| segment_meta.list_files()).collect();
     files.insert(Path::new("meta.json").to_path_buf());
     files.insert(Path::new(".managed.json").to_path_buf());
     Ok(files)
@@ -462,10 +431,7 @@ fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
 /// and writes a static cache file called hotcache in the `output`.
 ///
 /// See [`HotDirectory`] for more information.
-pub fn write_hotcache<D: Directory>(
-    directory: D,
-    output: &mut dyn io::Write,
-) -> tantivy::Result<()> {
+pub fn write_hotcache<D: Directory>(directory: D, output: &mut dyn io::Write) -> tantivy::Result<()> {
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
@@ -473,10 +439,7 @@ pub fn write_hotcache<D: Directory>(
     let debug_proxy_directory = DebugProxyDirectory::wrap(caching_directory);
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();
-    let reader: IndexReader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::Manual)
-        .try_into()?;
+    let reader: IndexReader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
     let searcher = reader.searcher();
     for (field, field_entry) in schema.fields() {
         if !field_entry.is_indexed() {
@@ -513,10 +476,7 @@ pub fn write_hotcache<D: Directory>(
                 // Warning: we need to work on string here because `Path::ends_with`
                 // has very different semantics.
                 let file_path_str = file_path.to_string_lossy();
-                if file_path_str.ends_with("store")
-                    || file_path_str.ends_with("term")
-                    || len < 10_000_000
-                {
+                if file_path_str.ends_with("store") || file_path_str.ends_with("term") || len < 10_000_000 {
                     let bytes = file_slice.read_bytes_slice(byte_range.clone())?;
                     file_cache_builder.add_bytes(bytes.as_slice(), byte_range.start);
                 }

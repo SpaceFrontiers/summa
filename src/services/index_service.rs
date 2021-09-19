@@ -1,7 +1,7 @@
 use crate::configs::{ApplicationConfigHolder, ConsumerConfig, IndexConfig, IndexConfigBuilder, IndexConfigProxy, IndexEngine};
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
-use crate::requests::{AlterIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
+use crate::requests::{validators, AlterIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
 use crate::search_engine::IndexHolder;
 use crate::utils::sync::{Handler, OwningHandler};
 use futures_util::future::join_all;
@@ -9,7 +9,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
-use tantivy::{IndexSettings, SegmentAttribute, SegmentAttributesConfig};
+use tantivy::{IndexSettings, Opstamp, SegmentAttribute, SegmentAttributesConfig};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{info, instrument};
 
@@ -117,17 +117,11 @@ impl IndexService {
         let index_config = IndexConfigBuilder::default().index_engine(index_engine.clone()).build().unwrap();
         self.insert_config(index_name, &index_config).await?;
 
-        let index_holder = IndexHolder::open(
-            index_name,
-            IndexConfigProxy::new(&self.application_config, index_name),
-        )
-        .await?;
+        let index_holder = IndexHolder::open(index_name, IndexConfigProxy::new(&self.application_config, index_name)).await?;
 
         let owning_handler = OwningHandler::new(index_holder);
         let handler = owning_handler.handler();
-        self.index_holders_mut()
-            .await
-            .insert(index_name.to_owned(), owning_handler);
+        self.index_holders_mut().await.insert(index_name.to_owned(), owning_handler);
         Ok(handler)
     }
 
@@ -160,6 +154,7 @@ impl IndexService {
 
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression,
+            docstore_blocksize: create_index_request.blocksize.unwrap_or(16384),
             sort_by_field: create_index_request.sort_by_field.clone(),
             segment_attributes_config: SegmentAttributesConfig::new(segment_attributes),
             ..Default::default()
@@ -180,14 +175,14 @@ impl IndexService {
         Ok(handler)
     }
 
-    /// Alters index
-    #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
-    pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaResult<Handler<IndexHolder>> {
-        let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name).await?;
+    async fn alter_index_settings(&self, alter_index_request: AlterIndexRequest, index_holder: &Handler<IndexHolder>) -> SummaResult<Opstamp> {
         let index_updater = index_holder.index_updater();
         let mut index_updater = index_updater.write().await;
         if let Some(compression) = alter_index_request.compression {
             index_updater.index_mut().settings_mut().docstore_compression = compression
+        }
+        if let Some(blocksize) = alter_index_request.blocksize {
+            index_updater.index_mut().settings_mut().docstore_blocksize = blocksize
         }
         if let Some(sort_by_field) = alter_index_request.sort_by_field {
             index_updater.index_mut().settings_mut().sort_by_field = match sort_by_field.field.as_str() {
@@ -196,12 +191,22 @@ impl IndexService {
             }
         }
         if let Some(default_fields) = alter_index_request.default_fields {
-            *index_holder.index_config_proxy().write().await.autosave().default_fields = default_fields
+            let parsed_default_fields = validators::parse_default_fields(index_holder.schema(), &default_fields)?;
+            index_holder.index_config_proxy().write().await.autosave().get_mut().default_fields = parsed_default_fields
         }
         if let Some(multi_fields) = alter_index_request.multi_fields {
-            *index_holder.index_config_proxy().write().await.autosave().multi_fields = multi_fields
+            let parsed_default_fields = validators::parse_multi_fields(index_holder.schema(), &multi_fields)?;
+            index_holder.index_config_proxy().write().await.autosave().get_mut().multi_fields = HashSet::from_iter(parsed_default_fields.into_iter())
         }
-        index_updater.commit().await?;
+        index_updater.commit().await
+    }
+
+    /// Alters index
+    #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
+    pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaResult<Handler<IndexHolder>> {
+        let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name).await?;
+        self.alter_index_settings(alter_index_request, &index_holder).await?;
+        index_holder.reload_query_parser().await;
         Ok(index_holder)
     }
 

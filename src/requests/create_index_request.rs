@@ -1,5 +1,6 @@
-use crate::errors::{Error, SummaResult, ValidationError};
+use crate::errors::{Error, SummaResult};
 use crate::proto;
+use crate::requests::validators;
 use tantivy::schema::Schema;
 use tantivy::IndexSortByField;
 
@@ -12,6 +13,8 @@ pub struct CreateIndexRequest {
     pub autocommit_interval_ms: Option<u64>,
     #[builder(default = "tantivy::store::Compressor::None")]
     pub compression: tantivy::store::Compressor,
+    #[builder(default = "None")]
+    pub blocksize: Option<usize>,
     #[builder(default = "Vec::new()")]
     pub default_fields: Vec<String>,
     #[builder(default = "Vec::new()")]
@@ -26,59 +29,26 @@ pub struct CreateIndexRequest {
     pub writer_heap_size_bytes: Option<u64>,
 }
 
-impl CreateIndexRequest {
-    fn parse_schema(schema: &str) -> SummaResult<Schema> {
-        serde_yaml::from_str(schema).map_err(|_| Error::Validation(ValidationError::InvalidSchema(schema.to_owned())))
-    }
-
-    fn parse_default_fields(schema: &Schema, default_fields: &[String]) -> SummaResult<Vec<String>> {
-        Ok(default_fields
-            .iter()
-            .map(|default_field_name| match schema.get_field(default_field_name) {
-                Some(_) => Ok(default_field_name.to_owned()),
-                None => Err(ValidationError::MissingDefaultField(default_field_name.to_owned())),
-            })
-            .collect::<Result<_, _>>()?)
-    }
-
-    fn parse_primary_key(schema: &Schema, primary_key: &Option<String>) -> SummaResult<Option<String>> {
-        Ok(match primary_key {
-            Some(primary_key) => Some(match schema.get_field(primary_key) {
-                Some(_) => primary_key.to_owned(),
-                None => return Err(ValidationError::MissingPrimaryKey(Some(primary_key.to_owned())).into()),
-            }),
-            None => None,
-        })
-    }
-}
-
 impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
     type Error = Error;
 
     fn try_from(proto_request: proto::CreateIndexRequest) -> SummaResult<Self> {
-        let schema = CreateIndexRequest::parse_schema(&proto_request.schema)?;
-        let default_fields = CreateIndexRequest::parse_default_fields(&schema, &proto_request.default_fields)?;
-        let primary_key = CreateIndexRequest::parse_primary_key(&schema, &proto_request.primary_key)?;
+        let schema = validators::parse_schema(&proto_request.schema)?;
+        let default_fields = validators::parse_default_fields(&schema, &proto_request.default_fields)?;
+        let multi_fields = validators::parse_multi_fields(&schema, &proto_request.multi_fields)?;
+        let primary_key = validators::parse_primary_key(&schema, &proto_request.primary_key)?;
 
         let compression = proto::Compression::from_i32(proto_request.compression)
             .map(proto::Compression::into)
             .unwrap_or(tantivy::store::Compressor::None);
-        let multi_fields = proto_request
-            .multi_fields
-            .iter()
-            .map(|multi_field_name| match schema.get_field(multi_field_name) {
-                Some(_) => Ok(multi_field_name.to_owned()),
-                None => Err(ValidationError::MissingMultiField(multi_field_name.to_owned())),
-            })
-            .collect::<Vec<Result<_, _>>>()
-            .into_iter()
-            .collect::<Result<_, _>>()?;
+
         Ok(CreateIndexRequestBuilder::default()
             .index_name(proto_request.index_name)
             .index_engine(proto::IndexEngine::from_i32(proto_request.index_engine).unwrap())
             .schema(schema)
             .primary_key(primary_key)
             .compression(compression)
+            .blocksize(proto_request.blocksize.map(|blocksize| blocksize as usize))
             .default_fields(default_fields)
             .multi_fields(multi_fields)
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))

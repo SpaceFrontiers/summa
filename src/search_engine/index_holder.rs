@@ -1,5 +1,5 @@
 use super::default_tokenizers::default_tokenizers;
-use crate::configs::{ConsumerConfig, IndexConfigProxy, IndexEngine};
+use crate::configs::{ConsumerConfig, IndexConfig, IndexConfigProxy, IndexEngine};
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::proto;
 use crate::search_engine::fruit_extractors::{build_fruit_extractor, FruitExtractor};
@@ -25,7 +25,7 @@ pub struct IndexHolder {
     index_config_proxy: IndexConfigProxy,
     cached_schema: Schema,
     index_reader: IndexReader,
-    query_parser: QueryParser,
+    query_parser: RwLock<QueryParser>,
     multi_fields: HashSet<Field>,
     /// All modifying operations are isolated inside `index_updater`
     index_updater: OwningHandler<RwLock<IndexUpdater>>,
@@ -43,6 +43,14 @@ fn register_default_tokenizers(index: &Index) {
     }
 }
 
+fn setup_query_parser(index_name: &str, index: &Index, index_config: &IndexConfig, schema: &Schema) -> QueryParser {
+    QueryParser::for_index(
+        index_name,
+        index,
+        index_config.default_fields.iter().map(|x| schema.get_field(x).unwrap()).collect(),
+    )
+}
+
 impl IndexHolder {
     /// Sets up `IndexHolder`
     ///
@@ -52,11 +60,8 @@ impl IndexHolder {
         register_default_tokenizers(&index);
 
         let cached_schema = index.schema();
-        let query_parser = QueryParser::for_index(
-            index_name,
-            &index,
-            index_config.default_fields.iter().map(|x| cached_schema.get_field(x).unwrap()).collect(),
-        );
+        let query_parser = RwLock::new(setup_query_parser(index_name, &index, &index_config, &cached_schema));
+
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
         let index_updater = OwningHandler::new(RwLock::new(IndexUpdater::new(index, index_name, index_config_proxy.clone()).await?));
 
@@ -115,6 +120,15 @@ impl IndexHolder {
             index_config_proxy,
             search_times_meter,
         })
+    }
+
+    pub(crate) async fn reload_query_parser(&self) {
+        *self.query_parser.write().await = setup_query_parser(
+            &self.index_name,
+            self.index_updater.read().await.index(),
+            self.index_config_proxy.read().await.get(),
+            &self.cached_schema,
+        );
     }
 
     /// Creates index and sets it up via `setup`
@@ -235,7 +249,7 @@ impl IndexHolder {
         collectors: Vec<proto::Collector>,
     ) -> SummaResult<Vec<proto::CollectorOutput>> {
         let searcher = self.index_reader.searcher();
-        let parsed_query = self.query_parser.parse_query(query)?;
+        let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let mut extractors: Vec<Box<dyn FruitExtractor>> = collectors
             .into_iter()

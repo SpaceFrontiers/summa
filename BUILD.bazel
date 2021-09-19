@@ -29,7 +29,7 @@ rust_library(
         exclude = ["src/bin/**"],
     ),
     edition = "2021",
-    deps = all_crate_deps() + [":proto_grpc_rust"],
+    deps = all_crate_deps() + [":proto_grpc_rust", "//summa-directory"],
     version = "0.9.0",
 )
 
@@ -55,3 +55,13 @@ container_push(
    repository = "izihawa/summa-server",
    tag = "latest",
 )
+
+container_push(
+   name = "push-summa-server-testing",
+   image = ":summa-server-image",
+   format = "Docker",
+   registry = "index.docker.io",
+   repository = "izihawa/summa-server",
+   tag = "testing",
+)
+

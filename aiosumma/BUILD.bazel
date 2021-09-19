@@ -36,6 +36,7 @@ py_binary(
     visibility = ["//visibility:public"],
     deps = [
         requirement("fire"),
+        requirement("termcolor"),
         ":aiosumma",
     ],
 )
@@ -55,19 +56,20 @@ py_wheel(
     python_requires = ">=3.9",
     python_tag = "py3",
     requires = [
-        "aiogrpcclient >= 1.1.11",
+        "aiogrpcclient >= 1.2.2",
         "fire >= 0.3.1",
         "izihawa_nlptools >= 1.1.9",
         "izihawa_types >= 0.1.2",
         "orjson >= 3.6.8",
         "ply >= 3.11",
+        "termcolor >= 1.1.0",
         "textblob >= 0.17.1",
     ],
     strip_path_prefixes = [
         "summa/proto/summa_py_pb",
         "aiosumma",
     ],
-    version = "2.10.0",
+    version = "2.10.7",
     deps = [
         ":aiosumma",
         ":data",

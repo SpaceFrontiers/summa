@@ -122,7 +122,7 @@ pub enum Error {
     #[error("unknown_directory_error: {0}")]
     UnknownDirectory(String),
     #[error("upstream_http_status_error: {0}")]
-    UpstreamHttpStatus(StatusCode),
+    UpstreamHttpStatus(StatusCode, String),
     #[error("utf8_error: {0}")]
     Utf8(std::str::Utf8Error),
     #[error("{0}")]

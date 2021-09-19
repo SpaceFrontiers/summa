@@ -29,9 +29,8 @@ http_archive(
 )
 http_archive(
     name = "com_google_protobuf",
-    sha256 = "d7d204a59fd0d2d2387bd362c2155289d5060f32122c4d1d922041b61191d522",
-    strip_prefix = "protobuf-3.21.5",
-    urls = ["https://github.com/protocolbuffers/protobuf/archive/v3.21.5.tar.gz"],
+    strip_prefix = "protobuf-3.21.6",
+    urls = ["https://github.com/protocolbuffers/protobuf/archive/v3.21.6.tar.gz"],
 )
 http_archive(
     name = "rules_proto_grpc",
@@ -41,6 +40,7 @@ http_archive(
 )
 http_archive(
     name = "rules_python",
+    sha256 = "b648af3256978aa4eac98d2dff5951265722570b8512dc732e00039ff869aacf",
     strip_prefix = "rules_python-3a34e28c699cacf89e68d33187e8ca4e4fe01382",
     url = "https://github.com/ppodolsky/rules_python/archive/3a34e28c699cacf89e68d33187e8ca4e4fe01382.tar.gz",
 )
@@ -70,7 +70,7 @@ load("@rules_rust//crate_universe:defs.bzl", "crate", "crates_repository", "rend
 crates_repository(
     name = "crate_index",
     cargo_lockfile = "//:Cargo.lock",
-    manifests = ["//:Cargo.toml"],
+    manifests = ["//:Cargo.toml", "//:summa-directory/Cargo.toml", "//:summa-wasm/Cargo.toml"],
     generator = "@cargo_bazel_bootstrap//:cargo-bazel",
     annotations = {
         "rdkafka-sys": [crate.annotation(

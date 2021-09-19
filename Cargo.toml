@@ -1,3 +1,6 @@
+[workspace]
+members = ["summa-directory", "summa-wasm"]
+
 [package]
 edition = "2021"
 name = "summa"
@@ -18,6 +21,12 @@ doc = false
 name = "summa"
 path = "src/lib.rs"
 doc = true
+
+[features]
+default = ["ipfs", "metrics", "writer"]
+ipfs = ["izihawa-common-multipart", "izihawa-hyper-multipart"]
+metrics = ["opentelemetry", "opentelemetry-prometheus", "prometheus"]
+writer = ["rdkafka"]
 
 [badges]
 maintenance = { status = "actively-developed" }
@@ -41,30 +50,31 @@ futures = "0.3.24"
 futures-util = "0.3.24"
 hyper = "0.14.20"
 itertools = "0.10.3"
-izihawa-common-multipart = "1.1.7"
-izihawa-hyper-multipart = "1.1.0"
+izihawa-common-multipart = { version = "1.1.7", optional = true }
+izihawa-hyper-multipart = { version = "1.1.0", optional = true }
 lazy_static = "1.4.0"
-opentelemetry = { version = "0.17.0", features = ["rt-tokio"] }
-opentelemetry-prometheus = "0.10.0"
+opentelemetry = { version = "0.17.0", features = ["rt-tokio"], optional = true }
+opentelemetry-prometheus = { version = "0.10.0", optional = true }
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
 path-absolutize = "3.0.13"
-prometheus = "0.13.2"
+prometheus = { version = "0.13.2", optional = true }
 prost = "0.11.0"
 prost-build = { version = "0.11.0" }
 prost-types = "0.11.0"
 rand = "0.8.5"
-rdkafka = "0.28.0"
+rdkafka = { version = "0.28.0", optional = true }
 serde = { version = "1.0.140", features = ["derive"] }
 serde_derive = "1.0.140"
 serde_json = "1.0.85"
 serde_yaml = "0.8.25"
 signal-hook = "0.3.14"
+summa-directory = { version = "0.1.0", path = "./summa-directory"}
 take_mut = "0.2.2"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr" , features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr" , features = ["lz4-compression", "quickwit", "zstd-compression"] }
 # tantivy = { version = "0.18.0", features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
 tantivy-fst = "0.3.0"
 textwrap = "0.15.0"
-time = { version = "0.3.14", features = ["serde-well-known"] }
+time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
 thiserror = "1.0.34"
 tokio = { version = "1.21.0", features = ["full", "time"] }
 tokio-stream = { version = "0.1.9", features = ["net"] }
@@ -77,3 +87,11 @@ tracing = "0.1.36"
 tracing-appender = "0.2.2"
 tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3.15", features = ["env-filter", "json"] }
+
+instant = { version = "0.1", features = [ "stdweb" ] }
+lru = "0.8.0"
+serde_cbor = "0.11"
+
+[profile.release]
+lto = true
+opt-level = 3

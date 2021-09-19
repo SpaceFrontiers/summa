@@ -17,16 +17,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::BufWriter;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 
 use crate::memory_sized_cache::MemorySizedCache;
-use crate::noop_writer::Noop;
-use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
-use tantivy::directory::{FileHandle, OwnedBytes, WatchCallback, WatchHandle, WritePtr};
+use tantivy::directory::error::OpenReadError;
+use tantivy::directory::{FileHandle, OwnedBytes};
 use tantivy::{Directory, HasLen};
 
 /// The caching directory is a simple cache that wraps another directory.
@@ -110,11 +108,11 @@ impl HasLen for CachingFileHandle {
 }
 
 impl Directory for CachingDirectory {
-    fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
         self.underlying.exists(path)
     }
 
-    fn get_file_handle(&self, path: &Path) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let underlying_filehandle = self.underlying.get_file_handle(path)?;
         let caching_file_handle = CachingFileHandle {
             path: path.to_path_buf(),
@@ -124,7 +122,7 @@ impl Directory for CachingDirectory {
         Ok(Arc::new(caching_file_handle))
     }
 
-    fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file_handle = self.get_file_handle(path)?;
         let len = file_handle.len();
         let owned_bytes = file_handle
@@ -133,23 +131,5 @@ impl Directory for CachingDirectory {
         Ok(owned_bytes.as_slice().to_vec())
     }
 
-    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
-        Ok(())
-    }
-
-    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        Ok(BufWriter::new(Box::new(Noop {})))
-    }
-
-    fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        todo!()
-    }
-
-    fn sync_directory(&self) -> io::Result<()> {
-        todo!()
-    }
-
-    fn watch(&self, _watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
-        Ok(WatchHandle::empty())
-    }
+    crate::read_only_directory!();
 }

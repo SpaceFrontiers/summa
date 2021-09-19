@@ -45,10 +45,7 @@ macro_rules! read_only_directory {
             unimplemented!("read-only")
         }
 
-        fn open_write(
-            &self,
-            _path: &Path,
-        ) -> Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError> {
+        fn open_write(&self, _path: &Path) -> Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError> {
             unimplemented!("read-only")
         }
 
@@ -56,17 +53,11 @@ macro_rules! read_only_directory {
             unimplemented!("read-only")
         }
 
-        fn watch(
-            &self,
-            _watch_callback: tantivy::directory::WatchCallback,
-        ) -> tantivy::Result<tantivy::directory::WatchHandle> {
+        fn watch(&self, _watch_callback: tantivy::directory::WatchCallback) -> tantivy::Result<tantivy::directory::WatchHandle> {
             Ok(tantivy::directory::WatchHandle::empty())
         }
 
-        fn acquire_lock(
-            &self,
-            _lock: &tantivy::directory::Lock,
-        ) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
+        fn acquire_lock(&self, _lock: &tantivy::directory::Lock) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
             Ok(tantivy::directory::DirectoryLock::from(Box::new(|| {})))
         }
     };

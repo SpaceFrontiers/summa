@@ -45,9 +45,10 @@ class SummaClient(BaseGrpcClient):
     async def alter_index(
         self,
         index_name: str,
-        default_fields: Optional[List[str]],
-        multi_fields: Optional[List[str]],
+        default_fields: Optional[List[str]] = None,
+        multi_fields: Optional[List[str]] = None,
         compression: Optional[str] = None,
+        blocksize: Optional[int] = None,
         sort_by_field: Optional[Tuple] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -61,6 +62,7 @@ class SummaClient(BaseGrpcClient):
             multi_fields: every field in Tantivy is list. For consistency, Summa returns
                             only first values of lists except for fields listed here as multiple
             compression: Tantivy index compression
+            blocksize: Docstore blocksize
             sort_by_field: (field_name, order)
             request_id: request id
             session_id: session id
@@ -68,9 +70,10 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].alter_index(
             index_service_pb.AlterIndexRequest(
                 index_name=index_name,
-                default_fields=default_fields,
-                multi_fields=multi_fields,
+                default_fields={'fields': default_fields},
+                multi_fields={'fields': multi_fields},
                 compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
+                blocksize=blocksize,
                 sort_by_field=index_service_pb.SortByField(
                     field=sort_by_field[0],
                     order=sort_by_field[1],
@@ -177,6 +180,7 @@ class SummaClient(BaseGrpcClient):
         default_fields: Optional[List[str]] = None,
         multi_fields: Optional[List[str]] = None,
         compression: Optional[Union[str, int]] = None,
+        blocksize: Optional[int] = None,
         writer_heap_size_bytes: Optional[int] = None,
         writer_threads: Optional[int] = None,
         autocommit_interval_ms: Optional[int] = None,
@@ -194,6 +198,7 @@ class SummaClient(BaseGrpcClient):
             default_fields: fields that are used to search by default
             multi_fields: fields that can have multiple values
             compression: Tantivy index compression
+            blocksize: Docstore blocksize
             writer_heap_size_bytes: Tantivy writer heap size in bytes, shared between all threads
             writer_threads: Tantivy writer threads
             autocommit_interval_ms: if true then there will be a separate thread committing index every nth milliseconds
@@ -214,6 +219,7 @@ class SummaClient(BaseGrpcClient):
                 default_fields=default_fields,
                 multi_fields=multi_fields,
                 compression=compression,
+                blocksize=blocksize,
                 writer_heap_size_bytes=writer_heap_size_bytes,
                 writer_threads=writer_threads,
                 autocommit_interval_ms=autocommit_interval_ms,

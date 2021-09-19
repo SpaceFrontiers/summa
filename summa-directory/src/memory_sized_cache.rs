@@ -98,11 +98,7 @@ impl<K: Hash + Eq> NeedMutMemorySizedCache<K> {
         Q: Hash + Eq + ?Sized,
     {
         let item_opt = self.lru_cache.get_mut(cache_key);
-        if let Some(item) = item_opt {
-            Some(item.payload())
-        } else {
-            None
-        }
+        item_opt.map(|item| item.payload())
     }
 
     /// Attempt to put the given amount of data in the cache.

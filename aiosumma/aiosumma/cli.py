@@ -2,11 +2,11 @@
 
 import asyncio
 import sys
-import traceback
 
 import fire
 
 from aiosumma import SummaClient
+from termcolor import colored
 
 
 async def client_cli(endpoint):
@@ -16,7 +16,7 @@ async def client_cli(endpoint):
         return client.get_interface()
     except asyncio.exceptions.TimeoutError:
         # ToDo: process exception through fire.core.FireError
-        print(traceback.format_exc())
+        print(f"{colored('ERROR', 'red')}: {endpoint} timeout", file=sys.stderr)
         sys.exit(1)
 
 
