@@ -548,7 +548,7 @@ checksum = "cd7d5c9e2fb96ea7b093da40c584cb3060eddbe0d4db8abcea655b197156d94e"
 [[package]]
 name = "fastfield_codecs"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#941f28929d5f700a7f6c530ced9cec8edf180175"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#cc9dee3af29f9b9deda9c20181139425d012ea92"
 dependencies = [
  "fastdivide",
  "itertools",
@@ -598,6 +598,12 @@ dependencies = [
  "libc",
  "winapi",
 ]
+
+[[package]]
+name = "fs_extra"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2022715d62ab30faffd124d40b76f4134a550a87792276512b18d63272333394"
 
 [[package]]
 name = "fuchsia-cprng"
@@ -884,6 +890,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "inotify"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abf888f9575c290197b2c948dc9e9ff10bd1a39ad1ea8585f734585fa6b9d3f9"
+dependencies = [
+ "bitflags",
+ "futures-core",
+ "inotify-sys",
+ "libc",
+ "tokio",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "instant"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -942,9 +970,9 @@ dependencies = [
 
 [[package]]
 name = "jobserver"
-version = "0.1.24"
+version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af25a77299a7f711a01975c35a6a424eb6862092cc2d6c72c4ed6cbc56dfc1fa"
+checksum = "068b1ee6743e4d11fb9c6a1e6064b3693a1b600e7f5f5988047d98b3dc9fb90b"
 dependencies = [
  "libc",
 ]
@@ -1296,7 +1324,7 @@ checksum = "9ff7415e9ae3fff1225851df9e0d9e4e5479f947619774677a63572e55e80eff"
 [[package]]
 name = "ownedbytes"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#941f28929d5f700a7f6c530ced9cec8edf180175"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#cc9dee3af29f9b9deda9c20181139425d012ea92"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -1475,9 +1503,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.43"
+version = "1.0.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a2ca2c61bc9f3d74d2886294ab7b9853abd9c1ad903a3ac7815c58989bb7bab"
+checksum = "7bd7356a8122b6c4a24a82b278680c73357984ca2fc79a0f9fa6dea7dced7c58"
 dependencies = [
  "unicode-ident",
 ]
@@ -1822,9 +1850,9 @@ checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
 name = "serde"
-version = "1.0.144"
+version = "1.0.145"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f747710de3dcd43b88c9168773254e809d8ddbdf9653b84e2554ab219f17860"
+checksum = "728eb6351430bccb993660dfffc5a72f91ccc1295abaa8ce19b27ebe4f75568b"
 dependencies = [
  "serde_derive",
 ]
@@ -1852,9 +1880,9 @@ dependencies = [
 
 [[package]]
 name = "serde_derive"
-version = "1.0.144"
+version = "1.0.145"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94ed3a816fb1d101812f83e789f888322c34e291f894f19590dc310963e87a00"
+checksum = "81fa1584d3d1bcacd84c277a0dfe21f5b0f6accf4a23d04d4c6d61f1af522b4c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1874,14 +1902,15 @@ dependencies = [
 
 [[package]]
 name = "serde_yaml"
-version = "0.8.26"
+version = "0.9.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "578a7433b776b56a35785ed5ce9a7e777ac0598aac5a6dd1b4b18a307c7fc71b"
+checksum = "8613d593412a0deb7bbd8de9d908efff5a0cb9ccd8f62c641e7b2ed2f57291d1"
 dependencies = [
  "indexmap",
+ "itoa",
  "ryu",
  "serde",
- "yaml-rust",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -2041,6 +2070,60 @@ checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
 [[package]]
 name = "summa"
 version = "0.9.0"
+
+[[package]]
+name = "summa-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "derive_builder",
+ "fasteval2",
+ "lazy_static",
+ "opentelemetry",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "summa-proto",
+ "tantivy",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "summa-directory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "instant",
+ "lru 0.8.0",
+ "serde",
+ "serde_cbor",
+ "tantivy",
+ "time",
+]
+
+[[package]]
+name = "summa-proto"
+version = "0.1.0"
+dependencies = [
+ "fs_extra",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "serde",
+ "tantivy",
+ "thiserror",
+ "tonic",
+ "tonic-build",
+ "tonic-reflection",
+]
+
+[[package]]
+name = "summa-server"
+version = "0.9.0"
 dependencies = [
  "async-broadcast",
  "base64",
@@ -2053,6 +2136,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hyper",
+ "inotify",
  "instant",
  "itertools",
  "izihawa-common-multipart",
@@ -2075,7 +2159,9 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "signal-hook",
+ "summa-core",
  "summa-directory",
+ "summa-proto",
  "take_mut",
  "tantivy",
  "tantivy-fst",
@@ -2098,19 +2184,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "summa-directory"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "instant",
- "lru 0.8.0",
- "serde",
- "serde_cbor",
- "tantivy",
- "time",
-]
-
-[[package]]
 name = "summa-wasm"
 version = "0.1.0"
 dependencies = [
@@ -2122,6 +2195,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "strfmt",
+ "summa-core",
  "summa-directory",
  "tantivy",
  "wasm-bindgen",
@@ -2155,7 +2229,7 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "tantivy"
 version = "0.18.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#941f28929d5f700a7f6c530ced9cec8edf180175"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#cc9dee3af29f9b9deda9c20181139425d012ea92"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2207,12 +2281,12 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#941f28929d5f700a7f6c530ced9cec8edf180175"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#cc9dee3af29f9b9deda9c20181139425d012ea92"
 
 [[package]]
 name = "tantivy-common"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#941f28929d5f700a7f6c530ced9cec8edf180175"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#cc9dee3af29f9b9deda9c20181139425d012ea92"
 dependencies = [
  "byteorder",
  "ownedbytes",
@@ -2232,7 +2306,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.18.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#941f28929d5f700a7f6c530ced9cec8edf180175"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/seg-attr#cc9dee3af29f9b9deda9c20181139425d012ea92"
 dependencies = [
  "combine",
  "once_cell",
@@ -2285,18 +2359,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.35"
+version = "1.0.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c53f98874615aea268107765aa1ed8f6116782501d18e53d08b471733bea6c85"
+checksum = "0a99cb8c4b9a8ef0e7907cd3b617cc8dc04d571c4e73c8ae403d80ac160bb122"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "1.0.35"
+version = "1.0.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8b463991b4eab2d801e724172285ec4195c650e8ec79b149e6c2a8e6dd3f783"
+checksum = "3a891860d3c8d66fec8e73ddb3765f90082374dbaaa833407b904a94f1a7eb43"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2660,6 +2734,12 @@ name = "unicode-width"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0edd1e5b14653f783770bce4a4dabb4a5108a5370a5f5d8cfe8710c361f6c8b"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1e5fa573d8ac5f1a856f8d7be41d390ee973daf97c806b2c1a465e4e1406e68"
 
 [[package]]
 name = "utf8-ranges"

@@ -1,0 +1,23 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "summa-core",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2021",
+    deps = [
+        "@crate_index//:base64",
+        "@crate_index//:derive_builder",
+        "@crate_index//:fasteval2",
+        "@crate_index//:lazy_static",
+        "@crate_index//:rand",
+        "@crate_index//:serde",
+        "@crate_index//:serde_json",
+        "@crate_index//:tantivy",
+        "@crate_index//:thiserror",
+        "@crate_index//:time",
+        "//summa:summa-proto",
+    ],
+    version = "0.1.0",
+)

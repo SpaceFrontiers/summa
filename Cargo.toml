@@ -1,5 +1,5 @@
 [workspace]
-members = ["summa-directory", "summa-wasm"]
+members = ["summa", "summa-core", "summa-directory", "summa-server", "summa-wasm"]
 
 [package]
 edition = "2021"
@@ -22,75 +22,8 @@ name = "summa"
 path = "src/lib.rs"
 doc = true
 
-[features]
-default = ["ipfs", "metrics", "writer"]
-ipfs = ["izihawa-common-multipart", "izihawa-hyper-multipart"]
-metrics = ["opentelemetry", "opentelemetry-prometheus", "prometheus"]
-writer = ["rdkafka"]
-
 [badges]
 maintenance = { status = "actively-developed" }
-
-[build-dependencies]
-tonic-build = { version = "0.8.0", default-features = false, features = ["prost", "transport"] }
-
-[dev-dependencies]
-tempdir = "0.3.7"
-
-[dependencies]
-async-broadcast = "0.4.1"
-base64 = "0.13.0"
-clap = { version = "3.2.16", features = ["cargo"] }
-colored = "2.0.0"
-config = "0.13.2"
-crossbeam-channel = "0.5.6"
-derive_builder = "0.11.2"
-fasteval2 = { version = "2.0.3", features = ["unsafe-vars"] }
-futures = "0.3.24"
-futures-util = "0.3.24"
-hyper = "0.14.20"
-itertools = "0.10.3"
-izihawa-common-multipart = { version = "1.1.7", optional = true }
-izihawa-hyper-multipart = { version = "1.1.0", optional = true }
-lazy_static = "1.4.0"
-opentelemetry = { version = "0.17.0", features = ["rt-tokio"], optional = true }
-opentelemetry-prometheus = { version = "0.10.0", optional = true }
-parking_lot = { version = "0.12.1", features = ["send_guard"] }
-path-absolutize = "3.0.13"
-prometheus = { version = "0.13.2", optional = true }
-prost = "0.11.0"
-prost-build = { version = "0.11.0" }
-prost-types = "0.11.0"
-rand = "0.8.5"
-rdkafka = { version = "0.28.0", optional = true }
-serde = { version = "1.0.140", features = ["derive"] }
-serde_derive = "1.0.140"
-serde_json = "1.0.85"
-serde_yaml = "0.8.25"
-signal-hook = "0.3.14"
-summa-directory = { version = "0.1.0", path = "./summa-directory"}
-take_mut = "0.2.2"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr" , features = ["lz4-compression", "quickwit", "zstd-compression"] }
-# tantivy = { version = "0.18.0", features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
-tantivy-fst = "0.3.0"
-textwrap = "0.15.0"
-time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
-thiserror = "1.0.34"
-tokio = { version = "1.21.0", features = ["full", "time"] }
-tokio-stream = { version = "0.1.9", features = ["net"] }
-tokio-util = { version = "0.7.4", features = ["compat"] }
-tonic = { version = "0.8.0", features = ["gzip"] }
-tonic-reflection = "0.5.0"
-tower = "0.4.13"
-tower-http = { version = "0.3.4", features = ["set-header", "trace"] }
-tracing = "0.1.36"
-tracing-appender = "0.2.2"
-tracing-futures = "0.2.5"
-tracing-subscriber = { version = "0.3.15", features = ["env-filter", "json"] }
-
-instant = { version = "0.1", features = [ "stdweb" ] }
-lru = "0.8.0"
-serde_cbor = "0.11"
 
 [profile.release]
 lto = true

@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from summa.proto import search_service_pb2
+from summa.proto import query_pb2
 
 
 class EvalScorerBuilder:
@@ -26,7 +26,7 @@ class EvalScorerBuilder:
         self.ops.append(f'fastsigm({field_name}, {alpha})')
         return self
 
-    def build(self) -> search_service_pb2.Scorer:
+    def build(self) -> query_pb2.Scorer:
         if not self.ops:
             return {}
-        return search_service_pb2.Scorer(eval_expr=' * '.join(self.ops))
+        return query_pb2.Scorer(eval_expr=' * '.join(self.ops))

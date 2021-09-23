@@ -19,6 +19,7 @@ from izihawa_utils.pb_to_json import ParseDict
 from summa.proto import beacon_service_pb2 as beacon_service_pb
 from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
+from summa.proto import query_pb2 as query_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
 from summa.proto import search_service_pb2 as search_service_pb
 from summa.proto.beacon_service_pb2_grpc import BeaconApiStub
@@ -483,7 +484,7 @@ class SummaClient(BaseGrpcClient):
         ignore_not_found: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> search_service_pb.SearchResponse:
+    ) -> query_pb.SearchResponse:
         """Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
 
         Args:
@@ -516,7 +517,7 @@ class SummaClient(BaseGrpcClient):
             )
         except AioRpcError as e:
             if ignore_not_found and e.code() == StatusCode.NOT_FOUND:
-                return search_service_pb.SearchResponse()
+                return query_pb.SearchResponse()
             raise
 
     @expose

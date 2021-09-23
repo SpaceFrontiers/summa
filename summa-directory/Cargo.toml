@@ -15,5 +15,5 @@ instant = { version = "0.1", features = [ "stdweb" ] }
 lru = "0.8.0"
 serde = "1"
 serde_cbor = "0.11"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr", default_features = false, features = ["lz4-compression"] }
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr", default_features = false, features = ["quickwit", "zstd-compression"] }
 time = { version = "0.3.14", features = ["wasm-bindgen"] }

@@ -183,6 +183,7 @@ message Index {
   uint64 num_docs = 4;
   Compression compression = 5;
 }
+
 message IndexDocumentOperation {
   bytes document = 1;
 }

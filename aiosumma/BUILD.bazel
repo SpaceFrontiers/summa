@@ -12,7 +12,7 @@ filegroup(
 py_library(
     name = "aiosumma",
     srcs = glob(["aiosumma/**/*.py"]),
-    imports = [".", "summa/proto"],
+    imports = ["."],
     srcs_version = "PY3",
     visibility = ["//visibility:public"],
     data = [":data"],
@@ -24,7 +24,7 @@ py_library(
         requirement("ply"),
         requirement("textblob"),
         "@rules_python//python/runfiles",
-        "//summa/proto:summa_py",
+        "//summa:summa_proto_py",
     ],
 )
 
@@ -66,13 +66,13 @@ py_wheel(
         "textblob >= 0.17.1",
     ],
     strip_path_prefixes = [
-        "summa/proto/summa_py_pb",
         "aiosumma",
+        "summa/summa_proto_py_pb",
     ],
-    version = "2.10.7",
+    version = "2.12.1",
     deps = [
         ":aiosumma",
         ":data",
-        "//summa/proto:summa_py",
+        "//summa:summa_proto_py",
     ],
 )
