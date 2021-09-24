@@ -1,4 +1,4 @@
-use crate::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, MetricsConfigBuilder};
+use crate::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder};
 use crate::errors::SummaServerResult;
 use crate::logging;
 use crate::servers::{GrpcServer, MetricsServer};
@@ -61,7 +61,8 @@ impl Application {
                             .default_value("127.0.0.1:8084")
                             .required(false)
                             .takes_value(true),
-                    ),
+                    )
+                    .arg(arg!(-i <IPFS_API_ENDPOINT> "IPFS API endpoint").required(false).takes_value(true)),
             )
             .subcommand(
                 command!("serve")
@@ -75,11 +76,13 @@ impl Application {
                 let data_path = Path::new(submatches.value_of("DATA_PATH").unwrap());
                 let grpc_endpoint = submatches.value_of("GRPC_ENDPOINT").unwrap();
                 let metrics_endpoint = submatches.value_of("METRICS_ENDPOINT").unwrap();
+                let ipfs_api_endpoint = submatches.value_of("IPFS_API_ENDPOINT");
                 let default_config = ApplicationConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
                     .grpc(GrpcConfigBuilder::default().endpoint(grpc_endpoint.to_owned()).build().unwrap())
                     .metrics(MetricsConfigBuilder::default().endpoint(metrics_endpoint.to_owned()).build().unwrap())
+                    .ipfs(ipfs_api_endpoint.map(|ipfs_api_endpoint| IpfsConfigBuilder::default().api_endpoint(ipfs_api_endpoint.to_owned()).build().unwrap()))
                     .build()
                     .unwrap();
                 println!("{}", serde_yaml::to_string(&default_config).unwrap());

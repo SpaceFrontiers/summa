@@ -1,5 +1,5 @@
-use summa_server::errors::SummaServerResult;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use summa_server::errors::SummaServerResult;
 use summa_server::Application;
 use tokio::runtime;
 

@@ -490,13 +490,13 @@ class SummaClient(BaseGrpcClient):
         Args:
             index_alias: index alias
             query: parsed `Query`
-            collectors: search_service_pb.Collector list
+            collectors: query_pb.Collector list
             tags: extra dict for logging purposes
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id
         """
-        if isinstance(collectors, (Dict, search_service_pb.Collector)):
+        if isinstance(collectors, (Dict, query_pb.Collector)):
             collectors = [collectors]
 
         try:
@@ -508,7 +508,7 @@ class SummaClient(BaseGrpcClient):
             for collector in collectors:
                 if isinstance(collector, Dict):
                     dict_collector = collector
-                    collector = search_service_pb.Collector()
+                    collector = query_pb.Collector()
                     ParseDict(dict_collector, collector)
                 search_request.collectors.append(collector)
             return await self.stubs['search_api'].search(

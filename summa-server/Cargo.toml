@@ -64,7 +64,7 @@ rdkafka = { version = "0.28.0", optional = true }
 serde = { version = "1.0.140", features = ["derive"] }
 serde_derive = "1.0.140"
 serde_json = "1.0.85"
-serde_yaml = "0.9.13"
+serde_yaml = "0.8.26"
 signal-hook = "0.3.14"
 summa-core = { version = "0.1.0", path = "../summa-core"}
 summa-directory = { version = "0.1.0", path = "../summa-directory"}

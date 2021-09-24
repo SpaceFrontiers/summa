@@ -216,6 +216,7 @@ message Highlight {
 message Snippet {
   bytes fragment = 1;
   repeated Highlight highlights = 2;
+  string html = 3;
 }
 
 message ScoredDocument {

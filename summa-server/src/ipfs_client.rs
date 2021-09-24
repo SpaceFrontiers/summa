@@ -192,7 +192,12 @@ impl IpfsClient {
 
         let uri = self.generate_uri(
             "/api/v0/add",
-            &[("nocopy", if no_copy { "true" } else { "false" }), ("cid-version", "1"), ("hash", "blake3")],
+            &[
+                ("nocopy", if no_copy { "true" } else { "false" }),
+                ("cid-version", "1"),
+                ("hash", "blake3"),
+                ("chunker", "size-32768"),
+            ],
         )?;
         for index_file_path in index_file_paths {
             let abs_path = full_directory_path.join(index_file_path.path());

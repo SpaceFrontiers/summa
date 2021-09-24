@@ -28,16 +28,20 @@ pip3 install -U https://github.com/explosion/spacy-models/releases/download/en_c
 mkdir data
 
 # Pull actual image for `summa-server`
-docker pull izihawa/summa-server
+docker pull izihawa/summa-server:testing
 
 # Generate config for `summa-server`
-docker run izihawa/summa-server generate-config -d /data \
+docker run izihawa/summa-server:testing generate-config -d /data \
 -g 0.0.0.0:8082 -m 0.0.0.0:8084 > summa.yaml
+
+# OR generate config for using with `IPFS` where `-i` is API endpoint address
+docker run izihawa/summa-server:testing generate-config -d /data \
+-g 0.0.0.0:8082 -m 0.0.0.0:8084 -i 0.0.0.0:5001 > summa.yaml
 
 # Launch `summa-server`
 docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data \
 -p 8082:8082 -p 8084:8084 \
-izihawa/summa-server serve /summa.yaml
+izihawa/summa-server:testing serve /summa.yaml
 ```
 
 ### Fill With Documents <a name="fill"></a>
@@ -50,4 +54,10 @@ izihawa/summa-server serve /summa.yaml
 ```bash
 # Do a match query that returns top-10 documents and its total count
 summa-cli localhost:8082 - search page '{"match": {"value": "astronomy"}}' '[{"top_docs": {"limit": 10}}, {"count": {}}]'
+```
+
+### Publish index to IPFS <a name="ipfs"></a>
+```bash
+# Do a match query that returns top-10 documents and its total count
+summa-cli localhost:8082 - publish-index page
 ```

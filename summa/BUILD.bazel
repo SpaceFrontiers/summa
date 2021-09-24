@@ -43,7 +43,7 @@ cargo_build_script(
 )
 
 rust_library(
-    name = "summa-proto",
+    name = "summa_proto",
     crate_features = ["grpc"],
     srcs = glob(["src/**/*.rs"]),
     edition = "2021",

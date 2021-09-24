@@ -1,9 +1,9 @@
 use crate::collectors;
 use crate::custom_serializer::NamedFieldDocument;
 use crate::errors::{Error, SummaResult, ValidationError};
-use summa_proto::proto;
 use crate::scorers::EvalScorer;
 use std::collections::{HashMap, HashSet};
+use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;

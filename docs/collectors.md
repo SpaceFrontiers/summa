@@ -73,7 +73,7 @@ Select `limit` random items corresponding to the query and returns them
 ```
 
 ## Aggregation
-Select `limit` random items corresponding to the query and returns them
+Returns an aggregation
 ```json
 {"aggregation": {"aggregations": {"year_stats": {"metric": {"stats": {"field": "issued_at"}}}}}}
 ```

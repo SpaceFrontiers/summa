@@ -1,7 +1,6 @@
 use crate::errors::{Error, SummaResult, ValidationError};
 #[cfg(feature = "metrics")]
 use crate::metrics::ToLabel;
-use summa_proto::proto;
 #[cfg(feature = "metrics")]
 use opentelemetry::metrics::Counter;
 #[cfg(feature = "metrics")]
@@ -9,6 +8,7 @@ use opentelemetry::{global, KeyValue};
 use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
+use summa_proto::proto;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };

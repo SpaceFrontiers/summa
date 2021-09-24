@@ -14,6 +14,7 @@ impl From<tantivy::Snippet> for proto::Snippet {
                     to: r.end as u32,
                 })
                 .collect(),
+            html: snippet.to_html(),
         }
     }
 }

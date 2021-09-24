@@ -13,10 +13,9 @@ rust_library(
     ),
     edition = "2021",
     deps = all_crate_deps() + [
-        "//summa:proto_grpc_rust",
         "//summa-core",
         "//summa-directory",
-        "//summa:summa-proto",
+        "//summa:summa_proto",
     ],
     version = "0.9.0",
 )
@@ -25,7 +24,7 @@ rust_test(
     name = "test",
     crate = ":summa",
     deps = [
-        "//summa:summa-proto"
+        "//summa:summa_proto"
     ],
 )
 

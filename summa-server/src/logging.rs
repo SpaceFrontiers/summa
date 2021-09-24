@@ -9,14 +9,14 @@ use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 const ENV_FILTER: &str = "librdkafka=trace,\
     rdkafka::client=debug,\
-    summa::services=info,\
-    summa::search_engine=info,\
-    summa::servers[lifecycle]=info,\
-    summa::consumers=info,\
+    summa_server::services=info,\
+    summa_server::search_engine=info,\
+    summa_server::servers[lifecycle]=info,\
+    summa_server::consumers=info,\
     tantivy=info,\
     warn";
 
-const REQUEST_ENV_FILTER: &str = "summa::servers::grpc[request]=info,summa::servers::metrics[request]=info";
+const REQUEST_ENV_FILTER: &str = "summa_server::servers::grpc[request]=info,summa_server::servers::metrics[request]=info";
 
 struct WatchedWriter {
     file: File,

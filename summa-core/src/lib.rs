@@ -9,13 +9,12 @@ pub mod scorers;
 mod summa_document;
 mod summa_tokenizer;
 
-pub use errors::Error;
 pub use default_tokenizers::default_tokenizers;
+pub use errors::Error;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor};
 pub use query_parser::QueryParser;
 pub use summa_document::{DocumentParsingError, SummaDocument};
 pub use summa_tokenizer::SummaTokenizer;
-
 
 #[macro_use]
 extern crate derive_builder;
