@@ -1,7 +1,7 @@
 ---
 layout: page
 title: IPFS
-permalink: /ipfs-replication
+permalink: /ipfs-publish
 ---
 ## IPFS API
 
@@ -34,4 +34,4 @@ Keep in mind that for Summa launched in Docker you should use `host.docker.inter
 summa-cli localhost:8082 - publish-index page --copy
 ```
 
-Summa supports `--no-copy` mode of IPFS but it requires extra efforts due to IPFS inability to `add` file that is outside of its root.
+Summa supports `--no-copy` mode of IPFS. However, it requires extra efforts due to IPFS inability to `add` file outside its root.
