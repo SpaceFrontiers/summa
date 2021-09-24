@@ -546,6 +546,7 @@ class SummaClient(BaseGrpcClient):
     async def publish_index(
         self,
         index_alias: str,
+        copy: bool,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> beacon_service_pb.PublishIndexResponse:
@@ -554,11 +555,12 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_alias: index alias
+            copy: set if you want to copy data into IPFS storage, otherwise --no-copy mode will be used
             request_id: request id
             session_id: session id
         """
         return await self.stubs['beacon_api'].publish_index(
-            beacon_service_pb.PublishIndexRequest(index_alias=index_alias),
+            beacon_service_pb.PublishIndexRequest(index_alias=index_alias, copy=copy),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 

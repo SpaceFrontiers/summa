@@ -31,14 +31,6 @@ schema: >
         record: position
         tokenizer: default
       stored: true
-  - name: opening_text
-    type: text
-    options:
-      indexing:
-        fieldnorms: true
-        record: position
-        tokenizer: default
-      stored: true
   - name: auxiliary_text
     type: text
     options:

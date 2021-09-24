@@ -18,7 +18,8 @@ impl BeaconService {
     }
 
     #[instrument(skip_all, fields(index_name = ?index_holder.index_name()))]
-    pub async fn publish_index(&self, index_holder: Handler<IndexHolder>) -> SummaServerResult<crate::ipfs_client::Key> {
+    pub async fn publish_index(&self, index_holder: Handler<IndexHolder>, copy: bool) -> SummaServerResult<crate::ipfs_client::Key> {
+        let no_copy = !copy;
         let index_path = {
             match &index_holder.index_config_proxy().read().await.index_engine {
                 IndexEngine::File(index_path) => index_path.to_path_buf(),
@@ -33,7 +34,7 @@ impl BeaconService {
                 .prepare_index_publishing(index_path.clone(), |files: Vec<IndexFilePath>| async move {
                     let mutable_files = files.iter().filter_map(|file| (!file.is_immutable()).then(|| file.clone())).collect::<Vec<_>>();
                     self.ipfs_client.add(&index_path, &mutable_files, false).await?;
-                    let added_files = self.ipfs_client.add(&index_path, &files, true).await?;
+                    let added_files = self.ipfs_client.add(&index_path, &files, no_copy).await?;
                     let new_root = added_files.into_iter().find(|added_file| added_file.name == index_name).unwrap();
                     let old_key = self.ipfs_client.key_list().await?.keys.into_iter().find(|key| key.name == index_name);
                     let key = match old_key {
