@@ -7,8 +7,10 @@ import "summa/proto/utils.proto";
 
 service IndexApi {
   rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
+  rpc attach_index(AttachIndexRequest) returns (AttachIndexResponse) {}
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
   rpc create_index (CreateIndexRequest) returns (CreateIndexResponse) {}
+  rpc delete_document (DeleteDocumentRequest) returns (DeleteDocumentResponse) {}
   rpc delete_index (DeleteIndexRequest) returns (DeleteIndexResponse) {}
   rpc get_indices_aliases (GetIndicesAliasesRequest) returns (GetIndicesAliasesResponse) {}
   rpc get_index (GetIndexRequest) returns (GetIndexResponse) {}
@@ -23,12 +25,26 @@ service IndexApi {
 // Requests
 
 message AlterIndexRequest {
+  message Fields {
+    repeated string fields = 1;
+  }
   string index_name = 1;
   optional Compression compression = 2;
+  optional uint32 blocksize = 6;
   optional SortByField sort_by_field = 3;
+  Fields default_fields = 4;
+  Fields multi_fields = 5;
 }
 
 message AlterIndexResponse {
+  Index index = 1;
+}
+
+message AttachIndexRequest {
+  string index_name = 1;
+}
+
+message AttachIndexResponse {
   Index index = 1;
 }
 
@@ -49,32 +65,37 @@ message SortByField {
 
 message CreateIndexRequest {
   string index_name = 1;
-  string fields = 2;
+  string schema = 2;
   IndexEngine index_engine = 10;
   optional string primary_key = 3;
   repeated string default_fields = 4;
   Compression compression = 5;
+  optional uint32 blocksize = 12;
   optional uint64 writer_heap_size_bytes = 6;
   optional uint64 writer_threads = 7;
   optional uint64 autocommit_interval_ms = 8;
   optional SortByField sort_by_field = 9;
   repeated string multi_fields = 11;
-  repeated string stop_words = 12;
 }
 
 message CreateIndexResponse {
   Index index = 1;
 }
 
-message DeleteIndexRequest {
-  string index_name = 1;
-  bool cascade = 2;
+message DeleteDocumentRequest {
+  string index_alias = 1;
+  int64 primary_key = 2;
 }
 
-message DeleteIndexResponse {
-  repeated string deleted_index_aliases = 1;
-  repeated string deleted_index_consumers = 2;
+message DeleteDocumentResponse {
+  optional uint64 opstamp = 1;
 }
+
+message DeleteIndexRequest {
+  string index_name = 1;
+}
+
+message DeleteIndexResponse {}
 
 message GetIndicesAliasesRequest {}
 
@@ -162,6 +183,7 @@ message Index {
   uint64 num_docs = 4;
   Compression compression = 5;
 }
+
 message IndexDocumentOperation {
   bytes document = 1;
 }

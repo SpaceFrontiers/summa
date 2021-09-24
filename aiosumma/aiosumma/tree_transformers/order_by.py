@@ -17,7 +17,6 @@ class OrderByTreeTransformer(TreeTransformer):
                 if node.expr.value in self.field_aliases:
                     node.expr.value = self.field_aliases[node.expr.value]
                 if node.expr.value in self.valid_fields:
-                    context.is_exploration = False
                     context.order_by = (node.expr.value, 'desc')
                     return None, True
         return node, False

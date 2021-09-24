@@ -1,10 +1,14 @@
-from typing import Callable, Union
+from typing import (
+    Callable,
+    Union,
+)
 
 from ..parser.elements import (
     Boost,
+    Group,
     Phrase,
+    Proximity,
     SearchField,
-    SynonymsGroup,
     Word,
 )
 from .base import TreeTransformer
@@ -21,27 +25,29 @@ class ExactMatchTreeTransformer(TreeTransformer):
         self.score = score
 
     def visit_group(self, node, context, parents=None):
-        words = []
         phrase = []
+
         if len(node) <= 1:
             return node, False
+
         for operand in node.operands:
             if isinstance(operand, Word):
-                words.append(operand)
                 phrase.append(operand.value)
-            elif isinstance(operand, SynonymsGroup):
-                words.append(operand.operands[0])
-                phrase.append(operand.operands[0].value)
             else:
                 return node, False
+
+        if not phrase:
+            return node, False
+
         phrase = ' '.join(phrase)
 
         score = self.score
         if callable(score):
             score = score(node, context)
+
         if self.default_phrase_field:
-            words.append(Boost(SearchField(self.default_phrase_field, Phrase(phrase)), score))
+            exact_query = Boost(SearchField(self.default_phrase_field, Proximity(Phrase(phrase), slop=1)), score)
         else:
-            words.append(Boost(Phrase(phrase), score))
-        node.operands = words
-        return node, False
+            exact_query = Boost(Proximity(Phrase(phrase), slop=1), score)
+
+        return Group(*node.operands, exact_query), False

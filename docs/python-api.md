@@ -37,7 +37,7 @@ async def main():
             {'occur': 'should', 'query': {'match': {'value': 'three'}}},
             {'occur': 'should', 'query': {'match': {'value': 'dogs'}}},
             {'occur': 'should', 'query': {
-                'boost': {'query': {'match': {'value': 'dog'}}, 'score': '0.85000'}}
+                'boost': {'query': {'match': {'value': 'dog'}}, 'score': '0.65'}}
             }
         ]}
     }

@@ -12,7 +12,7 @@ filegroup(
 py_library(
     name = "aiosumma",
     srcs = glob(["aiosumma/**/*.py"]),
-    imports = [".", "summa/proto"],
+    imports = ["."],
     srcs_version = "PY3",
     visibility = ["//visibility:public"],
     data = [":data"],
@@ -24,7 +24,7 @@ py_library(
         requirement("ply"),
         requirement("textblob"),
         "@rules_python//python/runfiles",
-        "//summa/proto:summa_py",
+        "//summa:summa_proto_py",
     ],
 )
 
@@ -36,6 +36,7 @@ py_binary(
     visibility = ["//visibility:public"],
     deps = [
         requirement("fire"),
+        requirement("termcolor"),
         ":aiosumma",
     ],
 )
@@ -55,22 +56,23 @@ py_wheel(
     python_requires = ">=3.9",
     python_tag = "py3",
     requires = [
-        "aiogrpcclient >= 1.1.9",
+        "aiogrpcclient >= 1.2.2",
         "fire >= 0.3.1",
-        "izihawa_nlptools >= 1.0.2",
+        "izihawa_nlptools >= 1.1.9",
         "izihawa_types >= 0.1.2",
         "orjson >= 3.6.8",
         "ply >= 3.11",
+        "termcolor >= 1.1.0",
         "textblob >= 0.17.1",
     ],
     strip_path_prefixes = [
-        "summa/proto/summa_py_pb",
         "aiosumma",
+        "summa/summa_proto_py_pb",
     ],
-    version = "2.3.12",
+    version = "2.12.5",
     deps = [
         ":aiosumma",
         ":data",
-        "//summa/proto:summa_py",
+        "//summa:summa_proto_py",
     ],
 )

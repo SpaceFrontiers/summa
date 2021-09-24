@@ -32,9 +32,8 @@ Full-text search server written in Rust with Python and GRPC API
 - [Python API](/summa/python-api)
 - [Kafka Consuming API](/summa/kafka-consuming-api)
 - [Metrics API](/summa/metrics-api)
-- [Reflection API](/summa/metrics-api)
 
 ### Expert
-- [IPFS Replication](/summa/ipfs-replication)
+- [IPFS Publish](/summa/ipfs-publish)
 - [Architecture](/summa/architecture)
 - [Development Guide](/summa/development)

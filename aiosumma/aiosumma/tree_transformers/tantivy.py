@@ -14,14 +14,17 @@ class TantivyTreeTransformer(TreeTransformer):
     def visit_phrase(self, node, context, parents=None):
         splitted = node.value.split()
         if len(splitted) == 0:
-            return None, False
+            return Word(''), False
         if len(splitted) == 1:
             return Word(splitted[0]), False
-        context.is_exploration = False
         return node, False
 
     def visit_minus(self, node, context, parents=None):
-        if isinstance(node.a, BaseGroup):
+        if node.a is None:
+            return None, False
+        elif parents is None:
+            return node.a, False
+        elif isinstance(node.a, BaseGroup):
             op = node.a
             new_operands = []
             for operand in op.operands:
@@ -31,7 +34,9 @@ class TantivyTreeTransformer(TreeTransformer):
         return node, False
 
     def visit_plus(self, node, context, parents=None):
-        if isinstance(node.a, BaseGroup):
+        if node.a is None:
+            return None, False
+        elif isinstance(node.a, Group):
             op = node.a
             new_operands = []
             for operand in op.operands:
@@ -41,7 +46,6 @@ class TantivyTreeTransformer(TreeTransformer):
         return node, False
 
     def visit_search_field(self, node, context, parents=None):
-        context.is_exploration = False
         if isinstance(node.expr, BaseGroup):
             return Group(*[
                 SearchField(node.name, operand) for operand in node.expr.operands

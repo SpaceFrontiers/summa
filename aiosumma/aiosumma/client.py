@@ -16,10 +16,13 @@ from aiogrpcclient import (
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
+from summa.proto import beacon_service_pb2 as beacon_service_pb
 from summa.proto import consumer_service_pb2 as consumer_service_pb
 from summa.proto import index_service_pb2 as index_service_pb
+from summa.proto import query_pb2 as query_pb
 from summa.proto import reflection_service_pb2 as reflection_service_pb
 from summa.proto import search_service_pb2 as search_service_pb
+from summa.proto.beacon_service_pb2_grpc import BeaconApiStub
 from summa.proto.consumer_service_pb2_grpc import ConsumerApiStub
 from summa.proto.index_service_pb2_grpc import IndexApiStub
 from summa.proto.reflection_service_pb2_grpc import ReflectionApiStub
@@ -32,11 +35,75 @@ from summa.proto.utils_pb2 import (  # noqa
 
 class SummaClient(BaseGrpcClient):
     stub_clses = {
+        'beacon_api': BeaconApiStub,
         'consumer_api': ConsumerApiStub,
         'index_api': IndexApiStub,
         'reflection_api': ReflectionApiStub,
         'search_api': SearchApiStub,
     }
+
+    @expose
+    async def alter_index(
+        self,
+        index_name: str,
+        default_fields: Optional[List[str]] = None,
+        multi_fields: Optional[List[str]] = None,
+        compression: Optional[str] = None,
+        blocksize: Optional[int] = None,
+        sort_by_field: Optional[Tuple] = None,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.CreateIndexResponse:
+        """
+        Alter index settings like default fields, multiple fields, compression, ordering etc
+
+        Args:
+            index_name: index name
+            default_fields: `Phrase` and `Match` queries are searching in these fields
+            multi_fields: every field in Tantivy is list. For consistency, Summa returns
+                            only first values of lists except for fields listed here as multiple
+            compression: Tantivy index compression
+            blocksize: Docstore blocksize
+            sort_by_field: (field_name, order)
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].alter_index(
+            index_service_pb.AlterIndexRequest(
+                index_name=index_name,
+                default_fields={'fields': default_fields},
+                multi_fields={'fields': multi_fields},
+                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
+                blocksize=blocksize,
+                sort_by_field=index_service_pb.SortByField(
+                    field=sort_by_field[0],
+                    order=sort_by_field[1],
+                ) if sort_by_field else None
+            ),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
+    async def attach_index(
+        self,
+        index_name: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.AttachIndexResponse:
+        """
+        Attach index to Summa. It must be placed under data directory named as `index_name`
+
+        Args:
+            index_name: index name
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].attach_index(
+            index_service_pb.AttachIndexRequest(
+                index_name=index_name,
+            ),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
 
     @expose
     async def commit_index(
@@ -105,47 +172,16 @@ class SummaClient(BaseGrpcClient):
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
-    @expose
-    async def alter_index(
-        self,
-        index_name: str,
-        compression: Optional[str] = None,
-        sort_by_field: Optional[Tuple] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> index_service_pb.CreateIndexResponse:
-        """
-        Alter index options like compression and ordering
-
-        Args:
-            index_name: index name
-            compression: Tantivy index compression
-            sort_by_field: (field_name, order)
-            request_id: request id
-            session_id: session id
-        """
-        return await self.stubs['index_api'].alter_index(
-            index_service_pb.AlterIndexRequest(
-                index_name=index_name,
-                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
-                sort_by_field=index_service_pb.SortByField(
-                    field=sort_by_field[0],
-                    order=sort_by_field[1],
-                ) if sort_by_field else None
-            ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
-        )
-
     @expose(with_from_file=True)
     async def create_index(
         self,
         index_name: str,
-        fields: str,
+        schema: str,
         primary_key: Optional[str] = None,
         default_fields: Optional[List[str]] = None,
         multi_fields: Optional[List[str]] = None,
-        stop_words: Optional[List[str]] = None,
-        compression: Optional[str] = None,
+        compression: Optional[Union[str, int]] = None,
+        blocksize: Optional[int] = None,
         writer_heap_size_bytes: Optional[int] = None,
         writer_threads: Optional[int] = None,
         autocommit_interval_ms: Optional[int] = None,
@@ -158,12 +194,12 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            fields: Tantivy index schema
+            schema: Tantivy index schema
             primary_key: primary key is used during insertion to check duplicates
             default_fields: fields that are used to search by default
             multi_fields: fields that can have multiple values
-            stop_words: list of words that won't be parsed
             compression: Tantivy index compression
+            blocksize: Docstore blocksize
             writer_heap_size_bytes: Tantivy writer heap size in bytes, shared between all threads
             writer_threads: Tantivy writer threads
             autocommit_interval_ms: if true then there will be a separate thread committing index every nth milliseconds
@@ -172,15 +208,19 @@ class SummaClient(BaseGrpcClient):
             session_id: session id
             sort_by_field: (field_name, order)
         """
+        if isinstance(compression, str):
+            compression = index_service_pb.Compression.Value(compression)
+        elif isinstance(compression, int):
+            compression = index_service_pb.Compression.Name(compression)
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
-                fields=fields,
+                schema=schema,
                 primary_key=primary_key,
                 default_fields=default_fields,
                 multi_fields=multi_fields,
-                stop_words=stop_words,
-                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
+                compression=compression,
+                blocksize=blocksize,
                 writer_heap_size_bytes=writer_heap_size_bytes,
                 writer_threads=writer_threads,
                 autocommit_interval_ms=autocommit_interval_ms,
@@ -215,10 +255,34 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
+    async def delete_document(
+        self,
+        index_alias: str,
+        primary_key: int,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.IndexDocumentResponse:
+        """
+        Delete document with primary key
+
+        Args:
+            index_alias: index alias
+            primary_key: bytes
+            request_id:
+            session_id:
+        """
+        return await self.stubs['index_api'].delete_document(
+            index_service_pb.DeleteDocumentRequest(
+                index_alias=index_alias,
+                primary_key=primary_key,
+            ),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
     async def delete_index(
         self,
         index_name: str,
-        cascade: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.DeleteIndexResponse:
@@ -227,12 +291,11 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            cascade: if set then delete both consumers and aliases too
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].delete_index(
-            index_service_pb.DeleteIndexRequest(index_name=index_name, cascade=cascade),
+            index_service_pb.DeleteIndexRequest(index_name=index_name),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
@@ -421,35 +484,40 @@ class SummaClient(BaseGrpcClient):
         ignore_not_found: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> search_service_pb.SearchResponse:
-        """
-        Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
+    ) -> query_pb.SearchResponse:
+        """Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
 
         Args:
             index_alias: index alias
             query: parsed `Query`
-            collectors: search_service_pb.Collector list
+            collectors: query_pb.Collector list
             tags: extra dict for logging purposes
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id
         """
-        if not isinstance(collectors, List):
+        if isinstance(collectors, (Dict, query_pb.Collector)):
             collectors = [collectors]
 
         try:
+            search_request = search_service_pb.SearchRequest(
+                index_alias=index_alias,
+                query=query,
+                tags=tags,
+            )
+            for collector in collectors:
+                if isinstance(collector, Dict):
+                    dict_collector = collector
+                    collector = query_pb.Collector()
+                    ParseDict(dict_collector, collector)
+                search_request.collectors.append(collector)
             return await self.stubs['search_api'].search(
-                ParseDict({
-                    'index_alias': index_alias,
-                    'query': query,
-                    'collectors': collectors,
-                    'tags': tags,
-                }, search_service_pb.SearchRequest()),
+                search_request,
                 metadata=(('request-id', request_id), ('session-id', session_id)),
             )
         except AioRpcError as e:
             if ignore_not_found and e.code() == StatusCode.NOT_FOUND:
-                return search_service_pb.SearchResponse()
+                return query_pb.SearchResponse()
             raise
 
     @expose
@@ -471,6 +539,28 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].merge_segments(
             index_service_pb.MergeSegmentsRequest(index_alias=index_alias, segment_ids=segment_ids),
+            metadata=(('request-id', request_id), ('session-id', session_id)),
+        )
+
+    @expose
+    async def publish_index(
+        self,
+        index_alias: str,
+        copy: bool,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> beacon_service_pb.PublishIndexResponse:
+        """
+        Publish index into IPFS, require `ipfs` section configured in config
+
+        Args:
+            index_alias: index alias
+            copy: set if you want to copy data into IPFS storage, otherwise --no-copy mode will be used
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['beacon_api'].publish_index(
+            beacon_service_pb.PublishIndexRequest(index_alias=index_alias, copy=copy),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 

@@ -62,12 +62,16 @@ class TreeVisitor:
 class TreeTransformer(TreeVisitor):
     def replace_node(self, old_node, new_node, parent):
         for k, v in parent.__dict__.items():  # pragma: no branch
-            if v == old_node:
+            if id(v) == id(old_node):
                 parent.__dict__[k] = new_node
                 break
             elif isinstance(v, list):
                 try:
-                    i = v.index(old_node)
+                    i = -1
+                    for ix, el in enumerate(v):
+                        if id(el) == id(old_node):
+                            i = ix
+                            break
                     if new_node is None:
                         del v[i]
                     else:
@@ -77,7 +81,11 @@ class TreeTransformer(TreeVisitor):
                     pass  # this was not the attribute containing old_node
             elif isinstance(v, tuple):
                 try:
-                    i = v.index(old_node)
+                    i = -1
+                    for ix, el in enumerate(v):
+                        if id(el) == id(old_node):
+                            i = ix
+                            break
                     v = list(v)
                     if new_node is None:
                         del v[i]

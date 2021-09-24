@@ -1,6 +1,9 @@
+from copy import deepcopy
 from typing import (
+    Dict,
     List,
     Optional,
+    Union,
 )
 
 from izihawa_nlptools.language_detect import detect_language
@@ -23,7 +26,7 @@ class ProcessedQuery:
         return not bool(self.parsed_query)
 
     def to_summa_query(self):
-        return self.parsed_query.to_summa_query() if self.parsed_query else {'all': {}}
+        return self.parsed_query.to_summa_query(self.context) if not self.is_empty() else self.context.blank_query()
 
     def __repr__(self):
         return repr(self.parsed_query)
@@ -55,18 +58,31 @@ class QueryProcessor:
             query = text_transformer.process(query)
         return query
 
-    def apply_tree_transformers(self, parsed_query, context: QueryContext):
+    def apply_tree_transformers(self, processed_query: ProcessedQuery):
+        new_processed_query = deepcopy(processed_query)
         for tree_transformer in self.tree_transformers:
-            parsed_query = tree_transformer.visit(parsed_query, context=context)
-        return parsed_query
+            new_processed_query.parsed_query = tree_transformer.visit(
+                new_processed_query.parsed_query,
+                context=new_processed_query.context,
+            )
+        return new_processed_query
 
-    def process(self, query: str, language: Optional[str] = None) -> ProcessedQuery:
+    def process(self, query: str, languages: Optional[Union[Dict[str, float], str]] = None) -> ProcessedQuery:
+        if languages is None or languages == '':
+            languages = {}
+
+        if isinstance(languages, str) and len(languages) > 0:
+            languages = {languages: 1.0}
+
         if not query:
-            return ProcessedQuery(parsed_query=None, context=QueryContext(language=language))
+            return ProcessedQuery(parsed_query=None, context=QueryContext(languages=languages))
 
         query = self.apply_text_transformers(query=query)
         parsed_query = self.parse(query=query)
-        context = QueryContext(language=detect_language(query, threshold=0.5) or language)
-        parsed_query = self.apply_tree_transformers(parsed_query=parsed_query, context=context)
+        if query_language := detect_language(query, threshold=0.5):
+            languages = {**languages, query_language: 1.0}
+        context = QueryContext(languages=languages, query_language=query_language)
+        processed_query = ProcessedQuery(parsed_query=parsed_query, context=context)
+        processed_query = self.apply_tree_transformers(processed_query)
 
-        return ProcessedQuery(parsed_query=parsed_query, context=context)
+        return processed_query
