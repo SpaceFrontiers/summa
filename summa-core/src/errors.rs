@@ -6,16 +6,8 @@ use tantivy::schema::FieldType;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ValidationError {
-    #[error("aliased_error: {0}")]
-    Aliased(String),
     #[error("builder_error: {0}")]
     BuilderError(String),
-    #[error("empty_argument_error: {0}")]
-    EmptyArgument(String),
-    #[error("existing_index_error: {0}")]
-    ExistingIndex(String),
-    #[error("existing_path_error: {0}")]
-    ExistingPath(PathBuf),
     #[error("index_argument_error: {0}")]
     InvalidArgument(String),
     #[error("invalid_fast_field_type_error: ({field:?}, {field_type:?}, {tantivy_error:?})")]
@@ -82,16 +74,12 @@ pub enum Error {
     InvalidSyntax(String),
     #[error("{0:?} for {1:?}")]
     InvalidTantivySyntax(tantivy::query::QueryParserError, String),
-    #[error("invalid_config_error: {0}")]
-    InvalidConfig(String),
     #[error("{0:?}")]
     IO((std::io::Error, Option<PathBuf>)),
     #[error("json_error: {0}")]
     Json(serde_json::Error),
     #[error("tantivy_error: {0}")]
     Tantivy(tantivy::TantivyError),
-    #[error("poison")]
-    Poison,
     #[error("proto")]
     Proto(summa_proto::errors::Error),
     #[error("timeout_error")]
@@ -123,12 +111,6 @@ impl From<UninitializedFieldError> for ValidationError {
 impl From<DocumentParsingError> for Error {
     fn from(error: DocumentParsingError) -> Self {
         Error::DocumentParsing(error)
-    }
-}
-
-impl<T> From<std::sync::PoisonError<T>> for Error {
-    fn from(_: std::sync::PoisonError<T>) -> Self {
-        Error::Poison
     }
 }
 

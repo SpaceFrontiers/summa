@@ -215,5 +215,5 @@ impl<D: Directory> Directory for DebugProxyDirectory<D> {
         Ok(payload.to_vec())
     }
 
-    crate::read_only_directory!();
+    super::read_only_directory!();
 }

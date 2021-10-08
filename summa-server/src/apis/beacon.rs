@@ -26,7 +26,10 @@ impl proto::beacon_api_server::BeaconApi for BeaconApiImpl {
     async fn publish_index(&self, proto_request: Request<proto::PublishIndexRequest>) -> Result<Response<proto::PublishIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
-        let key = self.beacon_service.publish_index(index_holder, proto_request.copy).await?;
+        let key = self
+            .beacon_service
+            .publish_index(index_holder, proto_request.payload, proto_request.copy)
+            .await?;
         let response = proto::PublishIndexResponse {
             key: Some(proto::publish_index_response::Key {
                 name: key.name().to_string(),

@@ -27,17 +27,24 @@
 //! - The `DebugDirectory` acts as a proxy to another directory to instrument it and record all of
 //!   its IO.
 
-pub mod caching_directory;
-pub mod debug_proxy_directory;
-pub mod hot_cache_directory;
-pub mod memory_sized_cache;
-pub mod noop_writer;
-pub mod slice_address;
-pub mod stored_item;
+mod chunk_generator;
+mod chunked_caching_directory;
+mod debug_proxy_directory;
+mod hot_cache_directory;
+mod memory_sized_cache;
+mod requests_composer;
+mod slice_address;
+mod stored_item;
 
+pub use chunked_caching_directory::ChunkedCachingDirectory;
+pub use debug_proxy_directory::DebugProxyDirectory;
+pub use hot_cache_directory::{write_hotcache, HotDirectory};
+pub use memory_sized_cache::MemorySizedCache;
+
+#[macro_export]
 macro_rules! read_only_directory {
     () => {
-        fn atomic_write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+        fn atomic_write(&self, _path: &Path, _data: &[u8]) -> std::io::Result<()> {
             unimplemented!("read-only")
         }
 
@@ -49,7 +56,7 @@ macro_rules! read_only_directory {
             unimplemented!("read-only")
         }
 
-        fn sync_directory(&self) -> io::Result<()> {
+        fn sync_directory(&self) -> std::io::Result<()> {
             unimplemented!("read-only")
         }
 
@@ -62,4 +69,4 @@ macro_rules! read_only_directory {
         }
     };
 }
-pub(crate) use read_only_directory;
+pub use read_only_directory;

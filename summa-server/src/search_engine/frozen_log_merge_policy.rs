@@ -1,6 +1,7 @@
+use crate::search_engine::segment_attributes::SummaSegmentAttributes;
 use std::fmt::Debug;
 use tantivy::merge_policy::{LogMergePolicy, MergeCandidate, MergePolicy};
-use tantivy::{SegmentAttribute, SegmentMeta};
+use tantivy::SegmentMeta;
 
 #[derive(Debug, Default)]
 pub struct FrozenLogMergePolicy(LogMergePolicy);
@@ -9,12 +10,16 @@ impl MergePolicy for FrozenLogMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
         let filtered_segments = segments
             .iter()
-            .filter(|segment_meta| match segment_meta.segment_attributes().get("is_frozen") {
-                None => true,
-                Some(is_frozen) => match is_frozen {
-                    SegmentAttribute::ConjunctiveBool(value) => !*value,
-                    _ => unreachable!(),
-                },
+            .filter(|segment_meta| {
+                let segment_attributes = segment_meta.segment_attributes();
+                let is_frozen = segment_attributes
+                    .as_ref()
+                    .map(|segment_attributes| {
+                        let parsed_attributes = serde_json::from_value::<SummaSegmentAttributes>(segment_attributes.clone());
+                        parsed_attributes.map(|v| v.is_frozen).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                !is_frozen
             })
             .cloned()
             .collect::<Vec<SegmentMeta>>();

@@ -63,7 +63,7 @@ grpc_extra_deps()
 load("@rules_rust//rust:repositories.bzl", "rust_register_toolchains", "rules_rust_dependencies")
 rules_rust_dependencies()
 rust_register_toolchains(
-    version="1.63.0",
+    version="1.64.0",
 )
 load("@rules_rust//crate_universe:repositories.bzl", "crate_universe_dependencies")
 crate_universe_dependencies(bootstrap = True)
@@ -75,10 +75,10 @@ crates_repository(
         "//:Cargo.toml",
         "//:summa/Cargo.toml",
         "//:summa-core/Cargo.toml",
-        "//:summa-directory/Cargo.toml",
         "//:summa-server/Cargo.toml",
         "//:summa-wasm/Cargo.toml",
     ],
+
     generator = "@cargo_bazel_bootstrap//:cargo-bazel",
     annotations = {
         "rdkafka-sys": [crate.annotation(

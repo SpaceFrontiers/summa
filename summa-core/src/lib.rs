@@ -1,6 +1,10 @@
+#[macro_use]
+extern crate async_trait;
+
 pub mod collectors;
 pub mod custom_serializer;
 mod default_tokenizers;
+pub mod directories;
 pub mod errors;
 mod fruit_extractors;
 pub mod metrics;

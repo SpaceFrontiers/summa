@@ -19,15 +19,14 @@
 
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use lru::KeyRef;
 
-#[derive(Hash, Clone, Debug, Eq, PartialEq)]
+#[derive(Hash, Clone, Eq, PartialEq)]
 pub struct SliceAddress {
     pub path: PathBuf,
-    pub byte_range: Range<usize>,
+    pub index: usize,
 }
 
 // ------------------------------------------------------------
@@ -36,10 +35,10 @@ pub struct SliceAddress {
 
 // The trick is described in https://github.com/sunshowers-code/borrow-complex-key-example/blob/main/src/lib.rs
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct SliceAddressRef<'a> {
     pub path: &'a Path,
-    pub byte_range: Range<usize>,
+    pub index: usize,
 }
 
 pub(crate) trait SliceAddressKey {
@@ -50,7 +49,7 @@ impl SliceAddressKey for SliceAddress {
     fn key(&self) -> SliceAddressRef {
         SliceAddressRef {
             path: self.path.as_path(),
-            byte_range: self.byte_range.clone(),
+            index: self.index,
         }
     }
 }

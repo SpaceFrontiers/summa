@@ -10,6 +10,7 @@ rust_library(
         "@crate_index//:base64",
         "@crate_index//:derive_builder",
         "@crate_index//:fasteval2",
+        "@crate_index//:futures",
         "@crate_index//:lazy_static",
         "@crate_index//:rand",
         "@crate_index//:serde",

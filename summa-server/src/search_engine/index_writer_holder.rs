@@ -1,7 +1,8 @@
 use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
+use crate::search_engine::segment_attributes::SummaSegmentAttributes;
 use tantivy::schema::{Field, FieldType};
-use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentAttribute, SegmentAttributes, SegmentId, SegmentMeta, Term};
+use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
 use tracing::info;
 
 /// Managing write operations to index
@@ -65,12 +66,16 @@ impl IndexWriterHolder {
     ///
     /// Also cleans deleted documents and do recompression. Possible to pass the only segment in `segment_ids` to do recompression or clean up.
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub(super) async fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<SegmentAttributes>) -> SummaServerResult<Option<SegmentMeta>> {
+    pub(super) async fn merge(
+        &mut self,
+        segment_ids: &[SegmentId],
+        segment_attributes: Option<SummaSegmentAttributes>,
+    ) -> SummaServerResult<Option<SegmentMeta>> {
         info!(action = "merge_segments", segment_ids = ?segment_ids);
-        let segment_meta = match segment_attributes {
-            Some(segment_attributes) => self.index_writer.merge_with_attributes(segment_ids, segment_attributes).await?,
-            None => self.index_writer.merge(segment_ids).await?,
-        };
+        let segment_meta = self
+            .index_writer
+            .merge_with_attributes(segment_ids, segment_attributes.map(|sa| serde_json::to_value(sa).unwrap()))
+            .await?;
         info!(action = "merged_segments", segment_ids = ?segment_ids, merged_segment_meta = ?segment_meta);
         Ok(segment_meta)
     }
@@ -79,38 +84,51 @@ impl IndexWriterHolder {
     ///
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub(super) async fn commit(&mut self) -> SummaServerResult<Opstamp> {
+    pub(super) async fn commit(&mut self, payload: Option<String>) -> SummaServerResult<Opstamp> {
         info!(action = "commit_index");
-        let result = self.index_writer.prepare_commit()?.commit_future().await;
+        let mut prepared_commit = self.index_writer.prepare_commit()?;
+        if let Some(payload) = payload {
+            prepared_commit.set_payload(&payload);
+        }
+        let result = prepared_commit.commit_future().await;
         info!(action = "committed_index", result = ?result);
         Ok(result?)
     }
 
-    pub(super) async fn vacuum(&mut self, segment_attributes: Option<&SegmentAttributes>) -> SummaServerResult<()> {
+    pub(super) async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaServerResult<()> {
         let mut segments = self.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
 
         let (small_segments, segments): (Vec<_>, Vec<_>) = segments
             .into_iter()
-            .filter(|segment| match segment.meta().segment_attributes().get("is_frozen") {
-                None => true,
-                Some(is_frozen) => match is_frozen {
-                    SegmentAttribute::ConjunctiveBool(value) => !*value,
-                    _ => unreachable!(),
-                },
+            .filter(|segment| {
+                let is_frozen = segment
+                    .meta()
+                    .segment_attributes()
+                    .as_ref()
+                    .map(|segment_attributes| {
+                        let parsed_attributes = serde_json::from_value::<SummaSegmentAttributes>(segment_attributes.clone());
+                        parsed_attributes.map(|v| v.is_frozen).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                !is_frozen
             })
             .partition(|segment| segment.meta().num_docs() < 100000);
 
         if !small_segments.is_empty() {
             self.merge(
-                &small_segments.into_iter().map(|segment| segment.id()).collect::<Vec<_>>(),
-                segment_attributes.cloned(),
+                &small_segments
+                    .into_iter()
+                    .chain(std::iter::once(segments.iter().take(1)))
+                    .map(|segment| segment.id())
+                    .collect::<Vec<_>>(),
+                segment_attributes.clone(),
             )
             .await?;
         }
 
         for segment in segments.iter() {
-            self.merge(&[segment.id()], segment_attributes.cloned()).await?;
+            self.merge(&[segment.id()], segment_attributes.clone()).await?;
         }
         Ok(())
     }

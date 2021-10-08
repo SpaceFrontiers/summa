@@ -12,21 +12,22 @@ doc = true
 [features]
 metrics = ["opentelemetry"]
 
-[build-dependencies]
-prost-build = { version = "0.11.0" }
-
 [dependencies]
+async-trait = "0.1.57"
 base64 = "0.13.0"
 derive_builder = "0.11.2"
 fasteval2 = { version = "2.0.3", features = ["unsafe-vars"] }
+futures = "0.3.24"
+instant = { version = "0.1", default_features = false, features = [ "wasm-bindgen", "inaccurate" ] }
 lazy_static = "1.4.0"
+lru = "0.8.1"
 opentelemetry = { version = "0.17.0", optional = true }
-prost = "0.11.0"
-prost-types = "0.11.0"
 rand = { version = "0.8.5", features = ["small_rng"] }
-serde = { version = "1.0.140", features = ["derive"] }
+serde = { version = "1.0.140", default_features = false, features = ["derive", "std"] }
+serde_cbor = "0.11.2"
 serde_json = "1.0.85"
 summa-proto = { version = "0.1.0", path = "../summa", default_features = false }
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr", default_features = false, features = ["quickwit", "zstd-compression"] }
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0.36"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
+web-sys = { version = "0.3.60", features = ["console"] }

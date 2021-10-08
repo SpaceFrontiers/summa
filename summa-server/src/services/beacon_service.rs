@@ -18,7 +18,7 @@ impl BeaconService {
     }
 
     #[instrument(skip_all, fields(index_name = ?index_holder.index_name()))]
-    pub async fn publish_index(&self, index_holder: Handler<IndexHolder>, copy: bool) -> SummaServerResult<crate::ipfs_client::Key> {
+    pub async fn publish_index(&self, index_holder: Handler<IndexHolder>, payload: Option<String>, copy: bool) -> SummaServerResult<crate::ipfs_client::Key> {
         let no_copy = !copy;
         let index_path = {
             match &index_holder.index_config_proxy().read().await.index_engine {
@@ -31,7 +31,7 @@ impl BeaconService {
         let key = {
             let mut index_updater = index_updater.write().await;
             index_updater
-                .prepare_index_publishing(index_path.clone(), |files: Vec<IndexFilePath>| async move {
+                .prepare_index_publishing(index_path.clone(), payload, |files: Vec<IndexFilePath>| async move {
                     let mutable_files = files.iter().filter_map(|file| (!file.is_immutable()).then(|| file.clone())).collect::<Vec<_>>();
                     self.ipfs_client.add(&index_path, &mutable_files, false).await?;
                     let added_files = self.ipfs_client.add(&index_path, &files, no_copy).await?;
@@ -58,6 +58,8 @@ impl BeaconService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use tokio::fs::File;
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]

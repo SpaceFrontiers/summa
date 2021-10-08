@@ -1,6 +1,7 @@
 use crate::configs::{ConsumerConfig, IndexConfig, IndexConfigProxy, IndexEngine};
 use crate::errors::SummaServerResult;
 use crate::errors::{Error, ValidationError};
+use crate::search_engine::segment_attributes::SummaSegmentAttributes;
 use crate::search_engine::IndexUpdater;
 use crate::utils::sync::{Handler, OwningHandler};
 use crate::utils::thread_handler::ThreadHandler;
@@ -52,9 +53,10 @@ impl IndexHolder {
     /// Sets up `IndexHolder`
     ///
     /// Creates the auto committing thread and consumers
-    async fn setup(index_name: &str, index: Index, index_config_proxy: IndexConfigProxy) -> SummaServerResult<IndexHolder> {
+    async fn setup(index_name: &str, mut index: Index, index_config_proxy: IndexConfigProxy) -> SummaServerResult<IndexHolder> {
         let index_config = index_config_proxy.read().await.get().clone();
         register_default_tokenizers(&index);
+        index.set_segment_attributes_merger::<SummaSegmentAttributes>();
 
         let cached_schema = index.schema();
         let query_parser = RwLock::new(setup_query_parser(&index, &index_config, &cached_schema));

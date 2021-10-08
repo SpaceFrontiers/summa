@@ -23,14 +23,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 
+use crate::directories::ChunkedCachingDirectory;
+use crate::metrics::CacheMetrics;
 use serde::{Deserialize, Serialize};
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes};
 use tantivy::error::DataCorruption;
-use tantivy::{Directory, HasLen, Index, IndexReader, ReloadPolicy};
+use tantivy::{AsyncIoResult, Directory, HasLen, Index, IndexReader, ReloadPolicy};
 
-use crate::caching_directory::CachingDirectory;
-use crate::debug_proxy_directory::DebugProxyDirectory;
+use super::debug_proxy_directory::DebugProxyDirectory;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SliceCacheIndexEntry {
@@ -227,11 +228,6 @@ impl StaticSliceCache {
         }
         None
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.len() == 0
-    }
-
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -292,11 +288,7 @@ impl StaticSliceCacheBuilder {
     }
 
     pub fn flush(mut self) -> tantivy::Result<Vec<u8>> {
-        let merged_slices_res = self.merged_slices();
-        if let Err(e) = merged_slices_res {
-            return Err(e);
-        }
-        let merged_slices = merged_slices_res?;
+        let merged_slices = self.merged_slices()?;
         let slices_idx = SliceCacheIndex {
             total_len: self.total_len,
             slices: merged_slices,
@@ -350,12 +342,19 @@ struct FileSliceWithCache {
     file_length: u64,
 }
 
+#[async_trait]
 impl FileHandle for FileSliceWithCache {
     fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         if let Some(found_bytes) = self.static_cache.try_read_bytes(byte_range.clone()) {
             return Ok(found_bytes);
         }
         self.underlying.read_bytes_slice(byte_range)
+    }
+    async fn read_bytes_async(&self, byte_range: Range<usize>) -> AsyncIoResult<OwnedBytes> {
+        if let Some(found_bytes) = self.static_cache.try_read_bytes(byte_range.clone()) {
+            return Ok(found_bytes);
+        }
+        self.underlying.read_bytes_slice_async(byte_range).await
     }
 }
 
@@ -404,11 +403,11 @@ impl Directory for HotDirectory {
         Ok(Arc::new(file_slice_with_cache))
     }
 
-    fn exists(&self, path: &std::path::Path) -> Result<bool, OpenReadError> {
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
         Ok(self.inner.cache.get_file_length(path).is_some())
     }
 
-    fn atomic_read(&self, path: &std::path::Path) -> Result<Vec<u8>, OpenReadError> {
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let slice_cache = self.inner.cache.get_slice(path);
         if let Some(all_bytes) = slice_cache.try_read_all() {
             return Ok(all_bytes.as_slice().to_owned());
@@ -416,7 +415,7 @@ impl Directory for HotDirectory {
         self.inner.underlying.atomic_read(path)
     }
 
-    crate::read_only_directory!();
+    super::read_only_directory!();
 }
 
 fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
@@ -431,11 +430,11 @@ fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
 /// and writes a static cache file called hotcache in the `output`.
 ///
 /// See [`HotDirectory`] for more information.
-pub fn write_hotcache<D: Directory>(directory: D, output: &mut dyn io::Write) -> tantivy::Result<()> {
+pub fn write_hotcache<D: Directory>(directory: D, chunk_size: usize, output: &mut dyn io::Write) -> tantivy::Result<()> {
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
-    let caching_directory = CachingDirectory::new_unbounded(Arc::new(directory));
+    let caching_directory = ChunkedCachingDirectory::new_unbounded(Arc::new(directory), chunk_size, CacheMetrics::default());
     let debug_proxy_directory = DebugProxyDirectory::wrap(caching_directory);
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();

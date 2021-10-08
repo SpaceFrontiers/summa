@@ -1,25 +1,51 @@
-const statistics = {
-    downloaded_bytes: 0,
-    requests: 0
-}
-
-export function stats() {
-    return statistics;
-}
-
-export function request(method: string, url: string, headers: Map<string, string>) {
+export function request(method: string, url: string, headers: Array<{name: string, value: string}>): Uint8Array | {status: number, status_text: string} {
     var xhr = new XMLHttpRequest();
     xhr.responseType = "arraybuffer"
+    xhr.open(method, url, false);
     if (headers !== undefined) {
-        headers.forEach((header_name, header_value) => {
-          xhr.setRequestHeader(header_name, header_value)
+        headers.forEach((header) => {
+          xhr.setRequestHeader(header.name, header.value)
         });
     }
-    xhr.open(method, url, false);
     xhr.send(null);
-    let array = new Uint8Array(xhr.response);
-    statistics.downloaded_bytes += array.byteLength;
-    statistics.requests += 1;
-    return array;
+    if (xhr.status >= 200 && xhr.status < 300) {
+        return new Uint8Array(xhr.response);
+    } else {
+        throw {
+            status: xhr.status,
+            status_text: xhr.statusText
+        };
+    }
+}
+
+export function request_async(method: string, url: string, headers: Array<{name: string, value: string}>) {
+    return new Promise(function (resolve, reject) {
+        let xhr = new XMLHttpRequest();
+        xhr.responseType = "arraybuffer"
+        xhr.open(method, url);
+         if (headers !== undefined) {
+            headers.forEach((header) => {
+              xhr.setRequestHeader(header.name, header.value)
+            });
+        }
+        xhr.onload = function () {
+            if (this.status >= 200 && this.status < 300) {
+                let array = new Uint8Array(xhr.response);
+                resolve(array);
+            } else {
+                reject({
+                    status: this.status,
+                    status_text: xhr.statusText
+                });
+            }
+        };
+        xhr.onerror = function () {
+            reject({
+                status: this.status,
+                status_text: xhr.statusText
+            });
+        };
+        xhr.send();
+    });
 }
 

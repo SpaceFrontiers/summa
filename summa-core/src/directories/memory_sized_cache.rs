@@ -19,32 +19,19 @@
 
 use std::borrow::Borrow;
 use std::hash::Hash;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Duration;
 use tantivy::directory::OwnedBytes;
 
+use crate::metrics::CacheMetrics;
 use lru::{KeyRef, LruCache};
 
-use crate::slice_address::{SliceAddress, SliceAddressKey, SliceAddressRef};
-use crate::stored_item::StoredItem;
+use super::slice_address::{SliceAddress, SliceAddressKey, SliceAddressRef};
+use super::stored_item::StoredItem;
 
-/// We do not evict anything that has been accessed in the last 60s.
-///
-/// The goal is to behave better on scan access patterns, without being as aggressive as
-/// using a MRU strategy.
-///
-/// TLDR is:
-///
-/// If two items have been access in the last 60s it is not really worth considering the
-/// latter too be more recent than the previous and do an eviction.
-/// The difference is not significant enough to raise the probability of its future access.
-///
-/// On the other hand, for very large queries involving enough data to saturate the cache,
-/// we are facing a scanning pattern. If variations of this  query is repeated over and over
-/// a regular LRU eviction policy would yield a hit rate of 0.
-const MIN_TIME_SINCE_LAST_ACCESS: Duration = Duration::from_secs(60);
+const MIN_TIME_SINCE_LAST_ACCESS: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug)]
 enum Capacity {
@@ -66,11 +53,19 @@ struct NeedMutMemorySizedCache<K: Hash + Eq> {
     num_items: usize,
     num_bytes: u64,
     capacity: Capacity,
+    cache_metrics: CacheMetrics,
+}
+
+impl<K: Hash + Eq> Drop for NeedMutMemorySizedCache<K> {
+    fn drop(&mut self) {
+        self.cache_metrics.in_cache_count.fetch_sub(self.num_items as i64, Ordering::Relaxed);
+        self.cache_metrics.in_cache_num_bytes.fetch_sub(self.num_bytes as i64, Ordering::Relaxed);
+    }
 }
 
 impl<K: Hash + Eq> NeedMutMemorySizedCache<K> {
     /// Creates a new NeedMutSliceCache with the given capacity.
-    fn with_capacity(capacity: Capacity) -> Self {
+    fn with_capacity(capacity: Capacity, cache_metrics: CacheMetrics) -> Self {
         NeedMutMemorySizedCache {
             // The limit will be decided by the amount of memory in the cache,
             // not the number of items in the cache.
@@ -79,17 +74,24 @@ impl<K: Hash + Eq> NeedMutMemorySizedCache<K> {
             num_items: 0,
             num_bytes: 0,
             capacity,
+            cache_metrics,
         }
     }
 
     pub fn record_item(&mut self, num_bytes: u64) {
         self.num_items += 1;
         self.num_bytes += num_bytes;
+        self.cache_metrics.requests_count.fetch_add(1, Ordering::Relaxed);
+        self.cache_metrics.requests_bytes.fetch_add(num_bytes, Ordering::Relaxed);
+        self.cache_metrics.in_cache_count.fetch_add(1, Ordering::Relaxed);
+        self.cache_metrics.in_cache_num_bytes.fetch_add(num_bytes as i64, Ordering::Relaxed);
     }
 
     pub fn drop_item(&mut self, num_bytes: u64) {
         self.num_items -= 1;
         self.num_bytes -= num_bytes;
+        self.cache_metrics.in_cache_count.fetch_sub(1, Ordering::Relaxed);
+        self.cache_metrics.in_cache_num_bytes.fetch_sub(num_bytes as i64, Ordering::Relaxed);
     }
 
     pub fn get<Q>(&mut self, cache_key: &Q) -> Option<OwnedBytes>
@@ -98,7 +100,14 @@ impl<K: Hash + Eq> NeedMutMemorySizedCache<K> {
         Q: Hash + Eq + ?Sized,
     {
         let item_opt = self.lru_cache.get_mut(cache_key);
-        item_opt.map(|item| item.payload())
+        if let Some(item) = item_opt {
+            self.cache_metrics.hits_num_items.fetch_add(1, Ordering::Relaxed);
+            self.cache_metrics.hits_num_bytes.fetch_add(item.len() as u64, Ordering::Relaxed);
+            Some(item.payload())
+        } else {
+            self.cache_metrics.misses_num_items.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 
     /// Attempt to put the given amount of data in the cache.
@@ -142,16 +151,16 @@ pub struct MemorySizedCache<K: Hash + Eq = SliceAddress> {
 
 impl<K: Hash + Eq> MemorySizedCache<K> {
     /// Creates an slice cache with the given capacity.
-    pub fn with_capacity_in_bytes(capacity_in_bytes: usize) -> Self {
+    pub fn with_capacity_in_bytes(capacity_in_bytes: usize, cache_metrics: CacheMetrics) -> Self {
         MemorySizedCache {
-            inner: Mutex::new(NeedMutMemorySizedCache::with_capacity(Capacity::InBytes(capacity_in_bytes))),
+            inner: Mutex::new(NeedMutMemorySizedCache::with_capacity(Capacity::InBytes(capacity_in_bytes), cache_metrics)),
         }
     }
 
     /// Creates a slice cache that nevers removes any entry.
-    pub fn with_infinite_capacity() -> Self {
+    pub fn with_infinite_capacity(cache_metrics: CacheMetrics) -> Self {
         MemorySizedCache {
-            inner: Mutex::new(NeedMutMemorySizedCache::with_capacity(Capacity::Unlimited)),
+            inner: Mutex::new(NeedMutMemorySizedCache::with_capacity(Capacity::Unlimited, cache_metrics)),
         }
     }
 
@@ -174,16 +183,16 @@ impl<K: Hash + Eq> MemorySizedCache<K> {
 
 impl MemorySizedCache<SliceAddress> {
     /// If available, returns the cached view of the slice.
-    pub fn get_slice(&self, path: &Path, byte_range: Range<usize>) -> Option<OwnedBytes> {
-        let slice_address_ref = SliceAddressRef { path, byte_range };
+    pub fn get_slice(&self, path: &Path, index: usize) -> Option<OwnedBytes> {
+        let slice_address_ref = SliceAddressRef { path, index };
         self.get(&slice_address_ref as &dyn SliceAddressKey)
     }
 
     /// Attempt to put the given amount of data in the cache.
     /// This may fail silently if the owned_bytes slice is larger than the cache
     /// capacity.
-    pub fn put_slice(&self, path: PathBuf, byte_range: Range<usize>, bytes: OwnedBytes) {
-        let slice_address = SliceAddress { path, byte_range };
+    pub fn put_slice(&self, path: PathBuf, index: usize, bytes: OwnedBytes) {
+        let slice_address = SliceAddress { path, index };
         self.put(slice_address, bytes);
     }
 }

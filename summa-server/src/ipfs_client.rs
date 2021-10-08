@@ -195,8 +195,8 @@ impl IpfsClient {
             &[
                 ("nocopy", if no_copy { "true" } else { "false" }),
                 ("cid-version", "1"),
-                ("hash", "blake3"),
-                ("chunker", "size-32768"),
+                ("hash", "blake2b-256"),
+                ("chunker", "size-65536"),
             ],
         )?;
         for index_file_path in index_file_paths {

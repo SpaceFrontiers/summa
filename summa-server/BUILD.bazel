@@ -14,7 +14,6 @@ rust_library(
     edition = "2021",
     deps = all_crate_deps() + [
         "//summa-core",
-        "//summa-directory",
         "//summa:summa_proto",
     ],
     version = "0.9.0",

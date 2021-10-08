@@ -101,7 +101,7 @@ impl Consumer {
             .iter()
             .map(|topic_name| {
                 AlterConfig::new(ResourceSpecifier::Topic(topic_name.as_str()))
-                    .set("retention.ms", "3600000")
+                    .set("retention.ms", "14400000")
                     .set("retention.bytes", "1073741824")
             })
             .collect();

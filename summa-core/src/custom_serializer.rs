@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashSet};
 use tantivy::schema::{Field, Schema};
 use tantivy::Document;
 
-#[derive(Debug)]
 pub enum Value {
     SingleValue(Option<tantivy::schema::Value>),
     MultipleValue(Vec<tantivy::schema::Value>),
@@ -15,7 +14,7 @@ pub enum Value {
 /// A `NamedFieldDocument` is a simple representation of a document
 /// as a `BTreeMap<String, Vec<Value>>`. It is base on `tantivy::schema::NamedFieldDocument`
 /// but with a support of multi fields
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct NamedFieldDocument(pub BTreeMap<String, Value>);
 
 impl NamedFieldDocument {

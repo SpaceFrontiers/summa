@@ -1,10 +1,9 @@
 {
   "compilerOptions": {
-    "outDir": "./dist/",
+    "outDir": "./pkg/dist",
     "noImplicitAny": true,
     "module": "es2022",
     "target": "es2022",
-    "moduleResolution": "node",
     "declaration": true
   }
 }

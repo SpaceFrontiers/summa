@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 use summa_proto::proto;
-use tantivy::{IndexSettings, Opstamp, SegmentAttribute, SegmentAttributesConfig};
+use tantivy::{IndexSettings, Opstamp};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{info, instrument};
 
@@ -150,14 +150,10 @@ impl IndexService {
         let index_config = index_config_builder.build().unwrap();
         self.insert_config(&create_index_request.index_name, &index_config).await?;
 
-        let mut segment_attributes = HashMap::new();
-        segment_attributes.insert("is_frozen".to_string(), SegmentAttribute::ConjunctiveBool(false));
-
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression,
             docstore_blocksize: create_index_request.blocksize.unwrap_or(16384),
             sort_by_field: create_index_request.sort_by_field.clone(),
-            segment_attributes_config: SegmentAttributesConfig::new(segment_attributes),
             ..Default::default()
         };
         let index_holder = IndexHolder::create(

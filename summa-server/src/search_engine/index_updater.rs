@@ -5,20 +5,21 @@ use crate::consumers::kafka::Consumer;
 use crate::errors::{Error, SummaServerResult, ValidationError};
 use crate::ipfs_client::Key;
 use crate::search_engine::frozen_log_merge_policy::FrozenLogMergePolicy;
+use crate::search_engine::segment_attributes::SummaSegmentAttributes;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::BorrowedMessage;
 use rdkafka::Message;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use summa_core::directories::write_hotcache;
 use summa_core::SummaDocument;
-use summa_directory::hot_cache_directory::write_hotcache;
 use summa_proto::proto;
 use tantivy::directory::MmapDirectory;
 use tantivy::schema::Schema;
-use tantivy::{Directory, Index, Opstamp, SegmentAttribute, SegmentAttributes, SegmentComponent, SegmentId, SegmentMeta};
+use tantivy::{Directory, Index, Opstamp, SegmentComponent, SegmentId, SegmentMeta};
 use tracing::{info, instrument, warn};
 
 fn process_message(
@@ -187,7 +188,7 @@ impl IndexUpdater {
     /// consumer separately.
     #[instrument(skip(self))]
     pub(crate) async fn delete_consumer(&mut self, consumer_name: &str) -> SummaServerResult<()> {
-        self.stop_consumers().await?.commit().await?;
+        self.stop_consumers().await?.commit(None).await?;
         if let Err(error) = self.commit_offsets().await {
             info!(action = "failed_commit", consumer_name = consumer_name, error = ?error);
         }
@@ -207,7 +208,7 @@ impl IndexUpdater {
     /// Deletes all consumers in a faster way than separate deletion of every consumer by their names
     #[instrument(skip(self))]
     pub(crate) async fn delete_all_consumers(&mut self) -> SummaServerResult<Vec<String>> {
-        self.stop_consumers().await?.commit().await?;
+        self.stop_consumers().await?.commit(None).await?;
         self.commit_offsets().await?;
         let mut deleted_consumers_names: Vec<_> = Vec::new();
         for consumer in self.consumers.drain(..) {
@@ -278,7 +279,7 @@ impl IndexUpdater {
     /// Commit Tantivy index and Kafka offsets
     #[instrument(skip(self), fields(index_name = ?self.index_name))]
     pub(crate) async fn commit(&mut self) -> SummaServerResult<Opstamp> {
-        let opstamp = self.stop_consumers().await?.commit().await?;
+        let opstamp = self.stop_consumers().await?.commit(None).await?;
         self.commit_offsets().await?;
         self.start_consumers().await?;
         Ok(opstamp)
@@ -288,9 +289,9 @@ impl IndexUpdater {
     #[instrument(skip(self))]
     pub(crate) async fn vacuum(&mut self) -> SummaServerResult<()> {
         let index_writer_holder = self.stop_consumers().await?;
-        index_writer_holder.commit().await?;
+        index_writer_holder.commit(None).await?;
         index_writer_holder.vacuum(None).await?;
-        index_writer_holder.commit().await?;
+        index_writer_holder.commit(None).await?;
 
         self.commit_offsets().await?;
         self.start_consumers().await?;
@@ -308,13 +309,18 @@ impl IndexUpdater {
     #[instrument(skip(self))]
     pub(super) async fn stop_consumers_and_commit(mut self) -> SummaServerResult<Opstamp> {
         self.stop_consumers().await?;
-        let opstamp = self.stop_consumers().await?.commit().await?;
+        let opstamp = self.stop_consumers().await?.commit(None).await?;
         self.commit_offsets().await?;
         Ok(opstamp)
     }
 
     /// Set attributes
-    pub async fn prepare_index_publishing<P, Fut>(&mut self, index_path: P, publisher: impl FnOnce(Vec<IndexFilePath>) -> Fut) -> SummaServerResult<Key>
+    pub async fn prepare_index_publishing<P, Fut>(
+        &mut self,
+        index_path: P,
+        payload: Option<String>,
+        publisher: impl FnOnce(Vec<IndexFilePath>) -> Fut,
+    ) -> SummaServerResult<Key>
     where
         P: AsRef<Path>,
         Fut: Future<Output = SummaServerResult<Key>>,
@@ -324,13 +330,11 @@ impl IndexUpdater {
 
         let index_writer_holder = self.stop_consumers().await?;
 
-        let is_frozen_attributes = Some(SegmentAttributes::new(HashMap::from_iter(
-            vec![("is_frozen".to_string(), SegmentAttribute::ConjunctiveBool(true))].into_iter(),
-        )));
+        let segment_attributes = SummaSegmentAttributes { is_frozen: true };
 
-        index_writer_holder.commit().await?;
-        index_writer_holder.vacuum(is_frozen_attributes.as_ref()).await?;
-        index_writer_holder.commit().await?;
+        index_writer_holder.commit(None).await?;
+        index_writer_holder.vacuum(Some(segment_attributes)).await?;
+        index_writer_holder.commit(payload).await?;
 
         wait_merging_threads(index_writer_holder, &index, &index_config);
         self.commit_offsets().await?;
@@ -338,7 +342,7 @@ impl IndexUpdater {
         let mut hotcache_bytes = vec![];
 
         let read_directory = MmapDirectory::open(index_path).unwrap();
-        write_hotcache(read_directory, &mut hotcache_bytes).unwrap();
+        write_hotcache(read_directory, &mut hotcache_bytes, None).unwrap();
         index
             .directory()
             .atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)

@@ -67,11 +67,9 @@ serde_json = "1.0.85"
 serde_yaml = "0.8.26"
 signal-hook = "0.3.14"
 summa-core = { version = "0.1.0", path = "../summa-core"}
-summa-directory = { version = "0.1.0", path = "../summa-directory"}
 summa-proto = { version = "0.1.0", path = "../summa" }
 take_mut = "0.2.2"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/seg-attr", features = ["quickwit", "zstd-compression"] }
-# tantivy = { version = "0.18.0", features = ["brotli-compression", "lz4-compression", "snappy-compression", "zstd-compression"] }
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
 tantivy-fst = "0.3.0"
 textwrap = "0.15.0"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
@@ -87,11 +85,3 @@ tracing = "0.1.36"
 tracing-appender = "0.2.2"
 tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3.15", features = ["env-filter", "json"] }
-
-instant = { version = "0.1", features = [ "stdweb" ] }
-lru = "0.8.0"
-serde_cbor = "0.11"
-
-[profile.release]
-lto = true
-opt-level = 3
