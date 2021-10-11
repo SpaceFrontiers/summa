@@ -12,10 +12,10 @@ export default defineComponent({
   components: { DocumentSnippet },
   props: {
     scored_documents: {
-      type: Array as PropType<{document: {id: number, title: string, text: string}}[]>,
+      type: Array as PropType<{document: {id: number[], title: string[], ipfs_multihashes: string[]}}[]>,
       required: true,
     },
-  }
+  },
 });
 </script>
 

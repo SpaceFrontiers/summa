@@ -1,5 +1,7 @@
 importScripts("localforage.js");
 
+const CHUNK_SIZE = 16384;
+
 function* range(start = 0, end = Infinity, step = 1) {
   let iterationCount = 0;
   for (let i = start; i < end; i += step) {
@@ -15,16 +17,16 @@ function set_same_origin_headers(headers) {
   return headers;
 }
 
-const CHUNK_SIZE = 16384;
+function get_chunk_cache_key(cache_key, chunk_id, chunk_size) {
+  return `${cache_key}:${chunk_id}-${chunk_id + chunk_size}`;
+}
 
-async function fill_from_cache(request, range_header) {
-  const [start, end] = range_header;
+async function fill_from_cache(cache_key, chunk_size, start, end) {
   const cached_response = new ArrayBuffer(end - start + 1);
   const cached_response_view = new Uint8Array(cached_response);
-  for (const current of range(start, end, CHUNK_SIZE)) {
-    const url = new URL(request.url).pathname;
-    const cache_key = `cache:${url}:${current}-${current + CHUNK_SIZE}`;
-    const cached = await localforage.getItem(cache_key);
+  for (const current of range(start, end, chunk_size)) {
+    const chunk_cache_key = get_chunk_cache_key(cache_key, current, chunk_size);
+    const cached = await localforage.getItem(chunk_cache_key);
     if (cached === null) {
       return null;
     }
@@ -33,15 +35,13 @@ async function fill_from_cache(request, range_header) {
   return cached_response;
 }
 
-async function fill_cache(request, response_body, range_header) {
-  const [start, end] = range_header;
-  for (const current of range(start, end, CHUNK_SIZE)) {
-    const url = new URL(request.url).pathname;
-    const cache_key = `cache:${url}:${current}-${current + CHUNK_SIZE}`;
+async function fill_cache(response_body, cache_key, chunk_size, start, end) {
+  for (const current of range(start, end, chunk_size)) {
+    const chunk_cache_key = get_chunk_cache_key(cache_key, current, chunk_size);
     await localforage.setItem(
-      cache_key,
+      chunk_cache_key,
       new Uint8Array(
-        response_body.slice(current - start, current - start + CHUNK_SIZE)
+        response_body.slice(current - start, current - start + chunk_size)
       )
     );
   }
@@ -49,22 +49,23 @@ async function fill_cache(request, response_body, range_header) {
 
 function process_request_headers(request) {
   const new_headers = new Headers();
-  let range_header = null;
-  let is_summa_cache = false;
+  let [range_start, range_end] = [null, null];
+  let summa_cache_is_enabled = false;
   for (const [header, value] of request.headers) {
-    if (header === "x-summa-cache") {
-      is_summa_cache = true;
+    if (header === "x-summa-cache-is-enabled") {
+      summa_cache_is_enabled = true;
       continue;
     }
     if (header === "range") {
       const [_, start, end] = /^bytes=(\d+)-(\d+)$/g.exec(value);
-      range_header = [parseInt(start), parseInt(end)];
+      [range_start, range_end] = [parseInt(start), parseInt(end)];
     }
     new_headers.set(header, value);
   }
   return {
-    is_summa_cache: is_summa_cache,
-    range_header: range_header,
+    summa_cache_is_enabled: summa_cache_is_enabled,
+    range_start: range_start,
+    range_end: range_end,
     request: new Request(request.url, {
       method: request.method,
       headers: new_headers,
@@ -74,10 +75,20 @@ function process_request_headers(request) {
 }
 
 async function handle_request(original_request) {
-  const { is_summa_cache, range_header, request } =
-    process_request_headers(original_request);
-  if (is_summa_cache && range_header) {
-    const response_body = await fill_from_cache(request, range_header);
+  const {
+    summa_cache_is_enabled,
+    range_start,
+    range_end,
+    request,
+  } = process_request_headers(original_request);
+  const cache_key = `cache:${new URL(request.url).pathname}`;
+  if (summa_cache_is_enabled) {
+    const response_body = await fill_from_cache(
+      cache_key,
+      CHUNK_SIZE,
+      range_start,
+      range_end
+    );
     if (response_body) {
       return new Response(response_body, {
         headers: set_same_origin_headers(new Headers()),
@@ -86,10 +97,14 @@ async function handle_request(original_request) {
   }
   const real_response = await fetch(request);
   const real_response_body = await real_response.arrayBuffer();
-  if (is_summa_cache && range_header) {
-    fill_cache(request, real_response_body, range_header).catch((e) =>
-      console.error("Filling cache failed", e)
-    );
+  if (summa_cache_is_enabled) {
+    fill_cache(
+      real_response_body,
+      cache_key,
+      CHUNK_SIZE,
+      range_start,
+      range_end
+    ).catch((e) => console.error("Filling cache failed", e));
   }
   return new Response(real_response_body, {
     status: real_response.status,

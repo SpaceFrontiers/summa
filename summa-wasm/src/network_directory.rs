@@ -6,6 +6,7 @@ use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     AsyncIoResult, Directory, HasLen,
 };
+use wasm_bindgen::UnwrapThrowExt;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::requests::RequestGenerator;
@@ -34,7 +35,7 @@ impl Directory for NetworkDirectory {
         let file_size = self
             .files
             .get(file_name_str.as_ref())
-            .ok_or(OpenReadError::FileDoesNotExist(file_name.to_path_buf()))?;
+            .ok_or_else(|| OpenReadError::FileDoesNotExist(file_name.to_path_buf()))?;
         Ok(Arc::new(NetworkFile::new(
             file_name_str.to_string(),
             *file_size,
@@ -86,9 +87,9 @@ impl FileHandle for NetworkFile {
         let (sender, receiver) = bounded(1);
         spawn_local(async move {
             let response = request.send_async().await.map(|response| response.to_vec());
-            sender.send(response).await.unwrap();
+            sender.send(response).await.unwrap_throw();
         });
-        let response = receiver.recv().await.unwrap()?;
+        let response = receiver.recv().await.unwrap_throw()?;
         Ok(OwnedBytes::new(response))
     }
 }

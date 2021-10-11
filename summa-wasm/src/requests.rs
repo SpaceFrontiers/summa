@@ -1,5 +1,5 @@
 use crate::errors::SummaWasmResult;
-use crate::Header;
+use crate::web_index_inner::Header;
 use js_sys::Uint8Array;
 use std::collections::{Bound, HashMap};
 use std::ops::RangeBounds;

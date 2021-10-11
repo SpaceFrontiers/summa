@@ -10,6 +10,6 @@ export function format_bytes(bytes: number, decimals = 2) {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
 }
 export function format_percent(v: number): string {
-  return (v * 100).toFixed(2) + '%'
+  return (v * 100).toFixed(2) + "%";
 }
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

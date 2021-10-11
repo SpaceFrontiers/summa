@@ -4,12 +4,12 @@ import { WebIndexCoordinate } from "./web-index";
 
 const web_index_service = {
   registry: new Map<String, WebIndexInner>(),
-  async setup(status_callback: any) {
+  async setup(status_callback: any, threads: number) {
     this.status_callback = status_callback;
     this.status_callback("status", "setting workers...");
     await init();
     this.status_callback("status", "setting thread pool...");
-    await init_thread_pool(4);
+    await init_thread_pool(threads);
   },
   async add_index(coordinate: WebIndexCoordinate) {
     const web_index = new WebIndexInner(
@@ -27,6 +27,10 @@ const web_index_service = {
   },
   async search(name: String, query: Object, collectors: Object[]) {
     return await this.registry.get(name)!.search(name, query, collectors);
+  },
+  async free(name: String) {
+    this.registry(name)!.free();
+    this.registry.delete(name);
   },
   async warmup(name: String) {
     this.status_callback(`warming up ${name}...`);

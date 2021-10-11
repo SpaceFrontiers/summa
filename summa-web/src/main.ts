@@ -1,19 +1,20 @@
 import { createApp } from "vue";
 import { createPinia } from "pinia";
-import piniaPluginPersistedstate from 'pinia-plugin-persistedstate'
-import { ipfs } from "./plugins/ipfs";
-import { summa } from "./plugins/summa";
 
 import App from "./App.vue";
 import router from "./router";
 
 import "./scss/styles.scss";
+import * as bootstrap from "bootstrap";
 
 const app = createApp(App);
 const pinia = createPinia();
-pinia.use(piniaPluginPersistedstate)
 
 app.use(pinia).use(router);
-app.config.globalProperties.summa = summa;
+
+import { ipfs } from "./plugins/ipfs";
+import { WebIndexService } from "./plugins/web-index-service";
+
 app.config.globalProperties.ipfs = ipfs;
-app.mount("#app")
+app.config.globalProperties.web_index_service = new WebIndexService();
+app.mount("#app");

@@ -8,10 +8,26 @@ import wasm from "vite-plugin-wasm";
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  base: "",
   build: {
-    target: "es2021",
+    assetsInlineLimit: 0,
+    rollupOptions: {
+      input: {
+        index: "./index.html",
+        "service-worker": "./service-worker.js",
+        localforage: "./node_modules/localforage/dist/localforage.js",
+      },
+      output: {
+        entryFileNames: (asset_info) => {
+          if (asset_info.name === "service-worker") {
+            return "[name].js";
+          }
+          return "assets/[name].[hash].js";
+        },
+      },
+    },
+    target: "modules",
   },
-  base: '',
   plugins: [
     vue({
       template: {
@@ -23,23 +39,17 @@ export default defineConfig({
     }),
     wasm(),
     topLevelAwait(),
-    {
-      name: "configure-response-headers",
-      configureServer: (server) => {
-        server.middlewares.use((_req, res, next) => {
-          res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-          res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-          next();
-        });
-      },
-    },
   ],
   optimizeDeps: {
+    esbuildOptions: {
+      target: "es2022",
+    },
     include: [
       "@libp2p/logger",
       "@multiformats/multiaddr",
       "ipfs-core-types",
       "ipfs-http-client",
+      "localforage",
       "merge-options",
       "summa-wasm",
     ],

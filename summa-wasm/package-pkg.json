@@ -4,7 +4,8 @@
     "Pasha Podolsky <ppodolsky@me.com>"
   ],
   "dependencies": {
-    "comlink": "^4.3.1"
+    "comlink": "^4.3.1",
+    "localforage": "^1.10.0"
   },
   "version": "",
   "files": [

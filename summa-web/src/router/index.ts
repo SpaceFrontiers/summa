@@ -7,11 +7,17 @@ const router = createRouter({
       path: "/",
       name: "search",
       component: () => import("../views/SearchView.vue"),
-      props: route => ({ query: route.query })
-    }, {
-      path: "/manage",
-      name: "manage",
-      component: () => import("../views/ManageView.vue"),
+      props: (route) => ({ query: route.query }),
+    },
+    {
+      path: "/databases",
+      name: "databases",
+      component: () => import("../views/DatabasesView.vue"),
+    },
+    {
+      path: "/about",
+      name: "about",
+      component: () => import("../views/AboutView.vue"),
     },
   ],
 });

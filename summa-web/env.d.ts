@@ -1,11 +1,22 @@
 /// <reference types="vite/client" />
 
-import { Summa } from "@/plugins/summa";
 import { IPFSHTTPClient } from "ipfs-http-client";
+import { WebIndexService } from "@/plugins/summa";
 
-declare module '@vue/runtime-core' {
-  interface ComponentCustomProperties  {
-      summa: Summa
-      ipfs: IPFSHTTPClient,
+declare module "@vue/runtime-core" {
+  interface ComponentCustomProperties {
+    ipfs: IPFSHTTPClient;
+    web_index_service: WebIndexService;
+  }
+}
+
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      GITHUB_AUTH_TOKEN: string;
+      NODE_ENV: "development" | "production";
+      PORT?: string;
+      PWD: string;
+    }
   }
 }

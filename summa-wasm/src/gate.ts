@@ -1,3 +1,8 @@
+/* gats.ts contains routines that are used inside Rust code to make queries
+* Both functions are required as there are use cases where only blocking
+* synchronous calls are possible
+*/
+
 export function request(method: string, url: string, headers: Array<{name: string, value: string}>): Uint8Array | {status: number, status_text: string} {
     var xhr = new XMLHttpRequest();
     xhr.responseType = "arraybuffer"
@@ -7,6 +12,7 @@ export function request(method: string, url: string, headers: Array<{name: strin
           xhr.setRequestHeader(header.name, header.value)
         });
     }
+    xhr.setRequestHeader("X-Summa-Cache-Is-Enabled", "1");
     xhr.send(null);
     if (xhr.status >= 200 && xhr.status < 300) {
         return new Uint8Array(xhr.response);
@@ -28,6 +34,7 @@ export function request_async(method: string, url: string, headers: Array<{name:
               xhr.setRequestHeader(header.name, header.value)
             });
         }
+        xhr.setRequestHeader("X-Summa-Cache-Is-Enabled", "1");
         xhr.onload = function () {
             if (this.status >= 200 && this.status < 300) {
                 let array = new Uint8Array(xhr.response);
@@ -48,4 +55,3 @@ export function request_async(method: string, url: string, headers: Array<{name:
         xhr.send();
     });
 }
-

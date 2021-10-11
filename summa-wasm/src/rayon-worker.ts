@@ -35,7 +35,7 @@ export async function start_workers(module, memory, builder) {
     memory,
     receiver: builder.receiver()
   };
-  _workers = await Promise.all(
+  self._workers = await Promise.all(
     Array.from({ length: builder.num_threads() }, async () => {
       const worker = new Worker(self.location.href, { type: "module" });
       worker.postMessage(workerInit);
@@ -43,5 +43,6 @@ export async function start_workers(module, memory, builder) {
       return worker;
     })
   );
+  _workers = self._workers
   builder.build();
 }
