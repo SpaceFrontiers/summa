@@ -9,7 +9,7 @@ use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
-use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerator};
+use tantivy::{DocAddress, DocId, Document, Score, Searcher, SegmentReader, SnippetGenerator};
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
 #[async_trait]
@@ -87,7 +87,6 @@ pub fn build_fruit_extractor(
                             ),
                         )
                         .query(query.box_clone())
-                        .explain(top_docs_collector_proto.explain)
                         .limit(top_docs_collector_proto.limit)
                         .snippets(top_docs_collector_proto.snippets)
                         .fields(fields)
@@ -107,7 +106,6 @@ pub fn build_fruit_extractor(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))
                             .query(query.box_clone())
-                            .explain(top_docs_collector_proto.explain)
                             .limit(top_docs_collector_proto.limit)
                             .snippets(top_docs_collector_proto.snippets)
                             .fields(fields)
@@ -127,7 +125,6 @@ pub fn build_fruit_extractor(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))
                             .query(query.box_clone())
-                            .explain(top_docs_collector_proto.explain)
                             .limit(top_docs_collector_proto.limit)
                             .snippets(top_docs_collector_proto.snippets)
                             .fields(fields)
@@ -166,6 +163,36 @@ pub fn build_fruit_extractor(
     }
 }
 
+fn extract_base<T: 'static + Copy + Into<proto::Score> + Sync + Send>(
+    scored_documents_iter: impl Iterator<Item = (T, Document)>,
+    external_index_alias: &str,
+    schema: &Schema,
+    has_next: bool,
+    fields: &Option<HashSet<Field>>,
+    multi_fields: &HashSet<Field>,
+    snippet_generators: HashMap<String, SnippetGenerator>,
+) -> proto::CollectorOutput {
+    let scored_documents = scored_documents_iter
+        .enumerate()
+        .map(|(position, (score, document))| proto::ScoredDocument {
+            document: NamedFieldDocument::from_document(schema, fields, multi_fields, &document).to_json(),
+            score: Some(score.into()),
+            position: position as u32,
+            snippets: snippet_generators
+                .iter()
+                .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
+                .collect(),
+            index_alias: external_index_alias.to_string(),
+        })
+        .collect();
+    proto::CollectorOutput {
+        collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+            scored_documents,
+            has_next,
+        })),
+    }
+}
+
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(error = "ValidationError"))]
 pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
@@ -173,8 +200,6 @@ pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
     limit: u32,
     snippets: HashMap<String, u32>,
     query: Box<dyn Query>,
-    #[builder(default = "false")]
-    explain: bool,
     #[builder(default = "None")]
     fields: Option<HashSet<Field>>,
 }
@@ -202,34 +227,25 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> proto::CollectorOutput {
-        let schema = searcher.schema();
         let snippet_generators = self.snippet_generators(searcher);
         let fruit = self.handle.extract(multi_fruit);
-        let scored_documents_iter = fruit.iter().enumerate().map(|(position, (score, doc_address))| {
-            let document = searcher.doc(*doc_address).unwrap();
-            proto::ScoredDocument {
-                document: NamedFieldDocument::from_document(schema, &self.fields, multi_fields, &document).to_json(),
-                score: Some((*score).into()),
-                position: position as u32,
-                snippets: snippet_generators
-                    .iter()
-                    .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
-                    .collect(),
-                index_alias: external_index_alias.to_string(),
-            }
-        });
-        let len = scored_documents_iter.len();
-        let scored_documents = scored_documents_iter.take(std::cmp::min(self.limit as usize, len)).collect();
-        let has_next = len > self.limit as usize;
-        proto::CollectorOutput {
-            collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
-                scored_documents,
-                has_next,
-            })),
-        }
+        let length = fruit.len();
+
+        let scored_documents = fruit
+            .iter()
+            .take(std::cmp::min(self.limit as usize, length))
+            .map(|(score, doc_address)| (*score, searcher.doc(*doc_address).unwrap()));
+        extract_base(
+            scored_documents,
+            external_index_alias,
+            searcher.schema(),
+            length > self.limit as usize,
+            &self.fields,
+            multi_fields,
+            snippet_generators,
+        )
     }
 
-    // ToDo: deduplicate!
     async fn extract_async(
         self: Box<Self>,
         external_index_alias: &str,
@@ -237,39 +253,26 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> proto::CollectorOutput {
-        let schema = searcher.schema();
         let snippet_generators = self.snippet_generators(searcher);
         let fruit = self.handle.extract(multi_fruit);
         let length = fruit.len();
-        let limit = std::cmp::min(self.limit as usize, length);
-        let has_next = length > self.limit as usize;
 
         let scored_documents = join_all(
             fruit
                 .iter()
-                .take(limit)
-                .map(|(score, doc_address)| async move { (score, searcher.doc_async(*doc_address).await.unwrap()) }),
+                .take(std::cmp::min(self.limit as usize, length))
+                .map(|(score, doc_address)| async move { (*score, searcher.doc_async(*doc_address).await.unwrap()) }),
         )
-        .await
-        .into_iter()
-        .enumerate()
-        .map(|(position, (score, document))| proto::ScoredDocument {
-            document: NamedFieldDocument::from_document(schema, &self.fields, multi_fields, &document).to_json(),
-            score: Some((*score).into()),
-            position: position as u32,
-            snippets: snippet_generators
-                .iter()
-                .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
-                .collect(),
-            index_alias: external_index_alias.to_string(),
-        })
-        .collect();
-        proto::CollectorOutput {
-            collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
-                scored_documents,
-                has_next,
-            })),
-        }
+        .await;
+        extract_base(
+            scored_documents.into_iter(),
+            external_index_alias,
+            searcher.schema(),
+            length > self.limit as usize,
+            &self.fields,
+            multi_fields,
+            snippet_generators,
+        )
     }
 }
 

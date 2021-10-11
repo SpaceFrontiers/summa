@@ -15,11 +15,18 @@ use tantivy::{Directory, HasLen};
 #[derive(Clone)]
 pub struct ChunkedCachingDirectory {
     chunk_size: usize,
-    cache: Arc<MemorySizedCache>,
+    cache: Option<Arc<MemorySizedCache>>,
     underlying: Arc<dyn Directory>,
 }
 
 impl ChunkedCachingDirectory {
+    pub fn new(underlying: Arc<dyn Directory>, chunk_size: usize) -> ChunkedCachingDirectory {
+        ChunkedCachingDirectory {
+            chunk_size,
+            cache: None,
+            underlying,
+        }
+    }
     pub fn new_with_capacity_in_bytes(
         underlying: Arc<dyn Directory>,
         chunk_size: usize,
@@ -28,14 +35,14 @@ impl ChunkedCachingDirectory {
     ) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
-            cache: Arc::new(MemorySizedCache::with_capacity_in_bytes(capacity_in_bytes, cache_metrics)),
+            cache: Some(Arc::new(MemorySizedCache::with_capacity_in_bytes(capacity_in_bytes, cache_metrics))),
             underlying,
         }
     }
     pub fn new_unbounded(underlying: Arc<dyn Directory>, chunk_size: usize, cache_metrics: CacheMetrics) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
-            cache: Arc::new(MemorySizedCache::with_infinite_capacity(cache_metrics)),
+            cache: Some(Arc::new(MemorySizedCache::with_infinite_capacity(cache_metrics))),
             underlying,
         }
     }
@@ -76,7 +83,7 @@ impl Directory for ChunkedCachingDirectory {
 
 struct ChunkedCachingFileHandle {
     path: PathBuf,
-    cache: Arc<MemorySizedCache>,
+    cache: Option<Arc<MemorySizedCache>>,
     chunk_size: usize,
     underlying_filehandle: Arc<dyn FileHandle>,
 }
@@ -94,23 +101,29 @@ impl Debug for ChunkedCachingFileHandle {
 
 impl ChunkedCachingFileHandle {
     fn try_fill_from_cache(&self, range: Range<usize>, response_buffer: &mut [u8]) -> Vec<Chunk> {
-        let mut missing_chunks = vec![];
-
-        for chunk in ChunkGenerator::new(range, self.len(), self.chunk_size) {
-            match self.cache.get_slice(&self.path, chunk.index) {
-                Some(item) => response_buffer[chunk.target_ix..][..chunk.len()].clone_from_slice(&item.slice(chunk.data_bounds())),
-                None => missing_chunks.push(chunk),
-            };
+        let chunks = ChunkGenerator::new(range, self.len(), self.chunk_size);
+        match &self.cache {
+            None => chunks.collect(),
+            Some(cache) => {
+                let mut missing_chunks = vec![];
+                for chunk in chunks {
+                    match cache.get_slice(&self.path, chunk.index) {
+                        Some(item) => response_buffer[chunk.target_ix..][..chunk.len()].clone_from_slice(&item.slice(chunk.data_bounds())),
+                        None => missing_chunks.push(chunk),
+                    };
+                }
+                missing_chunks
+            }
         }
-
-        missing_chunks
     }
 
     fn adopt_response(&self, total_response: &mut [u8], response: OwnedBytes, original_request: &Request) {
         for chunk in original_request.chunks() {
             let item = response.slice(chunk.shifted_chunk_range(original_request.bounds().start));
             total_response[chunk.target_ix..][..chunk.len()].clone_from_slice(&item.slice(chunk.data_bounds()));
-            self.cache.put_slice(self.path.to_path_buf(), chunk.index, item);
+            if let Some(cache) = &self.cache {
+                cache.put_slice(self.path.to_path_buf(), chunk.index, item);
+            }
         }
     }
 }
