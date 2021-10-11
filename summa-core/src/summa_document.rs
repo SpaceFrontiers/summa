@@ -78,6 +78,7 @@ impl<'a> SummaDocument<'a> {
                     expected: "a json object",
                     json: JsonValue::String(field_text),
                 }),
+                FieldType::IpAddr(_) => todo!(),
             },
             JsonValue::Number(field_val_num) => match field_type {
                 FieldType::I64(_) | FieldType::Date(_) => {
@@ -122,6 +123,7 @@ impl<'a> SummaDocument<'a> {
                     expected: "a json object",
                     json: JsonValue::Number(field_val_num),
                 }),
+                FieldType::IpAddr(_) => todo!(),
             },
             JsonValue::Object(json_map) => match field_type {
                 FieldType::Str(_) => {

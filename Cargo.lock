@@ -554,14 +554,13 @@ checksum = "cd7d5c9e2fb96ea7b093da40c584cb3060eddbe0d4db8abcea655b197156d94e"
 [[package]]
 name = "fastfield_codecs"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#43ef24d3e020a1cd8483cfdb8dde5503b938b198"
 dependencies = [
  "fastdivide",
  "itertools",
  "log",
- "ownedbytes 0.3.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
- "tantivy-bitpacker 0.2.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
- "tantivy-common 0.3.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
+ "ownedbytes",
+ "tantivy-bitpacker",
+ "tantivy-common",
 ]
 
 [[package]]
@@ -594,6 +593,16 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
 
 [[package]]
 name = "fuchsia-cprng"
@@ -1099,6 +1108,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dffe52ecf27772e601905b7522cb4ef790d2cc203488bbd0e2fe85fcb74566d"
 
 [[package]]
+name = "memmap2"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95af15f345b17af2efc8ead6080fb8bc376f8cec1b35277b935637595fe77498"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memoffset"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1299,7 +1317,6 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 [[package]]
 name = "ownedbytes"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#43ef24d3e020a1cd8483cfdb8dde5503b938b198"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -1969,7 +1986,7 @@ dependencies = [
  "serde_cbor",
  "serde_json",
  "summa-proto",
- "tantivy 0.18.0",
+ "tantivy",
  "thiserror",
  "time",
  "web-sys",
@@ -1983,7 +2000,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "serde",
- "tantivy 0.18.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
+ "tantivy",
  "thiserror",
  "tonic",
  "tonic-build",
@@ -2028,7 +2045,7 @@ dependencies = [
  "summa-core",
  "summa-proto",
  "take_mut",
- "tantivy 0.18.0",
+ "tantivy",
  "tantivy-fst 0.3.0",
  "tempdir",
  "textwrap",
@@ -2067,7 +2084,7 @@ dependencies = [
  "strfmt",
  "summa-core",
  "summa-proto",
- "tantivy 0.18.0",
+ "tantivy",
  "thiserror",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -2100,7 +2117,6 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "tantivy"
 version = "0.18.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#43ef24d3e020a1cd8483cfdb8dde5503b938b198"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2114,8 +2130,9 @@ dependencies = [
  "downcast-rs",
  "fail",
  "fastdivide",
- "fastfield_codecs 0.2.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
+ "fastfield_codecs",
  "fnv",
+ "fs2",
  "futures",
  "htmlescape",
  "itertools",
@@ -2123,11 +2140,12 @@ dependencies = [
  "log",
  "lru 0.7.8",
  "measure_time",
+ "memmap2",
  "murmurhash32",
  "num_cpus",
  "once_cell",
  "oneshot",
- "ownedbytes 0.3.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
+ "ownedbytes",
  "rayon",
  "regex",
  "rust-stemmers",
@@ -2135,10 +2153,11 @@ dependencies = [
  "serde_json",
  "smallvec",
  "stable_deref_trait",
- "tantivy-bitpacker 0.2.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
- "tantivy-common 0.3.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
+ "tantivy-bitpacker",
+ "tantivy-common",
  "tantivy-fst 0.4.0",
- "tantivy-query-grammar 0.18.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
+ "tantivy-query-grammar",
+ "tempfile",
  "thiserror",
  "time",
  "uuid",
@@ -2149,15 +2168,13 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#43ef24d3e020a1cd8483cfdb8dde5503b938b198"
 
 [[package]]
 name = "tantivy-common"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#43ef24d3e020a1cd8483cfdb8dde5503b938b198"
 dependencies = [
  "byteorder",
- "ownedbytes 0.3.0 (git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon)",
+ "ownedbytes",
 ]
 
 [[package]]
@@ -2185,7 +2202,6 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.18.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#43ef24d3e020a1cd8483cfdb8dde5503b938b198"
 dependencies = [
  "combine",
  "once_cell",
