@@ -6,7 +6,6 @@ license-file = "LICENSE"
 description = "Fast full-text search server"
 homepage = "https://github.com/izihawa/summa"
 repository = "https://github.com/izihawa/summa"
-readme = "README.md"
 keywords = ["async", "search", "server", "grpc"]
 
 [lib]
@@ -66,10 +65,10 @@ serde_derive = "1.0.140"
 serde_json = "1.0.85"
 serde_yaml = "0.8.26"
 signal-hook = "0.3.14"
-summa-core = { version = "0.1.0", path = "../summa-core"}
-summa-proto = { version = "0.1.0", path = "../summa" }
+summa-core = { version = "0.9.0", path = "../summa-core"}
+summa-proto = { version = "0.9.0", path = "../summa" }
 take_mut = "0.2.2"
-tantivy = { path = "../tantivy", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
+tantivy = { package = "summavy", version = "0.19.0", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
 tantivy-fst = "0.3.0"
 textwrap = "0.15.0"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }

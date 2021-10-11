@@ -1,3 +1,0 @@
-[submodule "tantivy"]
-	path = tantivy
-	url = git@github.com:izihawa/tantivy.git

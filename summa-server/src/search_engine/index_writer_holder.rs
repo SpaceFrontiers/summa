@@ -118,8 +118,8 @@ impl IndexWriterHolder {
         if !small_segments.is_empty() {
             self.merge(
                 &small_segments
-                    .into_iter()
-                    .chain(std::iter::once(segments.iter().take(1)))
+                    .iter()
+                    .chain(segments.iter().take(1))
                     .map(|segment| segment.id())
                     .collect::<Vec<_>>(),
                 segment_attributes.clone(),

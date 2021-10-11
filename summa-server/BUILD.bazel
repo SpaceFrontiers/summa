@@ -6,7 +6,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 package(default_visibility = ["//visibility:public"])
 
 rust_library(
-    name = "summa_server",
+    name = "summa-server",
     srcs = glob(
         ["src/**/*.rs"],
         exclude = ["src/bin/**"],
@@ -21,10 +21,7 @@ rust_library(
 
 rust_test(
     name = "test",
-    crate = ":summa",
-    deps = [
-        "//summa:summa_proto"
-    ],
+    crate = ":summa-server",
 )
 
 rust_image(
@@ -32,7 +29,7 @@ rust_image(
     srcs = glob(["src/bin/**/*.rs"]),
     base = "@izihawa-base-image//image",
     edition = "2021",
-    deps = ["@crate_index//:tokio", ":summa_server"],
+    deps = ["@crate_index//:tokio", ":summa-server"],
 )
 
 container_push(

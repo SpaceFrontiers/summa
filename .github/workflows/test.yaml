@@ -19,4 +19,4 @@ jobs:
         with:
           path: "~/.cache/bazel"
           key: ${{ runner.os }}-bazel
-      - run: bazel test -c opt //tests
+      - run: bazel test -c opt :tests

@@ -41,7 +41,15 @@ jobs:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
       - uses: actions-rs/cargo@v1.0.3
         with:
-          command: publish
+          command: publish -p summa-proto
+          args: --verbose
+      - uses: actions-rs/cargo@v1.0.3
+        with:
+          command: publish -p summa-core
+          args: --verbose
+      - uses: actions-rs/cargo@v1.0.3
+        with:
+          command: publish -p summa-server
           args: --verbose
   push-to-docker:
     needs: test

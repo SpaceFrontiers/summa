@@ -3,6 +3,8 @@ name = "summa-proto"
 version = "0.9.0"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
+license-file = "LICENSE"
+description = "Summa search server proto files"
 
 [lib]
 name = "summa_proto"
@@ -15,12 +17,13 @@ grpc = ["tonic", "tonic-build", "tonic-reflection"]
 
 [build-dependencies]
 prost-build = { version = "0.11.0" }
+tonic-build = { version = "0.8.0", default-features = false, features = ["prost", "transport"], optional = true }
 
 [dependencies]
 prost = "0.11.0"
 prost-types = "0.11.0"
 serde = "1.0.145"
-tantivy = { path = "../tantivy", default_features = false, features = ["quickwit", "zstd-compression"] }
+tantivy = { package = "summavy", version = "0.19.0", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0.36"
 tonic = { version = "0.8.0", features = ["gzip"], optional = true }
 tonic-build = { version = "0.8.0", default-features = false, features = ["prost", "transport"], optional = true }

@@ -3,6 +3,8 @@ name = "summa-core"
 version = "0.9.0"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
+license-file = "LICENSE"
+description = "Summa core library"
 
 [lib]
 name = "summa_core"
@@ -26,8 +28,8 @@ rand = { version = "0.8.5", features = ["small_rng"] }
 serde = { version = "1.0.140", default_features = false, features = ["derive", "std"] }
 serde_cbor = "0.11.2"
 serde_json = "1.0.85"
-summa-proto = { version = "0.1.0", path = "../summa", default_features = false }
-tantivy = { path = "../tantivy", default_features = false, features = ["quickwit", "zstd-compression"] }
+summa-proto = { version = "0.9.0", path = "../summa", default_features = false }
+tantivy = { package = "summavy", version = "0.19.0", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0.36"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
 web-sys = { version = "0.3.60", features = ["console"] }

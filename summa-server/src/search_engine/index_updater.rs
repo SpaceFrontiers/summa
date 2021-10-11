@@ -342,7 +342,7 @@ impl IndexUpdater {
         let mut hotcache_bytes = vec![];
 
         let read_directory = MmapDirectory::open(index_path).unwrap();
-        write_hotcache(read_directory, &mut hotcache_bytes, None).unwrap();
+        write_hotcache(read_directory, 16384, &mut hotcache_bytes).unwrap();
         index
             .directory()
             .atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)
