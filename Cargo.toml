@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["tantivy"]
 resolver = "2"
 members = ["summa", "summa-core", "summa-server", "summa-wasm"]
 

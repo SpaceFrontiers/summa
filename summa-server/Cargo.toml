@@ -69,7 +69,7 @@ signal-hook = "0.3.14"
 summa-core = { version = "0.1.0", path = "../summa-core"}
 summa-proto = { version = "0.1.0", path = "../summa" }
 take_mut = "0.2.2"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
+tantivy = { path = "../tantivy", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
 tantivy-fst = "0.3.0"
 textwrap = "0.15.0"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
