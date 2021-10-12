@@ -123,7 +123,7 @@ impl IpfsClient {
     {
         let status = response.status();
         let body = response.into_body();
-        let text = String::from_utf8(body::to_bytes(body).await.map_err(|_| Error::Internal)?.to_vec()).map_err(|e| Error::Utf8(e.utf8_error()))?;
+        let text = String::from_utf8(body::to_bytes(body).await?.to_vec()).map_err(|e| Error::Utf8(e.utf8_error()))?;
         if status != StatusCode::OK {
             return Err(Error::UpstreamHttpStatus(status, text));
         }
@@ -227,7 +227,8 @@ impl IpfsClient {
             .set_body_convert::<hyper::Body, multipart::Body>(Request::builder().method(Method::POST).uri(uri.clone()))
             .unwrap();
 
-        let text = self.parse_response(self.http_connector.request(request).await?).await?;
+        let response = self.http_connector.request(request).await?;
+        let text = self.parse_response(response).await?;
         let add_file_responses = text
             .lines()
             .filter(|line| !line.is_empty())
