@@ -123,7 +123,13 @@ impl IpfsClient {
     {
         let status = response.status();
         let body = response.into_body();
-        let text = String::from_utf8(body::to_bytes(body).await?.to_vec()).map_err(|e| Error::Utf8(e.utf8_error()))?;
+        let text = String::from_utf8(
+            body::to_bytes(body)
+                .await
+                .map_err(|e| Error::UpstreamHttpStatus(status, "".to_string()))?
+                .to_vec(),
+        )
+        .map_err(|e| Error::Utf8(e.utf8_error()))?;
         if status != StatusCode::OK {
             return Err(Error::UpstreamHttpStatus(status, text));
         }
@@ -181,6 +187,15 @@ impl IpfsClient {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_str(line).unwrap())
             .collect::<Vec<_>>())
+    }
+
+    pub async fn mkdir<P1: AsRef<Path> + Debug>(&self, directory: P1) -> SummaServerResult<AddedFile> {
+        let response = self.request(self.generate_uri("/api/v0/files/mkdir", &[
+            ("arg", directory),
+            ("parent", "true")
+        ])?).await?;
+        let text = self.parse_response(response).await?;
+        Ok(serde_json::from_str(&text).unwrap())
     }
 
     pub async fn add<P1: AsRef<Path> + Debug>(&self, directory: P1, index_file_paths: &[IndexFilePath], no_copy: bool) -> SummaServerResult<Vec<AddedFile>> {

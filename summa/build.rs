@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "summa/proto/search_service.proto",
                 "summa/proto/utils.proto",
             ],
-            &["../external/com_google_protobuf/_virtual_imports/empty_proto"],
+            &["./"],
         )?;
     #[cfg(not(feature = "grpc"))]
     prost_build::Config::new()
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute(".", "#[serde(rename_all = \"snake_case\")]")
         .compile_protos(
             &["summa/proto/index_service.proto", "summa/proto/query.proto", "summa/proto/utils.proto"],
-            &["../external/com_google_protobuf/_virtual_imports/empty_proto"],
+            &["./"],
         )?;
     fs::remove_dir_all("summa").unwrap();
     Ok(())

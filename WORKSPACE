@@ -92,6 +92,14 @@ crates_repository(
                 "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
             },
         )],
+        "summa-proto": [crate.annotation(
+            build_script_data = [
+                "@com_google_protobuf//:protoc",
+            ],
+            build_script_env = {
+                "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
+            },
+        )],
         "tonic-reflection": [crate.annotation(
             build_script_data = [
                 "@com_google_protobuf//:protoc",

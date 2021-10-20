@@ -1,4 +1,5 @@
 use derive_builder::UninitializedFieldError;
+use hyper::body::HttpBody;
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
 use summa_core::DocumentParsingError;

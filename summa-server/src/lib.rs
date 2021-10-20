@@ -20,6 +20,7 @@ extern crate derive_builder;
 #[macro_use]
 extern crate lazy_static;
 extern crate core;
+extern crate summavy as tantivy;
 
 pub mod apis;
 pub mod application;

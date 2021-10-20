@@ -1,0 +1,60 @@
+load("@crate_index//:defs.bzl", "all_crate_deps")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@rules_proto_grpc//python:defs.bzl", "python_grpc_library")
+load("@rules_rust//cargo:cargo_build_script.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "proto",
+    srcs = glob([
+        "proto/*.proto",
+    ]),
+    deps = [
+        "@com_google_protobuf//:empty_proto",
+    ],
+)
+
+python_grpc_library(
+    name = "summa_proto_py",
+    protos = [":proto"],
+)
+
+cargo_build_script(
+    name = "proto_grpc_rust",
+    crate_features = ["grpc"],
+    srcs = ["build.rs"],
+    build_script_env = {
+        "PROTOC": "$(execpath @com_google_protobuf//:protoc)",
+        "PROTOC_NO_VENDOR": "1",
+    },
+    data = [
+        ":proto",
+        "@com_google_protobuf//:protoc",
+        "@com_google_protobuf//:well_known_protos",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crate_index//:prost-build",
+        "@crate_index//:tonic-build",
+    ],
+    edition = "2021",
+)
+
+rust_library(
+    name = "summa_proto",
+    crate_features = ["grpc"],
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2021",
+    deps = [
+        "@crate_index//:derive_builder",
+        "@crate_index//:prost",
+        "@crate_index//:prost-types",
+        "@crate_index//:serde",
+        "@crate_index//:tantivy",
+        "@crate_index//:thiserror",
+        "@crate_index//:tonic",
+    ],
+    version = "0.9.0",
+)

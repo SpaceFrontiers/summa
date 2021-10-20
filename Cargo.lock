@@ -1336,9 +1336,9 @@ dependencies = [
 
 [[package]]
 name = "path-absolutize"
-version = "3.0.13"
+version = "3.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3de4b40bd9736640f14c438304c09538159802388febb02c8abaae0846c1f13"
+checksum = "0f1d4993b16f7325d90c18c3c6a3327db7808752db8d208cea0acee0abd52c52"
 dependencies = [
  "path-dedot",
 ]
@@ -1961,6 +1961,8 @@ checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
 [[package]]
 name = "summa-core"
 version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6af8a28e7b73c2fd911b6e47b389e83ddfadbc1d06c0103f434dfe2307e7509a"
 dependencies = [
  "async-trait",
  "base64",
@@ -1970,12 +1972,11 @@ dependencies = [
  "instant",
  "lazy_static",
  "lru 0.8.1",
- "opentelemetry",
  "rand 0.8.5",
  "serde",
  "serde_cbor",
  "serde_json",
- "summa-proto",
+ "summa-proto 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "summavy",
  "thiserror",
  "time",
@@ -1984,7 +1985,9 @@ dependencies = [
 
 [[package]]
 name = "summa-proto"
-version = "0.9.0"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "019279131c19261c636eaa2e23cb4b0acec816d1473692a3f5fa3a04edd4db8e"
 dependencies = [
  "prost",
  "prost-build",
@@ -2032,8 +2035,8 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "signal-hook",
- "summa-core",
- "summa-proto",
+ "summa-core 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "summa-proto 0.9.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "summavy",
  "take_mut",
  "tantivy-fst 0.3.0",
@@ -2072,8 +2075,8 @@ dependencies = [
  "serde_json",
  "spmc",
  "strfmt",
- "summa-core",
- "summa-proto",
+ "summa-core 0.9.0",
+ "summa-proto 0.9.1",
  "summavy",
  "thiserror",
  "wasm-bindgen",
