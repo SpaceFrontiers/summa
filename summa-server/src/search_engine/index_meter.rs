@@ -1,38 +1,38 @@
-use crate::search_engine::IndexHolder;
-use opentelemetry::metrics::{Unit, ValueRecorder};
-use opentelemetry::{global, KeyValue};
+use opentelemetry::metrics::{Histogram, Unit};
+use opentelemetry::{global, Context, KeyValue};
 use std::collections::HashMap;
 use std::iter;
+use summa_core::components::IndexHolder;
 
 #[derive(Clone)]
 pub struct IndexMeter {
-    documents_count: ValueRecorder<u64>,
-    deleted_documents_count: ValueRecorder<u64>,
-    deleted_memory_usage: ValueRecorder<u64>,
-    store_memory_usage: ValueRecorder<u64>,
-    fields_memory_usage: ValueRecorder<u64>,
+    documents_count: Histogram<u64>,
+    deleted_documents_count: Histogram<u64>,
+    deleted_memory_usage: Histogram<u64>,
+    store_memory_usage: Histogram<u64>,
+    fields_memory_usage: Histogram<u64>,
 }
 impl IndexMeter {
     pub fn new() -> IndexMeter {
         let meter = global::meter("summa");
         IndexMeter {
-            documents_count: meter.u64_value_recorder("documents_count").with_description("Documents count").init(),
+            documents_count: meter.u64_histogram("documents_count").with_description("Documents count").init(),
             deleted_documents_count: meter
-                .u64_value_recorder("deleted_documents_count")
+                .u64_histogram("deleted_documents_count")
                 .with_description("Deleted documents count")
                 .init(),
             deleted_memory_usage: meter
-                .u64_value_recorder("deleted_memory_usage")
+                .u64_histogram("deleted_memory_usage")
                 .with_description("Deleted documents memory usage in bytes")
                 .with_unit(Unit::new("bytes"))
                 .init(),
             store_memory_usage: meter
-                .u64_value_recorder("store_memory_usage")
+                .u64_histogram("store_memory_usage")
                 .with_description("Store memory usage in bytes")
                 .with_unit(Unit::new("bytes"))
                 .init(),
             fields_memory_usage: meter
-                .u64_value_recorder("fields_memory_usage")
+                .u64_histogram("fields_memory_usage")
                 .with_description("Memory usage per fields in bytes")
                 .with_unit(Unit::new("bytes"))
                 .init(),
@@ -44,6 +44,7 @@ impl IndexMeter {
         let searcher = index_holder.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
         let mut per_fields = HashMap::new();
+        let context = Context::current();
         for segment_reader in segment_readers {
             let segment_id = segment_reader.segment_id().uuid_string();
             let segment_space_usage = segment_reader.space_usage().unwrap();
@@ -61,17 +62,19 @@ impl IndexMeter {
                 KeyValue::new("index_name", index_holder.index_name().to_string()),
                 KeyValue::new("segment_id", segment_id.to_string()),
             ];
-            self.documents_count.record(segment_reader.num_docs() as u64, segment_keys);
-            self.deleted_documents_count.record(segment_reader.num_deleted_docs() as u64, segment_keys);
-            self.deleted_memory_usage.record(segment_space_usage.deletes() as u64, segment_keys);
-            self.store_memory_usage.record(segment_space_usage.store().total() as u64, segment_keys);
+            self.documents_count.record(&context, segment_reader.num_docs() as u64, segment_keys);
+            self.deleted_documents_count
+                .record(&context, segment_reader.num_deleted_docs() as u64, segment_keys);
+            self.deleted_memory_usage.record(&context, segment_space_usage.deletes() as u64, segment_keys);
+            self.store_memory_usage
+                .record(&context, segment_space_usage.store().total() as u64, segment_keys);
         }
         for (field_name, memory_usage) in &per_fields {
             let field_keys = &[
                 KeyValue::new("index_name", index_holder.index_name().to_string()),
                 KeyValue::new("field_name", field_name.to_string()),
             ];
-            self.fields_memory_usage.record(*memory_usage, field_keys);
+            self.fields_memory_usage.record(&context, *memory_usage, field_keys);
         }
     }
 }

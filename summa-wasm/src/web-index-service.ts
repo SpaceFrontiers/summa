@@ -1,48 +1,36 @@
 import * as Comlink from "comlink";
-import init, { cache_metrics, init_thread_pool, WebIndexInner } from "./";
-import { WebIndexCoordinate } from "./web-index";
+import init, { cache_metrics, init_thread_pool, WebIndexRegistry } from "./";
+
+export type IndexPayload = {
+  name: String;
+  description: String;
+  unixtime: Number;
+};
 
 const web_index_service = {
-  registry: new Map<String, WebIndexInner>(),
-  async setup(status_callback: any, threads: number) {
+  async setup(threads: number, status_callback: any) {
     this.status_callback = status_callback;
     this.status_callback("status", "setting workers...");
     await init();
-    this.status_callback("status", "setting thread pool...");
+    this.registry = new WebIndexRegistry();
+    this.status_callback("status", "setting thread pool of size " + threads.toString() + "...");
     await init_thread_pool(threads);
   },
-  async add_index(coordinate: WebIndexCoordinate) {
-    const web_index = new WebIndexInner(
-      coordinate.method,
-      coordinate.url_template,
-      coordinate.headers_template,
-      coordinate.files,
-      this.status_callback,
-    );
-    if (this.registry.has(web_index.name)) {
-      this.registry.get(web_index.name)!.free();
+  async add(network_config: any) {
+    network_config.caching_config = {
+      cache_size: 32 * 1024 * 1024,
+      chunk_size: 2 ** 16
     }
-    this.registry.set(web_index.name, web_index);
-    return this.metadata(web_index.name);
+    return await this.registry.add(network_config)
   },
-  async search(name: String, query: Object, collectors: Object[]) {
-    return await this.registry.get(name)!.search(name, query, collectors);
+  async delete(index_name: String) {
+    return await this.registry.delete(index_name)
   },
-  async free(name: String) {
-    this.registry(name)!.free();
-    this.registry.delete(name);
+  async search(index_names: String[], query: any, collectors: any) {
+    return await this.registry.search(index_names, query, collectors)
   },
-  async warmup(name: String) {
-    this.status_callback(`warming up ${name}...`);
-    await this.registry.get(name)!.warmup();
-  },
-  async metadata(name: String) {
-    const web_index = this.registry.get(name)!;
-    return {
-      name: web_index.name,
-      description: web_index.description,
-      unixtime: web_index.unixtime
-    }
+  async get_index_payload(index_name: String): IndexPayload {
+    return await this.registry.get_index_payload(index_name)
   },
   async cache_metrics() {
     return await cache_metrics()

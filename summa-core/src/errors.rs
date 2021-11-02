@@ -1,5 +1,3 @@
-use crate::summa_document::DocumentParsingError;
-use derive_builder::UninitializedFieldError;
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
 use tantivy::schema::FieldType;
@@ -8,42 +6,34 @@ use tantivy::schema::FieldType;
 pub enum ValidationError {
     #[error("builder_error: {0}")]
     BuilderError(String),
-    #[error("index_argument_error: {0}")]
-    InvalidArgument(String),
+    #[error("empty_argument_error: {0}")]
+    EmptyArgument(String),
+    #[error("existing_consumer_error: {0}")]
+    ExistingConsumer(String),
     #[error("invalid_fast_field_type_error: ({field:?}, {field_type:?}, {tantivy_error:?})")]
     InvalidFastFieldType {
         field: String,
         field_type: FieldType,
         tantivy_error: tantivy::TantivyError,
     },
-    #[error("invalid_memory_error: {0}")]
-    InvalidMemory(u64),
+    #[error("invalid_http_method: {0}")]
+    InvalidHttpMethod(String),
     #[error("invalid_primary_key_type_error: {0:?}")]
     InvalidPrimaryKeyType(FieldType),
-    #[error("invalid_schema_error: {0}")]
-    InvalidSchema(String),
-    #[error("invalid_threads_number_error: {0}")]
-    InvalidThreadsNumber(u64),
+    #[error("existing_path_error: {0}")]
+    ExistingPath(PathBuf),
     #[error("missing_consumer_error: {0}")]
     MissingConsumer(String),
     #[error("missing_index_error: {0}")]
     MissingIndex(String),
-    #[error("missing_default_field_error: {0}")]
-    MissingDefaultField(String),
     #[error("missing_field_error: {0}")]
     MissingField(String),
-    #[error("missing_multi_field_error: {0}")]
-    MissingMultiField(String),
     #[error("missing_path_error: {0}")]
     MissingPath(PathBuf),
     #[error("missing_primary_key_error: {0:?}")]
     MissingPrimaryKey(Option<String>),
     #[error("missing_range")]
     MissingRange,
-    #[error("missing_schema: {0}")]
-    MissingSchema(String),
-    #[error("missing_snippet_field: {0}")]
-    MissingSnippetField(String),
     #[error("required_fast_field: {0}")]
     RequiredFastField(String),
     #[error("utf8_error: {0}")]
@@ -54,14 +44,16 @@ pub enum ValidationError {
 pub enum Error {
     #[error("addr_parse_error: {0}")]
     AddrParse(std::net::AddrParseError),
-    #[error("arc_index_writer_holder_leaked_error")]
-    ArcIndexWriterHolderLeaked,
-    #[error("canceled_error")]
-    Canceled,
+    #[error("index_error: {0}")]
+    AsyncIo(tantivy::error::AsyncIoError),
+    #[error("config_error: {0}")]
+    Config(config::ConfigError),
     #[error("document_parsing_error: {0}")]
-    DocumentParsing(DocumentParsingError),
+    DocumentParsing(crate::components::DocumentParsingError),
     #[error("empty_query_error")]
     EmptyQuery,
+    #[error("external: {0}")]
+    External(String),
     #[error("fast_eval_error: {0:?}")]
     FastEval(fasteval2::Error),
     #[error("infallible")]
@@ -78,20 +70,19 @@ pub enum Error {
     IO((std::io::Error, Option<PathBuf>)),
     #[error("json_error: {0}")]
     Json(serde_json::Error),
+    #[cfg(feature = "index-updater")]
+    #[error("{0}")]
+    Kafka(rdkafka::error::KafkaError),
+    #[error("open_directory_error: {0}")]
+    OpenDirectory(tantivy::directory::error::OpenDirectoryError),
     #[error("tantivy_error: {0}")]
     Tantivy(tantivy::TantivyError),
     #[error("proto")]
     Proto(summa_proto::errors::Error),
-    #[error("timeout_error")]
-    Timeout,
-    #[error("transition_state_error")]
-    TransitionState,
     #[error("unbound_document_error")]
     UnboundDocument,
     #[error("unknown_directory_error: {0}")]
     UnknownDirectory(String),
-    #[error("utf8_error: {0}")]
-    Utf8(std::str::Utf8Error),
     #[error("{0}")]
     Validation(ValidationError),
 }
@@ -102,14 +93,14 @@ impl From<ValidationError> for Error {
     }
 }
 
-impl From<UninitializedFieldError> for ValidationError {
-    fn from(ufe: UninitializedFieldError) -> ValidationError {
+impl From<derive_builder::UninitializedFieldError> for ValidationError {
+    fn from(ufe: derive_builder::UninitializedFieldError) -> ValidationError {
         ValidationError::BuilderError(ufe.to_string())
     }
 }
 
-impl From<DocumentParsingError> for Error {
-    fn from(error: DocumentParsingError) -> Self {
+impl From<crate::components::DocumentParsingError> for Error {
+    fn from(error: crate::components::DocumentParsingError) -> Self {
         Error::DocumentParsing(error)
     }
 }
@@ -117,6 +108,18 @@ impl From<DocumentParsingError> for Error {
 impl From<serde_json::Error> for Error {
     fn from(error: serde_json::Error) -> Self {
         Error::Json(error)
+    }
+}
+
+impl From<tokio::task::JoinError> for Error {
+    fn from(_error: tokio::task::JoinError) -> Self {
+        Error::Internal
+    }
+}
+
+impl From<config::ConfigError> for Error {
+    fn from(error: config::ConfigError) -> Self {
+        Error::Config(error)
     }
 }
 
@@ -135,12 +138,6 @@ impl From<std::net::AddrParseError> for Error {
 impl From<std::str::Utf8Error> for ValidationError {
     fn from(error: std::str::Utf8Error) -> Self {
         ValidationError::Utf8(error)
-    }
-}
-
-impl From<std::str::Utf8Error> for Error {
-    fn from(error: std::str::Utf8Error) -> Self {
-        Error::Utf8(error)
     }
 }
 
@@ -165,6 +162,37 @@ impl From<fasteval2::Error> for Error {
 impl From<Infallible> for Error {
     fn from(_: Infallible) -> Self {
         Error::Infallible
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(error: Error) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, error)
+    }
+}
+
+impl From<Error> for tantivy::error::AsyncIoError {
+    fn from(error: Error) -> Self {
+        tantivy::error::AsyncIoError::Io(error.into())
+    }
+}
+
+impl From<tantivy::error::AsyncIoError> for Error {
+    fn from(error: tantivy::error::AsyncIoError) -> Self {
+        Error::AsyncIo(error)
+    }
+}
+
+impl From<tantivy::directory::error::OpenDirectoryError> for Error {
+    fn from(error: tantivy::directory::error::OpenDirectoryError) -> Self {
+        Error::OpenDirectory(error)
+    }
+}
+
+#[cfg(feature = "index-updater")]
+impl From<rdkafka::error::KafkaError> for Error {
+    fn from(error: rdkafka::error::KafkaError) -> Self {
+        Error::Kafka(error)
     }
 }
 

@@ -2,13 +2,19 @@
 extern crate async_trait;
 
 mod errors;
-mod network_directory;
+mod js_requests;
 mod rayon_helper;
-mod requests;
-mod web_index_inner;
+mod web_index_registry;
 
+use once_cell::sync::Lazy;
+use serde::Serialize;
+use serde_wasm_bindgen::Serializer;
+use summa_core::components::CACHE_METRICS;
 use wasm_bindgen::prelude::*;
 
-fn report_to_callback(callback: &js_sys::Function, type_: &str, message: &str) -> Result<JsValue, JsValue> {
-    callback.call2(&JsValue::null(), &type_.into(), &message.into())
+pub static SERIALIZER: Lazy<Serializer> = Lazy::new(|| Serializer::new().serialize_maps_as_objects(true));
+
+#[wasm_bindgen]
+pub async fn cache_metrics() -> Result<JsValue, JsValue> {
+    Ok(CACHE_METRICS.serialize(&*SERIALIZER)?)
 }

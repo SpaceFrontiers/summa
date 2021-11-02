@@ -36,7 +36,8 @@ impl proto::search_api_server::SearchApi for SearchApiImpl {
         let collector_outputs = index_holder
             .search(&proto_request.index_alias, &query, proto_request.collectors)
             .instrument(info_span!("search", tags = ?proto_request.tags))
-            .await?;
+            .await
+            .map_err(crate::errors::Error::from)?;
         let elapsed_secs = now.elapsed().as_secs_f64();
         Ok(Response::new(proto::SearchResponse {
             index_name: index_holder.index_name().to_owned(),

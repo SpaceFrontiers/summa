@@ -18,7 +18,6 @@ message CreateConsumerRequest {
   string index_alias = 3;
   string consumer_name = 4;
   repeated string topics = 5;
-  uint32 threads = 6;
 }
 message CreateConsumerResponse {
   Consumer consumer = 1;

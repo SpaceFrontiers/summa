@@ -1,6 +1,4 @@
-use crate::configs::IpfsConfig;
 use crate::errors::{Error, SummaServerResult};
-use crate::search_engine::IndexFilePath;
 use hyper::body::HttpBody;
 use hyper::client::HttpConnector;
 use hyper::header::HeaderName;
@@ -16,6 +14,8 @@ use std::fmt::{Debug, Formatter};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use summa_core::components::IndexFilePath;
+use summa_core::configs::IpfsConfig;
 use tokio::fs::File;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::info;
@@ -117,16 +117,17 @@ impl IpfsClient {
             .build()?)
     }
 
-    pub async fn parse_response<B>(&self, response: Response<B>) -> SummaServerResult<String>
+    pub async fn parse_response<B, E>(&self, response: Response<B>) -> SummaServerResult<String>
     where
-        B: HttpBody + Send + 'static,
+        B: HttpBody<Error = E> + Send + 'static,
+        E: Debug,
     {
         let status = response.status();
         let body = response.into_body();
         let text = String::from_utf8(
             body::to_bytes(body)
                 .await
-                .map_err(|e| Error::UpstreamHttpStatus(status, "".to_string()))?
+                .map_err(|e| Error::UpstreamHttpStatus(status, format!("{:?}", e)))?
                 .to_vec(),
         )
         .map_err(|e| Error::Utf8(e.utf8_error()))?;
@@ -189,13 +190,20 @@ impl IpfsClient {
             .collect::<Vec<_>>())
     }
 
-    pub async fn mkdir<P1: AsRef<Path> + Debug>(&self, directory: P1) -> SummaServerResult<AddedFile> {
-        let response = self.request(self.generate_uri("/api/v0/files/mkdir", &[
-            ("arg", directory),
-            ("parent", "true")
-        ])?).await?;
-        let text = self.parse_response(response).await?;
-        Ok(serde_json::from_str(&text).unwrap())
+    pub async fn files_mkdir<P1: AsRef<Path> + Debug>(&self, directory: P1) -> SummaServerResult<()> {
+        let response = self
+            .request(self.generate_uri("/api/v0/files/mkdir", &[("arg", &directory.as_ref().to_string_lossy()), ("parent", "true")])?)
+            .await?;
+        self.parse_response(response).await?;
+        Ok(())
+    }
+
+    pub async fn files_cp<P1: AsRef<Path> + Debug>(&self, directory: P1) -> SummaServerResult<()> {
+        let response = self
+            .request(self.generate_uri("/api/v0/files/cp", &[("arg", &directory.as_ref().to_string_lossy()), ("parent", "true")])?)
+            .await?;
+        self.parse_response(response).await?;
+        Ok(())
     }
 
     pub async fn add<P1: AsRef<Path> + Debug>(&self, directory: P1, index_file_paths: &[IndexFilePath], no_copy: bool) -> SummaServerResult<Vec<AddedFile>> {
@@ -239,7 +247,7 @@ impl IpfsClient {
         }
 
         let request = form
-            .set_body_convert::<hyper::Body, multipart::Body>(Request::builder().method(Method::POST).uri(uri.clone()))
+            .set_body_convert::<Body, multipart::Body>(Request::builder().method(Method::POST).uri(uri.clone()))
             .unwrap();
 
         let response = self.http_connector.request(request).await?;

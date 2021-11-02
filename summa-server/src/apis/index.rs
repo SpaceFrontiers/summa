@@ -2,15 +2,14 @@
 //!
 //! Index GRPC API is using for managing indices
 
-use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaServerResult;
-use crate::search_engine::IndexHolder;
 use crate::services::IndexService;
 use std::error::Error;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::time::Instant;
-use summa_core::SummaDocument;
+use summa_core::components::{IndexHolder, SummaDocument};
+use summa_core::configs::{ApplicationConfigHolder, Persistable};
 use summa_proto::proto;
 use tantivy::SegmentId;
 use tokio_stream::StreamExt;
@@ -36,11 +35,12 @@ impl IndexApiImpl {
 async fn cast(index_holder: &IndexHolder) -> proto::Index {
     let index_config_proxy = index_holder.index_config_proxy().read().await;
     proto::Index {
-        index_aliases: index_config_proxy.application_config().get_index_aliases_for_index(index_holder.index_name()),
+        //ToDo
+        index_aliases: vec![],
         index_name: index_holder.index_name().to_owned(),
-        index_engine: format!("{:?}", index_config_proxy.index_engine),
+        index_engine: format!("{:?}", index_config_proxy.get().index_engine),
         num_docs: index_holder.index_reader().searcher().num_docs(),
-        compression: index_holder.compression().await as i32,
+        compression: index_holder.compression() as i32,
     }
 }
 
@@ -82,13 +82,12 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn commit_index(&self, request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let request = request.into_inner();
         let index_holder = self.index_service.get_index_holder(&request.index_alias).await?;
-        let index_updater = index_holder.index_updater();
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
                 tokio::spawn(async move {
-                    match index_updater.try_write() {
+                    match index_holder.index_updater().try_write() {
                         Err(_) => warn!(action = "busy"),
-                        Ok(mut index_updater) => match index_updater.commit().await {
+                        Ok(index_updater) => match index_updater.commit(None).await {
                             Ok(_) => (),
                             Err(error) => warn!(error = ?error),
                         },
@@ -99,11 +98,11 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                     elapsed_secs: None,
                 }))
             }
-            Some(proto::CommitMode::Sync) => match index_updater.try_write() {
+            Some(proto::CommitMode::Sync) => match index_holder.index_updater().try_write() {
                 Err(_) => Err(Status::failed_precondition("busy")),
-                Ok(mut index_updater) => {
+                Ok(index_updater) => {
                     let now = Instant::now();
-                    let opstamp = index_updater.commit().await?;
+                    let opstamp = index_updater.commit(None).await.map_err(crate::errors::Error::from)?;
                     Ok(Response::new(proto::CommitIndexResponse {
                         opstamp: Some(opstamp),
                         elapsed_secs: Some(now.elapsed().as_secs_f64()),
@@ -130,7 +129,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .index_updater()
             .read()
             .await
-            .delete_document(request.primary_key)?;
+            .delete_document(request.primary_key)
+            .await
+            .map_err(crate::errors::Error::from)?;
         let response = proto::DeleteDocumentResponse { opstamp: Some(opstamp) };
         Ok(Response::new(response))
     }
@@ -144,7 +145,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .index_updater()
             .read()
             .await
-            .index_document(SummaDocument::UnboundJsonBytes(&request.document))?;
+            .index_document(SummaDocument::UnboundJsonBytes(&request.document))
+            .await
+            .map_err(crate::errors::Error::from)?;
         let response = proto::IndexDocumentResponse { opstamp };
         Ok(Response::new(response))
     }
@@ -167,7 +170,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                         .index_updater()
                         .read()
                         .await
-                        .index_bulk(&chunk.documents);
+                        .index_bulk(&chunk.documents)
+                        .await;
                     elapsed_secs += now.elapsed().as_secs_f64();
                     success_docs += success_bulk_docs;
                     failed_docs += failed_bulk_docs;
@@ -222,9 +226,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             let segment_ids: Vec<_> = proto_request.segment_ids.iter().map(|x| SegmentId::from_uuid_string(x).unwrap()).collect();
             index_holder
                 .index_updater()
-                .write()
+                .read()
                 .await
-                .merge(&segment_ids)
+                .merge_index(&segment_ids, None)
                 .instrument(info_span!("merge", index_name = ?index_name))
                 .await
                 .unwrap()
@@ -235,12 +239,11 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn set_index_alias(&self, proto_request: Request<proto::SetIndexAliasRequest>) -> Result<Response<proto::SetIndexAliasResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let old_index_name = self
-            .application_config
-            .write()
-            .await
-            .autosave()
-            .set_index_alias(&proto_request.index_alias, &proto_request.index_name)?;
+        let mut application_config = self.application_config.write().await;
+        let old_index_name = application_config
+            .set_index_alias(&proto_request.index_alias, &proto_request.index_name)
+            .map_err(crate::errors::Error::from)?;
+        application_config.save().map_err(crate::errors::Error::from)?;
         let response = proto::SetIndexAliasResponse { old_index_name };
         Ok(Response::new(response))
     }
@@ -252,9 +255,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             let index_name = index_holder.index_name();
             index_holder
                 .index_updater()
-                .write()
+                .read()
                 .await
-                .vacuum()
+                .vacuum_index(None, None)
                 .instrument(info_span!("vacuum", index_name = ?index_name))
                 .await
                 .unwrap();

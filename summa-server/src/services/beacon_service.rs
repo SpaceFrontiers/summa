@@ -1,9 +1,9 @@
-use crate::configs::{IndexEngine, IpfsConfig};
 use crate::errors::SummaServerResult;
 use crate::ipfs_client::IpfsClient;
-use crate::search_engine::{IndexFilePath, IndexHolder};
-use crate::utils::sync::Handler;
 use std::fmt::Debug;
+use std::sync::Arc;
+use summa_core::components::{IndexFilePath, IndexHolder};
+use summa_core::configs::{IndexEngine, IpfsConfig};
 use tracing::instrument;
 
 #[derive(Clone, Debug, Default)]
@@ -18,10 +18,10 @@ impl BeaconService {
     }
 
     #[instrument(skip_all, fields(index_name = ?index_holder.index_name()))]
-    pub async fn publish_index(&self, index_holder: Handler<IndexHolder>, payload: Option<String>, copy: bool) -> SummaServerResult<crate::ipfs_client::Key> {
+    pub async fn publish_index(&self, index_holder: Arc<IndexHolder>, payload: Option<String>, copy: bool) -> SummaServerResult<String> {
         let no_copy = !copy;
         let index_path = {
-            match &index_holder.index_config_proxy().read().await.index_engine {
+            match &index_holder.index_config_proxy().read().await.get().index_engine {
                 IndexEngine::File(index_path) => index_path.to_path_buf(),
                 _ => unreachable!(),
             }
@@ -33,60 +33,25 @@ impl BeaconService {
             index_updater
                 .prepare_index_publishing(index_path.clone(), payload, |files: Vec<IndexFilePath>| async move {
                     let mutable_files = files.iter().filter_map(|file| (!file.is_immutable()).then(|| file.clone())).collect::<Vec<_>>();
-                    self.ipfs_client.add(&index_path, &mutable_files, false).await?;
-                    let added_files = self.ipfs_client.add(&index_path, &files, no_copy).await?;
+                    self.ipfs_client.add(&index_path, &mutable_files, false).await.unwrap();
+                    let added_files = self.ipfs_client.add(&index_path, &files, no_copy).await.unwrap();
                     let new_root = added_files.into_iter().find(|added_file| added_file.name == index_name).unwrap();
-                    let old_key = self.ipfs_client.key_list().await?.keys.into_iter().find(|key| key.name == index_name);
+                    let old_key = self.ipfs_client.key_list().await.unwrap().keys.into_iter().find(|key| key.name == index_name);
                     let key = match old_key {
-                        None => self.ipfs_client.key_gen(&index_name).await?,
+                        None => self.ipfs_client.key_gen(&index_name).await.unwrap(),
                         Some(old_key) => {
-                            let resolved = self.ipfs_client.name_resolve(&old_key.id).await?;
-                            self.ipfs_client.pin_rm(&resolved.path).await?;
-                            self.ipfs_client.repo_gc().await?;
+                            let resolved = self.ipfs_client.name_resolve(&old_key.id).await.unwrap();
+                            self.ipfs_client.pin_rm(&resolved.path).await.unwrap();
+                            self.ipfs_client.repo_gc().await.unwrap();
                             old_key
                         }
                     };
-                    self.ipfs_client.name_publish(&new_root.hash, &index_name).await?;
-                    Ok(key)
+                    self.ipfs_client.name_publish(&new_root.hash, &index_name).await.unwrap();
+                    // ToDo: Ok(key)
+                    Ok(key.id)
                 })
                 .await?
         };
         Ok(key)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use tokio::fs::File;
-    use tokio::io::AsyncWriteExt;
-
-    #[tokio::test]
-    async fn test_base() {
-        let beacon_service = BeaconService::new(IpfsConfig::default());
-
-        let test_directory = tempdir::TempDir::new("test_base").unwrap();
-
-        let test_file_name = "test_file.txt";
-        let full_test_file_path = test_directory.path().join(test_file_name);
-        File::create(full_test_file_path).await.unwrap().write_all(b"Hello, world!").await.unwrap();
-
-        let meta_file_name = "meta.json";
-        let full_meta_file_path = test_directory.path().join(meta_file_name);
-        File::create(full_meta_file_path).await.unwrap().write_all(b"{}").await.unwrap();
-
-        beacon_service
-            .add(
-                test_directory.into_path(),
-                &[
-                    IndexFilePath::new(PathBuf::from(test_file_name), true),
-                    IndexFilePath::new(PathBuf::from(meta_file_name), false),
-                ],
-                false,
-            )
-            .await
-            .unwrap();
-        panic!();
     }
 }

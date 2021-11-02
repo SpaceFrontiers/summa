@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(feature = "test-utils")]
 pub mod shortcuts {
     use crate::proto;
 

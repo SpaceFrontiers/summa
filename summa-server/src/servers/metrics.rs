@@ -1,26 +1,27 @@
 //! HTTP server exposing metrics in Prometheus format
 
 use super::base::BaseServer;
-use crate::configs::ApplicationConfigHolder;
 use crate::errors::SummaServerResult;
 use crate::search_engine::IndexMeter;
 use crate::services::IndexService;
-use crate::utils::thread_handler::ControlMessage;
 use async_broadcast::Receiver;
 use hyper::{
     header::{HeaderValue, CONTENT_TYPE},
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
-use opentelemetry::metrics::{Descriptor, InstrumentKind};
-use opentelemetry::sdk::export::metrics::{Aggregator, AggregatorSelector};
-use opentelemetry::sdk::metrics::aggregators;
+use opentelemetry::sdk::export::metrics::{aggregation, AggregatorSelector};
+use opentelemetry::sdk::metrics::aggregators::Aggregator;
+use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
+use opentelemetry::sdk::metrics::{aggregators, controllers, processors};
 use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
+use summa_core::configs::ApplicationConfigHolder;
+use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument};
 
 lazy_static! {
@@ -50,10 +51,9 @@ impl AggregatorSelector for CustomAgg {
             InstrumentKind::Counter => Some(Arc::new(aggregators::sum())),
             _ => match descriptor.unit() {
                 Some("bytes") => Some(Arc::new(aggregators::last_value())),
-                Some("seconds") => Some(Arc::new(aggregators::histogram(
-                    descriptor,
-                    &[0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
-                ))),
+                Some("seconds") => Some(Arc::new(aggregators::histogram(&[
+                    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
+                ]))),
                 _ => Some(Arc::new(aggregators::last_value())),
             },
         }
@@ -62,7 +62,8 @@ impl AggregatorSelector for CustomAgg {
 
 impl MetricsServer {
     pub fn new(application_config: &ApplicationConfigHolder) -> SummaServerResult<MetricsServer> {
-        let exporter = opentelemetry_prometheus::exporter().with_aggregator_selector(CustomAgg).init();
+        let controller = controllers::basic(processors::factory(CustomAgg, aggregation::cumulative_temporality_selector()).with_memory(true)).build();
+        let exporter = opentelemetry_prometheus::exporter(controller).init();
         Ok(MetricsServer {
             application_config: application_config.clone(),
             exporter,

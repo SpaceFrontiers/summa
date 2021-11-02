@@ -69,18 +69,14 @@ function process_request_headers(request) {
     request: new Request(request.url, {
       method: request.method,
       headers: new_headers,
-      cache: "no-store",
+      cache: summa_cache_is_enabled ? "no-cache" : "default",
     }),
   };
 }
 
 async function handle_request(original_request) {
-  const {
-    summa_cache_is_enabled,
-    range_start,
-    range_end,
-    request,
-  } = process_request_headers(original_request);
+  const { summa_cache_is_enabled, range_start, range_end, request } =
+    process_request_headers(original_request);
   const cache_key = `cache:${new URL(request.url).pathname}`;
   if (summa_cache_is_enabled) {
     const response_body = await fill_from_cache(
@@ -95,7 +91,7 @@ async function handle_request(original_request) {
       });
     }
   }
-  const real_response = await fetch(request);
+  let real_response = await fetch(request);
   const real_response_body = await real_response.arrayBuffer();
   if (summa_cache_is_enabled) {
     fill_cache(
@@ -106,10 +102,14 @@ async function handle_request(original_request) {
       range_end
     ).catch((e) => console.error("Filling cache failed", e));
   }
+  const new_headers = set_same_origin_headers(
+    new Headers(real_response.headers)
+  );
+  new_headers.set("Cache-Control", "max-age=3600");
   return new Response(real_response_body, {
     status: real_response.status,
     statusText: real_response.statusText,
-    headers: set_same_origin_headers(new Headers(real_response.headers)),
+    headers: new_headers,
   });
 }
 

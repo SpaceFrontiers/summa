@@ -1,15 +1,15 @@
-use crate::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder};
 use crate::errors::SummaServerResult;
 use crate::logging;
 use crate::servers::{GrpcServer, MetricsServer};
 use crate::services::{BeaconService, IndexService};
-use crate::utils::signal_channel::signal_channel;
-use crate::utils::thread_handler::ControlMessage;
+use crate::utils::signal_channel;
 use async_broadcast::Receiver;
 use clap::{arg, command};
 use futures::try_join;
 use std::future::Future;
-use std::path::Path;
+use std::path::PathBuf;
+use summa_core::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder};
+use summa_core::utils::thread_handler::ControlMessage;
 
 pub struct Application {
     config: ApplicationConfigHolder,
@@ -44,52 +44,41 @@ impl Application {
             .subcommand(
                 command!("generate-config")
                     .about("Generate default config file")
-                    .arg(
-                        arg!(-d <DATA_PATH> "Path for storing configs and data")
-                            .default_value("data")
-                            .required(false)
-                            .takes_value(true),
-                    )
-                    .arg(
-                        arg!(-g <GRPC_ENDPOINT> "GRPC listen endpoint")
-                            .default_value("127.0.0.1:8082")
-                            .required(false)
-                            .takes_value(true),
-                    )
+                    .arg(arg!(-d <DATA_PATH> "Path for storing configs and data").default_value("data").num_args(1))
+                    .arg(arg!(-g <GRPC_ENDPOINT> "GRPC listen endpoint").default_value("127.0.0.1:8082").num_args(1))
                     .arg(
                         arg!(-m <METRICS_ENDPOINT> "Metrics listen endpoint")
                             .default_value("127.0.0.1:8084")
-                            .required(false)
-                            .takes_value(true),
+                            .num_args(1),
                     )
-                    .arg(arg!(-i <IPFS_API_ENDPOINT> "IPFS API endpoint").required(false).takes_value(true)),
+                    .arg(arg!(-i <IPFS_API_ENDPOINT> "IPFS API endpoint").num_args(0..=1)),
             )
             .subcommand(
                 command!("serve")
                     .about("Launch search server")
-                    .arg(arg!(<CONFIG> "Search engine config file").required(true).takes_value(true)),
+                    .arg(arg!(<CONFIG> "Search engine config file").num_args(1)),
             )
             .get_matches();
 
         match matches.subcommand() {
             Some(("generate-config", submatches)) => {
-                let data_path = Path::new(submatches.value_of("DATA_PATH").unwrap());
-                let grpc_endpoint = submatches.value_of("GRPC_ENDPOINT").unwrap();
-                let metrics_endpoint = submatches.value_of("METRICS_ENDPOINT").unwrap();
-                let ipfs_api_endpoint = submatches.value_of("IPFS_API_ENDPOINT");
+                let data_path = submatches.get_one::<PathBuf>("DATA_PATH").unwrap();
+                let grpc_endpoint = submatches.get_one::<String>("GRPC_ENDPOINT").unwrap();
+                let metrics_endpoint = submatches.get_one::<String>("METRICS_ENDPOINT").unwrap();
+                let ipfs_api_endpoint = submatches.get_one::<String>("IPFS_API_ENDPOINT");
                 let default_config = ApplicationConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
-                    .grpc(GrpcConfigBuilder::default().endpoint(grpc_endpoint.to_owned()).build().unwrap())
-                    .metrics(MetricsConfigBuilder::default().endpoint(metrics_endpoint.to_owned()).build().unwrap())
-                    .ipfs(ipfs_api_endpoint.map(|ipfs_api_endpoint| IpfsConfigBuilder::default().api_endpoint(ipfs_api_endpoint.to_owned()).build().unwrap()))
+                    .grpc(GrpcConfigBuilder::default().endpoint(grpc_endpoint.to_string()).build().unwrap())
+                    .metrics(MetricsConfigBuilder::default().endpoint(metrics_endpoint.to_string()).build().unwrap())
+                    .ipfs(ipfs_api_endpoint.map(|ipfs_api_endpoint| IpfsConfigBuilder::default().api_endpoint(ipfs_api_endpoint.to_string()).build().unwrap()))
                     .build()
                     .unwrap();
                 println!("{}", serde_yaml::to_string(&default_config).unwrap());
                 Ok(())
             }
             Some(("serve", submatches)) => {
-                let config_path = submatches.value_of("CONFIG").map(Path::new).unwrap();
+                let config_path = submatches.get_one::<PathBuf>("CONFIG").unwrap();
                 let application_config_holder = ApplicationConfigHolder::from_path(config_path)?;
                 let _guards = {
                     let application_config = application_config_holder.read().await;
@@ -130,20 +119,21 @@ impl Application {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::application_config::tests::create_test_application_config;
-    use crate::proto;
-    use crate::proto::index_api_client::IndexApiClient;
-    use crate::search_engine::index_holder::tests::create_test_schema;
-    use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
+    use crate::services::index_service::tests::create_test_schema;
     use async_broadcast::broadcast;
     use std::default::Default;
+    use std::path::Path;
+    use summa_core::configs::application_config::tests::create_test_application_config;
+    use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
+    use summa_proto::proto;
+    use summa_proto::proto::index_api_client::IndexApiClient;
     use tonic::transport::Channel;
 
     async fn create_index_api_client(endpoint: &str) -> IndexApiClient<Channel> {
         IndexApiClient::connect(endpoint.to_owned()).await.unwrap()
     }
 
-    async fn create_client_server(root_path: &Path) -> SummaServerResult<(ThreadHandler, IndexApiClient<Channel>)> {
+    async fn create_client_server(root_path: &Path) -> SummaServerResult<(ThreadHandler<SummaServerResult<()>>, IndexApiClient<Channel>)> {
         let config_holder = ApplicationConfigHolder::from_path_or(root_path.join("summa.yaml"), || create_test_application_config(&root_path.join("data")))?;
         let grpc_endpoint = config_holder.read().await.grpc.endpoint.clone();
         let (server_terminator, receiver) = broadcast::<ControlMessage>(1);
@@ -207,7 +197,7 @@ mod tests {
 
         let (thread_handler_1, mut index_api_client_1) = create_client_server(root_path.path()).await?;
         assert!(create_default_index(&mut index_api_client_1).await.is_ok());
-        thread_handler_1.stop().await?;
+        thread_handler_1.stop().await??;
 
         let (thread_handler_2, mut index_api_client_2) = create_client_server(root_path.path()).await?;
         assert_eq!(
@@ -224,7 +214,7 @@ mod tests {
                 }]
             }
         );
-        thread_handler_2.stop().await?;
+        thread_handler_2.stop().await??;
 
         Ok(())
     }

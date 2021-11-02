@@ -14,9 +14,9 @@
     "index_bg.js",
     "index.d.ts",
     "gate.ts",
+    "network-config.ts",
     "rayon-worker.ts",
     "searcher-worker.ts",
-    "web-index.ts",
     "web-index-service.ts"
   ],
   "module": "index.js",

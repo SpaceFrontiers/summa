@@ -30,9 +30,6 @@ export default defineComponent({
   name: "SearchView",
   components: { SearchList },
   props: {
-    i: {
-      type: String,
-    },
     p: {
       type: Number,
     },
@@ -43,7 +40,7 @@ export default defineComponent({
   data() {
     const web_index_store = useWebIndexStore();
     return {
-      index_name: web_index_store.names.keys().next().value,
+      indices: web_index_store.index_configs.keys(),
       loading: false,
       page: 1,
       query: "" as String,
@@ -61,9 +58,6 @@ export default defineComponent({
     if (route.query.p) {
       this.page = parseInt(route.query.p.toString() || "1");
     }
-    if (route.query.i) {
-      this.index_name = route.query.i.toString();
-    }
     await this.submit(false);
   },
   watch: {
@@ -79,6 +73,7 @@ export default defineComponent({
       async handler(new_q) {
         if (!new_q) {
           this.query = "";
+          this.has_next = false;
           await this.submit(false);
         }
       },
@@ -91,17 +86,22 @@ export default defineComponent({
       }
       if (this.query) {
         this.loading = true;
+        const index_names = Array.from(
+          this.web_index_store.index_configs.entries()
+        )
+          .filter(([index_name, index]) => index.enabled)
+          .map(([index_name, index]) => index_name);
         let collector_outputs = await this.web_index_service.search(
-          this.index_name,
+          index_names,
           { query: { match: { value: this.query } } },
           [
             {
               collector: {
                 top_docs: {
-                  limit: 5,
-                  offset: (this.page - 1) * 5,
-                  snippets: { description: 200, title: 140 },
-                  explain: true,
+                  limit: this.page * 5,
+                  offset: 0,
+                  snippets: { description: 400, title: 140, content: 400 },
+                  explain: false,
                   fields: [],
                 },
               },
@@ -110,7 +110,10 @@ export default defineComponent({
           ]
         );
         this.scored_documents =
-          collector_outputs[0].collector_output.top_docs.scored_documents;
+          collector_outputs[0].collector_output.top_docs.scored_documents.slice(
+            (this.page - 1) * 5,
+            this.page * 5
+          );
         this.total_documents =
           collector_outputs[1].collector_output.count.count;
         this.has_next = collector_outputs[0].collector_output.top_docs.has_next;

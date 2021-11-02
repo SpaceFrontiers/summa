@@ -32,7 +32,6 @@ import IsLoadingView from "@/components/IsLoading.vue";
 import { format_bytes } from "./utils";
 import ConnectivityIssuesView from "./components/ConnectivityIssues.vue";
 import { cache_metrics } from "./plugins/web-index-service";
-import * as localforage from "localforage";
 
 export default defineComponent({
   name: "App",

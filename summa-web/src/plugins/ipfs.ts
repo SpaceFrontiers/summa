@@ -1,8 +1,8 @@
 import axios from "axios";
 import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
 
-function detect_ipfs_url() {
-  let ipfs_url = window.location.hostname;
+function detect_ipfs_url(hostname: String) {
+  let ipfs_url = hostname;
   if (
     process.env.NODE_ENV === "development" ||
     window.location.port === "4173"
@@ -33,7 +33,7 @@ function detect_ipfs_url() {
   }
   return ipfs_url;
 }
-export const ipfs_url = detect_ipfs_url();
+export const ipfs_url = detect_ipfs_url(window.location.hostname);
 
 async function resolve_file(
   ipfs_name: IPFSPath,

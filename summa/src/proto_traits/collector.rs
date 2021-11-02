@@ -1,4 +1,7 @@
-#[cfg(test)]
+use std::cmp::Ordering;
+use crate::proto;
+
+#[cfg(feature = "test-utils")]
 pub mod shortcuts {
     use crate::proto;
     use std::collections::HashMap;
@@ -49,6 +52,50 @@ pub mod shortcuts {
                 scored_documents,
                 has_next,
             })),
+        }
+    }
+}
+
+impl PartialOrd for proto::score::Score {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let a = match self {
+            proto::score::Score::F64Score(score) => *score,
+            proto::score::Score::U64Score(score) => *score as f64
+        };
+        let b = match other {
+            proto::score::Score::F64Score(score) => *score,
+            proto::score::Score::U64Score(score) => *score as f64
+        };
+        a.partial_cmp(&b)
+    }
+}
+
+impl PartialOrd for proto::Score {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.score.partial_cmp(&other.score)
+    }
+}
+
+impl PartialOrd for proto::ScoredDocument {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.score.partial_cmp(&other.score)
+    }
+}
+
+impl proto::CollectorOutput {
+    pub fn as_top_docs(&self) -> Option<&proto::TopDocsCollectorOutput> {
+        if let Some(proto::collector_output::CollectorOutput::TopDocs(top_docs)) = &self.collector_output {
+            Some(top_docs)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_count(&self) -> Option<&proto::CountCollectorOutput> {
+        if let Some(proto::collector_output::CollectorOutput::Count(count)) = &self.collector_output {
+            Some(count)
+        } else {
+            None
         }
     }
 }

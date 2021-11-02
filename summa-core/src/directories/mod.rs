@@ -30,16 +30,20 @@
 mod chunk_generator;
 mod chunked_caching_directory;
 mod debug_proxy_directory;
+mod external_requests;
 mod hot_cache_directory;
 mod memory_sized_cache;
+mod network_directory;
 mod requests_composer;
 mod slice_address;
 mod stored_item;
 
 pub use chunked_caching_directory::ChunkedCachingDirectory;
 pub use debug_proxy_directory::DebugProxyDirectory;
+pub use external_requests::{DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, Header};
 pub use hot_cache_directory::{write_hotcache, HotDirectory};
 pub use memory_sized_cache::MemorySizedCache;
+pub use network_directory::NetworkDirectory;
 
 #[macro_export]
 macro_rules! read_only_directory {

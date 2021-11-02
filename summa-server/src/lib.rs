@@ -20,19 +20,17 @@ extern crate derive_builder;
 #[macro_use]
 extern crate lazy_static;
 extern crate core;
-extern crate summavy as tantivy;
 
 pub mod apis;
 pub mod application;
-pub mod configs;
-pub mod consumers;
 pub mod errors;
+pub(crate) mod hyper_external_request;
 mod ipfs_client;
 pub(crate) mod logging;
 pub mod requests;
 pub mod search_engine;
 pub mod servers;
 pub mod services;
-mod utils;
+pub(crate) mod utils;
 
 pub use application::Application;

@@ -1,14 +1,18 @@
-use crate::configs::{ApplicationConfigHolder, ConsumerConfig, IndexConfig, IndexConfigBuilder, IndexConfigProxy, IndexEngine};
 use crate::errors::SummaServerResult;
 use crate::errors::{Error, ValidationError};
+use crate::hyper_external_request::HyperExternalRequest;
 use crate::requests::{validators, AlterIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
-use crate::search_engine::IndexHolder;
-use crate::utils::sync::{Handler, OwningHandler};
 use futures_util::future::join_all;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
+use summa_core::components::IndexHolder;
+use summa_core::configs::{
+    ApplicationConfigHolder, ConfigProxy, ConsumerConfig, IndexConfig, IndexConfigBuilder, IndexConfigFilePartProxy, IndexEngine, Persistable,
+};
+use summa_core::directories::DefaultExternalRequestGenerator;
+use summa_core::errors::SummaResult;
 use summa_proto::proto;
 use tantivy::{IndexSettings, Opstamp};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -22,7 +26,7 @@ pub struct IndexService {
     /// `OwningHandler` that wraps `IndexHolder` allows safe cloning of `IndexHolder` objects.
     /// Every destructable operation like `stop` or `delete`
     /// will wait corresponding `IndexHolder` object until it will be released by other users
-    index_holders: Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>>,
+    index_holders: Arc<RwLock<HashMap<String, Arc<IndexHolder>>>>,
 }
 
 #[derive(Default)]
@@ -48,10 +52,11 @@ impl IndexService {
     pub(crate) async fn setup_index_holders(&self) -> SummaServerResult<()> {
         let mut index_holders = HashMap::new();
         for index_name in self.application_config.read().await.indices.keys() {
-            index_holders.insert(
-                index_name.clone(),
-                OwningHandler::new(IndexHolder::open(index_name, IndexConfigProxy::new(&self.application_config, index_name)).await?),
-            );
+            let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
+            let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
+                &index_config_proxy.read().await.get().index_engine,
+            )?;
+            index_holders.insert(index_name.clone(), Arc::new(IndexHolder::setup(index_name, index, index_config_proxy).await?));
         }
         info!(action = "index_holders", index_holders = ?index_holders);
         *self.index_holders_mut().await = index_holders;
@@ -59,30 +64,30 @@ impl IndexService {
     }
 
     /// Read-locked `HashMap` of all indices
-    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
+    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<IndexHolder>>> {
         self.index_holders.read().await
     }
 
     /// Write-locked `HashMap` of all indices
     ///
     /// Taking this lock means locking metadata modification
-    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
+    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<IndexHolder>>> {
         self.index_holders.write().await
     }
 
-    async fn get_index_holder_by_name(&self, index_name: &str) -> SummaServerResult<Handler<IndexHolder>> {
+    async fn get_index_holder_by_name(&self, index_name: &str) -> SummaServerResult<Arc<IndexHolder>> {
         Ok(self
             .index_holders()
             .await
             .get(index_name)
             .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_name.to_owned())))?
-            .handler())
+            .clone())
     }
     /// Returns `Handler` to `IndexHolder`.
     ///
     /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
     /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
-    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Handler<IndexHolder>> {
+    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Arc<IndexHolder>> {
         self.get_index_holder_by_name(
             self.application_config
                 .read()
@@ -96,19 +101,20 @@ impl IndexService {
 
     pub(crate) async fn insert_config(&self, index_name: &str, index_config: &IndexConfig) -> SummaServerResult<()> {
         let mut application_config = self.application_config.write().await;
-        match application_config.autosave().indices.entry(index_name.to_owned()) {
+        match application_config.indices.entry(index_name.to_owned()) {
             Entry::Occupied(o) => Err(ValidationError::ExistingIndex(o.key().to_owned())),
             Entry::Vacant(v) => {
                 v.insert(index_config.clone());
                 Ok(())
             }
         }?;
+        application_config.save()?;
         Ok(())
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = index_name))]
-    pub async fn attach_index(&self, index_name: &str) -> SummaServerResult<Handler<IndexHolder>> {
+    pub async fn attach_index(&self, index_name: &str) -> SummaServerResult<Arc<IndexHolder>> {
         let index_path = self.application_config.read().await.get_path_for_index_data(index_name);
         if !index_path.exists() {
             return Err(ValidationError::MissingIndex(index_name.to_string()).into());
@@ -118,17 +124,19 @@ impl IndexService {
         let index_config = IndexConfigBuilder::default().index_engine(index_engine.clone()).build().unwrap();
         self.insert_config(index_name, &index_config).await?;
 
-        let index_holder = IndexHolder::open(index_name, IndexConfigProxy::new(&self.application_config, index_name)).await?;
+        let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
+        let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
+            &index_config_proxy.read().await.get().index_engine,
+        )?;
+        let index_holder = Arc::new(IndexHolder::setup(index_name, index, index_config_proxy).await?);
 
-        let owning_handler = OwningHandler::new(index_holder);
-        let handler = owning_handler.handler();
-        self.index_holders_mut().await.insert(index_name.to_owned(), owning_handler);
-        Ok(handler)
+        self.index_holders_mut().await.insert(index_name.to_owned(), index_holder.clone());
+        Ok(index_holder)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
-    pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+    pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Arc<IndexHolder>> {
         let index_engine = match create_index_request.index_engine {
             proto::IndexEngine::Memory => IndexEngine::Memory(create_index_request.schema.clone()),
             proto::IndexEngine::File => IndexEngine::File(self.application_config.read().await.get_path_for_index_data(&create_index_request.index_name)),
@@ -156,23 +164,21 @@ impl IndexService {
             sort_by_field: create_index_request.sort_by_field.clone(),
             ..Default::default()
         };
-        let index_holder = IndexHolder::create(
-            &create_index_request.index_name,
+        let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, &create_index_request.index_name));
+        let index = IndexHolder::create::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
             &create_index_request.schema,
-            IndexConfigProxy::new(&self.application_config, &create_index_request.index_name),
             index_settings,
-        )
-        .await?;
+            &index_config_proxy.read().await.get().index_engine,
+        )?;
+        let index_holder = Arc::new(IndexHolder::setup(&create_index_request.index_name, index, index_config_proxy).await?);
 
-        let owning_handler = OwningHandler::new(index_holder);
-        let handler = owning_handler.handler();
         self.index_holders_mut()
             .await
-            .insert(create_index_request.index_name.to_owned(), owning_handler);
-        Ok(handler)
+            .insert(create_index_request.index_name.to_owned(), index_holder.clone());
+        Ok(index_holder)
     }
 
-    async fn alter_index_settings(&self, alter_index_request: AlterIndexRequest, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Opstamp> {
+    async fn alter_index_settings(&self, alter_index_request: AlterIndexRequest, index_holder: &IndexHolder) -> SummaServerResult<Opstamp> {
         let index_updater = index_holder.index_updater();
         let mut index_updater = index_updater.write().await;
         if let Some(compression) = alter_index_request.compression {
@@ -189,21 +195,25 @@ impl IndexService {
         }
         if let Some(default_fields) = alter_index_request.default_fields {
             let parsed_default_fields = validators::parse_default_fields(index_holder.schema(), &default_fields)?;
-            index_holder.index_config_proxy().write().await.autosave().get_mut().default_fields = parsed_default_fields
+            let mut index_config_proxy = index_holder.index_config_proxy().write().await;
+            index_config_proxy.get_mut().default_fields = parsed_default_fields;
+            index_config_proxy.commit()?;
         }
         if let Some(multi_fields) = alter_index_request.multi_fields {
-            let parsed_default_fields = validators::parse_multi_fields(index_holder.schema(), &multi_fields)?;
-            index_holder.index_config_proxy().write().await.autosave().get_mut().multi_fields = HashSet::from_iter(parsed_default_fields.into_iter())
+            let parsed_multi_fields = validators::parse_multi_fields(index_holder.schema(), &multi_fields)?;
+            let mut index_config_proxy = index_holder.index_config_proxy().write().await;
+            index_config_proxy.get_mut().multi_fields = HashSet::from_iter(parsed_multi_fields.into_iter());
+            index_config_proxy.commit()?;
         }
-        index_updater.commit().await
+        Ok(index_updater.commit(None).await?)
     }
 
     /// Alters index
     #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
-    pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+    pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaServerResult<Arc<IndexHolder>> {
         let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name).await?;
         self.alter_index_settings(alter_index_request, &index_holder).await?;
-        index_holder.reload_query_parser().await;
+        index_holder.reload_query_parser().await?;
         Ok(index_holder)
     }
 
@@ -222,16 +232,16 @@ impl IndexService {
                         return Err(ValidationError::Aliased(aliases.join(", ")).into());
                     }
                     if !consumer_names.is_empty() {
-                        return Err(ValidationError::ExistingConsumers(consumer_names.join(", ")).into());
+                        return Err(Error::Core(
+                            summa_core::errors::ValidationError::ExistingConsumer(consumer_names.join(", ")).into(),
+                        ));
                     }
                     entry.remove()
                 }
                 Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
             }
         };
-
-        let inner = tokio::task::spawn_blocking(move || index_holder.into_inner()).await?;
-        inner.delete().await?;
+        Arc::try_unwrap(index_holder).unwrap().delete().await?;
         Ok(DeleteIndexResult::default())
     }
 
@@ -266,41 +276,91 @@ impl IndexService {
     /// Delete consumer from the consumer registry and from `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?delete_consumer_request.consumer_name))]
     pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaServerResult<()> {
-        self.get_index_holder(&delete_consumer_request.index_alias)
+        Ok(self
+            .get_index_holder(&delete_consumer_request.index_alias)
             .await?
             .index_updater()
             .write()
             .await
             .delete_consumer(&delete_consumer_request.consumer_name)
-            .await
+            .await?)
     }
 
     /// Stopping index holders
     pub async fn stop(self) -> SummaServerResult<()> {
-        join_all(self.index_holders_mut().await.drain().map(|(_, index_holder)| index_holder.into_inner().stop()))
-            .await
-            .into_iter()
-            .collect::<SummaServerResult<Vec<_>>>()?;
+        join_all(
+            self.index_holders_mut()
+                .await
+                .drain()
+                .map(|(_, index_holder)| Arc::try_unwrap(index_holder).unwrap().stop()),
+        )
+        .await
+        .into_iter()
+        .collect::<SummaResult<Vec<_>>>()
+        .map_err(crate::errors::Error::from)?;
         Ok(())
     }
 
     /// Returns `ConsumerConfig`
     pub(crate) async fn get_consumer_config(&self, index_alias: &str, consumer_name: &str) -> SummaServerResult<ConsumerConfig> {
-        self.get_index_holder(index_alias).await?.get_consumer_config(consumer_name).await
+        Ok(self.get_index_holder(index_alias).await?.get_consumer_config(consumer_name).await?)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::configs::application_config::tests::create_test_application_config_holder;
     use crate::logging;
     use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
-    use crate::search_engine::index_holder::tests::create_test_schema;
     use std::path::Path;
+    use summa_core::components::SummaDocument;
+    use summa_core::configs::application_config::tests::create_test_application_config_holder;
+    use summa_core::SummaDocument;
+    use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
+    use summa_proto::proto_traits::query::shortcuts::match_query;
+    use tantivy::doc;
+    use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
 
-    pub(crate) async fn create_test_index_service(data_path: &Path) -> IndexService {
+    pub async fn create_test_index_service(data_path: &Path) -> IndexService {
         IndexService::new(&create_test_application_config_holder(&data_path))
+    }
+    pub async fn create_test_index_holder(index_service: &IndexService, schema: &Schema) -> SummaServerResult<Arc<IndexHolder>> {
+        index_service
+            .create_index(
+                CreateIndexRequestBuilder::default()
+                    .index_name("test_index".to_owned())
+                    .default_fields(vec!["title".to_owned(), "body".to_owned()])
+                    .index_engine(proto::IndexEngine::Memory)
+                    .schema(schema.clone())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+    }
+
+    pub fn create_test_schema() -> Schema {
+        let mut schema_builder = Schema::builder();
+
+        schema_builder.add_i64_field("id", FAST | INDEXED | STORED);
+        schema_builder.add_i64_field("issued_at", FAST | INDEXED | STORED);
+        schema_builder.add_text_field(
+            "title",
+            TextOptions::default().set_stored().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("summa")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
+        schema_builder.add_text_field(
+            "body",
+            TextOptions::default().set_stored().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("summa")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
+
+        schema_builder.build()
     }
 
     #[tokio::test]
@@ -366,5 +426,132 @@ pub(crate) mod tests {
             )
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_search() -> SummaServerResult<()> {
+        logging::tests::initialize_default_once();
+        let schema = create_test_schema();
+
+        let root_path = tempdir::TempDir::new("summa_test").unwrap();
+        let data_path = root_path.path().join("data");
+
+        let index_service = create_test_index_service(&data_path).await;
+        let index_holder = create_test_index_holder(&index_service, &schema).await?;
+
+        index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
+            schema.get_field("id").unwrap() => 1i64,
+            schema.get_field("title").unwrap() => "Headcrab",
+            schema.get_field("body").unwrap() => "Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient to dispatch them. \
+            They are also relatively slow-moving and their attacks inflict very little damage. However, they can leap long distances and heights. \
+            Headcrabs seek out larger human hosts, which are converted into zombie-like mutants that attack any living lifeform nearby. \
+            The converted humans are more resilient than an ordinary human would be and inherit the headcrab's resilience toward toxic and radioactive materials. \
+            Headcrabs and headcrab zombies die slowly when they catch fire. \
+            The games also establish that while headcrabs are parasites that prey on humans, they are also the prey of the creatures of their homeworld. \
+            Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
+            schema.get_field("issued_at").unwrap() => 1652986134i64
+        ))).await?;
+        index_holder.index_updater().write().await.commit(None).await?;
+        index_holder.index_reader().reload()?;
+        assert_eq!(
+            index_holder.search("index", &match_query("headcrabs"), vec![top_docs_collector(10)]).await?,
+            vec![top_docs_collector_output(
+                vec![scored_doc(
+                    "{\
+                        \"body\":\"Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient \
+                        to dispatch them. They are also relatively slow-moving and their attacks inflict very little damage. However, they can leap long distances \
+                        and heights. Headcrabs seek out larger human hosts, which are converted into zombie-like mutants that attack any living lifeform nearby. \
+                        The converted humans are more resilient than an ordinary human would be and inherit the headcrab's resilience toward toxic and radioactive materials. \
+                        Headcrabs and headcrab zombies die slowly when they catch fire. \
+                        The games also establish that while headcrabs are parasites that prey on humans, they are also the prey of the creatures of their homeworld. \
+                        Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.\",\
+                        \"id\":1,\
+                        \"issued_at\":1652986134,\
+                        \"title\":\"Headcrab\"}",
+                    0.5125294327735901,
+                    0
+                )],
+                false
+            )]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_custom_ranking() -> SummaServerResult<()> {
+        logging::tests::initialize_default_once();
+        let schema = create_test_schema();
+
+        let root_path = tempdir::TempDir::new("summa_test").unwrap();
+        let data_path = root_path.path().join("data");
+
+        let index_service = create_test_index_service(&data_path).await;
+        let index_holder = create_test_index_holder(&index_service, &schema).await?;
+
+        index_holder
+            .index_updater()
+            .read()
+            .await
+            .index_document(SummaDocument::TantivyDocument(doc!(
+                schema.get_field("id").unwrap() => 1i64,
+                schema.get_field("title").unwrap() => "term1 term2",
+                schema.get_field("body").unwrap() => "term3 term4 term5 term6",
+                schema.get_field("issued_at").unwrap() => 100i64
+            )))
+            .await?;
+        index_holder
+            .index_updater()
+            .read()
+            .await
+            .index_document(SummaDocument::TantivyDocument(doc!(
+                schema.get_field("id").unwrap() => 2i64,
+                schema.get_field("title").unwrap() => "term2 term3",
+                schema.get_field("body").unwrap() => "term1 term7 term8 term9 term10",
+                schema.get_field("issued_at").unwrap() => 110i64
+            )))
+            .await?;
+        index_holder.index_updater().write().await.commit(None).await?;
+        index_holder.index_reader().reload()?;
+        assert_eq!(
+            index_holder
+                .search("index", &match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "issued_at")])
+                .await?,
+            vec![top_docs_collector_output(
+                vec![
+                    scored_doc(
+                        "{\"body\":\"term1 term7 term8 term9 term10\",\"id\":2,\"issued_at\":110,\"title\":\"term2 term3\"}",
+                        110.0,
+                        0
+                    ),
+                    scored_doc(
+                        "{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}",
+                        100.0,
+                        1
+                    )
+                ],
+                false
+            )]
+        );
+        assert_eq!(
+            index_holder
+                .search("index", &match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "-issued_at")])
+                .await?,
+            vec![top_docs_collector_output(
+                vec![
+                    scored_doc(
+                        "{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}",
+                        -100.0,
+                        0
+                    ),
+                    scored_doc(
+                        "{\"body\":\"term1 term7 term8 term9 term10\",\"id\":2,\"issued_at\":110,\"title\":\"term2 term3\"}",
+                        -110.0,
+                        1
+                    ),
+                ],
+                false
+            )]
+        );
+        Ok(())
     }
 }

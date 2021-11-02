@@ -31,10 +31,7 @@ impl proto::beacon_api_server::BeaconApi for BeaconApiImpl {
             .publish_index(index_holder, proto_request.payload, proto_request.copy)
             .await?;
         let response = proto::PublishIndexResponse {
-            key: Some(proto::publish_index_response::Key {
-                name: key.name().to_string(),
-                id: key.id().to_string(),
-            }),
+            key: Some(proto::publish_index_response::Key { name: "".to_string(), id: key }),
         };
         Ok(Response::new(response))
     }
