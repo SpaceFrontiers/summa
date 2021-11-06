@@ -23,8 +23,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 
-use crate::directories::ChunkedCachingDirectory;
-use crate::metrics::CacheMetrics;
 use serde::{Deserialize, Serialize};
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes};
@@ -32,6 +30,8 @@ use tantivy::error::DataCorruption;
 use tantivy::{AsyncIoResult, Directory, HasLen, Index, IndexReader, ReloadPolicy};
 
 use super::debug_proxy_directory::DebugProxyDirectory;
+use crate::directories::ChunkedCachingDirectory;
+use crate::metrics::CacheMetrics;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SliceCacheIndexEntry {
@@ -98,7 +98,7 @@ impl StaticDirectoryCacheBuilder {
         // Write format version
         wrt.write_all(b"\x00")?;
 
-        let file_lengths_bytes = serde_cbor::to_vec(&self.file_lengths).unwrap();
+        let file_lengths_bytes = serde_cbor::to_vec(&self.file_lengths).expect("CBOR failed");
         wrt.write_all(&(file_lengths_bytes.len() as u64).to_le_bytes())?;
         wrt.write_all(&file_lengths_bytes[..])?;
 
@@ -111,7 +111,7 @@ impl StaticDirectoryCacheBuilder {
             offset += buf.len() as u64;
             data_buffer.extend_from_slice(&buf);
         }
-        let idx_bytes = serde_cbor::to_vec(&data_idx).unwrap();
+        let idx_bytes = serde_cbor::to_vec(&data_idx).expect("CBOR failed");
         wrt.write_all(&(idx_bytes.len() as u64).to_le_bytes())?;
         wrt.write_all(&idx_bytes[..])?;
         wrt.write_all(&data_buffer[..])?;
@@ -147,9 +147,9 @@ impl StaticDirectoryCache {
             ))));
         }
 
-        let file_lengths: HashMap<PathBuf, u64> = deserialize_cbor(&mut bytes).unwrap();
+        let file_lengths: HashMap<PathBuf, u64> = deserialize_cbor(&mut bytes).expect("CBOR failed");
 
-        let mut slice_offsets: Vec<(PathBuf, u64)> = deserialize_cbor(&mut bytes).unwrap();
+        let mut slice_offsets: Vec<(PathBuf, u64)> = deserialize_cbor(&mut bytes).expect("CBOR failed");
         slice_offsets.push((PathBuf::default(), bytes.len() as u64));
 
         let slices = slice_offsets
@@ -460,7 +460,7 @@ pub fn write_hotcache<D: Directory>(directory: D, chunk_size: usize, output: &mu
     let index_files = list_index_files(&index)?;
     for file_path in index_files {
         let file_slice_res = debug_proxy_directory.open_read(&file_path);
-        if let Err(tantivy::directory::error::OpenReadError::FileDoesNotExist(_)) = file_slice_res {
+        if let Err(OpenReadError::FileDoesNotExist(_)) = file_slice_res {
             continue;
         }
         let file_slice = file_slice_res?;

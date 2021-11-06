@@ -1,16 +1,18 @@
-use super::ConfigHolder;
-use super::GrpcConfig;
-use super::MetricsConfig;
-use crate::configs::{GrpcConfigBuilder, IndexConfig, IpfsConfig, Loadable, MetricsConfigBuilder};
-use crate::errors::{Error, SummaResult, ValidationError};
-use path_absolutize::*;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::default::Default;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use path_absolutize::*;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+
+use super::ConfigHolder;
+use super::GrpcConfig;
+use super::MetricsConfig;
+use crate::configs::{GrpcConfigBuilder, IndexConfig, IpfsConfig, Loadable, MetricsConfigBuilder};
+use crate::errors::{Error, SummaResult, ValidationError};
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default)]
@@ -154,10 +156,11 @@ impl DerefMut for ApplicationConfigHolder {
 
 #[cfg(feature = "test-utils")]
 pub mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::configs::GrpcConfigBuilder;
     use crate::configs::MetricsConfigBuilder;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     static BASE_PORT: AtomicUsize = AtomicUsize::new(50000);
 

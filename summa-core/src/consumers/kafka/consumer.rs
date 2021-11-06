@@ -1,8 +1,7 @@
-use super::status::{KafkaConsumingError, KafkaConsumingStatus};
-use crate::configs::ConsumerConfig;
-use crate::errors::SummaResult;
-use crate::utils::thread_handler::ThreadHandler;
-use crate::Error;
+use std::str;
+use std::sync::Arc;
+use std::time::Duration;
+
 use futures::StreamExt;
 use opentelemetry::{global, Context, KeyValue};
 use rdkafka::admin::{AdminClient, AdminOptions, AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
@@ -11,11 +10,14 @@ use rdkafka::consumer::{CommitMode, Consumer as KafkaConsumer, StreamConsumer as
 use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
-use std::str;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, info_span, instrument, warn, Instrument};
+
+use super::status::{KafkaConsumingError, KafkaConsumingStatus};
+use crate::configs::ConsumerConfig;
+use crate::errors::SummaResult;
+use crate::utils::thread_handler::ThreadHandler;
+use crate::Error;
 
 enum ConsumingState {
     Enabled(ThreadHandler<SummaResult<StreamConsumer>>),

@@ -23,13 +23,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Duration;
-use tantivy::directory::OwnedBytes;
 
-use crate::metrics::CacheMetrics;
 use lru::{KeyRef, LruCache};
+use tantivy::directory::OwnedBytes;
 
 use super::slice_address::{SliceAddress, SliceAddressKey, SliceAddressRef};
 use super::stored_item::StoredItem;
+use crate::metrics::CacheMetrics;
 
 const MIN_TIME_SINCE_LAST_ACCESS: Duration = Duration::from_secs(300);
 

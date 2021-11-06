@@ -1,4 +1,5 @@
 use std::io;
+
 use wasm_bindgen::JsValue;
 
 #[derive(thiserror::Error, Debug)]

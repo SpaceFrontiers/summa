@@ -1,5 +1,6 @@
-use super::summa_tokenizer::SummaTokenizer;
 use tantivy::tokenizer::{LowerCaser, RawTokenizer, RemoveLongFilter, SimpleTokenizer, StopWordFilter, TextAnalyzer};
+
+use super::summa_tokenizer::SummaTokenizer;
 
 const STOP_WORDS: [&str; 318] = [
     "a",

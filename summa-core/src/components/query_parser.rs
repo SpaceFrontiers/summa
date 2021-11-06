@@ -1,21 +1,23 @@
-use crate::errors::{Error, SummaResult, ValidationError};
-#[cfg(feature = "metrics")]
-use crate::metrics::ToLabel;
+use std::ops::Bound;
+use std::ops::Bound::Unbounded;
+use std::str::FromStr;
+
 #[cfg(feature = "metrics")]
 use opentelemetry::metrics::Counter;
 #[cfg(feature = "metrics")]
 use opentelemetry::Context;
 #[cfg(feature = "metrics")]
 use opentelemetry::{global, KeyValue};
-use std::ops::Bound;
-use std::ops::Bound::Unbounded;
-use std::str::FromStr;
 use summa_proto::proto;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
+
+use crate::errors::{Error, SummaResult, ValidationError};
+#[cfg(feature = "metrics")]
+use crate::metrics::ToLabel;
 
 /// Responsible for casting `crate::proto::Query` message to `tantivy::query::Query`
 pub struct QueryParser {

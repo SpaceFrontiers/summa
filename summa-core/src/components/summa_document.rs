@@ -1,12 +1,14 @@
-use crate::errors::{Error, SummaResult, ValidationError};
-use serde_json::Value as JsonValue;
 use std::net::IpAddr;
 use std::str::{from_utf8, FromStr};
+
+use serde_json::Value as JsonValue;
 use tantivy::schema::{Facet, FieldType, IntoIpv6Addr, Schema, Value};
 use tantivy::tokenizer::PreTokenizedString;
 use tantivy::{DateTime, Document};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+use crate::errors::{Error, SummaResult, ValidationError};
 
 /// Wrapper for carrying `tantivy::Document` from various sources
 pub enum SummaDocument<'a> {

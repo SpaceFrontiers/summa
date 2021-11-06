@@ -1,5 +1,6 @@
 use std::convert::{From, Infallible};
 use std::path::PathBuf;
+
 use tantivy::schema::FieldType;
 
 #[derive(thiserror::Error, Debug)]
@@ -38,6 +39,8 @@ pub enum ValidationError {
     RequiredFastField(String),
     #[error("utf8_error: {0}")]
     Utf8(std::str::Utf8Error),
+    #[error("template_error: {0}")]
+    Template(strfmt::FmtError),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -135,6 +138,11 @@ impl From<std::net::AddrParseError> for Error {
     }
 }
 
+impl<T> From<async_broadcast::SendError<T>> for Error {
+    fn from(_: async_broadcast::SendError<T>) -> Self {
+        Error::Internal
+    }
+}
 impl From<std::str::Utf8Error> for ValidationError {
     fn from(error: std::str::Utf8Error) -> Self {
         ValidationError::Utf8(error)
@@ -186,6 +194,12 @@ impl From<tantivy::error::AsyncIoError> for Error {
 impl From<tantivy::directory::error::OpenDirectoryError> for Error {
     fn from(error: tantivy::directory::error::OpenDirectoryError) -> Self {
         Error::OpenDirectory(error)
+    }
+}
+
+impl From<strfmt::FmtError> for ValidationError {
+    fn from(error: strfmt::FmtError) -> Self {
+        ValidationError::Template(error)
     }
 }
 

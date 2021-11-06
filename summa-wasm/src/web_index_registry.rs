@@ -1,20 +1,23 @@
-use crate::errors::{Error, SummaWasmResult};
-use crate::js_requests::JsExternalRequest;
-use crate::SERIALIZER;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use summa_core::components::{IndexHolder, IndexRegistry};
+
+use serde::{Deserialize, Serialize};
+use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry};
 use summa_core::configs::{DirectProxy, IndexConfigBuilder, IndexEngine, NetworkConfig};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use tantivy::Executor;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
-use web_sys::console::log_1;
+use summa_proto::proto;
+
+use crate::errors::{Error, SummaWasmResult};
+use crate::js_requests::JsExternalRequest;
+use crate::SERIALIZER;
 
 #[wasm_bindgen]
 pub struct WebIndexRegistry {
     index_registry: IndexRegistry,
+    multithreading: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -29,21 +32,20 @@ struct IndexPayload {
 #[wasm_bindgen]
 impl WebIndexRegistry {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> WebIndexRegistry {
+    pub fn new(multithreading: bool) -> WebIndexRegistry {
         console_error_panic_hook::set_once();
         WebIndexRegistry {
             index_registry: IndexRegistry::default(),
+            multithreading,
         }
     }
 
     #[wasm_bindgen]
-    pub async fn search(&self, index_names: JsValue, query: JsValue, collectors: JsValue) -> Result<JsValue, JsValue> {
-        let index_names: Vec<String> = serde_wasm_bindgen::from_value(index_names)?;
-        let query = serde_wasm_bindgen::from_value(query)?;
-        let collectors: Vec<_> = serde_wasm_bindgen::from_value(collectors)?;
+    pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
+        let index_queries: Vec<IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
         Ok(self
             .index_registry
-            .search(&index_names, &query, collectors)
+            .search(&index_queries)
             .await
             .map_err(Error::from)?
             .serialize(&*SERIALIZER)?)
@@ -59,7 +61,9 @@ impl WebIndexRegistry {
     pub async fn get_index_payload(&self, index_name: &str) -> Result<JsValue, JsValue> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
         let index_payload = index_holder.index_payload().ok().flatten();
-        let index_payload = index_payload.map(|index_payload| serde_json::from_str::<IndexPayload>(&index_payload).ok()).flatten();
+        let index_payload = index_payload
+            .map(|index_payload| serde_json::from_str::<IndexPayload>(&index_payload).ok())
+            .flatten();
         Ok(index_payload.serialize(&*SERIALIZER)?)
     }
 
@@ -75,7 +79,10 @@ impl WebIndexRegistry {
             .build()
             .unwrap();
 
-        index.set_multithread_executor(Executor::GlobalPool)?;
+        index.set_multithread_executor(match self.multithreading {
+            true => Executor::GlobalPool,
+            false => Executor::SingleThread,
+        })?;
 
         let index_config = Arc::new(DirectProxy::new(index_config));
         let index_holder = IndexHolder::setup(&index_payload.name, index, index_config).await?;
@@ -87,5 +94,12 @@ impl WebIndexRegistry {
     #[wasm_bindgen]
     pub async fn delete(&mut self, index_name: String) {
         self.index_registry.delete(&index_name).await;
+    }
+
+    #[wasm_bindgen]
+    pub async fn warmup(&self, index_name: &str) -> Result<(), JsValue> {
+        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
+        index_holder.warmup().await.map_err(Error::from)?;
+        Ok(())
     }
 }

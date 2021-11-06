@@ -1,4 +1,5 @@
 use std::str::CharIndices;
+
 use tantivy::tokenizer::BoxTokenStream;
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
@@ -86,8 +87,9 @@ impl<'a> TokenStream for SummaTokenStream<'a> {
 
 #[cfg(test)]
 pub mod tests {
-    use super::SummaTokenizer;
     use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenizerManager};
+
+    use super::SummaTokenizer;
 
     pub fn assert_token(token: &Token, position: usize, text: &str, from: usize, to: usize) {
         assert_eq!(token.position, position, "expected position {} but {:?}", position, token);

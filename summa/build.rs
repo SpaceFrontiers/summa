@@ -12,10 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     fs::create_dir_all("summa/proto").unwrap();
     for file in files {
-        fs::copy(file, &format!("summa/{}", file)).unwrap();
+        fs::copy(file, format!("summa/{}", file)).unwrap();
     }
     #[cfg(feature = "grpc")]
     tonic_build::configure()
+        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".", "#[serde(rename_all = \"snake_case\")]")
         .file_descriptor_set_path(std::env::var("OUT_DIR").unwrap() + "/summa.bin")
         .compile(
             &[

@@ -1,7 +1,9 @@
-use super::SummaSegmentAttributes;
 use std::fmt::Debug;
+
 use tantivy::merge_policy::{LogMergePolicy, MergeCandidate, MergePolicy};
 use tantivy::SegmentMeta;
+
+use super::SummaSegmentAttributes;
 
 #[derive(Debug, Default)]
 pub struct FrozenLogMergePolicy(LogMergePolicy);

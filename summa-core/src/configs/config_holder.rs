@@ -1,10 +1,12 @@
-use crate::errors::{Error, SummaResult, ValidationError};
-use config::{Config, Environment, File};
-use serde::{Deserialize, Serialize};
-use serde_yaml::to_writer;
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+
+use config::{Config, Environment, File};
+use serde::{Deserialize, Serialize};
+use serde_yaml::to_writer;
+
+use crate::errors::{Error, SummaResult, ValidationError};
 
 #[async_trait]
 pub trait Persistable {
@@ -50,7 +52,7 @@ impl<'a, T: Persistable> Deref for AutosaveLockWriteGuard<'a, T> {
 
 impl<'a, T: Persistable> DerefMut for AutosaveLockWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data
+        self.data
     }
 }
 

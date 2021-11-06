@@ -1,9 +1,11 @@
-use crate::errors::{Error, SummaResult, ValidationError};
-use crate::scorers::SegmentEvalScorer;
-use fasteval2::Evaler;
 use std::collections::HashSet;
+
+use fasteval2::Evaler;
 use tantivy::schema::Schema;
 use tantivy::SegmentReader;
+
+use crate::errors::{Error, SummaResult, ValidationError};
+use crate::scorers::SegmentEvalScorer;
 
 lazy_static! {
     static ref RESERVED_WORDS: HashSet<&'static str> = HashSet::from(["now", "original_score", "fastsigm"]);

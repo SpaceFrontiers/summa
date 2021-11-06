@@ -1,5 +1,6 @@
-use crate::errors::SummaResult;
 use serde::{Deserialize, Serialize};
+
+use crate::errors::SummaResult;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsumerConfig {

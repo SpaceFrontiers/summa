@@ -74,7 +74,7 @@ impl Collector for ReservoirSampling {
             seen_documents += segment_size;
             for doc in segment_docs {
                 // Fill the reservoir initially
-                if total_reservoir.len() < self.limit as usize {
+                if total_reservoir.len() < self.limit {
                     total_reservoir.push(*doc)
                 } else {
                     // Trial if the current document from the current `segment_docs` should be taken and put into reservoir taking into
@@ -82,10 +82,12 @@ impl Collector for ReservoirSampling {
                     if (rng.next_u32() as usize) % seen_documents < *segment_size {
                         taken_from_current_segment += 1;
                         // The goal is to put the document from the current segment instead of documents from
-                        // the document collected from previous iterations. Otherwise it could lead to the distribution skew.
+                        // the document collected from previous iterations.
+                        //
                         // For this purpose we are virtually splitting `total_reservoir` into two parts:
-                        // `total_reservoir[0; self.limit - taken_from_current_segment]`
-                        //  and `total_reservoir[self.limit - taken_from_current_segment; self.limit]`
+                        // - `total_reservoir[0; self.limit - taken_from_current_segment]`
+                        // - `total_reservoir[self.limit - taken_from_current_segment; self.limit]`
+                        //
                         // The first one contains previously collected documents and the second one contains document from the current segment.
                         let pivot_index = self.limit - taken_from_current_segment;
                         if pivot_index > 0 {
@@ -123,7 +125,7 @@ fn w_mul<TRng: Rng>(limit: usize, rng: &mut TRng) -> f64 {
 
 /// Implements [Algorithm L](https://en.wikipedia.org/wiki/Reservoir_sampling#An_optimal_algorithm) for reservoir sampling of size `k` from `n` elements
 /// found by the upstream `Query`
-/// It uses `O(k)` memory and has `O(k*(1+log(n/k)))` time complexity
+/// It uses `O(k)` memory and has `O(k *(1 + log(n / k)))` time complexity
 impl SegmentReservoirSamplingCollector {
     pub fn new(segment_ord: u32, limit: usize) -> SegmentReservoirSamplingCollector {
         let mut rng = SmallRng::from_entropy();
@@ -148,7 +150,7 @@ impl SegmentCollector for SegmentReservoirSamplingCollector {
 
     fn collect(&mut self, doc_id: DocId, _: Score) {
         self.seen_segment_docs += 1;
-        if self.reservoir.len() < self.limit as usize {
+        if self.reservoir.len() < self.limit {
             // Initial filling of the reservoir
             self.reservoir.push(DocAddress::new(self.segment_ord, doc_id));
         } else if self.seen_segment_docs == self.next_element {
@@ -165,9 +167,9 @@ impl SegmentCollector for SegmentReservoirSamplingCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::ReservoirSampling;
-
     use tantivy::collector::Collector;
+
+    use super::ReservoirSampling;
 
     #[test]
     fn test_count_collect_does_not_requires_scoring() {

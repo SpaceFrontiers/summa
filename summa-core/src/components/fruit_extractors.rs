@@ -1,16 +1,18 @@
-use super::custom_serializer::NamedFieldDocument;
-use crate::collectors;
-use crate::errors::{Error, SummaResult, ValidationError};
-use crate::scorers::EvalScorer;
+use std::collections::{HashMap, HashSet};
+
 use futures::future::join_all;
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, HashSet};
 use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
 use tantivy::{DocAddress, DocId, Document, Score, Searcher, SegmentReader, SnippetGenerator};
+
+use super::custom_serializer::NamedFieldDocument;
+use crate::collectors;
+use crate::errors::{Error, SummaResult, ValidationError};
+use crate::scorers::EvalScorer;
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
 #[async_trait]
@@ -34,15 +36,15 @@ pub trait FruitExtractor: Sync + Send {
     }
 }
 
-pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
+pub fn parse_aggregations(aggregations: &HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
     let aggregations = aggregations
         .into_iter()
         .map(|(name, aggregation)| {
-            let aggregation = match aggregation.aggregation {
+            let aggregation = match &aggregation.aggregation {
                 None => Err(Error::Proto(summa_proto::errors::Error::InvalidAggregation)),
-                Some(aggregation) => aggregation.try_into().map_err(Error::Proto),
+                Some(aggregation) => aggregation.clone().try_into().map_err(Error::Proto),
             }?;
-            Ok((name, aggregation))
+            Ok((name.clone(), aggregation))
         })
         .collect::<SummaResult<Vec<_>>>()?;
     Ok(HashMap::from_iter(aggregations.into_iter()))
@@ -69,12 +71,12 @@ fn get_strict_fields<'a, F: Iterator<Item = &'a String>>(schema: &Schema, fields
 }
 
 pub fn build_fruit_extractor(
-    collector_proto: proto::Collector,
+    collector_proto: &proto::Collector,
     query: &dyn Query,
     schema: &Schema,
     multi_collector: &mut MultiCollector,
 ) -> SummaResult<Box<dyn FruitExtractor>> {
-    match collector_proto.collector {
+    match &collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
             let fields = get_strict_fields(schema, top_docs_collector_proto.fields.iter())?;
             Ok(match top_docs_collector_proto.scorer {
@@ -88,7 +90,7 @@ pub fn build_fruit_extractor(
                         )
                         .query(query.box_clone())
                         .limit(top_docs_collector_proto.limit)
-                        .snippets(top_docs_collector_proto.snippets)
+                        .snippets(top_docs_collector_proto.snippets.clone())
                         .fields(fields)
                         .build()?,
                 ) as Box<dyn FruitExtractor>,
@@ -99,7 +101,7 @@ pub fn build_fruit_extractor(
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
                         .and_offset(top_docs_collector_proto.offset as usize)
                         .tweak_score(move |segment_reader: &SegmentReader| {
-                            let mut eval_scorer = eval_scorer_seed.get_for_segment_reader(segment_reader).unwrap();
+                            let mut eval_scorer = eval_scorer_seed.get_for_segment_reader(segment_reader).expect("Wrong eval expression");
                             move |doc_id: DocId, original_score: Score| eval_scorer.score(doc_id, original_score)
                         });
                     Box::new(
@@ -107,7 +109,7 @@ pub fn build_fruit_extractor(
                             .handle(multi_collector.add_collector(top_docs_collector))
                             .query(query.box_clone())
                             .limit(top_docs_collector_proto.limit)
-                            .snippets(top_docs_collector_proto.snippets)
+                            .snippets(top_docs_collector_proto.snippets.clone())
                             .fields(fields)
                             .build()?,
                     ) as Box<dyn FruitExtractor>
@@ -126,7 +128,7 @@ pub fn build_fruit_extractor(
                             .handle(multi_collector.add_collector(top_docs_collector))
                             .query(query.box_clone())
                             .limit(top_docs_collector_proto.limit)
-                            .snippets(top_docs_collector_proto.snippets)
+                            .snippets(top_docs_collector_proto.snippets.clone())
                             .fields(fields)
                             .build()?,
                     ) as Box<dyn FruitExtractor>
@@ -156,7 +158,7 @@ pub fn build_fruit_extractor(
         }
         Some(proto::collector::Collector::Aggregation(aggregation_collector_proto)) => {
             let aggregation_collector =
-                tantivy::aggregation::AggregationCollector::from_aggs(parse_aggregations(aggregation_collector_proto.aggregations)?, None);
+                tantivy::aggregation::AggregationCollector::from_aggs(parse_aggregations(&aggregation_collector_proto.aggregations)?, None);
             Ok(Box::new(Aggregation(multi_collector.add_collector(aggregation_collector))) as Box<dyn FruitExtractor>)
         }
         None => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
@@ -212,7 +214,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
             .iter()
             .filter_map(|(field_name, max_num_chars)| {
                 searcher.schema().get_field(field_name).map(|snippet_field| {
-                    let mut snippet_generator = SnippetGenerator::create(searcher, &*self.query, snippet_field).unwrap();
+                    let mut snippet_generator = SnippetGenerator::create(searcher, &*self.query, snippet_field).expect("Snippet generator cannot be created");
                     snippet_generator.set_max_num_chars(*max_num_chars as usize);
                     (field_name.to_string(), snippet_generator)
                 })
@@ -237,7 +239,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let scored_documents = fruit
             .iter()
             .take(std::cmp::min(self.limit as usize, length))
-            .map(|(score, doc_address)| (*score, searcher.doc(*doc_address).unwrap()));
+            .map(|(score, doc_address)| (*score, searcher.doc(*doc_address).expect("Document retrieving failed")));
         extract_base(
             scored_documents,
             external_index_alias,
@@ -264,7 +266,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             fruit
                 .iter()
                 .take(std::cmp::min(self.limit as usize, length))
-                .map(|(score, doc_address)| async move { (*score, searcher.doc_async(*doc_address).await.unwrap()) }),
+                .map(|(score, doc_address)| async move { (*score, searcher.doc_async(*doc_address).await.expect("Document retrieving failed")) }),
         )
         .await;
         extract_base(

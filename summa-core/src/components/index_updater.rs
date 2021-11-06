@@ -1,3 +1,22 @@
+use std::collections::hash_map::Entry;
+use std::collections::HashSet;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::future::join_all;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+use rdkafka::message::BorrowedMessage;
+use rdkafka::Message;
+use summa_proto::proto;
+use tantivy::directory::MmapDirectory;
+use tantivy::schema::Schema;
+use tantivy::{Directory, Index, Opstamp, SegmentComponent, SegmentId, SegmentMeta};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use tokio::time;
+use tracing::{info, info_span, instrument, warn, Instrument};
+
 use super::index_writer_holder::IndexWriterHolder;
 use super::SummaDocument;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
@@ -8,23 +27,6 @@ use crate::consumers::kafka::Consumer;
 use crate::directories::write_hotcache;
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::utils::thread_handler::ThreadHandler;
-use futures::future::join_all;
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::message::BorrowedMessage;
-use rdkafka::Message;
-use std::collections::hash_map::Entry;
-use std::collections::HashSet;
-use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-use summa_proto::proto;
-use tantivy::directory::MmapDirectory;
-use tantivy::schema::Schema;
-use tantivy::{Directory, Index, Opstamp, SegmentComponent, SegmentId, SegmentMeta};
-use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
-use tokio::time;
-use tracing::{info, info_span, instrument, warn, Instrument};
 
 pub fn process_message(
     index_writer_holder: &OwnedRwLockReadGuard<IndexWriterHolder>,

@@ -1,6 +1,10 @@
-importScripts("localforage.js");
+importScripts("dexie.min.js");
 
-const CHUNK_SIZE = 16384;
+const CHUNK_SIZE = 16 * 1024;
+const db = new Dexie("Cache");
+db.version(3).stores({
+  chunks: "[filename+chunk_id]",
+});
 
 function* range(start = 0, end = Infinity, step = 1) {
   let iterationCount = 0;
@@ -17,34 +21,41 @@ function set_same_origin_headers(headers) {
   return headers;
 }
 
-function get_chunk_cache_key(cache_key, chunk_id, chunk_size) {
-  return `${cache_key}:${chunk_id}-${chunk_id + chunk_size}`;
-}
-
-async function fill_from_cache(cache_key, chunk_size, start, end) {
+async function fill_from_cache(filename, chunk_size, start, end) {
   const cached_response = new ArrayBuffer(end - start + 1);
   const cached_response_view = new Uint8Array(cached_response);
-  for (const current of range(start, end, chunk_size)) {
-    const chunk_cache_key = get_chunk_cache_key(cache_key, current, chunk_size);
-    const cached = await localforage.getItem(chunk_cache_key);
-    if (cached === null) {
-      return null;
-    }
-    cached_response_view.set(cached, current - start);
+  const chunk_ixs = Array.from(range(start, end, chunk_size));
+  const cached_chunks = await db
+    .table("chunks")
+    .where("[filename+chunk_id]")
+    .between(
+      [filename, chunk_ixs[0]],
+      [filename, chunk_ixs[chunk_ixs.length - 1]],
+      true,
+      true
+    )
+    .toArray();
+  if (cached_chunks.length < chunk_ixs.length) {
+    return null;
   }
-  return cached_response;
+  chunk_ixs.map((current, ix) => {
+    cached_response_view.set(cached_chunks[ix], current - start);
+  });
 }
 
-async function fill_cache(response_body, cache_key, chunk_size, start, end) {
-  for (const current of range(start, end, chunk_size)) {
-    const chunk_cache_key = get_chunk_cache_key(cache_key, current, chunk_size);
-    await localforage.setItem(
-      chunk_cache_key,
-      new Uint8Array(
-        response_body.slice(current - start, current - start + chunk_size)
-      )
-    );
-  }
+async function fill_cache(response_body, filename, chunk_size, start, end) {
+  const items = await Promise.all(
+    Array.from(range(start, end, chunk_size)).map(function (chunk_id) {
+      return {
+        filename: filename,
+        chunk_id: chunk_id,
+        blob: new Uint8Array(
+          response_body.slice(chunk_id - start, chunk_id - start + chunk_size)
+        ),
+      };
+    })
+  );
+  await db.table("chunks").bulkPut(items);
 }
 
 function process_request_headers(request) {
@@ -75,12 +86,12 @@ function process_request_headers(request) {
 }
 
 async function handle_request(original_request) {
-  const { summa_cache_is_enabled, range_start, range_end, request } =
+  let { summa_cache_is_enabled, range_start, range_end, request } =
     process_request_headers(original_request);
-  const cache_key = `cache:${new URL(request.url).pathname}`;
+  const filename = new URL(request.url).pathname;
   if (summa_cache_is_enabled) {
     const response_body = await fill_from_cache(
-      cache_key,
+      filename,
       CHUNK_SIZE,
       range_start,
       range_end
@@ -96,7 +107,7 @@ async function handle_request(original_request) {
   if (summa_cache_is_enabled) {
     fill_cache(
       real_response_body,
-      cache_key,
+      filename,
       CHUNK_SIZE,
       range_start,
       range_end
@@ -105,7 +116,7 @@ async function handle_request(original_request) {
   const new_headers = set_same_origin_headers(
     new Headers(real_response.headers)
   );
-  new_headers.set("Cache-Control", "max-age=3600");
+  new_headers.set("Cache-Control", "public, max-age=3600");
   return new Response(real_response_body, {
     status: real_response.status,
     statusText: real_response.statusText,

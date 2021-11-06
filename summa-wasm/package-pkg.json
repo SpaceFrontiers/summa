@@ -4,8 +4,7 @@
     "Pasha Podolsky <ppodolsky@me.com>"
   ],
   "dependencies": {
-    "comlink": "^4.3.1",
-    "localforage": "^1.10.0"
+    "comlink": "^4.3.1"
   },
   "version": "",
   "files": [
@@ -16,7 +15,6 @@
     "gate.ts",
     "network-config.ts",
     "rayon-worker.ts",
-    "searcher-worker.ts",
     "web-index-service.ts"
   ],
   "module": "index.js",

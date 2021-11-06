@@ -15,12 +15,3 @@ export class NetworkConfig {
     this.files = files;
   }
 }
-
-export function create_network_config(ipfs_url: String, ipfs_path: String, files: Map<string, number>) {
-  return new NetworkConfig(
-    "GET",
-    `${ipfs_url}${ipfs_path}/{file_name}`,
-    [{name: "range", value: "bytes={start}-{end}"}],
-    files
-  )
-}

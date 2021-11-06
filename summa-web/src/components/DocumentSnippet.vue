@@ -11,7 +11,6 @@ import { defineComponent } from "vue";
 import NexusBook from "./snippets/NexusBook.vue";
 import NexusMedia from "./snippets/NexusMedia.vue";
 
-
 export default defineComponent({
   name: "DocumentSnippet",
   components: { NexusBook, NexusMedia },

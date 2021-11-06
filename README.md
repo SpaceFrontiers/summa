@@ -3,6 +3,6 @@
 
 # Summa
 
-Full-text search server written in Rust with Python and GRPC API
+Full-text WASM-compatible search server written in Rust with GRPC API
 
 [Quick-start and Documentation](https://izihawa.github.io/summa/)

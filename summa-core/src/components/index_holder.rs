@@ -1,11 +1,6 @@
-#[cfg(feature = "index-updater")]
-use super::IndexUpdater;
-use super::SummaSegmentAttributes;
-use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
-use crate::components::CACHE_METRICS;
-use crate::configs::{ConfigProxy, ConsumerConfig, IndexConfig, IndexEngine, NetworkConfig};
-use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory};
-use crate::errors::{self, SummaResult, ValidationError};
+use std::fmt::Debug;
+use std::sync::Arc;
+
 use futures::future::try_join_all;
 #[cfg(feature = "metrics")]
 use instant::Instant;
@@ -15,19 +10,29 @@ use opentelemetry::{
     metrics::{Histogram, Unit},
     Context, KeyValue,
 };
-use std::sync::Arc;
 use summa_proto::proto;
 use tantivy::collector::MultiCollector;
 use tantivy::directory::OwnedBytes;
 use tantivy::schema::Schema;
 #[cfg(feature = "index-updater")]
 use tantivy::Opstamp;
-use tantivy::{Directory, Index, IndexReader, IndexSettings, ReloadPolicy};
+use tantivy::{Directory, Executor, Index, IndexReader, IndexSettings, ReloadPolicy};
 #[cfg(feature = "index-updater")]
 use tokio::fs::remove_dir_all;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::RwLock;
 use tracing::info;
 use tracing::{instrument, trace};
+
+#[cfg(feature = "index-updater")]
+use super::IndexUpdater;
+use super::SummaSegmentAttributes;
+use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
+use crate::components::CACHE_METRICS;
+use crate::configs::{ConfigProxy, ConsumerConfig, IndexConfig, IndexEngine, NetworkConfig};
+use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory};
+use crate::errors::{SummaResult, ValidationError};
+use crate::Error;
 
 pub struct IndexHolder {
     index_name: String,
@@ -53,6 +58,7 @@ fn register_default_tokenizers(index: &Index) {
     }
 }
 
+/// Sets up query parser
 fn setup_query_parser(index_name: &str, index: &Index, index_config: &IndexConfig, schema: &Schema) -> SummaResult<QueryParser> {
     Ok(QueryParser::for_index(
         index_name,
@@ -83,14 +89,17 @@ fn create_network_index<TExternalRequest: ExternalRequest + 'static, TExternalRe
     network_config: &NetworkConfig,
 ) -> SummaResult<Index> {
     let network_directory = NetworkDirectory::new(network_config.files.clone(), Box::new(TExternalRequestGenerator::new(network_config.clone())));
-    Ok(match &network_config.caching_config {
-        Some(caching_config) => {
-            let chunking_directory = ChunkedCachingDirectory::new_with_capacity_in_bytes(
-                Arc::new(network_directory),
-                caching_config.chunk_size,
-                caching_config.cache_size,
-                CACHE_METRICS.clone(),
-            );
+    Ok(match &network_config.chunked_cache_config {
+        Some(chunked_cache_config) => {
+            let chunking_directory = match chunked_cache_config.cache_size {
+                Some(cache_size) => ChunkedCachingDirectory::new_with_capacity_in_bytes(
+                    Arc::new(network_directory),
+                    chunked_cache_config.chunk_size,
+                    cache_size,
+                    CACHE_METRICS.clone(),
+                ),
+                None => ChunkedCachingDirectory::new(Arc::new(network_directory), chunked_cache_config.chunk_size),
+            };
             create_index_with_hotcache(chunking_directory)?
         }
         None => create_index_with_hotcache(network_directory)?,
@@ -219,11 +228,11 @@ impl IndexHolder {
             .get()
             .consumer_configs
             .get(consumer_name)
-            .ok_or_else(|| errors::ValidationError::MissingConsumer(consumer_name.to_owned()))?
+            .ok_or_else(|| ValidationError::MissingConsumer(consumer_name.to_owned()))?
             .clone())
     }
 
-    pub async fn warmup_internal(&self) -> SummaResult<()> {
+    pub async fn warmup(&self) -> SummaResult<()> {
         let searcher = self.index_reader.searcher();
         let mut warm_up_futures = Vec::new();
         let fields = self
@@ -270,9 +279,7 @@ impl IndexHolder {
         match self.index_config_proxy.delete().await?.index_engine {
             IndexEngine::File(ref index_path) => {
                 info!(action = "delete_directory");
-                remove_dir_all(index_path)
-                    .await
-                    .map_err(|e| errors::Error::IO((e, Some(index_path.to_path_buf()))))?;
+                remove_dir_all(index_path).await.map_err(|e| Error::IO((e, Some(index_path.to_path_buf()))))?;
             }
             IndexEngine::Memory(_) => (),
             IndexEngine::Remote(_) => (),
@@ -280,15 +287,30 @@ impl IndexHolder {
         Ok(())
     }
 
+    fn spawn<R: Send + 'static, F: Sized + Send + Sync + FnOnce() -> R + 'static>(&self, f: F) -> UnboundedReceiver<R> {
+        let (fruit_sender, fruit_receiver) = tokio::sync::mpsc::unbounded_channel();
+        match self.index.search_executor() {
+            Executor::SingleThread => {
+                fruit_sender.send(f()).map_err(|_| Error::Internal).expect("Send error");
+            }
+            Executor::GlobalPool => {
+                rayon::spawn(move || {
+                    fruit_sender.send(f()).map_err(|_| Error::Internal).expect("Send error");
+                });
+            }
+            Executor::ThreadPool(pool) => {
+                pool.spawn(move || {
+                    fruit_sender.send(f()).map_err(|_| Error::Internal).expect("Send error");
+                });
+            }
+        };
+        fruit_receiver
+    }
+
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
-    pub async fn search(
-        &self,
-        external_index_alias: &str,
-        query: &proto::Query,
-        collectors: Vec<proto::Collector>,
-    ) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub async fn search(&self, external_index_alias: &str, query: &proto::Query, collectors: &[proto::Collector]) -> SummaResult<Vec<proto::CollectorOutput>> {
         let searcher = self.index_reader.searcher();
-        let parsed_query = self.query_parser.read().await.parse_query(&query)?;
+        let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let extractors: Vec<Box<dyn FruitExtractor>> = collectors
             .into_iter()
@@ -302,10 +324,8 @@ impl IndexHolder {
         );
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        #[cfg(feature = "async-search")]
-        let (multi_fruit, searcher) = tokio::task::spawn_blocking(move || (searcher.search(&parsed_query, &multi_collector), searcher)).await?;
-        #[cfg(not(feature = "async-search"))]
-        let multi_fruit = searcher.search(&parsed_query, &multi_collector);
+        let mut receiver = self.spawn(move || (searcher.search(&parsed_query, &multi_collector), searcher));
+        let (multi_fruit, searcher) = receiver.recv().await.unwrap();
         let mut multi_fruit = multi_fruit?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
@@ -321,7 +341,7 @@ impl IndexHolder {
             .get()
             .multi_fields
             .iter()
-            .map(|field_name| self.cached_schema.get_field(field_name).unwrap())
+            .map(|field_name| self.cached_schema.get_field(field_name).expect("Field not found"))
             .collect();
         for extractor in extractors.into_iter() {
             collector_outputs.push(
@@ -334,7 +354,7 @@ impl IndexHolder {
     }
 }
 
-impl std::fmt::Debug for IndexHolder {
+impl Debug for IndexHolder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("IndexHolder").field("index_name", &self.index_name).finish()
     }

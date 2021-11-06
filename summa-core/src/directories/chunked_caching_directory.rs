@@ -1,16 +1,18 @@
-use crate::directories::chunk_generator::{Chunk, ChunkGenerator};
-use crate::directories::requests_composer::{Request, RequestsComposer};
-use crate::directories::MemorySizedCache;
-use crate::metrics::CacheMetrics;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, OwnedBytes};
 use tantivy::error::AsyncIoError;
 use tantivy::{Directory, HasLen};
+
+use crate::directories::chunk_generator::{Chunk, ChunkGenerator};
+use crate::directories::requests_composer::{Request, RequestsComposer};
+use crate::directories::MemorySizedCache;
+use crate::metrics::CacheMetrics;
 
 #[derive(Clone)]
 pub struct ChunkedCachingDirectory {

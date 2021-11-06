@@ -1,9 +1,10 @@
-use super::fast_field_iterator::{FastFieldIterator, FastFieldIteratorImpl};
-use crate::errors::{Error, SummaResult, ValidationError};
 use fasteval2::{Compiler, Evaler, Instruction};
-use std::time::{SystemTime, UNIX_EPOCH};
+use instant::{Instant, SystemTime};
 use tantivy::schema::{FieldType, Schema};
 use tantivy::{DocId, Score, SegmentReader};
+
+use super::fast_field_iterator::{FastFieldIterator, FastFieldIteratorImpl};
+use crate::errors::{Error, SummaResult, ValidationError};
 
 pub struct SegmentEvalScorer {
     slab: fasteval2::Slab,
@@ -76,7 +77,7 @@ impl SegmentEvalScorer {
         };
 
         let boxed_original_score = Box::new(0f64);
-        let boxed_now = Box::new(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64());
+        let boxed_now = Box::new(instant::now() / 1000.0);
 
         // Set default variables
         unsafe {
@@ -88,10 +89,11 @@ impl SegmentEvalScorer {
 
         // Set fast fields
         for var_name in var_names {
-            fast_fields_iterators.push(fast_field_to_iter(schema, segment_reader, var_name)?);
+            let fast_field_iterator = fast_field_to_iter(schema, segment_reader, var_name)?;
             unsafe {
-                slab.ps.add_unsafe_var(var_name.to_owned(), fast_fields_iterators.last().unwrap().value());
+                slab.ps.add_unsafe_var(var_name.to_owned(), fast_field_iterator.value());
             }
+            fast_fields_iterators.push(fast_field_iterator);
         }
         let compiled = parser
             .parse(eval_expr, &mut slab.ps)?
@@ -115,7 +117,7 @@ impl SegmentEvalScorer {
         if let fasteval2::IUnsafeVar { ptr, .. } = self.compiled {
             unsafe { *ptr }
         } else {
-            self.compiled.eval(&self.slab, &mut self.namespace).unwrap()
+            self.compiled.eval(&self.slab, &mut self.namespace).expect("Undefined variable")
         }
     }
 }

@@ -1,7 +1,8 @@
-use crate::directories::chunk_generator::Chunk;
 use std::iter::{Chain, Once};
 use std::ops::Range;
 use std::slice::Iter;
+
+use crate::directories::chunk_generator::Chunk;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Request {

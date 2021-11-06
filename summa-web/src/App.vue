@@ -26,12 +26,13 @@ div.d-flex.flex-column.min-vh-100.w-100
 </template>
 
 <script lang="ts">
+import { num_threads } from "@/options";
 import { defineComponent } from "vue";
 import { RouterLink, RouterView } from "vue-router";
 import IsLoadingView from "@/components/IsLoading.vue";
-import { format_bytes } from "./utils";
-import ConnectivityIssuesView from "./components/ConnectivityIssues.vue";
-import { cache_metrics } from "./plugins/web-index-service";
+import { format_bytes } from "@/utils";
+import ConnectivityIssuesView from "@/components/ConnectivityIssues.vue";
+import { cache_metrics } from "@/services/web-index-service";
 
 export default defineComponent({
   name: "App",
@@ -56,7 +57,9 @@ export default defineComponent({
   async created() {
     this.is_loading = true;
     this.web_index_service.status_callback = this.status_callback;
-    const is_succeed = await this.web_index_service.setup({ num_threads: 8 });
+    const is_succeed = await this.web_index_service.setup({
+      num_threads: num_threads,
+    });
     this.is_loading_failed = !is_succeed;
     this.is_loading = false;
   },

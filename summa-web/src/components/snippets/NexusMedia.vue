@@ -27,7 +27,7 @@ export default defineComponent({
   },
   computed: {
     category() {
-      return this.document.category
+      return this.document.category;
     },
     document() {
       return JSON.parse(this.scored_document.document);
@@ -52,9 +52,7 @@ export default defineComponent({
         }
       } else {
         let encoder = new TextEncoder();
-        const original_length = encoder.encode(
-          this.document.content
-        ).length;
+        const original_length = encoder.encode(this.document.content).length;
         const snippet_length =
           this.scored_document.snippets.content.fragment.length;
         if (original_length > snippet_length) {

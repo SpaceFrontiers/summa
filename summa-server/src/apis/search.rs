@@ -34,7 +34,7 @@ impl proto::search_api_server::SearchApi for SearchApiImpl {
         let now = Instant::now();
 
         let collector_outputs = index_holder
-            .search(&proto_request.index_alias, &query, proto_request.collectors)
+            .search(&proto_request.index_alias, &query, &proto_request.collectors)
             .instrument(info_span!("search", tags = ?proto_request.tags))
             .await
             .map_err(crate::errors::Error::from)?;

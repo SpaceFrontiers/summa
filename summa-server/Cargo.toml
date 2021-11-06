@@ -19,7 +19,7 @@ path = "src/bin/main.rs"
 doc = false
 
 [features]
-default = ["ipfs", "metrics", "summa-core/async-search"]
+default = ["ipfs", "metrics"]
 ipfs = ["izihawa-common-multipart", "izihawa-hyper-multipart"]
 metrics = ["opentelemetry", "opentelemetry-prometheus", "prometheus", "summa-core/metrics"]
 
@@ -63,7 +63,7 @@ serde_json = "1.0.85"
 serde_yaml = "0.8.26"
 summa-core = { version = "0.9.1", path = "../summa-core", features = ["index-updater"] }
 summa-proto = { version = "0.9.1", path = "../summa" }
-tantivy = { package = "summavy", version = "0.19.3", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
+tantivy = { package = "summavy", version = "0.19.9", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
 tantivy-fst = "0.4.0"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
 thiserror = "1.0.36"

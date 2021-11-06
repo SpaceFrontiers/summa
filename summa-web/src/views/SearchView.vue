@@ -10,9 +10,9 @@ div
     nav(v-if="has_next")
       ul.pagination.justify-content-center
         li.page-item(v-on:click="page -= 1;")
-          a.page-link(href="#", tabindex="-1") &lt;
+          a.page-link &lt;
         li.page-item.disabled
-          a.page-link(href="#") {{ page }}
+          a.page-link {{ page }}
         li.page-item(v-on:click="page += 1;")
           a.page-link &gt;
   .d-flex.justify-content-center.m-5(v-else)
@@ -24,7 +24,94 @@ div
 import { defineComponent } from "vue";
 import SearchList from "@/components/SearchList.vue";
 import { useRoute } from "vue-router";
-import { useWebIndexStore } from "../store/web_index";
+import { db } from "../database";
+import { liveQuery } from "dexie";
+import { useObservable } from "@vueuse/rxjs";
+
+function add_exp_decay(
+  field_name: string,
+  origin: number,
+  scale: number,
+  offset: number,
+  decay
+) {
+  const lamb = `log(e(), ${decay}) / ${scale}`;
+  return `e() ^ ((${lamb}) * max(0, abs(${field_name} - ${origin}) - ${offset}))`;
+}
+
+function default_collectors(index_name, page) {
+  const now = Date.now() / 1000;
+  const defaults = {
+    default: [
+      {
+        collector: {
+          top_docs: {
+            limit: page * 5,
+            offset: 0,
+            snippets: { description: 400, title: 140, content: 400 },
+            explain: false,
+            fields: [],
+          },
+        },
+      },
+      { collector: { count: {} } },
+    ],
+    nexus_books: [
+      {
+        collector: {
+          top_docs: {
+            limit: page * 5,
+            offset: 0,
+            snippets: { description: 400, title: 140 },
+            explain: false,
+            fields: [],
+            scorer: {
+              scorer: {
+                eval_expr: `original_score * ${add_exp_decay(
+                  "issued_at",
+                  now - (now % 86400),
+                  365.25 * 14 * 86400,
+                  30 * 86400,
+                  0.85
+                )}`,
+              },
+            },
+          },
+        },
+      },
+      { collector: { count: {} } },
+    ],
+    nexus_media: [
+      {
+        collector: {
+          top_docs: {
+            limit: page * 5,
+            offset: 0,
+            snippets: { content: 400, title: 140 },
+            explain: false,
+            fields: [],
+            scorer: {
+              scorer: {
+                eval_expr: `original_score * ${add_exp_decay(
+                  "registered_at",
+                  now - (now % 86400),
+                  365.25 * 7 * 86400,
+                  30 * 86400,
+                  0.85
+                )}`,
+              },
+            },
+          },
+        },
+      },
+      { collector: { count: {} } },
+    ],
+  };
+  if (index_name in defaults) {
+    return defaults[index_name];
+  }
+  return defaults["default"];
+}
 
 export default defineComponent({
   name: "SearchView",
@@ -38,16 +125,18 @@ export default defineComponent({
     },
   },
   data() {
-    const web_index_store = useWebIndexStore();
     return {
-      indices: web_index_store.index_configs.keys(),
+      index_configs: useObservable(
+        liveQuery(async () => {
+          return db.index_configs.toArray();
+        })
+      ),
       loading: false,
       page: 1,
       query: "" as String,
       scored_documents: [],
       total_documents: null,
       has_next: false,
-      web_index_store: web_index_store,
     };
   },
   async created() {
@@ -86,28 +175,20 @@ export default defineComponent({
       }
       if (this.query) {
         this.loading = true;
-        const index_names = Array.from(
-          this.web_index_store.index_configs.entries()
-        )
-          .filter(([index_name, index]) => index.enabled)
-          .map(([index_name, index]) => index_name);
+        const enabled_index_configs = await db.index_configs
+          .filter((index_config) => index_config.is_enabled)
+          .toArray();
         let collector_outputs = await this.web_index_service.search(
-          index_names,
-          { query: { match: { value: this.query } } },
-          [
-            {
-              collector: {
-                top_docs: {
-                  limit: this.page * 5,
-                  offset: 0,
-                  snippets: { description: 400, title: 140, content: 400 },
-                  explain: false,
-                  fields: [],
-                },
-              },
-            },
-            { collector: { count: {} } },
-          ]
+          enabled_index_configs.map((index_config) => {
+            return {
+              index_name: index_config.index_payload.name,
+              query: { query: { match: { value: this.query } } },
+              collectors: default_collectors(
+                index_config.index_payload.name,
+                this.page
+              ),
+            };
+          })
         );
         this.scored_documents =
           collector_outputs[0].collector_output.top_docs.scored_documents.slice(

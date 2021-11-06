@@ -1,8 +1,10 @@
-use crate::errors::SummaResult;
-use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, HashSet};
+
+use serde::{Serialize, Serializer};
 use tantivy::schema::{Field, Schema};
 use tantivy::Document;
+
+use crate::errors::SummaResult;
 
 pub enum Value {
     SingleValue(Option<tantivy::schema::Value>),

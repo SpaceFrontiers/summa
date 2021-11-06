@@ -1,13 +1,15 @@
-use super::ExternalRequestGenerator;
-use crate::directories::ExternalRequest;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::{io, ops::Range, path::Path, sync::Arc, usize};
+
 use tantivy::directory::DirectoryClone;
 use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     AsyncIoResult, Directory, HasLen,
 };
+
+use super::ExternalRequestGenerator;
+use crate::directories::ExternalRequest;
 
 pub struct NetworkDirectory<TExternalRequest: ExternalRequest> {
     files: HashMap<String, usize>,

@@ -1,25 +1,26 @@
-use super::ConsumerConfig;
-use crate::configs::ConfigProxy;
-use crate::configs::ConfigReadProxy;
-use crate::configs::ConfigWriteProxy;
-use crate::configs::{ApplicationConfig, ApplicationConfigHolder, ConfigHolder, Persistable};
-use crate::errors::SummaResult;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 #[cfg(feature = "index-updater")]
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 use tantivy::schema::Schema;
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
+use super::ConsumerConfig;
+use crate::configs::ConfigProxy;
+use crate::configs::ConfigReadProxy;
+use crate::configs::ConfigWriteProxy;
+use crate::configs::{ApplicationConfig, ApplicationConfigHolder, ConfigHolder, Persistable};
 use crate::directories::Header;
+use crate::errors::SummaResult;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CachingConfig {
+pub struct ChunkedCacheConfig {
     pub chunk_size: usize,
-    pub cache_size: usize,
+    pub cache_size: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,7 +29,7 @@ pub struct NetworkConfig {
     pub method: String,
     pub url_template: String,
     pub headers_template: Vec<Header>,
-    pub caching_config: Option<CachingConfig>,
+    pub chunked_cache_config: Option<ChunkedCacheConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -75,7 +76,7 @@ pub struct IndexConfig {
 
 impl Debug for IndexConfig {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{}", &serde_yaml::to_string(&self).unwrap())
+        write!(f, "{}", &serde_yaml::to_string(&self).expect("Cannot serialize"))
     }
 }
 
@@ -156,10 +157,10 @@ impl<'a> IndexConfigFilePartWriteProxy<'a> {
 
 impl<'a> ConfigWriteProxy<IndexConfig> for IndexConfigFilePartWriteProxy<'a> {
     fn get(&self) -> &IndexConfig {
-        self.application_config.indices.get(&self.index_name).unwrap()
+        &self.application_config.indices[&self.index_name]
     }
     fn get_mut(&mut self) -> &mut IndexConfig {
-        self.application_config.indices.get_mut(&self.index_name).unwrap()
+        self.application_config.indices.get_mut(&self.index_name).expect("Not found IndexConfig")
     }
     fn commit(&self) -> SummaResult<()> {
         self.application_config.save()

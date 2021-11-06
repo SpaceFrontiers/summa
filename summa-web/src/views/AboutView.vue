@@ -1,52 +1,36 @@
 <template lang="pug">
-.font-monospace
-  h5.mb-3 Access Point for Knowledge Network
-  div
-    b.me-2 phase:
-    text 2b
-  div
-    b.me-2 epoch:
-    text {{ trantorianTime() }}gs ({{ now() }} Planetary Local Time)
-  h6.mb-3.mt-3 Log (automatically translated to the most spread Earth language)
+.font-monospace.small
+  h5 How to help us?
+  p.mt-4 Cryptos:
   ul
     li
-      b 2022-10
-      text  - started phase2b, initiated knowledge transferring to immutable carrier
+      b BTC:&nbsp;
+      text 3HooXUqJnZ4Ad8AGeqfSZ5QZQE72ZaZgY6
     li
-      b 2022-08
-      text  - locals are adopting novel approaches. seems that limits and recently mentioned obstacles are started to disappear
+      b ETH:&nbsp;
+      text 0x009AeabF4aeDe417d324077E7858956e6d0962D6
     li
-      b 2022-02
-      text  - ignorance still present. must double efforts.
-    li
-      b 2020-03
-      text  - started phase2, continue to increase availability of knowledge using local technological tools
-    li
-      b 2017-05
-      text  - widespread adoption of knowledge tools. observed general increase of stored knowledge in neural networks of local inhabitants
-    li
-      b 2011-09
-      text  - locals have created exchanging hub for knowledge. raw, unprocessed. however we are moving to the right direction
-    li
-      b 2008-07
-      text  - started phase1, explored target planet. found necessity to eliminate temporary obstacles for creation of cognitron. local inhabitants use primitive approaches to knowledge organizing
-
+      b XMR:&nbsp;
+      text 88NyLYKiuWPaNUoJrRTZQxNTT9JevoGHjacLaJp7F4UBVt9K6x3i7Khhgmap2bXRz6UczvNpu6XLS9GxoQ2RWdHQ3Kv4oMA
+  h5 Development
+  p.mt-4
+    text GitHub:&nbsp;
+    a(href="https://github.com/izihawa/summa") izihawa/summa
+  p
+    text TG Group:&nbsp;
+    a(href="https://t.me/summa_search") @summa_search
+  h5 Nexus Databases Development
+  p.mt-4
+    text TG Channel:&nbsp;
+    a(href="https://t.me/nexus_search") @nexus_search
+  p
+    text TG Group:&nbsp;
+    a(href="https://t.me/joinchat/SKgGpCnrzMdkMRxJ") SKgGpCnrzMdkMRxJ
 </template>
 <script lang="ts">
 import { defineComponent } from "vue";
 
 export default defineComponent({
-  name: "AboutView",
-  methods: {
-    now() {
-      const currentTime = new Date();
-      return `${currentTime.getFullYear()}-${String(
-        currentTime.getMonth() + 1
-      ).padStart(2, "0")}`;
-    },
-    trantorianTime() {
-      return 435196800;
-    },
-  },
+  name: "AboutView"
 });
 </script>

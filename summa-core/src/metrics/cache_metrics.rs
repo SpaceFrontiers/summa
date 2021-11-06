@@ -1,7 +1,8 @@
-use serde::ser::SerializeStruct;
-use serde::{Serialize, Serializer};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 
 #[derive(Clone, Default)]
 pub struct CacheMetrics {

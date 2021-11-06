@@ -1,5 +1,6 @@
-use crate::errors::SummaResult;
 use std::sync::Arc;
+
+use crate::errors::SummaResult;
 
 #[async_trait]
 pub trait ConfigProxy<TConfig>: Send + Sync {

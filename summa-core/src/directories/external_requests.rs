@@ -1,11 +1,14 @@
-use crate::configs::NetworkConfig;
-use crate::errors::SummaResult;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Range;
+
+use serde::{Deserialize, Serialize};
 use strfmt::strfmt;
+
+use crate::configs::NetworkConfig;
+use crate::errors::{SummaResult, ValidationError};
+use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,12 +70,12 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         for header in self.network_config.headers_template.iter() {
             headers.push(Header {
                 name: header.name.clone(),
-                value: strfmt(&header.value, &vars).unwrap(),
+                value: strfmt(&header.value, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
             });
         }
         Ok(TExternalRequest::new(
             &self.network_config.method,
-            &strfmt(&self.network_config.url_template, &vars).unwrap(),
+            &strfmt(&self.network_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
             &headers,
         ))
     }

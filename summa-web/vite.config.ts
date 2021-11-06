@@ -15,7 +15,7 @@ export default defineConfig({
       input: {
         index: "./index.html",
         "service-worker": "./service-worker.js",
-        localforage: "./node_modules/localforage/dist/localforage.js",
+        dexie: "./node_modules/dexie/dist/dexie.min.js",
       },
       output: {
         entryFileNames: (asset_info) => {
@@ -47,9 +47,9 @@ export default defineConfig({
     include: [
       "@libp2p/logger",
       "@multiformats/multiaddr",
+      "dexie",
       "ipfs-core-types",
       "ipfs-http-client",
-      "localforage",
       "merge-options",
       "summa-wasm",
     ],

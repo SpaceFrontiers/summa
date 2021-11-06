@@ -1,8 +1,9 @@
-use super::SummaSegmentAttributes;
-use crate::errors::{SummaResult, ValidationError};
 use tantivy::schema::{Field, FieldType};
 use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
 use tracing::info;
+
+use super::SummaSegmentAttributes;
+use crate::errors::{SummaResult, ValidationError};
 
 /// Managing write operations to index
 pub struct IndexWriterHolder {
