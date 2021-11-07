@@ -7,16 +7,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 jobs:
-  test:
-    runs-on: ubuntu-20.04
-    steps:
-      - uses: actions/checkout@v3
-      - run: cargo test
   cargo-publish:
     needs: test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
       - uses: actions-rs/toolchain@v1.0.7
         with:
           toolchain: stable
@@ -46,9 +43,11 @@ jobs:
           args: --verbose
   push-to-docker:
     needs: test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
       - uses: actions-rs/toolchain@v1.0.7
         with:
           toolchain: stable

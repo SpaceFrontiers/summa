@@ -78,7 +78,7 @@ impl Application {
                 Ok(())
             }
             Some(("serve", submatches)) => {
-                let config_path = submatches.get_one::<PathBuf>("CONFIG").unwrap();
+                let config_path = PathBuf::from(submatches.get_one::<String>("CONFIG").unwrap());
                 let application_config_holder = ApplicationConfigHolder::from_path(config_path)?;
                 let _guards = {
                     let application_config = application_config_holder.read().await;
