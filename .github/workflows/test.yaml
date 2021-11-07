@@ -9,14 +9,18 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
-      - name: Install Protobuf Headers
-        run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      - name: Install Protobuf Headers
-        run: sudo apt-get install -y libprotobuf-dev
-      - uses: bazelbuild/setup-bazelisk@v2
-      - name: Mount bazel cache
-        uses: actions/cache@v3
+      - uses: actions-rs/toolchain@v1.0.7
         with:
-          path: "~/.cache/bazel"
-          key: ${{ runner.os }}-bazel
-      - run: bazel test -c opt :tests
+          toolchain: stable
+      - uses: actions/cache@v2.1.6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions-rs/cargo@v1.0.3
+        with:
+          command: test

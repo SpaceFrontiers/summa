@@ -11,21 +11,17 @@ import {
   ipfs,
   ipfs_hostname,
   ipfs_http_protocol,
-  ipfs_url,
 } from "@/services/ipfs";
 import { NetworkConfig } from "summa-wasm/network-config";
 import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
-import { support_subdomains } from "@/options";
 
 const default_index_seeds = [
   {
-    ipns_path:
-      "/ipns/k51qzi5uqu5dl73ko65n1dhgj1uxkcomabckudr8at1n7g6jm87upcbvvn6xdt/",
+    ipns_path: "/ipns/nexus-books.eth/",
     is_enabled: true,
   },
   {
-    ipns_path:
-      "/ipns/k51qzi5uqu5dkr0d4zdv93jrwvbbwqyr2snps0yff6htztbr1db16v19oaxiej/",
+    ipns_path: "/ipns/nexus-media.eth/",
     is_enabled: false,
   },
 ];
@@ -88,20 +84,12 @@ export class WebIndexService {
     const ipfs_hash = ipfs_path.split("/")[2] as string;
     this.status_callback("status", `resolving files...`);
     const files = await ipfs.ls(ipfs_hash);
-    let network_config = new NetworkConfig(
+    const network_config = new NetworkConfig(
       "GET",
       `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
       [{ name: "range", value: "bytes={start}-{end}" }],
       files
     );
-    if (!support_subdomains) {
-      network_config = new NetworkConfig(
-        "GET",
-        `${ipfs_url}/ipfs/${ipfs_hash}/{file_name}`,
-        [{ name: "range", value: "bytes={start}-{end}" }],
-        files
-      );
-    }
     const index_payload = await this.web_index_service_worker.add(
       network_config
     );

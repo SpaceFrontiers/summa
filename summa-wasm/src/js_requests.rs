@@ -1,5 +1,5 @@
-use async_channel::bounded;
 use js_sys::Uint8Array;
+use tokio::sync::mpsc::unbounded_channel;
 use summa_core::directories::{ExternalRequest, Header};
 use summa_core::errors::SummaResult;
 use wasm_bindgen::prelude::*;
@@ -47,7 +47,7 @@ impl ExternalRequest for JsExternalRequest {
     }
 
     async fn request_async(&self) -> SummaResult<Vec<u8>> {
-        let (sender, receiver) = bounded(1);
+        let (sender, mut receiver) = unbounded_channel();
         let method = self.method.to_string();
         let url = self.url.to_string();
         let headers = self.headers.clone();
@@ -57,7 +57,7 @@ impl ExternalRequest for JsExternalRequest {
                 .await
                 .map(|response| Uint8Array::new(&response).to_vec())
                 .map_err(|e| summa_core::Error::External(format!("{:?}", e)));
-            sender.send(response).await.unwrap_throw();
+            sender.send(response).unwrap_throw();
         });
         let array = receiver.recv().await.unwrap_throw()?;
         Ok(array)

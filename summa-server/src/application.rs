@@ -62,7 +62,7 @@ impl Application {
 
         match matches.subcommand() {
             Some(("generate-config", submatches)) => {
-                let data_path = submatches.get_one::<PathBuf>("DATA_PATH").unwrap();
+                let data_path = PathBuf::from(submatches.get_one::<String>("DATA_PATH").unwrap());
                 let grpc_endpoint = submatches.get_one::<String>("GRPC_ENDPOINT").unwrap();
                 let metrics_endpoint = submatches.get_one::<String>("METRICS_ENDPOINT").unwrap();
                 let ipfs_api_endpoint = submatches.get_one::<String>("IPFS_API_ENDPOINT");

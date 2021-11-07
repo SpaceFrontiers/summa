@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,6 @@ use summa_core::directories::DefaultExternalRequestGenerator;
 use tantivy::Executor;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
-use summa_proto::proto;
 
 use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;

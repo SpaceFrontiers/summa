@@ -18,6 +18,7 @@ test-utils = []
 
 [build-dependencies]
 prost-build = { version = "0.11.0" }
+protoc-bin-vendored = "3.0.0"
 tonic-build = { version = "0.8.0", default-features = false, features = ["prost", "transport"], optional = true }
 
 [dependencies]

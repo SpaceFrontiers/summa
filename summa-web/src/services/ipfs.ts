@@ -1,6 +1,5 @@
 import axios from "axios";
 import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
-import {support_subdomains} from "@/options";
 
 function detect_ipfs_url(hostname: string) {
   let ipfs_url = hostname;
@@ -45,32 +44,21 @@ export const ipfs_http_protocol = parsed_url.protocol;
 
 function get_ipfs_url(options: {
   ipfs_hash?: string;
-  ipns_hash?: string;
+  ipns_name?: string;
+  eth_subdomain?: string;
   file_name?: string;
-  subdomain: boolean;
 }) {
-  const { ipfs_hash, ipns_hash, file_name, subdomain } = options;
-  let url = "";
-  if (subdomain) {
-    url = ipfs_http_protocol + "//";
-    if (ipfs_hash) {
-      url += ipfs_hash + ".ipfs.";
-    } else if (ipns_hash) {
-      url += ipns_hash + ".ipns.";
-    } else {
-      throw new Error("No IPFS or IPNS hashes");
-    }
-    url += ipfs_hostname;
+  const { ipfs_hash, ipns_name, file_name } =
+    options;
+  let url = ipfs_http_protocol + "//";
+  if (ipfs_hash) {
+    url += ipfs_hash + ".ipfs.";
+  } else if (ipns_name) {
+    url += ipns_name + ".ipns.";
   } else {
-    url = ipfs_url + "/";
-    if (ipfs_hash) {
-      url += "ipfs/" + ipfs_hash;
-    } else if (ipns_hash) {
-      url += "ipns/" + ipns_hash;
-    } else {
-      throw new Error("No IPFS or IPNS hashes");
-    }
+    throw new Error("No IPFS or IPNS hashes");
   }
+  url += ipfs_hostname;
   url += "/";
   if (file_name !== undefined) {
     return `${url}${file_name}`;
@@ -85,7 +73,6 @@ async function resolve_file(
   const file_url = get_ipfs_url({
     ipfs_hash: ipfs_hash,
     file_name: file_name,
-    subdomain: support_subdomains,
   });
   if (file_name.endsWith(".json")) {
     const response = await axios.get(file_url, {
@@ -102,16 +89,18 @@ async function resolve_file(
 }
 
 export class IPFSGatewayClient {
-  async resolve(ipns_hash: string): Promise<string> {
+  async resolve(ipns_name: string): Promise<string> {
     const response = await axios.get(
-      get_ipfs_url({ ipns_hash: ipns_hash, subdomain: support_subdomains })
+      get_ipfs_url({ ipns_name: ipns_name })
     );
     return "/ipfs/" + response.headers["x-ipfs-roots"];
   }
 
   async ls(ipfs_hash: string) {
     const response = await axios.get(
-      get_ipfs_url({ ipfs_hash: ipfs_hash, subdomain: support_subdomains })
+      get_ipfs_url({
+        ipfs_hash: ipfs_hash,
+      })
     );
     const parser = new DOMParser();
     const html_doc = parser.parseFromString(response.data, "text/html");
@@ -131,3 +120,4 @@ export class IPFSGatewayClient {
   }
 }
 export const ipfs = new IPFSGatewayClient();
+console.debug("IPFS URL", ipfs_url);

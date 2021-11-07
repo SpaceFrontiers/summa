@@ -11,22 +11,15 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
-      - uses: bazelbuild/setup-bazelisk@v2
-      - name: Install Protobuf Headers
-        run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      - name: Mount bazel cache
-        uses: actions/cache@v3
-        with:
-          path: "~/.cache/bazel"
-          key: ${{ runner.os }}-bazel
-      - run: bazel test -c opt //tests
+      - run: cargo test
   cargo-publish:
     needs: test
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
+      - uses: actions-rs/toolchain@v1.0.7
+        with:
+          toolchain: stable
       - uses: actions/cache@v2.1.6
         with:
           path: |
@@ -56,12 +49,18 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
-      - uses: bazelbuild/setup-bazelisk@v2
-      - name: Mount bazel cache
-        uses: actions/cache@v3
+      - uses: actions-rs/toolchain@v1.0.7
         with:
-          path: "~/.cache/bazel"
-          key: ${{ runner.os }}-bazel
+          toolchain: stable
+      - uses: actions/cache@v2.1.6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
       - name: Login to DockerHub
@@ -69,23 +68,4 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - run: DOCKER_CONFIG=$HOME/.docker bazel run -c opt //:push-summa-server
-  twine-upload:
-    needs: test
-    runs-on: ubuntu-20.04
-    steps:
-      - uses: actions/checkout@v3
-      - uses: bazelbuild/setup-bazelisk@v2
-      - name: Mount bazel cache
-        uses: actions/cache@v3
-        with:
-          path: "~/.cache/bazel"
-          key: ${{ runner.os }}-bazel
-      - uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
-      - uses: BSFishy/pip-action@v1
-        with:
-          packages: |
-            twine
-      - run: bazel build -c opt //aiosumma:aiosumma-wheel && TWINE_USERNAME=${{ secrets.TWINE_USERNAME }} TWINE_PASSWORD=${{ secrets.TWINE_PASSWORD }} twine upload bazel-bin/aiosumma/*.whl || /bin/true
+      - run: DOCKER_CONFIG=$HOME/.docker summa-server/push-to-docker.sh
