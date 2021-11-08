@@ -2,12 +2,11 @@
 //!
 //! Index GRPC API is using for managing indices
 
-use crate::errors::SummaServerResult;
-use crate::services::IndexService;
 use std::error::Error;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::time::Instant;
+
 use summa_core::components::{IndexHolder, SummaDocument};
 use summa_core::configs::{ApplicationConfigHolder, Persistable};
 use summa_proto::proto;
@@ -16,6 +15,9 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info_span, warn};
 use tracing_futures::Instrument;
+
+use crate::errors::SummaServerResult;
+use crate::services::IndexService;
 
 #[derive(Clone)]
 pub struct IndexApiImpl {

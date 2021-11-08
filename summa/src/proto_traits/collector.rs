@@ -1,10 +1,12 @@
 use std::cmp::Ordering;
+
 use crate::proto;
 
 #[cfg(feature = "test-utils")]
 pub mod shortcuts {
-    use crate::proto;
     use std::collections::HashMap;
+
+    use crate::proto;
 
     pub fn top_docs_collector(limit: u32) -> proto::Collector {
         proto::Collector {
@@ -60,11 +62,11 @@ impl PartialOrd for proto::score::Score {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         let a = match self {
             proto::score::Score::F64Score(score) => *score,
-            proto::score::Score::U64Score(score) => *score as f64
+            proto::score::Score::U64Score(score) => *score as f64,
         };
         let b = match other {
             proto::score::Score::F64Score(score) => *score,
-            proto::score::Score::U64Score(score) => *score as f64
+            proto::score::Score::U64Score(score) => *score as f64,
         };
         a.partial_cmp(&b)
     }

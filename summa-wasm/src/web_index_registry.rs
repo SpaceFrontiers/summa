@@ -42,12 +42,7 @@ impl WebIndexRegistry {
     #[wasm_bindgen]
     pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
         let index_queries: Vec<IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
-        Ok(self
-            .index_registry
-            .search(&index_queries)
-            .await
-            .map_err(Error::from)?
-            .serialize(&*SERIALIZER)?)
+        Ok(self.index_registry.search(&index_queries).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
     #[wasm_bindgen]
@@ -60,9 +55,7 @@ impl WebIndexRegistry {
     pub async fn get_index_payload(&self, index_name: &str) -> Result<JsValue, JsValue> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
         let index_payload = index_holder.index_payload().ok().flatten();
-        let index_payload = index_payload
-            .map(|index_payload| serde_json::from_str::<IndexPayload>(&index_payload).ok())
-            .flatten();
+        let index_payload = index_payload.and_then(|index_payload| serde_json::from_str::<IndexPayload>(&index_payload).ok());
         Ok(index_payload.serialize(&*SERIALIZER)?)
     }
 

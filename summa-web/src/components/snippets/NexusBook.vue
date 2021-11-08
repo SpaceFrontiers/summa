@@ -12,7 +12,7 @@ div(style="transform: rotate(0);")
 <script lang="ts">
 // @ts-nocheck
 import { defineComponent } from "vue";
-import { ipfs_url } from "@/services/ipfs";
+import {ipfs_url, is_eth_hostname, is_supporting_subdomains} from "@/options";
 import { format_bytes } from "@/utils";
 
 export default defineComponent({
@@ -63,7 +63,10 @@ export default defineComponent({
     },
     mono_link() {
       if (this.document["ipfs_multihashes"] !== undefined) {
-        return `${ipfs_url}/ipfs/${this.document["ipfs_multihashes"][0]}?filename=${this.filename}&download=true`;
+        if (!is_eth_hostname) {
+          return `${ipfs_url}/ipfs/${this.document["ipfs_multihashes"][0]}?filename=${this.filename}&download=true`;
+        }
+        return `https://ipfs.io/ipfs/${this.document["ipfs_multihashes"][0]}?filename=${this.filename}&download=true`;
       }
       return this.telegram_link;
     },

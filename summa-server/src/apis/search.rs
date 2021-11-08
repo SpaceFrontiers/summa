@@ -2,12 +2,14 @@
 //!
 //! Search GRPC API is using for querying indices
 
-use crate::errors::SummaServerResult;
-use crate::services::IndexService;
 use std::time::Instant;
+
 use summa_proto::proto;
 use tonic::{Request, Response, Status};
 use tracing::{info_span, Instrument};
+
+use crate::errors::SummaServerResult;
+use crate::services::IndexService;
 
 #[derive(Debug)]
 pub struct SearchApiImpl {

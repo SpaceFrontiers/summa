@@ -1,8 +1,8 @@
-import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
 import type { IndexPayload } from "summa-wasm/web-index-service";
 import type { NetworkConfig } from "summa-wasm/network-config";
 import Dexie from "dexie";
 import { toRaw } from "vue";
+import type { StatusCallback } from "@/services/web-index-service";
 
 class SummaDatabase extends Dexie {
   index_configs!: Dexie.Table<IIndexConfig, string>;
@@ -16,11 +16,18 @@ class SummaDatabase extends Dexie {
   }
 }
 
+export interface IIndexSeed {
+  retrieve_network_config(
+    status_callback: StatusCallback
+  ): Promise<NetworkConfig>;
+  get_ipns(): string;
+}
+
 interface IIndexConfig {
   is_enabled: boolean;
   is_warm_up: boolean;
   index_payload: IndexPayload;
-  ipns_path: IPFSPath;
+  ipns_path: string;
   network_config: NetworkConfig;
 }
 
@@ -28,14 +35,14 @@ export class IndexConfig implements IIndexConfig {
   is_enabled: boolean;
   is_warm_up: boolean;
   index_payload: IndexPayload;
-  ipns_path: IPFSPath;
+  ipns_path: string;
   network_config: NetworkConfig;
 
   constructor(
     is_enabled: boolean,
     is_warm_up: boolean,
     index_payload: IndexPayload,
-    ipns_path: IPFSPath,
+    ipns_path: string,
     network_config: NetworkConfig
   ) {
     this.is_enabled = is_enabled;
@@ -43,10 +50,6 @@ export class IndexConfig implements IIndexConfig {
     this.index_payload = index_payload;
     this.ipns_path = ipns_path;
     this.network_config = network_config;
-  }
-
-  get_pin_command(): string {
-    return "ipfs name resolve " + this.ipns_path + " | ipfs pin add";
   }
 
   save() {

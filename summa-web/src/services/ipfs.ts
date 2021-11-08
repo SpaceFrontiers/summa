@@ -1,51 +1,37 @@
 import axios from "axios";
 import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
+import { ipfs_hostname, ipfs_http_protocol, ipfs_url } from "@/options";
 
-function detect_ipfs_url(hostname: string) {
-  let ipfs_url = hostname;
-  if (
-    process.env.NODE_ENV === "development" ||
-    window.location.port === "4173"
-  ) {
-    return "http://localhost:8080";
+export class IPFSGatewayClient {
+  async resolve(ipns_name: string): Promise<string> {
+    const response = await axios.get(get_ipfs_url({ ipns_name: ipns_name }));
+    return "/ipfs/" + response.headers["x-ipfs-roots"];
   }
-  const hostname_parts = window.location.hostname.split(".");
-  if (hostname_parts[-1] === "localhost") {
-    ipfs_url = "http://localhost";
-  } else if (window.location.hostname === "ipfs.io") {
-    ipfs_url = "https://ipfs.io";
-  } else {
-    const ipfs_domain_index = hostname_parts.findIndex(
-      (el) => el === "ipfs" || el === "ipns"
-    );
-    if (ipfs_domain_index !== undefined) {
-      ipfs_url = `${window.location.protocol}//${hostname_parts
-        .slice(ipfs_domain_index + 1)
-        .join(".")}`;
-    }
-  }
-  if (
-    window.location.port !== undefined &&
-    window.location.port !== "" &&
-    window.location.port !== "80"
-  ) {
-    ipfs_url = `${ipfs_url}:${window.location.port}`;
-  }
-  return ipfs_url;
-}
-export const ipfs_url = detect_ipfs_url(window.location.hostname);
-const parsed_url = new URL(ipfs_url);
-let hostname = parsed_url.hostname;
-if (parsed_url.port !== "") {
-  hostname += ":" + parsed_url.port;
-}
-export const ipfs_hostname = hostname;
-export const ipfs_http_protocol = parsed_url.protocol;
 
-function get_ipfs_url(options: {
+  async ls(url: string) {
+    const response = await axios.get(url);
+    const parser = new DOMParser();
+    const html_doc = parser.parseFromString(response.data, "text/html");
+    const promises: Promise<[string, number]>[] = Array.from(
+      html_doc.querySelectorAll("tr td:nth-child(2) a")
+    )
+      .map((e) => e.innerHTML)
+      .filter((file_name) => file_name !== "..")
+      .map((file_name) => resolve_file(url, file_name));
+    return new Map(await Promise.all(promises));
+  }
+  async cat(ipfs_name: IPFSPath) {
+    const response = await axios.get(`${ipfs_url}${ipfs_name}`, {
+      responseType: "arraybuffer",
+    });
+    return new Uint8Array(response.data);
+  }
+}
+export const ipfs = new IPFSGatewayClient();
+
+export function get_ipfs_url(options: {
   ipfs_hash?: string;
   ipns_name?: string;
-  eth_subdomain?: string;
   file_name?: string;
 }) {
   const { ipfs_hash, ipns_name, file_name } =
@@ -67,18 +53,15 @@ function get_ipfs_url(options: {
 }
 
 async function resolve_file(
-  ipfs_hash: string,
+  url: string,
   file_name: string
 ): Promise<[string, number]> {
-  const file_url = get_ipfs_url({
-    ipfs_hash: ipfs_hash,
-    file_name: file_name,
-  });
+  const file_url = url + file_name;
   if (file_name.endsWith(".json")) {
-    const response = await axios.get(file_url, {
+    const response = await axios.get(url, {
       responseType: "arraybuffer",
     });
-    return [file_name, response.data.byteLength as number];
+    return [file_url, response.data.byteLength as number];
   } else {
     const file_response = await axios.head(file_url);
     return [
@@ -87,37 +70,3 @@ async function resolve_file(
     ];
   }
 }
-
-export class IPFSGatewayClient {
-  async resolve(ipns_name: string): Promise<string> {
-    const response = await axios.get(
-      get_ipfs_url({ ipns_name: ipns_name })
-    );
-    return "/ipfs/" + response.headers["x-ipfs-roots"];
-  }
-
-  async ls(ipfs_hash: string) {
-    const response = await axios.get(
-      get_ipfs_url({
-        ipfs_hash: ipfs_hash,
-      })
-    );
-    const parser = new DOMParser();
-    const html_doc = parser.parseFromString(response.data, "text/html");
-    const promises: Promise<[string, number]>[] = Array.from(
-      html_doc.querySelectorAll("tr td:nth-child(2) a")
-    )
-      .map((e) => e.innerHTML)
-      .filter((file_name) => file_name !== "..")
-      .map((file_name) => resolve_file(ipfs_hash, file_name));
-    return new Map(await Promise.all(promises));
-  }
-  async cat(ipfs_name: IPFSPath) {
-    const response = await axios.get(`${ipfs_url}${ipfs_name}`, {
-      responseType: "arraybuffer",
-    });
-    return new Uint8Array(response.data);
-  }
-}
-export const ipfs = new IPFSGatewayClient();
-console.debug("IPFS URL", ipfs_url);

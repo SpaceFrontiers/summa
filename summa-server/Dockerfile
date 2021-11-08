@@ -3,5 +3,5 @@ RUN apt install zlib1g
 
 FROM gcr.io/distroless/cc
 COPY --from=build-env /lib/x86_64-linux-gnu/libz.so.1 /lib/x86_64-linux-gnu/libz.so.1
-COPY target/release/summa-server-bin /bin/
-ENTRYPOINT ["/bin/summa-server-bin"]
+COPY summa-server-bin /bin/summa-server
+ENTRYPOINT ["/bin/summa-server"]

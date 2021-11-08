@@ -1,8 +1,9 @@
-use crate::errors::{Error, SummaServerResult};
-use crate::requests::validators;
 use summa_proto::proto;
 use tantivy::schema::Schema;
 use tantivy::IndexSortByField;
+
+use crate::errors::{Error, SummaServerResult};
+use crate::requests::validators;
 
 #[derive(Builder)]
 pub struct CreateIndexRequest {

@@ -2,11 +2,12 @@
 //!
 //! Consumer GRPC API is using for managing Kafka consumers
 
+use summa_proto::proto;
+use tonic::{Request, Response, Status};
+
 use crate::errors::SummaServerResult;
 use crate::requests::CreateConsumerRequest;
 use crate::services::IndexService;
-use summa_proto::proto;
-use tonic::{Request, Response, Status};
 
 pub struct ConsumerApiImpl {
     index_service: IndexService,

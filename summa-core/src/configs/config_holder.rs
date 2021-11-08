@@ -94,19 +94,15 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> Loadable for ConfigHolder<TConfig
 
 impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
     fn save(&self) -> SummaResult<()> {
-        self.config_filepath
-            .as_ref()
-            .map(|config_filepath| {
-                std::fs::File::create(config_filepath)
-                    .and_then(|mut file| {
-                        let mut vec = Vec::with_capacity(128);
-                        to_writer(&mut vec, &self.config).unwrap();
-                        file.write_all(&vec)
-                    })
-                    .map_err(|e| Error::IO((e, Some(config_filepath.to_path_buf()))))?;
-                Ok(())
-            })
-            .unwrap_or_else(|| Err(Error::Validation(ValidationError::MissingPath(PathBuf::new()))))?;
+        if let Some(config_filepath) = &self.config_filepath {
+            std::fs::File::create(config_filepath)
+                .and_then(|mut file| {
+                    let mut vec = Vec::with_capacity(128);
+                    to_writer(&mut vec, &self.config).unwrap();
+                    file.write_all(&vec)
+                })
+                .map_err(|e| Error::IO((e, Some(config_filepath.to_path_buf()))))?;
+        }
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
-use crate::errors::{Error, SummaServerResult};
 use summa_proto::proto;
 use tantivy::IndexSortByField;
+
+use crate::errors::{Error, SummaServerResult};
 
 #[derive(Builder)]
 pub struct AlterIndexRequest {

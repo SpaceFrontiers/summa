@@ -1,13 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use futures::future::join_all;
 use rustc_hash::FxHashMap;
 use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
-use tantivy::{DocAddress, DocId, Document, Score, Searcher, SegmentReader, SnippetGenerator};
+use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerator};
 
 use super::custom_serializer::NamedFieldDocument;
 use crate::collectors;
@@ -24,21 +23,11 @@ pub trait FruitExtractor: Sync + Send {
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> SummaResult<proto::CollectorOutput>;
-
-    async fn extract_async(
-        self: Box<Self>,
-        external_index_alias: &str,
-        multi_fruit: &mut MultiFruit,
-        searcher: &Searcher,
-        multi_fields: &HashSet<Field>,
-    ) -> SummaResult<proto::CollectorOutput> {
-        self.extract(external_index_alias, multi_fruit, searcher, multi_fields)
-    }
 }
 
 pub fn parse_aggregations(aggregations: &HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
     let aggregations = aggregations
-        .into_iter()
+        .iter()
         .map(|(name, aggregation)| {
             let aggregation = match &aggregation.aggregation {
                 None => Err(Error::Proto(summa_proto::errors::Error::InvalidAggregation)),
@@ -165,38 +154,6 @@ pub fn build_fruit_extractor(
     }
 }
 
-fn extract_base<T: 'static + Copy + Into<proto::Score> + Sync + Send>(
-    scored_documents_iter: impl Iterator<Item = (T, Document)>,
-    external_index_alias: &str,
-    schema: &Schema,
-    has_next: bool,
-    fields: &Option<HashSet<Field>>,
-    multi_fields: &HashSet<Field>,
-    snippet_generators: HashMap<String, SnippetGenerator>,
-) -> SummaResult<proto::CollectorOutput> {
-    let scored_documents = scored_documents_iter
-        .enumerate()
-        .map(|(position, (score, document))| {
-            Ok(proto::ScoredDocument {
-                document: NamedFieldDocument::from_document(schema, fields, multi_fields, &document).to_json()?,
-                score: Some(score.into()),
-                position: position as u32,
-                snippets: snippet_generators
-                    .iter()
-                    .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
-                    .collect(),
-                index_alias: external_index_alias.to_string(),
-            })
-        })
-        .collect::<SummaResult<_>>()?;
-    Ok(proto::CollectorOutput {
-        collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
-            scored_documents,
-            has_next,
-        })),
-    })
-}
-
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(error = "ValidationError"))]
 pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
@@ -236,48 +193,31 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let fruit = self.handle.extract(multi_fruit);
         let length = fruit.len();
 
-        let scored_documents = fruit
-            .iter()
-            .take(std::cmp::min(self.limit as usize, length))
-            .map(|(score, doc_address)| (*score, searcher.doc(*doc_address).expect("Document retrieving failed")));
-        extract_base(
-            scored_documents,
-            external_index_alias,
-            searcher.schema(),
-            length > self.limit as usize,
-            &self.fields,
-            multi_fields,
-            snippet_generators,
-        )
-    }
-
-    async fn extract_async(
-        self: Box<Self>,
-        external_index_alias: &str,
-        multi_fruit: &mut MultiFruit,
-        searcher: &Searcher,
-        multi_fields: &HashSet<Field>,
-    ) -> SummaResult<proto::CollectorOutput> {
-        let snippet_generators = self.snippet_generators(searcher);
-        let fruit = self.handle.extract(multi_fruit);
-        let length = fruit.len();
-
-        let scored_documents = join_all(
-            fruit
-                .iter()
-                .take(std::cmp::min(self.limit as usize, length))
-                .map(|(score, doc_address)| async move { (*score, searcher.doc_async(*doc_address).await.expect("Document retrieving failed")) }),
-        )
-        .await;
-        extract_base(
-            scored_documents.into_iter(),
-            external_index_alias,
-            searcher.schema(),
-            length > self.limit as usize,
-            &self.fields,
-            multi_fields,
-            snippet_generators,
-        )
+        let scored_documents = fruit.iter().take(std::cmp::min(self.limit as usize, length));
+        let scored_documents = searcher.index().search_executor().map(
+            |(position, (score, doc_address))| {
+                let document = searcher.doc(*doc_address).expect("Document retrieving failed");
+                Ok(proto::ScoredDocument {
+                    document: NamedFieldDocument::from_document(searcher.schema(), &self.fields, multi_fields, &document)
+                        .to_json()
+                        .unwrap(),
+                    score: Some((*score).into()),
+                    position: position as u32,
+                    snippets: snippet_generators
+                        .iter()
+                        .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
+                        .collect(),
+                    index_alias: external_index_alias.to_string(),
+                })
+            },
+            scored_documents.enumerate(),
+        )?;
+        Ok(proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+                scored_documents,
+                has_next: length > self.limit as usize,
+            })),
+        })
     }
 }
 

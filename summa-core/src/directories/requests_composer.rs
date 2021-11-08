@@ -77,9 +77,9 @@ mod tests {
         let chunk_generator_2 = ChunkGenerator::new(20..30, 30, 3);
         let chunks_1 = chunk_generator_1.collect::<Vec<_>>();
         let chunks_2 = chunk_generator_2.collect::<Vec<_>>();
-        let requests = compose_requests_for_chunks(chunks_1.into_iter().chain(chunks_2.into_iter()).collect::<Vec<_>>().into_iter());
+        let requests = RequestsComposer::for_chunks(chunks_1.into_iter().chain(chunks_2.into_iter()).collect::<Vec<_>>());
         assert_eq!(
-            &requests[..],
+            &requests.requests()[..],
             &[
                 Request {
                     first_chunk: Chunk {

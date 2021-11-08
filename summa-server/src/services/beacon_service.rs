@@ -1,10 +1,12 @@
-use crate::errors::SummaServerResult;
-use crate::ipfs_client::IpfsClient;
 use std::fmt::Debug;
 use std::sync::Arc;
+
 use summa_core::components::{IndexFilePath, IndexHolder};
 use summa_core::configs::{IndexEngine, IpfsConfig};
 use tracing::instrument;
+
+use crate::errors::SummaServerResult;
+use crate::ipfs_client::IpfsClient;
 
 #[derive(Clone, Debug, Default)]
 pub struct BeaconService {

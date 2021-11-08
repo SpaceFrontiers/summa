@@ -2,10 +2,11 @@
 //!
 //! Beacon GRPC API is using for distributing index
 
-use crate::errors::SummaServerResult;
-use crate::services::{BeaconService, IndexService};
 use summa_proto::proto;
 use tonic::{Request, Response, Status};
+
+use crate::errors::SummaServerResult;
+use crate::services::{BeaconService, IndexService};
 
 pub struct BeaconApiImpl {
     beacon_service: BeaconService,

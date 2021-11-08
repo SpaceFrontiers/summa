@@ -11,7 +11,7 @@ form.mb-4.col-md-7
         p.card-text {{ index_config.index_payload.description  }}
         hr
         .card-body.small
-          a.lh-1.link-dark(href="#" @click.stop.prevent="to_clipboard(index_config.get_pin_command())") Copy pin
+          a.lh-1.link-dark(href="#" @click.stop.prevent="to_clipboard(index_config.ipns_path)") Copy pin
           span.lh-1  command and insert it into your Terminal app for caching database locally for better performance
           .row
             hr.mt-4
@@ -22,8 +22,8 @@ form.mb-4.col-md-7
               span.lh-1 Cache most important index parts in browser for better performance
           .row
             .form-check.col-4.mt-4
-              input.form-check-input(type="checkbox" id="checkbox_enabled" v-model="index_config.is_enabled" @change="index_config.save()")
-              label.form-check-label(for="checkbox_enabled") Enabled
+              input.form-check-input(type="checkbox" :id="'checkbox_enabled' + index_config.name" v-model="index_config.is_enabled" @change="index_config.save()")
+              label.form-check-label(:for="'checkbox_enabled' + index_config.name") Enabled
           .btn-group(role="group").float-end
             button.btn.btn-danger.btn-sm(type="button" @click.stop.prevent="web_index_service.delete_index(index_config.index_payload.name)")
               i.bi-trash
@@ -57,8 +57,10 @@ export default defineComponent({
     };
   },
   methods: {
-    to_clipboard(command: string) {
-      navigator.clipboard.writeText(command);
+    to_clipboard(ipns_path: string) {
+      navigator.clipboard.writeText(
+        "ipfs name resolve " + ipns_path + " | ipfs pin add"
+      );
     },
     format_bytes: format_bytes,
     async install_new_index(ipns_path: string) {

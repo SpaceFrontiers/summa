@@ -1,7 +1,8 @@
-use opentelemetry::metrics::{Histogram, Unit};
-use opentelemetry::{global, Context, KeyValue};
 use std::collections::HashMap;
 use std::iter;
+
+use opentelemetry::metrics::{Histogram, Unit};
+use opentelemetry::{global, Context, KeyValue};
 use summa_core::components::IndexHolder;
 
 #[derive(Clone)]

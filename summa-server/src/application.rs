@@ -1,15 +1,17 @@
+use std::future::Future;
+use std::path::PathBuf;
+
+use async_broadcast::Receiver;
+use clap::{arg, command};
+use futures::try_join;
+use summa_core::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder};
+use summa_core::utils::thread_handler::ControlMessage;
+
 use crate::errors::SummaServerResult;
 use crate::logging;
 use crate::servers::{GrpcServer, MetricsServer};
 use crate::services::{BeaconService, IndexService};
 use crate::utils::signal_channel;
-use async_broadcast::Receiver;
-use clap::{arg, command};
-use futures::try_join;
-use std::future::Future;
-use std::path::PathBuf;
-use summa_core::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder};
-use summa_core::utils::thread_handler::ControlMessage;
 
 pub struct Application {
     config: ApplicationConfigHolder,
@@ -118,16 +120,18 @@ impl Application {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::services::index_service::tests::create_test_schema;
-    use async_broadcast::broadcast;
     use std::default::Default;
     use std::path::Path;
+
+    use async_broadcast::broadcast;
     use summa_core::configs::application_config::tests::create_test_application_config;
     use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
     use summa_proto::proto;
     use summa_proto::proto::index_api_client::IndexApiClient;
     use tonic::transport::Channel;
+
+    use super::*;
+    use crate::services::index_service::tests::create_test_schema;
 
     async fn create_index_api_client(endpoint: &str) -> IndexApiClient<Channel> {
         IndexApiClient::connect(endpoint.to_owned()).await.unwrap()
@@ -186,7 +190,7 @@ mod tests {
                 }),
             }
         );
-        thread_handler.stop().await?;
+        thread_handler.stop().await??;
         Ok(())
     }
 

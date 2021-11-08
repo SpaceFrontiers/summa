@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -68,7 +69,7 @@ pub fn default() -> Vec<WorkerGuard> {
     vec![]
 }
 
-pub fn file(log_path: &PathBuf) -> io::Result<Vec<WorkerGuard>> {
+pub fn file(log_path: &Path) -> io::Result<Vec<WorkerGuard>> {
     let mut guards = Vec::new();
     let file_writer_request = create_writer(log_path, "request.log", &mut guards)?;
     let file_writer_query = create_writer(log_path, "query.log", &mut guards)?;

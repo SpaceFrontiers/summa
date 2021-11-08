@@ -2,12 +2,14 @@
 //!
 //! Reflection GRPC API is using for inspecting indices
 
-use crate::errors::{SummaServerResult, ValidationError};
-use crate::services::IndexService;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+
 use summa_proto::proto;
 use tonic::{Request, Response, Status};
+
+use crate::errors::{SummaServerResult, ValidationError};
+use crate::services::IndexService;
 
 pub struct ReflectionApiImpl {
     index_service: IndexService,

@@ -1,4 +1,9 @@
-use crate::errors::{Error, SummaServerResult};
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
 use hyper::body::HttpBody;
 use hyper::client::HttpConnector;
 use hyper::header::HeaderName;
@@ -9,16 +14,13 @@ use itertools::Itertools;
 use izihawa_hyper_multipart::client::multipart;
 use serde::{de, Deserialize, Deserializer};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use summa_core::components::IndexFilePath;
 use summa_core::configs::IpfsConfig;
 use tokio::fs::File;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::info;
+
+use crate::errors::{Error, SummaServerResult};
 
 #[derive(Clone, Default)]
 pub struct IpfsClient {
@@ -85,7 +87,7 @@ pub struct GcRemovedItem {
 fn desize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     Ok(match Value::deserialize(deserializer)? {
         Value::String(s) => s.parse().map_err(de::Error::custom)?,
-        Value::Number(num) => num.as_u64().ok_or_else(|| de::Error::custom("Invalid number"))? as u64,
+        Value::Number(num) => num.as_u64().ok_or_else(|| de::Error::custom("Invalid number"))?,
         _ => return Err(de::Error::custom("wrong type")),
     })
 }

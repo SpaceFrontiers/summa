@@ -50,7 +50,7 @@ pub fn process_message(
 
 fn create_index_writer_holder(index: &Index, index_config: &IndexConfig) -> SummaResult<IndexWriterHolder> {
     let index_writer = index.writer_with_num_threads(index_config.writer_threads as usize, index_config.writer_heap_size_bytes as usize)?;
-    index_writer.set_merge_policy(Box::new(FrozenLogMergePolicy::default()));
+    index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
     IndexWriterHolder::new(
         index_writer,
         match index_config.primary_key {
@@ -98,7 +98,7 @@ impl IndexUpdater {
         let consumers = index_config
             .consumer_configs
             .iter()
-            .map(|(consumer_name, consumer_config)| Ok(Consumer::new(consumer_name, consumer_config)?))
+            .map(|(consumer_name, consumer_config)| Consumer::new(consumer_name, consumer_config))
             .into_iter()
             .collect::<SummaResult<_>>()?;
 

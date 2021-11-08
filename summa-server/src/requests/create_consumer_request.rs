@@ -1,6 +1,7 @@
-use crate::errors::SummaServerResult;
 use summa_core::configs::ConsumerConfig;
 use summa_proto::proto;
+
+use crate::errors::SummaServerResult;
 
 #[derive(Builder)]
 pub struct CreateConsumerRequest {

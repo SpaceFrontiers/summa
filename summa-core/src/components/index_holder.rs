@@ -313,7 +313,7 @@ impl IndexHolder {
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let extractors: Vec<Box<dyn FruitExtractor>> = collectors
-            .into_iter()
+            .iter()
             .map(|collector_proto| build_fruit_extractor(collector_proto, &parsed_query, &self.cached_schema, &mut multi_collector))
             .collect::<SummaResult<_>>()?;
         trace!(
@@ -344,11 +344,7 @@ impl IndexHolder {
             .map(|field_name| self.cached_schema.get_field(field_name).expect("Field not found"))
             .collect();
         for extractor in extractors.into_iter() {
-            collector_outputs.push(
-                extractor
-                    .extract_async(external_index_alias, &mut multi_fruit, &searcher, &multi_fields)
-                    .await?,
-            )
+            collector_outputs.push(extractor.extract(external_index_alias, &mut multi_fruit, &searcher, &multi_fields)?)
         }
         Ok(collector_outputs)
     }

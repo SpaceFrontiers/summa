@@ -1,7 +1,7 @@
 use js_sys::Uint8Array;
-use tokio::sync::mpsc::unbounded_channel;
 use summa_core::directories::{ExternalRequest, Header};
 use summa_core::errors::SummaResult;
+use tokio::sync::mpsc::unbounded_channel;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
@@ -31,7 +31,7 @@ impl ExternalRequest for JsExternalRequest {
         JsExternalRequest {
             method: method.to_string(),
             url: url.to_string(),
-            headers: Vec::from_iter(headers.iter().map(|header| header.clone())),
+            headers: Vec::from_iter(headers.iter().cloned()),
         }
     }
 

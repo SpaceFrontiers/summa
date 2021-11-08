@@ -1,12 +1,9 @@
-use crate::errors::SummaServerResult;
-use crate::errors::{Error, ValidationError};
-use crate::hyper_external_request::HyperExternalRequest;
-use crate::requests::{validators, AlterIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
-use futures_util::future::join_all;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
+
+use futures_util::future::join_all;
 use summa_core::components::IndexHolder;
 use summa_core::configs::{
     ApplicationConfigHolder, ConfigProxy, ConsumerConfig, IndexConfig, IndexConfigBuilder, IndexConfigFilePartProxy, IndexEngine, Persistable,
@@ -17,6 +14,11 @@ use summa_proto::proto;
 use tantivy::{IndexSettings, Opstamp};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{info, instrument};
+
+use crate::errors::SummaServerResult;
+use crate::errors::{Error, ValidationError};
+use crate::hyper_external_request::HyperExternalRequest;
+use crate::requests::{validators, AlterIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
 
 /// The main struct responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone, Default, Debug)]
@@ -309,17 +311,18 @@ impl IndexService {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-    use crate::logging;
-    use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
     use std::path::Path;
+
     use summa_core::components::SummaDocument;
     use summa_core::configs::application_config::tests::create_test_application_config_holder;
-    use summa_core::SummaDocument;
     use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
     use summa_proto::proto_traits::query::shortcuts::match_query;
     use tantivy::doc;
     use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
+
+    use super::*;
+    use crate::logging;
+    use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
 
     pub async fn create_test_index_service(data_path: &Path) -> IndexService {
         IndexService::new(&create_test_application_config_holder(&data_path))
@@ -367,50 +370,49 @@ pub(crate) mod tests {
     async fn test_same_name_index() {
         logging::tests::initialize_default_once();
         let index_service = IndexService::default();
-        assert!(index_service
+        index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .index_engine(proto::IndexEngine::Memory)
                     .schema(create_test_schema())
                     .build()
-                    .unwrap()
+                    .unwrap(),
             )
             .await
-            .is_ok());
+            .unwrap();
 
-        assert!(index_service
+        index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .index_engine(proto::IndexEngine::Memory)
                     .schema(create_test_schema())
                     .build()
-                    .unwrap()
+                    .unwrap(),
             )
             .await
-            .is_err());
+            .unwrap_err();
     }
 
     #[tokio::test]
-    async fn test_index_create_delete() {
+    async fn test_index_create_delete() -> SummaServerResult<()> {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
         let data_path = root_path.path().join("data");
         let application_config_holder = create_test_application_config_holder(&data_path);
 
         let index_service = IndexService::new(&application_config_holder);
-        assert!(index_service
+        index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .index_engine(proto::IndexEngine::Memory)
                     .schema(create_test_schema())
                     .build()
-                    .unwrap()
+                    .unwrap(),
             )
-            .await
-            .is_ok());
+            .await?;
         assert!(index_service
             .delete_index(DeleteIndexRequestBuilder::default().index_name("test_index".to_owned()).build().unwrap())
             .await
@@ -426,6 +428,7 @@ pub(crate) mod tests {
             )
             .await
             .is_ok());
+        Ok(())
     }
 
     #[tokio::test]
@@ -452,9 +455,9 @@ pub(crate) mod tests {
             schema.get_field("issued_at").unwrap() => 1652986134i64
         ))).await?;
         index_holder.index_updater().write().await.commit(None).await?;
-        index_holder.index_reader().reload()?;
+        index_holder.index_reader().reload().unwrap();
         assert_eq!(
-            index_holder.search("index", &match_query("headcrabs"), vec![top_docs_collector(10)]).await?,
+            index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)]).await?,
             vec![top_docs_collector_output(
                 vec![scored_doc(
                     "{\
@@ -468,7 +471,7 @@ pub(crate) mod tests {
                         \"id\":1,\
                         \"issued_at\":1652986134,\
                         \"title\":\"Headcrab\"}",
-                    0.5125294327735901,
+                    0.5126588344573975,
                     0
                 )],
                 false
@@ -511,10 +514,10 @@ pub(crate) mod tests {
             )))
             .await?;
         index_holder.index_updater().write().await.commit(None).await?;
-        index_holder.index_reader().reload()?;
+        index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder
-                .search("index", &match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "issued_at")])
+                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "issued_at")])
                 .await?,
             vec![top_docs_collector_output(
                 vec![
@@ -534,7 +537,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             index_holder
-                .search("index", &match_query("term1"), vec![top_docs_collector_with_eval_expr(10, "-issued_at")])
+                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "-issued_at")])
                 .await?,
             vec![top_docs_collector_output(
                 vec![

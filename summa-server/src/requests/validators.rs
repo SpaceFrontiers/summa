@@ -1,5 +1,6 @@
-use crate::errors::{Error, SummaServerResult, ValidationError};
 use tantivy::schema::Schema;
+
+use crate::errors::{Error, SummaServerResult, ValidationError};
 
 pub fn parse_schema(schema: &str) -> SummaServerResult<Schema> {
     serde_yaml::from_str(schema).map_err(|_| Error::Validation(ValidationError::InvalidSchema(schema.to_owned())))

@@ -2,18 +2,27 @@ importScripts("dexie.min.js");
 
 const CHUNK_SIZE = 16 * 1024;
 const db = new Dexie("Cache");
-db.version(3).stores({
+db.version(5).stores({
   chunks: "[filename+chunk_id]",
 });
 
-function* range(start = 0, end = Infinity, step = 1) {
+function* generate_chunk_ids(start = 0, end = Infinity, step = 1) {
   let iterationCount = 0;
-  for (let i = start; i < end; i += step) {
+  for (let i = start; i <= end; i += step) {
     iterationCount++;
-    yield i < end ? i : end;
+    yield i;
   }
   return iterationCount;
 }
+
+const fetch_with_retries = (url, options = {}, retries) =>
+  fetch(url, options).then((res) => {
+    if (!res.ok && retries > 0) {
+      console.error("retry", url, "failed with", res);
+      return fetch_with_retries(url, options, retries - 1);
+    }
+    return res;
+  });
 
 function set_same_origin_headers(headers) {
   headers.set("Cross-Origin-Embedder-Policy", "require-corp");
@@ -21,10 +30,10 @@ function set_same_origin_headers(headers) {
   return headers;
 }
 
-async function fill_from_cache(filename, chunk_size, start, end) {
+async function set_from_cache(filename, chunk_size, start, end) {
   const cached_response = new ArrayBuffer(end - start + 1);
   const cached_response_view = new Uint8Array(cached_response);
-  const chunk_ixs = Array.from(range(start, end, chunk_size));
+  const chunk_ixs = Array.from(generate_chunk_ids(start, end, chunk_size));
   const cached_chunks = await db
     .table("chunks")
     .where("[filename+chunk_id]")
@@ -39,19 +48,25 @@ async function fill_from_cache(filename, chunk_size, start, end) {
     return null;
   }
   chunk_ixs.map((current, ix) => {
-    cached_response_view.set(cached_chunks[ix], current - start);
+    cached_response_view.set(cached_chunks[ix].blob, current - start);
   });
+  return cached_response_view;
 }
 
 async function fill_cache(response_body, filename, chunk_size, start, end) {
   const items = await Promise.all(
-    Array.from(range(start, end, chunk_size)).map(function (chunk_id) {
+    Array.from(generate_chunk_ids(start, end, chunk_size)).map(function (
+      chunk_id
+    ) {
+      const left_border = chunk_id - start;
+      let right_border = left_border + chunk_size;
+      if (right_border >= end) {
+        right_border = end + 1;
+      }
       return {
         filename: filename,
         chunk_id: chunk_id,
-        blob: new Uint8Array(
-          response_body.slice(chunk_id - start, chunk_id - start + chunk_size)
-        ),
+        blob: new Uint8Array(response_body.slice(left_border, right_border)),
       };
     })
   );
@@ -61,23 +76,33 @@ async function fill_cache(response_body, filename, chunk_size, start, end) {
 function process_request_headers(request) {
   const new_headers = new Headers();
   let [range_start, range_end] = [null, null];
-  let summa_cache_is_enabled = false;
+  let url = request.url;
+  const summa_cache_is_enabled =
+    (url.endsWith(".json") ||
+      url.endsWith(".term") ||
+      url.endsWith(".store") ||
+      url.endsWith(".idx") ||
+      url.endsWith(".fast") ||
+      url.endsWith(".pos") ||
+      url.endsWith(".fieldnorm") ||
+      url.endsWith(".bin")) &&
+    request.method === "GET";
+
   for (const [header, value] of request.headers) {
-    if (header === "x-summa-cache-is-enabled") {
-      summa_cache_is_enabled = true;
-      continue;
-    }
     if (header === "range") {
       const [_, start, end] = /^bytes=(\d+)-(\d+)$/g.exec(value);
       [range_start, range_end] = [parseInt(start), parseInt(end)];
     }
     new_headers.set(header, value);
   }
+  if (summa_cache_is_enabled) {
+    url += "?r=" + range_end;
+  }
   return {
     summa_cache_is_enabled: summa_cache_is_enabled,
     range_start: range_start,
     range_end: range_end,
-    request: new Request(request.url, {
+    request: new Request(url, {
       method: request.method,
       headers: new_headers,
       cache: summa_cache_is_enabled ? "no-cache" : "default",
@@ -86,11 +111,11 @@ function process_request_headers(request) {
 }
 
 async function handle_request(original_request) {
+  const filename = original_request.url;
   let { summa_cache_is_enabled, range_start, range_end, request } =
     process_request_headers(original_request);
-  const filename = new URL(request.url).pathname;
   if (summa_cache_is_enabled) {
-    const response_body = await fill_from_cache(
+    const response_body = await set_from_cache(
       filename,
       CHUNK_SIZE,
       range_start,
@@ -102,9 +127,9 @@ async function handle_request(original_request) {
       });
     }
   }
-  let real_response = await fetch(request);
+  let real_response = await fetch_with_retries(request, {}, 2);
   const real_response_body = await real_response.arrayBuffer();
-  if (summa_cache_is_enabled) {
+  if (summa_cache_is_enabled && real_response.ok) {
     fill_cache(
       real_response_body,
       filename,

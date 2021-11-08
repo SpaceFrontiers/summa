@@ -23,7 +23,7 @@ impl ExternalRequest for HyperExternalRequest {
             client: Client::new(),
             method: method.to_string(),
             url: url.to_string(),
-            headers: Vec::from_iter(headers.iter().map(|header| header.clone())),
+            headers: Vec::from_iter(headers.iter().cloned()),
         }
     }
 
@@ -34,7 +34,7 @@ impl ExternalRequest for HyperExternalRequest {
     async fn request_async(&self) -> SummaResult<Vec<u8>> {
         let mut request = Request::builder()
             .uri(&self.url)
-            .method(Method::from_bytes(self.method.as_bytes()).map_err(|e| Error::Validation(ValidationError::InvalidHttpMethod(self.method.to_string())))?);
+            .method(Method::from_bytes(self.method.as_bytes()).map_err(|_| Error::Validation(ValidationError::InvalidHttpMethod(self.method.to_string())))?);
         for header in self.headers.iter() {
             request = request.header(&header.name, &header.value);
         }

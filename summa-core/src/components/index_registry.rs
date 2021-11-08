@@ -63,19 +63,16 @@ impl IndexRegistry {
     /// Searches in several indices simultaneously and merges results
     pub async fn search(&self, index_queries: &[IndexQuery]) -> SummaResult<Vec<proto::CollectorOutput>> {
         let index_holders = self.index_holders().await;
-        let futures = index_queries
-            .iter()
-            .map(|index_query| {
-                let index_holder = index_holders.get(&index_query.index_name).unwrap();
-                async move {
-                    index_holder
-                        .search(&index_query.index_name, &index_query.query, &index_query.collectors)
-                        .await
-                        .unwrap()
-                }
-            })
-            .collect::<Vec<_>>();
-        self.merge_responses(&join_all(futures.into_iter()).await)
+        let futures = index_queries.iter().map(|index_query| {
+            let index_holder = index_holders.get(&index_query.index_name).unwrap();
+            async move {
+                index_holder
+                    .search(&index_query.index_name, &index_query.query, &index_query.collectors)
+                    .await
+                    .unwrap()
+            }
+        });
+        self.merge_responses(&join_all(futures).await)
     }
 
     /// Merges several `proto::CollectorOutput`

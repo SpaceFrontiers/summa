@@ -1,11 +1,6 @@
-use super::base::BaseServer;
-use crate::apis::beacon::BeaconApiImpl;
-use crate::apis::consumer::ConsumerApiImpl;
-use crate::apis::index::IndexApiImpl;
-use crate::apis::reflection::ReflectionApiImpl;
-use crate::apis::search::SearchApiImpl;
-use crate::errors::SummaServerResult;
-use crate::services::{BeaconService, IndexService};
+use std::future::Future;
+use std::time::Duration;
+
 use async_broadcast::Receiver;
 use hyper::header::{HeaderName, HeaderValue};
 use proto::beacon_api_server::BeaconApiServer;
@@ -13,8 +8,6 @@ use proto::consumer_api_server::ConsumerApiServer;
 use proto::index_api_server::IndexApiServer;
 use proto::reflection_api_server::ReflectionApiServer;
 use proto::search_api_server::SearchApiServer;
-use std::future::Future;
-use std::time::Duration;
 use summa_core::configs::ApplicationConfigHolder;
 use summa_core::utils::random::generate_request_id;
 use summa_core::utils::thread_handler::ControlMessage;
@@ -26,6 +19,15 @@ use tower_http::classify::GrpcFailureClass;
 use tower_http::set_header::SetRequestHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, info_span, instrument, warn, Span};
+
+use super::base::BaseServer;
+use crate::apis::beacon::BeaconApiImpl;
+use crate::apis::consumer::ConsumerApiImpl;
+use crate::apis::index::IndexApiImpl;
+use crate::apis::reflection::ReflectionApiImpl;
+use crate::apis::search::SearchApiImpl;
+use crate::errors::SummaServerResult;
+use crate::services::{BeaconService, IndexService};
 
 /// GRPC server exposing [API](crate::apis)
 pub struct GrpcServer {

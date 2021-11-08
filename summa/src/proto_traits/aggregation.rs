@@ -1,10 +1,11 @@
-use crate::errors::Error;
-use crate::proto;
 use tantivy::aggregation::agg_req::{Aggregation, BucketAggregation, BucketAggregationType, MetricAggregation, RangeAggregation};
 use tantivy::aggregation::agg_result::{AggregationResult, BucketEntries, BucketEntry, BucketResult, MetricResult, RangeBucketEntry};
 use tantivy::aggregation::bucket::{CustomOrder, HistogramAggregation, HistogramBounds, Order, OrderTarget, RangeAggregationRange, TermsAggregation};
 use tantivy::aggregation::metric::{AverageAggregation, StatsAggregation};
 use tantivy::aggregation::Key;
+
+use crate::errors::Error;
+use crate::proto;
 
 impl TryFrom<proto::Aggregation> for Aggregation {
     type Error = Error;

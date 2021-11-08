@@ -33,7 +33,6 @@ import IsLoadingView from "@/components/IsLoading.vue";
 import { format_bytes } from "@/utils";
 import ConnectivityIssuesView from "@/components/ConnectivityIssues.vue";
 import { cache_metrics } from "@/services/web-index-service";
-
 export default defineComponent({
   name: "App",
   components: { ConnectivityIssuesView, RouterLink, RouterView, IsLoadingView },

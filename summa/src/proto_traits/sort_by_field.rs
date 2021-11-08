@@ -1,5 +1,6 @@
-use crate::proto;
 use tantivy::IndexSortByField;
+
+use crate::proto;
 
 impl From<proto::SortByField> for IndexSortByField {
     fn from(sort_by_field: proto::SortByField) -> Self {

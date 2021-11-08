@@ -1,5 +1,4 @@
 use fasteval2::{Compiler, Evaler, Instruction};
-use instant::{Instant, SystemTime};
 use tantivy::schema::{FieldType, Schema};
 use tantivy::{DocId, Score, SegmentReader};
 

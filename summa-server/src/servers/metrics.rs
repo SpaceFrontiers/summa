@@ -1,9 +1,10 @@
 //! HTTP server exposing metrics in Prometheus format
 
-use super::base::BaseServer;
-use crate::errors::SummaServerResult;
-use crate::search_engine::IndexMeter;
-use crate::services::IndexService;
+use std::convert::Infallible;
+use std::fmt::Debug;
+use std::future::Future;
+use std::sync::Arc;
+
 use async_broadcast::Receiver;
 use hyper::{
     header::{HeaderValue, CONTENT_TYPE},
@@ -16,13 +17,14 @@ use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
 use opentelemetry::sdk::metrics::{aggregators, controllers, processors};
 use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
-use std::convert::Infallible;
-use std::fmt::Debug;
-use std::future::Future;
-use std::sync::Arc;
 use summa_core::configs::ApplicationConfigHolder;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument};
+
+use super::base::BaseServer;
+use crate::errors::SummaServerResult;
+use crate::search_engine::IndexMeter;
+use crate::services::IndexService;
 
 lazy_static! {
     static ref EMPTY_HEADER_VALUE: HeaderValue = HeaderValue::from_static("");

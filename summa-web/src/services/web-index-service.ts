@@ -4,27 +4,90 @@ import type {
   IndexQuery,
   WebIndexService as WebIndexServiceWasm,
 } from "summa-wasm/web-index-service";
-import { db, IndexConfig } from "@/database";
+import { db, type IIndexSeed, IndexConfig } from "@/database";
 import { ref, toRaw } from "vue";
 import type { Remote } from "comlink";
-import {
-  ipfs,
-  ipfs_hostname,
-  ipfs_http_protocol,
-} from "@/services/ipfs";
+import { ipfs_hostname, ipfs_http_protocol } from "@/options";
 import { NetworkConfig } from "summa-wasm/network-config";
-import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
+import { is_eth_hostname, is_supporting_subdomains } from "@/options";
+import { get_ipfs_url, ipfs } from "@/services/ipfs";
 
-const default_index_seeds = [
-  {
-    ipns_path: "/ipns/nexus-books.eth/",
-    is_enabled: true,
-  },
-  {
-    ipns_path: "/ipns/nexus-media.eth/",
-    is_enabled: false,
-  },
-];
+class IpnsDatabaseSeed implements IIndexSeed {
+  ipns_path: string;
+
+  constructor(ipns_path: string) {
+    this.ipns_path = ipns_path;
+  }
+  get_ipns(): string {
+    return this.ipns_path;
+  }
+  async retrieve_network_config(
+    status_callback: StatusCallback
+  ): Promise<NetworkConfig> {
+    status_callback("status", `resolving ${this.ipns_path}...`);
+    const ipfs_path = await ipfs.resolve(
+      (this.ipns_path as string).split("/")[2]
+    );
+    const ipfs_hash = ipfs_path.split("/")[2] as string;
+    status_callback("status", `resolving files...`);
+    const files = await ipfs.ls(get_ipfs_url({ ipfs_hash }));
+    return new NetworkConfig(
+      "GET",
+      `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
+      [{ name: "range", value: "bytes={start}-{end}" }],
+      files
+    );
+  }
+}
+
+class EthSubdomainDatabaseSeed implements IIndexSeed {
+  subdomain: string;
+
+  constructor(subdomain: string) {
+    this.subdomain = subdomain;
+  }
+  get_ipns(): string {
+    return "/ipns/" + this.subdomain + ".summa-t.eth";
+  }
+  async retrieve_network_config(
+    status_callback: StatusCallback
+  ): Promise<NetworkConfig> {
+    status_callback("status", `resolving files...`);
+    const url = `${ipfs_http_protocol}//${this.subdomain}.${ipfs_hostname}/`;
+    const files = await ipfs.ls(url);
+    return new NetworkConfig(
+      "GET",
+      `${url}{file_name}`,
+      [{ name: "range", value: "bytes={start}-{end}" }],
+      files
+    );
+  }
+}
+
+async function get_startup_configs() {
+  if (!(await is_supporting_subdomains()) && is_eth_hostname) {
+    return [
+      {
+        seed: new EthSubdomainDatabaseSeed("nexus-books"),
+        is_enabled: true,
+      },
+      {
+        seed: new EthSubdomainDatabaseSeed("nexus-media"),
+        is_enabled: false,
+      },
+    ];
+  }
+  return [
+    {
+      seed: new IpnsDatabaseSeed("/ipns/nexus-books.summa-t.eth/"),
+      is_enabled: true,
+    },
+    {
+      seed: new IpnsDatabaseSeed("/ipns/nexus-media.summa-t.eth/"),
+      is_enabled: false,
+    },
+  ];
+}
 
 export type StatusCallback = (type: string, message: string) => void;
 export class WebIndexService {
@@ -73,31 +136,21 @@ export class WebIndexService {
       );
     }
   }
-  async add_index(index_seed: {
-    ipns_path: IPFSPath;
+  async add_index(startup_config: {
+    seed: IIndexSeed;
     is_enabled: boolean;
   }): Promise<IndexPayload> {
-    this.status_callback("status", `resolving ${index_seed.ipns_path}...`);
-    const ipfs_path = await ipfs.resolve(
-      (index_seed.ipns_path as string).split("/")[2]
-    );
-    const ipfs_hash = ipfs_path.split("/")[2] as string;
-    this.status_callback("status", `resolving files...`);
-    const files = await ipfs.ls(ipfs_hash);
-    const network_config = new NetworkConfig(
-      "GET",
-      `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
-      [{ name: "range", value: "bytes={start}-{end}" }],
-      files
+    const network_config = await startup_config.seed.retrieve_network_config(
+      this.status_callback
     );
     const index_payload = await this.web_index_service_worker.add(
       network_config
     );
     const index_config = new IndexConfig(
-      index_seed.is_enabled,
+      startup_config.is_enabled,
       false,
       index_payload,
-      index_seed.ipns_path,
+      startup_config.seed.get_ipns(),
       network_config
     );
     await index_config.save();
@@ -117,10 +170,9 @@ export class WebIndexService {
     return (await db.index_configs.count()) == 0;
   }
   async install_defaults() {
+    const startup_configs = await get_startup_configs();
     return await Promise.all(
-      default_index_seeds.map((default_index_seed) =>
-        this.add_index(default_index_seed)
-      )
+      startup_configs.map((startup_config) => this.add_index(startup_config))
     );
   }
 }

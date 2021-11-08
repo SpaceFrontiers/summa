@@ -12,7 +12,6 @@ export function request(method: string, url: string, headers: Array<{name: strin
           xhr.setRequestHeader(header.name, header.value)
         });
     }
-    xhr.setRequestHeader("X-Summa-Cache-Is-Enabled", "1");
     xhr.send(null);
     if (xhr.status >= 200 && xhr.status < 300) {
         return new Uint8Array(xhr.response);
@@ -34,7 +33,6 @@ export function request_async(method: string, url: string, headers: Array<{name:
               xhr.setRequestHeader(header.name, header.value)
             });
         }
-        xhr.setRequestHeader("X-Summa-Cache-Is-Enabled", "1");
         xhr.onload = function () {
             if (this.status >= 200 && this.status < 300) {
                 let array = new Uint8Array(xhr.response);
