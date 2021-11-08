@@ -27,14 +27,14 @@ pub struct IndexRegistry {
 
 impl IndexRegistry {
     /// Read-locked `HashMap` of all indices
-    async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<IndexHolder>>> {
         self.index_holders.read().await
     }
 
     /// Write-locked `HashMap` of all indices
     ///
     /// Taking this lock means locking metadata modification
-    async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<IndexHolder>>> {
         self.index_holders.write().await
     }
 
@@ -49,14 +49,16 @@ impl IndexRegistry {
     }
 
     /// Add new index to `IndexRegistry`
-    pub async fn add(&mut self, index_holder: IndexHolder) {
+    pub async fn add(&self, index_holder: IndexHolder) -> Arc<IndexHolder> {
+        let index_holder = Arc::new(index_holder);
         self.index_holders_mut()
             .await
-            .insert(index_holder.index_name().to_string(), Arc::new(index_holder));
+            .insert(index_holder.index_name().to_string(), index_holder.clone());
+        index_holder
     }
 
     /// Deletes index from `IndexRegistry`
-    pub async fn delete(&mut self, index_name: &str) {
+    pub async fn delete(&self, index_name: &str) {
         self.index_holders_mut().await.remove(index_name);
     }
 

@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use futures_util::future::join_all;
-use summa_core::components::IndexHolder;
+use summa_core::components::{IndexHolder, IndexRegistry};
 use summa_core::configs::{
     ApplicationConfigHolder, ConfigProxy, ConsumerConfig, IndexConfig, IndexConfigBuilder, IndexConfigFilePartProxy, IndexEngine, Persistable,
 };
@@ -12,7 +12,7 @@ use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
 use summa_proto::proto;
 use tantivy::{IndexSettings, Opstamp};
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 use tracing::{info, instrument};
 
 use crate::errors::SummaServerResult;
@@ -24,11 +24,7 @@ use crate::requests::{validators, AlterIndexRequest, CreateConsumerRequest, Crea
 #[derive(Clone, Default, Debug)]
 pub struct IndexService {
     application_config: ApplicationConfigHolder,
-    /// RwLock for index modification operations like creating new ones or deleting old ones
-    /// `OwningHandler` that wraps `IndexHolder` allows safe cloning of `IndexHolder` objects.
-    /// Every destructable operation like `stop` or `delete`
-    /// will wait corresponding `IndexHolder` object until it will be released by other users
-    index_holders: Arc<RwLock<HashMap<String, Arc<IndexHolder>>>>,
+    index_registry: IndexRegistry,
 }
 
 #[derive(Default)]
@@ -42,11 +38,41 @@ impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
 
 /// The main entry point for managing Summa indices
 impl IndexService {
+    /// Read-locked `HashMap` of all indices
+    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+        self.index_registry.index_holders().await
+    }
+
+    /// Write-locked `HashMap` of all indices
+    ///
+    /// Taking this lock means locking metadata modification
+    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+        self.index_registry.index_holders_mut().await
+    }
+
+    /// Returns `Handler` to `IndexHolder`.
+    ///
+    /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
+    /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
+    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Arc<IndexHolder>> {
+        Ok(self
+            .index_registry
+            .get_index_holder_by_name(
+                self.application_config
+                    .read()
+                    .await
+                    .resolve_index_alias(index_alias)
+                    .as_deref()
+                    .unwrap_or(index_alias),
+            )
+            .await?)
+    }
+
     /// Creates new `IndexService` with `ApplicationConfigHolder`
     pub fn new(application_config_holder: &ApplicationConfigHolder) -> IndexService {
         IndexService {
             application_config: application_config_holder.clone(),
-            index_holders: Arc::new(RwLock::new(HashMap::new())),
+            index_registry: IndexRegistry::default(),
         }
     }
 
@@ -61,44 +87,8 @@ impl IndexService {
             index_holders.insert(index_name.clone(), Arc::new(IndexHolder::setup(index_name, index, index_config_proxy).await?));
         }
         info!(action = "index_holders", index_holders = ?index_holders);
-        *self.index_holders_mut().await = index_holders;
+        *self.index_registry.index_holders_mut().await = index_holders;
         Ok(())
-    }
-
-    /// Read-locked `HashMap` of all indices
-    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<IndexHolder>>> {
-        self.index_holders.read().await
-    }
-
-    /// Write-locked `HashMap` of all indices
-    ///
-    /// Taking this lock means locking metadata modification
-    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<IndexHolder>>> {
-        self.index_holders.write().await
-    }
-
-    async fn get_index_holder_by_name(&self, index_name: &str) -> SummaServerResult<Arc<IndexHolder>> {
-        Ok(self
-            .index_holders()
-            .await
-            .get(index_name)
-            .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_name.to_owned())))?
-            .clone())
-    }
-    /// Returns `Handler` to `IndexHolder`.
-    ///
-    /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
-    /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
-    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Arc<IndexHolder>> {
-        self.get_index_holder_by_name(
-            self.application_config
-                .read()
-                .await
-                .resolve_index_alias(index_alias)
-                .as_deref()
-                .unwrap_or(index_alias),
-        )
-        .await
     }
 
     pub(crate) async fn insert_config(&self, index_name: &str, index_config: &IndexConfig) -> SummaServerResult<()> {
@@ -130,10 +120,7 @@ impl IndexService {
         let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
             &index_config_proxy.read().await.get().index_engine,
         )?;
-        let index_holder = Arc::new(IndexHolder::setup(index_name, index, index_config_proxy).await?);
-
-        self.index_holders_mut().await.insert(index_name.to_owned(), index_holder.clone());
-        Ok(index_holder)
+        Ok(self.index_registry.add(IndexHolder::setup(index_name, index, index_config_proxy).await?).await)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
@@ -172,12 +159,10 @@ impl IndexService {
             index_settings,
             &index_config_proxy.read().await.get().index_engine,
         )?;
-        let index_holder = Arc::new(IndexHolder::setup(&create_index_request.index_name, index, index_config_proxy).await?);
-
-        self.index_holders_mut()
-            .await
-            .insert(create_index_request.index_name.to_owned(), index_holder.clone());
-        Ok(index_holder)
+        Ok(self
+            .index_registry
+            .add(IndexHolder::setup(&create_index_request.index_name, index, index_config_proxy).await?)
+            .await)
     }
 
     async fn alter_index_settings(&self, alter_index_request: AlterIndexRequest, index_holder: &IndexHolder) -> SummaServerResult<Opstamp> {
@@ -213,7 +198,7 @@ impl IndexService {
     /// Alters index
     #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
     pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaServerResult<Arc<IndexHolder>> {
-        let index_holder = self.get_index_holder_by_name(&alter_index_request.index_name).await?;
+        let index_holder = self.index_registry.get_index_holder_by_name(&alter_index_request.index_name).await?;
         self.alter_index_settings(alter_index_request, &index_holder).await?;
         index_holder.reload_query_parser().await?;
         Ok(index_holder)
@@ -224,7 +209,7 @@ impl IndexService {
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
         let index_holder = {
             let application_config = self.application_config.write().await;
-            match self.index_holders_mut().await.entry(delete_index_request.index_name.to_owned()) {
+            match self.index_registry.index_holders_mut().await.entry(delete_index_request.index_name.to_owned()) {
                 Entry::Occupied(entry) => {
                     let index_holder = entry.get();
                     let aliases = application_config.get_index_aliases_for_index(&delete_index_request.index_name);
@@ -243,6 +228,7 @@ impl IndexService {
                 Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
             }
         };
+        // ToDo: is it always true?
         Arc::try_unwrap(index_holder).unwrap().delete().await?;
         Ok(DeleteIndexResult::default())
     }
@@ -291,7 +277,8 @@ impl IndexService {
     /// Stopping index holders
     pub async fn stop(self) -> SummaServerResult<()> {
         join_all(
-            self.index_holders_mut()
+            self.index_registry
+                .index_holders_mut()
                 .await
                 .drain()
                 .map(|(_, index_holder)| Arc::try_unwrap(index_holder).unwrap().stop()),
