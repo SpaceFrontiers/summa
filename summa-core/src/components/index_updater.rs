@@ -443,10 +443,9 @@ impl InnerIndexUpdater {
         .into_iter()
         .chain(self.get_index_files(index_path.as_ref().to_path_buf())?)
         .collect();
-        f(segment_files).await?;
-
+        let result = f(segment_files).await;
         self.start_consumers().await;
-        Ok(())
+        result
     }
 
     /// Get segments

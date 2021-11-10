@@ -9,6 +9,7 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::IndexHolder;
 use crate::errors::{SummaResult, ValidationError};
+use crate::utils::sync::{Handler, OwningHandler};
 use crate::Error;
 
 /// Packed query to a single index
@@ -22,39 +23,38 @@ pub struct IndexQuery {
 /// The main struct responsible for combining different indices and managing their lifetime.
 #[derive(Clone, Default, Debug)]
 pub struct IndexRegistry {
-    index_holders: Arc<RwLock<HashMap<String, Arc<IndexHolder>>>>,
+    index_holders: Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>>,
 }
 
 impl IndexRegistry {
     /// Read-locked `HashMap` of all indices
-    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
         self.index_holders.read().await
     }
 
     /// Write-locked `HashMap` of all indices
     ///
     /// Taking this lock means locking metadata modification
-    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
         self.index_holders.write().await
     }
 
     /// Retrieve `IndexHolder` by its name
-    pub async fn get_index_holder_by_name(&self, index_name: &str) -> SummaResult<Arc<IndexHolder>> {
+    pub async fn get_index_holder_by_name(&self, index_name: &str) -> SummaResult<Handler<IndexHolder>> {
         Ok(self
             .index_holders()
             .await
             .get(index_name)
             .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_name.to_owned())))?
-            .clone())
+            .handler())
     }
 
     /// Add new index to `IndexRegistry`
-    pub async fn add(&self, index_holder: IndexHolder) -> Arc<IndexHolder> {
-        let index_holder = Arc::new(index_holder);
-        self.index_holders_mut()
-            .await
-            .insert(index_holder.index_name().to_string(), index_holder.clone());
-        index_holder
+    pub async fn add(&self, index_holder: IndexHolder) -> Handler<IndexHolder> {
+        let index_holder = OwningHandler::new(index_holder);
+        let index_holder_handler = index_holder.handler();
+        self.index_holders_mut().await.insert(index_holder.index_name().to_string(), index_holder);
+        index_holder_handler
     }
 
     /// Deletes index from `IndexRegistry`

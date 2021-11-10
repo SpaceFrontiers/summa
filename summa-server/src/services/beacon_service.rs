@@ -1,10 +1,9 @@
-use std::sync::Arc;
-
 use futures_util::future::try_join_all;
 use ipfs_api::request::{Add, FilesMkdir};
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
 use summa_core::components::{ComponentFile, IndexHolder};
 use summa_core::configs::{IndexEngine, IpfsConfig};
+use summa_core::utils::sync::Handler;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, instrument};
 
@@ -16,25 +15,27 @@ use crate::utils::random_string;
 #[derive(Clone)]
 pub struct BeaconService {
     ipfs_client: IpfsClient,
+    ipfs_config: IpfsConfig,
 }
 
 impl BeaconService {
     pub fn new(ipfs_config: IpfsConfig) -> SummaServerResult<BeaconService> {
-        let ipfs_client = IpfsClient::from_str(&format!("http://{}", ipfs_config.api_endpoint)).unwrap();
-        Ok(BeaconService { ipfs_client })
+        let ipfs_client = IpfsClient::from_str(&format!("http://{}", &ipfs_config.api_endpoint)).unwrap();
+        Ok(BeaconService { ipfs_client, ipfs_config })
     }
 
     #[instrument(skip_all, fields(index_name = ?index_holder.index_name()))]
-    pub async fn publish_index(&self, mfs_path: &str, index_holder: Arc<IndexHolder>, payload: Option<String>) -> SummaServerResult<()> {
+    pub async fn publish_index(&self, mfs_path: &str, index_holder: Handler<IndexHolder>, payload: Option<String>) -> SummaServerResult<()> {
+        let index_config = index_holder.index_config_proxy().read().await.get().clone();
         let index_path = {
-            match &index_holder.index_config_proxy().read().await.get().index_engine {
+            match &index_config.index_engine {
                 IndexEngine::File(index_path) => index_path.to_path_buf(),
                 _ => unreachable!(),
             }
         };
         let index_updater = index_holder.index_updater();
-        let hash = Some("blake2b-256");
-        let chunker = Some("chunker-65536");
+        let hash = self.ipfs_config.default_hash.as_deref();
+        let chunker = self.ipfs_config.default_chunker.as_deref();
         let mut index_updater = index_updater.write().await;
         index_updater
             .lock_files(index_path.clone(), payload, |files: Vec<ComponentFile>| async move {
@@ -79,7 +80,8 @@ impl BeaconService {
                                 let local_file_path = format!("{}/{}", index_path.to_string_lossy(), component_file_path);
                                 let mfs_file_path = format!("{}/{}", &temporary_path, component_file_path);
                                 info!(action = "write_file", local_file_path = local_file_path, mfs_file_path = mfs_file_path);
-                                let add_response = self.ipfs_client
+                                let add_response = self
+                                    .ipfs_client
                                     .add_async_with_options(
                                         tokio::fs::File::open(local_file_path).await?.compat(),
                                         Add {

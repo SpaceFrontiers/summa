@@ -10,6 +10,7 @@ use summa_core::configs::{
 };
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
+use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_proto::proto;
 use tantivy::{IndexSettings, Opstamp};
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
@@ -39,14 +40,14 @@ impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
 /// The main entry point for managing Summa indices
 impl IndexService {
     /// Read-locked `HashMap` of all indices
-    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
         self.index_registry.index_holders().await
     }
 
     /// Write-locked `HashMap` of all indices
     ///
     /// Taking this lock means locking metadata modification
-    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, Arc<IndexHolder>>> {
+    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
         self.index_registry.index_holders_mut().await
     }
 
@@ -54,7 +55,7 @@ impl IndexService {
     ///
     /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
     /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
-    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Arc<IndexHolder>> {
+    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Handler<IndexHolder>> {
         Ok(self
             .index_registry
             .get_index_holder_by_name(
@@ -84,7 +85,10 @@ impl IndexService {
             let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
                 &index_config_proxy.read().await.get().index_engine,
             )?;
-            index_holders.insert(index_name.clone(), Arc::new(IndexHolder::setup(index_name, index, index_config_proxy).await?));
+            index_holders.insert(
+                index_name.clone(),
+                OwningHandler::new(IndexHolder::setup(index_name, index, index_config_proxy).await?),
+            );
         }
         info!(action = "index_holders", index_holders = ?index_holders);
         *self.index_registry.index_holders_mut().await = index_holders;
@@ -106,7 +110,7 @@ impl IndexService {
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = index_name))]
-    pub async fn attach_index(&self, index_name: &str) -> SummaServerResult<Arc<IndexHolder>> {
+    pub async fn attach_index(&self, index_name: &str) -> SummaServerResult<Handler<IndexHolder>> {
         let index_path = self.application_config.read().await.get_path_for_index_data(index_name);
         if !index_path.exists() {
             return Err(ValidationError::MissingIndex(index_name.to_string()).into());
@@ -125,7 +129,7 @@ impl IndexService {
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
-    pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Arc<IndexHolder>> {
+    pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_engine = match create_index_request.index_engine {
             proto::IndexEngine::Memory => IndexEngine::Memory(create_index_request.schema.clone()),
             proto::IndexEngine::File => IndexEngine::File(self.application_config.read().await.get_path_for_index_data(&create_index_request.index_name)),
@@ -197,7 +201,7 @@ impl IndexService {
 
     /// Alters index
     #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
-    pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaServerResult<Arc<IndexHolder>> {
+    pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_holder = self.index_registry.get_index_holder_by_name(&alter_index_request.index_name).await?;
         self.alter_index_settings(alter_index_request, &index_holder).await?;
         index_holder.reload_query_parser().await?;
@@ -228,8 +232,7 @@ impl IndexService {
                 Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
             }
         };
-        // ToDo: is it always true?
-        Arc::try_unwrap(index_holder).unwrap().delete().await?;
+        index_holder.into_inner().await.delete().await?;
         Ok(DeleteIndexResult::default())
     }
 
@@ -281,7 +284,7 @@ impl IndexService {
                 .index_holders_mut()
                 .await
                 .drain()
-                .map(|(_, index_holder)| Arc::try_unwrap(index_holder).unwrap().stop()),
+                .map(|(_, index_holder)| async move { index_holder.into_inner().await.stop().await }),
         )
         .await
         .into_iter()
@@ -314,7 +317,7 @@ pub(crate) mod tests {
     pub async fn create_test_index_service(data_path: &Path) -> IndexService {
         IndexService::new(&create_test_application_config_holder(&data_path))
     }
-    pub async fn create_test_index_holder(index_service: &IndexService, schema: &Schema) -> SummaServerResult<Arc<IndexHolder>> {
+    pub async fn create_test_index_holder(index_service: &IndexService, schema: &Schema) -> SummaServerResult<Handler<IndexHolder>> {
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -357,7 +360,7 @@ pub(crate) mod tests {
     async fn test_same_name_index() {
         logging::tests::initialize_default_once();
         let index_service = IndexService::default();
-        index_service
+        assert!(index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
@@ -367,9 +370,9 @@ pub(crate) mod tests {
                     .unwrap(),
             )
             .await
-            .unwrap();
+            .is_ok());
 
-        index_service
+        assert!(index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
@@ -379,7 +382,7 @@ pub(crate) mod tests {
                     .unwrap(),
             )
             .await
-            .unwrap_err();
+            .is_err());
     }
 
     #[tokio::test]
