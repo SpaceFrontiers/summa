@@ -89,7 +89,7 @@ impl ComponentFile {
     pub fn path(&self) -> &Path {
         match self {
             ComponentFile::SegmentComponent(segment_component) => &segment_component.path,
-            ComponentFile::Other(path) => path
+            ComponentFile::Other(path) => path,
         }
     }
 }
@@ -440,9 +440,9 @@ impl InnerIndexUpdater {
             ComponentFile::Other(PathBuf::from("meta.json")),
             ComponentFile::Other(PathBuf::from("hotcache.bin")),
         ]
-            .into_iter()
-            .chain(self.get_index_files()?)
-            .collect();
+        .into_iter()
+        .chain(self.get_index_files()?)
+        .collect();
         f(segment_files).await?;
 
         self.start_consumers().await;
@@ -450,13 +450,15 @@ impl InnerIndexUpdater {
     }
 
     /// Get segments
-    fn get_index_files(&self) -> SummaResult<impl Iterator<Item =ComponentFile>> {
+    fn get_index_files(&self) -> SummaResult<impl Iterator<Item = ComponentFile>> {
         Ok(self.index.searchable_segments()?.into_iter().flat_map(|segment| {
             tantivy::SegmentComponent::iterator()
-                .map(|segment_component| ComponentFile::SegmentComponent(SegmentComponent {
-                    path: segment.meta().relative_path(*segment_component),
-                    segment_component: segment_component.clone()
-                }))
+                .map(|segment_component| {
+                    ComponentFile::SegmentComponent(SegmentComponent {
+                        path: segment.meta().relative_path(*segment_component),
+                        segment_component: segment_component.clone(),
+                    })
+                })
                 .collect::<Vec<_>>()
         }))
     }

@@ -15,7 +15,7 @@ impl RequiredOperation {
     pub fn path(&self) -> &Path {
         match self {
             RequiredOperation::Add(component_file) => component_file.path(),
-            RequiredOperation::Remove(files_entry) => Path::new(&files_entry.name)
+            RequiredOperation::Remove(files_entry) => Path::new(&files_entry.name),
         }
     }
 }

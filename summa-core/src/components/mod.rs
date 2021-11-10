@@ -18,7 +18,7 @@ pub use fruit_extractors::{build_fruit_extractor, FruitExtractor};
 pub use index_holder::IndexHolder;
 pub use index_registry::{IndexQuery, IndexRegistry};
 #[cfg(feature = "index-updater")]
-pub use index_updater::{SegmentComponent, ComponentFile, IndexUpdater};
+pub use index_updater::{ComponentFile, IndexUpdater, SegmentComponent};
 #[cfg(feature = "index-updater")]
 pub use index_writer_holder::IndexWriterHolder;
 use once_cell::sync::Lazy;

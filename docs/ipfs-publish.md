@@ -26,7 +26,7 @@ ipfs:
 ```
 into `config.yaml`
 
-Keep in mind that for Summa launched in Docker you should use `host.docker.internal:5001` address if IPFS is launched on host
+Keep in mind that for Summa launched in Docker you should use `http://host.docker.internal:5001` address if IPFS is launched on host
 
 ### Creating Sample Dataset
 
