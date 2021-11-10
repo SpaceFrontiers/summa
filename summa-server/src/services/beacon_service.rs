@@ -5,7 +5,6 @@ use ipfs_api::request::{Add, FilesMkdir};
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
 use summa_core::components::{ComponentFile, IndexHolder};
 use summa_core::configs::{IndexEngine, IpfsConfig};
-use summa_core::errors::SummaResult;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, instrument};
 
@@ -35,6 +34,7 @@ impl BeaconService {
         };
         let index_updater = index_holder.index_updater();
         let hash = Some("blake2b-256");
+        let chunker = Some("chunker-65536");
         let mut index_updater = index_updater.write().await;
         index_updater
             .lock_files(index_path.clone(), payload, |files: Vec<ComponentFile>| async move {
@@ -79,25 +79,28 @@ impl BeaconService {
                                 let local_file_path = format!("{}/{}", index_path.to_string_lossy(), component_file_path);
                                 let mfs_file_path = format!("{}/{}", &temporary_path, component_file_path);
                                 info!(action = "write_file", local_file_path = local_file_path, mfs_file_path = mfs_file_path);
-                                self.ipfs_client
+                                let add_response = self.ipfs_client
                                     .add_async_with_options(
                                         tokio::fs::File::open(local_file_path).await?.compat(),
                                         Add {
                                             to_files: Some(&mfs_file_path),
+                                            chunker,
                                             hash,
                                             ..Default::default()
                                         },
                                     )
                                     .await
                                     .map_err(Error::from)?;
+                                info!(action = "file_written", mfs_file_path = mfs_file_path, hash = add_response.hash);
                             }
                         }
                         Ok::<(), Error>(())
                     }
                 }))
                 .await?;
-                info!(action = "committing_files", mfs_path = mfs_path, temporary_path = temporary_path);
+                info!(action = "removing_old_path", mfs_path = mfs_path, temporary_path = temporary_path);
                 self.ipfs_client.files_rm(&mfs_path, true).await.map_err(Error::from)?;
+                info!(action = "moving_new_path", mfs_path = mfs_path, temporary_path = temporary_path);
                 self.ipfs_client.files_mv(&temporary_path, mfs_path).await.map_err(Error::from)?;
                 Ok(())
             })
