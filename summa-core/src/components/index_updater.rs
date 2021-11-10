@@ -431,7 +431,7 @@ impl InnerIndexUpdater {
 
         let mut hotcache_bytes = vec![];
 
-        let read_directory = MmapDirectory::open(index_path)?;
+        let read_directory = MmapDirectory::open(&index_path)?;
         write_hotcache(read_directory, 16384, &mut hotcache_bytes)?;
         index.directory().atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)?;
 
@@ -441,7 +441,7 @@ impl InnerIndexUpdater {
             ComponentFile::Other(PathBuf::from("hotcache.bin")),
         ]
         .into_iter()
-        .chain(self.get_index_files()?)
+        .chain(self.get_index_files(index_path.as_ref().to_path_buf())?)
         .collect();
         f(segment_files).await?;
 
@@ -450,13 +450,16 @@ impl InnerIndexUpdater {
     }
 
     /// Get segments
-    fn get_index_files(&self) -> SummaResult<impl Iterator<Item = ComponentFile>> {
-        Ok(self.index.searchable_segments()?.into_iter().flat_map(|segment| {
+    fn get_index_files(&self, index_path: PathBuf) -> SummaResult<impl Iterator<Item = ComponentFile>> {
+        Ok(self.index.searchable_segments()?.into_iter().flat_map(move |segment| {
             tantivy::SegmentComponent::iterator()
-                .map(|segment_component| {
-                    ComponentFile::SegmentComponent(SegmentComponent {
-                        path: segment.meta().relative_path(*segment_component),
-                        segment_component: segment_component.clone(),
+                .filter_map(|segment_component| {
+                    let relative_path = segment.meta().relative_path(*segment_component);
+                    index_path.join(relative_path).exists().then(|| {
+                        ComponentFile::SegmentComponent(SegmentComponent {
+                            path: segment.meta().relative_path(*segment_component),
+                            segment_component: segment_component.clone(),
+                        })
                     })
                 })
                 .collect::<Vec<_>>()

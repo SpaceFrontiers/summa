@@ -1,10 +1,12 @@
-use std::fs::File;
 use std::sync::Arc;
 
-use ipfs_api::request::{FilesMkdir, FilesWrite};
+use futures_util::future::try_join_all;
+use ipfs_api::request::{Add, FilesMkdir};
 use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
 use summa_core::components::{ComponentFile, IndexHolder};
 use summa_core::configs::{IndexEngine, IpfsConfig};
+use summa_core::errors::SummaResult;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, instrument};
 
 use crate::errors::{Error, SummaServerResult};
@@ -52,36 +54,50 @@ impl BeaconService {
 
                 let temporary_path = format!("/tmp/{}", random_string(12));
                 info!(action = "create_temporary_directory", mfs_path = mfs_path, temporary_path = temporary_path);
+                self.ipfs_client
+                    .files_mkdir_with_options(FilesMkdir {
+                        path: "/tmp",
+                        parents: Some(true),
+                        hash,
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(Error::from)?;
                 self.ipfs_client.files_cp(mfs_path, &temporary_path).await.map_err(Error::from)?;
-                for operation in operations {
-                    match operation {
-                        RequiredOperation::Remove(files_entry) => {
-                            let mfs_file_path = format!("{}/{}", temporary_path, files_entry.name);
-                            info!(action = "remove_file", mfs_file_path = mfs_file_path);
-                            self.ipfs_client.files_rm(&mfs_file_path, false).await.map_err(Error::from)?
+                try_join_all(operations.iter().map(|operation| {
+                    let index_path = index_path.clone();
+                    let temporary_path = temporary_path.clone();
+                    async move {
+                        match operation {
+                            RequiredOperation::Remove(files_entry) => {
+                                let mfs_file_path = format!("{}/{}", &temporary_path, files_entry.name);
+                                info!(action = "remove_file", mfs_file_path = mfs_file_path);
+                                self.ipfs_client.files_rm(&mfs_file_path, false).await.map_err(Error::from)?
+                            }
+                            RequiredOperation::Add(component_file) => {
+                                let component_file_path = component_file.path().to_string_lossy();
+                                let local_file_path = format!("{}/{}", index_path.to_string_lossy(), component_file_path);
+                                let mfs_file_path = format!("{}/{}", &temporary_path, component_file_path);
+                                info!(action = "write_file", local_file_path = local_file_path, mfs_file_path = mfs_file_path);
+                                self.ipfs_client
+                                    .add_async_with_options(
+                                        tokio::fs::File::open(local_file_path).await?.compat(),
+                                        Add {
+                                            to_files: Some(&mfs_file_path),
+                                            hash,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                                    .map_err(Error::from)?;
+                            }
                         }
-                        RequiredOperation::Add(component_file) => {
-                            let component_file_path = component_file.path().to_string_lossy();
-                            let local_file_path = format!("{}/{}", index_path.to_string_lossy(), component_file_path);
-                            let mfs_file_path = format!("{}/{}", temporary_path, component_file_path);
-                            info!(action = "write_file", local_file_path = local_file_path, mfs_file_path = mfs_file_path);
-                            self.ipfs_client
-                                .files_write_with_options(
-                                    FilesWrite {
-                                        path: &mfs_file_path,
-                                        create: Some(true),
-                                        truncate: Some(true),
-                                        hash,
-                                        ..Default::default()
-                                    },
-                                    File::open(local_file_path)?,
-                                )
-                                .await
-                                .map_err(Error::from)?;
-                        }
+                        Ok::<(), Error>(())
                     }
-                }
+                }))
+                .await?;
                 info!(action = "committing_files", mfs_path = mfs_path, temporary_path = temporary_path);
+                self.ipfs_client.files_rm(&mfs_path, true).await.map_err(Error::from)?;
                 self.ipfs_client.files_mv(&temporary_path, mfs_path).await.map_err(Error::from)?;
                 Ok(())
             })

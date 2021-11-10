@@ -1015,57 +1015,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ipfs-api"
-version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d4854b5cde0a7e935ee4246c5b6c67fbf4961e303963537f10e184a4830bd17"
-dependencies = [
- "ipfs-api-backend-hyper",
-]
-
-[[package]]
-name = "ipfs-api-backend-hyper"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "114341e043a87eff0e43ec192f0a495988323dc14c468448e62b20aaf96bd1e6"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "http",
- "hyper",
- "hyper-multipart-rfc7578",
- "ipfs-api-prelude",
- "thiserror",
-]
-
-[[package]]
-name = "ipfs-api-prelude"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbaf47fa129710ae041d5844a15b1365bdad8551673aee237449ba9dec6bcadc"
-dependencies = [
- "async-trait",
- "bytes",
- "cfg-if",
- "common-multipart-rfc7578",
- "dirs",
- "futures",
- "http",
- "multibase",
- "parity-multiaddr",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror",
- "tokio",
- "tokio-util 0.6.10",
- "tracing",
- "typed-builder",
- "walkdir",
-]
-
-[[package]]
 name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1107,6 +1056,57 @@ dependencies = [
  "http",
  "hyper",
  "izihawa-common-multipart",
+]
+
+[[package]]
+name = "izihawa-ipfs-api"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d64fe8efd697f1dd4f2712bbd043078d6c5c7781bfc88fb614bf44f2bfbc10"
+dependencies = [
+ "izihawa-ipfs-api-backend-hyper",
+]
+
+[[package]]
+name = "izihawa-ipfs-api-backend-hyper"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8e856d5fb3d6c718ecb4fde7081439fde8412a7091f9656e1f30b483dd42c61"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "http",
+ "hyper",
+ "hyper-multipart-rfc7578",
+ "izihawa-ipfs-api-prelude",
+ "thiserror",
+]
+
+[[package]]
+name = "izihawa-ipfs-api-prelude"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0944427d5ad04009e817ecc50a845e9abd19e2aa074557b8e6475d391c10e3e"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cfg-if",
+ "common-multipart-rfc7578",
+ "dirs",
+ "futures",
+ "http",
+ "multibase",
+ "parity-multiaddr",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror",
+ "tokio",
+ "tokio-util 0.6.10",
+ "tracing",
+ "typed-builder",
+ "walkdir",
 ]
 
 [[package]]
@@ -2413,11 +2413,11 @@ dependencies = [
  "futures",
  "futures-util",
  "hyper",
- "ipfs-api",
- "ipfs-api-backend-hyper",
  "itertools",
  "izihawa-common-multipart",
  "izihawa-hyper-multipart",
+ "izihawa-ipfs-api",
+ "izihawa-ipfs-api-backend-hyper",
  "lazy_static",
  "multihash 0.17.0",
  "opentelemetry",
