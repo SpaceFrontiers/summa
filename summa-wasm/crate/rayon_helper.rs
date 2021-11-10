@@ -14,7 +14,7 @@ pub struct wbg_rayon_PoolBuilder {
     receiver: Receiver<rayon::ThreadBuilder>,
 }
 
-#[wasm_bindgen(raw_module = "./rayon-worker.ts")]
+#[wasm_bindgen(raw_module = "../src/rayon-worker.ts")]
 extern "C" {
     #[wasm_bindgen(js_name = start_workers)]
     fn start_workers(module: JsValue, memory: JsValue, builder: wbg_rayon_PoolBuilder) -> Promise;

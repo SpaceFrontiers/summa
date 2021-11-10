@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::HashSet;
+use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use rdkafka::Message;
 use summa_proto::proto;
 use tantivy::directory::MmapDirectory;
 use tantivy::schema::Schema;
-use tantivy::{Directory, Index, Opstamp, SegmentComponent, SegmentId, SegmentMeta};
+use tantivy::{Directory, Index, Opstamp, SegmentId, SegmentMeta};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use tokio::time;
 use tracing::{info, info_span, instrument, warn, Instrument};
@@ -67,21 +67,30 @@ fn wait_merging_threads(index_writer_holder: &mut IndexWriterHolder, index: &Ind
     });
 }
 
-#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
-pub struct IndexFilePath {
-    file_path: PathBuf,
-    is_immutable: bool,
+#[derive(Clone)]
+pub struct SegmentComponent {
+    pub path: PathBuf,
+    pub segment_component: tantivy::SegmentComponent,
 }
 
-impl IndexFilePath {
-    pub fn new(file_path: PathBuf, is_immutable: bool) -> IndexFilePath {
-        IndexFilePath { file_path, is_immutable }
+impl Debug for SegmentComponent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.path.fmt(f)
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum ComponentFile {
+    SegmentComponent(SegmentComponent),
+    Other(PathBuf),
+}
+
+impl ComponentFile {
     pub fn path(&self) -> &Path {
-        &self.file_path
-    }
-    pub fn is_immutable(&self) -> bool {
-        self.is_immutable
+        match self {
+            ComponentFile::SegmentComponent(segment_component) => &segment_component.path,
+            ComponentFile::Other(path) => path
+        }
     }
 }
 
@@ -399,16 +408,11 @@ impl InnerIndexUpdater {
         Ok(segment_meta)
     }
 
-    /// Set attributes
-    pub async fn prepare_index_publishing<P, Fut>(
-        &mut self,
-        index_path: P,
-        payload: Option<String>,
-        publisher: impl FnOnce(Vec<IndexFilePath>) -> Fut,
-    ) -> SummaResult<String>
+    /// Locking index files for executing operation on them
+    pub async fn lock_files<P, Fut>(&mut self, index_path: P, payload: Option<String>, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<()>
     where
         P: AsRef<Path>,
-        Fut: Future<Output = SummaResult<String>>,
+        Fut: Future<Output = SummaResult<()>>,
     {
         let index = self.index.clone();
         let index_config = self.index_config_proxy.read().await.get().clone();
@@ -431,36 +435,29 @@ impl InnerIndexUpdater {
         write_hotcache(read_directory, 16384, &mut hotcache_bytes)?;
         index.directory().atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)?;
 
-        let mut segment_files = self.get_immutable_segment_files().await?;
-        segment_files.push(IndexFilePath::new(PathBuf::from(".managed.json"), false));
-        segment_files.push(IndexFilePath::new(PathBuf::from("meta.json"), false));
-        segment_files.push(IndexFilePath::new(PathBuf::from("hotcache.bin"), false));
-
-        let result = publisher(segment_files).await?;
+        let segment_files = [
+            ComponentFile::Other(PathBuf::from(".managed.json")),
+            ComponentFile::Other(PathBuf::from("meta.json")),
+            ComponentFile::Other(PathBuf::from("hotcache.bin")),
+        ]
+            .into_iter()
+            .chain(self.get_index_files()?)
+            .collect();
+        f(segment_files).await?;
 
         self.start_consumers().await;
-        Ok(result)
+        Ok(())
     }
 
     /// Get segments
-    async fn get_immutable_segment_files(&self) -> SummaResult<Vec<IndexFilePath>> {
-        Ok(self
-            .index
-            .searchable_segments()?
-            .into_iter()
-            .flat_map(|segment| {
-                SegmentComponent::iterator()
-                    .filter_map(|segment_component| {
-                        if *segment_component == SegmentComponent::TempStore
-                            || (*segment_component == SegmentComponent::Delete && !segment.meta().has_deletes())
-                        {
-                            None
-                        } else {
-                            Some(IndexFilePath::new(segment.meta().relative_path(*segment_component), true))
-                        }
-                    })
-                    .collect::<HashSet<_>>()
-            })
-            .collect::<Vec<_>>())
+    fn get_index_files(&self) -> SummaResult<impl Iterator<Item =ComponentFile>> {
+        Ok(self.index.searchable_segments()?.into_iter().flat_map(|segment| {
+            tantivy::SegmentComponent::iterator()
+                .map(|segment_component| ComponentFile::SegmentComponent(SegmentComponent {
+                    path: segment.meta().relative_path(*segment_component),
+                    segment_component: segment_component.clone()
+                }))
+                .collect::<Vec<_>>()
+        }))
     }
 }

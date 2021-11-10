@@ -35,6 +35,8 @@ pub enum Error {
     Internal,
     #[error("{0:?}")]
     IO((std::io::Error, Option<PathBuf>)),
+    #[error("ipfs_error: {0}")]
+    IPFS(#[from] ipfs_api::Error),
     #[error("json_error: {0}")]
     Json(serde_json::Error),
     #[error("summa_core: {0}")]
@@ -70,6 +72,12 @@ impl From<hyper::http::Error> for Error {
 impl From<summa_core::Error> for Error {
     fn from(error: summa_core::Error) -> Self {
         Error::Core(error)
+    }
+}
+
+impl From<Error> for summa_core::Error {
+    fn from(error: Error) -> Self {
+        summa_core::Error::External(format!("{:?}", error))
     }
 }
 

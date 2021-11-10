@@ -1,15 +1,22 @@
-function wait_for_msg_type(target, type) {
+type WorkerData =  {
+  type: string,
+  module: WebAssembly.Module,
+  memory: WebAssembly.Memory,
+  receiver: any
+}
+
+function wait_for_msg_type(target: any, type: any): Promise<WorkerData> {
   return new Promise(resolve => {
-    target.addEventListener('message', function onMsg({ data }) {
-      if (data == null || data.type !== type) return;
+    target.addEventListener('message', function onMsg(message: { data: WorkerData}) {
+      if (message.data == null || message.data.type !== type) return;
       target.removeEventListener('message', onMsg);
-      resolve(data);
+      resolve(message.data);
     });
   });
 }
 
-wait_for_msg_type(self, 'wasm_bindgen_worker_init').then(async data => {
-  const pkg = await import('./');
+wait_for_msg_type(self, 'wasm_bindgen_worker_init').then(async (data: WorkerData) => {
+  const pkg = await import('../pkg');
   await pkg.default(data.module, data.memory);
   postMessage({ type: 'wasm_bindgen_worker_ready' });
   pkg.wbg_rayon_start_worker(data.receiver);
@@ -22,20 +29,20 @@ wait_for_msg_type(self, 'wasm_bindgen_worker_init').then(async data => {
 //
 // By storing them in a variable, we can keep `Worker` objects around and
 // prevent them from getting GC-d.
-let _workers;
+export let _workers: Worker[];
 
-export async function start_workers(module, memory, builder) {
+export async function start_workers(module: WebAssembly.Module, memory: WebAssembly.Memory, builder: any) {
   if (builder.num_threads() === 0) {
     throw new Error(`num_threads must be > 0.`);
   }
 
-  const workerInit = {
+  const workerInit: WorkerData = {
     type: 'wasm_bindgen_worker_init',
     module,
     memory,
     receiver: builder.receiver()
   };
-  self._workers = await Promise.all(
+  _workers = await Promise.all(
     Array.from({ length: builder.num_threads() }, async () => {
       const worker = new Worker(self.location.href, { type: "module" });
       worker.postMessage(workerInit);
@@ -43,6 +50,5 @@ export async function start_workers(module, memory, builder) {
       return worker;
     })
   );
-  _workers = self._workers
   builder.build();
 }

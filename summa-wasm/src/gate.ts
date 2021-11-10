@@ -3,7 +3,22 @@
 * synchronous calls are possible
 */
 
-export function request(method: string, url: string, headers: Array<{name: string, value: string}>): Uint8Array | {status: number, status_text: string} {
+type Header = {name: string, value: string};
+
+function parse_headers(xhr: XMLHttpRequest): Header[] {
+    const headers = xhr.getAllResponseHeaders().toLowerCase();
+    const arr = headers.trim().split(/[\r\n]+/);
+    const headers_arr: Header[] = [];
+    arr.forEach((line) => {
+      const parts = line.split(': ');
+      const name = parts.shift();
+      const value = parts.join(': ');
+      headers_arr.push({name: name!, value});
+    });
+    return headers_arr;
+}
+
+export function request(method: string, url: string, headers: Array<{name: string, value: string}>): { data: Uint8Array, headers: Header[]} | {status: number, status_text: string} {
     var xhr = new XMLHttpRequest();
     xhr.responseType = "arraybuffer"
     xhr.open(method, url, false);
@@ -14,7 +29,7 @@ export function request(method: string, url: string, headers: Array<{name: strin
     }
     xhr.send(null);
     if (xhr.status >= 200 && xhr.status < 300) {
-        return new Uint8Array(xhr.response);
+        return { data: new Uint8Array(xhr.response), headers: parse_headers(xhr) }
     } else {
         throw {
             status: xhr.status,
@@ -35,8 +50,7 @@ export function request_async(method: string, url: string, headers: Array<{name:
         }
         xhr.onload = function () {
             if (this.status >= 200 && this.status < 300) {
-                let array = new Uint8Array(xhr.response);
-                resolve(array);
+                resolve({ data: new Uint8Array(xhr.response), headers: parse_headers(xhr) })
             } else {
                 reject({
                     status: this.status,

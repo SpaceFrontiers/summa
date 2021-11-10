@@ -1,15 +1,19 @@
+import type { Remote } from "comlink";
 import * as Comlink from "comlink";
 import type {
-  IndexPayload,
   IndexQuery,
-  WebIndexService as WebIndexServiceWasm,
-} from "summa-wasm/web-index-service";
-import { db, type IIndexSeed, IndexConfig } from "@/database";
+  StatusCallback,
+  WebIndexServiceWorker,
+} from "summa-wasm";
+import { ChunkedCacheConfig, NetworkConfig } from "summa-wasm";
 import { ref, toRaw } from "vue";
-import type { Remote } from "comlink";
-import { ipfs_hostname, ipfs_http_protocol } from "@/options";
-import { NetworkConfig } from "summa-wasm/network-config";
-import { is_eth_hostname, is_supporting_subdomains } from "@/options";
+import { db, type IIndexSeed, IndexConfig } from "@/database";
+import {
+  ipfs_hostname,
+  ipfs_http_protocol,
+  is_eth_hostname,
+  is_supporting_subdomains,
+} from "@/options";
 import { get_ipfs_url, ipfs } from "@/services/ipfs";
 
 class IpnsDatabaseSeed implements IIndexSeed {
@@ -30,12 +34,11 @@ class IpnsDatabaseSeed implements IIndexSeed {
     );
     const ipfs_hash = ipfs_path.split("/")[2] as string;
     status_callback("status", `resolving files...`);
-    const files = await ipfs.ls(get_ipfs_url({ ipfs_hash }));
     return new NetworkConfig(
       "GET",
       `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
       [{ name: "range", value: "bytes={start}-{end}" }],
-      files
+      new ChunkedCacheConfig(16 * 1024, 128 * 1024 * 1024)
     );
   }
 }
@@ -54,12 +57,11 @@ class EthSubdomainDatabaseSeed implements IIndexSeed {
   ): Promise<NetworkConfig> {
     status_callback("status", `resolving files...`);
     const url = `${ipfs_http_protocol}//${this.subdomain}.${ipfs_hostname}/`;
-    const files = await ipfs.ls(url);
     return new NetworkConfig(
       "GET",
       `${url}{file_name}`,
       [{ name: "range", value: "bytes={start}-{end}" }],
-      files
+      new ChunkedCacheConfig(16 * 1024, 128 * 1024 * 1024)
     );
   }
 }
@@ -89,18 +91,17 @@ async function get_startup_configs() {
   ];
 }
 
-export type StatusCallback = (type: string, message: string) => void;
 export class WebIndexService {
   status_callback: StatusCallback;
-  web_index_service_worker: Remote<WebIndexServiceWasm>;
+  web_index_service_worker: Remote<WebIndexServiceWorker>;
 
   constructor() {
     this.status_callback = (type: string, message: string) =>
       console.log(type, message);
-    this.web_index_service_worker = Comlink.wrap<WebIndexServiceWasm>(
+    this.web_index_service_worker = Comlink.wrap<WebIndexServiceWorker>(
       new Worker(
         new URL(
-          "../../node_modules/summa-wasm/web-index-service.ts",
+          "../../node_modules/summa-wasm/dist/worker.js",
           import.meta.url
         ),
         { type: "module" }
@@ -110,6 +111,10 @@ export class WebIndexService {
   async setup(options: { num_threads: number }) {
     try {
       await this.web_index_service_worker.setup(
+        new URL(
+          "../../node_modules/summa-wasm/dist/index_bg.wasm",
+          import.meta.url
+        ).href,
         options.num_threads,
         Comlink.proxy(this.status_callback)
       );
@@ -131,15 +136,19 @@ export class WebIndexService {
   }
   async load_from_store() {
     for (const index_config of await db.index_configs.toArray()) {
-      await this.web_index_service_worker.add(
-        toRaw(index_config.network_config)
+      const network_config = toRaw(index_config.network_config);
+      // ToDo: remove soon
+      network_config.chunked_cache_config = new ChunkedCacheConfig(
+        16 * 1024,
+        128 * 1024 * 1024
       );
+      await this.web_index_service_worker.add(network_config);
     }
   }
   async add_index(startup_config: {
     seed: IIndexSeed;
     is_enabled: boolean;
-  }): Promise<IndexPayload> {
+  }): Promise<Object> {
     const network_config = await startup_config.seed.retrieve_network_config(
       this.status_callback
     );

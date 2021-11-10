@@ -13,10 +13,4 @@ message PublishIndexRequest {
   optional string payload = 3;
 }
 
-message PublishIndexResponse {
-  message Key {
-    string name = 1;
-    string id = 2;
-  }
-  Key key = 1;
-}
+message PublishIndexResponse {}

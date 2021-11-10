@@ -17,20 +17,28 @@ pub struct Header {
     pub value: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ExternalResponse {
+    pub data: Vec<u8>,
+    pub headers: Vec<Header>,
+}
+
 #[async_trait]
 pub trait ExternalRequest: Debug + Send + Sync {
     fn new(method: &str, url: &str, headers: &[Header]) -> Self
     where
         Self: Sized;
-    fn request(&self) -> SummaResult<Vec<u8>>;
-    async fn request_async(&self) -> SummaResult<Vec<u8>>;
+    fn request(&self) -> SummaResult<ExternalResponse>;
+    async fn request_async(&self) -> SummaResult<ExternalResponse>;
 }
 
 pub trait ExternalRequestGenerator<TExternalRequest: ExternalRequest>: ExternalRequestGeneratorClone<TExternalRequest> + Debug + Send + Sync {
     fn new(network_config: NetworkConfig) -> Self
     where
         Self: Sized;
-    fn generate(&self, file_name: &str, range: Range<usize>) -> SummaResult<TExternalRequest>;
+    fn generate_range_request(&self, file_name: &str, range: Range<usize>) -> SummaResult<TExternalRequest>;
+    fn generate_length_request(&self, file_name: &str) -> SummaResult<TExternalRequest>;
 }
 
 pub trait ExternalRequestGeneratorClone<TExternalRequest: ExternalRequest> {
@@ -59,7 +67,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         }
     }
 
-    fn generate(&self, file_name: &str, range: Range<usize>) -> SummaResult<TExternalRequest> {
+    fn generate_range_request(&self, file_name: &str, range: Range<usize>) -> SummaResult<TExternalRequest> {
         let mut vars = HashMap::new();
         let start = range.start.to_string();
         let end = (range.end - 1).to_string();
@@ -77,6 +85,16 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
             &self.network_config.method,
             &strfmt(&self.network_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
             &headers,
+        ))
+    }
+
+    fn generate_length_request(&self, file_name: &str) -> SummaResult<TExternalRequest> {
+        let mut vars = HashMap::new();
+        vars.insert("file_name".to_string(), file_name);
+        Ok(TExternalRequest::new(
+            "HEAD",
+            &strfmt(&self.network_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
+            &vec![],
         ))
     }
 }

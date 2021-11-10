@@ -1,10 +1,10 @@
 [package]
 name = "summa-wasm"
-version = "0.1.0"
+version = "0.37.1"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
-description = "WASM bindings for full-text search summa"
+description = "WASM bindings for Summa"
 homepage = "https://github.com/izihawa/summa"
 repository = "https://github.com/izihawa/summa"
 readme = "README.md"
@@ -12,6 +12,7 @@ keywords = ["async", "search", "wasm", "web"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+path = "crate/lib.rs"
 
 [features]
 default = ["console_error_panic_hook"]

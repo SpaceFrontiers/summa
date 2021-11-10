@@ -16,14 +16,14 @@ form.mb-4.col-md-7
           .row
             hr.mt-4
             .form-check.col-4.mt-4
-              input.form-check-input(type="checkbox" :id="'checkbox_warmup' + index_config.name" v-model="index_config.is_warm_up" @change="switch_warmup(index_config)")
-              label.form-check-label(:for="'checkbox_warmup' + index_config.name") Warm Up
+              input.form-check-input(type="checkbox" :id="'checkbox_warmup_' + index_config.index_payload.name" v-model="index_config.is_warm_up" @change="switch_warmup(index_config)")
+              label.form-check-label(:for="'checkbox_warmup_' + index_config.index_payload.name") Warm Up
             .form-text.col-8.mt-3
               span.lh-1 Cache most important index parts in browser for better performance
           .row
             .form-check.col-4.mt-4
-              input.form-check-input(type="checkbox" :id="'checkbox_enabled' + index_config.name" v-model="index_config.is_enabled" @change="index_config.save()")
-              label.form-check-label(:for="'checkbox_enabled' + index_config.name") Enabled
+              input.form-check-input(type="checkbox" :id="'checkbox_enabled_' + index_config.index_payload.name" v-model="index_config.is_enabled" @change="index_config.save()")
+              label.form-check-label(:for="'checkbox_enabled_' + index_config.index_payload.name") Enabled
           .btn-group(role="group").float-end
             button.btn.btn-danger.btn-sm(type="button" @click.stop.prevent="web_index_service.delete_index(index_config.index_payload.name)")
               i.bi-trash

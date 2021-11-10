@@ -1,8 +1,6 @@
-import type { IndexPayload } from "summa-wasm/web-index-service";
-import type { NetworkConfig } from "summa-wasm/network-config";
+import type { NetworkConfig, StatusCallback } from "summa-wasm";
 import Dexie from "dexie";
 import { toRaw } from "vue";
-import type { StatusCallback } from "@/services/web-index-service";
 
 class SummaDatabase extends Dexie {
   index_configs!: Dexie.Table<IIndexConfig, string>;
@@ -26,7 +24,7 @@ export interface IIndexSeed {
 interface IIndexConfig {
   is_enabled: boolean;
   is_warm_up: boolean;
-  index_payload: IndexPayload;
+  index_payload: Object;
   ipns_path: string;
   network_config: NetworkConfig;
 }
@@ -34,14 +32,14 @@ interface IIndexConfig {
 export class IndexConfig implements IIndexConfig {
   is_enabled: boolean;
   is_warm_up: boolean;
-  index_payload: IndexPayload;
+  index_payload: Object;
   ipns_path: string;
   network_config: NetworkConfig;
 
   constructor(
     is_enabled: boolean,
     is_warm_up: boolean,
-    index_payload: IndexPayload,
+    index_payload: Object,
     ipns_path: string,
     network_config: NetworkConfig
   ) {

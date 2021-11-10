@@ -25,7 +25,6 @@ pub struct ChunkedCacheConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    pub files: HashMap<String, usize>,
     pub method: String,
     pub url_template: String,
     pub headers_template: Vec<Header>,

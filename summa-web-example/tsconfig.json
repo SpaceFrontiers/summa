@@ -1,0 +1,11 @@
+{
+  "include": ["src/**/*.ts"],
+  "compilerOptions": {
+    "esModuleInterop": true,
+    "module": "es2022",
+    "moduleResolution": "Node",
+    "skipDefaultLibCheck": true,
+    "target": "es2022"
+  },
+   "types": ["node"]
+}

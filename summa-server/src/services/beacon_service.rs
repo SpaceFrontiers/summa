@@ -1,59 +1,75 @@
-use std::fmt::Debug;
+use std::fs::File;
 use std::sync::Arc;
 
-use summa_core::components::{IndexFilePath, IndexHolder};
+use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
+use summa_core::components::{ComponentFile, IndexHolder};
 use summa_core::configs::{IndexEngine, IpfsConfig};
-use tracing::instrument;
+use tracing::{info, instrument};
 
-use crate::errors::SummaServerResult;
-use crate::ipfs_client::IpfsClient;
+use crate::errors::{Error, SummaServerResult};
+use crate::services::differential_updater::RequiredOperation;
+use crate::services::DifferentialUpdater;
+use crate::utils::random_string;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct BeaconService {
     ipfs_client: IpfsClient,
 }
 
 impl BeaconService {
-    pub fn new(ipfs_config: IpfsConfig) -> BeaconService {
-        let ipfs_client = IpfsClient::new(ipfs_config);
-        BeaconService { ipfs_client }
+    pub fn new(ipfs_config: IpfsConfig) -> SummaServerResult<BeaconService> {
+        let ipfs_client = IpfsClient::from_str(&ipfs_config.api_endpoint).unwrap();
+        Ok(BeaconService { ipfs_client })
     }
 
     #[instrument(skip_all, fields(index_name = ?index_holder.index_name()))]
-    pub async fn publish_index(&self, index_holder: Arc<IndexHolder>, payload: Option<String>, copy: bool) -> SummaServerResult<String> {
-        let no_copy = !copy;
+    pub async fn publish_index(&self, mfs_path: &str, index_holder: Arc<IndexHolder>, payload: Option<String>) -> SummaServerResult<()> {
         let index_path = {
             match &index_holder.index_config_proxy().read().await.get().index_engine {
                 IndexEngine::File(index_path) => index_path.to_path_buf(),
                 _ => unreachable!(),
             }
         };
-        let index_name = index_holder.index_name().to_string();
         let index_updater = index_holder.index_updater();
-        let key = {
-            let mut index_updater = index_updater.write().await;
-            index_updater
-                .prepare_index_publishing(index_path.clone(), payload, |files: Vec<IndexFilePath>| async move {
-                    let mutable_files = files.iter().filter_map(|file| (!file.is_immutable()).then(|| file.clone())).collect::<Vec<_>>();
-                    self.ipfs_client.add(&index_path, &mutable_files, false).await.unwrap();
-                    let added_files = self.ipfs_client.add(&index_path, &files, no_copy).await.unwrap();
-                    let new_root = added_files.into_iter().find(|added_file| added_file.name == index_name).unwrap();
-                    let old_key = self.ipfs_client.key_list().await.unwrap().keys.into_iter().find(|key| key.name == index_name);
-                    let key = match old_key {
-                        None => self.ipfs_client.key_gen(&index_name).await.unwrap(),
-                        Some(old_key) => {
-                            let resolved = self.ipfs_client.name_resolve(&old_key.id).await.unwrap();
-                            self.ipfs_client.pin_rm(&resolved.path).await.unwrap();
-                            self.ipfs_client.repo_gc().await.unwrap();
-                            old_key
+        let mut index_updater = index_updater.write().await;
+        index_updater
+            .lock_files(index_path.clone(), payload, |files: Vec<ComponentFile>| async move {
+                let stored_files = self.ipfs_client.files_ls(Some(mfs_path)).await.unwrap().entries;
+
+                let differential_updater = DifferentialUpdater::from_source(stored_files.into_iter());
+                let operations = differential_updater.target_state(files.into_iter());
+
+                let temporary_path = format!("/tmp/{}", random_string(12));
+                info!(action = "create_temporary_directory", mfs_path = mfs_path, temporary_path = temporary_path);
+                self.ipfs_client.files_cp(mfs_path, &temporary_path).await.map_err(Error::from)?;
+                for operation in operations {
+                    match operation {
+                        RequiredOperation::Remove(files_entry) => {
+                            let mfs_file_path = format!("{}/{}", temporary_path, files_entry.name);
+                            info!(action = "remove_file", mfs_file_path = mfs_file_path);
+                            self
+                                .ipfs_client
+                                .files_rm(&mfs_file_path, false)
+                                .await
+                                .map_err(Error::from)?
+                        },
+                        RequiredOperation::Add(component_file) => {
+                            let component_file_path = component_file.path().to_string_lossy();
+                            let local_file_path = format!("{}/{}", index_path.to_string_lossy(), component_file_path);
+                            let mfs_file_path = format!("{}/{}", temporary_path, component_file_path);
+                            info!(action = "write_file", local_file_path = local_file_path, mfs_file_path = mfs_file_path);
+                            self.ipfs_client
+                                .files_write(&mfs_file_path, true, true, File::open(local_file_path)?)
+                                .await
+                                .map_err(Error::from)?;
                         }
-                    };
-                    self.ipfs_client.name_publish(&new_root.hash, &index_name).await.unwrap();
-                    // ToDo: Ok(key)
-                    Ok(key.id)
-                })
-                .await?
-        };
-        Ok(key)
+                    }
+                }
+                info!(action = "committing_files", mfs_path = mfs_path, temporary_path = temporary_path);
+                self.ipfs_client.files_mv(&temporary_path, mfs_path).await.map_err(Error::from)?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
 }

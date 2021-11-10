@@ -26,7 +26,7 @@ export default defineConfig({
         },
       },
     },
-    target: "modules",
+    target: "esnext",
   },
   plugins: [
     vue({
@@ -40,6 +40,12 @@ export default defineConfig({
     wasm(),
     topLevelAwait(),
   ],
+  worker: {
+    format: "es",
+    plugins: [
+        wasm(),
+    ]
+  },
   optimizeDeps: {
     esbuildOptions: {
       target: "es2022",

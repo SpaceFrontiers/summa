@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::future::try_join_all;
@@ -75,34 +77,32 @@ fn setup_query_parser(index_name: &str, index: &Index, index_config: &IndexConfi
     ))
 }
 
-fn create_index_with_hotcache<D: Directory>(directory: D) -> SummaResult<Index> {
-    Ok(match directory.atomic_read("hotcache.bin".as_ref()) {
-        Ok(hotcache_bytes) => {
-            let hotcache_directory = HotDirectory::open(directory, OwnedBytes::new(hotcache_bytes.to_vec()))?;
-            Index::open(hotcache_directory)?
-        }
-        Err(_) => Index::open(directory)?,
-    })
-}
-
 fn create_network_index<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
     network_config: &NetworkConfig,
 ) -> SummaResult<Index> {
-    let network_directory = NetworkDirectory::new(network_config.files.clone(), Box::new(TExternalRequestGenerator::new(network_config.clone())));
-    Ok(match &network_config.chunked_cache_config {
-        Some(chunked_cache_config) => {
-            let chunking_directory = match chunked_cache_config.cache_size {
-                Some(cache_size) => ChunkedCachingDirectory::new_with_capacity_in_bytes(
-                    Arc::new(network_directory),
-                    chunked_cache_config.chunk_size,
-                    cache_size,
-                    CACHE_METRICS.clone(),
-                ),
-                None => ChunkedCachingDirectory::new(Arc::new(network_directory), chunked_cache_config.chunk_size),
-            };
-            create_index_with_hotcache(chunking_directory)?
+    let file_lengths = Arc::new(parking_lot::RwLock::new(HashMap::<PathBuf, u64>::new()));
+    let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(network_config.clone())), file_lengths.clone());
+    let hotcache_bytes = network_directory.atomic_read("hotcache.bin".as_ref());
+
+    let next_directory = match &network_config.chunked_cache_config {
+        Some(chunked_cache_config) => match chunked_cache_config.cache_size {
+            Some(cache_size) => Box::new(ChunkedCachingDirectory::new_with_capacity_in_bytes(
+                Arc::new(network_directory),
+                chunked_cache_config.chunk_size,
+                cache_size,
+                CACHE_METRICS.clone(),
+            )) as Box<dyn Directory>,
+            None => Box::new(ChunkedCachingDirectory::new(Arc::new(network_directory), chunked_cache_config.chunk_size)) as Box<dyn Directory>,
+        },
+        None => Box::new(network_directory) as Box<dyn Directory>,
+    };
+
+    Ok(match hotcache_bytes {
+        Ok(hotcache_bytes) => {
+            let hotcache_directory = HotDirectory::open(next_directory, OwnedBytes::new(hotcache_bytes.to_vec()), file_lengths)?;
+            Index::open(hotcache_directory)?
         }
-        None => create_index_with_hotcache(network_directory)?,
+        Err(_) => Index::open(next_directory)?,
     })
 }
 

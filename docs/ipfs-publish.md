@@ -28,6 +28,12 @@ into `config.yaml`
 
 Keep in mind that for Summa launched in Docker you should use `host.docker.internal:5001` address if IPFS is launched on host
 
+### Creating Sample Dataset
+
+Follow quick-start guide for [summa](/summa/quick-start#setup)
+
+In the end you will have index that we will publish and view through IPFS + Web.
+
 ### Publish index to IPFS <a name="ipfs"></a>
 ```bash
 # Publish index to IPFS and return keys
@@ -35,3 +41,9 @@ summa-cli localhost:8082 - publish-index page --copy
 ```
 
 Summa supports `--no-copy` mode of IPFS. However, it requires extra efforts due to IPFS inability to `add` file outside its root.
+
+### View it on web page <a name="web"></a>
+
+
+
+### (Optional) Using NetworkEngine is Summa <a name="network-engine"></a>

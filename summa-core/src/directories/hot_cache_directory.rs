@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fmt, io};
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes};
@@ -132,12 +133,12 @@ where
 
 #[derive(Debug)]
 struct StaticDirectoryCache {
-    file_lengths: HashMap<PathBuf, u64>,
+    file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
     slices: HashMap<PathBuf, Arc<StaticSliceCache>>,
 }
 
 impl StaticDirectoryCache {
-    pub fn open(mut bytes: OwnedBytes) -> tantivy::Result<StaticDirectoryCache> {
+    pub fn open(mut bytes: OwnedBytes, file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>) -> tantivy::Result<StaticDirectoryCache> {
         let format_version = bytes.read_u8();
 
         if format_version != 0 {
@@ -147,7 +148,7 @@ impl StaticDirectoryCache {
             ))));
         }
 
-        let file_lengths: HashMap<PathBuf, u64> = deserialize_cbor(&mut bytes).expect("CBOR failed");
+        *file_lengths.write() = deserialize_cbor(&mut bytes).expect("CBOR failed");
 
         let mut slice_offsets: Vec<(PathBuf, u64)> = deserialize_cbor(&mut bytes).expect("CBOR failed");
         slice_offsets.push((PathBuf::default(), bytes.len() as u64));
@@ -170,15 +171,7 @@ impl StaticDirectoryCache {
     }
 
     pub fn get_file_length(&self, path: &Path) -> Option<u64> {
-        self.file_lengths.get(path).map(u64::clone)
-    }
-
-    /// return the files and their cached lengths
-    pub fn get_stats(&self) -> Vec<(PathBuf, usize)> {
-        let mut entries = self.slices.iter().map(|(path, cache)| (path.to_owned(), cache.len())).collect::<Vec<_>>();
-
-        entries.sort_by_key(|el| el.0.to_owned());
-        entries
+        self.file_lengths.read().get(path).map(u64::clone)
     }
 }
 
@@ -227,9 +220,6 @@ impl StaticSliceCache {
             return Some(self.bytes.slice(start..start + byte_range.len()));
         }
         None
-    }
-    pub fn len(&self) -> usize {
-        self.bytes.len()
     }
 }
 
@@ -320,19 +310,18 @@ pub struct HotDirectory {
 
 impl HotDirectory {
     /// Wraps an index, with a static cache serialized into `hot_cache_bytes`.
-    pub fn open<D: Directory>(underlying: D, hot_cache_bytes: OwnedBytes) -> tantivy::Result<HotDirectory> {
-        let static_cache = StaticDirectoryCache::open(hot_cache_bytes)?;
+    pub fn open(
+        underlying: Box<dyn Directory>,
+        hot_cache_bytes: OwnedBytes,
+        file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
+    ) -> tantivy::Result<HotDirectory> {
+        let static_cache = StaticDirectoryCache::open(hot_cache_bytes, file_lengths)?;
         Ok(HotDirectory {
             inner: Arc::new(InnerHotDirectory {
-                underlying: Box::new(underlying),
+                underlying,
                 cache: Arc::new(static_cache),
             }),
         })
-    }
-    /// Get files and their cached sizes.
-    pub fn get_stats_per_file(hot_cache_bytes: OwnedBytes) -> tantivy::Result<Vec<(PathBuf, usize)>> {
-        let static_cache = StaticDirectoryCache::open(hot_cache_bytes)?;
-        Ok(static_cache.get_stats())
     }
 }
 

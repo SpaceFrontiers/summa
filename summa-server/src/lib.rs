@@ -25,7 +25,6 @@ pub mod apis;
 pub mod application;
 pub mod errors;
 pub(crate) mod hyper_external_request;
-mod ipfs_client;
 pub(crate) mod logging;
 pub mod requests;
 pub mod search_engine;

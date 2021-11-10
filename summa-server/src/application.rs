@@ -98,7 +98,7 @@ impl Application {
     }
 
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        let beacon_service = self.config.read().await.ipfs.clone().map(BeaconService::new);
+        let beacon_service = self.config.read().await.ipfs.clone().map(BeaconService::new).transpose()?;
         let index_service = IndexService::new(&self.config);
         let metrics_server_future = MetricsServer::new(&self.config)?.start(&index_service, terminator.clone()).await?;
         let grpc_server_future = GrpcServer::new(&self.config, beacon_service.as_ref(), &index_service)?
