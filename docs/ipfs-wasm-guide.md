@@ -23,11 +23,11 @@ ipfs:
 ```
 into your `config.yaml`
 
-Keep in mind that for Summa launched in Docker you should use `http://host.docker.internal:5001` address if IPFS is launched on host
+Keep in mind that for Summa launched in Docker you should use `host.docker.internal:5001` address if IPFS is launched on host
 
 ### Creating Sample Dataset
 
-Follow quick-start guide for [summa](/summa/quick-start#setup)
+Follow quick-start guide for [creating new index](/summa/quick-start#setup)
 
 In the end you will have index that we will publish and view through IPFS + Web.
 

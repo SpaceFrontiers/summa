@@ -1,6 +1,7 @@
-In this quick-start we will create index for searching in WikiBooks. There are two essential parts, Summa server responsible for
-indexing text data and Summa client that is required for communicating with Summa server. 
-Although there is an [GRPC API](summa/proto) you may want to use, here we will use Summa client implemented in Python.
+In this quick-start we will create index for searching in WikiBooks. There are two essential parts, **Summa server** responsible for
+indexing text data and **Summa client** that is required for communicating with Summa server. 
+
+Although there is a [GRPC API](summa/proto) you may want to use, here we will use Summa client implemented in Python.
 
 ### Setup <a name="setup"></a>
 
@@ -39,6 +40,9 @@ Here we download WikiBooks dumps and index them in Summa server.
 mkdir data
 
 # Generate config for `summa-server`
+# -g flag is for setting listen address of GRPC API
+# -m flag is for setting listen address of Metrics API
+# add -i flag for setting IPFS endpoint
 docker run izihawa/summa-server:testing generate-config -d /data \
 -g 0.0.0.0:8082 -m 0.0.0.0:8084 > summa.yaml
 
@@ -48,9 +52,11 @@ docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data \
 izihawa/summa-server:testing serve /summa.yaml
 ```
 
-Then, we should open another Terminal session.
-
+Now, we should open another Terminal session and download items there.
 ```bash
+# Activate venv in new session
+source venv/bin/acticate
+
 {% include download-dump-snippet.sh %}
 
 {% include import-data-to-summa-snippet.sh %}
