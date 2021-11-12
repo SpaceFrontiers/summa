@@ -42,22 +42,28 @@ You need to have IPFS with write access through API. Everything other is delegat
 summa-cli localhost:8082 - publish-index books --payload "{'default_fields': ['title', 'text'], 'multi_fields': [], 'name': 'books'}"
 
 # Check if index is published to MFS
-ipfs files stats /index/books
+ipfs files stat /index/books
 ```
 
 Here you will see hashes and sizes of published index. Copy `Hash` of the index, you will need it on the next step.
 
-### View it on web page <a name="web"></a>
+### Integrate it with browser <a name="web"></a>
 
 Summa repository has [an example web interface](https://github.com/izihawa/summa/tree/master/summa-web-example) that is capable to use IPFS-placed search index.
+You need installed `node` and `npm` for launching web-interface locally.
 ```bash
 # Clone repository to local disk
 git clone https://github.com/izihawa/summa
 
 # Move to web interface example
 cd summa/summa-web-example
+```
 
-# Install and launch example
+Open `src/index.ts` and set IPFS hash that you retrieved in the previous section.
+
+Launch time!
+
+```bash
 npm i && npm run dev
 ```
 
