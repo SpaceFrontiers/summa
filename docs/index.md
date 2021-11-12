@@ -7,17 +7,15 @@ Yes, you can launch it entirely inside your browser!
 
 ## Key Features
 
-- Full-text index with wide range of supported queries and ranking functions
+- Full-text index with a wide range of supported queries and ranking functions
 - GRPC API, Python asynchronous client [library](/summa/python-api) and [CLI](/summa/python-api)
-- [WASM-bindings](https://github.com/izihawa/summa/tree/master/summa-wasm) to launch Summa in browsers (yes, entirely in browsers)
+- [WASM-bindings](https://github.com/izihawa/summa/tree/master/summa-wasm) to launch Summa in browsers
 - Open remote indices through network. We have already implemented [IPFS](/summa/ipfs-wasm-guide) support out of the box
 - Kafka for indexing
 
-## Quick Start
+## Online-documentation
 
-{% include quick-start-snippet.md %}
-
-## Further Reading
+- [Quick-start](/summa/quick-start)
 
 ### Mandatory
 - [Query DSL](/summa/query-dsl)
@@ -32,4 +30,7 @@ Yes, you can launch it entirely inside your browser!
 ### Expert
 - [IPFS Publish + WASM Browsing](/summa/ipfs-wasm-guide)
 - [Architecture](/summa/architecture)
+
+## Development
+
 - [Development Guide](/summa/development)
