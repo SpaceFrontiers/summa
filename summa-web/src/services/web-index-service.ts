@@ -11,28 +11,35 @@ import { db, type IIndexSeed, IndexConfig } from "@/database";
 import {
   ipfs_hostname,
   ipfs_http_protocol,
+  ipfs_url,
   is_eth_hostname,
   is_supporting_subdomains,
 } from "@/options";
-import { get_ipfs_url, ipfs } from "@/services/ipfs";
+import axios from "axios";
 
-class IpnsDatabaseSeed implements IIndexSeed {
-  ipns_path: string;
+export class IpfsDatabaseSeed implements IIndexSeed {
+  ipfs_path: string;
 
-  constructor(ipns_path: string) {
-    this.ipns_path = ipns_path;
+  constructor(ipfs_path: string) {
+    this.ipfs_path = ipfs_path;
   }
-  get_ipns(): string {
-    return this.ipns_path;
+
+  get_pin_command(): string {
+    if (this.ipfs_path.startsWith("/ipfs")) {
+      return `ipfs pin add ${this.ipfs_path}`;
+    } else {
+      return `ipfs name resolve ${this.ipfs_path} | ipfs pin add`;
+    }
   }
+
   async retrieve_network_config(
     status_callback: StatusCallback
   ): Promise<NetworkConfig> {
-    status_callback("status", `resolving ${this.ipns_path}...`);
-    const ipfs_path = await ipfs.resolve(
-      (this.ipns_path as string).split("/")[2]
-    );
+    status_callback("status", `resolving ${this.ipfs_path}...`);
+    const response = await axios.get(ipfs_url + this.ipfs_path);
+    const ipfs_path = "/ipfs/" + response.headers["x-ipfs-roots"];
     const ipfs_hash = ipfs_path.split("/")[2] as string;
+
     status_callback("status", `resolving files...`);
     return new NetworkConfig(
       "GET",
@@ -49,9 +56,11 @@ class EthSubdomainDatabaseSeed implements IIndexSeed {
   constructor(subdomain: string) {
     this.subdomain = subdomain;
   }
-  get_ipns(): string {
+
+  get_pin_command(): string {
     return "/ipns/" + this.subdomain + ".summa-t.eth";
   }
+
   async retrieve_network_config(
     status_callback: StatusCallback
   ): Promise<NetworkConfig> {
@@ -81,11 +90,11 @@ async function get_startup_configs() {
   }
   return [
     {
-      seed: new IpnsDatabaseSeed("/ipns/nexus-books.summa-t.eth/"),
+      seed: new IpfsDatabaseSeed("/ipns/nexus-books.summa-t.eth/"),
       is_enabled: true,
     },
     {
-      seed: new IpnsDatabaseSeed("/ipns/nexus-media.summa-t.eth/"),
+      seed: new IpfsDatabaseSeed("/ipns/nexus-media.summa-t.eth/"),
       is_enabled: false,
     },
   ];
@@ -159,7 +168,7 @@ export class WebIndexService {
       startup_config.is_enabled,
       false,
       index_payload,
-      startup_config.seed.get_ipns(),
+      startup_config.seed,
       network_config
     );
     await index_config.save();

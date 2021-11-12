@@ -9,10 +9,7 @@ form.mb-4.col-md-7
       .card-body
         h5.card-title.font-monospace {{ index_config.index_payload.name }}
         p.card-text {{ index_config.index_payload.description  }}
-        hr
         .card-body.small
-          a.lh-1.link-dark(href="#" @click.stop.prevent="to_clipboard(index_config.ipns_path)") Copy pin
-          span.lh-1  command and insert it into your Terminal app for caching database locally for better performance
           .row
             hr.mt-4
             .form-check.col-4.mt-4
@@ -24,6 +21,11 @@ form.mb-4.col-md-7
             .form-check.col-4.mt-4
               input.form-check-input(type="checkbox" :id="'checkbox_enabled_' + index_config.index_payload.name" v-model="index_config.is_enabled" @change="index_config.save()")
               label.form-check-label(:for="'checkbox_enabled_' + index_config.index_payload.name") Enabled
+          .row
+            hr.mt-4
+            span Index ID:
+            .form-text
+              span.lh-1 {{ index_config.index_seed }}
           .btn-group(role="group").float-end
             button.btn.btn-danger.btn-sm(type="button" @click.stop.prevent="web_index_service.delete_index(index_config.index_payload.name)")
               i.bi-trash
@@ -41,6 +43,7 @@ import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
 import { db, IndexConfig } from "@/database";
 import { useObservable } from "@vueuse/rxjs";
 import IsLoadingView from "@/components/IsLoading.vue";
+import {IpfsDatabaseSeed} from "../services/web-index-service";
 
 export default defineComponent({
   name: "DatabasesView",
@@ -57,16 +60,14 @@ export default defineComponent({
     };
   },
   methods: {
-    to_clipboard(ipns_path: string) {
-      navigator.clipboard.writeText(
-        "ipfs name resolve " + ipns_path + " | ipfs pin add"
-      );
-    },
     format_bytes: format_bytes,
-    async install_new_index(ipns_path: string) {
+    async install_new_index(ipfs_path: string) {
       this.is_loading = true;
       try {
-        await this.web_index_service.add_index(ipns_path as IPFSPath);
+        await this.web_index_service.add_index({
+          seed: new IpfsDatabaseSeed(ipfs_path),
+          is_enabled: true,
+        });
       } finally {
         this.is_loading = false;
       }

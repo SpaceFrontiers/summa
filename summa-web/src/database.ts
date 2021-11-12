@@ -7,7 +7,7 @@ class SummaDatabase extends Dexie {
 
   constructor() {
     super("SummaDatabase");
-    this.version(2).stores({
+    this.version(5).stores({
       index_configs: "index_payload.name,is_enabled",
     });
     this.index_configs.mapToClass(IndexConfig);
@@ -18,14 +18,14 @@ export interface IIndexSeed {
   retrieve_network_config(
     status_callback: StatusCallback
   ): Promise<NetworkConfig>;
-  get_ipns(): string;
+  get_pin_command(): string;
 }
 
 interface IIndexConfig {
   is_enabled: boolean;
   is_warm_up: boolean;
   index_payload: Object;
-  ipns_path: string;
+  index_seed: Object;
   network_config: NetworkConfig;
 }
 
@@ -33,20 +33,20 @@ export class IndexConfig implements IIndexConfig {
   is_enabled: boolean;
   is_warm_up: boolean;
   index_payload: Object;
-  ipns_path: string;
+  index_seed: Object;
   network_config: NetworkConfig;
 
   constructor(
     is_enabled: boolean,
     is_warm_up: boolean,
     index_payload: Object,
-    ipns_path: string,
+    index_seed: Object,
     network_config: NetworkConfig
   ) {
     this.is_enabled = is_enabled;
     this.is_warm_up = is_warm_up;
     this.index_payload = index_payload;
-    this.ipns_path = ipns_path;
+    this.index_seed = index_seed;
     this.network_config = network_config;
   }
 

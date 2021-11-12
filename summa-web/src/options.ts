@@ -1,13 +1,17 @@
 import { detect } from "detect-browser";
 import axios from "axios";
 
-export const is_development = process.env.NODE_ENV === "development" || window.location.port === "4173";
+export const is_development =
+  process.env.NODE_ENV === "development" || window.location.port === "4173";
 export const browser = detect();
 export const num_threads =
   browser && (browser.name === "safari" || browser.name === "ios") ? 0 : 16;
-export const hostname = window.location.hostname + (window.location.port == "" ? "" : ":" + window.location.port);
+export const hostname =
+  window.location.hostname +
+  (window.location.port == "" ? "" : ":" + window.location.port);
 export const ipfs_url = detect_ipfs_url(window.location.hostname);
-export const { ipfs_hostname, ipfs_http_protocol } = get_ipfs_hostname(ipfs_url);
+export const { ipfs_hostname, ipfs_http_protocol } =
+  get_ipfs_hostname(ipfs_url);
 export const is_eth_hostname =
   hostname.endsWith("eth.link") || hostname.endsWith("eth.limo");
 
