@@ -3,8 +3,8 @@
 - [Fill With Documents](#fill)
 - [Query](#query)
 
-In the following guide we are going to create searchable index based on WikiBooks data dumps. For these purposes we need
-preinstall [Python3](https://www.python.org/downloads/) for using Summa client and [Docker](https://www.docker.com/) for launching Summa server.
+In this quick-start we are going to create searchable index based on WikiBooks data dumps. For these purposes we need to
+install [Python3](https://www.python.org/downloads/) for using Summa client and [Docker](https://www.docker.com/) for launching Summa server.
 
 ### Setup <a name="setup"></a>
 Both server `summa-server` and client `aiosumma` are distributed through the package systems, `Cargo` and `pip`.
@@ -26,7 +26,7 @@ pip3 install -U https://github.com/explosion/spacy-models/releases/download/en_c
 ```
 
 #### Summa Server
-Summa server is a main guy on the party. This Rust-written software manages search indices and allows to do search queries.
+Summa server is a main guy at the party. This Rust-written software manages search indices and allows to do search queries.
 
 ```bash
 # Create diectory for storing index
