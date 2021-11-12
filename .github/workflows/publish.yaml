@@ -15,6 +15,7 @@ jobs:
         uses: arduino/setup-protoc@v1
       - uses: actions-rs/toolchain@v1.0.7
         with:
+          override: true
           toolchain: stable
       - uses: actions/cache@v2.1.6
         with:
@@ -25,21 +26,10 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo login ${CRATES_IO_TOKEN}
-        env:
-          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-      - uses: actions-rs/cargo@v1.0.3
+      - uses: katyo/publish-crates@v1
         with:
-          command: publish -p summa-proto
-          args: --verbose
-      - uses: actions-rs/cargo@v1.0.3
-        with:
-          command: publish -p summa-core
-          args: --verbose
-      - uses: actions-rs/cargo@v1.0.3
-        with:
-          command: publish -p summa-server
-          args: --verbose
+          ignore-unpublished-changes: true
+          registry-token: ${{ secrets.CRATES_IO_TOKEN }}
   push-to-docker:
     runs-on: ubuntu-22.04
     steps:
