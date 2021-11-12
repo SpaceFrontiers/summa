@@ -1,8 +1,3 @@
-### Table of Contents
-- [Setup](#setup)
-- [Fill With Documents](#fill)
-- [Query](#query)
-
 In this quick-start we will create index for searching in WikiBooks. There are two essential parts, Summa server responsible for
 indexing text data and Summa client that is required for communicating with Summa server. 
 Although there is an [GRPC API](summa/proto) you may want to use, here we will use Summa client implemented in Python.
@@ -13,7 +8,7 @@ Although there is an [GRPC API](summa/proto) you may want to use, here we will u
 - [Python3](https://www.python.org/downloads/)
 - [Docker](https://www.docker.com/)
 
-Both server `summa-server` and Summa client (named `aiosumma`) are distributed through the package systems, `Cargo` and `pip`.
+Both server `summa-server` and Summa client (named `aiosumma`) are distributed through the package systems, `Cargo` and `pip` correspondingly.
 Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub that we are going to use.
 
 #### Aiosumma
@@ -40,7 +35,6 @@ docker pull izihawa/summa-server:testing
 Here we download WikiBooks dumps and index them in Summa server.
 
 ```bash
-
 # Create diectory for storing index
 mkdir data
 
@@ -62,7 +56,7 @@ Then, we should open another Terminal session.
 {% include import-data-to-summa-snippet.sh %}
 ```
 
-Now, we have WikiBooks databases indexed locally.
+Now, we have WikiBooks database indexed locally.
 
 ### Query <a name="query"></a>
 Let's do a test query!
