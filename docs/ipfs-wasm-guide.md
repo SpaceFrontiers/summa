@@ -7,11 +7,11 @@ Here is a crossroad of three wonderful technologies: [IPFS](https://docs.ipfs.io
 In the following guide we learn how to: 
 create search index on the server, 
 replicate it to IPFS 
-and how to open it from inside your browser, using library allowing to fetch index directly to your browser from IPFS
+and how to open it from inside your browser without server for executing queries
 
 ### Configuring Summa
 
-Enable IPFS support during [config generation] with `-i` flag that accepts IPFS API endpoint:
+Enable IPFS support during [config generation](/summa/quick-start) with `-i` flag that accepts IPFS API endpoint:
 ```bash
 docker run izihawa/summa-server:testing generate-config -d /data \
 -g 0.0.0.0:8082 -m 0.0.0.0:8084 -i 0.0.0.0:5001 > summa.yaml
@@ -21,7 +21,7 @@ or add IPFS support to existing instance by adding section
 ipfs:
   api_endpoint: "0.0.0.0:5001"
 ```
-into your `config.yaml`
+into your `summa.yaml`
 
 Keep in mind that for Summa launched in Docker you should use `host.docker.internal:5001` address if IPFS is launched on host
 
@@ -29,7 +29,7 @@ Keep in mind that for Summa launched in Docker you should use `host.docker.inter
 
 Follow quick-start guide for [creating new index](/summa/quick-start#setup)
 
-In the end you will have index that we will publish and view through IPFS + Web.
+In the end you will have index that we will publish to IPFS and view through browser.
 
 ### Publish index to IPFS <a name="ipfs"></a>
 
