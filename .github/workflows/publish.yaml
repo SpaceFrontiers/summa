@@ -28,7 +28,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - uses: katyo/publish-crates@v1
         with:
-          ignore-unpublished-changes: true
           registry-token: ${{ secrets.CRATES_IO_TOKEN }}
   push-to-docker:
     runs-on: ubuntu-22.04
@@ -52,3 +51,18 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - run: DOCKER_CONFIG=$HOME/.docker summa-server/push-to-docker.sh
+  npm-publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 19
+      - run: npm install
+        working-directory: summa-wasm
+      - run: npm run build && ./patch.sh
+        working-directory: summa-wasm
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: summa-wasm

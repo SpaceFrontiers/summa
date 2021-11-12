@@ -30,8 +30,8 @@ serde_json = "1.0.85"
 serde-wasm-bindgen = "0.4.3"
 spmc = "0.3.0"
 strfmt = "0.2.2"
-summa-core = { version = "0.9.1", path = "../summa-core", default_features = false }
-summa-proto = { version = "0.9.1", path = "../summa", default_features = false }
+summa-core = { version = "0.10.0", path = "../summa-core", default_features = false }
+summa-proto = { version = "0.10.0", path = "../summa", default_features = false }
 tantivy = { package = "summavy", version = "0.19.9", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0.37"
 tokio = { version = "1.21.2", default_features = false, features = ["macros", "rt", "signal-hook-registry", "sync"] }
