@@ -3,11 +3,15 @@
 - [Fill With Documents](#fill)
 - [Query](#query)
 
+In the following guide we are going to create searchable index based on WikiBooks data dumps. For these purposes we need
+preinstall [Python3](https://www.python.org/downloads/) for using Summa client and [Docker](https://www.docker.com/) for launching Summa server.
+
 ### Setup <a name="setup"></a>
 Both server `summa-server` and client `aiosumma` are distributed through the package systems, `Cargo` and `pip`.
-Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub.
+Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub that we are going to use.
 
 #### Aiosumma
+`aiosumma` is a python package that allows to use Summa GRPC API from Python and Terminal.
 
 ```bash
 # (Optional) Create virtual env for `aiosumma`
@@ -22,6 +26,7 @@ pip3 install -U https://github.com/explosion/spacy-models/releases/download/en_c
 ```
 
 #### Summa Server
+Summa server is a main guy on the party. This Rust-written software manages search indices and allows to do search queries.
 
 ```bash
 # Create diectory for storing index
@@ -41,13 +46,17 @@ izihawa/summa-server:testing serve /summa.yaml
 ```
 
 ### Fill With Documents <a name="fill"></a>
+Here we download Wikibooks dumps for using them as a sample.
+
 ```bash
 {% include download-dump-snippet.sh %}
 
 {% include import-data-to-summa-snippet.sh %}
 ```
 ### Query <a name="query"></a>
+Let's do a test query!
+
 ```bash
 # Do a match query that returns top-10 documents and its total count
-summa-cli localhost:8082 - search page '{"match": {"value": "astronomy"}}' '[{"top_docs": {"limit": 10}}, {"count": {}}]'
+summa-cli localhost:8082 - search books '{"match": {"value": "astronomy"}}' '[{"top_docs": {"limit": 10}}, {"count": {}}]'
 ```

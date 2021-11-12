@@ -37,10 +37,8 @@ In the end you will have index that we will publish and view through IPFS + Web.
 ### Publish index to IPFS <a name="ipfs"></a>
 ```bash
 # Publish index to IPFS and return keys
-summa-cli localhost:8082 - publish-index page --copy
+summa-cli localhost:8082 - publish-index books
 ```
-
-Summa supports `--no-copy` mode of IPFS. However, it requires extra efforts due to IPFS inability to `add` file outside its root.
 
 ### View it on web page <a name="web"></a>
 

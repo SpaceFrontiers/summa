@@ -1,6 +1,6 @@
 ---
 # yamllint disable rule:key-ordering
-index_name: page
+index_name: books
 compression: Zstd
 multi_fields: ["category"]
 default_fields: ["opening_text", "title", "text"]
