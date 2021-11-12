@@ -2,11 +2,14 @@
 title: Welcome
 ---
 
-Full-text search server written in Rust with Python and GRPC API
+Full-text WASM-compatible search server written in Rust.
+Yes, you can launch it entirely inside your browser!
 
 ## Key Features
 
 - Full-text index
+- Compile to WASM and use [bindings](summa-wasm) to launch Summa in browsers
+- Use with IPFS out of the box
 - Store and retrieve documents with textual and numeric fields
 - Wide range of supported queries. Retrieve documents, do faceted search and collect statistics
 - Rank documents with BM25, custom and/or user-defined scoring functions
@@ -34,6 +37,6 @@ Full-text search server written in Rust with Python and GRPC API
 - [Metrics API](/summa/metrics-api)
 
 ### Expert
-- [IPFS Publish](/summa/ipfs-publish)
+- [IPFS Publish + WASM Browsing](/summa/ipfs-wasm-guide)
 - [Architecture](/summa/architecture)
 - [Development Guide](/summa/development)
