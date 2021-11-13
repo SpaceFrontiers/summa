@@ -16,7 +16,7 @@ Moreover, local processing of search queries would allow to use full-featured se
 
 ### Configuring Summa
 
-Enable IPFS support during [config generation](/summa-proto/quick-start) with `-i` flag that accepts IPFS API endpoint:
+Enable IPFS support during [config generation](/summa/quick-start) with `-i` flag that accepts IPFS API endpoint:
 ```bash
 docker run izihawa/summa-server:testing generate-config -d /data \
 -g 0.0.0.0:8082 -m 0.0.0.0:8084 -i 0.0.0.0:5001 > summa.yaml
@@ -32,7 +32,7 @@ Keep in mind that for Summa launched in Docker you should use `host.docker.inter
 
 ### Creating Sample Dataset
 
-Follow quick-start guide for [creating new index](/summa-proto/quick-start#setup)
+Follow quick-start guide for [creating new index](/summa/quick-start#setup)
 
 In the end you will have index that we will publish to IPFS and view through browser.
 
