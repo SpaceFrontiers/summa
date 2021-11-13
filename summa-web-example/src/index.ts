@@ -40,7 +40,7 @@ omnibox.onkeydown = ((e) => {
         const index_query = {
             index_name: index_payload["name"],
             query: {query: {match: {value: (omnibox as HTMLInputElement).value}}},
-            collectors: [{collector: {top_docs: {limit: 5, offset: 0, fields: [], snippets: [], explain: false}}}],
+            collectors: [{collector: {top_docs: {limit: 5}}}],
         }
         web_index_service_worker.search([ index_query ]).then((search_results) => {
             document.getElementById("search_result").innerText = JSON.stringify(

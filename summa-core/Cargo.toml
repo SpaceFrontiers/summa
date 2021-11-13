@@ -1,6 +1,6 @@
 [package]
 name = "summa-core"
-version = "0.10.0"
+version = "0.11.0"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -44,7 +44,7 @@ serde_cbor = "0.11.2"
 serde_json = "1.0.85"
 serde_yaml = "0.8.26"
 strfmt = "0.2.2"
-summa-proto = { version = "0.10.0", path = "../summa-proto", default_features = false }
+summa-proto = { version = "0.11.0", path = "../summa-proto", default_features = false }
 take_mut = "0.2.2"
 tantivy = { package = "summavy", version = "0.19.9", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0.36"

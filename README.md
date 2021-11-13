@@ -4,7 +4,8 @@
 # Summa
 
 Summa is a full-text WASM-compatible search server written in Rust.
-Yes, you can launch it entirely inside your browser!
+
+**Yes, you can launch and use Summa inside your browser for opening and searching indices over HTTP!**
 
 ## Key Features
 
@@ -18,3 +19,4 @@ Yes, you can launch it entirely inside your browser!
 
 - [github.io](https://izihawa.github.io)
 - [docs.rs](https://docs.rs/summa)
+

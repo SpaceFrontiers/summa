@@ -20,11 +20,16 @@ pub struct WebIndexRegistry {
 }
 
 #[derive(Deserialize, Serialize)]
+
 struct IndexPayload {
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub default_fields: Vec<String>,
+    #[serde(default)]
     pub multi_fields: HashSet<String>,
+    #[serde(default)]
     pub unixtime: u32,
 }
 

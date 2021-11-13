@@ -60,7 +60,7 @@ jobs:
           node-version: 19
       - run: npm install
         working-directory: summa-wasm
-      - run: npm run build && ./patch.sh
+      - run: ./build.sh
         working-directory: summa-wasm
       - run: npm publish
         env:

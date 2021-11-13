@@ -61,10 +61,7 @@ function default_collectors(index_name, page) {
         collector: {
           top_docs: {
             limit: page * 5,
-            offset: 0,
             snippets: { description: 400, title: 140 },
-            explain: false,
-            fields: [],
             scorer: {
               scorer: {
                 eval_expr: `original_score * ${add_exp_decay(
@@ -86,10 +83,7 @@ function default_collectors(index_name, page) {
         collector: {
           top_docs: {
             limit: page * 5,
-            offset: 0,
             snippets: { content: 400, title: 140 },
-            explain: false,
-            fields: [],
             scorer: {
               scorer: {
                 eval_expr: `original_score * ${add_exp_decay(
