@@ -1,4 +1,6 @@
+remote_theme: just-the-docs/just-the-docs
+plugins:
+- jekyll-remote-theme
 title: Summa Search Engine
 description: Fast full-text search server
-sass:
-  sass_dir: _sass
+show_downloads: false

@@ -3,7 +3,7 @@
 
 # Summa
 
-Summa is a full-text WASM-compatible search server written in Rust.
+Summa is the fast full-text search server for decentralized web.
 
 **Yes, you can launch and use Summa inside your browser for opening and searching indices over HTTP!**
 

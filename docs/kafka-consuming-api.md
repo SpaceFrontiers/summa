@@ -1,5 +1,4 @@
 ---
-layout: page
 title: Kafka Consuming API
 permalink: /kafka-consuming-api
 ---

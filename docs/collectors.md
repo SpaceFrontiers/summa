@@ -1,5 +1,4 @@
 ---
-layout: page
 title: Collectors
 permalink: /collectors
 ---

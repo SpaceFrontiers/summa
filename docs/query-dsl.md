@@ -1,5 +1,4 @@
 ---
-layout: page
 title: Query DSL
 permalink: /query-dsl
 ---

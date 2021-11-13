@@ -1,5 +1,4 @@
 ---
-layout: page
 title: IPFS Publish + WASM Browsing
 permalink: /ipfs-wasm-guide
 ---
