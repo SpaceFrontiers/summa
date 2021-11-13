@@ -16,18 +16,18 @@ from aiogrpcclient import (
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
-from summa.proto import beacon_service_pb2 as beacon_service_pb
-from summa.proto import consumer_service_pb2 as consumer_service_pb
-from summa.proto import index_service_pb2 as index_service_pb
-from summa.proto import query_pb2 as query_pb
-from summa.proto import reflection_service_pb2 as reflection_service_pb
-from summa.proto import search_service_pb2 as search_service_pb
-from summa.proto.beacon_service_pb2_grpc import BeaconApiStub
-from summa.proto.consumer_service_pb2_grpc import ConsumerApiStub
-from summa.proto.index_service_pb2_grpc import IndexApiStub
-from summa.proto.reflection_service_pb2_grpc import ReflectionApiStub
-from summa.proto.search_service_pb2_grpc import SearchApiStub
-from summa.proto.utils_pb2 import (  # noqa
+from .proto import beacon_service_pb2 as beacon_service_pb
+from .proto import consumer_service_pb2 as consumer_service_pb
+from .proto import index_service_pb2 as index_service_pb
+from .proto import query_pb2 as query_pb
+from .proto import reflection_service_pb2 as reflection_service_pb
+from .proto import search_service_pb2 as search_service_pb
+from .proto.beacon_service_pb2_grpc import BeaconApiStub
+from .proto.consumer_service_pb2_grpc import ConsumerApiStub
+from .proto.index_service_pb2_grpc import IndexApiStub
+from .proto.reflection_service_pb2_grpc import ReflectionApiStub
+from .proto.search_service_pb2_grpc import SearchApiStub
+from .proto.utils_pb2 import (  # noqa
     Asc,
     Desc,
 )

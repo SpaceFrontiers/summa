@@ -31,7 +31,7 @@ tonic-build = { version = "0.8.0", default-features = false, features = ["prost"
 
 [dev-dependencies]
 summa-core = { version = "0.10.0", path = "../summa-core", features = ["index-updater", "test-utils"] }
-summa-proto = { version = "0.10.0", path = "../summa", features = ["test-utils"] }
+summa-proto = { version = "0.10.0", path = "../summa-proto", features = ["test-utils"] }
 tempdir = "0.3.7"
 
 [dependencies]
@@ -65,7 +65,7 @@ serde_derive = "1.0.140"
 serde_json = "1.0.85"
 serde_yaml = "0.8.26"
 summa-core = { version = "0.10.0", path = "../summa-core", features = ["index-updater"] }
-summa-proto = { version = "0.10.0", path = "../summa" }
+summa-proto = { version = "0.10.0", path = "../summa-proto" }
 tantivy = { package = "summavy", version = "0.19.9", default_features = false, features = ["mmap", "quickwit", "zstd-compression"] }
 tantivy-fst = "0.4.0"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }

@@ -1,7 +1,7 @@
 syntax = "proto3";
 package summa.proto;
 
-import "summa/proto/query.proto";
+import "query.proto";
 
 
 // Main entrypoint for `Summa` that accepts queries to execute

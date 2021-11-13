@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["summa", "summa-core", "summa-server", "summa-wasm"]
+members = ["summa-proto", "summa-core", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true

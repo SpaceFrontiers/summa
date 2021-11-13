@@ -66,3 +66,14 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: summa-wasm
+  twine-upload:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: bash build.sh
+        working-directory: aiosumma
+      - run: twine upload dist/*
+        working-directory: aiosumma

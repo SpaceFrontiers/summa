@@ -2345,7 +2345,7 @@ checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
 
 [[package]]
 name = "summa-core"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-broadcast",
  "async-trait",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "summa-proto"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "summa-server"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-broadcast",
  "base64",

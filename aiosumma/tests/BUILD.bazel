@@ -1,7 +1,0 @@
-test_suite(
-    name = "tests",
-    tests = [
-        "//aiosumma/aiosumma/tests",
-        "//aiosumma/aiosumma/parser/tests",
-    ],
-)

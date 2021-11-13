@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from summa.proto import query_pb2
+from .proto import query_pb2
 
 
 class EvalScorerBuilder:
