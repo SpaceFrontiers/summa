@@ -3,11 +3,16 @@ layout: page
 title: IPFS Publish + WASM Browsing
 permalink: /ipfs-wasm-guide
 ---
-Here is a crossroad of three wonderful technologies: [IPFS](https://docs.ipfs.io/), [WASM](https://webassembly.org/getting-started/developers-guide/) and Summa.
-In the following guide we learn how to: 
-create search index on the server, 
-replicate it to IPFS 
-and how to open it from inside your browser without server for executing queries
+Current guide is a crossroad of three wonderful technologies: [IPFS](https://docs.ipfs.io/), [WASM](https://webassembly.org/getting-started/developers-guide/) and Summa.
+We learn here how to: 
+**create search index** on the server, 
+**replicate it to IPFS**
+and **open and use it from inside your browser** without the need of server.
+
+Launching search engine in browser means all computations required for search would be done by your browser. Search engine will request data chunks over HTTP requests and that's all.
+In perspective, such approach may dramatically increase privacy of search in the Internet. If your search query doesn't trip over network then nobody can count it.
+
+Moreover, local processing of search queries would allow to use full-featured search engine on statically hosted sites or even in decentralized systems such as IPFS.
 
 ### Configuring Summa
 
