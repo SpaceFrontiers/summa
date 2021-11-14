@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use crate::errors::BuilderError;
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
-#[builder(default)]
+#[builder(default, build_fn(error = "BuilderError"))]
 pub struct MetricsConfig {
     pub endpoint: String,
 }

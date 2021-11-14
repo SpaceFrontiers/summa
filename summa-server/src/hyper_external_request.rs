@@ -50,7 +50,7 @@ impl ExternalRequest for HyperExternalRequest {
             .iter()
             .map(|header_value| Header {
                 name: header_value.0.to_string(),
-                value: header_value.1.to_str().unwrap().to_string(),
+                value: header_value.1.to_str().expect("wrong header value").to_string(),
             })
             .collect();
         Ok(ExternalResponse {

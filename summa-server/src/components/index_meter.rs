@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::iter;
+use std::{io, iter};
 
 use opentelemetry::metrics::{Histogram, Unit};
 use opentelemetry::{global, Context, KeyValue};
@@ -40,7 +40,7 @@ impl IndexMeter {
         }
     }
 
-    pub(crate) fn record_metrics(&self, index_holder: &IndexHolder) {
+    pub(crate) fn record_metrics(&self, index_holder: &IndexHolder) -> io::Result<()> {
         let schema = index_holder.schema();
         let searcher = index_holder.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
@@ -48,7 +48,7 @@ impl IndexMeter {
         let context = Context::current();
         for segment_reader in segment_readers {
             let segment_id = segment_reader.segment_id().uuid_string();
-            let segment_space_usage = segment_reader.space_usage().unwrap();
+            let segment_space_usage = segment_reader.space_usage()?;
             for (field, field_usage) in iter::empty()
                 .chain(segment_space_usage.fast_fields().fields())
                 .chain(segment_space_usage.fieldnorms().fields())
@@ -77,5 +77,6 @@ impl IndexMeter {
             ];
             self.fields_memory_usage.record(&context, *memory_usage, field_keys);
         }
+        Ok(())
     }
 }

@@ -54,7 +54,7 @@ impl DifferentialUpdater {
                 },
             }
         }
-        required_operations.extend(target_files.into_values().map(|index_file| RequiredOperation::Add(index_file)));
+        required_operations.extend(target_files.into_values().map(RequiredOperation::Add));
         required_operations.into_iter().sorted_by_cached_key(|f| f.path().to_path_buf()).collect()
     }
 }

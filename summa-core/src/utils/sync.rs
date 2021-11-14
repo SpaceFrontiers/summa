@@ -78,7 +78,7 @@ impl<T> OwningHandler<T> {
                 Ok(data) => return data,
                 Err(arc_data) => {
                     data = arc_data;
-                    receiver.recv().await.unwrap();
+                    receiver.recv().await.expect("channel unexpectedly closed");
                 }
             }
         }

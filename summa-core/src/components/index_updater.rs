@@ -62,8 +62,8 @@ fn create_index_writer_holder(index: &Index, index_config: &IndexConfig) -> Summ
 
 fn wait_merging_threads(index_writer_holder: &mut IndexWriterHolder, index: &Index, index_config: &IndexConfig) {
     take_mut::take(index_writer_holder, |index_writer_holder| {
-        index_writer_holder.wait_merging_threads().unwrap();
-        create_index_writer_holder(index, index_config).unwrap()
+        index_writer_holder.wait_merging_threads().expect("cannot wait merging threads");
+        create_index_writer_holder(index, index_config).expect("cannot create index writer_holder")
     });
 }
 
@@ -457,7 +457,7 @@ impl InnerIndexUpdater {
                     index_path.join(relative_path).exists().then(|| {
                         ComponentFile::SegmentComponent(SegmentComponent {
                             path: segment.meta().relative_path(*segment_component),
-                            segment_component: segment_component.clone(),
+                            segment_component: *segment_component,
                         })
                     })
                 })

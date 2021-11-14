@@ -1,22 +1,26 @@
 use async_broadcast::{broadcast, Receiver};
 use rand::{distributions::Alphanumeric, Rng};
+use summa_core::errors::SummaResult;
 use summa_core::utils::thread_handler::ControlMessage;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task;
+use tracing::error;
 
 /// Spawns a thread for processing `SignalKind` and returns `oneshot::Receiver` for a signal event
-pub fn signal_channel() -> Receiver<ControlMessage> {
+pub fn signal_channel() -> SummaResult<Receiver<ControlMessage>> {
     let (sender, receiver) = broadcast::<ControlMessage>(1);
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
     task::spawn(async move {
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
         tokio::select! {
             _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
         }
-        sender.broadcast(ControlMessage::Shutdown).await.unwrap()
+        if let Err(error) = sender.broadcast(ControlMessage::Shutdown).await {
+            error!(action = "signal_channel_termination", error = ?error)
+        }
     });
-    receiver
+    Ok(receiver)
 }
 
 pub fn random_string(length: usize) -> String {

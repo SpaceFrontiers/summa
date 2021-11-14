@@ -6,6 +6,7 @@ use crate::errors::{Error, SummaServerResult};
 use crate::requests::validators;
 
 #[derive(Builder)]
+#[builder(build_fn(error = "summa_core::errors::BuilderError"))]
 pub struct CreateIndexRequest {
     pub index_name: String,
     pub index_engine: proto::IndexEngine,
@@ -45,7 +46,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
 
         Ok(CreateIndexRequestBuilder::default()
             .index_name(proto_request.index_name)
-            .index_engine(proto::IndexEngine::from_i32(proto_request.index_engine).unwrap())
+            .index_engine(proto::IndexEngine::from_i32(proto_request.index_engine).expect("cannot cast proto value"))
             .schema(schema)
             .primary_key(primary_key)
             .compression(compression)
@@ -57,6 +58,6 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .writer_threads(proto_request.writer_threads)
             .writer_heap_size_bytes(proto_request.writer_heap_size_bytes)
             .build()
-            .unwrap())
+            .map_err(summa_core::Error::from)?)
     }
 }

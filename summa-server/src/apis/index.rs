@@ -13,7 +13,7 @@ use summa_proto::proto;
 use tantivy::SegmentId;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info_span, warn};
+use tracing::{error, info_span, warn};
 use tracing_futures::Instrument;
 
 use crate::errors::SummaServerResult;
@@ -224,16 +224,21 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         tokio::spawn(async move {
-            let index_name = index_holder.index_name();
-            let segment_ids: Vec<_> = proto_request.segment_ids.iter().map(|x| SegmentId::from_uuid_string(x).unwrap()).collect();
-            index_holder
-                .index_updater()
-                .read()
-                .await
-                .merge_index(&segment_ids, None)
-                .instrument(info_span!("merge", index_name = ?index_name))
-                .await
-                .unwrap()
+            let index_name = index_holder.index_name().to_string();
+            let segment_ids: Vec<_> = proto_request
+                .segment_ids
+                .iter()
+                .map(|segment_id| SegmentId::from_uuid_string(segment_id))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("wrong uuid");
+            async move {
+                let result = index_holder.index_updater().read().await.merge_index(&segment_ids, None).await;
+                if let Err(error) = result {
+                    error!(error = ?error)
+                }
+            }
+            .instrument(info_span!("merge", index_name = ?index_name))
+            .await
         });
         let response = proto::MergeSegmentsResponse {};
         Ok(Response::new(response))
@@ -254,15 +259,15 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         tokio::spawn(async move {
-            let index_name = index_holder.index_name();
-            index_holder
-                .index_updater()
-                .read()
-                .await
-                .vacuum_index(None, None)
-                .instrument(info_span!("vacuum", index_name = ?index_name))
-                .await
-                .unwrap();
+            let index_name = index_holder.index_name().to_string();
+            async move {
+                let result = index_holder.index_updater().read().await.vacuum_index(None, None).await;
+                if let Err(error) = result {
+                    error!(error = ?error)
+                }
+            }
+            .instrument(info_span!("merge", index_name = ?index_name))
+            .await
         });
         let response = proto::VacuumIndexResponse {};
         Ok(Response::new(response))

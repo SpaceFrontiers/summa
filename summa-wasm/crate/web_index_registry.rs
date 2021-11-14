@@ -74,7 +74,7 @@ impl WebIndexRegistry {
             .default_fields(index_payload.default_fields.clone())
             .multi_fields(index_payload.multi_fields.clone())
             .build()
-            .unwrap();
+            .map_err(|e| Error::Core(e.into()))?;
 
         index.set_multithread_executor(match self.multithreading {
             true => Executor::GlobalPool,

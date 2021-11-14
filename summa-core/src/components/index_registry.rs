@@ -65,29 +65,30 @@ impl IndexRegistry {
     /// Searches in several indices simultaneously and merges results
     pub async fn search(&self, index_queries: &[IndexQuery]) -> SummaResult<Vec<proto::CollectorOutput>> {
         let index_holders = self.index_holders().await;
-        let futures = index_queries.iter().map(|index_query| {
-            let index_holder = index_holders.get(&index_query.index_name).unwrap();
-            async move {
-                index_holder
-                    .search(&index_query.index_name, &index_query.query, &index_query.collectors)
-                    .await
-                    .unwrap()
-            }
-        });
-        self.merge_responses(&join_all(futures).await)
+        let futures = index_queries
+            .iter()
+            .map(|index_query| {
+                let index_holder = index_holders
+                    .get(&index_query.index_name)
+                    .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_query.index_name.to_owned())))?
+                    .handler();
+                Ok(async move { index_holder.search(&index_query.index_name, &index_query.query, &index_query.collectors).await })
+            })
+            .collect::<SummaResult<Vec<_>>>()?;
+        self.merge_responses(&join_all(futures).await.into_iter().collect::<SummaResult<Vec<_>>>()?)
     }
 
     /// Merges several `proto::CollectorOutput`
     fn merge_responses(&self, collectors_outputs: &[Vec<proto::CollectorOutput>]) -> SummaResult<Vec<proto::CollectorOutput>> {
         let mut merged_response = vec![];
-        for (ix, collector_output) in collectors_outputs.get(0).unwrap().iter().enumerate() {
+        for (ix, first_collector_output) in collectors_outputs[0].iter().enumerate() {
             merged_response.push(proto::CollectorOutput {
-                collector_output: match &collector_output.collector_output {
+                collector_output: match &first_collector_output.collector_output {
                     Some(proto::collector_output::CollectorOutput::Aggregation(_)) => todo!(),
                     Some(proto::collector_output::CollectorOutput::Count(_)) => {
                         let counts = collectors_outputs
                             .iter()
-                            .map(|collectors_outputs| collectors_outputs[ix].as_count().expect("Expected count collector").count);
+                            .map(|collectors_output| collectors_output[ix].as_count().expect("expected count collector").count);
                         Some(proto::collector_output::CollectorOutput::Count(proto::CountCollectorOutput {
                             count: counts.sum(),
                         }))
@@ -95,7 +96,9 @@ impl IndexRegistry {
                     Some(proto::collector_output::CollectorOutput::Facet(_)) => todo!(),
                     Some(proto::collector_output::CollectorOutput::ReservoirSampling(_)) => todo!(),
                     Some(proto::collector_output::CollectorOutput::TopDocs(_)) => {
-                        let top_docs = collectors_outputs.iter().map(|collectors_output| collectors_output[ix].as_top_docs().unwrap());
+                        let top_docs = collectors_outputs
+                            .iter()
+                            .map(|collectors_output| collectors_output[ix].as_top_docs().expect("expected top_docs collector"));
                         let has_next = top_docs.clone().any(|top_docs| top_docs.has_next);
                         let mut scored_documents: Vec<_> = top_docs
                             .map(|top_docs| top_docs.scored_documents.iter())

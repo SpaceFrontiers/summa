@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use crate::errors::BuilderError;
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
-#[builder(default)]
+#[builder(default, build_fn(error = "BuilderError"))]
 pub struct GrpcConfig {
     pub endpoint: String,
     pub max_frame_size_bytes: Option<u32>,

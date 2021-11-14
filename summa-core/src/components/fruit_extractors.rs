@@ -10,7 +10,7 @@ use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerato
 
 use super::custom_serializer::NamedFieldDocument;
 use crate::collectors;
-use crate::errors::{Error, SummaResult, ValidationError};
+use crate::errors::{BuilderError, Error, SummaResult, ValidationError};
 use crate::scorers::EvalScorer;
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
@@ -155,7 +155,7 @@ pub fn build_fruit_extractor(
 }
 
 #[derive(Builder)]
-#[builder(pattern = "owned", build_fn(error = "ValidationError"))]
+#[builder(pattern = "owned", build_fn(error = "BuilderError"))]
 pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
     handle: FruitHandle<Vec<(T, DocAddress)>>,
     limit: u32,
@@ -198,9 +198,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             |(position, (score, doc_address))| {
                 let document = searcher.doc(*doc_address).expect("Document retrieving failed");
                 Ok(proto::ScoredDocument {
-                    document: NamedFieldDocument::from_document(searcher.schema(), &self.fields, multi_fields, &document)
-                        .to_json()
-                        .unwrap(),
+                    document: NamedFieldDocument::from_document(searcher.schema(), &self.fields, multi_fields, &document).to_json(),
                     score: Some((*score).into()),
                     position: position as u32,
                     snippets: snippet_generators
@@ -222,7 +220,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
 }
 
 #[derive(Builder)]
-#[builder(pattern = "owned", build_fn(error = "ValidationError"))]
+#[builder(pattern = "owned", build_fn(error = "BuilderError"))]
 pub struct ReservoirSampling {
     handle: FruitHandle<Vec<DocAddress>>,
     #[builder(default = "None")]
@@ -248,7 +246,7 @@ impl FruitExtractor for ReservoirSampling {
                         .map(|doc_address| {
                             Ok(proto::RandomDocument {
                                 index_alias: external_index_alias.to_string(),
-                                document: NamedFieldDocument::from_document(schema, &self.fields, multi_fields, &searcher.doc(*doc_address)?).to_json()?,
+                                document: NamedFieldDocument::from_document(schema, &self.fields, multi_fields, &searcher.doc(*doc_address)?).to_json(),
                                 score: Some((1.0).into()),
                             })
                         })

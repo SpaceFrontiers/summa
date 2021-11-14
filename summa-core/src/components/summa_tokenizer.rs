@@ -58,7 +58,7 @@ impl<'a> TokenStream for SummaTokenStream<'a> {
             if c.is_alphanumeric() {
                 let offset_to = if !is_cjk(&c) {
                     let offset_to = self.search_token_end();
-                    if !is_cjk(&self.current_char_index.unwrap().1) {
+                    if !is_cjk(&self.current_char_index.expect("expected char").1) {
                         self.current_char_index = self.chars.next();
                     }
                     offset_to

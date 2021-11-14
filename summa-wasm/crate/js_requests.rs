@@ -38,7 +38,7 @@ impl ExternalRequest for JsExternalRequest {
         let response = request(
             self.method.to_string(),
             self.url.to_string(),
-            serde_wasm_bindgen::to_value(&self.headers).unwrap(),
+            serde_wasm_bindgen::to_value(&self.headers).map_err(|e| summa_core::errors::Error::External(e.to_string()))?,
         )
         .map_err(|e| summa_core::Error::External(format!("{:?}", e)))?;
         let response: ExternalResponse = serde_wasm_bindgen::from_value(response).unwrap_throw();
@@ -51,7 +51,7 @@ impl ExternalRequest for JsExternalRequest {
         let url = self.url.to_string();
         let headers = self.headers.clone();
         spawn_local(async move {
-            let headers = serde_wasm_bindgen::to_value(&headers).unwrap();
+            let headers = serde_wasm_bindgen::to_value(&headers).expect("headers are not serializable");
             let response = request_async(method, url, headers)
                 .await
                 .map(|response| serde_wasm_bindgen::from_value(response).unwrap_throw())

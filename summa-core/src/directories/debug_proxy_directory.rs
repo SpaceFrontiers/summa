@@ -19,11 +19,12 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{fmt, io, mem};
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, OwnedBytes};
 use tantivy::{Directory, HasLen};
@@ -40,13 +41,13 @@ impl fmt::Debug for OperationBuffer {
 
 impl OperationBuffer {
     fn drain(&self) -> impl Iterator<Item = ReadOperation> + 'static {
-        let mut guard = self.0.lock().expect("Mutex poisoned");
+        let mut guard = self.0.lock();
         let ops: Vec<ReadOperation> = mem::take(guard.as_mut());
         ops.into_iter()
     }
 
     fn push(&self, read_operation: ReadOperation) {
-        let mut guard = self.0.lock().expect("Mutex poisoned");
+        let mut guard = self.0.lock();
         guard.push(read_operation);
     }
 }

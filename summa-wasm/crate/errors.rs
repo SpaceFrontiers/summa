@@ -1,17 +1,15 @@
 use std::io;
 
-use wasm_bindgen::JsValue;
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("index_error: {0}")]
-    AsyncIo(tantivy::error::AsyncIoError),
-    #[error("index_error: {0}")]
-    Core(summa_core::Error),
+    #[error("async_io: {0}")]
+    AsyncIo(#[from] tantivy::error::AsyncIoError),
+    #[error("core: {0}")]
+    Core(#[from] summa_core::Error),
     #[error("incorrect_payload")]
     IncorrectPayload,
     #[error("index_error: {0}")]
-    Index(tantivy::TantivyError),
+    Index(#[from] tantivy::TantivyError),
     #[error("js_error: {0}")]
     Js(String),
     #[error("serialization_error: {0}")]
@@ -42,33 +40,15 @@ impl From<strfmt::FmtError> for Error {
     }
 }
 
-impl From<Error> for JsValue {
+impl From<Error> for wasm_bindgen::JsValue {
     fn from(error: Error) -> Self {
-        JsValue::from(format!("{:?}", error))
+        wasm_bindgen::JsValue::from(format!("{:?}", error))
     }
 }
 
 impl From<Error> for tantivy::error::AsyncIoError {
     fn from(error: Error) -> Self {
         tantivy::error::AsyncIoError::Io(error.into())
-    }
-}
-
-impl From<tantivy::error::AsyncIoError> for Error {
-    fn from(error: tantivy::error::AsyncIoError) -> Self {
-        Error::AsyncIo(error)
-    }
-}
-
-impl From<tantivy::TantivyError> for Error {
-    fn from(error: tantivy::TantivyError) -> Self {
-        Error::Index(error)
-    }
-}
-
-impl From<summa_core::Error> for Error {
-    fn from(error: summa_core::Error) -> Self {
-        Error::Core(error)
     }
 }
 

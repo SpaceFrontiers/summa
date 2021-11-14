@@ -12,10 +12,10 @@ use super::ConfigHolder;
 use super::GrpcConfig;
 use super::MetricsConfig;
 use crate::configs::{GrpcConfigBuilder, IndexConfig, IpfsConfig, Loadable, MetricsConfigBuilder};
-use crate::errors::{Error, SummaResult, ValidationError};
+use crate::errors::{BuilderError, Error, SummaResult, ValidationError};
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
-#[builder(default)]
+#[builder(default, build_fn(error = "BuilderError"))]
 pub struct ApplicationConfig {
     #[serde(default = "HashMap::new")]
     pub aliases: HashMap<String, String>,
@@ -37,11 +37,11 @@ impl Default for ApplicationConfig {
             aliases: HashMap::new(),
             data_path: PathBuf::new(),
             debug: true,
-            grpc: GrpcConfigBuilder::default().build().unwrap(),
+            grpc: GrpcConfigBuilder::default().build().expect("cannot build default config"),
             indices: HashMap::new(),
             ipfs: None,
             log_path: PathBuf::new(),
-            metrics: MetricsConfigBuilder::default().build().unwrap(),
+            metrics: MetricsConfigBuilder::default().build().expect("cannot build default config"),
         }
     }
 }
@@ -89,12 +89,12 @@ impl ApplicationConfig {
 
 impl ApplicationConfigBuilder {
     pub fn data_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self {
-        self.data_path = Some(Absolutize::absolutize(value.as_ref()).unwrap().to_path_buf());
+        self.data_path = Some(Absolutize::absolutize(value.as_ref()).expect("cannot get cwd").to_path_buf());
         self
     }
 
     pub fn logs_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self {
-        self.log_path = Some(Absolutize::absolutize(value.as_ref()).unwrap().to_path_buf());
+        self.log_path = Some(Absolutize::absolutize(value.as_ref()).expect("cannot get cwd").to_path_buf());
         self
     }
 }
@@ -135,7 +135,7 @@ impl ApplicationConfigHolder {
 impl Default for ApplicationConfigHolder {
     fn default() -> Self {
         ApplicationConfigHolder(Arc::new(RwLock::new(ConfigHolder::memory(
-            ApplicationConfigBuilder::default().build().unwrap(),
+            ApplicationConfigBuilder::default().build().expect("cannot build default config"),
         ))))
     }
 }

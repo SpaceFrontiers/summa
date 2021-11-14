@@ -26,14 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "grpc")]
 fn build_tonic(files: &[&str], serde_default_structs: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = tonic_build::configure();
-    builder = builder
+    let builder = tonic_build::configure();
+    let mut builder_ref = builder
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"snake_case\")]");
     for serde_default_struct in serde_default_structs {
-        builder = builder.type_attribute(serde_default_struct, "#[serde(default)]");
+        builder_ref = builder_ref.type_attribute(serde_default_struct, "#[serde(default)]");
     }
-    Ok(builder
+    Ok(builder_ref
         .file_descriptor_set_path(std::env::var("OUT_DIR").unwrap() + "/summa.bin")
         .compile(files, &["./proto"])?)
 }
@@ -41,11 +41,11 @@ fn build_tonic(files: &[&str], serde_default_structs: &[&str]) -> Result<(), Box
 #[cfg(not(feature = "grpc"))]
 fn build_prost(files: &[&str], serde_default_structs: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = prost_build::Config::new();
-    builder = builder
+    let mut builder_ref = builder
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"snake_case\")]");
     for serde_default_struct in serde_default_structs {
-        builder = builder.type_attribute(serde_default_struct, "#[serde(default)]");
+        builder_ref = builder_ref.type_attribute(serde_default_struct, "#[serde(default)]");
     }
-    Ok(builder.compile_protos(files, &["./proto"])?)
+    Ok(builder_ref.compile_protos(files, &["./proto"])?)
 }

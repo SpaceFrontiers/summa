@@ -15,7 +15,7 @@ use crate::configs::ConfigReadProxy;
 use crate::configs::ConfigWriteProxy;
 use crate::configs::{ApplicationConfig, ApplicationConfigHolder, ConfigHolder, Persistable};
 use crate::directories::Header;
-use crate::errors::SummaResult;
+use crate::errors::{BuilderError, SummaResult, ValidationError};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkedCacheConfig {
@@ -55,6 +55,7 @@ impl Debug for IndexEngine {
 }
 
 #[derive(Builder, Clone, Serialize, Deserialize)]
+#[builder(build_fn(error = "BuilderError"))]
 pub struct IndexConfig {
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
@@ -112,7 +113,10 @@ impl ConfigProxy<IndexConfig> for IndexConfigFilePartProxy {
 
     async fn delete(self: Arc<Self>) -> SummaResult<IndexConfig> {
         let mut application_config = self.application_config.write().await;
-        let index_config = application_config.indices.remove(&self.index_name).unwrap();
+        let index_config = application_config
+            .indices
+            .remove(&self.index_name)
+            .ok_or_else(|| ValidationError::MissingIndex(self.index_name.to_string()))?;
         application_config.save()?;
         Ok(index_config)
     }
@@ -131,7 +135,11 @@ impl<'a> IndexConfigFilePartReadProxy<'a> {
 
 impl<'a> ConfigReadProxy<IndexConfig> for IndexConfigFilePartReadProxy<'a> {
     fn get(&self) -> &IndexConfig {
-        self.application_config.indices.get(&self.index_name).unwrap()
+        self.application_config
+            .indices
+            .get(&self.index_name)
+            .ok_or_else(|| ValidationError::MissingIndex(self.index_name.to_string()))
+            .expect("missing index")
     }
 }
 

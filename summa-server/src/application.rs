@@ -64,23 +64,42 @@ impl Application {
 
         match matches.subcommand() {
             Some(("generate-config", submatches)) => {
-                let data_path = PathBuf::from(submatches.get_one::<String>("DATA_PATH").unwrap());
-                let grpc_endpoint = submatches.get_one::<String>("GRPC_ENDPOINT").unwrap();
-                let metrics_endpoint = submatches.get_one::<String>("METRICS_ENDPOINT").unwrap();
-                let ipfs_api_endpoint = submatches.get_one::<String>("IPFS_API_ENDPOINT");
+                let data_path = PathBuf::from(submatches.try_get_one::<String>("DATA_PATH")?.expect("no value"));
+                let grpc_endpoint = submatches.try_get_one::<String>("GRPC_ENDPOINT")?.expect("no value");
+                let metrics_endpoint = submatches.try_get_one::<String>("METRICS_ENDPOINT")?.expect("no value");
+                let ipfs_api_endpoint = submatches.try_get_one::<String>("IPFS_API_ENDPOINT")?;
                 let default_config = ApplicationConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
-                    .grpc(GrpcConfigBuilder::default().endpoint(grpc_endpoint.to_string()).build().unwrap())
-                    .metrics(MetricsConfigBuilder::default().endpoint(metrics_endpoint.to_string()).build().unwrap())
-                    .ipfs(ipfs_api_endpoint.map(|ipfs_api_endpoint| IpfsConfigBuilder::default().api_endpoint(ipfs_api_endpoint.to_string()).build().unwrap()))
+                    .grpc(
+                        GrpcConfigBuilder::default()
+                            .endpoint(grpc_endpoint.to_string())
+                            .build()
+                            .map_err(summa_core::Error::from)?,
+                    )
+                    .metrics(
+                        MetricsConfigBuilder::default()
+                            .endpoint(metrics_endpoint.to_string())
+                            .build()
+                            .map_err(summa_core::Error::from)?,
+                    )
+                    .ipfs(
+                        ipfs_api_endpoint
+                            .map(|ipfs_api_endpoint| {
+                                IpfsConfigBuilder::default()
+                                    .api_endpoint(ipfs_api_endpoint.to_string())
+                                    .build()
+                                    .map_err(summa_core::Error::from)
+                            })
+                            .transpose()?,
+                    )
                     .build()
-                    .unwrap();
-                println!("{}", serde_yaml::to_string(&default_config).unwrap());
+                    .map_err(summa_core::Error::from)?;
+                println!("{}", serde_yaml::to_string(&default_config).expect("cannot serialize config"));
                 Ok(())
             }
             Some(("serve", submatches)) => {
-                let config_path = PathBuf::from(submatches.get_one::<String>("CONFIG").unwrap());
+                let config_path = PathBuf::from(submatches.try_get_one::<String>("CONFIG")?.expect("no value"));
                 let application_config_holder = ApplicationConfigHolder::from_path(config_path)?;
                 let _guards = {
                     let application_config = application_config_holder.read().await;
@@ -113,7 +132,7 @@ impl Application {
     }
 
     async fn run(&self) -> SummaServerResult<()> {
-        let server = self.serve(&signal_channel()).await?;
+        let server = self.serve(&signal_channel()?).await?;
         server.await
     }
 }

@@ -27,12 +27,6 @@ pub struct AutosaveLockWriteGuard<'a, T: Persistable> {
     data: &'a mut T,
 }
 
-impl<'a, T: Persistable> AutosaveLockWriteGuard<'a, T> {
-    pub fn new(data: &'a mut T) -> Self {
-        AutosaveLockWriteGuard { data }
-    }
-}
-
 impl<'a, T: Persistable> Drop for AutosaveLockWriteGuard<'a, T> {
     fn drop(&mut self) {
         match self.data.save() {
@@ -95,12 +89,10 @@ impl<'a, TConfig: Serialize + Deserialize<'a>> Loadable for ConfigHolder<TConfig
 impl<TConfig: Serialize> Persistable for ConfigHolder<TConfig> {
     fn save(&self) -> SummaResult<()> {
         if let Some(config_filepath) = &self.config_filepath {
+            let mut vec = Vec::with_capacity(128);
+            to_writer(&mut vec, &self.config)?;
             std::fs::File::create(config_filepath)
-                .and_then(|mut file| {
-                    let mut vec = Vec::with_capacity(128);
-                    to_writer(&mut vec, &self.config).unwrap();
-                    file.write_all(&vec)
-                })
+                .and_then(|mut file| file.write_all(&vec))
                 .map_err(|e| Error::IO((e, Some(config_filepath.to_path_buf()))))?;
         }
         Ok(())
@@ -123,6 +115,6 @@ impl<TConfig: Serialize> DerefMut for ConfigHolder<TConfig> {
 
 impl<TConfig: Serialize> std::fmt::Display for ConfigHolder<TConfig> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", serde_yaml::to_string(&self.config).unwrap())
+        write!(f, "{}", serde_yaml::to_string(&self.config).expect("cannot serialize"))
     }
 }

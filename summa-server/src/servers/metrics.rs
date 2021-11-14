@@ -22,8 +22,8 @@ use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument};
 
 use super::base::BaseServer;
-use crate::errors::SummaServerResult;
-use crate::search_engine::IndexMeter;
+use crate::components::IndexMeter;
+use crate::errors::{Error, SummaServerResult};
 use crate::services::IndexService;
 
 lazy_static! {
@@ -71,6 +71,7 @@ impl MetricsServer {
             exporter,
         })
     }
+
     async fn serve_request(request: Request<Body>, state: Arc<AppState>) -> Result<Response<Body>, hyper::Error> {
         let _span = info_span!(
             "request",
@@ -81,20 +82,24 @@ impl MetricsServer {
         let response = match request.method() {
             &Method::GET => {
                 for index_holder in state.index_service.index_holders().await.values() {
-                    state.index_meter.record_metrics(index_holder)
+                    state
+                        .index_meter
+                        .record_metrics(index_holder)
+                        .map_err(Error::from)
+                        .expect("cannot record meters")
                 }
 
                 let mut buffer = vec![];
                 let encoder = TextEncoder::new();
                 let metric_families = state.exporter.registry().gather();
-                encoder.encode(&metric_families[..], &mut buffer).unwrap();
+                encoder.encode(&metric_families[..], &mut buffer).expect("prometheus failed");
                 Response::builder()
                     .status(200)
                     .header(CONTENT_TYPE, encoder.format_type())
                     .body(Body::from(buffer))
-                    .unwrap()
+                    .expect("encoding body failed")
             }
-            _ => Response::builder().status(404).body(Body::from("Missing Page")).unwrap(),
+            _ => Response::builder().status(404).body(Body::from("Missing Page")).expect("encoding body failed"),
         };
         Ok(response)
     }
@@ -119,13 +124,12 @@ impl MetricsServer {
         let server = Server::bind(&metrics_config.endpoint.parse()?).serve(service);
         info!(action = "binded", endpoint = ?metrics_config.endpoint);
         let graceful = server.with_graceful_shutdown(async move {
-            terminator.recv().await.unwrap();
-            info!(action = "sigterm_received");
+            let signal_result = terminator.recv().await;
+            info!(action = "sigterm_received", received = ?signal_result);
         });
 
         Ok(async move {
-            graceful.await.unwrap();
-            info!(action = "terminated");
+            info!(action = "terminated", result = ?graceful.await?);
             Ok(())
         })
     }

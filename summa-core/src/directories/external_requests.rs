@@ -94,7 +94,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         Ok(TExternalRequest::new(
             "HEAD",
             &strfmt(&self.network_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
-            &vec![],
+            &[],
         ))
     }
 }

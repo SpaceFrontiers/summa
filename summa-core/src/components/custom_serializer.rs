@@ -4,8 +4,6 @@ use serde::{Serialize, Serializer};
 use tantivy::schema::{Field, Schema};
 use tantivy::Document;
 
-use crate::errors::SummaResult;
-
 pub enum Value {
     SingleValue(Option<tantivy::schema::Value>),
     MultipleValue(Vec<tantivy::schema::Value>),
@@ -40,8 +38,8 @@ impl NamedFieldDocument {
         }
         NamedFieldDocument(field_map)
     }
-    pub fn to_json(&self) -> SummaResult<String> {
-        Ok(serde_json::to_string(self)?)
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("must be serializable")
     }
 }
 

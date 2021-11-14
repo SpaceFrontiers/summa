@@ -117,7 +117,10 @@ impl IndexService {
         }
         let index_engine = IndexEngine::File(index_path);
 
-        let index_config = IndexConfigBuilder::default().index_engine(index_engine.clone()).build().unwrap();
+        let index_config = IndexConfigBuilder::default()
+            .index_engine(index_engine.clone())
+            .build()
+            .map_err(summa_core::Error::from)?;
         self.insert_config(index_name, &index_config).await?;
 
         let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
@@ -148,7 +151,7 @@ impl IndexService {
             index_config_builder.writer_heap_size_bytes(writer_heap_size_bytes);
         }
 
-        let index_config = index_config_builder.build().unwrap();
+        let index_config = index_config_builder.build().map_err(summa_core::Error::from)?;
         self.insert_config(&create_index_request.index_name, &index_config).await?;
 
         let index_settings = IndexSettings {

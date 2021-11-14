@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use crate::errors::BuilderError;
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
-#[builder(default)]
+#[builder(default, build_fn(error = "BuilderError"))]
 pub struct IpfsConfig {
     pub api_endpoint: String,
     pub default_hash: Option<String>,

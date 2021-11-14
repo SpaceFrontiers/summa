@@ -12,7 +12,8 @@ use tantivy::{
 
 use super::ExternalRequestGenerator;
 use crate::directories::ExternalRequest;
-use crate::errors::SummaResult;
+use crate::errors::ValidationError::InvalidHttpHeader;
+use crate::errors::{SummaResult, ValidationError};
 
 pub struct NetworkDirectory<TExternalRequest: ExternalRequest> {
     file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
@@ -101,12 +102,17 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
                     .iter()
                     .find_map(|header| {
                         if header.name == "content-length" {
-                            Some(header.value.parse::<u64>().unwrap())
+                            Some(
+                                header
+                                    .value
+                                    .parse::<u64>()
+                                    .map_err(|_| InvalidHttpHeader(header.name.clone(), header.value.clone())),
+                            )
                         } else {
                             None
                         }
                     })
-                    .unwrap()
+                    .ok_or_else(|| ValidationError::MissingHeader("content_range".to_string()))??
             }
         })
     }

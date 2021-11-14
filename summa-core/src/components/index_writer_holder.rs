@@ -72,7 +72,10 @@ impl IndexWriterHolder {
         info!(action = "merge_segments", segment_ids = ?segment_ids);
         let segment_meta = self
             .index_writer
-            .merge_with_attributes(segment_ids, segment_attributes.map(|sa| serde_json::to_value(sa).unwrap()))
+            .merge_with_attributes(
+                segment_ids,
+                segment_attributes.map(|segment_attributes| serde_json::to_value(segment_attributes).expect("cannot seriliaze")),
+            )
             .await?;
         info!(action = "merged_segments", segment_ids = ?segment_ids, merged_segment_meta = ?segment_meta);
         Ok(segment_meta)

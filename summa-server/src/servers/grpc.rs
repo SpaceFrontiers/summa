@@ -52,8 +52,8 @@ impl GrpcServer {
     fn set_span(request: &hyper::Request<hyper::Body>) -> Span {
         info_span!(
             "request",
-            request_id = ?request.headers().get("request-id").unwrap(),
-            session_id = ?request.headers().get("session-id").unwrap(),
+            request_id = ?request.headers().get("request-id").expect("request-id must be set"),
+            session_id = ?request.headers().get("session-id").expect("session-id must be set"),
         )
     }
 
@@ -81,15 +81,15 @@ impl GrpcServer {
             .include_reflection_service(false)
             .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
             .build()
-            .unwrap();
+            .expect("cannot build grpc server");
         let grpc_config = self.application_config.read().await.grpc.clone();
 
         let layer = ServiceBuilder::new()
             .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("request-id"), |_: &_| {
-                Some(HeaderValue::from_str(&generate_request_id()).unwrap())
+                Some(HeaderValue::from_str(&generate_request_id()).expect("invalid generated request id"))
             }))
             .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("session-id"), |_: &_| {
-                Some(HeaderValue::from_str(&generate_request_id()).unwrap())
+                Some(HeaderValue::from_str(&generate_request_id()).expect("invalid generated session id"))
             }))
             .layer(
                 TraceLayer::new_for_grpc()
@@ -119,13 +119,12 @@ impl GrpcServer {
         let server = async move {
             router
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                    terminator.recv().await.unwrap();
-                    info!(action = "sigterm_received");
-                    self.index_service.stop().await.unwrap();
-                    info!(action = "terminated");
+                    let signal_result = terminator.recv().await;
+                    info!(action = "sigterm_received", received = ?signal_result);
+                    let service_result = self.index_service.stop().await;
+                    info!(action = "terminated", result = ?service_result);
                 })
-                .await
-                .unwrap();
+                .await?;
             Ok(())
         };
 

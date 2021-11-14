@@ -4,6 +4,7 @@ use tantivy::IndexSortByField;
 use crate::errors::{Error, SummaServerResult};
 
 #[derive(Builder)]
+#[builder(build_fn(error = "summa_core::errors::BuilderError"))]
 pub struct AlterIndexRequest {
     pub index_name: String,
     #[builder(default = "None")]
@@ -34,6 +35,6 @@ impl TryFrom<proto::AlterIndexRequest> for AlterIndexRequest {
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
             .default_fields(proto_request.default_fields.map(|f| f.fields))
             .multi_fields(proto_request.multi_fields.map(|f| f.fields));
-        Ok(alter_index_request_builder.build().unwrap())
+        Ok(alter_index_request_builder.build().map_err(summa_core::Error::from)?)
     }
 }

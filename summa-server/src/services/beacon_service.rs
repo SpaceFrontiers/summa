@@ -20,7 +20,7 @@ pub struct BeaconService {
 
 impl BeaconService {
     pub fn new(ipfs_config: IpfsConfig) -> SummaServerResult<BeaconService> {
-        let ipfs_client = IpfsClient::from_str(&format!("http://{}", &ipfs_config.api_endpoint)).unwrap();
+        let ipfs_client = IpfsClient::from_str(&format!("http://{}", &ipfs_config.api_endpoint)).map_err(hyper::http::Error::from)?;
         Ok(BeaconService { ipfs_client, ipfs_config })
     }
 
@@ -101,7 +101,7 @@ impl BeaconService {
                 }))
                 .await?;
                 info!(action = "removing_old_path", mfs_path = mfs_path, temporary_path = temporary_path);
-                self.ipfs_client.files_rm(&mfs_path, true).await.map_err(Error::from)?;
+                self.ipfs_client.files_rm(mfs_path, true).await.map_err(Error::from)?;
                 info!(action = "moving_new_path", mfs_path = mfs_path, temporary_path = temporary_path);
                 self.ipfs_client.files_mv(&temporary_path, mfs_path).await.map_err(Error::from)?;
                 Ok(())

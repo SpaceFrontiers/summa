@@ -21,10 +21,10 @@ use std::borrow::Borrow;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use lru::{KeyRef, LruCache};
+use parking_lot::Mutex;
 use tantivy::directory::OwnedBytes;
 
 use super::slice_address::{SliceAddress, SliceAddressKey, SliceAddressRef};
@@ -170,14 +170,14 @@ impl<K: Hash + Eq> MemorySizedCache<K> {
         KeyRef<K>: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.lock().unwrap().get(cache_key)
+        self.inner.lock().get(cache_key)
     }
 
     /// Attempt to put the given amount of data in the cache.
     /// This may fail silently if the owned_bytes slice is larger than the cache
     /// capacity.
     pub fn put(&self, val: K, bytes: OwnedBytes) {
-        self.inner.lock().unwrap().put(val, bytes);
+        self.inner.lock().put(val, bytes);
     }
 }
 

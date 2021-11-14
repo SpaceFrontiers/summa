@@ -325,7 +325,7 @@ impl IndexHolder {
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
         let mut receiver = self.spawn(move || (searcher.search(&parsed_query, &multi_collector), searcher));
-        let (multi_fruit, searcher) = receiver.recv().await.unwrap();
+        let (multi_fruit, searcher) = receiver.recv().await.expect("channel unexpectedly closed");
         let mut multi_fruit = multi_fruit?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
