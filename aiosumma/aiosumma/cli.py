@@ -4,9 +4,9 @@ import asyncio
 import sys
 
 import fire
+from termcolor import colored
 
 from aiosumma import SummaClient
-from termcolor import colored
 
 
 async def client_cli(endpoint):

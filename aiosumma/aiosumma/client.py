@@ -16,6 +16,7 @@ from aiogrpcclient import (
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
+
 from .proto import beacon_service_pb2 as beacon_service_pb
 from .proto import consumer_service_pb2 as consumer_service_pb
 from .proto import index_service_pb2 as index_service_pb
@@ -546,7 +547,6 @@ class SummaClient(BaseGrpcClient):
     async def publish_index(
         self,
         index_alias: str,
-        copy: bool = False,
         payload: Optional[str] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -556,7 +556,6 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_alias: index alias
-            copy: set if you want to copy data into IPFS storage, otherwise --no-copy mode will be used
             payload: extra data stored with publish commit
             request_id: request id
             session_id: session id
@@ -564,7 +563,7 @@ class SummaClient(BaseGrpcClient):
         if isinstance(payload, dict):
             payload = json.dumps(payload)
         return await self.stubs['beacon_api'].publish_index(
-            beacon_service_pb.PublishIndexRequest(index_alias=index_alias, copy=copy, payload=payload),
+            beacon_service_pb.PublishIndexRequest(index_alias=index_alias, payload=payload),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 

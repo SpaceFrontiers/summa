@@ -9,7 +9,6 @@ service BeaconApi {
 
 message PublishIndexRequest {
   string index_alias = 1;
-  bool copy = 2;
   optional string payload = 3;
 }
 

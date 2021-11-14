@@ -42,9 +42,7 @@ export default defineConfig({
   ],
   worker: {
     format: "es",
-    plugins: [
-        wasm(),
-    ]
+    plugins: [wasm()],
   },
   optimizeDeps: {
     esbuildOptions: {

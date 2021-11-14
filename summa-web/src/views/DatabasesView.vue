@@ -43,7 +43,7 @@ import type { IPFSPath } from "ipfs-core-types/dist/src/utils";
 import { db, IndexConfig } from "@/database";
 import { useObservable } from "@vueuse/rxjs";
 import IsLoadingView from "@/components/IsLoading.vue";
-import {IpfsDatabaseSeed} from "../services/web-index-service";
+import { IpfsDatabaseSeed } from "../services/web-index-service";
 
 export default defineComponent({
   name: "DatabasesView",

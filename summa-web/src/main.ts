@@ -11,6 +11,5 @@ const app = createApp(App);
 
 app.use(router);
 
-
 app.config.globalProperties.web_index_service = new WebIndexService();
 app.mount("#app");

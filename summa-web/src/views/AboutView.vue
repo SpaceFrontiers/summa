@@ -31,6 +31,6 @@
 import { defineComponent } from "vue";
 
 export default defineComponent({
-  name: "AboutView"
+  name: "AboutView",
 });
 </script>
