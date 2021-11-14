@@ -129,7 +129,8 @@ impl MetricsServer {
         });
 
         Ok(async move {
-            info!(action = "terminated", result = ?graceful.await?);
+            graceful.await?;
+            info!(action = "terminated");
             Ok(())
         })
     }

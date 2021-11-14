@@ -20,6 +20,7 @@ impl<T> ThreadHandler<T> {
         ThreadHandler { join_handle, shutdown_trigger }
     }
 
+
     pub async fn stop(self) -> SummaResult<T> {
         self.shutdown_trigger.broadcast(ControlMessage::Shutdown).await?;
         Ok(self.join_handle.await?)

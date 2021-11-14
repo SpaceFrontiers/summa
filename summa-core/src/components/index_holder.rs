@@ -19,8 +19,6 @@ use tantivy::schema::Schema;
 #[cfg(feature = "index-updater")]
 use tantivy::Opstamp;
 use tantivy::{Directory, Executor, Index, IndexReader, IndexSettings, ReloadPolicy};
-#[cfg(feature = "index-updater")]
-use tokio::fs::remove_dir_all;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -273,13 +271,13 @@ impl IndexHolder {
     /// Consumers are stopped, then `IndexConfig` is removed from `ApplicationConfig`
     /// and then directory with the index is deleted.
     #[instrument(skip(self), fields(index_name = %self.index_name))]
-    #[cfg(feature = "index-updater")]
     pub async fn delete(mut self) -> SummaResult<()> {
         self.index_updater.stop_updates().await?;
+        info!(action = "delete_directory");
         match self.index_config_proxy.delete().await?.index_engine {
             IndexEngine::File(ref index_path) => {
-                info!(action = "delete_directory");
-                remove_dir_all(index_path).await.map_err(|e| Error::IO((e, Some(index_path.to_path_buf()))))?;
+                #[cfg(feature = "index-updater")]
+                tokio::fs::remove_dir_all(index_path).await.map_err(|e| Error::IO((e, Some(index_path.to_path_buf()))))?;
             }
             IndexEngine::Memory(_) => (),
             IndexEngine::Remote(_) => (),
