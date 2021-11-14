@@ -1,5 +1,6 @@
 ---
 title: Quick Start
-permalink: /quick-start
+parent: Guides
+nav_order: 1
 ---
 {% include quick-start-snippet.md %}

@@ -1,6 +1,7 @@
 ---
 title: Query DSL
-permalink: /query-dsl
+parent: Core
+nav_order: 1
 ---
 
 There are different kinds of possible queries Summa can process. 

@@ -1,6 +1,6 @@
 ---
 title: Kafka Consuming API
-permalink: /kafka-consuming-api
+parent: APIs
 ---
 ## Consumer API
 Summa can ingest documents through Kafka.

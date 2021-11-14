@@ -1,6 +1,6 @@
 # Create index schema in file
 cat << EOF > schema.yaml
-{% include_relative files/summa-wiki-schema.yaml %}
+{% include summa-wiki-schema.yaml %}
 EOF
 
 # Create index

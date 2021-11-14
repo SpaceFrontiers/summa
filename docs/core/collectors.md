@@ -1,6 +1,7 @@
 ---
 title: Collectors
-permalink: /collectors
+parent: Core
+nav_order: 2
 ---
 Collectors are responsible for processing the stream of documents that matched the query. 
 Every collector ingests this stream and derives output based on what ingested.

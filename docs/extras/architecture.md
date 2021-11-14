@@ -1,4 +1,4 @@
 ---
 title: Architecture
-permalink: /architecture
+parent: Extras
 ---

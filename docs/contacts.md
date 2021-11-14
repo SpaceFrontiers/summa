@@ -1,4 +1,4 @@
 ---
 title: Contacts
-permalink: /contacts
+nav_order: 6
 ---

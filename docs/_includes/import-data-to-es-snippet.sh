@@ -1,6 +1,6 @@
 # Create index schema in file
 cat << EOF > es-wiki-schema.json
-{% include_relative files/es-wiki-schema.json %}
+{% include es-wiki-schema.json %}
 EOF
 
 # (Optional) Delete previously created index

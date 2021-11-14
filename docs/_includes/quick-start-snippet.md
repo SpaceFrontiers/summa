@@ -1,7 +1,7 @@
 In this quick-start we will create index for searching in WikiBooks. There are two essential parts, **Summa server** responsible for
 indexing text data and **Summa client** that is required for communicating with Summa server. 
 
-Although there is a [GRPC API](summa/proto) you may want to use, here we will use Summa client implemented in Python.
+Although there is a [GRPC API](/summa/apis/grpc-api) you may want to use, here we will use Summa client implemented in Python.
 
 ### Setup <a name="setup"></a>
 

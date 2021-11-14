@@ -1,6 +1,6 @@
 ---
-title: Metrics
-permalink: /metrics-api
+title: GRPC API
+parent: APIs
 ---
 ## Metrics API
 

@@ -1,6 +1,6 @@
 ---
 title: Schema
-permalink: /python-api
+parent: APIs
 ---
 
 # Aiosumma
@@ -41,7 +41,7 @@ async def main():
         ]}
     }
 
-    # Collectors are described at https://izihawa.github.io/summa/collectors
+    # Collectors are described at https://izihawa.github.io/summa/core/collectors
     # Here we are requesting `TopDocs` collector with limit 10 that means 
     # that top-10 documents will be returned
     results = await client.search(
