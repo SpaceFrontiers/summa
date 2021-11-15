@@ -1,11 +1,8 @@
-import init from "../pkg"
-
-export { init }
-export type { StatusCallback } from "./web-index-service-worker";
+export type { StatusCallback } from "./web-index-service";
 export {
   IndexQuery,
-  WebIndexServiceWorker,
-} from "./web-index-service-worker";
+  WebIndexService,
+} from "./web-index-service";
 export {
   ChunkedCacheConfig,
   NetworkConfig,

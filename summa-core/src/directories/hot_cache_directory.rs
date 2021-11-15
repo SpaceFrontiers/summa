@@ -31,7 +31,7 @@ use tantivy::error::DataCorruption;
 use tantivy::{AsyncIoResult, Directory, HasLen, Index, IndexReader, ReloadPolicy};
 
 use super::debug_proxy_directory::DebugProxyDirectory;
-use crate::directories::ChunkedCachingDirectory;
+use crate::directories::{ChunkedCachingDirectory, Noop};
 use crate::metrics::CacheMetrics;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

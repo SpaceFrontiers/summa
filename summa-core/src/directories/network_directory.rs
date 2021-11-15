@@ -1,39 +1,19 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::{io, ops::Range, path::Path, sync::Arc, usize};
 
 use parking_lot::RwLock;
-use tantivy::directory::error::{DeleteError, OpenWriteError};
-use tantivy::directory::{AntiCallToken, DirectoryClone, TerminatingWrite, WatchCallback, WatchHandle, WritePtr};
+use tantivy::directory::DirectoryClone;
 use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     AsyncIoResult, Directory, HasLen,
 };
 
 use super::ExternalRequestGenerator;
-use crate::directories::ExternalRequest;
+use crate::directories::{ExternalRequest, Noop};
 use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
-
-struct Noop {}
-
-impl Write for Noop {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl TerminatingWrite for Noop {
-    fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 pub struct NetworkDirectory<TExternalRequest: ExternalRequest> {
     file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
@@ -77,16 +57,8 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
         )?))
     }
 
-    fn delete(&self, _: &Path) -> Result<(), DeleteError> {
-        Ok(())
-    }
-
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
         Ok(self.get_file_handle(path)?.len() > 0)
-    }
-
-    fn open_write(&self, _: &Path) -> Result<WritePtr, OpenWriteError> {
-        Ok(BufWriter::new(Box::new(Noop {})))
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
@@ -97,17 +69,7 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
             .to_vec())
     }
 
-    fn atomic_write(&self, _: &Path, _: &[u8]) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn sync_directory(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn watch(&self, _: WatchCallback) -> tantivy::Result<WatchHandle> {
-        Ok(WatchHandle::empty())
-    }
+    super::read_only_directory!();
 }
 
 #[derive(Debug)]

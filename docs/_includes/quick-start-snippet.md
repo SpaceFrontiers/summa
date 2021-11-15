@@ -12,31 +12,15 @@ Although there is a [GRPC API](/summa/apis/grpc-api) you may want to use, here w
 Both server `summa-server` and Summa client (named `aiosumma`) are distributed through the package systems, `Cargo` and `pip` correspondingly.
 Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub that we are going to use.
 
-#### Aiosumma
-`aiosumma` is a python package that allows to use Summa GRPC API from Python and Terminal.
-
-```bash
-# (Optional) Create virtual env for `aiosumma`
-python3 -m venv venv
-source venv/bin/acticate
-
-# Install aiosumma
-pip3 install -U aiosumma
-```
-
 #### Summa Server
-Summa server is a main guy at the party. This Rust-written software manages search indices and allows to do search queries.
+`summa-server` is a main guy at the party. This tool manages search indices and allows to do search queries. 
+We are going to pull and launch `summa-server` through Docker. Pulling can be done by `docker pull`
 
 ```bash
 # Pull actual image for `summa-server`
 docker pull izihawa/summa-server:testing
-```
 
-### Fill With Documents <a name="fill"></a>
-Here we download WikiBooks dumps and index them in Summa server.
-
-```bash
-# Create diectory for storing index
+# Create local directory for storing index
 mkdir data
 
 # Generate config for `summa-server`
@@ -52,11 +36,31 @@ docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data \
 izihawa/summa-server:testing serve /summa.yaml
 ```
 
-Now, we should open another Terminal session and download items there.
+After the last command you should see starting logs of `summa-server`, something like
 ```bash
-# Activate venv in new session
+2022-11-17T16:14:00.712450Z  INFO main lifecycle: summa_server::servers::metrics: action="binded" endpoint="0.0.0.0:8084"
+2022-11-17T16:14:00.714536Z  INFO main lifecycle: summa_server::servers::grpc: action="binded" endpoint="0.0.0.0:8082"
+2022-11-17T16:14:00.752511Z  INFO main summa_server::services::index_service: action="index_holders" index_holders={}
+```
+
+#### Aiosumma
+`aiosumma` is a python package that allows to use Summa GRPC API from Python and Terminal. Let's install it:
+Previous Terminal session is occupied by `summa-server`. Leave it alone, open another bash terminal:
+
+```bash
+# (Optional) Create virtual env for `aiosumma`
+python3 -m venv venv
 source venv/bin/acticate
 
+# Install aiosumma
+pip3 install -U aiosumma
+```
+Now we have `summa-cli` tool for doing queries to `summa-server`
+
+### Fill With Documents <a name="fill"></a>
+Here we download WikiBooks dumps and index them in Summa server.
+
+```bash
 {% include download-dump-snippet.sh %}
 
 {% include import-data-to-summa-snippet.sh %}

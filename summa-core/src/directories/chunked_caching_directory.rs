@@ -11,7 +11,7 @@ use tantivy::{Directory, HasLen};
 
 use crate::directories::chunk_generator::{Chunk, ChunkGenerator};
 use crate::directories::requests_composer::{Request, RequestsComposer};
-use crate::directories::MemorySizedCache;
+use crate::directories::{MemorySizedCache, Noop};
 use crate::metrics::CacheMetrics;
 
 #[derive(Clone)]

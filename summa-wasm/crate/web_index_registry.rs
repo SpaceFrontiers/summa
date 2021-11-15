@@ -51,8 +51,8 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub async fn add(&mut self, network_config: JsValue) -> Result<JsValue, JsValue> {
-        let index_engine: IndexEngine = serde_wasm_bindgen::from_value(network_config)?;
+    pub async fn add(&mut self, index_engine: JsValue) -> Result<JsValue, JsValue> {
+        let index_engine: IndexEngine = serde_wasm_bindgen::from_value(index_engine)?;
         Ok(self.add_internal(index_engine).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
@@ -66,6 +66,8 @@ impl WebIndexRegistry {
 
     async fn add_internal(&mut self, index_engine: IndexEngine) -> SummaWasmResult<IndexPayload> {
         let mut index = IndexHolder::open::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine)?;
+        index.settings_mut().docstore_compress_dedicated_thread = false;
+
         let index_payload: IndexPayload =
             serde_json::from_str(&index.load_metas()?.payload.ok_or(Error::IncorrectPayload)?).map_err(|_| Error::IncorrectPayload)?;
         let index_config = IndexConfigBuilder::default()

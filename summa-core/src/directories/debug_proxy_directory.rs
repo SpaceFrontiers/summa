@@ -30,6 +30,8 @@ use tantivy::directory::{FileHandle, OwnedBytes};
 use tantivy::{Directory, HasLen};
 use time::OffsetDateTime;
 
+use crate::directories::Noop;
+
 #[derive(Clone, Default)]
 struct OperationBuffer(Arc<Mutex<Vec<ReadOperation>>>);
 

@@ -1,6 +1,6 @@
 import * as Comlink from "comlink";
 
-import { WebIndexServiceWorker } from "summa-wasm";
+import { WebIndexService } from "summa-wasm";
 
 // IPFS hash of directory with the index of interest
 const ipfs_hash = "bafyb4ibkmzobsfgyjleeqiintntxehqarrpmipwpxrqrmvxgqlgxysdbiq";
@@ -8,7 +8,7 @@ const ipfs_hash = "bafyb4ibkmzobsfgyjleeqiintntxehqarrpmipwpxrqrmvxgqlgxysdbiq";
 // Directory URL that is used to access index
 const directory_url = `http://localhost:8080/ipfs/${ipfs_hash}/`;
 
-const web_index_service_worker = Comlink.wrap<WebIndexServiceWorker>(
+const web_index_service_worker = Comlink.wrap<WebIndexService>(
     new Worker(
         new URL(
           "summa-wasm/dist/worker.js",
@@ -25,7 +25,7 @@ const index_bg_wasm = new URL(
 // `setup` initializes WASM-module and pool of Web Workers integrated with Rust's `rayon`.
 // If your browser doesn't support Web Workers, pass `0` here to disable multithreading through pooling but it may
 // decrease performance.
-await web_index_service_worker.setup(index_bg_wasm, 4)
+await web_index_service_worker.setup(index_bg_wasm, 0)
 
 // `network_config` is a configuration object used for telling Summa how to reach remote index
 const network_config = {

@@ -1,4 +1,3 @@
-import * as Comlink from "comlink";
 import init, { cache_metrics, init_thread_pool, WebIndexRegistry } from "../pkg";
 import { NetworkConfig } from "./configs";
 
@@ -14,7 +13,7 @@ export class IndexQuery {
   }
 }
 
-export class WebIndexServiceWorker {
+export class WebIndexService {
   registry?: WebIndexRegistry;
   async setup(init_url: string, threads: number, status_callback?: StatusCallback) {
     if (!status_callback) {
@@ -28,7 +27,7 @@ export class WebIndexServiceWorker {
       await init_thread_pool(threads);
     }
   }
-  async add(index_engine: { remote: NetworkConfig } | { memory: {}}): Promise<Object> {
+  async add(index_engine: { remote: NetworkConfig } | { memory: Object}): Promise<Object> {
     return await this.registry!.add(index_engine)
   }
   async delete(index_name: string) {
@@ -50,5 +49,3 @@ export class WebIndexServiceWorker {
     return await this.registry!.commit(index_name)
   }
 }
-export const web_index_service_worker = new WebIndexServiceWorker();
-Comlink.expose(web_index_service_worker);
