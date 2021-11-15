@@ -55,8 +55,8 @@ export default defineComponent({
 
   async created() {
     this.is_loading = true;
-    this.web_index_service.status_callback = this.status_callback;
-    const is_succeed = await this.web_index_service.setup({
+    this.search_service.status_callback = this.status_callback;
+    const is_succeed = await this.search_service.setup({
       num_threads: num_threads,
     });
     this.is_loading_failed = !is_succeed;

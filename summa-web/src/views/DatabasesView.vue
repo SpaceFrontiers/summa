@@ -27,7 +27,7 @@ form.mb-4.col-md-7
             .form-text
               span.lh-1 {{ index_config.index_seed }}
           .btn-group(role="group").float-end
-            button.btn.btn-danger.btn-sm(type="button" @click.stop.prevent="web_index_service.delete_index(index_config.index_payload.name)")
+            button.btn.btn-danger.btn-sm(type="button" @click.stop.prevent="search_service.delete_index(index_config.index_payload.name)")
               i.bi-trash
   .col(v-if="is_loading")
     .card.bg-light.text-dark
@@ -64,7 +64,7 @@ export default defineComponent({
     async install_new_index(ipfs_path: string) {
       this.is_loading = true;
       try {
-        await this.web_index_service.add_index({
+        await this.search_service.add_index({
           seed: new IpfsDatabaseSeed(ipfs_path),
           is_enabled: true,
         });
@@ -74,7 +74,7 @@ export default defineComponent({
     },
     async switch_warmup(index_config: IndexConfig) {
       if (index_config.is_warm_up) {
-        await this.web_index_service.web_index_service_worker.warmup(
+        await this.search_service.web_index_service_worker.warmup(
           index_config.index_payload.name
         );
       }

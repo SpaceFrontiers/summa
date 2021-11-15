@@ -1,12 +1,12 @@
 /// <reference types="vite/client" />
 
 import { IPFSHTTPClient } from "ipfs-http-client";
-import { WebIndexService } from "@/services/summa";
+import { SearchService } from "@/services/summa";
 
 declare module "@vue/runtime-core" {
   interface ComponentCustomProperties {
     ipfs: IPFSHTTPClient;
-    web_index_service: WebIndexService;
+    search_service: SearchService;
   }
 }
 

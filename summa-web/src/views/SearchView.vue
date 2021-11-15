@@ -172,7 +172,7 @@ export default defineComponent({
         const enabled_index_configs = await db.index_configs
           .filter((index_config) => index_config.is_enabled)
           .toArray();
-        let collector_outputs = await this.web_index_service.search(
+        let collector_outputs = await this.search_service.search(
           enabled_index_configs.map((index_config) => {
             return {
               index_name: index_config.index_payload.name,

@@ -3,7 +3,7 @@ import * as Comlink from "comlink";
 import type {
   IndexQuery,
   StatusCallback,
-  WebIndexServiceWorker,
+  WebIndexService,
 } from "summa-wasm";
 import { ChunkedCacheConfig, NetworkConfig } from "summa-wasm";
 import { ref, toRaw } from "vue";
@@ -100,14 +100,14 @@ async function get_startup_configs() {
   ];
 }
 
-export class WebIndexService {
+export class SearchService {
   status_callback: StatusCallback;
-  web_index_service_worker: Remote<WebIndexServiceWorker>;
+  web_index_service_worker: Remote<WebIndexService>;
 
   constructor() {
     this.status_callback = (type: string, message: string) =>
       console.log(type, message);
-    this.web_index_service_worker = Comlink.wrap<WebIndexServiceWorker>(
+    this.web_index_service_worker = Comlink.wrap<WebIndexService>(
       new Worker(
         new URL(
           "../../node_modules/summa-wasm/dist/worker.js",
