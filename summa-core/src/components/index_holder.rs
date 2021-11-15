@@ -385,7 +385,7 @@ impl IndexHolder {
     }
 
     /// Commits index
-    #[instrument(skip(self))]
+    #[instrument(skip(self, payload))]
     pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
         self.index_writer_holder.write().await.commit(payload).await
     }

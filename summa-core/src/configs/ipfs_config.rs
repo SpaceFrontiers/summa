@@ -15,7 +15,7 @@ impl Default for IpfsConfig {
         IpfsConfig {
             api_endpoint: "127.0.0.1:8080".to_owned(),
             default_hash: Some("blake3".to_string()),
-            default_chunker: Some("size-1048576".to_string()),
+            default_chunker: Some("size-65536".to_string()),
         }
     }
 }

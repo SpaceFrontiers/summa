@@ -12,4 +12,6 @@ message PublishIndexRequest {
   optional string payload = 3;
 }
 
-message PublishIndexResponse {}
+message PublishIndexResponse {
+  string hash = 1;
+}

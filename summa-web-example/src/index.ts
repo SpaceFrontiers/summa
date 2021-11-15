@@ -3,7 +3,7 @@ import * as Comlink from "comlink";
 import { WebIndexServiceWorker } from "summa-wasm";
 
 // IPFS hash of directory with the index of interest
-const ipfs_hash = "bafyb4ih55sd6tmyz2nxvif5zb43yjhzlhcwuhrjcg2q4dtjrj3wmzeey6a";
+const ipfs_hash = "bafyb4ihyvnxgoy2vkmkd53jvbphlza6q4n7vhzchgr4gnynpeukn4hw2wi";
 
 // Directory URL that is used to access index
 const directory_url = `http://localhost:8080/ipfs/${ipfs_hash}/`;

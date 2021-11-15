@@ -372,10 +372,10 @@ impl InnerIndexUpdater {
     }
 
     /// Locking index files for executing operation on them
-    pub async fn lock_files<P, Fut>(&mut self, index_path: P, payload: Option<String>, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<()>
+    pub async fn lock_files<P, O, Fut>(&mut self, index_path: P, payload: Option<String>, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
     where
         P: AsRef<Path>,
-        Fut: Future<Output = SummaResult<()>>,
+        Fut: Future<Output = SummaResult<O>>,
     {
         let index = self.index.clone();
         let index_config = self.index_config_proxy.read().await.get().clone();

@@ -13,5 +13,7 @@ class PublishIndexRequest(_message.Message):
     def __init__(self, index_alias: _Optional[str] = ..., payload: _Optional[str] = ...) -> None: ...
 
 class PublishIndexResponse(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+    __slots__ = ["hash"]
+    HASH_FIELD_NUMBER: _ClassVar[int]
+    hash: str
+    def __init__(self, hash: _Optional[str] = ...) -> None: ...

@@ -64,12 +64,10 @@ class CommitIndexRequest(_message.Message):
     def __init__(self, index_alias: _Optional[str] = ..., commit_mode: _Optional[_Union[CommitMode, str]] = ...) -> None: ...
 
 class CommitIndexResponse(_message.Message):
-    __slots__ = ["elapsed_secs", "opstamp"]
+    __slots__ = ["elapsed_secs"]
     ELAPSED_SECS_FIELD_NUMBER: _ClassVar[int]
-    OPSTAMP_FIELD_NUMBER: _ClassVar[int]
     elapsed_secs: float
-    opstamp: int
-    def __init__(self, opstamp: _Optional[int] = ..., elapsed_secs: _Optional[float] = ...) -> None: ...
+    def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
 
 class CreateIndexRequest(_message.Message):
     __slots__ = ["autocommit_interval_ms", "blocksize", "compression", "default_fields", "index_engine", "index_name", "multi_fields", "primary_key", "schema", "sort_by_field", "writer_heap_size_bytes", "writer_threads"]
@@ -114,10 +112,8 @@ class DeleteDocumentRequest(_message.Message):
     def __init__(self, index_alias: _Optional[str] = ..., primary_key: _Optional[int] = ...) -> None: ...
 
 class DeleteDocumentResponse(_message.Message):
-    __slots__ = ["opstamp"]
-    OPSTAMP_FIELD_NUMBER: _ClassVar[int]
-    opstamp: int
-    def __init__(self, opstamp: _Optional[int] = ...) -> None: ...
+    __slots__ = []
+    def __init__(self) -> None: ...
 
 class DeleteIndexRequest(_message.Message):
     __slots__ = ["index_name"]
@@ -197,10 +193,8 @@ class IndexDocumentRequest(_message.Message):
     def __init__(self, index_alias: _Optional[str] = ..., document: _Optional[bytes] = ...) -> None: ...
 
 class IndexDocumentResponse(_message.Message):
-    __slots__ = ["opstamp"]
-    OPSTAMP_FIELD_NUMBER: _ClassVar[int]
-    opstamp: int
-    def __init__(self, opstamp: _Optional[int] = ...) -> None: ...
+    __slots__ = []
+    def __init__(self) -> None: ...
 
 class IndexDocumentStreamRequest(_message.Message):
     __slots__ = ["documents", "index_alias"]

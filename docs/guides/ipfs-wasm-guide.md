@@ -19,12 +19,12 @@ Moreover, local processing of search queries would allow to use full-featured se
 Enable IPFS support during [config generation](/summa/guides/quick-start) with `-i` flag that accepts IPFS API endpoint:
 ```bash
 docker run izihawa/summa-server:testing generate-config -d /data \
--g 0.0.0.0:8082 -m 0.0.0.0:8084 -i 0.0.0.0:5001 > summa.yaml
+-g 0.0.0.0:8082 -m 0.0.0.0:8084 -i host.docker.internal:5001 > summa.yaml
 ```
 or add IPFS support to existing instance by adding section
 ```yaml
 ipfs:
-  api_endpoint: "0.0.0.0:5001"
+  api_endpoint: "host.docker.internal:5001"
 ```
 into your `summa.yaml`
 

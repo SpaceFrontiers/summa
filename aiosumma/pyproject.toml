@@ -3,8 +3,8 @@ requires = ["setuptools<65.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aiosumma-wheel"
-version = "2.14.0"
+name = "aiosumma"
+version = "2.15.0"
 authors = [{ name = "Pasha Podolsky", email = "ppodolsky@me.com" }]
 description = "Async client for Summa Search"
 readme = "README.md"

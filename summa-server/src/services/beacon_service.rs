@@ -25,7 +25,7 @@ impl BeaconService {
     }
 
     #[instrument(skip_all, fields(index_name = ?index_holder.index_name()))]
-    pub async fn publish_index(&self, mfs_path: &str, index_holder: Handler<IndexHolder>, payload: Option<String>) -> SummaServerResult<()> {
+    pub async fn publish_index(&self, mfs_path: &str, index_holder: Handler<IndexHolder>, payload: Option<String>) -> SummaServerResult<String> {
         let index_config = index_holder.index_config_proxy().read().await.get().clone();
         let index_path = {
             match &index_config.index_engine {
@@ -37,7 +37,7 @@ impl BeaconService {
         let hash = self.ipfs_config.default_hash.as_deref();
         let chunker = self.ipfs_config.default_chunker.as_deref();
         let mut index_updater = index_updater.write().await;
-        index_updater
+        let hash = index_updater
             .lock_files(index_path.clone(), payload, |files: Vec<ComponentFile>| async move {
                 self.ipfs_client
                     .files_mkdir_with_options(FilesMkdir {
@@ -104,9 +104,9 @@ impl BeaconService {
                 self.ipfs_client.files_rm(mfs_path, true).await.map_err(Error::from)?;
                 info!(action = "moving_new_path", mfs_path = mfs_path, temporary_path = temporary_path);
                 self.ipfs_client.files_mv(&temporary_path, mfs_path).await.map_err(Error::from)?;
-                Ok(())
+                Ok(self.ipfs_client.files_stat(&mfs_path).await.map_err(Error::from)?.hash)
             })
             .await?;
-        Ok(())
+        Ok(hash)
     }
 }
