@@ -16,7 +16,8 @@ Plain BM25 with limit anf offset (can be omitted)
 {
   "top_docs": {
     "limit": 10, 
-    "offset": 200
+    "offset": 200,
+    "fields": []
   }
 }
 ```

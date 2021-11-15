@@ -2,17 +2,23 @@
 title: Query DSL
 parent: Core
 nav_order: 1
+has_toc: true
 ---
 
-There are different kinds of possible queries Summa can process. 
-One kind of queries are just scoring and returning documents like `TermQuery` 
-that returns all documents with some term scored with BM25. Other queries can
-combine nested queries and modify their scores like `BoostQuery` or `BooleanQuery`
+Query describes what documents you want to extract from Summa for further processing. The stream of matched documents are then passed
+to [collectors](/summa/cors/collectors) responsible for final processing. So you should learn the difference between queries and collectors,
+first ones tell what documents should be taken from database and second ones describes how to process them and what to return to users.
+
+There are different kinds of possible queries. 
+One kind of queries are just scoring and returning documents. 
+For example, `TermQuery` matches all documents containing specified term and associates score to every matched document. These scores
+may be used for ranking documents by relevance.
+Other queries such as `BooleanQuery` or `DisjunctionMaxQuery` combine documents and scores matched by multiple sub-queries.
 
 ## TermQuery
 The most basic kind of query. 
-Match documents that contain the specific word inside specific field.
-The list of documents are ranged according to BM25 score.
+Match documents that contain the specified term (word) inside the specified field.
+Every matched document also associated with its BM25 score relevant to the query.
 
 ```json 
 {
@@ -24,7 +30,12 @@ The list of documents are ranged according to BM25 score.
 ```
 
 ## BooleanQuery
-Allowes to combine multiple queries into a single one.
+Allows to combine multiple queries into a single one. Every sub-query has a property named `occur` describing how to do combination
+
+- `must` tells that all matched documents must match to this sub-query too
+- `must_not` tells that all matched documents must not contain documents matching to this sub-query
+- `should` tells that matched documents may contain documents matching to this sub-query
+
 ```json 
 {
   "boolean": {
@@ -44,13 +55,58 @@ Allowes to combine multiple queries into a single one.
           "value": "nebula"
         }
       }
+    }, {
+      "occur": "must_not", 
+      "query": {
+        "phrase": {
+          "field": "author",
+          "value": "tony igy"
+        }
+      }
+    }]
+  }
+}
+```
+
+## DisjunctionMaxQuery
+Allows to combine multiple queries into a single one. It is similar to `BooleanQuery` but scores are calculated in other way.
+Instead of summarizing scores of all sub-queries, it takes maximum score of a single sub-query. Such approach may be useful
+in specific cases like searching documents with synonyms.
+
+```json 
+{
+  "disjunction_max": {
+    "subqueries": [{
+      "occur": "should",
+      "query": {
+        "term": {
+          "field": "title",
+          "value": "astronomy"
+        }
+      }
+    }, {
+      "occur": "must", 
+      "query": {
+        "term": {
+          "field": "title",
+          "value": "astronomia"
+        }
+      }
+    }, {
+      "occur": "must_not", 
+      "query": {
+        "phrase": {
+          "field": "author",
+          "value": "tony igy"
+        }
+      }
     }]
   }
 }
 ```
 
 ## BoostQuery
-Modifies scores produced by a nested query. It is useful in `BooleanQuery` to penalize or boost
+Modifies scores produced by a nested query. Useful in `BooleanQuery` to penalize or boost
 parts of the query.
 ```json
 {
@@ -82,11 +138,44 @@ parts of the query.
 ```
 
 ## MatchQuery
-Uses Tantivy parser to create tree of other queries. 
+`MatchQuery` is a special query. Summa takes the value of this query, parses it and produces other kind of queries.
+`MatchQuery` may be used for parsing queries written in natural language. For example, following query
 ```json
 {
   "match": {
-      "value": "astronomy"
+      "value": "astronomy +nebula -\"tony igy\""
+  }
+}
+```
+will be parsed into
+```json 
+{
+  "boolean": {
+    "subqueries": [{
+      "occur": "should",
+      "query": {
+        "term": {
+          "field": "title",
+          "value": "astronomy"
+        }
+      }
+    }, {
+      "occur": "must", 
+      "query": {
+        "term": {
+          "field": "title",
+          "value": "nebula"
+        }
+      }
+    }, {
+      "occur": "must_not", 
+      "query": {
+        "phrase": {
+          "field": "author",
+          "value": "tony igy"
+        }
+      }
+    }]
   }
 }
 ```
@@ -115,7 +204,6 @@ Documents that have field value matched against the regular expression
 
 ## RangeQuery
 Documents where the requested field lays between the range
-
 ```json
 {
   "range": {
