@@ -13,5 +13,5 @@ The issue is that IPFS does not emit following CORS headers:
 
 and it may be worked around by setting headers inside `ServiceWorker`
 
-These headers are required for enabling `SharedArrayBuffer` in browsers. `summa-wasm` spawns `WebWorkers` and
-actively uses shared memory. 
+These headers are required for enabling `SharedArrayBuffer` in browsers. `summa-wasm` needs `SharedArrayBuffer` because library spawns `WebWorkers` and
+actively uses shared memory for passing data. 

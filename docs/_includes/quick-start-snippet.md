@@ -44,8 +44,7 @@ After the last command you should see starting logs of `summa-server`, something
 ```
 
 #### Aiosumma
-`aiosumma` is a python package that allows to use Summa GRPC API from Python and Terminal. Let's install it:
-Previous Terminal session is occupied by `summa-server`. Leave it alone, open another bash terminal:
+`aiosumma` is a Python package for using Summa GRPC API from Python and Terminal. Let's install it:
 
 ```bash
 # (Optional) Create virtual env for `aiosumma`
@@ -58,7 +57,8 @@ pip3 install -U aiosumma
 Now we have `summa-cli` tool for doing queries to `summa-server`
 
 ### Fill With Documents <a name="fill"></a>
-Here we download WikiBooks dumps and index them in Summa server.
+WikiBooks provides weekly dumps of their books database. 
+Let's download their dump and index it in Summa.
 
 ```bash
 {% include download-dump-snippet.sh %}
@@ -66,7 +66,7 @@ Here we download WikiBooks dumps and index them in Summa server.
 {% include import-data-to-summa-snippet.sh %}
 ```
 
-Now, we have WikiBooks database indexed locally.
+For now, WikiBooks database is indexed locally.
 
 ### Query <a name="query"></a>
 Let's do a test query!
