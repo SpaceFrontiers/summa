@@ -1,5 +1,5 @@
 ---
-title: Kafka Consuming API
+title: Kafka Consuming
 parent: APIs
 ---
 ## Consumer API

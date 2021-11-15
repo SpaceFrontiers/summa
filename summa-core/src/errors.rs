@@ -78,7 +78,7 @@ pub enum Error {
     IO((std::io::Error, Option<PathBuf>)),
     #[error("json_error: {0}")]
     Json(#[from] serde_json::Error),
-    #[cfg(feature = "index-updater")]
+    #[cfg(feature = "consume")]
     #[error("{0}")]
     Kafka(#[from] rdkafka::error::KafkaError),
     #[error("open_directory_error: {0}")]

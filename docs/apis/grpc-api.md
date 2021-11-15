@@ -1,5 +1,5 @@
 ---
-title: GRPC API
+title: GRPC
 parent: APIs
 ---
 ## GRPC API

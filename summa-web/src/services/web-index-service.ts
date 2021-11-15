@@ -151,7 +151,7 @@ export class WebIndexService {
         16 * 1024,
         128 * 1024 * 1024
       );
-      await this.web_index_service_worker.add(network_config);
+      await this.web_index_service_worker.add({remote: network_config});
     }
   }
   async add_index(startup_config: {
@@ -162,7 +162,7 @@ export class WebIndexService {
       this.status_callback
     );
     const index_payload = await this.web_index_service_worker.add(
-      network_config
+      {remote: network_config}
     );
     const index_config = new IndexConfig(
       startup_config.is_enabled,

@@ -35,7 +35,7 @@ const network_config = {
 }
 
 // `index_payload` is the payload we have stored in index when have been publishing it
-const index_payload = await web_index_service_worker.add(network_config);
+const index_payload = await web_index_service_worker.add({remote: network_config});
 const omnibox = document.getElementById("omnibox");
 
 omnibox.onkeydown = ((e) => {

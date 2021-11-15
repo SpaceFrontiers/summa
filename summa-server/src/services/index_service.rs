@@ -12,7 +12,7 @@ use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_proto::proto;
-use tantivy::{IndexSettings, Opstamp};
+use tantivy::IndexSettings;
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 use tracing::{info, instrument};
 
@@ -165,14 +165,15 @@ impl IndexService {
             &create_index_request.schema,
             index_settings,
             &index_config_proxy.read().await.get().index_engine,
-        )?;
+        )
+        .await?;
         Ok(self
             .index_registry
             .add(IndexHolder::setup(&create_index_request.index_name, index, index_config_proxy).await?)
             .await)
     }
 
-    async fn alter_index_settings(&self, alter_index_request: AlterIndexRequest, index_holder: &IndexHolder) -> SummaServerResult<Opstamp> {
+    async fn alter_index_settings(&self, alter_index_request: AlterIndexRequest, index_holder: &IndexHolder) -> SummaServerResult<()> {
         let index_updater = index_holder.index_updater();
         let mut index_updater = index_updater.write().await;
         if let Some(compression) = alter_index_request.compression {
@@ -435,7 +436,7 @@ pub(crate) mod tests {
         let index_service = create_test_index_service(&data_path).await;
         let index_holder = create_test_index_holder(&index_service, &schema).await?;
 
-        index_holder.index_updater().read().await.index_document(SummaDocument::TantivyDocument(doc!(
+        index_holder.index_document(SummaDocument::TantivyDocument(doc!(
             schema.get_field("id").unwrap() => 1i64,
             schema.get_field("title").unwrap() => "Headcrab",
             schema.get_field("body").unwrap() => "Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient to dispatch them. \
@@ -485,9 +486,6 @@ pub(crate) mod tests {
         let index_holder = create_test_index_holder(&index_service, &schema).await?;
 
         index_holder
-            .index_updater()
-            .read()
-            .await
             .index_document(SummaDocument::TantivyDocument(doc!(
                 schema.get_field("id").unwrap() => 1i64,
                 schema.get_field("title").unwrap() => "term1 term2",
@@ -496,9 +494,6 @@ pub(crate) mod tests {
             )))
             .await?;
         index_holder
-            .index_updater()
-            .read()
-            .await
             .index_document(SummaDocument::TantivyDocument(doc!(
                 schema.get_field("id").unwrap() => 2i64,
                 schema.get_field("title").unwrap() => "term2 term3",

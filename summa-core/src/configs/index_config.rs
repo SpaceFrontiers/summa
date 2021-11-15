@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
-#[cfg(feature = "index-updater")]
+#[cfg(feature = "fs")]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,8 +32,9 @@ pub struct NetworkConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IndexEngine {
-    #[cfg(feature = "index-updater")]
+    #[cfg(feature = "fs")]
     File(PathBuf),
     Memory(Schema),
     Remote(NetworkConfig),
@@ -45,7 +46,7 @@ impl Debug for IndexEngine {
             f,
             "{}",
             match self {
-                #[cfg(feature = "index-updater")]
+                #[cfg(feature = "fs")]
                 IndexEngine::File(_) => "File",
                 IndexEngine::Memory(_) => "Memory",
                 IndexEngine::Remote(_) => "Remote",

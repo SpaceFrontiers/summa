@@ -16,19 +16,17 @@ use summa_proto::proto;
 use tantivy::collector::MultiCollector;
 use tantivy::directory::OwnedBytes;
 use tantivy::schema::Schema;
-#[cfg(feature = "index-updater")]
-use tantivy::Opstamp;
 use tantivy::{Directory, Executor, Index, IndexReader, IndexSettings, ReloadPolicy};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use tracing::{instrument, trace};
 
-#[cfg(feature = "index-updater")]
+#[cfg(feature = "consume")]
 use super::IndexUpdater;
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
-use crate::components::CACHE_METRICS;
+use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::{ConfigProxy, ConsumerConfig, IndexConfig, IndexEngine, NetworkConfig};
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory};
 use crate::errors::{SummaResult, ValidationError};
@@ -40,12 +38,13 @@ pub struct IndexHolder {
     index_config_proxy: Arc<dyn ConfigProxy<IndexConfig>>,
     cached_schema: Schema,
     index_reader: IndexReader,
+    index_writer_holder: Arc<RwLock<IndexWriterHolder>>,
     query_parser: RwLock<QueryParser>,
     /// Counters
     #[cfg(feature = "metrics")]
     search_times_meter: Histogram<f64>,
     /// All modifying operations are isolated inside `index_updater`
-    #[cfg(feature = "index-updater")]
+    #[cfg(feature = "consume")]
     index_updater: IndexUpdater,
 }
 
@@ -114,6 +113,7 @@ impl IndexHolder {
         let cached_schema = index.schema();
         let query_parser = RwLock::new(setup_query_parser(index_name, &index, &index_config, &cached_schema)?);
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
+        let index_writer_holder = Arc::new(RwLock::new(IndexWriterHolder::from_config(&index, &index_config)?));
 
         Ok(IndexHolder {
             index_name: String::from(index_name),
@@ -121,6 +121,7 @@ impl IndexHolder {
             query_parser,
             cached_schema,
             index_reader,
+            index_writer_holder: index_writer_holder.clone(),
             index_config_proxy: index_config_proxy.clone(),
             #[cfg(feature = "metrics")]
             search_times_meter: global::meter("summa")
@@ -128,8 +129,8 @@ impl IndexHolder {
                 .with_unit(Unit::new("seconds"))
                 .with_description("Search times")
                 .init(),
-            #[cfg(feature = "index-updater")]
-            index_updater: IndexUpdater::new(index, index_name, index_config_proxy).await?,
+            #[cfg(feature = "consume")]
+            index_updater: IndexUpdater::new(index, index_writer_holder, index_name, index_config_proxy).await?,
         })
     }
 
@@ -145,19 +146,19 @@ impl IndexHolder {
 
     /// Creates index and sets it up via `setup`
     #[instrument(skip_all)]
-    pub fn create<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
+    pub async fn create<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
         schema: &Schema,
         index_settings: IndexSettings,
         index_engine: &IndexEngine,
     ) -> SummaResult<Index> {
         let index_builder = Index::builder().schema(schema.clone()).settings(index_settings);
         let index = match index_engine {
-            #[cfg(feature = "index-updater")]
+            #[cfg(feature = "fs")]
             IndexEngine::File(index_path) => {
                 if index_path.exists() {
                     return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
                 }
-                std::fs::create_dir_all(index_path)?;
+                tokio::fs::create_dir_all(index_path).await?;
                 index_builder.create_in_dir(index_path)?
             }
             IndexEngine::Memory(_) => index_builder.create_in_ram()?,
@@ -173,7 +174,7 @@ impl IndexHolder {
         index_engine: &IndexEngine,
     ) -> SummaResult<Index> {
         let index = match index_engine {
-            #[cfg(feature = "index-updater")]
+            #[cfg(feature = "fs")]
             IndexEngine::File(index_path) => Index::open_in_dir(index_path)?,
             IndexEngine::Memory(schema) => Index::create_in_ram(schema.clone()),
             IndexEngine::Remote(network_config) => create_network_index::<TExternalRequest, TExternalRequestGenerator>(network_config)?,
@@ -203,7 +204,7 @@ impl IndexHolder {
     }
 
     /// `IndexUpdater` handler
-    #[cfg(feature = "index-updater")]
+    #[cfg(feature = "consume")]
     pub fn index_updater(&self) -> &IndexUpdater {
         &self.index_updater
     }
@@ -260,9 +261,9 @@ impl IndexHolder {
     }
 
     /// Stops `IndexHolder` instance
-    #[cfg(feature = "index-updater")]
+    #[cfg(feature = "consume")]
     #[instrument(skip(self), fields(index_name = %self.index_name))]
-    pub async fn stop(self) -> SummaResult<Opstamp> {
+    pub async fn stop(self) -> SummaResult<()> {
         self.index_updater.stop_updates_and_commit().await
     }
 
@@ -272,12 +273,15 @@ impl IndexHolder {
     /// and then directory with the index is deleted.
     #[instrument(skip(self), fields(index_name = %self.index_name))]
     pub async fn delete(mut self) -> SummaResult<()> {
+        #[cfg(feature = "consume")]
         self.index_updater.stop_updates().await?;
         info!(action = "delete_directory");
         match self.index_config_proxy.delete().await?.index_engine {
+            #[cfg(feature = "fs")]
             IndexEngine::File(ref index_path) => {
-                #[cfg(feature = "index-updater")]
-                tokio::fs::remove_dir_all(index_path).await.map_err(|e| Error::IO((e, Some(index_path.to_path_buf()))))?;
+                tokio::fs::remove_dir_all(index_path)
+                    .await
+                    .map_err(|e| Error::IO((e, Some(index_path.to_path_buf()))))?;
             }
             IndexEngine::Memory(_) => (),
             IndexEngine::Remote(_) => (),
@@ -345,6 +349,45 @@ impl IndexHolder {
             collector_outputs.push(extractor.extract(external_index_alias, &mut multi_fruit, &searcher, &multi_fields)?)
         }
         Ok(collector_outputs)
+    }
+
+    /// Delete `SummaDocument` by `primary_key`
+    pub async fn delete_document(&self, primary_key_value: i64) -> SummaResult<()> {
+        self.index_writer_holder.read().await.delete_document_by_primary_key(primary_key_value)
+    }
+
+    /// Index generic `SummaDocument`
+    ///
+    /// `IndexUpdater` bounds unbounded `SummaDocument` inside
+    pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<()> {
+        let document = document.bound_with(&self.index.schema()).try_into()?;
+        self.index_writer_holder.read().await.index_document(document)
+    }
+
+    /// Index multiple documents at a time
+    pub async fn index_bulk(&self, documents: &Vec<Vec<u8>>) -> (u64, u64) {
+        let (mut success_docs, mut failed_docs) = (0u64, 0u64);
+        let index_writer_holder = self.index_writer_holder.read().await;
+        for document in documents {
+            match SummaDocument::UnboundJsonBytes(document)
+                .bound_with(&self.index.schema())
+                .try_into()
+                .and_then(|document| index_writer_holder.index_document(document))
+            {
+                Ok(_) => success_docs += 1,
+                Err(error) => {
+                    warn!(action = "error", error = ?error);
+                    failed_docs += 1
+                }
+            }
+        }
+        (success_docs, failed_docs)
+    }
+
+    /// Commits index
+    #[instrument(skip(self))]
+    pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
+        self.index_writer_holder.write().await.commit(payload).await
     }
 }
 

@@ -2482,9 +2482,9 @@ dependencies = [
 
 [[package]]
 name = "summavy"
-version = "0.19.9"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24e148d13473c1deb3e55b61f666cf8933d3fed1550d67c53e81bffed9505036"
+checksum = "5cc12f4bea484d438e9b8c2776152fff00fcac9f808970b3a7fb7f68f393fc9d"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2536,15 +2536,15 @@ dependencies = [
 
 [[package]]
 name = "summavy-bitpacker"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0cb9a31c4c72e9c47093d3e804f6543aa98c007f95c04ac64fb14ac275d7f9b"
+checksum = "c23ff896f976b677d236898df408ba9ebc74ec8aa52bef8b8919478583f6391f"
 
 [[package]]
 name = "summavy-common"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce50c8f1173b4998bdff6d22a1f957880fd08fcbcd78ef66209e68d92875ab04"
+checksum = "e992ee4227882e0e4a89c8ebff5d795c310541b17fb9b303c5090816f5ac2994"
 dependencies = [
  "byteorder",
  "ownedbytes",
@@ -2552,9 +2552,9 @@ dependencies = [
 
 [[package]]
 name = "summavy-query-grammar"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "356a2421bcbdb38fcf3482b9669edafeda3a5dbbd1ab3f131fb412d21a21eb70"
+checksum = "d71ff54ac80057afdc2cb17b3ce5fa67eb12c9915d17d6d8aa0a79941512d7d6"
 dependencies = [
  "combine",
  "once_cell",
@@ -2563,9 +2563,9 @@ dependencies = [
 
 [[package]]
 name = "summavy_codecs"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57fa0d24510dfe84b296a9b3f608cdfb1bc4de1b6671f72b587906820366819b"
+checksum = "5abc32a3a50c9eac6f73055ba9ec1b316007a618d62f40b3fd6830041afd3827"
 dependencies = [
  "fastdivide",
  "itertools",

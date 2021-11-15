@@ -28,8 +28,8 @@ export class WebIndexServiceWorker {
       await init_thread_pool(threads);
     }
   }
-  async add(network_config: NetworkConfig): Promise<Object> {
-    return await this.registry!.add(network_config)
+  async add(index_engine: { remote: NetworkConfig } | { memory: {}}): Promise<Object> {
+    return await this.registry!.add(index_engine)
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
@@ -42,6 +42,12 @@ export class WebIndexServiceWorker {
   }
   async warmup(index_name: string) {
     return await this.registry!.warmup(index_name);
+  }
+  async index_document(index_name: string, document: string) {
+    return await this.registry!.index_document(index_name, document)
+  }
+  async commit(index_name: string) {
+    return await this.registry!.commit(index_name)
   }
 }
 export const web_index_service_worker = new WebIndexServiceWorker();

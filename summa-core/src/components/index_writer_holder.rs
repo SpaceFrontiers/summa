@@ -1,13 +1,97 @@
+use parking_lot::RwLock;
 use tantivy::schema::{Field, FieldType};
-use tantivy::{Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, Term};
+use tantivy::{Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
 
 use super::SummaSegmentAttributes;
+use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
+use crate::configs::IndexConfig;
 use crate::errors::{SummaResult, ValidationError};
+
+pub struct SingleIndexWriter {
+    pub index_writer: RwLock<SingleSegmentIndexWriter>,
+    pub index_config: IndexConfig,
+    pub index: Index,
+}
+
+pub enum IndexWriterImpl {
+    Single(SingleIndexWriter),
+    Threaded(IndexWriter),
+}
+
+impl IndexWriterImpl {
+    pub fn delete_term(&self, term: Term) {
+        match self {
+            IndexWriterImpl::Single(_) => {
+                unimplemented!()
+            }
+            IndexWriterImpl::Threaded(writer) => writer.delete_term(term),
+        };
+    }
+    pub fn add_document(&self, document: Document) -> SummaResult<()> {
+        match self {
+            IndexWriterImpl::Single(writer) => {
+                writer.index_writer.write().add_document(document)?;
+            }
+            IndexWriterImpl::Threaded(writer) => {
+                writer.add_document(document)?;
+            }
+        };
+        Ok(())
+    }
+    pub fn index(&self) -> &Index {
+        match self {
+            IndexWriterImpl::Single(writer) => &writer.index,
+            IndexWriterImpl::Threaded(writer) => writer.index(),
+        }
+    }
+    pub fn wait_merging_threads(self) -> SummaResult<()> {
+        match self {
+            IndexWriterImpl::Single(_) => Ok(()),
+            IndexWriterImpl::Threaded(writer) => Ok(writer.wait_merging_threads()?),
+        }
+    }
+    pub async fn merge_with_attributes(
+        &mut self,
+        segment_ids: &[SegmentId],
+        segment_attributes: Option<serde_json::Value>,
+    ) -> SummaResult<Option<SegmentMeta>> {
+        match self {
+            IndexWriterImpl::Single(_) => {
+                unimplemented!()
+            }
+            IndexWriterImpl::Threaded(writer) => Ok(writer.merge_with_attributes(segment_ids, segment_attributes).await?),
+        }
+    }
+    pub async fn commit(&mut self, payload: Option<String>) -> SummaResult<()> {
+        match self {
+            IndexWriterImpl::Single(writer) => {
+                let index = writer.index.clone();
+                let writer_heap_size_bytes = writer.index_config.writer_heap_size_bytes as usize;
+                let writer = writer.index_writer.get_mut();
+                take_mut::take(writer, |writer| {
+                    writer.finalize().expect("cannot finalize");
+                    SingleSegmentIndexWriter::new(index.clone(), writer_heap_size_bytes).expect("cannot recreate writer")
+                });
+                Ok(())
+            }
+            IndexWriterImpl::Threaded(writer) => {
+                info!(action = "commit_index");
+                let mut prepared_commit = writer.prepare_commit()?;
+                if let Some(payload) = payload {
+                    prepared_commit.set_payload(&payload);
+                }
+                let opstamp = prepared_commit.commit_future().await?;
+                info!(action = "committed_index", opstamp = ?opstamp);
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Managing write operations to index
 pub struct IndexWriterHolder {
-    index_writer: IndexWriter,
+    index_writer: IndexWriterImpl,
     primary_key: Option<Field>,
 }
 
@@ -17,7 +101,7 @@ impl IndexWriterHolder {
     /// `IndexWriterHolder` maintains invariant that the only document with the particular primary key exists in the index.
     /// It is reached by deletion of every document with the same primary key as indexing one.
     /// The type of primary key is restricted to I64 but it is subjected to be changed in the future.
-    pub(super) fn new(index_writer: IndexWriter, primary_key: Option<Field>) -> SummaResult<IndexWriterHolder> {
+    pub(super) fn new(index_writer: IndexWriterImpl, primary_key: Option<Field>) -> SummaResult<IndexWriterHolder> {
         if let Some(primary_key) = primary_key {
             match index_writer.index().schema().get_field_entry(primary_key).field_type() {
                 FieldType::I64(_) => Ok(()),
@@ -25,6 +109,29 @@ impl IndexWriterHolder {
             }?
         }
         Ok(IndexWriterHolder { index_writer, primary_key })
+    }
+
+    /// Creates new `IndexWriterHolder` from `Index` and `IndexConfig`
+    pub(super) fn from_config(index: &Index, index_config: &IndexConfig) -> SummaResult<IndexWriterHolder> {
+        let index_writer = if index_config.writer_threads == 0 {
+            IndexWriterImpl::Single(SingleIndexWriter {
+                index: index.clone(),
+                index_config: index_config.clone(),
+                index_writer: RwLock::new(SingleSegmentIndexWriter::new(index.clone(), index_config.writer_heap_size_bytes as usize)?),
+            })
+        } else {
+            let index_writer = index.writer_with_num_threads(index_config.writer_threads as usize, index_config.writer_heap_size_bytes as usize)?;
+            index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
+            IndexWriterImpl::Threaded(index_writer)
+        };
+        IndexWriterHolder::new(
+            index_writer,
+            index_config
+                .primary_key
+                .as_ref()
+                .map(|primary_key| index.schema().get_field(primary_key))
+                .flatten(),
+        )
     }
 
     /// Delete index by its primary key
@@ -45,7 +152,7 @@ impl IndexWriterHolder {
     }
 
     /// Delete index by its primary key
-    pub(super) fn delete_document_by_primary_key(&self, primary_key_value: i64) -> SummaResult<Opstamp> {
+    pub(super) fn delete_document_by_primary_key(&self, primary_key_value: i64) -> SummaResult<()> {
         if let Some(primary_key) = self.primary_key {
             Ok(self.index_writer.delete_term(Term::from_field_i64(primary_key, primary_key_value)))
         } else {
@@ -59,7 +166,7 @@ impl IndexWriterHolder {
     }
 
     /// Put document to the index. Before comes searchable it must be committed
-    pub(super) fn index_document(&self, document: Document) -> SummaResult<Opstamp> {
+    pub(super) fn index_document(&self, document: Document) -> SummaResult<()> {
         self.delete_document(&document)?;
         Ok(self.index_writer.add_document(document)?)
     }
@@ -85,15 +192,8 @@ impl IndexWriterHolder {
     ///
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub(super) async fn commit(&mut self, payload: Option<String>) -> SummaResult<Opstamp> {
-        info!(action = "commit_index");
-        let mut prepared_commit = self.index_writer.prepare_commit()?;
-        if let Some(payload) = payload {
-            prepared_commit.set_payload(&payload);
-        }
-        let result = prepared_commit.commit_future().await;
-        info!(action = "committed_index", result = ?result);
-        Ok(result?)
+    pub(super) async fn commit(&mut self, payload: Option<String>) -> SummaResult<()> {
+        self.index_writer.commit(payload).await
     }
 
     pub(super) async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {

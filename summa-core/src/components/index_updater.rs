@@ -12,14 +12,13 @@ use rdkafka::Message;
 use summa_proto::proto;
 use tantivy::directory::MmapDirectory;
 use tantivy::schema::Schema;
-use tantivy::{Directory, Index, Opstamp, SegmentId, SegmentMeta};
+use tantivy::{Directory, Index, SegmentId, SegmentMeta};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use tokio::time;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 use super::index_writer_holder::IndexWriterHolder;
 use super::SummaDocument;
-use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::components::segment_attributes::SummaSegmentAttributes;
 use crate::configs::{ConfigProxy, ConsumerConfig, IndexConfig};
 use crate::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
@@ -48,22 +47,10 @@ pub fn process_message(
     }
 }
 
-fn create_index_writer_holder(index: &Index, index_config: &IndexConfig) -> SummaResult<IndexWriterHolder> {
-    let index_writer = index.writer_with_num_threads(index_config.writer_threads as usize, index_config.writer_heap_size_bytes as usize)?;
-    index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
-    IndexWriterHolder::new(
-        index_writer,
-        match index_config.primary_key {
-            Some(ref primary_key) => index.schema().get_field(primary_key),
-            None => None,
-        },
-    )
-}
-
 fn wait_merging_threads(index_writer_holder: &mut IndexWriterHolder, index: &Index, index_config: &IndexConfig) {
     take_mut::take(index_writer_holder, |index_writer_holder| {
         index_writer_holder.wait_merging_threads().expect("cannot wait merging threads");
-        create_index_writer_holder(index, index_config).expect("cannot create index writer_holder")
+        IndexWriterHolder::from_config(index, index_config).expect("cannot create index writer_holder")
     });
 }
 
@@ -101,9 +88,13 @@ pub struct IndexUpdater {
 
 impl IndexUpdater {
     /// Creates new `IndexUpdater`
-    pub(super) async fn new(index: Index, index_name: &str, index_config_proxy: Arc<dyn ConfigProxy<IndexConfig>>) -> SummaResult<IndexUpdater> {
+    pub(super) async fn new(
+        index: Index,
+        index_writer_holder: Arc<RwLock<IndexWriterHolder>>,
+        index_name: &str,
+        index_config_proxy: Arc<dyn ConfigProxy<IndexConfig>>,
+    ) -> SummaResult<IndexUpdater> {
         let index_config = index_config_proxy.read().await.get().clone();
-        let index_writer_holder = Arc::new(RwLock::new(create_index_writer_holder(&index, &index_config)?));
         let consumers = index_config
             .consumer_configs
             .iter()
@@ -205,12 +196,12 @@ impl IndexUpdater {
 
     /// Stops consumers, commits Tantivy and Kafka offsets
     #[instrument(skip(self))]
-    pub async fn stop_updates_and_commit(self) -> SummaResult<Opstamp> {
+    pub async fn stop_updates_and_commit(self) -> SummaResult<()> {
         let inner_index_updater = self.read().await;
         inner_index_updater.stop_consumers().await?;
-        let opstamp = inner_index_updater.commit_index(None).await?;
+        inner_index_updater.commit_index(None).await?;
         inner_index_updater.commit_offsets().await?;
-        Ok(opstamp)
+        Ok(())
     }
 }
 
@@ -328,34 +319,6 @@ impl InnerIndexUpdater {
         self.consumers.iter().map(|x| x.consumer_name().to_owned()).collect()
     }
 
-    /// Delete `SummaDocument` by `primary_key`
-    pub async fn delete_document(&self, primary_key_value: i64) -> SummaResult<Opstamp> {
-        self.index_writer_holder.read().await.delete_document_by_primary_key(primary_key_value)
-    }
-
-    /// Index generic `SummaDocument`
-    ///
-    /// `IndexUpdater` bounds unbounded `SummaDocument` inside
-    pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<Opstamp> {
-        let document = document.bound_with(&self.index.schema()).try_into()?;
-        self.index_writer_holder.read().await.index_document(document)
-    }
-
-    /// Index multiple documents at a time
-    pub async fn index_bulk(&self, documents: &Vec<Vec<u8>>) -> (u64, u64) {
-        let (mut success_docs, mut failed_docs) = (0u64, 0u64);
-        for document in documents {
-            match self.index_document(SummaDocument::UnboundJsonBytes(document)).await {
-                Ok(_) => success_docs += 1,
-                Err(error) => {
-                    warn!(action = "error", error = ?error);
-                    failed_docs += 1
-                }
-            }
-        }
-        (success_docs, failed_docs)
-    }
-
     /// Commits Kafka offsets
     #[instrument(skip(self))]
     pub(super) async fn commit_offsets(&self) -> SummaResult<()> {
@@ -373,30 +336,30 @@ impl InnerIndexUpdater {
 
     /// Commits index
     #[instrument(skip(self))]
-    pub(super) async fn commit_index(&self, payload: Option<String>) -> SummaResult<Opstamp> {
+    pub(super) async fn commit_index(&self, payload: Option<String>) -> SummaResult<()> {
         self.index_writer_holder.write().await.commit(payload).await
     }
 
     /// Commits all
     #[instrument(skip(self))]
-    pub async fn commit(&self, payload: Option<String>) -> SummaResult<Opstamp> {
+    pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
         self.stop_consumers().await?;
-        let opstamp = self.commit_index(payload).await?;
+        self.commit_index(payload).await?;
         self.commit_offsets().await?;
         self.start_consumers().await;
-        Ok(opstamp)
+        Ok(())
     }
 
     /// Vacuum index
     #[instrument(skip(self))]
-    pub async fn vacuum_index(&self, payload: Option<String>, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<Opstamp> {
+    pub async fn vacuum_index(&self, payload: Option<String>, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
         self.stop_consumers().await?;
         self.commit_index(payload.clone()).await?;
         self.index_writer_holder.write().await.vacuum(segment_attributes).await?;
-        let opstamp = self.commit_index(payload).await?;
+        self.commit_index(payload).await?;
         self.commit_offsets().await?;
         self.start_consumers().await;
-        Ok(opstamp)
+        Ok(())
     }
 
     /// Merge index

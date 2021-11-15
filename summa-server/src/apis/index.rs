@@ -95,18 +95,14 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                         },
                     }
                 });
-                Ok(Response::new(proto::CommitIndexResponse {
-                    opstamp: None,
-                    elapsed_secs: None,
-                }))
+                Ok(Response::new(proto::CommitIndexResponse { elapsed_secs: None }))
             }
             Some(proto::CommitMode::Sync) => match index_holder.index_updater().try_write() {
                 Err(_) => Err(Status::failed_precondition("busy")),
                 Ok(index_updater) => {
                     let now = Instant::now();
-                    let opstamp = index_updater.commit(None).await.map_err(crate::errors::Error::from)?;
+                    index_updater.commit(None).await.map_err(crate::errors::Error::from)?;
                     Ok(Response::new(proto::CommitIndexResponse {
-                        opstamp: Some(opstamp),
                         elapsed_secs: Some(now.elapsed().as_secs_f64()),
                     }))
                 }
@@ -124,33 +120,25 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn delete_document(&self, request: Request<proto::DeleteDocumentRequest>) -> Result<Response<proto::DeleteDocumentResponse>, Status> {
         let request = request.into_inner();
-        let opstamp = self
-            .index_service
+        self.index_service
             .get_index_holder(&request.index_alias)
             .await?
-            .index_updater()
-            .read()
-            .await
             .delete_document(request.primary_key)
             .await
             .map_err(crate::errors::Error::from)?;
-        let response = proto::DeleteDocumentResponse { opstamp: Some(opstamp) };
+        let response = proto::DeleteDocumentResponse {};
         Ok(Response::new(response))
     }
 
     async fn index_document(&self, request: Request<proto::IndexDocumentRequest>) -> Result<Response<proto::IndexDocumentResponse>, Status> {
         let request = request.into_inner();
-        let opstamp = self
-            .index_service
+        self.index_service
             .get_index_holder(&request.index_alias)
             .await?
-            .index_updater()
-            .read()
-            .await
             .index_document(SummaDocument::UnboundJsonBytes(&request.document))
             .await
             .map_err(crate::errors::Error::from)?;
-        let response = proto::IndexDocumentResponse { opstamp };
+        let response = proto::IndexDocumentResponse {};
         Ok(Response::new(response))
     }
 
@@ -169,9 +157,6 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                         .index_service
                         .get_index_holder(&chunk.index_alias)
                         .await?
-                        .index_updater()
-                        .read()
-                        .await
                         .index_bulk(&chunk.documents)
                         .await;
                     elapsed_secs += now.elapsed().as_secs_f64();

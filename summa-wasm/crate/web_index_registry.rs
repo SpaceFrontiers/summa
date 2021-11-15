@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry};
-use summa_core::configs::{DirectProxy, IndexConfigBuilder, IndexEngine, NetworkConfig};
+use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry, SummaDocument};
+use summa_core::configs::{DirectProxy, IndexConfigBuilder, IndexEngine};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use tantivy::Executor;
 use wasm_bindgen::prelude::*;
@@ -52,8 +52,8 @@ impl WebIndexRegistry {
 
     #[wasm_bindgen]
     pub async fn add(&mut self, network_config: JsValue) -> Result<JsValue, JsValue> {
-        let network_config: NetworkConfig = serde_wasm_bindgen::from_value(network_config)?;
-        Ok(self.add_internal(network_config).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+        let index_engine: IndexEngine = serde_wasm_bindgen::from_value(network_config)?;
+        Ok(self.add_internal(index_engine).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
     #[wasm_bindgen]
@@ -64,8 +64,7 @@ impl WebIndexRegistry {
         Ok(index_payload.serialize(&*SERIALIZER)?)
     }
 
-    async fn add_internal(&mut self, network_config: NetworkConfig) -> SummaWasmResult<IndexPayload> {
-        let index_engine = IndexEngine::Remote(network_config);
+    async fn add_internal(&mut self, index_engine: IndexEngine) -> SummaWasmResult<IndexPayload> {
         let mut index = IndexHolder::open::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine)?;
         let index_payload: IndexPayload =
             serde_json::from_str(&index.load_metas()?.payload.ok_or(Error::IncorrectPayload)?).map_err(|_| Error::IncorrectPayload)?;
@@ -73,6 +72,7 @@ impl WebIndexRegistry {
             .index_engine(index_engine)
             .default_fields(index_payload.default_fields.clone())
             .multi_fields(index_payload.multi_fields.clone())
+            .writer_threads(0)
             .build()
             .map_err(|e| Error::Core(e.into()))?;
 
@@ -97,6 +97,23 @@ impl WebIndexRegistry {
     pub async fn warmup(&self, index_name: &str) -> Result<(), JsValue> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
         index_holder.warmup().await.map_err(Error::from)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn index_document(&self, index_name: &str, document: &str) -> Result<(), JsValue> {
+        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
+        index_holder
+            .index_document(SummaDocument::UnboundJsonBytes(document.as_bytes()))
+            .await
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn commit(&self, index_name: &str) -> Result<(), JsValue> {
+        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
+        index_holder.commit(None).await.map_err(Error::from)?;
         Ok(())
     }
 }
