@@ -57,8 +57,8 @@ pip3 install -U aiosumma
 Now we have `summa-cli` tool for doing queries to `summa-server`
 
 ### Fill With Documents <a name="fill"></a>
-WikiBooks provides weekly dumps of their books database. 
-Let's download their dump and index it in Summa.
+WikiBooks provides weekly dumps of their books' database. 
+Let's download their dump and index it in Summa:
 
 ```bash
 {% include download-dump-snippet.sh %}
@@ -66,12 +66,18 @@ Let's download their dump and index it in Summa.
 {% include import-data-to-summa-snippet.sh %}
 ```
 
-For now, WikiBooks database is indexed locally.
+Well, we have WikiBooks database indexed locally.
 
 ### Query <a name="query"></a>
-Let's do a test query!
+Let's do a test query:
 
 ```bash
 # Do a match query that returns top-10 documents and its total count
 summa-cli localhost:8082 - search books '{"match": {"value": "astronomy"}}' '[{"top_docs": {"limit": 10}}, {"count": {}}]'
 ```
+
+You will see response containing found documents.
+
+## Further reading
+- [Core components](/summa/core)
+- [API References](/summa/apis)

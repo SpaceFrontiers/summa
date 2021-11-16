@@ -50,7 +50,10 @@ impl DifferentialUpdater {
                 None => required_operations.push(RequiredOperation::Remove(source_file)),
                 Some(index_file) => match index_file {
                     ComponentFile::SegmentComponent(_) => {}
-                    ComponentFile::Other(_) => required_operations.push(RequiredOperation::Add(index_file.clone())),
+                    ComponentFile::Other(_) => {
+                        required_operations.push(RequiredOperation::Remove(source_file));
+                        required_operations.push(RequiredOperation::Add(index_file.clone()));
+                    }
                 },
             }
         }
@@ -113,6 +116,12 @@ mod tests {
         assert_eq!(
             DifferentialUpdater::from_source(old_files).target_state(new_files),
             vec![
+                RequiredOperation::Remove(FilesEntry {
+                    name: ".managed.json".to_string(),
+                    typ: 0,
+                    size: 31,
+                    hash: "deadbeef13".to_string()
+                }),
                 RequiredOperation::Add(ComponentFile::Other(PathBuf::from(".managed.json"))),
                 RequiredOperation::Remove(FilesEntry {
                     name: "0.pos".to_string(),
@@ -125,6 +134,12 @@ mod tests {
                     segment_component: tantivy::SegmentComponent::Postings
                 })),
                 RequiredOperation::Add(ComponentFile::Other(PathBuf::from("hotcache.bin"))),
+                RequiredOperation::Remove(FilesEntry {
+                    name: "meta.json".to_string(),
+                    typ: 0,
+                    size: 61,
+                    hash: "deadbeef14".to_string()
+                }),
                 RequiredOperation::Add(ComponentFile::Other(PathBuf::from("meta.json"))),
             ]
         )
