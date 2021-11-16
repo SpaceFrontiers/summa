@@ -5,7 +5,7 @@ export const is_development =
   process.env.NODE_ENV === "development" || window.location.port === "4173";
 export const browser = detect();
 export const num_threads =
-  browser && (browser.name === "safari" || browser.name === "ios") ? 0 : 16;
+  browser && (browser.name === "safari" || browser.name === "ios") ? 0 : 8;
 export const hostname =
   window.location.hostname +
   (window.location.port == "" ? "" : ":" + window.location.port);

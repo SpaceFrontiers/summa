@@ -2,7 +2,7 @@ use summa_proto::proto;
 use tantivy::schema::Schema;
 use tantivy::IndexSortByField;
 
-use crate::errors::{Error, SummaServerResult};
+use crate::errors::{Error, SummaServerResult, ValidationError};
 use crate::requests::validators;
 
 #[derive(Builder)]
@@ -43,6 +43,15 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
         let compression = proto::Compression::from_i32(proto_request.compression)
             .map(proto::Compression::into)
             .unwrap_or(tantivy::store::Compressor::None);
+
+        match (proto_request.writer_heap_size_bytes, proto_request.writer_threads) {
+            (Some(writer_heap_size_bytes), Some(writer_threads)) => {
+                if writer_heap_size_bytes / writer_threads > 4293967294 {
+                    return Err(ValidationError::InvalidArgument("The memory arena in bytes per thread cannot exceed 4293967295".to_string()).into());
+                }
+            }
+            _ => {}
+        };
 
         Ok(CreateIndexRequestBuilder::default()
             .index_name(proto_request.index_name)

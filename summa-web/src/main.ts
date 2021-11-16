@@ -2,7 +2,7 @@ import { createApp } from "vue";
 
 import App from "./App.vue";
 import router from "./router";
-import { SearchService } from "./services/web-index-service";
+import { SearchService } from "./services/search-service";
 
 import "./scss/styles.scss";
 import * as bootstrap from "bootstrap";

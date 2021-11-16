@@ -1,10 +1,6 @@
 import type { Remote } from "comlink";
 import * as Comlink from "comlink";
-import type {
-  IndexQuery,
-  StatusCallback,
-  WebIndexService,
-} from "summa-wasm";
+import type { IndexQuery, StatusCallback, WebIndexService } from "summa-wasm";
 import { ChunkedCacheConfig, NetworkConfig } from "summa-wasm";
 import { ref, toRaw } from "vue";
 import { db, type IIndexSeed, IndexConfig } from "@/database";
@@ -37,10 +33,18 @@ export class IpfsDatabaseSeed implements IIndexSeed {
   ): Promise<NetworkConfig> {
     status_callback("status", `resolving ${this.ipfs_path}...`);
     const response = await axios.get(ipfs_url + this.ipfs_path);
-    const ipfs_path = "/ipfs/" + response.headers["x-ipfs-roots"];
-    const ipfs_hash = ipfs_path.split("/")[2] as string;
-
-    status_callback("status", `resolving files...`);
+    let ipfs_hash = response.headers["x-ipfs-roots"];
+    if (
+      ipfs_hash === undefined &&
+      response.headers["content-type"] === "text/html"
+    ) {
+      const parser = new DOMParser();
+      const htmlDoc = parser.parseFromString(response.data, "text/html");
+      ipfs_hash = htmlDoc
+        .getElementsByClassName("ipfs-hash")[0]
+        .textContent!.trim();
+    }
+    console.debug("Detected IPFS Hash", ipfs_hash);
     return new NetworkConfig(
       "GET",
       `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
@@ -151,7 +155,7 @@ export class SearchService {
         16 * 1024,
         128 * 1024 * 1024
       );
-      await this.web_index_service_worker.add({remote: network_config});
+      await this.web_index_service_worker.add({ remote: network_config });
     }
   }
   async add_index(startup_config: {
@@ -161,9 +165,9 @@ export class SearchService {
     const network_config = await startup_config.seed.retrieve_network_config(
       this.status_callback
     );
-    const index_payload = await this.web_index_service_worker.add(
-      {remote: network_config}
-    );
+    const index_payload = await this.web_index_service_worker.add({
+      remote: network_config,
+    });
     const index_config = new IndexConfig(
       startup_config.is_enabled,
       false,
