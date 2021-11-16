@@ -200,7 +200,7 @@ impl IndexWriterHolder {
         let mut segments = self.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
 
-        let (small_segments, segments): (Vec<_>, Vec<_>) = segments
+        let segments = segments
             .into_iter()
             .filter(|segment| {
                 let is_frozen = segment
@@ -214,22 +214,16 @@ impl IndexWriterHolder {
                     .unwrap_or(false);
                 !is_frozen
             })
-            .partition(|segment| segment.meta().num_docs() < 100000);
-
-        if !small_segments.is_empty() {
+            .collect::<Vec<_>>();
+        if !segments.is_empty() {
             self.merge(
-                &small_segments
+                &segments
                     .iter()
-                    .chain(segments.iter().take(1))
                     .map(|segment| segment.id())
                     .collect::<Vec<_>>(),
                 segment_attributes.clone(),
             )
             .await?;
-        }
-
-        for segment in segments.iter() {
-            self.merge(&[segment.id()], segment_attributes.clone()).await?;
         }
         Ok(())
     }
