@@ -1,8 +1,7 @@
 syntax = "proto3";
 package summa.proto;
 
-// API
-
+// Analyzes indices
 service ReflectionApi {
   rpc get_top_terms (GetTopTermsRequest) returns (GetTopTermsResponse) {}
 }

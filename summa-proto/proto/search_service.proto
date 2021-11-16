@@ -4,12 +4,11 @@ package summa.proto;
 import "query.proto";
 
 
-// Main entrypoint for `Summa` that accepts queries to execute
+// Searches documents in the stored indices
 service SearchApi {
   rpc search (SearchRequest) returns (SearchResponse) {}
 }
 
-// Requests
 message SearchRequest {
   // The index name or alias
   string index_alias = 1;

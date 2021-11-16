@@ -3,8 +3,7 @@ package summa.proto;
 
 import "utils.proto";
 
-// API
-
+// Manages indices
 service IndexApi {
   rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
   rpc attach_index(AttachIndexRequest) returns (AttachIndexResponse) {}

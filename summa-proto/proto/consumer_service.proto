@@ -1,16 +1,15 @@
 syntax = "proto3";
 package summa.proto;
 
-// API
-
+// Manages consumers that ingest data from Kafka
 service ConsumerApi {
+  // Create a new consumer
   rpc create_consumer (CreateConsumerRequest) returns (CreateConsumerResponse) {}
+  // Get a single consumer
   rpc get_consumer (GetConsumerRequest) returns (GetConsumerResponse) {}
   rpc get_consumers (GetConsumersRequest) returns (GetConsumersResponse) {}
   rpc delete_consumer (DeleteConsumerRequest) returns (DeleteConsumerResponse) {}
 }
-
-// Requests
 
 message CreateConsumerRequest {
   repeated string bootstrap_servers = 1;
