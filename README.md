@@ -4,20 +4,21 @@
 
 # Summa
 
-Summa is the fast full-text search server for decentralized web.
+Summa is a full-text WASM-compatible search server written in Rust.
+Yes, you can launch it entirely inside your browser!
 
-**Yes, you can launch and use Summa inside your browser for opening and searching indices over HTTP!**
+Start with our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start).
 
 ## Key Features
 
 - Full-text index with a wide range of supported queries and ranking functions
 - GRPC API, Python asynchronous client [library](https://izihawa.github.io/summa/apis/python-api) and [CLI](https://izihawa.github.io/summa/apis/python-api)
-- [WASM-bindings](https://github.com/izihawa/summa/tree/master/summa-wasm) to launch Summa in browsers
+- [WASM-bindings](https://izihawa.github.io/summa/apis/wasm-api) to launch Summa in browsers
 - Open remote indices through network. We have already implemented [IPFS](https://izihawa.github.io/summa/guides/ipfs-wasm-guide) support out of the box
 - Kafka for indexing
 
 ## Online-documentation
 
-- [github.io](https://izihawa.github.io)
+- [github.io](https://izihawa.github.io/summa)
 - [docs.rs](https://docs.rs/summa-core)
 
