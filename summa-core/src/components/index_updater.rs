@@ -380,8 +380,8 @@ impl InnerIndexUpdater {
         let index = self.index.clone();
         let index_config = self.index_config_proxy.read().await.get().clone();
 
-        let mut index_writer_holder = self.index_writer_holder.write().await;
         self.stop_consumers().await?;
+        let mut index_writer_holder = self.index_writer_holder.write().await;
 
         let segment_attributes = SummaSegmentAttributes { is_frozen: true };
 
@@ -407,6 +407,7 @@ impl InnerIndexUpdater {
         .chain(self.get_index_files(index_path.as_ref().to_path_buf())?)
         .collect();
         let result = f(segment_files).await;
+        drop(index_writer_holder);
         self.start_consumers().await;
         result
     }

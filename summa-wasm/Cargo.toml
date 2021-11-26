@@ -32,7 +32,7 @@ spmc = "0.3.0"
 strfmt = "0.2.2"
 summa-core = { version = "0.11.0", path = "../summa-core", default_features = false }
 summa-proto = { version = "0.11.0", path = "../summa-proto", default_features = false }
-tantivy = { package = "summavy", version = "0.20.0", default_features = false, features = ["quickwit", "zstd-compression"] }
+tantivy = { package = "summavy", version = "0.20.2", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0.37"
 tokio = { version = "1.21.2", default_features = false, features = ["macros", "rt", "signal-hook-registry", "sync"] }
 tracing = "0.1.36"

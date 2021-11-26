@@ -34,23 +34,28 @@ async function set_from_cache(filename, chunk_size, start, end) {
   const cached_response = new ArrayBuffer(end - start + 1);
   const cached_response_view = new Uint8Array(cached_response);
   const chunk_ixs = Array.from(generate_chunk_ids(start, end, chunk_size));
-  const cached_chunks = await db
-    .table("chunks")
-    .where("[filename+chunk_id]")
-    .between(
-      [filename, chunk_ixs[0]],
-      [filename, chunk_ixs[chunk_ixs.length - 1]],
-      true,
-      true
-    )
-    .toArray();
-  if (cached_chunks.length < chunk_ixs.length) {
-    return null;
+  try {
+    const cached_chunks = await db
+      .table("chunks")
+      .where("[filename+chunk_id]")
+      .between(
+        [filename, chunk_ixs[0]],
+        [filename, chunk_ixs[chunk_ixs.length - 1]],
+        true,
+        true
+      )
+      .toArray();
+    if (cached_chunks.length < chunk_ixs.length) {
+      return null;
+    }
+    chunk_ixs.map((current, ix) => {
+      cached_response_view.set(cached_chunks[ix].blob, current - start);
+    });
+    return cached_response_view;
+  } catch (e) {
+    console.error(e, filename, chunk_size, start, end);
+    throw e;
   }
-  chunk_ixs.map((current, ix) => {
-    cached_response_view.set(cached_chunks[ix].blob, current - start);
-  });
-  return cached_response_view;
 }
 
 async function fill_cache(response_body, filename, chunk_size, start, end) {
@@ -70,13 +75,26 @@ async function fill_cache(response_body, filename, chunk_size, start, end) {
       };
     })
   );
-  await db.table("chunks").bulkPut(items);
+  try {
+    await db.table("chunks").bulkPut(items);
+  } catch (e) {
+    console.error(e, filename, chunk_size, start, end);
+    throw e;
+  }
 }
 
 function process_request_headers(request) {
   const new_headers = new Headers();
   let [range_start, range_end] = [null, null];
   let url = request.url;
+
+  for (const [header, value] of request.headers) {
+    if (header === "range") {
+      const [_, start, end] = /^bytes=(\d+)-(\d+)$/g.exec(value);
+      [range_start, range_end] = [parseInt(start), parseInt(end)];
+    }
+    new_headers.set(header, value);
+  }
   const summa_cache_is_enabled =
     (url.endsWith(".json") ||
       url.endsWith(".term") ||
@@ -86,15 +104,9 @@ function process_request_headers(request) {
       url.endsWith(".pos") ||
       url.endsWith(".fieldnorm") ||
       url.endsWith(".bin")) &&
-    request.method === "GET";
-
-  for (const [header, value] of request.headers) {
-    if (header === "range") {
-      const [_, start, end] = /^bytes=(\d+)-(\d+)$/g.exec(value);
-      [range_start, range_end] = [parseInt(start), parseInt(end)];
-    }
-    new_headers.set(header, value);
-  }
+    request.method === "GET" &&
+    range_start !== null &&
+    range_end !== null;
   if (summa_cache_is_enabled) {
     url += "?r=" + range_end;
   }
@@ -114,6 +126,7 @@ async function handle_request(original_request) {
   const filename = original_request.url;
   let { summa_cache_is_enabled, range_start, range_end, request } =
     process_request_headers(original_request);
+  console.log(summa_cache_is_enabled, range_start, range_end, filename)
   if (summa_cache_is_enabled) {
     const response_body = await set_from_cache(
       filename,

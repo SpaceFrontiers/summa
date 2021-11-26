@@ -71,9 +71,9 @@ pub fn default() -> Vec<WorkerGuard> {
 
 pub fn file(log_path: &Path) -> io::Result<Vec<WorkerGuard>> {
     let mut guards = Vec::new();
-    let file_writer_request = create_writer(log_path, "request", &mut guards)?;
-    let file_writer_query = create_writer(log_path, "query", &mut guards)?;
-    let file_writer_summa = create_writer(log_path, "summa", &mut guards)?;
+    let file_writer_request = create_writer(log_path, "request.log", &mut guards)?;
+    let file_writer_query = create_writer(log_path, "query.log", &mut guards)?;
+    let file_writer_summa = create_writer(log_path, "summa.log", &mut guards)?;
 
     let filter_layer_request = EnvFilter::new(REQUEST_ENV_FILTER);
     let filter_layer_query = EnvFilter::new("query");

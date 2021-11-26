@@ -102,9 +102,9 @@ impl BeaconService {
                 .await?;
                 info!(action = "removing_old_path", mfs_path = mfs_path, temporary_path = temporary_path);
                 self.ipfs_client.files_rm(mfs_path, true).await.map_err(Error::from)?;
-                info!(action = "moving_new_path", mfs_path = mfs_path, temporary_path = temporary_path);
+                info!(action = "moving_to_new_path", mfs_path = mfs_path, temporary_path = temporary_path);
                 self.ipfs_client.files_mv(&temporary_path, mfs_path).await.map_err(Error::from)?;
-                Ok(self.ipfs_client.files_stat(&mfs_path).await.map_err(Error::from)?.hash)
+                Ok(self.ipfs_client.files_stat(mfs_path).await.map_err(Error::from)?.hash)
             })
             .await?;
         Ok(hash)

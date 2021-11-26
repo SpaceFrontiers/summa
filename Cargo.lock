@@ -1553,15 +1553,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
-name = "ownedbytes"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2981bd7cfb2a70e6c50083c60561275a269fc7458f151c53b126ec1b15cc040"
-dependencies = [
- "stable_deref_trait",
-]
-
-[[package]]
 name = "parity-multiaddr"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2362,7 +2353,6 @@ dependencies = [
  "once_cell",
  "opentelemetry",
  "opentelemetry-prometheus",
- "parking_lot",
  "path-absolutize",
  "prost",
  "rand 0.8.5",
@@ -2422,7 +2412,6 @@ dependencies = [
  "multihash 0.17.0",
  "opentelemetry",
  "opentelemetry-prometheus",
- "parking_lot",
  "path-absolutize",
  "prometheus",
  "prost",
@@ -2482,9 +2471,9 @@ dependencies = [
 
 [[package]]
 name = "summavy"
-version = "0.20.0"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cc12f4bea484d438e9b8c2776152fff00fcac9f808970b3a7fb7f68f393fc9d"
+checksum = "237ba63ec83aba2c175345563b4ec76861c9c956d809da4f24352dde39431c58"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2512,7 +2501,6 @@ dependencies = [
  "num_cpus",
  "once_cell",
  "oneshot",
- "ownedbytes",
  "rayon",
  "regex",
  "rust-stemmers",
@@ -2523,6 +2511,7 @@ dependencies = [
  "stable_deref_trait",
  "summavy-bitpacker",
  "summavy-common",
+ "summavy-ownedbytes",
  "summavy-query-grammar",
  "summavy_codecs",
  "tantivy-fst",
@@ -2536,25 +2525,34 @@ dependencies = [
 
 [[package]]
 name = "summavy-bitpacker"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c23ff896f976b677d236898df408ba9ebc74ec8aa52bef8b8919478583f6391f"
+checksum = "2e4f9133e7d5f2e2dde6a63e0e42898d36f642806aea8b962249275411eb2ac0"
 
 [[package]]
 name = "summavy-common"
-version = "0.3.1"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e992ee4227882e0e4a89c8ebff5d795c310541b17fb9b303c5090816f5ac2994"
+checksum = "5c66ca45f473362ccfb91776b514a00a75aa606bedfc0f9879198b8910bc8aad"
 dependencies = [
  "byteorder",
- "ownedbytes",
+ "summavy-ownedbytes",
+]
+
+[[package]]
+name = "summavy-ownedbytes"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f20b8d6a65a3e904a6391528d12fe3a326163ead96328e745f40bda06da5d1f"
+dependencies = [
+ "stable_deref_trait",
 ]
 
 [[package]]
 name = "summavy-query-grammar"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d71ff54ac80057afdc2cb17b3ce5fa67eb12c9915d17d6d8aa0a79941512d7d6"
+checksum = "56fa3354d255938518fdce19b037159e212fe3fa3a2d7222e722ac02a3a25421"
 dependencies = [
  "combine",
  "once_cell",
@@ -2563,16 +2561,16 @@ dependencies = [
 
 [[package]]
 name = "summavy_codecs"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5abc32a3a50c9eac6f73055ba9ec1b316007a618d62f40b3fd6830041afd3827"
+checksum = "d9a42faf2246528173d647d10fe886dffdaf504578ec23d27cdc2b014c86bfd1"
 dependencies = [
  "fastdivide",
  "itertools",
  "log",
- "ownedbytes",
  "summavy-bitpacker",
  "summavy-common",
+ "summavy-ownedbytes",
 ]
 
 [[package]]
@@ -3404,18 +3402,18 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.11.2+zstd.1.5.2"
+version = "0.12.0+zstd.1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20cc960326ece64f010d2d2107537f26dc589a6573a316bd5b1dba685fa5fde4"
+checksum = "b8148aa921e9d53217ab9322f8553bd130f7ae33489db68b381d76137d2e6374"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "5.0.2+zstd.1.5.2"
+version = "6.0.2+zstd.1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d2a5585e04f9eea4b2a3d1eca508c4dee9592a89ef6f450c11719da0726f4db"
+checksum = "a6cf39f730b440bab43da8fb5faf5f254574462f73f260f85f7987f32154ff17"
 dependencies = [
  "libc",
  "zstd-sys",

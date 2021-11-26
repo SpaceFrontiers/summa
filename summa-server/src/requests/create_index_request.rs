@@ -44,13 +44,10 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .map(proto::Compression::into)
             .unwrap_or(tantivy::store::Compressor::None);
 
-        match (proto_request.writer_heap_size_bytes, proto_request.writer_threads) {
-            (Some(writer_heap_size_bytes), Some(writer_threads)) => {
-                if writer_heap_size_bytes / writer_threads > 4293967294 {
-                    return Err(ValidationError::InvalidArgument("The memory arena in bytes per thread cannot exceed 4293967295".to_string()).into());
-                }
+        if let (Some(writer_heap_size_bytes), Some(writer_threads)) = (proto_request.writer_heap_size_bytes, proto_request.writer_threads) {
+            if writer_heap_size_bytes / writer_threads > 4293967294 {
+                return Err(ValidationError::InvalidArgument("The memory arena in bytes per thread cannot exceed 4293967295".to_string()).into());
             }
-            _ => {}
         };
 
         Ok(CreateIndexRequestBuilder::default()

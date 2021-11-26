@@ -54,7 +54,7 @@ function detect_ipfs_url(hostname: string) {
   return ipfs_url;
 }
 
-export async function is_supporting_subdomains() {
+export async function is_supporting_subsubdomains() {
   try {
     await axios.get(
       ipfs_http_protocol + "//nexus-books.summa-t.eth.ipns." + ipfs_hostname

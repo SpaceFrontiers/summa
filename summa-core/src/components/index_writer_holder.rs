@@ -1,4 +1,6 @@
-use parking_lot::RwLock;
+use std::sync::RwLock;
+
+use summa_proto::proto;
 use tantivy::schema::{Field, FieldType};
 use tantivy::{Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
@@ -31,7 +33,7 @@ impl IndexWriterImpl {
     pub fn add_document(&self, document: Document) -> SummaResult<()> {
         match self {
             IndexWriterImpl::Single(writer) => {
-                writer.index_writer.write().add_document(document)?;
+                writer.index_writer.write().expect("poisoned").add_document(document)?;
             }
             IndexWriterImpl::Threaded(writer) => {
                 writer.add_document(document)?;
@@ -68,7 +70,7 @@ impl IndexWriterImpl {
             IndexWriterImpl::Single(writer) => {
                 let index = writer.index.clone();
                 let writer_heap_size_bytes = writer.index_config.writer_heap_size_bytes as usize;
-                let writer = writer.index_writer.get_mut();
+                let writer = writer.index_writer.get_mut().expect("poisoned");
                 take_mut::take(writer, |writer| {
                     writer.finalize().expect("cannot finalize");
                     SingleSegmentIndexWriter::new(index.clone(), writer_heap_size_bytes).expect("cannot recreate writer")
@@ -105,6 +107,7 @@ impl IndexWriterHolder {
         if let Some(primary_key) = primary_key {
             match index_writer.index().schema().get_field_entry(primary_key).field_type() {
                 FieldType::I64(_) => Ok(()),
+                FieldType::Str(_) => Ok(()),
                 another_type => Err(ValidationError::InvalidPrimaryKeyType(another_type.to_owned())),
             }?
         }
@@ -126,11 +129,7 @@ impl IndexWriterHolder {
         };
         IndexWriterHolder::new(
             index_writer,
-            index_config
-                .primary_key
-                .as_ref()
-                .map(|primary_key| index.schema().get_field(primary_key))
-                .flatten(),
+            index_config.primary_key.as_ref().and_then(|primary_key| index.schema().get_field(primary_key)),
         )
     }
 
@@ -152,12 +151,17 @@ impl IndexWriterHolder {
     }
 
     /// Delete index by its primary key
-    pub(super) fn delete_document_by_primary_key(&self, primary_key_value: i64) -> SummaResult<()> {
-        if let Some(primary_key) = self.primary_key {
-            Ok(self.index_writer.delete_term(Term::from_field_i64(primary_key, primary_key_value)))
-        } else {
-            Err(ValidationError::MissingPrimaryKey(None).into())
-        }
+    pub(super) fn delete_document_by_primary_key(&self, primary_key_value: Option<proto::PrimaryKey>) -> SummaResult<()> {
+        self.primary_key
+            .and_then(|primary_key| {
+                primary_key_value.and_then(|primary_key_value| {
+                    primary_key_value.value.map(|value| match value {
+                        proto::primary_key::Value::Str(s) => self.index_writer.delete_term(Term::from_field_text(primary_key, &s)),
+                        proto::primary_key::Value::I64(i) => self.index_writer.delete_term(Term::from_field_i64(primary_key, i)),
+                    })
+                })
+            })
+            .ok_or_else(|| ValidationError::MissingPrimaryKey(None).into())
     }
 
     /// Tantivy `Index`
@@ -168,7 +172,7 @@ impl IndexWriterHolder {
     /// Put document to the index. Before comes searchable it must be committed
     pub(super) fn index_document(&self, document: Document) -> SummaResult<()> {
         self.delete_document(&document)?;
-        Ok(self.index_writer.add_document(document)?)
+        self.index_writer.add_document(document)
     }
 
     /// Merge segments into one.
@@ -181,7 +185,7 @@ impl IndexWriterHolder {
             .index_writer
             .merge_with_attributes(
                 segment_ids,
-                segment_attributes.map(|segment_attributes| serde_json::to_value(segment_attributes).expect("cannot seriliaze")),
+                segment_attributes.map(|segment_attributes| serde_json::to_value(segment_attributes).expect("cannot serialize")),
             )
             .await?;
         info!(action = "merged_segments", segment_ids = ?segment_ids, merged_segment_meta = ?segment_meta);
@@ -216,19 +220,13 @@ impl IndexWriterHolder {
             })
             .collect::<Vec<_>>();
         if !segments.is_empty() {
-            self.merge(
-                &segments
-                    .iter()
-                    .map(|segment| segment.id())
-                    .collect::<Vec<_>>(),
-                segment_attributes.clone(),
-            )
-            .await?;
+            self.merge(&segments.iter().map(|segment| segment.id()).collect::<Vec<_>>(), segment_attributes.clone())
+                .await?;
         }
         Ok(())
     }
 
     pub(super) fn wait_merging_threads(self) -> SummaResult<()> {
-        Ok(self.index_writer.wait_merging_threads()?)
+        self.index_writer.wait_merging_threads()
     }
 }

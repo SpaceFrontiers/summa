@@ -9,7 +9,7 @@ import {
   ipfs_http_protocol,
   ipfs_url,
   is_eth_hostname,
-  is_supporting_subdomains,
+  is_supporting_subsubdomains,
 } from "@/options";
 import axios from "axios";
 
@@ -45,12 +45,23 @@ export class IpfsDatabaseSeed implements IIndexSeed {
         .textContent!.trim();
     }
     console.debug("Detected IPFS Hash", ipfs_hash);
-    return new NetworkConfig(
-      "GET",
-      `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
-      [{ name: "range", value: "bytes={start}-{end}" }],
-      new ChunkedCacheConfig(16 * 1024, 128 * 1024 * 1024)
-    );
+    try {
+      // ToDo: Create separate check function
+      await axios.get(`${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/meta.json`);
+      return new NetworkConfig(
+        "GET",
+        `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
+        [{ name: "range", value: "bytes={start}-{end}" }],
+        new ChunkedCacheConfig(16 * 1024, 128 * 1024 * 1024)
+      );
+    } catch {
+      return new NetworkConfig(
+        "GET",
+        `${ipfs_http_protocol}//${ipfs_hostname}/ipfs/${ipfs_hash}/{file_name}`,
+        [{ name: "range", value: "bytes={start}-{end}" }],
+        new ChunkedCacheConfig(16 * 1024, 128 * 1024 * 1024)
+      );
+    }
   }
 }
 
@@ -80,7 +91,7 @@ class EthSubdomainDatabaseSeed implements IIndexSeed {
 }
 
 async function get_startup_configs() {
-  if (!(await is_supporting_subdomains()) && is_eth_hostname) {
+  if (!(await is_supporting_subsubdomains()) && is_eth_hostname) {
     return [
       {
         seed: new EthSubdomainDatabaseSeed("nexus-books"),
@@ -94,11 +105,11 @@ async function get_startup_configs() {
   }
   return [
     {
-      seed: new IpfsDatabaseSeed("/ipns/nexus-books.summa-t.eth/"),
+      seed: new IpfsDatabaseSeed("/ipfs/bafykbzacebftn62im7khi24gstiqc6j4e2bxpodttx5tnveecr3brc5uhqwvw/"),
       is_enabled: true,
     },
     {
-      seed: new IpfsDatabaseSeed("/ipns/nexus-media.summa-t.eth/"),
+      seed: new IpfsDatabaseSeed("/ipfs/bafykbzacebghljvglld3ycd4jglv45sqb3rfqgaygj7ansgejd47skn3xuawm/"),
       is_enabled: false,
     },
   ];

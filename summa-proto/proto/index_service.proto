@@ -23,6 +23,13 @@ service IndexApi {
 
 // Requests
 
+message PrimaryKey {
+  oneof value {
+    string str = 1;
+    int64 i64 = 2;
+  }
+}
+
 message AlterIndexRequest {
   message Fields {
     repeated string fields = 1;
@@ -82,7 +89,7 @@ message CreateIndexResponse {
 
 message DeleteDocumentRequest {
   string index_alias = 1;
-  int64 primary_key = 2;
+  PrimaryKey primary_key = 2;
 }
 
 message DeleteDocumentResponse {}

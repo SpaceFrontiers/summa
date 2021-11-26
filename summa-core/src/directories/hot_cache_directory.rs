@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::{fmt, io};
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes};
@@ -148,7 +148,7 @@ impl StaticDirectoryCache {
             ))));
         }
 
-        *file_lengths.write() = deserialize_cbor(&mut bytes).expect("CBOR failed");
+        *file_lengths.write().expect("poisoned") = deserialize_cbor(&mut bytes).expect("CBOR failed");
 
         let mut slice_offsets: Vec<(PathBuf, u64)> = deserialize_cbor(&mut bytes).expect("CBOR failed");
         slice_offsets.push((PathBuf::default(), bytes.len() as u64));
@@ -171,7 +171,7 @@ impl StaticDirectoryCache {
     }
 
     pub fn get_file_length(&self, path: &Path) -> Option<u64> {
-        self.file_lengths.read().get(path).map(u64::clone)
+        self.file_lengths.read().expect("poisoned").get(path).map(u64::clone)
     }
 }
 

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::{io, ops::Range, path::Path, sync::Arc, usize};
 
-use parking_lot::RwLock;
 use tantivy::directory::DirectoryClone;
 use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
@@ -52,7 +52,7 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
         let file_name_str = file_name.to_string_lossy();
         Ok(Arc::new(NetworkFile::new(
             file_name_str.to_string(),
-            self.file_lengths.read().get(file_name).cloned(),
+            self.file_lengths.read().expect("poisoned").get(file_name).cloned(),
             self.external_request_generator.box_clone(),
         )?))
     }

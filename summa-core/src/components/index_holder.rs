@@ -77,7 +77,7 @@ fn setup_query_parser(index_name: &str, index: &Index, index_config: &IndexConfi
 fn create_network_index<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
     network_config: &NetworkConfig,
 ) -> SummaResult<Index> {
-    let file_lengths = Arc::new(parking_lot::RwLock::new(HashMap::<PathBuf, u64>::new()));
+    let file_lengths = Arc::new(std::sync::RwLock::new(HashMap::<PathBuf, u64>::new()));
     let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(network_config.clone())), file_lengths.clone());
     let hotcache_bytes = network_directory.atomic_read("hotcache.bin".as_ref());
 
@@ -352,7 +352,7 @@ impl IndexHolder {
     }
 
     /// Delete `SummaDocument` by `primary_key`
-    pub async fn delete_document(&self, primary_key_value: i64) -> SummaResult<()> {
+    pub async fn delete_document(&self, primary_key_value: Option<proto::PrimaryKey>) -> SummaResult<()> {
         self.index_writer_holder.read().await.delete_document_by_primary_key(primary_key_value)
     }
 

@@ -12,7 +12,7 @@ div(style="transform: rotate(0);")
 <script lang="ts">
 // @ts-nocheck
 import { defineComponent } from "vue";
-import { ipfs_url, is_eth_hostname, is_supporting_subdomains } from "@/options";
+import { ipfs_url, is_eth_hostname, is_supporting_subsubdomains } from "@/options";
 import { format_bytes } from "@/utils";
 
 export default defineComponent({
