@@ -17,6 +17,8 @@ pub struct AlterIndexRequest {
     pub default_fields: Option<Vec<String>>,
     #[builder(default = "None")]
     pub multi_fields: Option<Vec<String>>,
+    #[builder(default = "None")]
+    pub primary_key: Option<String>,
 }
 
 impl TryFrom<proto::AlterIndexRequest> for AlterIndexRequest {
@@ -34,7 +36,8 @@ impl TryFrom<proto::AlterIndexRequest> for AlterIndexRequest {
             .blocksize(proto_request.blocksize.map(|blocksize| blocksize as usize))
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
             .default_fields(proto_request.default_fields.map(|f| f.fields))
-            .multi_fields(proto_request.multi_fields.map(|f| f.fields));
+            .multi_fields(proto_request.multi_fields.map(|f| f.fields))
+            .primary_key(proto_request.primary_key);
         Ok(alter_index_request_builder.build().map_err(summa_core::Error::from)?)
     }
 }

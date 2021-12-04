@@ -1,9 +1,14 @@
+from typing import ClassVar as _ClassVar
+from typing import Iterable as _Iterable
+from typing import Mapping as _Mapping
+from typing import Optional as _Optional
+from typing import Union as _Union
+
 import utils_pb2 as _utils_pb2
-from google.protobuf.internal import containers as _containers
-from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
+from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 
 Async: CommitMode
 Brotli: Compression
@@ -17,7 +22,7 @@ Sync: CommitMode
 Zstd: Compression
 
 class AlterIndexRequest(_message.Message):
-    __slots__ = ["blocksize", "compression", "default_fields", "index_name", "multi_fields", "sort_by_field"]
+    __slots__ = ["blocksize", "compression", "default_fields", "index_name", "multi_fields", "primary_key", "sort_by_field"]
     class Fields(_message.Message):
         __slots__ = ["fields"]
         FIELDS_FIELD_NUMBER: _ClassVar[int]
@@ -28,14 +33,16 @@ class AlterIndexRequest(_message.Message):
     DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
     SORT_BY_FIELD_FIELD_NUMBER: _ClassVar[int]
     blocksize: int
     compression: Compression
     default_fields: AlterIndexRequest.Fields
     index_name: str
     multi_fields: AlterIndexRequest.Fields
+    primary_key: str
     sort_by_field: SortByField
-    def __init__(self, index_name: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., default_fields: _Optional[_Union[AlterIndexRequest.Fields, _Mapping]] = ..., multi_fields: _Optional[_Union[AlterIndexRequest.Fields, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., default_fields: _Optional[_Union[AlterIndexRequest.Fields, _Mapping]] = ..., multi_fields: _Optional[_Union[AlterIndexRequest.Fields, _Mapping]] = ..., primary_key: _Optional[str] = ...) -> None: ...
 
 class AlterIndexResponse(_message.Message):
     __slots__ = ["index"]

@@ -40,6 +40,7 @@ message AlterIndexRequest {
   optional SortByField sort_by_field = 3;
   Fields default_fields = 4;
   Fields multi_fields = 5;
+  optional string primary_key = 7;
 }
 
 message AlterIndexResponse {

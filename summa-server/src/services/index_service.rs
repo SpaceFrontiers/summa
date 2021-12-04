@@ -123,12 +123,12 @@ impl IndexService {
             .build()
             .map_err(summa_core::Error::from)?;
         self.insert_config(index_name, &index_config).await?;
-
         let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
         let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
             &index_config_proxy.read().await.get().index_engine,
         ).await?;
-        Ok(self.index_registry.add(IndexHolder::setup(index_name, index, index_config_proxy).await?).await)
+        let index_holder = self.index_registry.add(IndexHolder::setup(index_name, index, index_config_proxy).await?).await
+        Ok(index_holder)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
@@ -189,18 +189,21 @@ impl IndexService {
                 _ => Some(sort_by_field),
             }
         }
+        let mut index_config_proxy = index_holder.index_config_proxy().write().await;
         if let Some(default_fields) = alter_index_request.default_fields {
             let parsed_default_fields = validators::parse_default_fields(index_holder.schema(), &default_fields)?;
-            let mut index_config_proxy = index_holder.index_config_proxy().write().await;
             index_config_proxy.get_mut().default_fields = parsed_default_fields;
-            index_config_proxy.commit()?;
         }
         if let Some(multi_fields) = alter_index_request.multi_fields {
             let parsed_multi_fields = validators::parse_multi_fields(index_holder.schema(), &multi_fields)?;
-            let mut index_config_proxy = index_holder.index_config_proxy().write().await;
             index_config_proxy.get_mut().multi_fields = HashSet::from_iter(parsed_multi_fields.into_iter());
-            index_config_proxy.commit()?;
         }
+        if let Some(primary_key) = alter_index_request.primary_key {
+            let primary_key = validators::parse_primary_key(index_holder.schema(), &Some(primary_key))?;
+            index_config_proxy.get_mut().primary_key = primary_key;
+        }
+        index_config_proxy.commit()?;
+        drop(index_config_proxy);
         Ok(index_updater.commit(None).await?)
     }
 

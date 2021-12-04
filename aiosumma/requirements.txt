@@ -1,8 +1,5 @@
 aiogrpcclient >= 1.2.2
 fire >= 0.3.1
-izihawa_nlptools >= 1.1.9
-izihawa_types >= 0.1.2
+izihawa_utils
 orjson >= 3.6.8
-ply >= 3.11
 termcolor >= 1.1.0
-textblob >= 0.17.1

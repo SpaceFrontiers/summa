@@ -47,6 +47,7 @@ class SummaClient(BaseGrpcClient):
     async def alter_index(
         self,
         index_name: str,
+        primary_key: Optional[str] = None,
         default_fields: Optional[List[str]] = None,
         multi_fields: Optional[List[str]] = None,
         compression: Optional[str] = None,
@@ -72,6 +73,7 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].alter_index(
             index_service_pb.AlterIndexRequest(
                 index_name=index_name,
+                primary_key=primary_key,
                 default_fields={'fields': default_fields},
                 multi_fields={'fields': multi_fields},
                 compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
