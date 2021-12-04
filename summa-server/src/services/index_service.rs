@@ -127,8 +127,7 @@ impl IndexService {
         let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
             &index_config_proxy.read().await.get().index_engine,
         ).await?;
-        let index_holder = self.index_registry.add(IndexHolder::setup(index_name, index, index_config_proxy).await?).await
-        Ok(index_holder)
+        Ok(self.index_registry.add(IndexHolder::setup(index_name, index, index_config_proxy).await?).await)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.

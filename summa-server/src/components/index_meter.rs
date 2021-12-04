@@ -62,6 +62,7 @@ impl IndexMeter {
             let segment_keys = &[
                 KeyValue::new("index_name", index_holder.index_name().to_string()),
                 KeyValue::new("segment_id", segment_id.to_string()),
+                KeyValue::new("service.name", "summa-server"),
             ];
             self.documents_count.record(&context, segment_reader.num_docs() as u64, segment_keys);
             self.deleted_documents_count
