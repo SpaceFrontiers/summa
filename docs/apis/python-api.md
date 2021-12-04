@@ -11,41 +11,24 @@ is pretty plain, query library provides tools for extending queries and deriving
 ```python
 import asyncio
 
-from aiosumma import QueryProcessor, SummaClient
-from aiosumma.transformers import MorphyTransformer
-from izihawa_nlptools.language_detect import detect_language
+from aiosumma import SummaClient
 
 async def main():
     # Create client and connect to the endpoint
     client = SummaClient('localhost:8082')
     await client.start_and_wait()
     
-    # `QueryProcessor` converts textual queries into the tree that can be
-    # further casted to Summa DSL Query
-    # Transformers is an extra fuctionality attached to the `QueryProcessor` 
-    # and responsible for particular tree mutations. 
-    # For example, `MorphyTransformer` can convert `Word` 
-    # node of query into `Group()` of morphologically equivalent `Word`s
-    query_processor = QueryProcessor(transformers=[MorphyTransformer()])
-    query = 'three dogs'
-    language = detect_language(query)
-    processed_query = query_processor.process(query, language=language)
-    summa_query = processed_query.to_summa_query()
-    assert summa_query == {
+    # Collectors are described at https://izihawa.github.io/summa/core/collectors
+    # Here we are requesting `TopDocs` collector with limit 10 that means 
+    # that top-10 documents will be returned
+    results = await client.search({
         'boolean': {'subqueries': [
             {'occur': 'should', 'query': {'match': {'value': 'three'}}},
             {'occur': 'should', 'query': {'match': {'value': 'dogs'}}},
             {'occur': 'should', 'query': {
                 'boost': {'query': {'match': {'value': 'dog'}}, 'score': '0.65'}}
-            }
-        ]}
-    }
-
-    # Collectors are described at https://izihawa.github.io/summa/core/collectors
-    # Here we are requesting `TopDocs` collector with limit 10 that means 
-    # that top-10 documents will be returned
-    results = await client.search(
-        summa_query,
+            }]}
+        },
         collectors=[{'top_docs': {'limit': 10}}],
     )
     return results
