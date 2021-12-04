@@ -7,7 +7,7 @@ from . import search_service_pb2 as search__service__pb2
 
 
 class SearchApiStub(object):
-    """Main entrypoint for `Summa` that accepts queries to execute
+    """Searches documents in the stored indices
     """
 
     def __init__(self, channel):
@@ -24,7 +24,7 @@ class SearchApiStub(object):
 
 
 class SearchApiServicer(object):
-    """Main entrypoint for `Summa` that accepts queries to execute
+    """Searches documents in the stored indices
     """
 
     def search(self, request, context):
@@ -49,7 +49,7 @@ def add_SearchApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class SearchApi(object):
-    """Main entrypoint for `Summa` that accepts queries to execute
+    """Searches documents in the stored indices
     """
 
     @staticmethod

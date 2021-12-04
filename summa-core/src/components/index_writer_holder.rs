@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
 use summa_proto::proto;
-use tantivy::schema::{Field, FieldType};
+use tantivy::schema::{Field, FieldType, Value};
 use tantivy::{Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
 
@@ -24,10 +24,10 @@ pub enum IndexWriterImpl {
 impl IndexWriterImpl {
     pub fn delete_term(&self, term: Term) {
         match self {
-            IndexWriterImpl::Single(_) => {
-                unimplemented!()
+            IndexWriterImpl::Single(_) => {}
+            IndexWriterImpl::Threaded(writer) => {
+                writer.delete_term(term);
             }
-            IndexWriterImpl::Threaded(writer) => writer.delete_term(term),
         };
     }
     pub fn add_document(&self, document: Document) -> SummaResult<()> {
@@ -136,16 +136,18 @@ impl IndexWriterHolder {
     /// Delete index by its primary key
     pub(super) fn delete_document(&self, document: &Document) -> SummaResult<()> {
         if let Some(primary_key) = self.primary_key {
-            self.index_writer.delete_term(Term::from_field_i64(
-                primary_key,
-                document
+            self.index_writer.delete_term(
+                match document
                     .get_first(primary_key)
                     .ok_or_else(|| ValidationError::MissingPrimaryKey(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(document)))))?
-                    .as_i64()
-                    .ok_or_else(|| {
-                        ValidationError::InvalidPrimaryKeyType(self.index_writer.index().schema().get_field_entry(primary_key).field_type().clone())
-                    })?,
-            ));
+                {
+                    Value::Str(s) => Term::from_field_text(primary_key, s),
+                    Value::I64(i) => Term::from_field_i64(primary_key, *i),
+                    _ => Err(ValidationError::InvalidPrimaryKeyType(
+                        self.index_writer.index().schema().get_field_entry(primary_key).field_type().clone(),
+                    ))?,
+                },
+            )
         }
         Ok(())
     }

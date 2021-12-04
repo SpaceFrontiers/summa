@@ -6,8 +6,7 @@ from . import index_service_pb2 as index__service__pb2
 
 
 class IndexApiStub(object):
-    """API
-
+    """Manages indices
     """
 
     def __init__(self, channel):
@@ -89,8 +88,7 @@ class IndexApiStub(object):
 
 
 class IndexApiServicer(object):
-    """API
-
+    """Manages indices
     """
 
     def alter_index(self, request, context):
@@ -258,8 +256,7 @@ def add_IndexApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class IndexApi(object):
-    """API
-
+    """Manages indices
     """
 
     @staticmethod

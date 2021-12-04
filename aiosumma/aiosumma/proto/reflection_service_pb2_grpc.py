@@ -6,8 +6,7 @@ from . import reflection_service_pb2 as reflection__service__pb2
 
 
 class ReflectionApiStub(object):
-    """API
-
+    """Analyzes indices
     """
 
     def __init__(self, channel):
@@ -24,8 +23,7 @@ class ReflectionApiStub(object):
 
 
 class ReflectionApiServicer(object):
-    """API
-
+    """Analyzes indices
     """
 
     def get_top_terms(self, request, context):
@@ -50,8 +48,7 @@ def add_ReflectionApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class ReflectionApi(object):
-    """API
-
+    """Analyzes indices
     """
 
     @staticmethod

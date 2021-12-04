@@ -65,7 +65,7 @@ impl WebIndexRegistry {
     }
 
     async fn add_internal(&mut self, index_engine: IndexEngine) -> SummaWasmResult<IndexPayload> {
-        let mut index = IndexHolder::open::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine)?;
+        let mut index = IndexHolder::open::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine).await?;
         index.settings_mut().docstore_compress_dedicated_thread = false;
 
         let index_payload: IndexPayload =

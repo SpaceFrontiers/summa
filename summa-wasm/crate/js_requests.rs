@@ -1,5 +1,6 @@
 use summa_core::directories::{ExternalRequest, ExternalResponse, Header};
 use summa_core::errors::SummaResult;
+use summa_core::Error;
 use tokio::sync::mpsc::unbounded_channel;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
@@ -9,7 +10,6 @@ use wasm_bindgen_futures::spawn_local;
 extern "C" {
     #[wasm_bindgen(catch)]
     pub fn request(method: String, url: String, headers: JsValue) -> Result<JsValue, JsValue>;
-
     #[wasm_bindgen(catch)]
     pub async fn request_async(method: String, url: String, headers: JsValue) -> Result<JsValue, JsValue>;
 }
@@ -38,9 +38,9 @@ impl ExternalRequest for JsExternalRequest {
         let response = request(
             self.method.to_string(),
             self.url.to_string(),
-            serde_wasm_bindgen::to_value(&self.headers).map_err(|e| summa_core::errors::Error::External(e.to_string()))?,
+            serde_wasm_bindgen::to_value(&self.headers).map_err(|e| Error::External(e.to_string()))?,
         )
-        .map_err(|e| summa_core::Error::External(format!("{:?}", e)))?;
+        .map_err(|e| Error::External(format!("{:?}", e)))?;
         let response: ExternalResponse = serde_wasm_bindgen::from_value(response).unwrap_throw();
         Ok(response)
     }
@@ -55,10 +55,9 @@ impl ExternalRequest for JsExternalRequest {
             let response = request_async(method, url, headers)
                 .await
                 .map(|response| serde_wasm_bindgen::from_value(response).unwrap_throw())
-                .map_err(|e| summa_core::Error::External(format!("{:?}", e)));
+                .map_err(|e| Error::External(format!("{:?}", e)));
             sender.send(response).unwrap_throw();
         });
-        let request_response = receiver.recv().await.unwrap_throw()?;
-        Ok(request_response)
+        Ok(receiver.recv().await.unwrap_throw()?)
     }
 }

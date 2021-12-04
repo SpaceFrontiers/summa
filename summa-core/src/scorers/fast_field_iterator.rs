@@ -5,7 +5,7 @@ use tantivy::DocId;
 
 use super::safe_into_f64::SafeIntoF64;
 
-pub(crate) trait FastFieldIterator {
+pub(crate) trait FastFieldIterator: Send + Sync {
     fn advance(&mut self, doc_id: DocId);
     fn value(&self) -> &f64;
 }

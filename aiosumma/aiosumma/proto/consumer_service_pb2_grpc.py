@@ -6,8 +6,7 @@ from . import consumer_service_pb2 as consumer__service__pb2
 
 
 class ConsumerApiStub(object):
-    """API
-
+    """Manages consumers that ingest data from Kafka
     """
 
     def __init__(self, channel):
@@ -39,18 +38,19 @@ class ConsumerApiStub(object):
 
 
 class ConsumerApiServicer(object):
-    """API
-
+    """Manages consumers that ingest data from Kafka
     """
 
     def create_consumer(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Create a new consumer
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def get_consumer(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Get a single consumer
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -98,8 +98,7 @@ def add_ConsumerApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class ConsumerApi(object):
-    """API
-
+    """Manages consumers that ingest data from Kafka
     """
 
     @staticmethod

@@ -6,7 +6,7 @@ from . import beacon_service_pb2 as beacon__service__pb2
 
 
 class BeaconApiStub(object):
-    """Service
+    """Communication with IPFS
     """
 
     def __init__(self, channel):
@@ -23,11 +23,12 @@ class BeaconApiStub(object):
 
 
 class BeaconApiServicer(object):
-    """Service
+    """Communication with IPFS
     """
 
     def publish_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Put index to IPFS
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -48,7 +49,7 @@ def add_BeaconApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class BeaconApi(object):
-    """Service
+    """Communication with IPFS
     """
 
     @staticmethod

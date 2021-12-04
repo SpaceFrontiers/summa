@@ -136,6 +136,6 @@ target/
 
 # Ignore code-workspaces
 *.code-workspace
-rutracker
+summa-web
 
 # End of https://www.toptal.com/developers/gitignore/api/intellij+all,visualstudiocode,rust

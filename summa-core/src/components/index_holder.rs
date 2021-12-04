@@ -26,6 +26,7 @@ use tracing::{instrument, trace};
 use super::IndexUpdater;
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
+use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::{ConfigProxy, ConsumerConfig, IndexConfig, IndexEngine, NetworkConfig};
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory};
@@ -37,7 +38,7 @@ pub struct IndexHolder {
     index: Index,
     index_config_proxy: Arc<dyn ConfigProxy<IndexConfig>>,
     cached_schema: Schema,
-    index_reader: IndexReader,
+    index_reader: Option<IndexReader>,
     index_writer_holder: Arc<RwLock<IndexWriterHolder>>,
     query_parser: RwLock<QueryParser>,
     /// Counters
@@ -74,12 +75,16 @@ fn setup_query_parser(index_name: &str, index: &Index, index_config: &IndexConfi
     ))
 }
 
-fn create_network_index<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
+async fn create_network_index<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
     network_config: &NetworkConfig,
 ) -> SummaResult<Index> {
     let file_lengths = Arc::new(std::sync::RwLock::new(HashMap::<PathBuf, u64>::new()));
     let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(network_config.clone())), file_lengths.clone());
-    let hotcache_bytes = network_directory.atomic_read("hotcache.bin".as_ref());
+
+    let hotcache_bytes = match network_directory.get_file_handle("hotcache.bin".as_ref()) {
+        Ok(hotcache_handle) => Some(hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await?),
+        Err(_) => None
+    };
 
     let next_directory = match &network_config.chunked_cache_config {
         Some(chunked_cache_config) => match chunked_cache_config.cache_size {
@@ -95,11 +100,11 @@ fn create_network_index<TExternalRequest: ExternalRequest + 'static, TExternalRe
     };
 
     Ok(match hotcache_bytes {
-        Ok(hotcache_bytes) => {
+        Some(hotcache_bytes) => {
             let hotcache_directory = HotDirectory::open(next_directory, OwnedBytes::new(hotcache_bytes.to_vec()), file_lengths)?;
             Index::open(hotcache_directory)?
         }
-        Err(_) => Index::open(next_directory)?,
+        None => Index::open(next_directory)?,
     })
 }
 
@@ -108,7 +113,7 @@ impl IndexHolder {
     pub async fn setup(index_name: &str, mut index: Index, index_config_proxy: Arc<dyn ConfigProxy<IndexConfig>>) -> SummaResult<IndexHolder> {
         let index_config = index_config_proxy.read().await.get().clone();
         register_default_tokenizers(&index);
-        index.set_segment_attributes_merger::<SummaSegmentAttributes>();
+        index.set_segment_attributes_merger(Arc::new(SegmentAttributesMergerImpl::<SummaSegmentAttributes>::new()));
 
         let cached_schema = index.schema();
         let query_parser = RwLock::new(setup_query_parser(index_name, &index, &index_config, &cached_schema)?);
@@ -120,7 +125,7 @@ impl IndexHolder {
             index: index.clone(),
             query_parser,
             cached_schema,
-            index_reader,
+            index_reader: Some(index_reader),
             index_writer_holder: index_writer_holder.clone(),
             index_config_proxy: index_config_proxy.clone(),
             #[cfg(feature = "metrics")]
@@ -137,7 +142,7 @@ impl IndexHolder {
     pub async fn reload_query_parser(&self) -> SummaResult<()> {
         *self.query_parser.write().await = setup_query_parser(
             &self.index_name,
-            self.index_reader.searcher().index(),
+            self.index_reader().searcher().index(),
             self.index_config_proxy.read().await.get(),
             &self.cached_schema,
         )?;
@@ -162,7 +167,7 @@ impl IndexHolder {
                 index_builder.create_in_dir(index_path)?
             }
             IndexEngine::Memory(_) => index_builder.create_in_ram()?,
-            IndexEngine::Remote(network_config) => create_network_index::<TExternalRequest, TExternalRequestGenerator>(network_config)?,
+            IndexEngine::Remote(network_config) => create_network_index::<TExternalRequest, TExternalRequestGenerator>(network_config).await?,
         };
         info!(action = "created", index = ?index);
         Ok(index)
@@ -170,14 +175,14 @@ impl IndexHolder {
 
     /// Opens index and sets it up via `setup`
     #[instrument(skip_all)]
-    pub fn open<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
+    pub async fn open<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
         index_engine: &IndexEngine,
     ) -> SummaResult<Index> {
         let index = match index_engine {
             #[cfg(feature = "fs")]
             IndexEngine::File(index_path) => Index::open_in_dir(index_path)?,
             IndexEngine::Memory(schema) => Index::create_in_ram(schema.clone()),
-            IndexEngine::Remote(network_config) => create_network_index::<TExternalRequest, TExternalRequestGenerator>(network_config)?,
+            IndexEngine::Remote(network_config) => create_network_index::<TExternalRequest, TExternalRequestGenerator>(network_config).await?,
         };
         info!(action = "opened", index = ?index);
         Ok(index)
@@ -185,7 +190,7 @@ impl IndexHolder {
 
     /// Compression
     pub fn compression(&self) -> proto::Compression {
-        self.index_reader.searcher().index().settings().docstore_compression.into()
+        self.index_reader().searcher().index().settings().docstore_compression.into()
     }
 
     /// Index name
@@ -200,7 +205,7 @@ impl IndexHolder {
 
     /// `IndexReader` singleton
     pub fn index_reader(&self) -> &IndexReader {
-        &self.index_reader
+        self.index_reader.as_ref().expect("no index reader")
     }
 
     /// `IndexUpdater` handler
@@ -232,7 +237,7 @@ impl IndexHolder {
     }
 
     pub async fn warmup(&self) -> SummaResult<()> {
-        let searcher = self.index_reader.searcher();
+        let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
         let fields = self
             .index_config_proxy
@@ -311,7 +316,7 @@ impl IndexHolder {
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
     pub async fn search(&self, external_index_alias: &str, query: &proto::Query, collectors: &[proto::Collector]) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let searcher = self.index_reader.searcher();
+        let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let extractors: Vec<Box<dyn FruitExtractor>> = collectors
@@ -326,9 +331,7 @@ impl IndexHolder {
         );
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        let mut receiver = self.spawn(move || (searcher.search(&parsed_query, &multi_collector), searcher));
-        let (multi_fruit, searcher) = receiver.recv().await.expect("channel unexpectedly closed");
-        let mut multi_fruit = multi_fruit?;
+        let mut multi_fruit = searcher.search_async(&parsed_query, &multi_collector).await?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
             &Context::current(),
@@ -346,7 +349,11 @@ impl IndexHolder {
             .map(|field_name| self.cached_schema.get_field(field_name).expect("Field not found"))
             .collect();
         for extractor in extractors.into_iter() {
-            collector_outputs.push(extractor.extract(external_index_alias, &mut multi_fruit, &searcher, &multi_fields)?)
+            collector_outputs.push(
+                extractor
+                    .extract_async(external_index_alias, &mut multi_fruit, &searcher, &multi_fields)
+                    .await?,
+            )
         }
         Ok(collector_outputs)
     }

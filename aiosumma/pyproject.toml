@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiosumma"
-version = "2.15.0"
+version = "2.18.0"
 authors = [{ name = "Pasha Podolsky", email = "ppodolsky@me.com" }]
 description = "Async client for Summa Search"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 classifiers = [
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.8",
     "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
 ]
 dynamic = ["dependencies"]
@@ -23,7 +23,7 @@ summa-cli = "aiosumma.cli:main"
 "Documentation" = "https://izihawa.github.io/summa"
 
 [tool.setuptools.dynamic]
-dependencies = {file = ["requirements-lock.txt"]}
+dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.package-data]
 aiosumma = ["data/synsets/*.csv", "*.txt"]

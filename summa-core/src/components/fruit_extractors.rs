@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use futures::future::join_all;
 use rustc_hash::FxHashMap;
 use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
-use tantivy::query::Query;
+use tantivy::query::{Query, QueryClone};
 use tantivy::schema::{Field, Schema};
 use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerator};
 
@@ -23,6 +24,16 @@ pub trait FruitExtractor: Sync + Send {
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> SummaResult<proto::CollectorOutput>;
+
+    async fn extract_async(
+        self: Box<Self>,
+        external_index_alias: &str,
+        multi_fruit: &mut MultiFruit,
+        searcher: &Searcher,
+        multi_fields: &HashSet<Field>,
+    ) -> SummaResult<proto::CollectorOutput> {
+        self.extract(external_index_alias, multi_fruit, searcher, multi_fields)
+    }
 }
 
 pub fn parse_aggregations(aggregations: &HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
@@ -165,19 +176,31 @@ pub struct TopDocs<T: 'static + Copy + Into<proto::Score> + Sync + Send> {
     fields: Option<HashSet<Field>>,
 }
 
-impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> TopDocs<T> {
-    fn snippet_generators(&self, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
-        self.snippets
-            .iter()
-            .filter_map(|(field_name, max_num_chars)| {
-                searcher.schema().get_field(field_name).map(|snippet_field| {
-                    let mut snippet_generator = SnippetGenerator::create(searcher, &*self.query, snippet_field).expect("Snippet generator cannot be created");
-                    snippet_generator.set_max_num_chars(*max_num_chars as usize);
-                    (field_name.to_string(), snippet_generator)
-                })
+fn snippet_generators(snippets: &HashMap<String, u32>, query: &dyn Query, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
+    snippets
+        .iter()
+        .filter_map(|(field_name, max_num_chars)| {
+            searcher.schema().get_field(field_name).map(|snippet_field| {
+                let mut snippet_generator = SnippetGenerator::create(searcher, query, snippet_field).expect("Snippet generator cannot be created");
+                snippet_generator.set_max_num_chars(*max_num_chars as usize);
+                (field_name.to_string(), snippet_generator)
             })
-            .collect()
-    }
+        })
+        .collect()
+}
+
+async fn snippet_generators_async(snippets: HashMap<String, u32>, query: Box<dyn Query>, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
+    let futures = snippets.iter().filter_map(|(field_name, max_num_chars)| {
+        let query = query.box_clone();
+        searcher.schema().get_field(field_name).map(|snippet_field| async move {
+            let mut snippet_generator = SnippetGenerator::create_async(searcher, &query, snippet_field)
+                .await
+                .expect("Snippet generator cannot be created");
+            snippet_generator.set_max_num_chars(*max_num_chars as usize);
+            (field_name.to_string(), snippet_generator)
+        })
+    });
+    join_all(futures).await.into_iter().collect()
 }
 
 #[async_trait]
@@ -189,7 +212,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> SummaResult<proto::CollectorOutput> {
-        let snippet_generators = self.snippet_generators(searcher);
+        let snippet_generators = snippet_generators(&self.snippets, &self.query, searcher);
         let fruit = self.handle.extract(multi_fruit);
         let length = fruit.len();
 
@@ -210,6 +233,45 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             },
             scored_documents.enumerate(),
         )?;
+        Ok(proto::CollectorOutput {
+            collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+                scored_documents,
+                has_next: length > self.limit as usize,
+            })),
+        })
+    }
+
+    async fn extract_async(
+        self: Box<Self>,
+        external_index_alias: &str,
+        multi_fruit: &mut MultiFruit,
+        searcher: &Searcher,
+        multi_fields: &HashSet<Field>,
+    ) -> SummaResult<proto::CollectorOutput> {
+        let fruit = self.handle.extract(multi_fruit);
+        let length = fruit.len();
+
+        let scored_documents = fruit.iter().take(std::cmp::min(self.limit as usize, length));
+        let document_futures = scored_documents.enumerate().map(|(position, (score, doc_address))| {
+            let fields = self.fields.clone();
+            let snippets = self.snippets.clone();
+            let query = self.query.box_clone();
+            async move {
+                let snippet_generators = snippet_generators_async(snippets, query, searcher).await;
+                let document = searcher.doc_async(*doc_address).await.expect("Document retrieving failed");
+                proto::ScoredDocument {
+                    document: NamedFieldDocument::from_document(searcher.schema(), &fields, multi_fields, &document).to_json(),
+                    score: Some((*score).into()),
+                    position: position as u32,
+                    snippets: snippet_generators
+                        .iter()
+                        .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
+                        .collect(),
+                    index_alias: external_index_alias.to_string(),
+                }
+            }
+        });
+        let scored_documents = join_all(document_futures).await;
         Ok(proto::CollectorOutput {
             collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
                 scored_documents,

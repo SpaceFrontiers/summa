@@ -25,6 +25,7 @@ export class WebIndexService {
     if (threads > 0) {
       status_callback("status", "setting thread pool of size " + threads.toString() + "...");
       await init_thread_pool(threads);
+      status_callback("status", "");
     }
   }
   async add(index_engine: { remote: NetworkConfig } | { memory: Object}): Promise<Object> {

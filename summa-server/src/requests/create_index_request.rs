@@ -45,7 +45,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .unwrap_or(tantivy::store::Compressor::None);
 
         if let (Some(writer_heap_size_bytes), Some(writer_threads)) = (proto_request.writer_heap_size_bytes, proto_request.writer_threads) {
-            if writer_heap_size_bytes / writer_threads > 4293967294 {
+            if writer_heap_size_bytes / std::cmp::max(writer_threads, 1) > 4293967294 {
                 return Err(ValidationError::InvalidArgument("The memory arena in bytes per thread cannot exceed 4293967295".to_string()).into());
             }
         };

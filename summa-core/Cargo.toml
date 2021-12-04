@@ -24,7 +24,7 @@ base64 = "0.13.0"
 config = "0.13.2"
 crossbeam-channel = "0.5.6"
 derive_builder = "0.11.2"
-fasteval2 = { version = "2.0.3", features = ["unsafe-vars"] }
+fasteval2 = { version = "2.0.6", features = ["unsafe-vars"] }
 futures = "0.3.24"
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
 itertools = "0.10.5"
@@ -46,8 +46,9 @@ serde_yaml = "0.8.26"
 strfmt = "0.2.2"
 summa-proto = { version = "0.11.0", path = "../summa-proto", default_features = false }
 take_mut = "0.2.2"
-tantivy = { package = "summavy", version = "0.20.2", default_features = false, features = ["quickwit", "zstd-compression"] }
+tantivy = { package = "summavy", version = "0.22.0", path = "../../tantivy", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0.36"
 time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
 tokio = { version = "1.21.2", default_features = false, features = ["macros", "rt", "signal-hook-registry", "sync"] }
 tracing = "0.1.37"
+web-sys = { version = "0.3.60", features = ["console"] }

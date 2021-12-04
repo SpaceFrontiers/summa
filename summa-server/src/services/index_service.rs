@@ -84,7 +84,8 @@ impl IndexService {
             let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
             let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
                 &index_config_proxy.read().await.get().index_engine,
-            )?;
+            )
+            .await?;
             index_holders.insert(
                 index_name.clone(),
                 OwningHandler::new(IndexHolder::setup(index_name, index, index_config_proxy).await?),
@@ -126,7 +127,7 @@ impl IndexService {
         let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
         let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
             &index_config_proxy.read().await.get().index_engine,
-        )?;
+        ).await?;
         Ok(self.index_registry.add(IndexHolder::setup(index_name, index, index_config_proxy).await?).await)
     }
 

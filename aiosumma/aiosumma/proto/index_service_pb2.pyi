@@ -108,8 +108,8 @@ class DeleteDocumentRequest(_message.Message):
     INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
     PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
     index_alias: str
-    primary_key: int
-    def __init__(self, index_alias: _Optional[str] = ..., primary_key: _Optional[int] = ...) -> None: ...
+    primary_key: PrimaryKey
+    def __init__(self, index_alias: _Optional[str] = ..., primary_key: _Optional[_Union[PrimaryKey, _Mapping]] = ...) -> None: ...
 
 class DeleteDocumentResponse(_message.Message):
     __slots__ = []
@@ -231,6 +231,14 @@ class MergeSegmentsRequest(_message.Message):
 class MergeSegmentsResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
+
+class PrimaryKey(_message.Message):
+    __slots__ = ["i64", "str"]
+    I64_FIELD_NUMBER: _ClassVar[int]
+    STR_FIELD_NUMBER: _ClassVar[int]
+    i64: int
+    str: str
+    def __init__(self, str: _Optional[str] = ..., i64: _Optional[int] = ...) -> None: ...
 
 class SetIndexAliasRequest(_message.Message):
     __slots__ = ["index_alias", "index_name"]
