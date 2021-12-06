@@ -8,7 +8,7 @@ use crate::errors::BuilderError;
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
-pub struct ApplicationConfig {
+pub struct CoreConfig {
     #[serde(default = "HashMap::new")]
     pub indices: HashMap<String, IndexEngineConfig>,
     #[builder(default = "None")]
@@ -19,9 +19,9 @@ pub struct ApplicationConfig {
     pub writer_threads: u64,
 }
 
-impl Default for ApplicationConfig {
+impl Default for CoreConfig {
     fn default() -> Self {
-        ApplicationConfig {
+        CoreConfig {
             indices: HashMap::new(),
             autocommit_interval_ms: None,
             writer_heap_size_bytes: 1024 * 1024 * 1024,

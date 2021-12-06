@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry, SummaDocument};
-use summa_core::configs::{ApplicationConfigBuilder, DirectProxy};
+use summa_core::configs::{CoreConfigBuilder, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_proto::proto::IndexEngineConfig;
 use tantivy::Executor;
@@ -37,34 +37,27 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub async fn add(&mut self, index_name: &str, index_engine: JsValue) -> Result<JsValue, JsValue> {
+    pub async fn add(&mut self, index_engine: JsValue) -> Result<JsValue, JsValue> {
         let index_engine: IndexEngineConfig = serde_wasm_bindgen::from_value(index_engine)?;
-        Ok(self
-            .add_internal(index_name, index_engine)
-            .await
-            .map_err(Error::from)?
-            .serialize(&*SERIALIZER)?)
+        Ok(self.add_internal(index_engine).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
-    async fn add_internal(&mut self, index_name: &str, index_engine: IndexEngineConfig) -> SummaWasmResult<()> {
+    async fn add_internal(&mut self, index_engine: IndexEngineConfig) -> SummaWasmResult<String> {
         let mut index = IndexHolder::from_index_engine_config::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine).await?;
         index.settings_mut().docstore_compress_dedicated_thread = false;
 
-        let application_config = ApplicationConfigBuilder::default()
-            .writer_threads(0)
-            .build()
-            .map_err(|e| Error::Core(e.into()))?;
+        let core_config = CoreConfigBuilder::default().writer_threads(0).build().map_err(|e| Error::Core(e.into()))?;
 
         index.set_multithread_executor(match self.multithreading {
             true => Executor::GlobalPool,
             false => Executor::SingleThread,
         })?;
 
-        let application_config = Arc::new(DirectProxy::new(application_config));
-        let index_holder = IndexHolder::create_holder(application_config, index_engine, index_name, index).await?;
-
+        let core_config = Arc::new(DirectProxy::new(core_config));
+        let index_holder = IndexHolder::create_holder(core_config, index, None, index_engine).await?;
+        let index_name = index_holder.index_name().to_string();
         self.index_registry.add(index_holder).await;
-        Ok(())
+        Ok(index_name)
     }
 
     #[wasm_bindgen]

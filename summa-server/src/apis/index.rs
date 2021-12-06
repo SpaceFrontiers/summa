@@ -85,8 +85,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
                 let index_service = self.index_service.clone();
+                let index_holder = index_service.get_index_holder(&request.index_alias).await?;
                 tokio::spawn(async move {
-                    if let Err(err) = index_service.commit_and_restart_consumption(&request.index_alias).await {
+                    if let Err(err) = index_service.commit_and_restart_consumption(&index_holder).await {
                         warn!(action = "busy", error = format!("{:?}", err))
                     }
                 });
@@ -94,7 +95,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             }
             Some(proto::CommitMode::Sync) => {
                 let now = Instant::now();
-                self.index_service.commit_and_restart_consumption(&request.index_alias).await?;
+                let index_holder = self.index_service.get_index_holder(&request.index_alias).await?;
+                self.index_service.commit_and_restart_consumption(&index_holder).await?;
                 Ok(Response::new(proto::CommitIndexResponse {
                     elapsed_secs: Some(now.elapsed().as_secs_f64()),
                 }))

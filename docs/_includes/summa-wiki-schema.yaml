@@ -2,10 +2,9 @@
 # yamllint disable rule:key-ordering
 index_name: books
 compression: Zstd
-multi_fields: ["category"]
-default_fields: ["opening_text", "title", "text"]
-writer_heap_size_bytes: 1073741824
-writer_threads: 4
+index_attributes:
+  multi_fields: ["category"]
+  default_fields: ["opening_text", "title", "text"]
 schema: >
   - name: category
     type: text

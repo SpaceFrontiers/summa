@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::future::try_join_all;
@@ -27,13 +27,13 @@ use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
-use crate::configs::{ApplicationConfig, ConfigProxy};
+use crate::configs::{ConfigProxy, CoreConfig};
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory};
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
 
 pub struct IndexHolder {
-    application_config_holder: Arc<dyn ConfigProxy<ApplicationConfig>>,
+    core_config_holder: Arc<dyn ConfigProxy<CoreConfig>>,
     index_engine_config: proto::IndexEngineConfig,
     index_name: String,
     index: Index,
@@ -117,26 +117,29 @@ async fn open_network_index<TExternalRequest: ExternalRequest + 'static, TExtern
 impl IndexHolder {
     /// Sets up `IndexHolder`
     pub async fn create_holder(
-        application_config_holder: Arc<dyn ConfigProxy<ApplicationConfig>>,
-        index_engine_config: proto::IndexEngineConfig,
-        index_name: &str,
+        core_config_holder: Arc<dyn ConfigProxy<CoreConfig>>,
         mut index: Index,
+        index_name: Option<&str>,
+        index_engine_config: proto::IndexEngineConfig,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
         index.set_segment_attributes_merger(Arc::new(SegmentAttributesMergerImpl::<SummaSegmentAttributes>::new()));
 
+        let index_name = index_name.map(|x| x.to_string()).unwrap_or_else(|| {
+            serde_json::from_value::<proto::IndexAttributes>(index.load_metas().expect("no metas").attributes.expect("no attributes"))
+                .expect("wrong json")
+                .default_index_name
+                .expect("no index name")
+        });
         let cached_schema = index.schema();
-        let query_parser = RwLock::new(QueryParser::for_index(index_name, &index)?);
+        let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index)?);
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
-        let index_writer_holder = Arc::new(RwLock::new(IndexWriterHolder::from_config(
-            &index,
-            application_config_holder.read().await.get(),
-        )?));
+        let index_writer_holder = Arc::new(RwLock::new(IndexWriterHolder::from_config(&index, core_config_holder.read().await.get())?));
 
         Ok(IndexHolder {
-            application_config_holder: application_config_holder.clone(),
+            core_config_holder: core_config_holder.clone(),
             index_engine_config,
-            index_name: String::from(index_name),
+            index_name,
             index: index.clone(),
             query_parser,
             cached_schema,
@@ -172,7 +175,7 @@ impl IndexHolder {
     /// Creates index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
-    pub async fn create_file_index(index_path: &Path, index_builder: IndexBuilder) -> SummaResult<Index> {
+    pub async fn create_file_index(index_path: &std::path::Path, index_builder: IndexBuilder) -> SummaResult<Index> {
         if index_path.exists() {
             return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
         }
@@ -213,7 +216,7 @@ impl IndexHolder {
     /// Attaches index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
-    pub async fn attach_file_index(index_path: &Path) -> SummaResult<Index> {
+    pub async fn attach_file_index(index_path: &std::path::Path) -> SummaResult<Index> {
         let index = Index::open_in_dir(index_path)?;
         info!(action = "attached", index = ?index);
         Ok(index)
@@ -290,12 +293,12 @@ impl IndexHolder {
 
     /// Delete `IndexHolder` instance
     ///
-    /// Consumers are stopped, then `IndexConfig` is removed from `ApplicationConfig`
+    /// Consumers are stopped, then `IndexConfig` is removed from `CoreConfig`
     /// and then directory with the index is deleted.
     #[instrument(skip(self), fields(index_name = %self.index_name))]
     pub async fn delete(self) -> SummaResult<()> {
         info!(action = "delete_directory");
-        self.application_config_holder.write().await.get_mut().indices.remove(self.index_name());
+        self.core_config_holder.write().await.get_mut().indices.remove(self.index_name());
         match self.index_engine_config {
             #[cfg(feature = "fs")]
             proto::IndexEngineConfig {

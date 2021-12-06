@@ -2,16 +2,18 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use summa_core::components::{IndexHolder, IndexRegistry};
 use summa_core::configs::PartialProxy;
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::utils::sync::{Handler, OwningHandler};
+use summa_core::utils::thread_handler::ThreadHandler;
 use summa_proto::proto;
 use tantivy::{Index, IndexSettings};
 use tokio::sync::RwLock;
-use tracing::{info, instrument, warn};
+use tracing::{info, info_span, instrument, warn, Instrument};
 
 use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::configs::{ConsumerConfig, ServerConfig};
@@ -27,6 +29,7 @@ pub struct IndexService {
     index_registry: IndexRegistry,
     consumer_manager: Arc<RwLock<ConsumerManager>>,
     should_terminate: Arc<AtomicBool>,
+    autocommit_thread: Arc<RwLock<Option<ThreadHandler<SummaServerResult<()>>>>>,
 }
 
 impl Default for IndexService {
@@ -36,6 +39,7 @@ impl Default for IndexService {
             index_registry: IndexRegistry::default(),
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
+            autocommit_thread: Arc::default(),
         }
     }
 }
@@ -66,6 +70,16 @@ impl IndexService {
     /// `HashMap` of all indices
     pub fn index_holders(&self) -> &Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>> {
         self.index_registry.index_holders()
+    }
+
+    pub async fn index_holders_cloned(&self) -> HashMap<String, Handler<IndexHolder>> {
+        self.index_registry
+            .index_holders()
+            .read()
+            .await
+            .iter()
+            .map(|(index_name, handler)| (index_name.to_string(), handler.handler()))
+            .collect()
     }
 
     /// Returns `ConsumerManager`
@@ -109,13 +123,14 @@ impl IndexService {
             index_registry: IndexRegistry::default(),
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
+            autocommit_thread: Arc::default(),
         }
     }
 
     /// Create `IndexHolder`s from config
     pub(crate) async fn setup_index_holders(&self) -> SummaServerResult<()> {
         let mut index_holders = HashMap::new();
-        for (index_name, index_engine_config) in self.server_config.read().await.get().application.indices.iter() {
+        for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.iter() {
             let index =
                 IndexHolder::from_index_engine_config::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(index_engine_config)
                     .await?;
@@ -125,12 +140,12 @@ impl IndexService {
                     IndexHolder::create_holder(
                         Arc::new(PartialProxy::new(
                             &self.server_config,
-                            |server_config| &server_config.application,
-                            |server_config| &mut server_config.application,
+                            |server_config| &server_config.core,
+                            |server_config| &mut server_config.core,
                         )),
-                        index_engine_config.clone(),
-                        index_name,
                         index,
+                        Some(index_name),
+                        index_engine_config.clone(),
                     )
                     .await?,
                 ),
@@ -150,7 +165,7 @@ impl IndexService {
 
     pub(crate) async fn insert_config(&self, index_name: &str, index_engine_config: &proto::IndexEngineConfig) -> SummaServerResult<()> {
         let mut server_config = self.server_config.write().await;
-        match server_config.get_mut().application.indices.entry(index_name.to_owned()) {
+        match server_config.get_mut().core.indices.entry(index_name.to_owned()) {
             Entry::Occupied(o) => Err(ValidationError::ExistingIndex(format!("{:?}", o.key()))),
             Entry::Vacant(v) => {
                 v.insert(index_engine_config.clone());
@@ -187,12 +202,12 @@ impl IndexService {
                 IndexHolder::create_holder(
                     Arc::new(PartialProxy::new(
                         &self.server_config,
-                        |server_config| &server_config.application,
-                        |server_config| &mut server_config.application,
+                        |server_config| &server_config.core,
+                        |server_config| &mut server_config.core,
                     )),
-                    index_engine_config,
-                    &attach_index_request.index_name,
                     index,
+                    Some(&attach_index_request.index_name),
+                    index_engine_config,
                 )
                 .await?,
             )
@@ -241,12 +256,12 @@ impl IndexService {
                 IndexHolder::create_holder(
                     Arc::new(PartialProxy::new(
                         &self.server_config,
-                        |server_config| &server_config.application,
-                        |server_config| &mut server_config.application,
+                        |server_config| &server_config.core,
+                        |server_config| &mut server_config.core,
                     )),
-                    index_engine_config,
-                    &create_index_request.index_name,
                     index,
+                    Some(&create_index_request.index_name),
+                    index_engine_config,
                 )
                 .await?,
             )
@@ -265,7 +280,7 @@ impl IndexService {
                     .write()
                     .await
                     .entry(delete_index_request.index_name.to_owned()),
-                server_config.get_mut().application.indices.entry(delete_index_request.index_name.to_owned()),
+                server_config.get_mut().core.indices.entry(delete_index_request.index_name.to_owned()),
             ) {
                 (Entry::Occupied(index_holder_entry), Entry::Occupied(config_entry)) => {
                     let index_holder = index_holder_entry.get();
@@ -353,11 +368,19 @@ impl IndexService {
     }
 
     /// Commits all and restarts consuming threads
-    pub async fn commit_and_restart_consumption(&self, index_alias: &str) -> SummaServerResult<()> {
-        let index_holder = self.get_index_holder(index_alias).await?;
-        let prepared_consumption = self.commit(&index_holder).await?;
+    pub async fn commit_and_restart_consumption(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<()> {
+        let prepared_consumption = self.commit(index_holder).await?;
         if let Some(prepared_consumption) = prepared_consumption {
-            self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
+            self.consumer_manager.write().await.start_consuming(index_holder, prepared_consumption).await?;
+        }
+        Ok(())
+    }
+
+    /// Commits all and restarts consuming threads
+    pub async fn try_commit_and_restart_consumption(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<()> {
+        let prepared_consumption = self.try_commit(index_holder).await?;
+        if let Some(prepared_consumption) = prepared_consumption {
+            self.consumer_manager.write().await.start_consuming(index_holder, prepared_consumption).await?;
         }
         Ok(())
     }
@@ -371,6 +394,75 @@ impl IndexService {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
         })
+    }
+
+    /// Commits immediately or returns all without restarting consuming threads
+    #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
+    pub async fn try_commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
+        let mut index_writer = index_holder.index_writer_holder().try_write()?;
+        let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
+        index_writer.commit(None).await?;
+        Ok(match stopped_consumption {
+            Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
+            None => None,
+        })
+    }
+
+    async fn setup_autocommit_thread(&mut self) {
+        let interval_ms = match self.server_config.read().await.get().core.autocommit_interval_ms {
+            Some(interval_ms) => interval_ms,
+            None => return,
+        };
+
+        let index_service = self.clone();
+        let (shutdown_trigger, mut shutdown_tripwire) = async_broadcast::broadcast(1);
+        let mut tick_task = tokio::time::interval(Duration::from_millis(interval_ms));
+
+        *self.autocommit_thread.write().await = Some(ThreadHandler::new(
+            tokio::spawn(
+                async move {
+                    info!(action = "spawning_autocommit_thread", interval_ms = interval_ms);
+                    // The first tick ticks immediately so we skip it
+                    tick_task.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = tick_task.tick() => {
+                                info!(action = "autocommit_thread_tick");
+                                let index_holders = index_service.index_holders_cloned().await;
+                                for index_holder in index_holders.into_values() {
+                                    let result = index_service.try_commit_and_restart_consumption(&index_holder).await;
+                                    if let Err(error) = result {
+                                        warn!(error = ?error);
+                                    }
+                                }
+                            }
+                            _ = &mut shutdown_tripwire.recv() => {
+                                info!(action = "shutdown_autocommit_thread");
+                                break;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                .instrument(info_span!(parent: None, "autocommit_thread")),
+            ),
+            shutdown_trigger,
+        ));
+    }
+
+    /// Starts autocommitting thread
+    #[instrument(skip(self))]
+    pub async fn start_autocommit_thread(&mut self) {
+        self.setup_autocommit_thread().await;
+    }
+
+    /// Stops autocommitting thread
+    #[instrument(skip(self))]
+    pub async fn stop_autocommit_thread(&mut self) -> SummaServerResult<()> {
+        if let Some(autocommit_thread) = self.autocommit_thread.write().await.take() {
+            autocommit_thread.stop().await??;
+        }
+        Ok(())
     }
 }
 

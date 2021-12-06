@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use path_absolutize::*;
 use serde::{Deserialize, Serialize};
-use summa_core::configs::{ApplicationConfig, ConfigProxy, DirectProxy, FileProxy, Loadable};
+use summa_core::configs::{ConfigProxy, CoreConfig, DirectProxy, FileProxy, Loadable};
 use summa_core::errors::BuilderError;
 
 use super::{GrpcConfig, GrpcConfigBuilder};
@@ -31,7 +31,7 @@ pub struct ServerConfig {
     pub consumer_configs: HashMap<String, ConsumerConfig>,
 
     #[serde(default)]
-    pub application: ApplicationConfig,
+    pub core: CoreConfig,
 }
 
 impl Default for ServerConfig {
@@ -45,7 +45,7 @@ impl Default for ServerConfig {
             log_path: PathBuf::new(),
             metrics: MetricsConfigBuilder::default().build().expect("cannot build default config"),
             consumer_configs: HashMap::new(),
-            application: ApplicationConfig::default(),
+            core: CoreConfig::default(),
         }
     }
 }
@@ -77,7 +77,7 @@ impl ServerConfig {
         if index_name.is_empty() {
             return Err(ValidationError::EmptyArgument("index_name".to_owned()).into());
         }
-        if !self.application.indices.contains_key(index_name) {
+        if !self.core.indices.contains_key(index_name) {
             return Err(ValidationError::MissingIndex(index_name.to_owned()).into());
         }
         Ok(self.aliases.insert(alias.to_owned(), index_name.to_owned()))

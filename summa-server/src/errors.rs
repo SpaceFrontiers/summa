@@ -37,6 +37,8 @@ pub enum Error {
     AddrParse(#[from] std::net::AddrParseError),
     #[error("clap_matches_error: {0}")]
     ClapMatches(#[from] clap::parser::MatchesError),
+    #[error("summa_core: {0}")]
+    Core(#[from] summa_core::Error),
     #[error("hyper_error: {0}")]
     Hyper(#[from] hyper::Error),
     #[error("hyper_http_error: {0}")]
@@ -49,8 +51,8 @@ pub enum Error {
     IPFS(#[from] ipfs_api::Error),
     #[error("json_error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("summa_core: {0}")]
-    Core(#[from] summa_core::Error),
+    #[error("lock_error: {0}")]
+    Lock(#[from] tokio::sync::TryLockError),
     #[error("tantivy_error: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
     #[error("tonic_error: {0}")]
@@ -94,6 +96,7 @@ impl From<Error> for tonic::Status {
                 },
                 Error::Validation(ValidationError::MissingIndex(_)) => tonic::Code::NotFound,
                 Error::Validation(_) => tonic::Code::InvalidArgument,
+                Error::Lock(_) => tonic::Code::FailedPrecondition,
                 _ => tonic::Code::Internal,
             },
             format!("{}", error),

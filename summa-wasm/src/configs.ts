@@ -1,12 +1,12 @@
 export class RemoteEngineConfig {
   method: string;
   url_template: string;
-  headers_template: {name: string, value: string}[] | null;
+  headers_template: Map<string, string> | null;
   chunked_cache_config?: ChunkedCacheConfig;
   constructor(
     method: string,
     url_template: string,
-    headers_template: {name: string, value: string}[] | null,
+    headers_template: Map<string, string> | null,
     chunked_cache_config?: ChunkedCacheConfig,
   ) {
     this.method = method

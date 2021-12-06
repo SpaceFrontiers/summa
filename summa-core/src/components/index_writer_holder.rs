@@ -9,7 +9,7 @@ use tracing::info;
 
 use super::SummaSegmentAttributes;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
-use crate::configs::ApplicationConfig;
+use crate::configs::CoreConfig;
 use crate::errors::{SummaResult, ValidationError};
 
 #[derive(Clone)]
@@ -163,13 +163,9 @@ impl IndexWriterHolder {
         })
     }
 
-    /// Creates new `IndexWriterHolder` from `Index` and `ApplicationConfig`
-    pub fn from_config(index: &Index, application_config: &ApplicationConfig) -> SummaResult<IndexWriterHolder> {
-        let index_writer = IndexWriterImpl::new(
-            index,
-            application_config.writer_threads as usize,
-            application_config.writer_heap_size_bytes as usize,
-        )?;
+    /// Creates new `IndexWriterHolder` from `Index` and `CoreConfig`
+    pub fn from_config(index: &Index, core_config: &CoreConfig) -> SummaResult<IndexWriterHolder> {
+        let index_writer = IndexWriterImpl::new(index, core_config.writer_threads as usize, core_config.writer_heap_size_bytes as usize)?;
         let primary_key = index
             .load_metas()?
             .attributes()?
@@ -185,8 +181,8 @@ impl IndexWriterHolder {
         IndexWriterHolder::new(
             index_writer,
             primary_key,
-            application_config.writer_heap_size_bytes as usize,
-            application_config.writer_threads as usize,
+            core_config.writer_threads as usize,
+            core_config.writer_heap_size_bytes as usize,
         )
     }
 
