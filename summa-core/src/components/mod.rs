@@ -4,8 +4,6 @@ mod frozen_log_merge_policy;
 mod fruit_extractors;
 mod index_holder;
 mod index_registry;
-#[cfg(feature = "consume")]
-mod index_updater;
 mod index_writer_holder;
 mod query_parser;
 mod segment_attributes;
@@ -16,9 +14,7 @@ pub use default_tokenizers::default_tokenizers;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor};
 pub use index_holder::IndexHolder;
 pub use index_registry::{IndexQuery, IndexRegistry};
-#[cfg(feature = "consume")]
-pub use index_updater::{ComponentFile, IndexUpdater, SegmentComponent};
-pub use index_writer_holder::IndexWriterHolder;
+pub use index_writer_holder::{ComponentFile, IndexWriterHolder, SegmentComponent};
 use once_cell::sync::Lazy;
 pub use query_parser::QueryParser;
 pub use segment_attributes::SummaSegmentAttributes;

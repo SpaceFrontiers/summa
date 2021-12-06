@@ -50,6 +50,7 @@ impl wbg_rayon_PoolBuilder {
 
 #[wasm_bindgen(js_name = init_thread_pool)]
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn init_thread_pool(num_threads: usize) -> Promise {
     console_error_panic_hook::set_once();
     start_workers(wasm_bindgen::module(), wasm_bindgen::memory(), wbg_rayon_PoolBuilder::new(num_threads))
@@ -58,6 +59,7 @@ pub fn init_thread_pool(num_threads: usize) -> Promise {
 #[wasm_bindgen]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn wbg_rayon_start_worker(receiver: *const Receiver<rayon::ThreadBuilder>)
 where
     // Statically assert that it's safe to accept `Receiver` from another thread.

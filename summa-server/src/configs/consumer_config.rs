@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::errors::SummaResult;
+use crate::errors::SummaServerResult;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsumerConfig {
+    pub index_name: String,
     pub bootstrap_servers: Vec<String>,
     pub create_topics: bool,
     pub delete_topics: bool,
@@ -14,8 +15,9 @@ pub struct ConsumerConfig {
 }
 
 impl ConsumerConfig {
-    pub fn new(bootstrap_servers: &[String], group_id: &str, topics: &[String]) -> SummaResult<ConsumerConfig> {
+    pub fn new(index_name: &str, bootstrap_servers: &[String], group_id: &str, topics: &[String]) -> SummaServerResult<ConsumerConfig> {
         Ok(ConsumerConfig {
+            index_name: index_name.to_string(),
             bootstrap_servers: bootstrap_servers.to_owned(),
             create_topics: true,
             delete_topics: true,

@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
-
-use crate::errors::BuilderError;
+use summa_core::errors::BuilderError;
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]

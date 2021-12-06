@@ -8,10 +8,6 @@ use tantivy::schema::FieldType;
 pub enum ValidationError {
     #[error("builder_error: {0}")]
     Builder(#[from] BuilderError),
-    #[error("empty_argument_error: {0}")]
-    EmptyArgument(String),
-    #[error("existing_consumer_error: {0}")]
-    ExistingConsumer(String),
     #[error("invalid_fast_field_type_error: ({field:?}, {field_type:?}, {tantivy_error:?})")]
     InvalidFastFieldType {
         field: String,
@@ -26,8 +22,6 @@ pub enum ValidationError {
     InvalidPrimaryKeyType(FieldType),
     #[error("existing_path_error: {0}")]
     ExistingPath(PathBuf),
-    #[error("missing_consumer_error: {0}")]
-    MissingConsumer(String),
     #[error("missing_index_error: {0}")]
     MissingIndex(String),
     #[error("missing_field_error: {0}")]
@@ -70,6 +64,8 @@ pub enum Error {
     Internal,
     #[error("{0:?}: {1:?}")]
     InvalidFieldType(String, FieldType),
+    #[error("invalid_index_engine_error: {0:?}")]
+    InvalidIndexEngine(summa_proto::proto::IndexEngineConfig),
     #[error("{0:?}")]
     InvalidSyntax(String),
     #[error("{0:?} for {1:?}")]
@@ -78,9 +74,6 @@ pub enum Error {
     IO((std::io::Error, Option<PathBuf>)),
     #[error("json_error: {0}")]
     Json(#[from] serde_json::Error),
-    #[cfg(feature = "consume")]
-    #[error("{0}")]
-    Kafka(#[from] rdkafka::error::KafkaError),
     #[error("open_directory_error: {0}")]
     OpenDirectory(#[from] tantivy::directory::error::OpenDirectoryError),
     #[error("tantivy_error: {0}")]
@@ -95,6 +88,14 @@ pub enum Error {
     Validation(#[from] ValidationError),
     #[error("{0}")]
     Yaml(#[from] serde_yaml::Error),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum BuilderError {
+    /// Uninitialized field
+    UninitializedField(&'static str),
+    /// Custom validation error
+    ValidationError(String),
 }
 
 impl From<BuilderError> for Error {
@@ -137,14 +138,6 @@ impl From<Error> for tantivy::error::AsyncIoError {
     fn from(error: Error) -> Self {
         tantivy::error::AsyncIoError::Io(error.into())
     }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum BuilderError {
-    /// Uninitialized field
-    UninitializedField(&'static str),
-    /// Custom validation error
-    ValidationError(String),
 }
 
 impl Display for BuilderError {

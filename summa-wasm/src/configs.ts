@@ -1,4 +1,4 @@
-export class NetworkConfig {
+export class RemoteEngineConfig {
   method: string;
   url_template: string;
   headers_template: {name: string, value: string}[] | null;

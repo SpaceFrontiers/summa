@@ -14,7 +14,7 @@ service ConsumerApi {
 message CreateConsumerRequest {
   repeated string bootstrap_servers = 1;
   string group_id = 2;
-  string index_alias = 3;
+  string index_name = 3;
   string consumer_name = 4;
   repeated string topics = 5;
 }
@@ -22,8 +22,7 @@ message CreateConsumerResponse {
   Consumer consumer = 1;
 }
 message DeleteConsumerRequest {
-  string index_alias = 1;
-  string consumer_name = 2;
+  string consumer_name = 1;
 }
 message DeleteConsumerResponse {}
 message GetConsumerRequest {
@@ -40,6 +39,6 @@ message GetConsumersResponse {
 
 // Extra structures
 message Consumer {
-  string index_name = 1;
-  string consumer_name = 2;
+  string consumer_name = 1;
+  string index_name = 2;
 }

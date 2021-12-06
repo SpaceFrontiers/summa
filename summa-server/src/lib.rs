@@ -38,14 +38,15 @@ extern crate derive_builder;
 extern crate lazy_static;
 
 pub mod apis;
-pub mod application;
 pub mod components;
+pub mod configs;
 pub mod errors;
 pub(crate) mod hyper_external_request;
 pub(crate) mod logging;
 pub mod requests;
+pub mod server;
 pub mod servers;
 pub mod services;
 pub(crate) mod utils;
 
-pub use application::Application;
+pub use server::Server;

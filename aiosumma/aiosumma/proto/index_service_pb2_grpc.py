@@ -15,11 +15,6 @@ class IndexApiStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.alter_index = channel.unary_unary(
-                '/summa.proto.IndexApi/alter_index',
-                request_serializer=index__service__pb2.AlterIndexRequest.SerializeToString,
-                response_deserializer=index__service__pb2.AlterIndexResponse.FromString,
-                )
         self.attach_index = channel.unary_unary(
                 '/summa.proto.IndexApi/attach_index',
                 request_serializer=index__service__pb2.AttachIndexRequest.SerializeToString,
@@ -90,12 +85,6 @@ class IndexApiStub(object):
 class IndexApiServicer(object):
     """Manages indices
     """
-
-    def alter_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
 
     def attach_index(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -178,11 +167,6 @@ class IndexApiServicer(object):
 
 def add_IndexApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'alter_index': grpc.unary_unary_rpc_method_handler(
-                    servicer.alter_index,
-                    request_deserializer=index__service__pb2.AlterIndexRequest.FromString,
-                    response_serializer=index__service__pb2.AlterIndexResponse.SerializeToString,
-            ),
             'attach_index': grpc.unary_unary_rpc_method_handler(
                     servicer.attach_index,
                     request_deserializer=index__service__pb2.AttachIndexRequest.FromString,
@@ -258,23 +242,6 @@ def add_IndexApiServicer_to_server(servicer, server):
 class IndexApi(object):
     """Manages indices
     """
-
-    @staticmethod
-    def alter_index(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(request, target, '/summa.proto.IndexApi/alter_index',
-            index__service__pb2.AlterIndexRequest.SerializeToString,
-            index__service__pb2.AlterIndexResponse.FromString,
-            options, channel_credentials,
-            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 
     @staticmethod
     def attach_index(request,

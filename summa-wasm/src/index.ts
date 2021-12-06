@@ -5,5 +5,5 @@ export {
 } from "./web-index-service";
 export {
   ChunkedCacheConfig,
-  NetworkConfig,
+  RemoteEngineConfig,
 } from "./configs";

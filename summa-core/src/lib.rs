@@ -21,8 +21,6 @@ extern crate async_trait;
 pub mod collectors;
 pub mod components;
 pub mod configs;
-#[cfg(feature = "consume")]
-mod consumers;
 pub mod directories;
 pub mod errors;
 pub mod metrics;

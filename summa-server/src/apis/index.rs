@@ -4,11 +4,12 @@
 
 use std::error::Error;
 use std::io::ErrorKind;
-use std::ops::Deref;
+use std::sync::Arc;
 use std::time::Instant;
 
 use summa_core::components::{IndexHolder, SummaDocument};
-use summa_core::configs::{ApplicationConfigHolder, Persistable};
+use summa_core::configs::ConfigProxy;
+use summa_core::utils::sync::Handler;
 use summa_proto::proto;
 use tantivy::SegmentId;
 use tokio_stream::StreamExt;
@@ -16,33 +17,22 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info_span, warn};
 use tracing_futures::Instrument;
 
+use crate::configs::ServerConfig;
 use crate::errors::SummaServerResult;
 use crate::services::IndexService;
 
 #[derive(Clone)]
 pub struct IndexApiImpl {
-    application_config: ApplicationConfigHolder,
+    server_config: Arc<dyn ConfigProxy<ServerConfig>>,
     index_service: IndexService,
 }
 
 impl IndexApiImpl {
-    pub fn new(application_config: &ApplicationConfigHolder, index_service: &IndexService) -> SummaServerResult<IndexApiImpl> {
+    pub fn new(server_config: &Arc<dyn ConfigProxy<ServerConfig>>, index_service: &IndexService) -> SummaServerResult<IndexApiImpl> {
         Ok(IndexApiImpl {
-            application_config: application_config.clone(),
+            server_config: server_config.clone(),
             index_service: index_service.clone(),
         })
-    }
-}
-
-async fn cast(index_holder: &IndexHolder) -> proto::Index {
-    let index_config_proxy = index_holder.index_config_proxy().read().await;
-    proto::Index {
-        //ToDo
-        index_aliases: vec![],
-        index_name: index_holder.index_name().to_owned(),
-        index_engine: format!("{:?}", index_config_proxy.get().index_engine),
-        num_docs: index_holder.index_reader().searcher().num_docs(),
-        compression: index_holder.compression() as i32,
     }
 }
 
@@ -61,59 +51,61 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
     }
 }
 
+impl IndexApiImpl {
+    pub async fn get_index_description(&self, index_holder: &Handler<IndexHolder>) -> proto::IndexDescription {
+        proto::IndexDescription {
+            index_aliases: self
+                .index_service
+                .server_config()
+                .read()
+                .await
+                .get()
+                .get_index_aliases_for_index(index_holder.index_name()),
+            index_name: index_holder.index_name().to_owned(),
+            index_engine: Some(index_holder.index_engine_config().clone()),
+            num_docs: index_holder.index_reader().searcher().num_docs(),
+            compression: index_holder.compression() as i32,
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl proto::index_api_server::IndexApi for IndexApiImpl {
-    async fn alter_index(&self, proto_request: Request<proto::AlterIndexRequest>) -> Result<Response<proto::AlterIndexResponse>, Status> {
-        let alter_index_request = proto_request.into_inner().try_into()?;
-        let index_holder = self.index_service.alter_index(alter_index_request).await?;
-        let response = proto::AlterIndexResponse {
-            index: Some(cast(index_holder.deref()).await),
-        };
-        Ok(Response::new(response))
-    }
-
     async fn attach_index(&self, proto_request: Request<proto::AttachIndexRequest>) -> Result<Response<proto::AttachIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.attach_index(&proto_request.index_name).await?;
+        let index_holder = self.index_service.attach_index(proto_request.try_into()?).await?;
         let response = proto::AttachIndexResponse {
-            index: Some(cast(index_holder.deref()).await),
+            index: Some(self.get_index_description(&index_holder).await),
         };
         Ok(Response::new(response))
     }
 
     async fn commit_index(&self, request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let request = request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&request.index_alias).await?;
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
+                let index_service = self.index_service.clone();
                 tokio::spawn(async move {
-                    match index_holder.index_updater().try_write() {
-                        Err(_) => warn!(action = "busy"),
-                        Ok(index_updater) => match index_updater.commit(None).await {
-                            Ok(_) => (),
-                            Err(error) => warn!(error = ?error),
-                        },
+                    if let Err(err) = index_service.commit_and_restart_consumption(&request.index_alias).await {
+                        warn!(action = "busy", error = format!("{:?}", err))
                     }
                 });
                 Ok(Response::new(proto::CommitIndexResponse { elapsed_secs: None }))
             }
-            Some(proto::CommitMode::Sync) => match index_holder.index_updater().try_write() {
-                Err(_) => Err(Status::failed_precondition("busy")),
-                Ok(index_updater) => {
-                    let now = Instant::now();
-                    index_updater.commit(None).await.map_err(crate::errors::Error::from)?;
-                    Ok(Response::new(proto::CommitIndexResponse {
-                        elapsed_secs: Some(now.elapsed().as_secs_f64()),
-                    }))
-                }
-            },
+            Some(proto::CommitMode::Sync) => {
+                let now = Instant::now();
+                self.index_service.commit_and_restart_consumption(&request.index_alias).await?;
+                Ok(Response::new(proto::CommitIndexResponse {
+                    elapsed_secs: Some(now.elapsed().as_secs_f64()),
+                }))
+            }
         }
     }
 
     async fn create_index(&self, proto_request: Request<proto::CreateIndexRequest>) -> Result<Response<proto::CreateIndexResponse>, Status> {
         let index_holder = self.index_service.create_index(proto_request.into_inner().try_into()?).await?;
         let response = proto::CreateIndexResponse {
-            index: Some(cast(index_holder.deref()).await),
+            index: Some(self.get_index_description(&index_holder).await),
         };
         Ok(Response::new(response))
     }
@@ -185,23 +177,25 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
+        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_alias).await?;
+        let index_description = self.get_index_description(&index_holder).await;
         Ok(Response::new(proto::GetIndexResponse {
-            index: Some(cast(self.index_service.get_index_holder(&proto_request.into_inner().index_alias).await?.deref()).await),
+            index: Some(index_description),
         }))
     }
 
     async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
-        let index_holders = self.index_service.index_holders().await;
+        let index_holders = self.index_service.index_holders().read().await;
         let mut indices = Vec::with_capacity(index_holders.len());
         for index_holder in index_holders.values() {
-            indices.push(cast(index_holder).await)
+            indices.push(self.get_index_description(&index_holder.handler()).await)
         }
         Ok(Response::new(proto::GetIndicesResponse { indices }))
     }
 
     async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {
         Ok(Response::new(proto::GetIndicesAliasesResponse {
-            indices_aliases: self.application_config.read().await.aliases.clone(),
+            indices_aliases: self.server_config.read().await.get().aliases.clone(),
         }))
     }
 
@@ -217,7 +211,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("wrong uuid");
             async move {
-                let result = index_holder.index_updater().read().await.merge_index(&segment_ids, None).await;
+                let result = index_holder.index_writer_holder().write().await.merge(&segment_ids, None).await;
                 if let Err(error) = result {
                     error!(error = ?error)
                 }
@@ -231,11 +225,12 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn set_index_alias(&self, proto_request: Request<proto::SetIndexAliasRequest>) -> Result<Response<proto::SetIndexAliasResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let mut application_config = self.application_config.write().await;
-        let old_index_name = application_config
+        let mut server_config = self.server_config.write().await;
+        let old_index_name = server_config
+            .get_mut()
             .set_index_alias(&proto_request.index_alias, &proto_request.index_name)
             .map_err(crate::errors::Error::from)?;
-        application_config.save().map_err(crate::errors::Error::from)?;
+        server_config.commit().await.map_err(crate::errors::Error::from)?;
         let response = proto::SetIndexAliasResponse { old_index_name };
         Ok(Response::new(response))
     }
@@ -246,7 +241,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         tokio::spawn(async move {
             let index_name = index_holder.index_name().to_string();
             async move {
-                let result = index_holder.index_updater().read().await.vacuum_index(None, None).await;
+                let result = index_holder.index_writer_holder().write().await.vacuum(None).await;
                 if let Err(error) = result {
                     error!(error = ?error)
                 }

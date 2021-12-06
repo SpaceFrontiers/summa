@@ -1,21 +1,16 @@
-from typing import ClassVar as _ClassVar
-from typing import Iterable as _Iterable
-from typing import Mapping as _Mapping
-from typing import Optional as _Optional
-from typing import Union as _Union
-
 import utils_pb2 as _utils_pb2
-from google.protobuf import descriptor as _descriptor
-from google.protobuf import message as _message
 from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
 
 Async: CommitMode
 Brotli: Compression
+CreateFileEngine: CreateIndexEngineRequest
+CreateMemoryEngine: CreateIndexEngineRequest
 DESCRIPTOR: _descriptor.FileDescriptor
-File: IndexEngine
 Lz4: Compression
-Memory: IndexEngine
 None: Compression
 Snappy: Compression
 Sync: CommitMode
@@ -47,20 +42,46 @@ class AlterIndexRequest(_message.Message):
 class AlterIndexResponse(_message.Message):
     __slots__ = ["index"]
     INDEX_FIELD_NUMBER: _ClassVar[int]
-    index: Index
-    def __init__(self, index: _Optional[_Union[Index, _Mapping]] = ...) -> None: ...
+    index: IndexDescription
+    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
+
+class AttachFileEngineRequest(_message.Message):
+    __slots__ = []
+    def __init__(self) -> None: ...
 
 class AttachIndexRequest(_message.Message):
-    __slots__ = ["index_name"]
+    __slots__ = ["attach_file_engine_request", "attach_ipfs_engine_request", "attach_remote_engine_request", "index_name"]
+    ATTACH_FILE_ENGINE_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    ATTACH_IPFS_ENGINE_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    ATTACH_REMOTE_ENGINE_REQUEST_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    attach_file_engine_request: AttachFileEngineRequest
+    attach_ipfs_engine_request: AttachIpfsEngineRequest
+    attach_remote_engine_request: AttachRemoteEngineRequest
     index_name: str
-    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., attach_file_engine_request: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., attach_remote_engine_request: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., attach_ipfs_engine_request: _Optional[_Union[AttachIpfsEngineRequest, _Mapping]] = ...) -> None: ...
 
 class AttachIndexResponse(_message.Message):
     __slots__ = ["index"]
     INDEX_FIELD_NUMBER: _ClassVar[int]
-    index: Index
-    def __init__(self, index: _Optional[_Union[Index, _Mapping]] = ...) -> None: ...
+    index: IndexDescription
+    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
+
+class AttachIpfsEngineRequest(_message.Message):
+    __slots__ = []
+    def __init__(self) -> None: ...
+
+class AttachRemoteEngineRequest(_message.Message):
+    __slots__ = []
+    def __init__(self) -> None: ...
+
+class ChunkedCacheConfig(_message.Message):
+    __slots__ = ["cache_size", "chunk_size"]
+    CACHE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_SIZE_FIELD_NUMBER: _ClassVar[int]
+    cache_size: int
+    chunk_size: int
+    def __init__(self, chunk_size: _Optional[int] = ..., cache_size: _Optional[int] = ...) -> None: ...
 
 class CommitIndexRequest(_message.Message):
     __slots__ = ["commit_mode", "index_alias"]
@@ -77,8 +98,7 @@ class CommitIndexResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
 
 class CreateIndexRequest(_message.Message):
-    __slots__ = ["autocommit_interval_ms", "blocksize", "compression", "default_fields", "index_engine", "index_name", "multi_fields", "primary_key", "schema", "sort_by_field", "writer_heap_size_bytes", "writer_threads"]
-    AUTOCOMMIT_INTERVAL_MS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["blocksize", "compression", "default_fields", "index_engine", "index_name", "multi_fields", "primary_key", "schema", "sort_by_field"]
     BLOCKSIZE_FIELD_NUMBER: _ClassVar[int]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
@@ -88,27 +108,22 @@ class CreateIndexRequest(_message.Message):
     PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
     SCHEMA_FIELD_NUMBER: _ClassVar[int]
     SORT_BY_FIELD_FIELD_NUMBER: _ClassVar[int]
-    WRITER_HEAP_SIZE_BYTES_FIELD_NUMBER: _ClassVar[int]
-    WRITER_THREADS_FIELD_NUMBER: _ClassVar[int]
-    autocommit_interval_ms: int
     blocksize: int
     compression: Compression
     default_fields: _containers.RepeatedScalarFieldContainer[str]
-    index_engine: IndexEngine
+    index_engine: CreateIndexEngineRequest
     index_name: str
     multi_fields: _containers.RepeatedScalarFieldContainer[str]
     primary_key: str
     schema: str
     sort_by_field: SortByField
-    writer_heap_size_bytes: int
-    writer_threads: int
-    def __init__(self, index_name: _Optional[str] = ..., schema: _Optional[str] = ..., index_engine: _Optional[_Union[IndexEngine, str]] = ..., primary_key: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., writer_heap_size_bytes: _Optional[int] = ..., writer_threads: _Optional[int] = ..., autocommit_interval_ms: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., multi_fields: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., index_engine: _Optional[_Union[CreateIndexEngineRequest, str]] = ..., schema: _Optional[str] = ..., primary_key: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ...) -> None: ...
 
 class CreateIndexResponse(_message.Message):
     __slots__ = ["index"]
     INDEX_FIELD_NUMBER: _ClassVar[int]
-    index: Index
-    def __init__(self, index: _Optional[_Union[Index, _Mapping]] = ...) -> None: ...
+    index: IndexDescription
+    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class DeleteDocumentRequest(_message.Message):
     __slots__ = ["index_alias", "primary_key"]
@@ -132,6 +147,12 @@ class DeleteIndexResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
 
+class FileEngineConfig(_message.Message):
+    __slots__ = ["path"]
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    path: str
+    def __init__(self, path: _Optional[str] = ...) -> None: ...
+
 class GetIndexRequest(_message.Message):
     __slots__ = ["index_alias"]
     INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
@@ -141,8 +162,8 @@ class GetIndexRequest(_message.Message):
 class GetIndexResponse(_message.Message):
     __slots__ = ["index"]
     INDEX_FIELD_NUMBER: _ClassVar[int]
-    index: Index
-    def __init__(self, index: _Optional[_Union[Index, _Mapping]] = ...) -> None: ...
+    index: IndexDescription
+    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class GetIndicesAliasesRequest(_message.Message):
     __slots__ = []
@@ -168,10 +189,10 @@ class GetIndicesRequest(_message.Message):
 class GetIndicesResponse(_message.Message):
     __slots__ = ["indices"]
     INDICES_FIELD_NUMBER: _ClassVar[int]
-    indices: _containers.RepeatedCompositeFieldContainer[Index]
-    def __init__(self, indices: _Optional[_Iterable[_Union[Index, _Mapping]]] = ...) -> None: ...
+    indices: _containers.RepeatedCompositeFieldContainer[IndexDescription]
+    def __init__(self, indices: _Optional[_Iterable[_Union[IndexDescription, _Mapping]]] = ...) -> None: ...
 
-class Index(_message.Message):
+class IndexDescription(_message.Message):
     __slots__ = ["compression", "index_aliases", "index_engine", "index_name", "num_docs"]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
     INDEX_ALIASES_FIELD_NUMBER: _ClassVar[int]
@@ -180,10 +201,10 @@ class Index(_message.Message):
     NUM_DOCS_FIELD_NUMBER: _ClassVar[int]
     compression: Compression
     index_aliases: _containers.RepeatedScalarFieldContainer[str]
-    index_engine: str
+    index_engine: IndexEngineConfig
     index_name: str
     num_docs: int
-    def __init__(self, index_name: _Optional[str] = ..., index_aliases: _Optional[_Iterable[str]] = ..., index_engine: _Optional[str] = ..., num_docs: _Optional[int] = ..., compression: _Optional[_Union[Compression, str]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., index_aliases: _Optional[_Iterable[str]] = ..., index_engine: _Optional[_Union[IndexEngineConfig, _Mapping]] = ..., num_docs: _Optional[int] = ..., compression: _Optional[_Union[Compression, str]] = ...) -> None: ...
 
 class IndexDocumentOperation(_message.Message):
     __slots__ = ["document"]
@@ -221,11 +242,35 @@ class IndexDocumentStreamResponse(_message.Message):
     success_docs: int
     def __init__(self, success_docs: _Optional[int] = ..., failed_docs: _Optional[int] = ..., elapsed_secs: _Optional[float] = ...) -> None: ...
 
+class IndexEngineConfig(_message.Message):
+    __slots__ = ["file", "ipfs", "memory", "remote"]
+    FILE_FIELD_NUMBER: _ClassVar[int]
+    IPFS_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_FIELD_NUMBER: _ClassVar[int]
+    REMOTE_FIELD_NUMBER: _ClassVar[int]
+    file: FileEngineConfig
+    ipfs: IpfsEngineConfig
+    memory: MemoryEngineConfig
+    remote: RemoteEngineConfig
+    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., ipfs: _Optional[_Union[IpfsEngineConfig, _Mapping]] = ...) -> None: ...
+
 class IndexOperation(_message.Message):
     __slots__ = ["index_document"]
     INDEX_DOCUMENT_FIELD_NUMBER: _ClassVar[int]
     index_document: IndexDocumentOperation
     def __init__(self, index_document: _Optional[_Union[IndexDocumentOperation, _Mapping]] = ...) -> None: ...
+
+class IpfsEngineConfig(_message.Message):
+    __slots__ = ["cid"]
+    CID_FIELD_NUMBER: _ClassVar[int]
+    cid: str
+    def __init__(self, cid: _Optional[str] = ...) -> None: ...
+
+class MemoryEngineConfig(_message.Message):
+    __slots__ = ["schema"]
+    SCHEMA_FIELD_NUMBER: _ClassVar[int]
+    schema: str
+    def __init__(self, schema: _Optional[str] = ...) -> None: ...
 
 class MergeSegmentsRequest(_message.Message):
     __slots__ = ["index_alias", "segment_ids"]
@@ -246,6 +291,25 @@ class PrimaryKey(_message.Message):
     i64: int
     str: str
     def __init__(self, str: _Optional[str] = ..., i64: _Optional[int] = ...) -> None: ...
+
+class RemoteEngineConfig(_message.Message):
+    __slots__ = ["chunked_cache_config", "headers_template", "method", "url_template"]
+    class HeadersTemplateEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    HEADERS_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
+    METHOD_FIELD_NUMBER: _ClassVar[int]
+    URL_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
+    chunked_cache_config: ChunkedCacheConfig
+    headers_template: _containers.ScalarMap[str, str]
+    method: str
+    url_template: str
+    def __init__(self, method: _Optional[str] = ..., url_template: _Optional[str] = ..., headers_template: _Optional[_Mapping[str, str]] = ..., chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
 
 class SetIndexAliasRequest(_message.Message):
     __slots__ = ["index_alias", "index_name"]
@@ -279,10 +343,10 @@ class VacuumIndexResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
 
-class Compression(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+class CreateIndexEngineRequest(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []
 
-class IndexEngine(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+class Compression(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []
 
 class CommitMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):

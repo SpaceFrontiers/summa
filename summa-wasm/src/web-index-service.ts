@@ -1,5 +1,5 @@
 import init, { cache_metrics, init_thread_pool, WebIndexRegistry } from "../pkg";
-import { NetworkConfig } from "./configs";
+import { RemoteEngineConfig } from "./configs";
 
 export type StatusCallback = (type: string, message: string) => void;
 export class IndexQuery {
@@ -28,8 +28,8 @@ export class WebIndexService {
       status_callback("status", "");
     }
   }
-  async add(index_engine: { remote: NetworkConfig } | { memory: Object}): Promise<Object> {
-    return await this.registry!.add(index_engine)
+  async add(index_name: string, index_engine: { remote: RemoteEngineConfig } | { memory: Object}): Promise<Object> {
+    return await this.registry!.add(index_name, index_engine)
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)

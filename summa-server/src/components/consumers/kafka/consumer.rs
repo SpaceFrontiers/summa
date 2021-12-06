@@ -10,17 +10,16 @@ use rdkafka::consumer::{CommitMode, Consumer as KafkaConsumer, StreamConsumer as
 use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
+use summa_core::utils::thread_handler::ThreadHandler;
 use tokio::sync::Mutex;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 use super::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::configs::ConsumerConfig;
-use crate::errors::SummaResult;
-use crate::utils::thread_handler::ThreadHandler;
-use crate::Error;
+use crate::errors::{Error, SummaServerResult};
 
 enum ConsumingState {
-    Enabled(ThreadHandler<SummaResult<StreamConsumer>>),
+    Enabled(ThreadHandler<SummaServerResult<StreamConsumer>>),
     Disabled(StreamConsumer),
 }
 
@@ -32,16 +31,16 @@ impl std::fmt::Debug for ConsumingState {
 
 /// Manages consuming thread
 #[derive(Clone, Debug)]
-pub struct Consumer {
+pub struct ConsumerThread {
     consumer_name: String,
     config: ConsumerConfig,
     kafka_producer_config: ClientConfig,
     consuming_state: Arc<Mutex<Option<ConsumingState>>>,
 }
 
-impl Consumer {
+impl ConsumerThread {
     #[instrument]
-    pub fn new(consumer_name: &str, config: &ConsumerConfig) -> SummaResult<Consumer> {
+    pub fn new(consumer_name: &str, config: &ConsumerConfig) -> SummaServerResult<ConsumerThread> {
         let mut kafka_consumer_config = ClientConfig::new();
         kafka_consumer_config
             .set("broker.address.ttl", "1000")
@@ -59,7 +58,7 @@ impl Consumer {
         let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create()?;
         stream_consumer.subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>())?;
 
-        Ok(Consumer {
+        Ok(ConsumerThread {
             consumer_name: consumer_name.to_owned(),
             config: config.clone(),
             kafka_producer_config,
@@ -126,7 +125,7 @@ impl Consumer {
     }
 
     #[instrument(skip(self))]
-    pub async fn stop(&self) -> SummaResult<()> {
+    pub async fn stop(&self) -> SummaServerResult<()> {
         let mut consuming = self.consuming_state.lock().await;
         *consuming = match consuming.take() {
             Some(ConsumingState::Enabled(thread_handler)) => {
@@ -139,7 +138,7 @@ impl Consumer {
     }
 
     #[instrument(skip(self))]
-    pub async fn commit(&self) -> SummaResult<()> {
+    pub async fn commit(&self) -> SummaServerResult<()> {
         let mut consuming = self.consuming_state.lock().await;
         *consuming = match consuming.take() {
             Some(ConsumingState::Disabled(stream_consumer)) => {
@@ -157,7 +156,7 @@ impl Consumer {
     }
 
     #[instrument(skip(self))]
-    async fn create_topics(&self) -> SummaResult<()> {
+    async fn create_topics(&self) -> SummaServerResult<()> {
         let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let admin_options = AdminOptions::new().operation_timeout(Some(Timeout::Never));
         let new_topics: Vec<_> = self
@@ -184,7 +183,7 @@ impl Consumer {
     }
 
     #[instrument(skip(self))]
-    async fn delete_topics(&self) -> SummaResult<()> {
+    async fn delete_topics(&self) -> SummaServerResult<()> {
         let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let topics: Vec<_> = self.config.topics.iter().map(String::as_str).collect();
         let response = admin_client
@@ -200,7 +199,7 @@ impl Consumer {
     }
 
     #[instrument]
-    pub async fn on_create(&self) -> SummaResult<()> {
+    pub async fn on_create(&self) -> SummaServerResult<()> {
         if self.config.create_topics {
             return self.create_topics().await;
         }
@@ -208,10 +207,14 @@ impl Consumer {
     }
 
     #[instrument(skip(self), fields(consumer_name = ?self.consumer_name))]
-    pub async fn on_delete(&self) -> SummaResult<()> {
+    pub async fn on_delete(&self) -> SummaServerResult<()> {
         if self.config.delete_topics {
             return self.delete_topics().await;
         }
         Ok(())
+    }
+
+    pub fn config(&self) -> &ConsumerConfig {
+        &self.config
     }
 }

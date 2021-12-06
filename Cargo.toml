@@ -4,3 +4,6 @@ members = ["summa-proto", "summa-core", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true
+
+[workspace.dependencies]
+tantivy = { package = "summavy", version = "0.22.3", default_features = false, features = ["quickwit", "zstd-compression"] }

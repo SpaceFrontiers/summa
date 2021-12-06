@@ -1,65 +1,86 @@
 use std::sync::Arc;
 
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 use crate::errors::SummaResult;
 
 #[async_trait]
 pub trait ConfigProxy<TConfig>: Send + Sync {
     async fn read<'a>(&'a self) -> Box<dyn ConfigReadProxy<TConfig> + 'a>;
     async fn write<'a>(&'a self) -> Box<dyn ConfigWriteProxy<TConfig> + 'a>;
-    async fn delete(self: Arc<Self>) -> SummaResult<TConfig>;
 }
 
 pub trait ConfigReadProxy<TConfig>: Send + Sync {
     fn get(&self) -> &TConfig;
 }
 
+#[async_trait]
 pub trait ConfigWriteProxy<TConfig>: Send + Sync {
     fn get(&self) -> &TConfig;
     fn get_mut(&mut self) -> &mut TConfig;
-    fn commit(&self) -> SummaResult<()>;
+    async fn commit(&self) -> SummaResult<()>;
 }
 
 pub struct DirectProxy<TConfig> {
-    config: TConfig,
+    config: Arc<RwLock<TConfig>>,
 }
 
 impl<TConfig> DirectProxy<TConfig> {
     pub fn new(config: TConfig) -> DirectProxy<TConfig> {
-        DirectProxy { config }
+        DirectProxy {
+            config: Arc::new(RwLock::new(config)),
+        }
+    }
+}
+
+impl<TConfig: Default> Default for DirectProxy<TConfig> {
+    fn default() -> Self {
+        DirectProxy {
+            config: Arc::new(RwLock::new(TConfig::default())),
+        }
     }
 }
 
 #[async_trait]
 impl<TConfig: Send + Sync> ConfigProxy<TConfig> for DirectProxy<TConfig> {
     async fn read<'a>(&'a self) -> Box<dyn ConfigReadProxy<TConfig> + 'a> {
-        Box::new(self)
+        Box::new(DirectReadProxy {
+            config: self.config.read().await,
+        })
     }
 
     async fn write<'a>(&'a self) -> Box<dyn ConfigWriteProxy<TConfig> + 'a> {
-        Box::new(self)
-    }
-
-    async fn delete(self: Arc<Self>) -> SummaResult<TConfig> {
-        panic!()
+        Box::new(DirectWriteProxy {
+            config: self.config.write().await,
+        })
     }
 }
 
-impl<TConfig: Send + Sync> ConfigReadProxy<TConfig> for &DirectProxy<TConfig> {
+pub struct DirectReadProxy<'a, TConfig: Send + Sync> {
+    config: RwLockReadGuard<'a, TConfig>,
+}
+
+impl<TConfig: Send + Sync> ConfigReadProxy<TConfig> for DirectReadProxy<'_, TConfig> {
     fn get(&self) -> &TConfig {
         &self.config
     }
 }
 
-impl<TConfig: Send + Sync> ConfigWriteProxy<TConfig> for &DirectProxy<TConfig> {
+pub struct DirectWriteProxy<'a, TConfig: Send + Sync> {
+    config: RwLockWriteGuard<'a, TConfig>,
+}
+
+#[async_trait]
+impl<TConfig: Send + Sync> ConfigWriteProxy<TConfig> for DirectWriteProxy<'_, TConfig> {
     fn get(&self) -> &TConfig {
         &self.config
     }
 
     fn get_mut(&mut self) -> &mut TConfig {
-        panic!()
+        &mut self.config
     }
 
-    fn commit(&self) -> SummaResult<()> {
-        panic!()
+    async fn commit(&self) -> SummaResult<()> {
+        Ok(())
     }
 }

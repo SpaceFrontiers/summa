@@ -6,8 +6,6 @@ pub enum Error {
     AsyncIo(#[from] tantivy::error::AsyncIoError),
     #[error("core: {0}")]
     Core(#[from] summa_core::Error),
-    #[error("incorrect_payload")]
-    IncorrectPayload,
     #[error("index_error: {0}")]
     Index(#[from] tantivy::TantivyError),
     #[error("js_error: {0}")]

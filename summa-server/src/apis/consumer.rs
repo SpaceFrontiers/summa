@@ -6,6 +6,7 @@ use summa_proto::proto;
 use tonic::{Request, Response, Status};
 
 use crate::errors::SummaServerResult;
+use crate::errors::ValidationError;
 use crate::requests::CreateConsumerRequest;
 use crate::services::IndexService;
 
@@ -29,8 +30,8 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
         let index_name = self.index_service.create_consumer(&create_consumer_request).await?;
         let response = proto::CreateConsumerResponse {
             consumer: Some(proto::Consumer {
-                consumer_name: create_consumer_request.consumer_name.to_owned(),
                 index_name,
+                consumer_name: create_consumer_request.consumer_name.to_owned(),
             }),
         };
         Ok(Response::new(response))
@@ -38,13 +39,15 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
 
     async fn get_consumer(&self, proto_request: Request<proto::GetConsumerRequest>) -> Result<Response<proto::GetConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        self.index_service
-            .get_consumer_config(&proto_request.index_alias, &proto_request.consumer_name)
-            .await?;
+        let consumer_config = self
+            .index_service
+            .get_consumer_config(&proto_request.consumer_name)
+            .await
+            .ok_or_else(|| ValidationError::MissingConsumer(proto_request.consumer_name.to_string()))?;
         let response = proto::GetConsumerResponse {
             consumer: Some(proto::Consumer {
                 consumer_name: proto_request.consumer_name.to_owned(),
-                index_name: proto_request.index_alias,
+                index_name: consumer_config.index_name,
             }),
         };
         Ok(Response::new(response))
@@ -55,11 +58,11 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
             consumers: self
                 .index_service
                 .get_consumers()
-                .await?
+                .await
                 .iter()
-                .map(|(index_name, consumer_name)| proto::Consumer {
+                .map(|(consumer_name, consumer_config)| proto::Consumer {
+                    index_name: consumer_config.index_name.to_string(),
                     consumer_name: consumer_name.clone(),
-                    index_name: index_name.clone(),
                 })
                 .collect(),
         };

@@ -11,7 +11,6 @@ use tracing::{info_span, Instrument};
 use crate::errors::SummaServerResult;
 use crate::services::IndexService;
 
-#[derive(Debug)]
 pub struct SearchApiImpl {
     index_service: IndexService,
 }

@@ -5,8 +5,8 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use strfmt::strfmt;
+use summa_proto::proto::RemoteEngineConfig;
 
-use crate::configs::NetworkConfig;
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
 
@@ -29,12 +29,12 @@ pub trait ExternalRequest: Debug + Send + Sync {
     fn new(method: &str, url: &str, headers: &[Header]) -> Self
     where
         Self: Sized;
-    fn request(&self) -> SummaResult<ExternalResponse>;
-    async fn request_async(&self) -> SummaResult<ExternalResponse>;
+    fn request(self) -> SummaResult<ExternalResponse>;
+    async fn request_async(self) -> SummaResult<ExternalResponse>;
 }
 
 pub trait ExternalRequestGenerator<TExternalRequest: ExternalRequest>: ExternalRequestGeneratorClone<TExternalRequest> + Debug + Send + Sync {
-    fn new(network_config: NetworkConfig) -> Self
+    fn new(network_config: RemoteEngineConfig) -> Self
     where
         Self: Sized;
     fn generate_range_request(&self, file_name: &str, range: Range<usize>) -> SummaResult<TExternalRequest>;
@@ -47,7 +47,7 @@ pub trait ExternalRequestGeneratorClone<TExternalRequest: ExternalRequest> {
 
 #[derive(Clone, Debug)]
 pub struct DefaultExternalRequestGenerator<TExternalRequest: ExternalRequest + Clone> {
-    network_config: NetworkConfig,
+    remote_engine_config: RemoteEngineConfig,
     _pd: PhantomData<TExternalRequest>,
 }
 
@@ -60,9 +60,9 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
 }
 
 impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerator<TExternalRequest> for DefaultExternalRequestGenerator<TExternalRequest> {
-    fn new(network_config: NetworkConfig) -> DefaultExternalRequestGenerator<TExternalRequest> {
+    fn new(network_config: RemoteEngineConfig) -> DefaultExternalRequestGenerator<TExternalRequest> {
         DefaultExternalRequestGenerator {
-            network_config,
+            remote_engine_config: network_config,
             _pd: PhantomData,
         }
     }
@@ -74,16 +74,16 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         vars.insert("file_name".to_string(), file_name);
         vars.insert("start".to_string(), &start);
         vars.insert("end".to_string(), &end);
-        let mut headers = Vec::with_capacity(self.network_config.headers_template.len());
-        for header in self.network_config.headers_template.iter() {
+        let mut headers = Vec::with_capacity(self.remote_engine_config.headers_template.len());
+        for (header_name, header_value) in self.remote_engine_config.headers_template.iter() {
             headers.push(Header {
-                name: header.name.clone(),
-                value: strfmt(&header.value, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
+                name: header_name.clone(),
+                value: strfmt(header_value, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
             });
         }
         Ok(TExternalRequest::new(
-            &self.network_config.method,
-            &strfmt(&self.network_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
+            &self.remote_engine_config.method,
+            &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
             &headers,
         ))
     }
@@ -93,7 +93,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         vars.insert("file_name".to_string(), file_name);
         Ok(TExternalRequest::new(
             "HEAD",
-            &strfmt(&self.network_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
+            &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
             &[],
         ))
     }

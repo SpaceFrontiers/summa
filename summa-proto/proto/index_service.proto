@@ -5,24 +5,35 @@ import "utils.proto";
 
 // Manages indices
 service IndexApi {
-  rpc alter_index (AlterIndexRequest) returns (AlterIndexResponse) {}
+  // Attaches index to Summa server. Attaching allows to incorporate and start using of downloaded or network indices
   rpc attach_index(AttachIndexRequest) returns (AttachIndexResponse) {}
+  // Committing all collected writes to the index
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
+  // Creates new index from scratch
   rpc create_index (CreateIndexRequest) returns (CreateIndexResponse) {}
+  // Deletes single document from the index by its primary key (therefore, index must have primary key)
   rpc delete_document (DeleteDocumentRequest) returns (DeleteDocumentResponse) {}
+  // Deletes index and physically removes file in the case of `FileEngine`
   rpc delete_index (DeleteIndexRequest) returns (DeleteIndexResponse) {}
+  // Gets all existing index aliases
   rpc get_indices_aliases (GetIndicesAliasesRequest) returns (GetIndicesAliasesResponse) {}
+  // Gets index description
   rpc get_index (GetIndexRequest) returns (GetIndexResponse) {}
+  // Gets all existing index descriptions
   rpc get_indices (GetIndicesRequest) returns (GetIndicesResponse) {}
+  // Adds document to the index in a streaming way
   rpc index_document_stream (stream IndexDocumentStreamRequest) returns (IndexDocumentStreamResponse) {}
+  // Adds document to the index
   rpc index_document (IndexDocumentRequest) returns (IndexDocumentResponse) {}
+  // Merges multiple segments into a single one. Used for service purposes
   rpc merge_segments (MergeSegmentsRequest) returns (MergeSegmentsResponse) {}
+  // Sets or replaces existing index alias
   rpc set_index_alias (SetIndexAliasRequest) returns (SetIndexAliasResponse) {}
+  // Removes deletions from all segments
   rpc vacuum_index (VacuumIndexRequest) returns (VacuumIndexResponse) {}
 }
 
-// Requests
-
+// Possible primary keys
 message PrimaryKey {
   oneof value {
     string str = 1;
@@ -30,29 +41,29 @@ message PrimaryKey {
   }
 }
 
-message AlterIndexRequest {
-  message Fields {
-    repeated string fields = 1;
-  }
-  string index_name = 1;
-  optional Compression compression = 2;
-  optional uint32 blocksize = 6;
-  optional SortByField sort_by_field = 3;
-  Fields default_fields = 4;
-  Fields multi_fields = 5;
-  optional string primary_key = 7;
+// Attach file engine request
+message AttachFileEngineRequest {}
+
+// Attach remote engine request
+message AttachRemoteEngineRequest {}
+
+// Attach file engine request
+message AttachIpfsEngineRequest {
+  string cid = 1;
 }
 
-message AlterIndexResponse {
-  Index index = 1;
-}
-
+// Attach index request
 message AttachIndexRequest {
-  string index_name = 1;
+ string index_name = 1;
+ oneof request {
+   AttachFileEngineRequest attach_file_engine_request = 2;
+   AttachRemoteEngineRequest attach_remote_engine_request = 3;
+   AttachIpfsEngineRequest attach_ipfs_engine_request = 4;
+ }
 }
 
 message AttachIndexResponse {
-  Index index = 1;
+  IndexDescription index = 1;
 }
 
 message CommitIndexRequest {
@@ -69,23 +80,25 @@ message SortByField {
   Order order = 2;
 }
 
+enum CreateIndexEngineRequest {
+  File = 0;
+  Memory = 1;
+}
+
 message CreateIndexRequest {
   string index_name = 1;
-  string schema = 2;
-  IndexEngine index_engine = 10;
-  optional string primary_key = 3;
-  repeated string default_fields = 4;
-  Compression compression = 5;
-  optional uint32 blocksize = 12;
-  optional uint64 writer_heap_size_bytes = 6;
-  optional uint64 writer_threads = 7;
-  optional uint64 autocommit_interval_ms = 8;
+  CreateIndexEngineRequest index_engine = 2;
+  string schema = 3;
+  optional string primary_key = 4;
+  repeated string default_fields = 5;
+  repeated string multi_fields = 6;
+  Compression compression = 7;
+  optional uint32 blocksize = 8;
   optional SortByField sort_by_field = 9;
-  repeated string multi_fields = 11;
 }
 
 message CreateIndexResponse {
-  Index index = 1;
+  IndexDescription index = 1;
 }
 
 message DeleteDocumentRequest {
@@ -112,13 +125,13 @@ message GetIndexRequest {
 }
 
 message GetIndexResponse {
-  Index index = 1;
+  IndexDescription index = 1;
 }
 
 message GetIndicesRequest {}
 
 message GetIndicesResponse {
-  repeated Index indices = 1;
+  repeated IndexDescription indices = 1;
 }
 
 message IndexDocumentStreamRequest {
@@ -173,15 +186,39 @@ enum Compression {
   Zstd = 4;
 }
 
-enum IndexEngine {
-  File = 0;
-  Memory = 1;
+message FileEngineConfig {
+  string path = 1;
+}
+message MemoryEngineConfig {
+  string schema = 1;
+}
+message ChunkedCacheConfig {
+  uint64 chunk_size = 1;
+  optional uint64 cache_size = 2;
+}
+message RemoteEngineConfig {
+  string method = 1;
+  string url_template = 2;
+  map<string, string> headers_template = 3;
+  ChunkedCacheConfig chunked_cache_config = 4;
+}
+message IpfsEngineConfig {
+  string cid = 1;
 }
 
-message Index {
+message IndexEngineConfig {
+  oneof config {
+    FileEngineConfig file = 1;
+    MemoryEngineConfig memory = 2;
+    RemoteEngineConfig remote = 3;
+    IpfsEngineConfig ipfs = 4;
+  }
+}
+
+message IndexDescription {
   string index_name = 1;
   repeated string index_aliases = 2;
-  string index_engine = 3;
+  IndexEngineConfig index_engine = 3;
   uint64 num_docs = 4;
   Compression compression = 5;
 }

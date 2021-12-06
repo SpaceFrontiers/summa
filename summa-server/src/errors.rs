@@ -7,12 +7,18 @@ use tracing::warn;
 pub enum ValidationError {
     #[error("aliased_error: {0}")]
     Aliased(String),
+    #[error("empty_argument_error: {0}")]
+    EmptyArgument(String),
+    #[error("existing_consumer_error: {0}")]
+    ExistingConsumer(String),
     #[error("existing_index_error: {0}")]
     ExistingIndex(String),
     #[error("invalid_argument: {0}")]
     InvalidArgument(String),
     #[error("invalid_schema_error: {0}")]
     InvalidSchema(String),
+    #[error("missing_consumer_error: {0}")]
+    MissingConsumer(String),
     #[error("missing_index_error: {0}")]
     MissingIndex(String),
     #[error("missing_default_field_error: {0}")]
@@ -55,6 +61,8 @@ pub enum Error {
     Utf8(#[from] std::str::Utf8Error),
     #[error("{0}")]
     Validation(#[from] ValidationError),
+    #[error("{0}")]
+    Kafka(#[from] rdkafka::error::KafkaError),
 }
 
 impl From<std::io::Error> for Error {

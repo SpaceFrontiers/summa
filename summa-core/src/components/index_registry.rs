@@ -5,7 +5,7 @@ use futures::future::join_all;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use summa_proto::proto;
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::RwLock;
 
 use super::IndexHolder;
 use crate::errors::{SummaResult, ValidationError};
@@ -28,21 +28,15 @@ pub struct IndexRegistry {
 
 impl IndexRegistry {
     /// Read-locked `HashMap` of all indices
-    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
-        self.index_holders.read().await
-    }
-
-    /// Write-locked `HashMap` of all indices
-    ///
-    /// Taking this lock means locking metadata modification
-    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
-        self.index_holders.write().await
+    pub fn index_holders(&self) -> &Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>> {
+        &self.index_holders
     }
 
     /// Retrieve `IndexHolder` by its name
     pub async fn get_index_holder_by_name(&self, index_name: &str) -> SummaResult<Handler<IndexHolder>> {
         Ok(self
             .index_holders()
+            .read()
             .await
             .get(index_name)
             .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_name.to_owned())))?
@@ -53,18 +47,18 @@ impl IndexRegistry {
     pub async fn add(&self, index_holder: IndexHolder) -> Handler<IndexHolder> {
         let index_holder = OwningHandler::new(index_holder);
         let index_holder_handler = index_holder.handler();
-        self.index_holders_mut().await.insert(index_holder.index_name().to_string(), index_holder);
+        self.index_holders().write().await.insert(index_holder.index_name().to_string(), index_holder);
         index_holder_handler
     }
 
     /// Deletes index from `IndexRegistry`
     pub async fn delete(&self, index_name: &str) {
-        self.index_holders_mut().await.remove(index_name);
+        self.index_holders().write().await.remove(index_name);
     }
 
     /// Searches in several indices simultaneously and merges results
     pub async fn search(&self, index_queries: &[IndexQuery]) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let index_holders = self.index_holders().await;
+        let index_holders = self.index_holders().read().await;
         let futures = index_queries
             .iter()
             .map(|index_query| {

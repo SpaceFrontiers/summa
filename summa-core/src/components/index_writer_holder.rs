@@ -1,3 +1,5 @@
+use std::fmt::{Debug, Formatter};
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use summa_proto::proto;
@@ -7,13 +9,40 @@ use tracing::info;
 
 use super::SummaSegmentAttributes;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
-use crate::configs::IndexConfig;
+use crate::configs::{ApplicationConfig, IndexAttributes};
 use crate::errors::{SummaResult, ValidationError};
+
+#[derive(Clone)]
+pub struct SegmentComponent {
+    pub path: PathBuf,
+    pub segment_component: tantivy::SegmentComponent,
+}
+
+impl Debug for SegmentComponent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.path.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ComponentFile {
+    SegmentComponent(SegmentComponent),
+    Other(PathBuf),
+}
+
+impl ComponentFile {
+    pub fn path(&self) -> &Path {
+        match self {
+            ComponentFile::SegmentComponent(segment_component) => &segment_component.path,
+            ComponentFile::Other(path) => path,
+        }
+    }
+}
 
 pub struct SingleIndexWriter {
     pub index_writer: RwLock<SingleSegmentIndexWriter>,
-    pub index_config: IndexConfig,
     pub index: Index,
+    pub writer_heap_size_bytes: usize,
 }
 
 pub enum IndexWriterImpl {
@@ -22,6 +51,20 @@ pub enum IndexWriterImpl {
 }
 
 impl IndexWriterImpl {
+    pub fn new(index: &Index, writer_threads: usize, writer_heap_size_bytes: usize) -> SummaResult<Self> {
+        Ok(if writer_threads == 0 {
+            IndexWriterImpl::Single(SingleIndexWriter {
+                index: index.clone(),
+                index_writer: RwLock::new(SingleSegmentIndexWriter::new(index.clone(), writer_heap_size_bytes)?),
+                writer_heap_size_bytes,
+            })
+        } else {
+            let index_writer = index.writer_with_num_threads(writer_threads, writer_heap_size_bytes)?;
+            index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
+            IndexWriterImpl::Threaded(index_writer)
+        })
+    }
+
     pub fn delete_term(&self, term: Term) {
         match self {
             IndexWriterImpl::Single(_) => {}
@@ -47,12 +90,6 @@ impl IndexWriterImpl {
             IndexWriterImpl::Threaded(writer) => writer.index(),
         }
     }
-    pub fn wait_merging_threads(self) -> SummaResult<()> {
-        match self {
-            IndexWriterImpl::Single(_) => Ok(()),
-            IndexWriterImpl::Threaded(writer) => Ok(writer.wait_merging_threads()?),
-        }
-    }
     pub async fn merge_with_attributes(
         &mut self,
         segment_ids: &[SegmentId],
@@ -69,7 +106,7 @@ impl IndexWriterImpl {
         match self {
             IndexWriterImpl::Single(writer) => {
                 let index = writer.index.clone();
-                let writer_heap_size_bytes = writer.index_config.writer_heap_size_bytes as usize;
+                let writer_heap_size_bytes = writer.writer_heap_size_bytes;
                 let writer = writer.index_writer.get_mut().expect("poisoned");
                 take_mut::take(writer, |writer| {
                     writer.finalize().expect("cannot finalize");
@@ -95,6 +132,8 @@ impl IndexWriterImpl {
 pub struct IndexWriterHolder {
     index_writer: IndexWriterImpl,
     primary_key: Option<Field>,
+    writer_threads: usize,
+    writer_heap_size_bytes: usize,
 }
 
 impl IndexWriterHolder {
@@ -103,7 +142,12 @@ impl IndexWriterHolder {
     /// `IndexWriterHolder` maintains invariant that the only document with the particular primary key exists in the index.
     /// It is reached by deletion of every document with the same primary key as indexing one.
     /// The type of primary key is restricted to I64 but it is subjected to be changed in the future.
-    pub(super) fn new(index_writer: IndexWriterImpl, primary_key: Option<Field>) -> SummaResult<IndexWriterHolder> {
+    pub(super) fn new(
+        index_writer: IndexWriterImpl,
+        primary_key: Option<Field>,
+        writer_threads: usize,
+        writer_heap_size_bytes: usize,
+    ) -> SummaResult<IndexWriterHolder> {
         if let Some(primary_key) = primary_key {
             match index_writer.index().schema().get_field_entry(primary_key).field_type() {
                 FieldType::I64(_) => Ok(()),
@@ -111,25 +155,38 @@ impl IndexWriterHolder {
                 another_type => Err(ValidationError::InvalidPrimaryKeyType(another_type.to_owned())),
             }?
         }
-        Ok(IndexWriterHolder { index_writer, primary_key })
+        Ok(IndexWriterHolder {
+            index_writer,
+            primary_key,
+            writer_threads,
+            writer_heap_size_bytes,
+        })
     }
 
-    /// Creates new `IndexWriterHolder` from `Index` and `IndexConfig`
-    pub(super) fn from_config(index: &Index, index_config: &IndexConfig) -> SummaResult<IndexWriterHolder> {
-        let index_writer = if index_config.writer_threads == 0 {
-            IndexWriterImpl::Single(SingleIndexWriter {
-                index: index.clone(),
-                index_config: index_config.clone(),
-                index_writer: RwLock::new(SingleSegmentIndexWriter::new(index.clone(), index_config.writer_heap_size_bytes as usize)?),
+    /// Creates new `IndexWriterHolder` from `Index` and `ApplicationConfig`
+    pub fn from_config(index: &Index, application_config: &ApplicationConfig) -> SummaResult<IndexWriterHolder> {
+        let index_writer = IndexWriterImpl::new(
+            index,
+            application_config.writer_threads as usize,
+            application_config.writer_heap_size_bytes as usize,
+        )?;
+        let primary_key = index
+            .load_metas()?
+            .attributes()?
+            .and_then(|attributes: IndexAttributes| {
+                attributes.primary_key.map(|primary_key| {
+                    index
+                        .schema()
+                        .get_field(&primary_key)
+                        .ok_or(ValidationError::MissingPrimaryKey(Some(primary_key.to_string())))
+                })
             })
-        } else {
-            let index_writer = index.writer_with_num_threads(index_config.writer_threads as usize, index_config.writer_heap_size_bytes as usize)?;
-            index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
-            IndexWriterImpl::Threaded(index_writer)
-        };
+            .transpose()?;
         IndexWriterHolder::new(
             index_writer,
-            index_config.primary_key.as_ref().and_then(|primary_key| index.schema().get_field(primary_key)),
+            primary_key,
+            application_config.writer_heap_size_bytes as usize,
+            application_config.writer_threads as usize,
         )
     }
 
@@ -172,7 +229,7 @@ impl IndexWriterHolder {
     }
 
     /// Put document to the index. Before comes searchable it must be committed
-    pub(super) fn index_document(&self, document: Document) -> SummaResult<()> {
+    pub fn index_document(&self, document: Document) -> SummaResult<()> {
         self.delete_document(&document)?;
         self.index_writer.add_document(document)
     }
@@ -181,7 +238,7 @@ impl IndexWriterHolder {
     ///
     /// Also cleans deleted documents and do recompression. Possible to pass the only segment in `segment_ids` to do recompression or clean up.
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub(super) async fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
+    pub async fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
         info!(action = "merge_segments", segment_ids = ?segment_ids);
         let segment_meta = self
             .index_writer
@@ -198,11 +255,11 @@ impl IndexWriterHolder {
     ///
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub(super) async fn commit(&mut self, payload: Option<String>) -> SummaResult<()> {
+    pub async fn commit(&mut self, payload: Option<String>) -> SummaResult<()> {
         self.index_writer.commit(payload).await
     }
 
-    pub(super) async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
+    pub async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
         let mut segments = self.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
 
@@ -228,7 +285,70 @@ impl IndexWriterHolder {
         Ok(())
     }
 
-    pub(super) fn wait_merging_threads(self) -> SummaResult<()> {
-        self.index_writer.wait_merging_threads()
+    pub fn wait_merging_threads(&mut self) {
+        match &mut self.index_writer {
+            IndexWriterImpl::Single(_) => (),
+            IndexWriterImpl::Threaded(index_writer) => take_mut::take(index_writer, |index_writer| {
+                let index = index_writer.index().clone();
+                index_writer.wait_merging_threads().expect("cannot wait merging threads");
+                index
+                    .writer_with_num_threads(self.writer_threads, self.writer_heap_size_bytes)
+                    .expect("cannot create index writer_holder")
+            }),
+        };
+    }
+
+    /// Locking index files for executing operation on them
+    #[cfg(feature = "fs")]
+    pub async fn lock_files<P, O, Fut>(&mut self, index_path: P, payload: Option<String>, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
+    where
+        P: AsRef<Path>,
+        Fut: std::future::Future<Output = SummaResult<O>>,
+    {
+        use tantivy::Directory;
+
+        let segment_attributes = SummaSegmentAttributes { is_frozen: true };
+
+        self.commit(None).await?;
+        self.vacuum(Some(segment_attributes)).await?;
+        self.commit(payload).await?;
+
+        self.wait_merging_threads();
+
+        let mut hotcache_bytes = vec![];
+
+        let read_directory = tantivy::directory::MmapDirectory::open(&index_path)?;
+        crate::directories::write_hotcache(read_directory, 16384, &mut hotcache_bytes)?;
+        self.index()
+            .directory()
+            .atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)?;
+
+        let segment_files = [
+            ComponentFile::Other(PathBuf::from(".managed.json")),
+            ComponentFile::Other(PathBuf::from("meta.json")),
+            ComponentFile::Other(PathBuf::from("hotcache.bin")),
+        ]
+        .into_iter()
+        .chain(self.get_index_files(index_path.as_ref().to_path_buf())?)
+        .collect();
+        f(segment_files).await
+    }
+
+    /// Get segments
+    #[cfg(feature = "fs")]
+    fn get_index_files(&self, index_path: PathBuf) -> SummaResult<impl Iterator<Item = ComponentFile>> {
+        Ok(self.index().searchable_segments()?.into_iter().flat_map(move |segment| {
+            tantivy::SegmentComponent::iterator()
+                .filter_map(|segment_component| {
+                    let relative_path = segment.meta().relative_path(*segment_component);
+                    index_path.join(relative_path).exists().then(|| {
+                        ComponentFile::SegmentComponent(SegmentComponent {
+                            path: segment.meta().relative_path(*segment_component),
+                            segment_component: *segment_component,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        }))
     }
 }

@@ -116,7 +116,7 @@ impl SegmentEvalScorer {
         if let fasteval2::IUnsafeVar { ptr, .. } = self.compiled {
             unsafe { *ptr }
         } else {
-            self.compiled.eval(&self.slab, &mut self.namespace).expect("Undefined variable")
+            self.compiled.eval(&self.slab, &mut self.namespace).expect("undefined variable")
         }
     }
 }

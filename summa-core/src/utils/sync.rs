@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// `Handler` wraps data with [Arc](std::sync::Arc) and notifies exteriors by channel when dropping
+#[derive(Debug)]
 pub struct Handler<T> {
     data: ManuallyDrop<Arc<T>>,
     sender: UnboundedSender<()>,
@@ -46,9 +48,16 @@ impl<T> Deref for Handler<T> {
 
 /// `OwningHandler` is like [Arc](std::sync::Arc) but with additional possibility to wait until
 /// the last strong reference drops and then return wrapped data.
+#[derive(Debug)]
 pub struct OwningHandler<T> {
     handler: Handler<T>,
     receiver: UnboundedReceiver<()>,
+}
+
+impl<T: Default> Default for OwningHandler<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
 }
 
 impl<T> OwningHandler<T> {
@@ -93,8 +102,16 @@ impl<T> Deref for OwningHandler<T> {
     }
 }
 
-impl<T: Debug> Debug for OwningHandler<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("OwningHandler").field("data", &self.handler.data).finish()
+impl<T: Hash> Hash for Handler<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.data.hash(state)
     }
 }
+
+impl<T: PartialEq> PartialEq<Self> for Handler<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.eq(&other.data)
+    }
+}
+
+impl<T: PartialEq> Eq for Handler<T> {}

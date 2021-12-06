@@ -15,6 +15,7 @@ use tantivy::query::{
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
 
+use crate::configs::IndexAttributes;
 use crate::errors::{Error, SummaResult, ValidationError};
 #[cfg(feature = "metrics")]
 use crate::metrics::ToLabel;
@@ -74,7 +75,20 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
 }
 
 impl QueryParser {
-    pub fn for_index(index_name: &str, index: &Index, default_fields: Vec<Field>) -> QueryParser {
+    pub fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
+        let index_meta = index.load_metas()?;
+        let attributes: Option<IndexAttributes> = index_meta.attributes()?;
+        let default_fields = attributes
+            .map(|attributes| attributes.default_fields)
+            .unwrap_or_else(Vec::new)
+            .iter()
+            .map(|field_name| {
+                index
+                    .schema()
+                    .get_field(field_name)
+                    .ok_or_else(|| ValidationError::MissingField(field_name.to_string()).into())
+            })
+            .collect::<SummaResult<_>>()?;
         let nested_query_parser = tantivy::query::QueryParser::for_index(index, default_fields);
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
@@ -84,7 +98,7 @@ impl QueryParser {
             .with_description("Sub-queries counter")
             .init();
 
-        QueryParser {
+        Ok(QueryParser {
             index: index.clone(),
             index_name: index_name.to_string(),
             cached_schema: index.schema(),
@@ -93,7 +107,7 @@ impl QueryParser {
             query_counter,
             #[cfg(feature = "metrics")]
             subquery_counter,
-        }
+        })
     }
 
     #[inline]

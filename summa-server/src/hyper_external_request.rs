@@ -28,11 +28,13 @@ impl ExternalRequest for HyperExternalRequest {
         }
     }
 
-    fn request(&self) -> SummaResult<ExternalResponse> {
-        todo!()
+    fn request(self) -> SummaResult<ExternalResponse> {
+        let (s, r) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move { s.send(self.request_async().await) });
+        r.blocking_recv().expect("channel failed")
     }
 
-    async fn request_async(&self) -> SummaResult<ExternalResponse> {
+    async fn request_async(self) -> SummaResult<ExternalResponse> {
         let mut request = Request::builder().uri(&self.url).method(
             Method::from_bytes(self.method.as_bytes())
                 .map_err(|_| summa_core::Error::Validation(ValidationError::InvalidHttpMethod(self.method.to_string())))?,

@@ -1,18 +1,17 @@
+use summa_core::errors::BuilderError;
 use summa_proto::proto;
 use tantivy::schema::Schema;
 use tantivy::IndexSortByField;
 
-use crate::errors::{Error, SummaServerResult, ValidationError};
+use crate::errors::{Error, SummaServerResult};
 use crate::requests::validators;
 
 #[derive(Builder)]
-#[builder(build_fn(error = "summa_core::errors::BuilderError"))]
+#[builder(build_fn(error = "BuilderError"))]
 pub struct CreateIndexRequest {
     pub index_name: String,
-    pub index_engine: proto::IndexEngine,
+    pub index_engine: proto::CreateIndexEngineRequest,
     pub schema: Schema,
-    #[builder(default = "None")]
-    pub autocommit_interval_ms: Option<u64>,
     #[builder(default = "tantivy::store::Compressor::None")]
     pub compression: tantivy::store::Compressor,
     #[builder(default = "None")]
@@ -25,10 +24,6 @@ pub struct CreateIndexRequest {
     pub primary_key: Option<String>,
     #[builder(default = "None")]
     pub sort_by_field: Option<IndexSortByField>,
-    #[builder(default = "None")]
-    pub writer_threads: Option<u64>,
-    #[builder(default = "None")]
-    pub writer_heap_size_bytes: Option<u64>,
 }
 
 impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
@@ -44,15 +39,9 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .map(proto::Compression::into)
             .unwrap_or(tantivy::store::Compressor::None);
 
-        if let (Some(writer_heap_size_bytes), Some(writer_threads)) = (proto_request.writer_heap_size_bytes, proto_request.writer_threads) {
-            if writer_heap_size_bytes / std::cmp::max(writer_threads, 1) > 4293967294 {
-                return Err(ValidationError::InvalidArgument("The memory arena in bytes per thread cannot exceed 4293967295".to_string()).into());
-            }
-        };
-
         Ok(CreateIndexRequestBuilder::default()
             .index_name(proto_request.index_name)
-            .index_engine(proto::IndexEngine::from_i32(proto_request.index_engine).expect("cannot cast proto value"))
+            .index_engine(proto::CreateIndexEngineRequest::from_i32(proto_request.index_engine).expect("unknown engine"))
             .schema(schema)
             .primary_key(primary_key)
             .compression(compression)
@@ -60,9 +49,6 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .default_fields(default_fields)
             .multi_fields(multi_fields)
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
-            .autocommit_interval_ms(proto_request.autocommit_interval_ms)
-            .writer_threads(proto_request.writer_threads)
-            .writer_heap_size_bytes(proto_request.writer_heap_size_bytes)
             .build()
             .map_err(summa_core::Error::from)?)
     }

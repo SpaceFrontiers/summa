@@ -44,52 +44,12 @@ class SummaClient(BaseGrpcClient):
     }
 
     @expose
-    async def alter_index(
-        self,
-        index_name: str,
-        primary_key: Optional[str] = None,
-        default_fields: Optional[List[str]] = None,
-        multi_fields: Optional[List[str]] = None,
-        compression: Optional[str] = None,
-        blocksize: Optional[int] = None,
-        sort_by_field: Optional[Tuple] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> index_service_pb.CreateIndexResponse:
-        """
-        Alter index settings like default fields, multiple fields, compression, ordering etc
-
-        Args:
-            index_name: index name
-            default_fields: `Phrase` and `Match` queries are searching in these fields
-            multi_fields: every field in Tantivy is list. For consistency, Summa returns
-                            only first values of lists except for fields listed here as multiple
-            compression: Tantivy index compression
-            blocksize: Docstore blocksize
-            sort_by_field: (field_name, order)
-            request_id: request id
-            session_id: session id
-        """
-        return await self.stubs['index_api'].alter_index(
-            index_service_pb.AlterIndexRequest(
-                index_name=index_name,
-                primary_key=primary_key,
-                default_fields={'fields': default_fields},
-                multi_fields={'fields': multi_fields},
-                compression=index_service_pb.Compression.Value(compression) if compression is not None else None,
-                blocksize=blocksize,
-                sort_by_field=index_service_pb.SortByField(
-                    field=sort_by_field[0],
-                    order=sort_by_field[1],
-                ) if sort_by_field else None
-            ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
-        )
-
-    @expose
     async def attach_index(
         self,
         index_name: str,
+        attach_file_engine_request: index_service_pb.AttachFileEngineRequest | Dict | None,
+        attach_remote_engine_request: index_service_pb.AttachRemoteEngineRequest | Dict | None,
+        attach_ipfs_engine_request: index_service_pb.AttachIpfsEngineRequest | Dict | None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.AttachIndexResponse:
@@ -98,12 +58,18 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
+            attach_file_engine_request: attaching index placed under `<data_path>/<index_name>` directory
+            attach_remote_engine_request: attaching remote index
+            attach_ipfs_engine_request: attaching ipfs index
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].attach_index(
             index_service_pb.AttachIndexRequest(
                 index_name=index_name,
+                attach_file_engine_request=attach_file_engine_request,
+                attach_remote_engine_request=attach_remote_engine_request,
+                attach_ipfs_engine_request=attach_ipfs_engine_request,
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
@@ -140,12 +106,11 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def create_consumer(
         self,
-        index_alias: str,
+        index_name: str,
         consumer_name: str,
         bootstrap_servers: List[str],
         group_id: str,
         topics: List[str],
-        threads: int = None,
         request_id: str = None,
         session_id: str = None,
     ) -> consumer_service_pb.CreateConsumerResponse:
@@ -154,12 +119,11 @@ class SummaClient(BaseGrpcClient):
         The newly created consumer starts immediately after creation
 
         Args:
-            index_alias: index alias
+            index_name: index name
             consumer_name: consumer name that will be used for topic creation in Kafka too
             bootstrap_servers: list of bootstrap servers
             group_id: group_id for Kafka topic consumption
             topics: list of topics
-            threads: number of threads to read topics and number of partitions in Kafka topic
             request_id: request id
             session_id: session id
         """
@@ -168,9 +132,8 @@ class SummaClient(BaseGrpcClient):
                 consumer_name=consumer_name,
                 bootstrap_servers=bootstrap_servers,
                 group_id=group_id,
-                index_alias=index_alias,
+                index_name=index_name,
                 topics=topics,
-                threads=threads,
             ),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
@@ -179,34 +142,29 @@ class SummaClient(BaseGrpcClient):
     async def create_index(
         self,
         index_name: str,
+        index_engine: str | index_service_pb.CreateIndexEngineRequest,
         schema: str,
-        primary_key: Optional[str] = None,
-        default_fields: Optional[List[str]] = None,
-        multi_fields: Optional[List[str]] = None,
-        compression: Optional[Union[str, int]] = None,
-        blocksize: Optional[int] = None,
-        writer_heap_size_bytes: Optional[int] = None,
-        writer_threads: Optional[int] = None,
-        autocommit_interval_ms: Optional[int] = None,
-        sort_by_field: Optional[Tuple] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+        primary_key: str | None = None,
+        default_fields: List[str] | None = None,
+        multi_fields: List[str] | None = None,
+        compression: str | int | None = None,
+        blocksize: int | None = None,
+        sort_by_field: Tuple | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
     ) -> index_service_pb.CreateIndexResponse:
         """
         Create index
 
         Args:
             index_name: index name
+            index_engine: "File" or "Memory"
             schema: Tantivy index schema
             primary_key: primary key is used during insertion to check duplicates
             default_fields: fields that are used to search by default
             multi_fields: fields that can have multiple values
             compression: Tantivy index compression
             blocksize: Docstore blocksize
-            writer_heap_size_bytes: Tantivy writer heap size in bytes, shared between all threads
-            writer_threads: Tantivy writer threads
-            autocommit_interval_ms: if true then there will be a separate thread committing index every nth milliseconds
-                set by this parameter
             request_id: request id
             session_id: session id
             sort_by_field: (field_name, order)
@@ -218,15 +176,13 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
+                index_engine=index_engine,
                 schema=schema,
                 primary_key=primary_key,
                 default_fields=default_fields,
                 multi_fields=multi_fields,
                 compression=compression,
                 blocksize=blocksize,
-                writer_heap_size_bytes=writer_heap_size_bytes,
-                writer_threads=writer_threads,
-                autocommit_interval_ms=autocommit_interval_ms,
                 sort_by_field=index_service_pb.SortByField(
                     field=sort_by_field[0],
                     order=sort_by_field[1],
@@ -238,7 +194,6 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def delete_consumer(
         self,
-        index_alias: str,
         consumer_name: str,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -247,13 +202,12 @@ class SummaClient(BaseGrpcClient):
         Delete consumer by index and consumer names
 
         Args:
-            index_alias: index alias
             consumer_name: consumer name
             request_id: request id
             session_id: session id
         """
         return await self.stubs['consumer_api'].delete_consumer(
-            consumer_service_pb.DeleteConsumerRequest(index_alias=index_alias, consumer_name=consumer_name),
+            consumer_service_pb.DeleteConsumerRequest(consumer_name=consumer_name),
             metadata=(('request-id', request_id), ('session-id', session_id)),
         )
 
@@ -261,7 +215,7 @@ class SummaClient(BaseGrpcClient):
     async def delete_document(
         self,
         index_alias: str,
-        primary_key: int,
+        primary_key: index_service_pb.PrimaryKey,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentResponse:

@@ -1,31 +1,41 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use futures_util::future::join_all;
 use summa_core::components::{IndexHolder, IndexRegistry};
-use summa_core::configs::{
-    ApplicationConfigHolder, ConfigProxy, ConsumerConfig, IndexConfig, IndexConfigBuilder, IndexConfigFilePartProxy, IndexEngine, Persistable,
-};
+use summa_core::configs::PartialProxy;
+use summa_core::configs::{ConfigProxy, DirectProxy, IndexAttributes};
 use summa_core::directories::DefaultExternalRequestGenerator;
-use summa_core::errors::SummaResult;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_proto::proto;
-use tantivy::IndexSettings;
-use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
+use tantivy::{Index, IndexSettings};
+use tokio::sync::RwLock;
 use tracing::{info, instrument};
 
+use crate::components::{ConsumerManager, PreparedConsumption};
+use crate::configs::{ConsumerConfig, ServerConfig};
 use crate::errors::SummaServerResult;
-use crate::errors::{Error, ValidationError};
+use crate::errors::ValidationError;
 use crate::hyper_external_request::HyperExternalRequest;
-use crate::requests::{validators, AlterIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
+use crate::requests::{AttachIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
 
 /// The main struct responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone)]
 pub struct IndexService {
-    application_config: ApplicationConfigHolder,
+    server_config: Arc<dyn ConfigProxy<ServerConfig>>,
     index_registry: IndexRegistry,
+    consumer_manager: Arc<RwLock<ConsumerManager>>,
+}
+
+impl Default for IndexService {
+    fn default() -> Self {
+        IndexService {
+            server_config: Arc::new(DirectProxy::default()),
+            index_registry: IndexRegistry::default(),
+            consumer_manager: Arc::default(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -39,16 +49,19 @@ impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
 
 /// The main entry point for managing Summa indices
 impl IndexService {
-    /// Read-locked `HashMap` of all indices
-    pub async fn index_holders(&self) -> RwLockReadGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
-        self.index_registry.index_holders().await
+    /// `HashMap` of all indices
+    pub fn index_holders(&self) -> &Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>> {
+        self.index_registry.index_holders()
     }
 
-    /// Write-locked `HashMap` of all indices
-    ///
-    /// Taking this lock means locking metadata modification
-    pub async fn index_holders_mut(&self) -> RwLockWriteGuard<'_, HashMap<String, OwningHandler<IndexHolder>>> {
-        self.index_registry.index_holders_mut().await
+    /// Returns `ConsumerManager`
+    pub fn consumer_manager(&self) -> &Arc<RwLock<ConsumerManager>> {
+        &self.consumer_manager
+    }
+
+    /// Returns server config
+    pub fn server_config(&self) -> &Arc<dyn ConfigProxy<ServerConfig>> {
+        &self.server_config
     }
 
     /// Returns `Handler` to `IndexHolder`.
@@ -59,9 +72,10 @@ impl IndexService {
         Ok(self
             .index_registry
             .get_index_holder_by_name(
-                self.application_config
+                self.server_config
                     .read()
                     .await
+                    .get()
                     .resolve_index_alias(index_alias)
                     .as_deref()
                     .unwrap_or(index_alias),
@@ -69,170 +83,183 @@ impl IndexService {
             .await?)
     }
 
-    /// Creates new `IndexService` with `ApplicationConfigHolder`
-    pub fn new(application_config_holder: &ApplicationConfigHolder) -> IndexService {
+    /// Creates new `IndexService` with `ServerConfigHolder`
+    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<ServerConfig>>) -> IndexService {
         IndexService {
-            application_config: application_config_holder.clone(),
+            server_config: server_config_holder.clone(),
             index_registry: IndexRegistry::default(),
+            consumer_manager: Arc::default(),
         }
     }
 
     /// Create `IndexHolder`s from config
     pub(crate) async fn setup_index_holders(&self) -> SummaServerResult<()> {
         let mut index_holders = HashMap::new();
-        for index_name in self.application_config.read().await.indices.keys() {
-            let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
-            let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
-                &index_config_proxy.read().await.get().index_engine,
-            )
-            .await?;
+        for (index_name, index_engine_config) in self.server_config.read().await.get().application.indices.iter() {
+            let index =
+                IndexHolder::from_index_engine_config::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(index_engine_config)
+                    .await?;
             index_holders.insert(
                 index_name.clone(),
-                OwningHandler::new(IndexHolder::setup(index_name, index, index_config_proxy).await?),
+                OwningHandler::new(
+                    IndexHolder::create_holder(
+                        Arc::new(PartialProxy::new(
+                            &self.server_config,
+                            |server_config| &server_config.application,
+                            |server_config| &mut server_config.application,
+                        )),
+                        index_engine_config.clone(),
+                        index_name,
+                        index,
+                    )
+                    .await?,
+                ),
             );
         }
         info!(action = "index_holders", index_holders = ?index_holders);
-        *self.index_registry.index_holders_mut().await = index_holders;
+        *self.index_registry.index_holders().write().await = index_holders;
+
+        for (consumer_name, consumer_config) in self.server_config.read().await.get().consumer_configs.iter() {
+            let index_holder = self.get_index_holder(&consumer_config.index_name).await?;
+            let prepared_consumption = PreparedConsumption::from_config(consumer_name, consumer_config)?;
+            self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
+        }
+
         Ok(())
     }
 
-    pub(crate) async fn insert_config(&self, index_name: &str, index_config: &IndexConfig) -> SummaServerResult<()> {
-        let mut application_config = self.application_config.write().await;
-        match application_config.indices.entry(index_name.to_owned()) {
-            Entry::Occupied(o) => Err(ValidationError::ExistingIndex(o.key().to_owned())),
+    pub(crate) async fn insert_config(&self, index_name: &str, index_engine_config: &proto::IndexEngineConfig) -> SummaServerResult<()> {
+        let mut server_config = self.server_config.write().await;
+        match server_config.get_mut().application.indices.entry(index_name.to_owned()) {
+            Entry::Occupied(o) => Err(ValidationError::ExistingIndex(format!("{:?}", o.key()))),
             Entry::Vacant(v) => {
-                v.insert(index_config.clone());
+                v.insert(index_engine_config.clone());
                 Ok(())
             }
         }?;
-        application_config.save()?;
+        server_config.commit().await?;
         Ok(())
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
-    #[instrument(skip_all, fields(index_name = index_name))]
-    pub async fn attach_index(&self, index_name: &str) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_path = self.application_config.read().await.get_path_for_index_data(index_name);
-        if !index_path.exists() {
-            return Err(ValidationError::MissingIndex(index_name.to_string()).into());
-        }
-        let index_engine = IndexEngine::File(index_path);
-
-        let index_config = IndexConfigBuilder::default()
-            .index_engine(index_engine.clone())
-            .build()
-            .map_err(summa_core::Error::from)?;
-        self.insert_config(index_name, &index_config).await?;
-        let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, index_name));
-        let index = IndexHolder::open::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
-            &index_config_proxy.read().await.get().index_engine,
-        ).await?;
-        Ok(self.index_registry.add(IndexHolder::setup(index_name, index, index_config_proxy).await?).await)
+    #[instrument(skip_all, fields(index_name = ?attach_index_request.index_name))]
+    pub async fn attach_index(&self, attach_index_request: AttachIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+        let (index, index_engine_config) = match attach_index_request.attach_index_request {
+            proto::attach_index_request::Request::AttachFileEngineRequest(proto::AttachFileEngineRequest {}) => {
+                let index_path = self.server_config.read().await.get().get_path_for_index_data(&attach_index_request.index_name);
+                if !index_path.exists() {
+                    return Err(ValidationError::MissingIndex(attach_index_request.index_name.to_string()).into());
+                }
+                let index = IndexHolder::attach_file_index(&index_path).await?;
+                let index_engine_config = proto::IndexEngineConfig {
+                    config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
+                        path: index_path.to_string_lossy().to_string(),
+                    })),
+                };
+                (index, index_engine_config)
+            }
+            _ => unimplemented!(),
+        };
+        self.insert_config(&attach_index_request.index_name, &index_engine_config).await?;
+        Ok(self
+            .index_registry
+            .add(
+                IndexHolder::create_holder(
+                    Arc::new(PartialProxy::new(
+                        &self.server_config,
+                        |server_config| &server_config.application,
+                        |server_config| &mut server_config.application,
+                    )),
+                    index_engine_config,
+                    &attach_index_request.index_name,
+                    index,
+                )
+                .await?,
+            )
+            .await)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_engine = match create_index_request.index_engine {
-            proto::IndexEngine::Memory => IndexEngine::Memory(create_index_request.schema.clone()),
-            proto::IndexEngine::File => IndexEngine::File(self.application_config.read().await.get_path_for_index_data(&create_index_request.index_name)),
+        let index_attributes = IndexAttributes {
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH).expect("cannot retrieve time").as_secs(),
+            default_fields: create_index_request.default_fields.clone(),
+            primary_key: create_index_request.primary_key.to_owned(),
+            multi_fields: HashSet::from_iter(create_index_request.multi_fields.clone().into_iter()),
         };
-        let mut index_config_builder = IndexConfigBuilder::default();
-        index_config_builder
-            .index_engine(index_engine.clone())
-            .primary_key(create_index_request.primary_key.to_owned())
-            .default_fields(create_index_request.default_fields.clone())
-            .multi_fields(HashSet::from_iter(create_index_request.multi_fields.clone().into_iter()))
-            .autocommit_interval_ms(create_index_request.autocommit_interval_ms);
-        if let Some(writer_threads) = create_index_request.writer_threads {
-            index_config_builder.writer_threads(writer_threads);
-        }
-        if let Some(writer_heap_size_bytes) = create_index_request.writer_heap_size_bytes {
-            index_config_builder.writer_heap_size_bytes(writer_heap_size_bytes);
-        }
-
-        let index_config = index_config_builder.build().map_err(summa_core::Error::from)?;
-        self.insert_config(&create_index_request.index_name, &index_config).await?;
-
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression,
             docstore_blocksize: create_index_request.blocksize.unwrap_or(16384),
             sort_by_field: create_index_request.sort_by_field.clone(),
             ..Default::default()
         };
-        let index_config_proxy = Arc::new(IndexConfigFilePartProxy::new(&self.application_config, &create_index_request.index_name));
-        let index = IndexHolder::create::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
-            &create_index_request.schema,
-            index_settings,
-            &index_config_proxy.read().await.get().index_engine,
-        )
-        .await?;
+        let index_builder = Index::builder()
+            .schema(create_index_request.schema.clone())
+            .settings(index_settings)
+            .attributes(index_attributes);
+        let (index, index_engine_config) = match create_index_request.index_engine {
+            proto::CreateIndexEngineRequest::File => {
+                let index_path = self.server_config.read().await.get().get_path_for_index_data(&create_index_request.index_name);
+                let index = IndexHolder::create_file_index(&index_path, index_builder).await?;
+                let index_engine_config = proto::IndexEngineConfig {
+                    config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
+                        path: index_path.to_string_lossy().to_string(),
+                    })),
+                };
+                (index, index_engine_config)
+            }
+            proto::CreateIndexEngineRequest::Memory => {
+                let index = index_builder.create_in_ram()?;
+                let index_engine_config = proto::IndexEngineConfig {
+                    config: Some(proto::index_engine_config::Config::Memory(proto::MemoryEngineConfig {
+                        schema: serde_yaml::to_string(&index.schema()).expect("cannot serialize"),
+                    })),
+                };
+                (index, index_engine_config)
+            }
+        };
+        self.insert_config(&create_index_request.index_name, &index_engine_config).await?;
         Ok(self
             .index_registry
-            .add(IndexHolder::setup(&create_index_request.index_name, index, index_config_proxy).await?)
+            .add(
+                IndexHolder::create_holder(
+                    Arc::new(PartialProxy::new(
+                        &self.server_config,
+                        |server_config| &server_config.application,
+                        |server_config| &mut server_config.application,
+                    )),
+                    index_engine_config,
+                    &create_index_request.index_name,
+                    index,
+                )
+                .await?,
+            )
             .await)
-    }
-
-    async fn alter_index_settings(&self, alter_index_request: AlterIndexRequest, index_holder: &IndexHolder) -> SummaServerResult<()> {
-        let index_updater = index_holder.index_updater();
-        let mut index_updater = index_updater.write().await;
-        if let Some(compression) = alter_index_request.compression {
-            index_updater.index_mut().settings_mut().docstore_compression = compression
-        }
-        if let Some(blocksize) = alter_index_request.blocksize {
-            index_updater.index_mut().settings_mut().docstore_blocksize = blocksize
-        }
-        if let Some(sort_by_field) = alter_index_request.sort_by_field {
-            index_updater.index_mut().settings_mut().sort_by_field = match sort_by_field.field.as_str() {
-                "" => None,
-                _ => Some(sort_by_field),
-            }
-        }
-        let mut index_config_proxy = index_holder.index_config_proxy().write().await;
-        if let Some(default_fields) = alter_index_request.default_fields {
-            let parsed_default_fields = validators::parse_default_fields(index_holder.schema(), &default_fields)?;
-            index_config_proxy.get_mut().default_fields = parsed_default_fields;
-        }
-        if let Some(multi_fields) = alter_index_request.multi_fields {
-            let parsed_multi_fields = validators::parse_multi_fields(index_holder.schema(), &multi_fields)?;
-            index_config_proxy.get_mut().multi_fields = HashSet::from_iter(parsed_multi_fields.into_iter());
-        }
-        if let Some(primary_key) = alter_index_request.primary_key {
-            let primary_key = validators::parse_primary_key(index_holder.schema(), &Some(primary_key))?;
-            index_config_proxy.get_mut().primary_key = primary_key;
-        }
-        index_config_proxy.commit()?;
-        drop(index_config_proxy);
-        Ok(index_updater.commit(None).await?)
-    }
-
-    /// Alters index
-    #[instrument(skip_all, fields(index_name = ?alter_index_request.index_name))]
-    pub async fn alter_index(&self, alter_index_request: AlterIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_holder = self.index_registry.get_index_holder_by_name(&alter_index_request.index_name).await?;
-        self.alter_index_settings(alter_index_request, &index_holder).await?;
-        index_holder.reload_query_parser().await?;
-        Ok(index_holder)
     }
 
     /// Delete index, optionally with all its aliases and consumers
     #[instrument(skip_all, fields(index_name = ?delete_index_request.index_name))]
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
         let index_holder = {
-            let application_config = self.application_config.write().await;
-            match self.index_registry.index_holders_mut().await.entry(delete_index_request.index_name.to_owned()) {
+            let server_config = self.server_config.write().await;
+            match self
+                .index_registry
+                .index_holders()
+                .write()
+                .await
+                .entry(delete_index_request.index_name.to_owned())
+            {
                 Entry::Occupied(entry) => {
                     let index_holder = entry.get();
-                    let aliases = application_config.get_index_aliases_for_index(&delete_index_request.index_name);
-                    let consumer_names = index_holder.index_updater().read().await.consumer_names();
+                    let aliases = server_config.get().get_index_aliases_for_index(&delete_index_request.index_name);
+                    let has_consumers = self.consumer_manager.read().await.consumer_for(&index_holder.handler()).await.is_some();
 
                     if !aliases.is_empty() {
                         return Err(ValidationError::Aliased(aliases.join(", ")).into());
                     }
-                    if !consumer_names.is_empty() {
-                        return Err(Error::Core(
-                            summa_core::errors::ValidationError::ExistingConsumer(consumer_names.join(", ")).into(),
-                        ));
+                    if has_consumers {
+                        return Err(ValidationError::ExistingConsumer("".to_string()).into());
                     }
                     entry.remove()
                 }
@@ -244,65 +271,72 @@ impl IndexService {
     }
 
     /// Returns all existent consumers for all indices
-    pub async fn get_consumers(&self) -> SummaServerResult<Vec<(String, String)>> {
-        let application_config = self.application_config.read().await;
-        let mut result = Vec::new();
-        for (index_name, index_config) in &application_config.indices {
-            result.extend(
-                index_config
-                    .consumer_configs
-                    .keys()
-                    .map(|consumer_name| (index_name.to_owned(), consumer_name.to_owned())),
-            )
-        }
-        Ok(result)
+    pub async fn get_consumers(&self) -> HashMap<String, ConsumerConfig> {
+        self.server_config.read().await.get().consumer_configs.clone()
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?create_consumer_request.consumer_name))]
     pub async fn create_consumer(&self, create_consumer_request: &CreateConsumerRequest) -> SummaServerResult<String> {
-        let index_holder = self.get_index_holder(&create_consumer_request.index_alias).await?;
-        index_holder
-            .index_updater()
+        let index_holder = self.get_index_holder(&create_consumer_request.consumer_config.index_name).await?;
+        self.consumer_manager
             .write()
             .await
-            .create_consumer(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)
+            .start_consuming(
+                &index_holder,
+                PreparedConsumption::from_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?,
+            )
             .await?;
+        let mut server_config = self.server_config.write().await;
+        server_config.get_mut().consumer_configs.insert(
+            create_consumer_request.consumer_name.to_string(),
+            create_consumer_request.consumer_config.clone(),
+        );
+        server_config.commit().await?;
         Ok(index_holder.index_name().to_owned())
     }
 
     /// Delete consumer from the consumer registry and from `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?delete_consumer_request.consumer_name))]
     pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaServerResult<()> {
-        Ok(self
-            .get_index_holder(&delete_consumer_request.index_alias)
-            .await?
-            .index_updater()
-            .write()
-            .await
-            .delete_consumer(&delete_consumer_request.consumer_name)
-            .await?)
+        let mut server_config = self.server_config.write().await;
+        server_config.get_mut().consumer_configs.remove(&delete_consumer_request.consumer_name);
+        server_config.commit().await?;
+        let index_holder = self.consumer_manager.read().await.find_index_holder_for(&delete_consumer_request.consumer_name);
+        if let Some(index_holder) = index_holder {
+            self.commit(&index_holder).await?;
+        }
+        Ok(())
     }
 
     /// Stopping index holders
-    pub async fn stop(self) -> SummaServerResult<()> {
-        join_all(
-            self.index_registry
-                .index_holders_mut()
-                .await
-                .drain()
-                .map(|(_, index_holder)| async move { index_holder.into_inner().await.stop().await }),
-        )
-        .await
-        .into_iter()
-        .collect::<SummaResult<Vec<_>>>()
-        .map_err(crate::errors::Error::from)?;
+    pub async fn stop(self, force: bool) -> SummaServerResult<()> {
+        if !force {
+            self.consumer_manager.write().await.stop().await?;
+        }
         Ok(())
     }
 
     /// Returns `ConsumerConfig`
-    pub(crate) async fn get_consumer_config(&self, index_alias: &str, consumer_name: &str) -> SummaServerResult<ConsumerConfig> {
-        Ok(self.get_index_holder(index_alias).await?.get_consumer_config(consumer_name).await?)
+    pub(crate) async fn get_consumer_config(&self, consumer_name: &str) -> Option<ConsumerConfig> {
+        self.consumer_manager.read().await.find_consumer_config_for(consumer_name).cloned()
+    }
+
+    /// Commits all and restarts consuming threads
+    #[instrument(skip(self))]
+    pub async fn commit_and_restart_consumption(&self, index_alias: &str) -> SummaServerResult<()> {
+        let index_holder = self.get_index_holder(index_alias).await?;
+        let prepared_consumption = self.commit(&index_holder).await?;
+        self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
+        Ok(())
+    }
+
+    /// Commits all without restarting consuming threads
+    #[instrument(skip(self))]
+    pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<PreparedConsumption> {
+        let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
+        index_holder.index_writer_holder().write().await.commit(None).await?;
+        stopped_consumption.commit_offsets().await
     }
 }
 
@@ -311,18 +345,18 @@ pub(crate) mod tests {
     use std::path::Path;
 
     use summa_core::components::SummaDocument;
-    use summa_core::configs::application_config::tests::create_test_application_config_holder;
     use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
     use summa_proto::proto_traits::query::shortcuts::match_query;
     use tantivy::doc;
     use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
 
     use super::*;
+    use crate::configs::server_config::tests::create_test_server_config_holder;
     use crate::logging;
     use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
 
     pub async fn create_test_index_service(data_path: &Path) -> IndexService {
-        IndexService::new(&create_test_application_config_holder(&data_path))
+        IndexService::new(&create_test_server_config_holder(&data_path))
     }
     pub async fn create_test_index_holder(index_service: &IndexService, schema: &Schema) -> SummaServerResult<Handler<IndexHolder>> {
         index_service
@@ -330,7 +364,7 @@ pub(crate) mod tests {
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
                     .default_fields(vec!["title".to_owned(), "body".to_owned()])
-                    .index_engine(proto::IndexEngine::Memory)
+                    .index_engine(proto::CreateIndexEngineRequest::Memory)
                     .schema(schema.clone())
                     .build()
                     .unwrap(),
@@ -371,7 +405,7 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::IndexEngine::Memory)
+                    .index_engine(proto::CreateIndexEngineRequest::Memory)
                     .schema(create_test_schema())
                     .build()
                     .unwrap(),
@@ -383,7 +417,7 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::IndexEngine::Memory)
+                    .index_engine(proto::CreateIndexEngineRequest::Memory)
                     .schema(create_test_schema())
                     .build()
                     .unwrap(),
@@ -397,14 +431,14 @@ pub(crate) mod tests {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
         let data_path = root_path.path().join("data");
-        let application_config_holder = create_test_application_config_holder(&data_path);
+        let server_config_holder = create_test_server_config_holder(&data_path);
 
-        let index_service = IndexService::new(&application_config_holder);
+        let index_service = IndexService::new(&server_config_holder);
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::IndexEngine::Memory)
+                    .index_engine(proto::CreateIndexEngineRequest::File)
                     .schema(create_test_schema())
                     .build()
                     .unwrap(),
@@ -418,7 +452,7 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::IndexEngine::Memory)
+                    .index_engine(proto::CreateIndexEngineRequest::Memory)
                     .schema(create_test_schema())
                     .build()
                     .unwrap()
@@ -451,7 +485,7 @@ pub(crate) mod tests {
             Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
             schema.get_field("issued_at").unwrap() => 1652986134i64
         ))).await?;
-        index_holder.index_updater().write().await.commit(None).await?;
+        index_holder.index_writer_holder().write().await.commit(None).await?;
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)]).await?,
@@ -504,7 +538,7 @@ pub(crate) mod tests {
                 schema.get_field("issued_at").unwrap() => 110i64
             )))
             .await?;
-        index_holder.index_updater().write().await.commit(None).await?;
+        index_holder.index_writer_holder().write().await.commit(None).await?;
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder

@@ -13,7 +13,7 @@ pub enum KafkaConsumingError {
     #[error("kafka_error: {0}")]
     Kafka(rdkafka::error::KafkaError),
     #[error("parse_document_error: {0}")]
-    ParseDocument(crate::errors::Error),
+    ParseDocument(summa_core::errors::Error),
     #[error("proto_decode_error: {0}")]
     ProtoDecode(prost::DecodeError),
 }

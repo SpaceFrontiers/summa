@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use summa_server::errors::SummaServerResult;
-use summa_server::Application;
+use summa_server::Server;
 use tokio::runtime;
 
 pub fn create_runtime() -> runtime::Runtime {
@@ -18,5 +18,5 @@ pub fn create_runtime() -> runtime::Runtime {
 
 fn main() -> SummaServerResult<()> {
     let runtime = create_runtime();
-    runtime.block_on(Application::proceed_args())
+    runtime.block_on(Server::proceed_args())
 }

@@ -1,12 +1,15 @@
 use futures_util::future::try_join_all;
 use ipfs_api::request::{Add, FilesMkdir};
-use ipfs_api::{IpfsApi, IpfsClient, TryFromUri};
-use summa_core::components::{ComponentFile, IndexHolder};
-use summa_core::configs::{IndexEngine, IpfsConfig};
+use ipfs_api::{IpfsApi, TryFromUri};
+use ipfs_api_backend_hyper::IpfsClient;
+use summa_core::components::ComponentFile;
+use summa_core::components::IndexHolder;
 use summa_core::utils::sync::Handler;
+use summa_proto::proto;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, instrument};
 
+use crate::configs::IpfsConfig;
 use crate::errors::{Error, SummaServerResult};
 use crate::services::differential_updater::RequiredOperation;
 use crate::services::DifferentialUpdater;
@@ -26,18 +29,20 @@ impl BeaconService {
 
     #[instrument(skip_all, fields(index_name = ?index_holder.index_name()))]
     pub async fn publish_index(&self, mfs_path: &str, index_holder: Handler<IndexHolder>, payload: Option<String>) -> SummaServerResult<String> {
-        let index_config = index_holder.index_config_proxy().read().await.get().clone();
         let index_path = {
-            match &index_config.index_engine {
-                IndexEngine::File(index_path) => index_path.to_path_buf(),
-                _ => unreachable!(),
+            match &index_holder.index_engine_config() {
+                proto::IndexEngineConfig {
+                    config: Some(proto::index_engine_config::Config::File(config)),
+                } => &config.path,
+                _ => unimplemented!(),
             }
         };
-        let index_updater = index_holder.index_updater();
         let hash = self.ipfs_config.default_hash.as_deref();
         let chunker = self.ipfs_config.default_chunker.as_deref();
-        let mut index_updater = index_updater.write().await;
-        let hash = index_updater
+        let hash = index_holder
+            .index_writer_holder()
+            .write()
+            .await
             .lock_files(index_path.clone(), payload, |files: Vec<ComponentFile>| async move {
                 self.ipfs_client
                     .files_mkdir_with_options(FilesMkdir {
@@ -77,7 +82,7 @@ impl BeaconService {
                             }
                             RequiredOperation::Add(component_file) => {
                                 let component_file_path = component_file.path().to_string_lossy();
-                                let local_file_path = format!("{}/{}", index_path.to_string_lossy(), component_file_path);
+                                let local_file_path = format!("{}/{}", index_path, component_file_path);
                                 let mfs_file_path = format!("{}/{}", &temporary_path, component_file_path);
                                 info!(action = "write_file", local_file_path = local_file_path, mfs_file_path = mfs_file_path);
                                 let add_response = self

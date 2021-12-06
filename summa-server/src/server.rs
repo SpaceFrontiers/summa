@@ -1,20 +1,23 @@
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_broadcast::Receiver;
 use clap::{arg, command};
 use futures::try_join;
-use summa_core::configs::{ApplicationConfig, ApplicationConfigBuilder, ApplicationConfigHolder, GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder};
+use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 
-use crate::errors::SummaServerResult;
+use crate::configs::server_config::ServerConfigHolder;
+use crate::configs::{GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder, ServerConfig, ServerConfigBuilder};
+use crate::errors::{Error, SummaServerResult};
 use crate::logging;
 use crate::servers::{GrpcServer, MetricsServer};
 use crate::services::{BeaconService, IndexService};
 use crate::utils::signal_channel;
 
-pub struct Application {
-    config: ApplicationConfigHolder,
+pub struct Server {
+    server_config: Arc<dyn ConfigProxy<ServerConfig>>,
 }
 
 const LONG_ABOUT: &str = "
@@ -23,15 +26,9 @@ Fast full-text search server.
 Documentation: https://izihawa.github.io/summa
 ";
 
-impl Application {
-    pub fn from_config(config: ApplicationConfig) -> Application {
-        Application {
-            config: ApplicationConfigHolder::from_config(config),
-        }
-    }
-
-    pub fn from_application_config_holder(config: ApplicationConfigHolder) -> Application {
-        Application { config }
+impl Server {
+    pub fn from_server_config(config: Arc<dyn ConfigProxy<ServerConfig>>) -> Server {
+        Server { server_config: config }
     }
 
     pub async fn proceed_args() -> SummaServerResult<()> {
@@ -68,7 +65,7 @@ impl Application {
                 let grpc_endpoint = submatches.try_get_one::<String>("GRPC_ENDPOINT")?.expect("no value");
                 let metrics_endpoint = submatches.try_get_one::<String>("METRICS_ENDPOINT")?.expect("no value");
                 let ipfs_api_endpoint = submatches.try_get_one::<String>("IPFS_API_ENDPOINT")?;
-                let default_config = ApplicationConfigBuilder::default()
+                let default_config = ServerConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
                     .grpc(
@@ -100,16 +97,20 @@ impl Application {
             }
             Some(("serve", submatches)) => {
                 let config_path = PathBuf::from(submatches.try_get_one::<String>("CONFIG")?.expect("no value"));
-                let application_config_holder = ApplicationConfigHolder::from_path(config_path)?;
+                let server_config_holder = ServerConfigHolder::from_path(config_path)?;
                 let _guards = {
-                    let application_config = application_config_holder.read().await;
-                    if application_config.debug {
+                    let server_config = server_config_holder.read().await;
+                    let log_guards = if server_config.get().debug {
                         logging::default()
                     } else {
-                        logging::file(&application_config.log_path)?
-                    }
+                        logging::file(&server_config.get().log_path)?
+                    };
+                    tokio::fs::create_dir_all(&server_config.get().data_path)
+                        .await
+                        .map_err(|e| Error::IO((e, Some(server_config.get().data_path.clone()))))?;
+                    log_guards
                 };
-                let app = Application::from_application_config_holder(application_config_holder);
+                let app = Server::from_server_config(server_config_holder);
                 app.run().await
             }
             _ => unreachable!("Exhausted list of subcommands and subcommand_required prevents `None`"),
@@ -117,10 +118,12 @@ impl Application {
     }
 
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        let beacon_service = self.config.read().await.ipfs.clone().map(BeaconService::new).transpose()?;
-        let index_service = IndexService::new(&self.config);
-        let metrics_server_future = MetricsServer::new(&self.config)?.start(&index_service, terminator.clone()).await?;
-        let grpc_server_future = GrpcServer::new(&self.config, beacon_service.as_ref(), &index_service)?
+        let beacon_service = self.server_config.read().await.get().ipfs.clone().map(BeaconService::new).transpose()?;
+        let index_service = IndexService::new(&self.server_config);
+        let metrics_server_future = MetricsServer::new(&self.server_config.read().await.get().metrics)?
+            .start(&index_service, terminator.clone())
+            .await?;
+        let grpc_server_future = GrpcServer::new(&self.server_config, beacon_service.as_ref(), &index_service)?
             .start(terminator.clone())
             .await?;
 
@@ -143,13 +146,13 @@ mod tests {
     use std::path::Path;
 
     use async_broadcast::broadcast;
-    use summa_core::configs::application_config::tests::create_test_application_config;
     use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
     use summa_proto::proto;
     use summa_proto::proto::index_api_client::IndexApiClient;
     use tonic::transport::Channel;
 
     use super::*;
+    use crate::configs::server_config::tests::create_test_server_config;
     use crate::services::index_service::tests::create_test_schema;
 
     async fn create_index_api_client(endpoint: &str) -> IndexApiClient<Channel> {
@@ -157,11 +160,15 @@ mod tests {
     }
 
     async fn create_client_server(root_path: &Path) -> SummaServerResult<(ThreadHandler<SummaServerResult<()>>, IndexApiClient<Channel>)> {
-        let config_holder = ApplicationConfigHolder::from_path_or(root_path.join("summa.yaml"), || create_test_application_config(&root_path.join("data")))?;
-        let grpc_endpoint = config_holder.read().await.grpc.endpoint.clone();
+        let server_config_holder = ServerConfigHolder::from_path_or(root_path.join("summa.yaml"), || create_test_server_config(&root_path.join("data")))?;
+        let server_config = server_config_holder.read().await.get().clone();
+        tokio::fs::create_dir_all(&server_config.data_path)
+            .await
+            .map_err(|e| Error::IO((e, Some(server_config.data_path.clone()))))?;
+        let grpc_endpoint = server_config.grpc.endpoint.clone();
         let (server_terminator, receiver) = broadcast::<ControlMessage>(1);
         let thread_handler = ThreadHandler::new(
-            tokio::spawn(Application::from_application_config_holder(config_holder).serve(&receiver).await?),
+            tokio::spawn(Server::from_server_config(server_config_holder).serve(&receiver).await?),
             server_terminator,
         );
         let client = create_index_api_client(&format!("http://{}", &grpc_endpoint)).await;
@@ -176,7 +183,7 @@ mod tests {
         index_api_client
             .create_index(tonic::Request::new(proto::CreateIndexRequest {
                 index_name: index_name.to_owned(),
-                index_engine: proto::IndexEngine::File.into(),
+                index_engine: proto::CreateIndexEngineRequest::File.into(),
                 schema: schema.to_owned(),
                 ..Default::default()
             }))
@@ -202,9 +209,13 @@ mod tests {
         assert_eq!(
             response.into_inner(),
             proto::CreateIndexResponse {
-                index: Some(proto::Index {
+                index: Some(proto::IndexDescription {
                     index_name: "test_index".to_owned(),
-                    index_engine: "File".to_owned(),
+                    index_engine: Some(proto::IndexEngineConfig {
+                        config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
+                            path: root_path.into_path().join("data").join("test_index").to_string_lossy().to_string()
+                        }))
+                    }),
                     ..Default::default()
                 }),
             }
@@ -230,9 +241,13 @@ mod tests {
                 .unwrap()
                 .into_inner(),
             proto::GetIndicesResponse {
-                indices: vec![proto::Index {
+                indices: vec![proto::IndexDescription {
                     index_name: "test_index".to_owned(),
-                    index_engine: "File".to_owned(),
+                    index_engine: Some(proto::IndexEngineConfig {
+                        config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
+                            path: root_path.into_path().join("data").join("test_index").to_string_lossy().to_string()
+                        }))
+                    }),
                     ..Default::default()
                 }]
             }
