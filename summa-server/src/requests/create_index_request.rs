@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use summa_core::errors::BuilderError;
 use summa_proto::proto;
 use tantivy::schema::Schema;
@@ -16,14 +18,9 @@ pub struct CreateIndexRequest {
     pub compression: tantivy::store::Compressor,
     #[builder(default = "None")]
     pub blocksize: Option<usize>,
-    #[builder(default = "Vec::new()")]
-    pub default_fields: Vec<String>,
-    #[builder(default = "Vec::new()")]
-    pub multi_fields: Vec<String>,
-    #[builder(default = "None")]
-    pub primary_key: Option<String>,
     #[builder(default = "None")]
     pub sort_by_field: Option<IndexSortByField>,
+    pub index_attributes: proto::IndexAttributes,
 }
 
 impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
@@ -31,9 +28,12 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
 
     fn try_from(proto_request: proto::CreateIndexRequest) -> SummaServerResult<Self> {
         let schema = validators::parse_schema(&proto_request.schema)?;
-        let default_fields = validators::parse_default_fields(&schema, &proto_request.default_fields)?;
-        let multi_fields = validators::parse_multi_fields(&schema, &proto_request.multi_fields)?;
-        let primary_key = validators::parse_primary_key(&schema, &proto_request.primary_key)?;
+        let mut index_attributes = proto_request.index_attributes.unwrap_or_default();
+        validators::parse_default_fields(&schema, &index_attributes.default_fields)?;
+        validators::parse_multi_fields(&schema, &index_attributes.multi_fields)?;
+        validators::parse_primary_key(&schema, &index_attributes.primary_key)?;
+
+        index_attributes.created_at = SystemTime::now().duration_since(UNIX_EPOCH).expect("cannot retrieve time").as_secs();
 
         let compression = proto::Compression::from_i32(proto_request.compression)
             .map(proto::Compression::into)
@@ -43,12 +43,10 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .index_name(proto_request.index_name)
             .index_engine(proto::CreateIndexEngineRequest::from_i32(proto_request.index_engine).expect("unknown engine"))
             .schema(schema)
-            .primary_key(primary_key)
             .compression(compression)
             .blocksize(proto_request.blocksize.map(|blocksize| blocksize as usize))
-            .default_fields(default_fields)
-            .multi_fields(multi_fields)
             .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
+            .index_attributes(index_attributes)
             .build()
             .map_err(summa_core::Error::from)?)
     }

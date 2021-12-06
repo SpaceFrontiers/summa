@@ -13,7 +13,7 @@ pub struct ApplicationConfig {
     pub indices: HashMap<String, IndexEngineConfig>,
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
-    #[builder(default = "128 * 1024 * 1024")]
+    #[builder(default = "1024 * 1024 * 1024")]
     pub writer_heap_size_bytes: u64,
     #[builder(default = "1")]
     pub writer_threads: u64,
@@ -24,7 +24,7 @@ impl Default for ApplicationConfig {
         ApplicationConfig {
             indices: HashMap::new(),
             autocommit_interval_ms: None,
-            writer_heap_size_bytes: 128 * 1024 * 1024,
+            writer_heap_size_bytes: 1024 * 1024 * 1024,
             writer_threads: 1,
         }
     }

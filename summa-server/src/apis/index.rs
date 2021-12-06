@@ -14,7 +14,7 @@ use summa_proto::proto;
 use tantivy::SegmentId;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, info_span, warn};
+use tracing::{error, info, info_span, warn};
 use tracing_futures::Instrument;
 
 use crate::configs::ServerConfig;
@@ -141,19 +141,24 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let (mut success_docs, mut failed_docs) = (0u64, 0u64);
         let mut elapsed_secs = 0f64;
         let mut in_stream = request.into_inner();
+        let mut last_status_report = Instant::now();
         while let Some(chunk) = in_stream.next().await {
             match chunk {
                 Ok(chunk) => {
+                    info!(action = "received_chunk", index_alias = chunk.index_alias, documents = ?chunk.documents.len());
                     let now = Instant::now();
-                    let (success_bulk_docs, failed_bulk_docs) = self
-                        .index_service
-                        .get_index_holder(&chunk.index_alias)
-                        .await?
-                        .index_bulk(&chunk.documents)
-                        .await;
+                    let index_holder = self.index_service.get_index_holder(&chunk.index_alias).await?;
+                    let (success_bulk_docs, failed_bulk_docs) = index_holder.index_bulk(&chunk.documents).await;
                     elapsed_secs += now.elapsed().as_secs_f64();
                     success_docs += success_bulk_docs;
                     failed_docs += failed_bulk_docs;
+                    if last_status_report.elapsed().as_secs_f64() > 60f64 {
+                        info!(action = "indexed", success_docs = success_docs, failed_docs = failed_docs);
+                        last_status_report = Instant::now();
+                    }
+                    if self.index_service.should_terminate() {
+                        break;
+                    }
                 }
                 Err(err) => {
                     if let Some(io_err) = match_for_io_error(&err) {

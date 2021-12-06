@@ -10,10 +10,10 @@ use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 const ENV_FILTER: &str = "librdkafka=trace,\
     rdkafka::client=debug,\
+    summa_core::components=info,\
     summa_server::services=info,\
-    summa_server::search_engine=info,\
+    summa_server::components=info,\
     summa_server::servers[lifecycle]=info,\
-    summa_server::consumers=info,\
     tantivy,\
     fastfield_codecs=debug,\
     warn";

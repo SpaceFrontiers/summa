@@ -19,7 +19,7 @@ use tower::ServiceBuilder;
 use tower_http::classify::GrpcFailureClass;
 use tower_http::set_header::SetRequestHeaderLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, info_span, instrument, warn, Span};
+use tracing::{info, info_span, instrument, warn, Instrument, Span};
 
 use super::base::BaseServer;
 use crate::apis::beacon::BeaconApiImpl;
@@ -93,6 +93,8 @@ impl GrpcServer {
             .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("session-id"), |_: &_| {
                 Some(HeaderValue::from_str(&generate_request_id()).expect("invalid generated session id"))
             }))
+            .concurrency_limit(10)
+            .buffer(100)
             .layer(
                 TraceLayer::new_for_grpc()
                     .make_span_with(GrpcServer::set_span)
@@ -126,6 +128,7 @@ impl GrpcServer {
                     let service_result = self.index_service.stop(false).await;
                     info!(action = "terminated", result = ?service_result);
                 })
+                .instrument(info_span!("lifecycle"))
                 .await?;
             Ok(())
         };

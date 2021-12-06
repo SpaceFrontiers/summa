@@ -34,6 +34,15 @@ from .proto.utils_pb2 import (  # noqa
 )
 
 
+def setup_metadata(session_id, request_id):
+    metadata = []
+    if session_id:
+        metadata.append(('session-id', session_id))
+    if request_id:
+        metadata.append(('request-id', request_id))
+    return metadata
+
+
 class SummaClient(BaseGrpcClient):
     stub_clses = {
         'beacon_api': BeaconApiStub,
@@ -47,9 +56,9 @@ class SummaClient(BaseGrpcClient):
     async def attach_index(
         self,
         index_name: str,
-        attach_file_engine_request: index_service_pb.AttachFileEngineRequest | Dict | None,
-        attach_remote_engine_request: index_service_pb.AttachRemoteEngineRequest | Dict | None,
-        attach_ipfs_engine_request: index_service_pb.AttachIpfsEngineRequest | Dict | None,
+        attach_file_engine_request: Optional[Union[index_service_pb.AttachFileEngineRequest, Dict]] = None,
+        attach_remote_engine_request: Optional[Union[index_service_pb.AttachRemoteEngineRequest, Dict]] = None,
+        attach_ipfs_engine_request: Optional[Union[index_service_pb.AttachIpfsEngineRequest, Dict]] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.AttachIndexResponse:
@@ -71,7 +80,7 @@ class SummaClient(BaseGrpcClient):
                 attach_remote_engine_request=attach_remote_engine_request,
                 attach_ipfs_engine_request=attach_ipfs_engine_request,
             ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -100,7 +109,7 @@ class SummaClient(BaseGrpcClient):
                 index_alias=index_alias,
                 commit_mode=commit_mode,
             ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -135,23 +144,21 @@ class SummaClient(BaseGrpcClient):
                 index_name=index_name,
                 topics=topics,
             ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose(with_from_file=True)
     async def create_index(
         self,
         index_name: str,
-        index_engine: str | index_service_pb.CreateIndexEngineRequest,
+        index_engine: str,
         schema: str,
-        primary_key: str | None = None,
-        default_fields: List[str] | None = None,
-        multi_fields: List[str] | None = None,
-        compression: str | int | None = None,
-        blocksize: int | None = None,
-        sort_by_field: Tuple | None = None,
-        request_id: str | None = None,
-        session_id: str | None = None,
+        compression: Optional[Union[str, int]] = None,
+        blocksize: Optional[int] = None,
+        sort_by_field: Optional[Tuple] = None,
+        index_attributes: Optional[Dict] = None,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
         """
         Create index
@@ -160,11 +167,9 @@ class SummaClient(BaseGrpcClient):
             index_name: index name
             index_engine: "File" or "Memory"
             schema: Tantivy index schema
-            primary_key: primary key is used during insertion to check duplicates
-            default_fields: fields that are used to search by default
-            multi_fields: fields that can have multiple values
             compression: Tantivy index compression
             blocksize: Docstore blocksize
+            index_attributes: Various index attributes such as default fields, multi fields, primary keys etc.
             request_id: request id
             session_id: session id
             sort_by_field: (field_name, order)
@@ -178,17 +183,15 @@ class SummaClient(BaseGrpcClient):
                 index_name=index_name,
                 index_engine=index_engine,
                 schema=schema,
-                primary_key=primary_key,
-                default_fields=default_fields,
-                multi_fields=multi_fields,
                 compression=compression,
                 blocksize=blocksize,
+                index_attributes=index_attributes,
                 sort_by_field=index_service_pb.SortByField(
                     field=sort_by_field[0],
                     order=sort_by_field[1],
                 ) if sort_by_field else None
             ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -208,7 +211,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['consumer_api'].delete_consumer(
             consumer_service_pb.DeleteConsumerRequest(consumer_name=consumer_name),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -233,7 +236,7 @@ class SummaClient(BaseGrpcClient):
                 index_alias=index_alias,
                 primary_key=primary_key,
             ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -253,7 +256,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].delete_index(
             index_service_pb.DeleteIndexRequest(index_name=index_name),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -275,7 +278,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['consumer_api'].get_consumer(
             consumer_service_pb.GetConsumerRequest(consumer_name=consumer_name),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -295,7 +298,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['consumer_api'].get_consumers(
             consumer_service_pb.GetConsumersRequest(),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -317,7 +320,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].get_index(
             index_service_pb.GetIndexRequest(index_alias=index_alias),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -337,7 +340,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].get_indices(
             index_service_pb.GetIndicesRequest(),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -357,7 +360,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].get_indices_aliases(
             index_service_pb.GetIndicesAliasesRequest(),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -403,7 +406,7 @@ class SummaClient(BaseGrpcClient):
 
         return await self.stubs['index_api'].index_document_stream(
             documents_portion_iter(),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -428,7 +431,7 @@ class SummaClient(BaseGrpcClient):
                 index_alias=index_alias,
                 document=json.dumps(document) if isinstance(document, dict) else document,
             ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -470,7 +473,7 @@ class SummaClient(BaseGrpcClient):
                 search_request.collectors.append(collector)
             return await self.stubs['search_api'].search(
                 search_request,
-                metadata=(('request-id', request_id), ('session-id', session_id)),
+                metadata=setup_metadata(session_id, request_id),
             )
         except AioRpcError as e:
             if ignore_not_found and e.code() == StatusCode.NOT_FOUND:
@@ -496,7 +499,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].merge_segments(
             index_service_pb.MergeSegmentsRequest(index_alias=index_alias, segment_ids=segment_ids),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -520,7 +523,7 @@ class SummaClient(BaseGrpcClient):
             payload = json.dumps(payload)
         return await self.stubs['beacon_api'].publish_index(
             beacon_service_pb.PublishIndexRequest(index_alias=index_alias, payload=payload),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -542,7 +545,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].set_index_alias(
             index_service_pb.SetIndexAliasRequest(index_alias=index_alias, index_name=index_name),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -562,7 +565,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].vacuum_index(
             index_service_pb.VacuumIndexRequest(index_alias=index_alias),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
@@ -590,5 +593,5 @@ class SummaClient(BaseGrpcClient):
                 field_name=field_name,
                 top_k=top_k,
             ),
-            metadata=(('request-id', request_id), ('session-id', session_id)),
+            metadata=setup_metadata(session_id, request_id),
         )

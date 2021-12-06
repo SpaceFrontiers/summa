@@ -7,6 +7,7 @@ use clap::{arg, command};
 use futures::try_join;
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
+use tracing::{info, info_span, Instrument};
 
 use crate::configs::server_config::ServerConfigHolder;
 use crate::configs::{GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder, ServerConfig, ServerConfigBuilder};
@@ -130,8 +131,10 @@ impl Server {
         Ok(async move {
             index_service.setup_index_holders().await?;
             try_join!(metrics_server_future, grpc_server_future)?;
+            info!(action = "all_systems_down");
             Ok(())
-        })
+        }
+        .instrument(info_span!("lifecycle")))
     }
 
     async fn run(&self) -> SummaServerResult<()> {

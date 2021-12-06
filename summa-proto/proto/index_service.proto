@@ -85,16 +85,25 @@ enum CreateIndexEngineRequest {
   Memory = 1;
 }
 
+message IndexAttributes {
+  uint64 created_at = 1;
+  optional string primary_key = 2;
+  repeated string default_fields = 3;
+  repeated string multi_fields = 4;
+  optional string default_index_name = 5;
+  optional string description = 6;
+  repeated string default_snippets = 7;
+}
+
 message CreateIndexRequest {
   string index_name = 1;
   CreateIndexEngineRequest index_engine = 2;
   string schema = 3;
-  optional string primary_key = 4;
-  repeated string default_fields = 5;
-  repeated string multi_fields = 6;
-  Compression compression = 7;
-  optional uint32 blocksize = 8;
-  optional SortByField sort_by_field = 9;
+  Compression compression = 4;
+  optional uint32 blocksize = 5;
+  optional SortByField sort_by_field = 6;
+
+  IndexAttributes index_attributes = 7;
 }
 
 message CreateIndexResponse {
@@ -112,7 +121,9 @@ message DeleteIndexRequest {
   string index_name = 1;
 }
 
-message DeleteIndexResponse {}
+message DeleteIndexResponse {
+  string index_name = 1;
+}
 
 message GetIndicesAliasesRequest {}
 

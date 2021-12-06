@@ -104,6 +104,7 @@ impl ConsumerManager {
     /// Stops all consuming threads
     #[instrument(skip(self))]
     pub async fn stop(&mut self) -> SummaServerResult<()> {
+        info!(action = "stopping");
         join_all(self.consumptions.drain().map(|(index_holder, consumer_thread)| async move {
             consumer_thread.stop().await?;
             let stopped_consumption = StoppedConsumption { consumer_thread };
@@ -118,10 +119,13 @@ impl ConsumerManager {
 
     /// Stops particular `IndexHolder`
     #[instrument(skip(self))]
-    pub async fn stop_consuming_for(&mut self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<StoppedConsumption> {
-        let consumer_thread = self.consumptions.remove(index_holder).expect("no index");
-        consumer_thread.stop().await?;
-        Ok(StoppedConsumption { consumer_thread })
+    pub async fn stop_consuming_for(&mut self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<StoppedConsumption>> {
+        if let Some(consumer_thread) = self.consumptions.remove(index_holder) {
+            consumer_thread.stop().await?;
+            Ok(Some(StoppedConsumption { consumer_thread }))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn consumer_for(&self, index_holder: &Handler<IndexHolder>) -> Option<&ConsumerThread> {

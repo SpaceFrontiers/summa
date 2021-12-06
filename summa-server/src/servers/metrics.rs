@@ -19,6 +19,7 @@ use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument};
+use tracing_futures::Instrument;
 
 use super::base::BaseServer;
 use crate::components::IndexMeter;
@@ -128,9 +129,10 @@ impl MetricsServer {
         });
 
         Ok(async move {
-            graceful.await?;
-            info!(action = "terminated");
+            let result = graceful.await;
+            info!(action = "terminated", result = ?result);
             Ok(())
-        })
+        }
+        .instrument(info_span!("lifecycle")))
     }
 }

@@ -27,7 +27,7 @@ use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
-use crate::configs::{ApplicationConfig, ConfigProxy, IndexAttributes};
+use crate::configs::{ApplicationConfig, ConfigProxy};
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory};
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
@@ -55,6 +55,17 @@ impl Hash for IndexHolder {
 impl PartialEq<Self> for IndexHolder {
     fn eq(&self, other: &Self) -> bool {
         self.index_name.eq(&other.index_name)
+    }
+}
+
+impl Debug for IndexHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("IndexHolder")
+            .field("index_name", &self.index_name)
+            .field("index_engine_config", &self.index_engine_config)
+            .field("index_settings", &self.index.settings())
+            .field("index_attributes", &self.index_attributes())
+            .finish()
     }
 }
 
@@ -214,7 +225,7 @@ impl IndexHolder {
     }
 
     /// Load index attributes from meta.json
-    pub fn index_attributes(&self) -> SummaResult<Option<IndexAttributes>> {
+    pub fn index_attributes(&self) -> SummaResult<Option<proto::IndexAttributes>> {
         Ok(self.index.load_metas()?.attributes()?)
     }
 
@@ -398,14 +409,8 @@ impl IndexHolder {
     }
 
     /// Commits index
-    #[instrument(skip(self, payload))]
+    #[instrument(skip(self))]
     pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
         self.index_writer_holder.write().await.commit(payload).await
-    }
-}
-
-impl Debug for IndexHolder {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("IndexHolder").field("index_name", &self.index_name).finish()
     }
 }

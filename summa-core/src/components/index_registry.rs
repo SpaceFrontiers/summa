@@ -32,6 +32,10 @@ impl IndexRegistry {
         &self.index_holders
     }
 
+    pub async fn clear(self) {
+        self.index_holders().write().await.clear();
+    }
+
     /// Retrieve `IndexHolder` by its name
     pub async fn get_index_holder_by_name(&self, index_name: &str) -> SummaResult<Handler<IndexHolder>> {
         Ok(self

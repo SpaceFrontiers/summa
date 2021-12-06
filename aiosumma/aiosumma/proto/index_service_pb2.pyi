@@ -7,43 +7,14 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Map
 
 Async: CommitMode
 Brotli: Compression
-CreateFileEngine: CreateIndexEngineRequest
-CreateMemoryEngine: CreateIndexEngineRequest
 DESCRIPTOR: _descriptor.FileDescriptor
+File: CreateIndexEngineRequest
 Lz4: Compression
+Memory: CreateIndexEngineRequest
 None: Compression
 Snappy: Compression
 Sync: CommitMode
 Zstd: Compression
-
-class AlterIndexRequest(_message.Message):
-    __slots__ = ["blocksize", "compression", "default_fields", "index_name", "multi_fields", "primary_key", "sort_by_field"]
-    class Fields(_message.Message):
-        __slots__ = ["fields"]
-        FIELDS_FIELD_NUMBER: _ClassVar[int]
-        fields: _containers.RepeatedScalarFieldContainer[str]
-        def __init__(self, fields: _Optional[_Iterable[str]] = ...) -> None: ...
-    BLOCKSIZE_FIELD_NUMBER: _ClassVar[int]
-    COMPRESSION_FIELD_NUMBER: _ClassVar[int]
-    DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
-    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
-    PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
-    SORT_BY_FIELD_FIELD_NUMBER: _ClassVar[int]
-    blocksize: int
-    compression: Compression
-    default_fields: AlterIndexRequest.Fields
-    index_name: str
-    multi_fields: AlterIndexRequest.Fields
-    primary_key: str
-    sort_by_field: SortByField
-    def __init__(self, index_name: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., default_fields: _Optional[_Union[AlterIndexRequest.Fields, _Mapping]] = ..., multi_fields: _Optional[_Union[AlterIndexRequest.Fields, _Mapping]] = ..., primary_key: _Optional[str] = ...) -> None: ...
-
-class AlterIndexResponse(_message.Message):
-    __slots__ = ["index"]
-    INDEX_FIELD_NUMBER: _ClassVar[int]
-    index: IndexDescription
-    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class AttachFileEngineRequest(_message.Message):
     __slots__ = []
@@ -68,8 +39,10 @@ class AttachIndexResponse(_message.Message):
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class AttachIpfsEngineRequest(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+    __slots__ = ["cid"]
+    CID_FIELD_NUMBER: _ClassVar[int]
+    cid: str
+    def __init__(self, cid: _Optional[str] = ...) -> None: ...
 
 class AttachRemoteEngineRequest(_message.Message):
     __slots__ = []
@@ -98,26 +71,22 @@ class CommitIndexResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
 
 class CreateIndexRequest(_message.Message):
-    __slots__ = ["blocksize", "compression", "default_fields", "index_engine", "index_name", "multi_fields", "primary_key", "schema", "sort_by_field"]
+    __slots__ = ["blocksize", "compression", "index_attributes", "index_engine", "index_name", "schema", "sort_by_field"]
     BLOCKSIZE_FIELD_NUMBER: _ClassVar[int]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
-    DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_ATTRIBUTES_FIELD_NUMBER: _ClassVar[int]
     INDEX_ENGINE_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
-    PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
     SCHEMA_FIELD_NUMBER: _ClassVar[int]
     SORT_BY_FIELD_FIELD_NUMBER: _ClassVar[int]
     blocksize: int
     compression: Compression
-    default_fields: _containers.RepeatedScalarFieldContainer[str]
+    index_attributes: IndexAttributes
     index_engine: CreateIndexEngineRequest
     index_name: str
-    multi_fields: _containers.RepeatedScalarFieldContainer[str]
-    primary_key: str
     schema: str
     sort_by_field: SortByField
-    def __init__(self, index_name: _Optional[str] = ..., index_engine: _Optional[_Union[CreateIndexEngineRequest, str]] = ..., schema: _Optional[str] = ..., primary_key: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., index_engine: _Optional[_Union[CreateIndexEngineRequest, str]] = ..., schema: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ...) -> None: ...
 
 class CreateIndexResponse(_message.Message):
     __slots__ = ["index"]
@@ -191,6 +160,24 @@ class GetIndicesResponse(_message.Message):
     INDICES_FIELD_NUMBER: _ClassVar[int]
     indices: _containers.RepeatedCompositeFieldContainer[IndexDescription]
     def __init__(self, indices: _Optional[_Iterable[_Union[IndexDescription, _Mapping]]] = ...) -> None: ...
+
+class IndexAttributes(_message.Message):
+    __slots__ = ["created_at", "default_fields", "default_index_name", "default_snippets", "description", "multi_fields", "primary_key"]
+    CREATED_AT_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_SNIPPETS_FIELD_NUMBER: _ClassVar[int]
+    DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
+    MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
+    created_at: int
+    default_fields: _containers.RepeatedScalarFieldContainer[str]
+    default_index_name: str
+    default_snippets: _containers.RepeatedScalarFieldContainer[str]
+    description: str
+    multi_fields: _containers.RepeatedScalarFieldContainer[str]
+    primary_key: str
+    def __init__(self, created_at: _Optional[int] = ..., primary_key: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ["compression", "index_aliases", "index_engine", "index_name", "num_docs"]

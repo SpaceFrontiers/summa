@@ -1,17 +1,17 @@
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use summa_core::components::{IndexHolder, IndexRegistry};
 use summa_core::configs::PartialProxy;
-use summa_core::configs::{ConfigProxy, DirectProxy, IndexAttributes};
+use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_proto::proto;
 use tantivy::{Index, IndexSettings};
 use tokio::sync::RwLock;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::configs::{ConsumerConfig, ServerConfig};
@@ -26,6 +26,7 @@ pub struct IndexService {
     server_config: Arc<dyn ConfigProxy<ServerConfig>>,
     index_registry: IndexRegistry,
     consumer_manager: Arc<RwLock<ConsumerManager>>,
+    should_terminate: Arc<AtomicBool>,
 }
 
 impl Default for IndexService {
@@ -34,16 +35,29 @@ impl Default for IndexService {
             server_config: Arc::new(DirectProxy::default()),
             index_registry: IndexRegistry::default(),
             consumer_manager: Arc::default(),
+            should_terminate: Arc::default(),
         }
     }
 }
 
 #[derive(Default)]
-pub struct DeleteIndexResult {}
+pub struct DeleteIndexResult {
+    index_name: String,
+}
+
+impl DeleteIndexResult {
+    pub fn new(index_name: &str) -> DeleteIndexResult {
+        DeleteIndexResult {
+            index_name: index_name.to_string(),
+        }
+    }
+}
 
 impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
-    fn from(_delete_index_request: DeleteIndexResult) -> Self {
-        proto::DeleteIndexResponse {}
+    fn from(delete_index_request: DeleteIndexResult) -> Self {
+        proto::DeleteIndexResponse {
+            index_name: delete_index_request.index_name,
+        }
     }
 }
 
@@ -62,6 +76,11 @@ impl IndexService {
     /// Returns server config
     pub fn server_config(&self) -> &Arc<dyn ConfigProxy<ServerConfig>> {
         &self.server_config
+    }
+
+    /// Flag meaning that all dependent operations should be ended as soon as possible
+    pub fn should_terminate(&self) -> bool {
+        self.should_terminate.load(Ordering::Relaxed)
     }
 
     /// Returns `Handler` to `IndexHolder`.
@@ -89,6 +108,7 @@ impl IndexService {
             server_config: server_config_holder.clone(),
             index_registry: IndexRegistry::default(),
             consumer_manager: Arc::default(),
+            should_terminate: Arc::default(),
         }
     }
 
@@ -116,7 +136,7 @@ impl IndexService {
                 ),
             );
         }
-        info!(action = "index_holders", index_holders = ?index_holders);
+        info!(action = "setting_index_holders", index_holders = ?index_holders);
         *self.index_registry.index_holders().write().await = index_holders;
 
         for (consumer_name, consumer_config) in self.server_config.read().await.get().consumer_configs.iter() {
@@ -182,12 +202,7 @@ impl IndexService {
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_attributes = IndexAttributes {
-            created_at: SystemTime::now().duration_since(UNIX_EPOCH).expect("cannot retrieve time").as_secs(),
-            default_fields: create_index_request.default_fields.clone(),
-            primary_key: create_index_request.primary_key.to_owned(),
-            multi_fields: HashSet::from_iter(create_index_request.multi_fields.clone().into_iter()),
-        };
+        let index_attributes = create_index_request.index_attributes;
         let index_settings = IndexSettings {
             docstore_compression: create_index_request.compression,
             docstore_blocksize: create_index_request.blocksize.unwrap_or(16384),
@@ -242,32 +257,46 @@ impl IndexService {
     #[instrument(skip_all, fields(index_name = ?delete_index_request.index_name))]
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
         let index_holder = {
-            let server_config = self.server_config.write().await;
-            match self
-                .index_registry
-                .index_holders()
-                .write()
-                .await
-                .entry(delete_index_request.index_name.to_owned())
-            {
-                Entry::Occupied(entry) => {
-                    let index_holder = entry.get();
-                    let aliases = server_config.get().get_index_aliases_for_index(&delete_index_request.index_name);
-                    let has_consumers = self.consumer_manager.read().await.consumer_for(&index_holder.handler()).await.is_some();
-
+            let mut server_config = self.server_config.write().await;
+            let aliases = server_config.get().get_index_aliases_for_index(&delete_index_request.index_name);
+            match (
+                self.index_registry
+                    .index_holders()
+                    .write()
+                    .await
+                    .entry(delete_index_request.index_name.to_owned()),
+                server_config.get_mut().application.indices.entry(delete_index_request.index_name.to_owned()),
+            ) {
+                (Entry::Occupied(index_holder_entry), Entry::Occupied(config_entry)) => {
+                    let index_holder = index_holder_entry.get();
+                    let has_consumer = self.consumer_manager.read().await.consumer_for(&index_holder.handler()).await.is_some();
                     if !aliases.is_empty() {
                         return Err(ValidationError::Aliased(aliases.join(", ")).into());
                     }
-                    if has_consumers {
+                    if has_consumer {
                         return Err(ValidationError::ExistingConsumer("".to_string()).into());
                     }
-                    entry.remove()
+                    config_entry.remove();
+                    let index_holder = index_holder_entry.remove();
+                    server_config.commit().await?;
+                    index_holder
                 }
-                Entry::Vacant(_) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
+                (Entry::Vacant(_), Entry::Vacant(_)) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
+                (Entry::Occupied(index_holder_entry), Entry::Vacant(_)) => {
+                    warn!(error = "missing_config");
+                    index_holder_entry.remove()
+                }
+                (Entry::Vacant(_), Entry::Occupied(config_entry)) => {
+                    warn!(error = "missing_index_holder");
+                    config_entry.remove();
+                    server_config.commit().await?;
+                    return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into());
+                }
             }
         };
+        let index_name = index_holder.index_name().to_string();
         index_holder.into_inner().await.delete().await?;
-        Ok(DeleteIndexResult::default())
+        Ok(DeleteIndexResult::new(&index_name))
     }
 
     /// Returns all existent consumers for all indices
@@ -311,6 +340,7 @@ impl IndexService {
 
     /// Stopping index holders
     pub async fn stop(self, force: bool) -> SummaServerResult<()> {
+        self.should_terminate.store(true, Ordering::Relaxed);
         if !force {
             self.consumer_manager.write().await.stop().await?;
         }
@@ -323,20 +353,24 @@ impl IndexService {
     }
 
     /// Commits all and restarts consuming threads
-    #[instrument(skip(self))]
     pub async fn commit_and_restart_consumption(&self, index_alias: &str) -> SummaServerResult<()> {
         let index_holder = self.get_index_holder(index_alias).await?;
         let prepared_consumption = self.commit(&index_holder).await?;
-        self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
+        if let Some(prepared_consumption) = prepared_consumption {
+            self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
+        }
         Ok(())
     }
 
     /// Commits all without restarting consuming threads
-    #[instrument(skip(self))]
-    pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<PreparedConsumption> {
+    #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
+    pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         index_holder.index_writer_holder().write().await.commit(None).await?;
-        stopped_consumption.commit_offsets().await
+        Ok(match stopped_consumption {
+            Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
+            None => None,
+        })
     }
 }
 

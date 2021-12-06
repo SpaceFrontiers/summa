@@ -9,7 +9,7 @@ use tracing::info;
 
 use super::SummaSegmentAttributes;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
-use crate::configs::{ApplicationConfig, IndexAttributes};
+use crate::configs::ApplicationConfig;
 use crate::errors::{SummaResult, ValidationError};
 
 #[derive(Clone)]
@@ -173,7 +173,7 @@ impl IndexWriterHolder {
         let primary_key = index
             .load_metas()?
             .attributes()?
-            .and_then(|attributes: IndexAttributes| {
+            .and_then(|attributes: proto::IndexAttributes| {
                 attributes.primary_key.map(|primary_key| {
                     index
                         .schema()
@@ -256,7 +256,10 @@ impl IndexWriterHolder {
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
     pub async fn commit(&mut self, payload: Option<String>) -> SummaResult<()> {
-        self.index_writer.commit(payload).await
+        info!(action = "commit");
+        let result = self.index_writer.commit(payload).await;
+        info!(action = "committed");
+        result
     }
 
     pub async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {

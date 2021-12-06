@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
@@ -48,10 +48,15 @@ impl<T> Deref for Handler<T> {
 
 /// `OwningHandler` is like [Arc](std::sync::Arc) but with additional possibility to wait until
 /// the last strong reference drops and then return wrapped data.
-#[derive(Debug)]
 pub struct OwningHandler<T> {
     handler: Handler<T>,
     receiver: UnboundedReceiver<()>,
+}
+
+impl<T: Debug> Debug for OwningHandler<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        T::fmt(&**self.handler.data, f)
+    }
 }
 
 impl<T: Default> Default for OwningHandler<T> {

@@ -87,79 +87,92 @@ class IndexApiServicer(object):
     """
 
     def attach_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Attaches index to Summa server. Attaching allows to incorporate and start using of downloaded or network indices
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def commit_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Committing all collected writes to the index
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def create_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Creates new index from scratch
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def delete_document(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Deletes single document from the index by its primary key (therefore, index must have primary key)
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def delete_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Deletes index and physically removes file in the case of `FileEngine`
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def get_indices_aliases(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Gets all existing index aliases
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def get_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Gets index description
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def get_indices(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Gets all existing index descriptions
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def index_document_stream(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """Adds document to the index in a streaming way
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def index_document(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Adds document to the index
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def merge_segments(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Merges multiple segments into a single one. Used for service purposes
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def set_index_alias(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Sets or replaces existing index alias
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def vacuum_index(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """Removes deletions from all segments
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

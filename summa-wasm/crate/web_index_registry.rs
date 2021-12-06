@@ -1,7 +1,6 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry, SummaDocument};
 use summa_core::configs::{ApplicationConfigBuilder, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;

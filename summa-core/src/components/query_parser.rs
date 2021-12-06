@@ -15,7 +15,6 @@ use tantivy::query::{
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
 
-use crate::configs::IndexAttributes;
 use crate::errors::{Error, SummaResult, ValidationError};
 #[cfg(feature = "metrics")]
 use crate::metrics::ToLabel;
@@ -77,7 +76,7 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
 impl QueryParser {
     pub fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
         let index_meta = index.load_metas()?;
-        let attributes: Option<IndexAttributes> = index_meta.attributes()?;
+        let attributes: Option<proto::IndexAttributes> = index_meta.attributes()?;
         let default_fields = attributes
             .map(|attributes| attributes.default_fields)
             .unwrap_or_else(Vec::new)

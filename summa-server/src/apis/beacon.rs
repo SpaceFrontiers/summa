@@ -32,12 +32,15 @@ impl proto::beacon_api_server::BeaconApi for BeaconApiImpl {
             .beacon_service
             .publish_index(&format!("/index/{}", index_holder.index_name()), index_holder.clone(), proto_request.payload)
             .await?;
-        self.index_service
-            .consumer_manager()
-            .write()
-            .await
-            .start_consuming(&index_holder, prepared_consumption)
-            .await?;
+        if let Some(prepared_consumption) = prepared_consumption {
+            self.index_service
+                .consumer_manager()
+                .write()
+                .await
+                .start_consuming(&index_holder, prepared_consumption)
+                .await?;
+        }
+
         Ok(Response::new(proto::PublishIndexResponse { hash }))
     }
 }
