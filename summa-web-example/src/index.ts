@@ -35,13 +35,13 @@ const remote_engine_config = {
 }
 
 // `index_payload` is the payload we have stored in index when have been publishing it
-const index_payload = await web_index_service_worker.add({config: { remote: remote_engine_config}});
+const index_name = await web_index_service_worker.add({config: { remote: remote_engine_config}});
 const omnibox = document.getElementById("omnibox");
 
 omnibox.onkeydown = ((e) => {
     if(e.code == "Enter") {
         const index_query = {
-            index_name: index_payload["name"],
+            index_name: index_name,
             query: {query: {match: {value: (omnibox as HTMLInputElement).value}}},
             collectors: [{collector: {top_docs: {limit: 5}}}],
         }

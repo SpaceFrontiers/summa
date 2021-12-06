@@ -669,6 +669,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d240c8aab8f3f9906bd3bd67a5a2104da85525b28462b396923db6f11a898aa"
 
 [[package]]
+name = "fastfield_codecs"
+version = "0.2.0"
+dependencies = [
+ "fastdivide",
+ "itertools",
+ "log",
+ "ownedbytes",
+ "tantivy-bitpacker",
+ "tantivy-common",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1579,6 +1591,13 @@ name = "overload"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
+
+[[package]]
+name = "ownedbytes"
+version = "0.3.0"
+dependencies = [
+ "stable_deref_trait",
+]
 
 [[package]]
 name = "parity-multiaddr"
@@ -2509,9 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "summavy"
-version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa5cb8046f7473ad689bf8d5fd9a84fc6c85cd778b2d676e1ce91f58d054fd60"
+version = "0.24.0"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2526,6 +2543,7 @@ dependencies = [
  "downcast-rs",
  "fail",
  "fastdivide",
+ "fastfield_codecs",
  "fs2",
  "futures",
  "htmlescape",
@@ -2539,6 +2557,7 @@ dependencies = [
  "num_cpus",
  "once_cell",
  "oneshot",
+ "ownedbytes",
  "rayon",
  "regex",
  "rust-stemmers",
@@ -2547,68 +2566,16 @@ dependencies = [
  "serde_json",
  "smallvec",
  "stable_deref_trait",
- "summavy-bitpacker",
- "summavy-common",
- "summavy-ownedbytes",
- "summavy-query-grammar",
- "summavy_codecs",
+ "tantivy-bitpacker",
+ "tantivy-common",
  "tantivy-fst",
+ "tantivy-query-grammar",
  "tempfile",
  "thiserror",
  "time",
  "uuid",
  "winapi",
  "zstd",
-]
-
-[[package]]
-name = "summavy-bitpacker"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e4f9133e7d5f2e2dde6a63e0e42898d36f642806aea8b962249275411eb2ac0"
-
-[[package]]
-name = "summavy-common"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c66ca45f473362ccfb91776b514a00a75aa606bedfc0f9879198b8910bc8aad"
-dependencies = [
- "byteorder",
- "summavy-ownedbytes",
-]
-
-[[package]]
-name = "summavy-ownedbytes"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f20b8d6a65a3e904a6391528d12fe3a326163ead96328e745f40bda06da5d1f"
-dependencies = [
- "stable_deref_trait",
-]
-
-[[package]]
-name = "summavy-query-grammar"
-version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56fa3354d255938518fdce19b037159e212fe3fa3a2d7222e722ac02a3a25421"
-dependencies = [
- "combine",
- "once_cell",
- "regex",
-]
-
-[[package]]
-name = "summavy_codecs"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9a42faf2246528173d647d10fe886dffdaf504578ec23d27cdc2b014c86bfd1"
-dependencies = [
- "fastdivide",
- "itertools",
- "log",
- "summavy-bitpacker",
- "summavy-common",
- "summavy-ownedbytes",
 ]
 
 [[package]]
@@ -2647,6 +2614,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 
 [[package]]
+name = "tantivy-bitpacker"
+version = "0.2.0"
+
+[[package]]
+name = "tantivy-common"
+version = "0.3.0"
+dependencies = [
+ "byteorder",
+ "ownedbytes",
+]
+
+[[package]]
 name = "tantivy-fst"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2655,6 +2634,15 @@ dependencies = [
  "byteorder",
  "regex-syntax",
  "utf8-ranges",
+]
+
+[[package]]
+name = "tantivy-query-grammar"
+version = "0.18.0"
+dependencies = [
+ "combine",
+ "once_cell",
+ "regex",
 ]
 
 [[package]]

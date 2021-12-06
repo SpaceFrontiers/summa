@@ -1,7 +1,7 @@
 {
   "name": "summa-wasm",
   "description": "WASM-bindings for Summa",
-  "version": "0.66.4",
+  "version": "0.66.9",
   "keywords": ["search", "database", "rust", "wasm"],
   "homepage": "https://github.com/izihawa/summa",
   "main": "./dist/main.js",
@@ -13,8 +13,7 @@
     "build": "webpack --mode=production"
   },
   "dependencies": {
-    "comlink": "^4.3.1",
-    "dexie": "^3.2.2"
+    "comlink": "^4.3.1"
   },
   "devDependencies": {
     "@wasm-tool/wasm-pack-plugin": "^1.6.0",

@@ -14,7 +14,9 @@ impl TryFrom<proto::AttachIndexRequest> for AttachIndexRequest {
     fn try_from(proto_request: proto::AttachIndexRequest) -> Result<Self, Self::Error> {
         Ok(AttachIndexRequest {
             index_name: proto_request.index_name,
-            attach_index_request: proto_request.request.expect("no attach request"),
+            attach_index_request: proto_request
+                .request
+                .unwrap_or_else(|| proto::attach_index_request::Request::AttachFileEngineRequest(proto::AttachFileEngineRequest {})),
         })
     }
 }

@@ -27,10 +27,11 @@ impl ExternalRequest for JsExternalRequest {
     where
         Self: Sized,
     {
+        let default_headers = &[Header::new("Accept", "application/vnd.ipld.raw")];
         JsExternalRequest {
             method: method.to_string(),
             url: url.to_string(),
-            headers: Vec::from_iter(headers.iter().cloned()),
+            headers: Vec::from_iter(headers.iter().chain(default_headers.into_iter()).cloned()),
         }
     }
 

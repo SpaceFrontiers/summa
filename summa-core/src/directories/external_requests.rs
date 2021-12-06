@@ -17,6 +17,15 @@ pub struct Header {
     pub value: String,
 }
 
+impl Header {
+    pub fn new(name: &str, value: &str) -> Header {
+        Header {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExternalResponse {

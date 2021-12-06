@@ -19,8 +19,9 @@ export class WebIndexService {
     if (!status_callback) {
       status_callback = (type: string, message: string) => console.log(type, message)
     }
-    status_callback("status", "setting workers...");
+    status_callback("status", "setting workers " + init_url + "...");
     await init(init_url);
+    status_callback("status", "creating registry...");
     this.registry = new WebIndexRegistry(threads > 0);
     if (threads > 0) {
       status_callback("status", "setting thread pool of size " + threads.toString() + "...");

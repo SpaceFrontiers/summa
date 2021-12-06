@@ -52,9 +52,7 @@ impl<'a, TConfig: Send + Sync + Serialize + Deserialize<'a>> Loadable for FilePr
         if !config_filepath.exists() {
             return Err(ValidationError::MissingPath(config_filepath.to_path_buf()).into());
         }
-        if config_filepath.exists() {
-            s = s.add_source(File::from(config_filepath));
-        }
+        s = s.add_source(File::from(config_filepath));
         if let Some(env_prefix) = env_prefix {
             s = s.add_source(Environment::with_prefix(env_prefix).separator("."));
         }
