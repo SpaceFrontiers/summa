@@ -6,4 +6,4 @@ members = ["summa-proto", "summa-core", "summa-server", "summa-wasm"]
 lto = true
 
 [workspace.dependencies]
-tantivy = { package = "summavy", version = "0.24.0", default_features = false, features = ["quickwit", "zstd-compression"], path = "../tantivy" }
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", package = "summavy", version = "0.24.0", default_features = false, features = ["quickwit", "zstd-compression"]}
