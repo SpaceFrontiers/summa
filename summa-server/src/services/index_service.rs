@@ -284,12 +284,18 @@ impl IndexService {
             ) {
                 (Entry::Occupied(index_holder_entry), Entry::Occupied(config_entry)) => {
                     let index_holder = index_holder_entry.get();
-                    let has_consumer = self.consumer_manager.read().await.consumer_for(&index_holder.handler()).await.is_some();
                     if !aliases.is_empty() {
                         return Err(ValidationError::Aliased(aliases.join(", ")).into());
                     }
-                    if has_consumer {
-                        return Err(ValidationError::ExistingConsumer("".to_string()).into());
+                    if let Some(consumer_name) = self
+                        .consumer_manager
+                        .read()
+                        .await
+                        .get_consumer_for(&index_holder.handler())
+                        .await
+                        .map(|consumer_thread| consumer_thread.consumer_name().to_string())
+                    {
+                        return Err(ValidationError::ExistingConsumer(consumer_name).into());
                     }
                     config_entry.remove();
                     let index_holder = index_holder_entry.remove();
@@ -323,14 +329,9 @@ impl IndexService {
     #[instrument(skip_all, fields(consumer_name = ?create_consumer_request.consumer_name))]
     pub async fn create_consumer(&self, create_consumer_request: &CreateConsumerRequest) -> SummaServerResult<String> {
         let index_holder = self.get_index_holder(&create_consumer_request.consumer_config.index_name).await?;
-        self.consumer_manager
-            .write()
-            .await
-            .start_consuming(
-                &index_holder,
-                PreparedConsumption::from_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?,
-            )
-            .await?;
+        let prepared_consumption = PreparedConsumption::from_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?;
+        prepared_consumption.on_create().await?;
+        self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         let mut server_config = self.server_config.write().await;
         server_config.get_mut().consumer_configs.insert(
             create_consumer_request.consumer_name.to_string(),
@@ -342,15 +343,27 @@ impl IndexService {
 
     /// Delete consumer from the consumer registry and from `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?delete_consumer_request.consumer_name))]
-    pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaServerResult<()> {
+    pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaServerResult<proto::DeleteConsumerResponse> {
         let mut server_config = self.server_config.write().await;
-        server_config.get_mut().consumer_configs.remove(&delete_consumer_request.consumer_name);
+        if server_config
+            .get_mut()
+            .consumer_configs
+            .remove(&delete_consumer_request.consumer_name)
+            .is_none()
+        {
+            return Err(ValidationError::MissingConsumer(delete_consumer_request.consumer_name.to_string()).into());
+        }
         server_config.commit().await?;
         let index_holder = self.consumer_manager.read().await.find_index_holder_for(&delete_consumer_request.consumer_name);
         if let Some(index_holder) = index_holder {
-            self.commit(&index_holder).await?;
+            let prepared_consumption = self.commit(&index_holder).await?;
+            if let Some(prepared_consumption) = prepared_consumption {
+                prepared_consumption.on_delete().await?;
+            }
         }
-        Ok(())
+        Ok(proto::DeleteConsumerResponse {
+            consumer_name: delete_consumer_request.consumer_name.to_string(),
+        })
     }
 
     /// Stopping index holders

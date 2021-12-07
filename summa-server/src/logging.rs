@@ -53,7 +53,7 @@ impl Write for WatchedWriter {
 }
 
 fn create_writer(log_path: &Path, name: &str, guards: &mut Vec<WorkerGuard>) -> io::Result<NonBlocking> {
-    let file = WatchedWriter::new(log_path.join(name))?;
+    let file = WatchedWriter::new(log_path.join(name).with_extension("log"))?;
     let (file_writer, guard) = tracing_appender::non_blocking(file);
     guards.push(guard);
     Ok(file_writer)

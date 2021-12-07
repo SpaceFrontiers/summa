@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 
 use futures_util::future::join_all;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -58,6 +59,12 @@ impl StoppedConsumption {
                     committed_consumer_thread: self.consumer_thread,
                 })
             }
+            Err(Error::Kafka(KafkaError::ConsumerCommit(RDKafkaErrorCode::NoOffset))) => {
+                warn!(error = "no_offset");
+                Ok(PreparedConsumption {
+                    committed_consumer_thread: self.consumer_thread,
+                })
+            }
             Err(e) => Err(e),
         }
     }
@@ -74,6 +81,18 @@ impl PreparedConsumption {
             committed_consumer_thread: ConsumerThread::new(consumer_name, consumer_config)?,
         })
     }
+
+    pub fn on_create(&self) -> impl Future<Output = SummaServerResult<()>> + '_ {
+        self.committed_consumer_thread.on_create()
+    }
+
+    pub fn on_delete(&self) -> impl Future<Output = SummaServerResult<()>> + '_ {
+        self.committed_consumer_thread.on_delete()
+    }
+
+    pub fn consumer_name(&self) -> &str {
+        self.committed_consumer_thread.consumer_name()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +106,7 @@ impl ConsumerManager {
     }
 
     /// Starts prepared consumption to the index
-    #[instrument(skip(self))]
+    #[instrument(skip(self, index_holder, prepared_consumption), fields(index_name = index_holder.index_name(), consumer_name = prepared_consumption.consumer_name()))]
     pub async fn start_consuming(&mut self, index_holder: &Handler<IndexHolder>, prepared_consumption: PreparedConsumption) -> SummaServerResult<()> {
         if self.consumptions.contains_key(index_holder) {
             return Err(ValidationError::ExistingConsumer(index_holder.index_name().to_string()).into());
@@ -98,6 +117,7 @@ impl ConsumerManager {
             .committed_consumer_thread
             .start(move |message| process_message(&index_writer_holder, &schema, message))
             .await;
+        self.consumptions.insert(index_holder.clone(), prepared_consumption.committed_consumer_thread);
         Ok(())
     }
 
@@ -128,7 +148,7 @@ impl ConsumerManager {
         }
     }
 
-    pub async fn consumer_for(&self, index_holder: &Handler<IndexHolder>) -> Option<&ConsumerThread> {
+    pub async fn get_consumer_for(&self, index_holder: &Handler<IndexHolder>) -> Option<&ConsumerThread> {
         self.consumptions.get(index_holder)
     }
 

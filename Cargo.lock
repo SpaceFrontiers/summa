@@ -670,7 +670,7 @@ checksum = "0d240c8aab8f3f9906bd3bd67a5a2104da85525b28462b396923db6f11a898aa"
 
 [[package]]
 name = "fastfield_codecs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fastdivide",
  "itertools",
@@ -1594,7 +1594,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
 name = "ownedbytes"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -2615,11 +2615,11 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 
 [[package]]
 name = "tantivy-bitpacker"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "tantivy-common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "byteorder",
  "ownedbytes",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "tantivy-query-grammar"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "combine",
  "once_cell",

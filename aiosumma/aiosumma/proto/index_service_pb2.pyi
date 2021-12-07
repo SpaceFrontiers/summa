@@ -113,8 +113,10 @@ class DeleteIndexRequest(_message.Message):
     def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class DeleteIndexResponse(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+    __slots__ = ["index_name"]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class FileEngineConfig(_message.Message):
     __slots__ = ["path"]

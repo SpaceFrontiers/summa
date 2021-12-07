@@ -31,7 +31,7 @@ impl ExternalRequest for JsExternalRequest {
         JsExternalRequest {
             method: method.to_string(),
             url: url.to_string(),
-            headers: Vec::from_iter(headers.iter().chain(default_headers.into_iter()).cloned()),
+            headers: Vec::from_iter(headers.iter().chain(default_headers.iter()).cloned()),
         }
     }
 

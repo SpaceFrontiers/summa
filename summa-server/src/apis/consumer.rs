@@ -70,7 +70,7 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     }
 
     async fn delete_consumer(&self, proto_request: Request<proto::DeleteConsumerRequest>) -> Result<Response<proto::DeleteConsumerResponse>, Status> {
-        self.index_service.delete_consumer(proto_request.into_inner().into()).await?;
-        Ok(Response::new(proto::DeleteConsumerResponse {}))
+        let delete_consumer_response = self.index_service.delete_consumer(proto_request.into_inner().into()).await?;
+        Ok(Response::new(delete_consumer_response))
     }
 }
