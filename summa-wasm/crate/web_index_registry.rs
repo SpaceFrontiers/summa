@@ -4,7 +4,7 @@ use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry, SummaDocument};
 use summa_core::configs::{CoreConfigBuilder, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
-use summa_proto::proto::IndexEngineConfig;
+use summa_proto::proto::{IndexAttributes, IndexEngineConfig};
 use tantivy::Executor;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
@@ -42,7 +42,7 @@ impl WebIndexRegistry {
         Ok(self.add_internal(index_engine).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
-    async fn add_internal(&mut self, index_engine: IndexEngineConfig) -> SummaWasmResult<String> {
+    async fn add_internal(&mut self, index_engine: IndexEngineConfig) -> SummaWasmResult<Option<IndexAttributes>> {
         let mut index = IndexHolder::from_index_engine_config::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine).await?;
         index.settings_mut().docstore_compress_dedicated_thread = false;
 
@@ -55,9 +55,9 @@ impl WebIndexRegistry {
 
         let core_config = Arc::new(DirectProxy::new(core_config));
         let index_holder = IndexHolder::create_holder(core_config, index, None, index_engine).await?;
-        let index_name = index_holder.index_name().to_string();
+        let index_attributes = index_holder.index_attributes()?;
         self.index_registry.add(index_holder).await;
-        Ok(index_name)
+        Ok(index_attributes)
     }
 
     #[wasm_bindgen]

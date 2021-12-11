@@ -27,7 +27,7 @@ impl ExternalRequest for JsExternalRequest {
     where
         Self: Sized,
     {
-        let default_headers = &[Header::new("Accept", "application/vnd.ipld.raw")];
+        let default_headers = &[];
         JsExternalRequest {
             method: method.to_string(),
             url: url.to_string(),

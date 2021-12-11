@@ -173,6 +173,7 @@ impl ConsumerThread {
                 AlterConfig::new(ResourceSpecifier::Topic(topic_name.as_str()))
                     .set("retention.ms", "14400000")
                     .set("retention.bytes", "1073741824")
+                    .set("max.message.bytes", "134217728")
             })
             .collect();
         let response = admin_client.create_topics(&new_topics, &admin_options).await?;

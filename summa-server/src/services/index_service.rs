@@ -482,6 +482,7 @@ impl IndexService {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::Path;
+    use rdkafka::admin::ConfigSource::Default;
 
     use summa_core::components::SummaDocument;
     use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
@@ -502,7 +503,10 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .default_fields(vec!["title".to_owned(), "body".to_owned()])
+                    .index_attributes(proto::IndexAttributes {
+                        default_fields: vec!["title".to_owned(), "body".to_owned()],
+                        ..Default::default()
+                    })
                     .index_engine(proto::CreateIndexEngineRequest::Memory)
                     .schema(schema.clone())
                     .build()

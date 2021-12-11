@@ -20,7 +20,7 @@ export class WebIndexService {
       status_callback = (type: string, message: string) => console.log(type, message)
     }
     status_callback("status", "setting workers " + init_url + "...");
-    await init(init_url);
+    await init(init_url, new WebAssembly.Memory({ initial: 4096, maximum: 16384, shared: true }));
     status_callback("status", "creating registry...");
     this.registry = new WebIndexRegistry(threads > 0);
     if (threads > 0) {
@@ -29,7 +29,7 @@ export class WebIndexService {
       status_callback("status", "");
     }
   }
-  async add(index_engine: { config: { remote: RemoteEngineConfig } | { memory: Object }}): Promise<string> {
+  async add(index_engine: { config: { remote: RemoteEngineConfig } | { memory: Object }}): Promise<Object> {
     return await this.registry!.add(index_engine)
   }
   async delete(index_name: string) {
