@@ -41,7 +41,7 @@ impl ExternalRequest for JsExternalRequest {
             self.url,
             serde_wasm_bindgen::to_value(&self.headers).map_err(|e| Error::External(e.to_string()))?,
         )
-        .map_err(|e| Error::External(format!("{:?}", e)))?;
+        .map_err(|error| Error::External(format!("{error:?}")))?;
         let response: ExternalResponse = serde_wasm_bindgen::from_value(response).unwrap_throw();
         Ok(response)
     }
@@ -53,7 +53,7 @@ impl ExternalRequest for JsExternalRequest {
             let response = request_async(self.method, self.url, headers)
                 .await
                 .map(|response| serde_wasm_bindgen::from_value(response).unwrap_throw())
-                .map_err(|e| Error::External(format!("{:?}", e)));
+                .map_err(|error| Error::External(format!("{error:?}")));
             sender.send(response).unwrap_throw();
         });
         Ok(receiver.recv().await.unwrap_throw()?)

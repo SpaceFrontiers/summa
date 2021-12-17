@@ -3,13 +3,13 @@ use summa_core::errors::BuilderError;
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
-pub struct MetricsConfig {
+pub struct Config {
     pub endpoint: String,
 }
 
-impl Default for MetricsConfig {
+impl Default for Config {
     fn default() -> Self {
-        MetricsConfig {
+        Config {
             endpoint: "127.0.0.1:8084".to_owned(),
         }
     }

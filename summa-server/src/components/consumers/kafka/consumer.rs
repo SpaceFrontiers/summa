@@ -15,7 +15,6 @@ use tokio::sync::Mutex;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 use super::status::{KafkaConsumingError, KafkaConsumingStatus};
-use crate::configs::ConsumerConfig;
 use crate::errors::{Error, SummaServerResult};
 
 enum ConsumingState {
@@ -33,14 +32,14 @@ impl std::fmt::Debug for ConsumingState {
 #[derive(Clone, Debug)]
 pub struct ConsumerThread {
     consumer_name: String,
-    config: ConsumerConfig,
+    config: crate::configs::consumer::Config,
     kafka_producer_config: ClientConfig,
     consuming_state: Arc<Mutex<Option<ConsumingState>>>,
 }
 
 impl ConsumerThread {
     #[instrument]
-    pub fn new(consumer_name: &str, config: &ConsumerConfig) -> SummaServerResult<ConsumerThread> {
+    pub fn new(consumer_name: &str, config: &crate::configs::consumer::Config) -> SummaServerResult<ConsumerThread> {
         let mut kafka_consumer_config = ClientConfig::new();
         kafka_consumer_config
             .set("broker.address.ttl", "1000")
@@ -215,7 +214,7 @@ impl ConsumerThread {
         Ok(())
     }
 
-    pub fn config(&self) -> &ConsumerConfig {
+    pub fn config(&self) -> &crate::configs::consumer::Config {
         &self.config
     }
 }

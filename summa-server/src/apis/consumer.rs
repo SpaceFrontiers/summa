@@ -8,14 +8,14 @@ use tonic::{Request, Response, Status};
 use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
 use crate::requests::CreateConsumerRequest;
-use crate::services::IndexService;
+use crate::services::Index;
 
 pub struct ConsumerApiImpl {
-    index_service: IndexService,
+    index_service: Index,
 }
 
 impl ConsumerApiImpl {
-    pub fn new(index_service: &IndexService) -> SummaServerResult<ConsumerApiImpl> {
+    pub fn new(index_service: &Index) -> SummaServerResult<ConsumerApiImpl> {
         Ok(ConsumerApiImpl {
             index_service: index_service.clone(),
         })

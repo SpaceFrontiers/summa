@@ -11,12 +11,10 @@ use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::ThreadHandler;
 use summa_proto::proto;
-use tantivy::{Index, IndexSettings};
 use tokio::sync::RwLock;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 use crate::components::{ConsumerManager, PreparedConsumption};
-use crate::configs::{ConsumerConfig, ServerConfig};
 use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
 use crate::hyper_external_request::HyperExternalRequest;
@@ -24,17 +22,17 @@ use crate::requests::{AttachIndexRequest, CreateConsumerRequest, CreateIndexRequ
 
 /// The main struct responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone)]
-pub struct IndexService {
-    server_config: Arc<dyn ConfigProxy<ServerConfig>>,
+pub struct Index {
+    server_config: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
     index_registry: IndexRegistry,
     consumer_manager: Arc<RwLock<ConsumerManager>>,
     should_terminate: Arc<AtomicBool>,
     autocommit_thread: Arc<RwLock<Option<ThreadHandler<SummaServerResult<()>>>>>,
 }
 
-impl Default for IndexService {
+impl Default for Index {
     fn default() -> Self {
-        IndexService {
+        Index {
             server_config: Arc::new(DirectProxy::default()),
             index_registry: IndexRegistry::default(),
             consumer_manager: Arc::default(),
@@ -66,7 +64,7 @@ impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
 }
 
 /// The main entry point for managing Summa indices
-impl IndexService {
+impl Index {
     /// `HashMap` of all indices
     pub fn index_holders(&self) -> &Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>> {
         self.index_registry.index_holders()
@@ -88,7 +86,7 @@ impl IndexService {
     }
 
     /// Returns server config
-    pub fn server_config(&self) -> &Arc<dyn ConfigProxy<ServerConfig>> {
+    pub fn server_config(&self) -> &Arc<dyn ConfigProxy<crate::configs::server::Config>> {
         &self.server_config
     }
 
@@ -116,9 +114,9 @@ impl IndexService {
             .await?)
     }
 
-    /// Creates new `IndexService` with `ServerConfigHolder`
-    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<ServerConfig>>) -> IndexService {
-        IndexService {
+    /// Creates new `IndexService` with `ConfigHolder`
+    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> Index {
+        Index {
             server_config: server_config_holder.clone(),
             index_registry: IndexRegistry::default(),
             consumer_manager: Arc::default(),
@@ -154,7 +152,7 @@ impl IndexService {
         info!(action = "setting_index_holders", index_holders = ?index_holders);
         *self.index_registry.index_holders().write().await = index_holders;
 
-        for (consumer_name, consumer_config) in self.server_config.read().await.get().consumer_configs.iter() {
+        for (consumer_name, consumer_config) in self.server_config.read().await.get().consumers.iter() {
             let index_holder = self.get_index_holder(&consumer_config.index_name).await?;
             let prepared_consumption = PreparedConsumption::from_config(consumer_name, consumer_config)?;
             self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
@@ -218,13 +216,13 @@ impl IndexService {
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_attributes = create_index_request.index_attributes;
-        let index_settings = IndexSettings {
+        let index_settings = tantivy::IndexSettings {
             docstore_compression: create_index_request.compression,
             docstore_blocksize: create_index_request.blocksize.unwrap_or(16384),
             sort_by_field: create_index_request.sort_by_field.clone(),
             ..Default::default()
         };
-        let index_builder = Index::builder()
+        let index_builder = tantivy::Index::builder()
             .schema(create_index_request.schema.clone())
             .settings(index_settings)
             .attributes(index_attributes);
@@ -321,8 +319,8 @@ impl IndexService {
     }
 
     /// Returns all existent consumers for all indices
-    pub async fn get_consumers(&self) -> HashMap<String, ConsumerConfig> {
-        self.server_config.read().await.get().consumer_configs.clone()
+    pub async fn get_consumers(&self) -> HashMap<String, crate::configs::consumer::Config> {
+        self.server_config.read().await.get().consumers.clone()
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
@@ -333,7 +331,7 @@ impl IndexService {
         prepared_consumption.on_create().await?;
         self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         let mut server_config = self.server_config.write().await;
-        server_config.get_mut().consumer_configs.insert(
+        server_config.get_mut().consumers.insert(
             create_consumer_request.consumer_name.to_string(),
             create_consumer_request.consumer_config.clone(),
         );
@@ -345,12 +343,7 @@ impl IndexService {
     #[instrument(skip_all, fields(consumer_name = ?delete_consumer_request.consumer_name))]
     pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaServerResult<proto::DeleteConsumerResponse> {
         let mut server_config = self.server_config.write().await;
-        if server_config
-            .get_mut()
-            .consumer_configs
-            .remove(&delete_consumer_request.consumer_name)
-            .is_none()
-        {
+        if server_config.get_mut().consumers.remove(&delete_consumer_request.consumer_name).is_none() {
             return Err(ValidationError::MissingConsumer(delete_consumer_request.consumer_name.to_string()).into());
         }
         server_config.commit().await?;
@@ -376,7 +369,7 @@ impl IndexService {
     }
 
     /// Returns `ConsumerConfig`
-    pub(crate) async fn get_consumer_config(&self, consumer_name: &str) -> Option<ConsumerConfig> {
+    pub(crate) async fn get_consumer_config(&self, consumer_name: &str) -> Option<crate::configs::consumer::Config> {
         self.consumer_manager.read().await.find_consumer_config_for(consumer_name).cloned()
     }
 
@@ -481,9 +474,10 @@ impl IndexService {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::default::Default;
     use std::path::Path;
-    use rdkafka::admin::ConfigSource::Default;
 
+    use rdkafka::admin::ConfigSource::Default;
     use summa_core::components::SummaDocument;
     use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
     use summa_proto::proto_traits::query::shortcuts::match_query;
@@ -491,14 +485,14 @@ pub(crate) mod tests {
     use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
 
     use super::*;
-    use crate::configs::server_config::tests::create_test_server_config_holder;
+    use crate::configs::server::tests::create_test_server_config_holder;
     use crate::logging;
     use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
 
-    pub async fn create_test_index_service(data_path: &Path) -> IndexService {
-        IndexService::new(&create_test_server_config_holder(&data_path))
+    pub async fn create_test_index_service(data_path: &Path) -> Index {
+        Index::new(&create_test_server_config_holder(&data_path))
     }
-    pub async fn create_test_index_holder(index_service: &IndexService, schema: &Schema) -> SummaServerResult<Handler<IndexHolder>> {
+    pub async fn create_test_index_holder(index_service: &Index, schema: &Schema) -> SummaServerResult<Handler<IndexHolder>> {
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -543,7 +537,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_same_name_index() {
         logging::tests::initialize_default_once();
-        let index_service = IndexService::default();
+        let index_service = Index::default();
         assert!(index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -576,7 +570,7 @@ pub(crate) mod tests {
         let data_path = root_path.path().join("data");
         let server_config_holder = create_test_server_config_holder(&data_path);
 
-        let index_service = IndexService::new(&server_config_holder);
+        let index_service = Index::new(&server_config_holder);
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()

@@ -43,7 +43,7 @@ impl<'a> SummaTokenStream<'a> {
                 *cci = Some((offset, c));
                 (offset, c)
             })
-            .filter(|&(_, ref c)| !(c.is_alphanumeric() || *c == '#' || *c == '+') || is_cjk(c))
+            .filter(|(_, c)| !(c.is_alphanumeric() || *c == '#' || *c == '+') || is_cjk(c))
             .map(|(offset, _)| offset)
             .next()
             .unwrap_or(self.text.len())

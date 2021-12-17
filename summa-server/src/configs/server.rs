@@ -5,52 +5,51 @@ use std::sync::Arc;
 
 use path_absolutize::*;
 use serde::{Deserialize, Serialize};
-use summa_core::configs::{ConfigProxy, CoreConfig, DirectProxy, FileProxy, Loadable};
+use summa_core::configs::{ConfigProxy, DirectProxy, FileProxy, Loadable};
 use summa_core::errors::BuilderError;
 
-use super::{GrpcConfig, GrpcConfigBuilder};
-use super::{MetricsConfig, MetricsConfigBuilder};
-use crate::configs::{ConsumerConfig, IpfsConfig};
 use crate::errors::{SummaServerResult, ValidationError};
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
-pub struct ServerConfig {
+pub struct Config {
     #[serde(default = "HashMap::new")]
     pub aliases: HashMap<String, String>,
     #[builder(setter(custom))]
     pub data_path: PathBuf,
     pub debug: bool,
-    pub grpc: GrpcConfig,
-    pub ipfs: Option<IpfsConfig>,
+    pub grpc: crate::configs::grpc::Config,
+    pub p2p: crate::configs::p2p::Config,
+    pub store: crate::configs::store::Config,
     #[builder(setter(custom))]
     pub log_path: PathBuf,
-    pub metrics: MetricsConfig,
+    pub metrics: crate::configs::metrics::Config,
 
     #[builder(default = "HashMap::new()")]
-    pub consumer_configs: HashMap<String, ConsumerConfig>,
+    pub consumers: HashMap<String, crate::configs::consumer::Config>,
 
     #[serde(default)]
-    pub core: CoreConfig,
+    pub core: summa_core::configs::core::Config,
 }
 
-impl Default for ServerConfig {
+impl Default for Config {
     fn default() -> Self {
-        ServerConfig {
+        Config {
             aliases: HashMap::new(),
             data_path: PathBuf::new(),
             debug: true,
-            grpc: GrpcConfigBuilder::default().build().expect("cannot build default config"),
-            ipfs: None,
+            grpc: crate::configs::grpc::Config::default(),
+            p2p: crate::configs::p2p::Config::default(),
+            store: crate::configs::store::Config::default(),
             log_path: PathBuf::new(),
-            metrics: MetricsConfigBuilder::default().build().expect("cannot build default config"),
-            consumer_configs: HashMap::new(),
-            core: CoreConfig::default(),
+            metrics: crate::configs::metrics::Config::default(),
+            consumers: HashMap::new(),
+            core: summa_core::configs::core::Config::default(),
         }
     }
 }
 
-impl ServerConfig {
+impl Config {
     pub fn get_path_for_index_data(&self, index_name: &str) -> PathBuf {
         self.data_path.join(index_name)
     }
@@ -91,7 +90,7 @@ impl ServerConfig {
     }
 }
 
-impl ServerConfigBuilder {
+impl ConfigBuilder {
     pub fn data_path<P: AsRef<Path>>(&mut self, value: P) -> &mut Self {
         self.data_path = Some(Absolutize::absolutize(value.as_ref()).expect("cannot get cwd").to_path_buf());
         self
@@ -103,27 +102,27 @@ impl ServerConfigBuilder {
     }
 }
 
-pub struct ServerConfigHolder {}
+pub struct ConfigHolder {}
 
-impl ServerConfigHolder {
-    pub fn from_path<P: AsRef<Path>>(server_config_filepath: P) -> SummaServerResult<Arc<dyn ConfigProxy<ServerConfig>>> {
-        let server_config = FileProxy::<ServerConfig>::from_file(server_config_filepath.as_ref(), None)?;
+impl ConfigHolder {
+    pub fn from_path<P: AsRef<Path>>(server_config_filepath: P) -> SummaServerResult<Arc<dyn ConfigProxy<Config>>> {
+        let server_config = FileProxy::<Config>::from_file(server_config_filepath.as_ref(), None)?;
         Ok(Arc::new(server_config))
     }
-    pub fn with_path<P: AsRef<Path>>(server_config: ServerConfig, server_config_filepath: P) -> Arc<dyn ConfigProxy<ServerConfig>> {
+    pub fn with_path<P: AsRef<Path>>(server_config: Config, server_config_filepath: P) -> Arc<dyn ConfigProxy<Config>> {
         Arc::new(FileProxy::file(server_config, server_config_filepath.as_ref()))
     }
-    pub fn from_path_or<P: AsRef<Path>, F: FnOnce() -> ServerConfig>(
+    pub fn from_path_or<P: AsRef<Path>, F: FnOnce() -> Config>(
         server_config_filepath: P,
         server_config_fn: F,
-    ) -> SummaServerResult<Arc<dyn ConfigProxy<ServerConfig>>> {
+    ) -> SummaServerResult<Arc<dyn ConfigProxy<Config>>> {
         if server_config_filepath.as_ref().exists() {
-            ServerConfigHolder::from_path(server_config_filepath)
+            ConfigHolder::from_path(server_config_filepath)
         } else {
-            Ok(ServerConfigHolder::with_path(server_config_fn(), server_config_filepath))
+            Ok(ConfigHolder::with_path(server_config_fn(), server_config_filepath))
         }
     }
-    pub fn from_config(server_config: ServerConfig) -> Arc<dyn ConfigProxy<ServerConfig>> {
+    pub fn from_config(server_config: Config) -> Arc<dyn ConfigProxy<Config>> {
         Arc::new(DirectProxy::new(server_config))
     }
 }
@@ -132,23 +131,21 @@ pub mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::configs::GrpcConfigBuilder;
-    use crate::configs::MetricsConfigBuilder;
 
     static BASE_PORT: AtomicUsize = AtomicUsize::new(50000);
 
-    pub fn create_test_server_config(data_path: &Path) -> ServerConfig {
-        ServerConfigBuilder::default()
+    pub fn create_test_server_config(data_path: &Path) -> Config {
+        crate::configs::server::ConfigBuilder::default()
             .debug(true)
             .data_path(data_path)
             .grpc(
-                GrpcConfigBuilder::default()
+                crate::configs::grpc::ConfigBuilder::default()
                     .endpoint(format!("127.0.0.1:{}", BASE_PORT.fetch_add(1, Ordering::Relaxed)))
                     .build()
                     .expect("cannot create grpc config"),
             )
             .metrics(
-                MetricsConfigBuilder::default()
+                crate::configs::metrics::ConfigBuilder::default()
                     .endpoint(format!("127.0.0.1:{}", BASE_PORT.fetch_add(1, Ordering::Relaxed)))
                     .build()
                     .expect("cannot create metrics config"),
@@ -157,7 +154,7 @@ pub mod tests {
             .expect("cannot create server config")
     }
 
-    pub fn create_test_server_config_holder(data_path: &Path) -> Arc<dyn ConfigProxy<ServerConfig>> {
-        ServerConfigHolder::from_config(create_test_server_config(data_path))
+    pub fn create_test_server_config_holder(data_path: &Path) -> Arc<dyn ConfigProxy<Config>> {
+        ConfigHolder::from_config(create_test_server_config(data_path))
     }
 }

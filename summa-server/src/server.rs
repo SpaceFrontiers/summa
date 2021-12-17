@@ -9,16 +9,15 @@ use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, Instrument};
 
-use crate::configs::server_config::ServerConfigHolder;
-use crate::configs::{GrpcConfigBuilder, IpfsConfigBuilder, MetricsConfigBuilder, ServerConfig, ServerConfigBuilder};
+use crate::configs::server::ConfigHolder;
 use crate::errors::{Error, SummaServerResult};
 use crate::logging;
-use crate::servers::{GrpcServer, MetricsServer};
-use crate::services::{BeaconService, IndexService};
+use crate::services::store::Store;
+use crate::services::{Beacon, Grpc, Index, Metrics, P2p};
 use crate::utils::signal_channel;
 
 pub struct Server {
-    server_config: Arc<dyn ConfigProxy<ServerConfig>>,
+    server_config: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
 }
 
 const LONG_ABOUT: &str = "
@@ -28,7 +27,7 @@ Documentation: https://izihawa.github.io/summa
 ";
 
 impl Server {
-    pub fn from_server_config(config: Arc<dyn ConfigProxy<ServerConfig>>) -> Server {
+    pub fn from_server_config(config: Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> Server {
         Server { server_config: config }
     }
 
@@ -65,40 +64,41 @@ impl Server {
                 let data_path = PathBuf::from(submatches.try_get_one::<String>("DATA_PATH")?.expect("no value"));
                 let grpc_endpoint = submatches.try_get_one::<String>("GRPC_ENDPOINT")?.expect("no value");
                 let metrics_endpoint = submatches.try_get_one::<String>("METRICS_ENDPOINT")?.expect("no value");
-                let ipfs_api_endpoint = submatches.try_get_one::<String>("IPFS_API_ENDPOINT")?;
-                let default_config = ServerConfigBuilder::default()
+                let server_config = crate::configs::server::ConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
                     .grpc(
-                        GrpcConfigBuilder::default()
+                        crate::configs::grpc::ConfigBuilder::default()
                             .endpoint(grpc_endpoint.to_string())
                             .build()
                             .map_err(summa_core::Error::from)?,
                     )
                     .metrics(
-                        MetricsConfigBuilder::default()
+                        crate::configs::metrics::ConfigBuilder::default()
                             .endpoint(metrics_endpoint.to_string())
                             .build()
                             .map_err(summa_core::Error::from)?,
                     )
-                    .ipfs(
-                        ipfs_api_endpoint
-                            .map(|ipfs_api_endpoint| {
-                                IpfsConfigBuilder::default()
-                                    .api_endpoint(ipfs_api_endpoint.to_string())
-                                    .build()
-                                    .map_err(summa_core::Error::from)
-                            })
-                            .transpose()?,
+                    .p2p(
+                        crate::configs::p2p::ConfigBuilder::default()
+                            .key_store_path(data_path.join("ks"))
+                            .build()
+                            .map_err(summa_core::Error::from)?,
+                    )
+                    .store(
+                        crate::configs::store::ConfigBuilder::default()
+                            .path(data_path.join("store"))
+                            .build()
+                            .map_err(summa_core::Error::from)?,
                     )
                     .build()
                     .map_err(summa_core::Error::from)?;
-                println!("{}", serde_yaml::to_string(&default_config).expect("cannot serialize config"));
+                println!("{}", serde_yaml::to_string(&server_config).expect("cannot serialize config"));
                 Ok(())
             }
             Some(("serve", submatches)) => {
                 let config_path = PathBuf::from(submatches.try_get_one::<String>("CONFIG")?.expect("no value"));
-                let server_config_holder = ServerConfigHolder::from_path(config_path)?;
+                let server_config_holder = ConfigHolder::from_path(config_path)?;
                 let _guards = {
                     let server_config = server_config_holder.read().await;
                     let log_guards = if server_config.get().debug {
@@ -119,18 +119,19 @@ impl Server {
     }
 
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        let beacon_service = self.server_config.read().await.get().ipfs.clone().map(BeaconService::new).transpose()?;
-        let index_service = IndexService::new(&self.server_config);
-        let metrics_server_future = MetricsServer::new(&self.server_config.read().await.get().metrics)?
-            .start(&index_service, terminator.clone())
-            .await?;
-        let grpc_server_future = GrpcServer::new(&self.server_config, beacon_service.as_ref(), &index_service)?
+        let p2p_future = P2p::new(&self.server_config).await?.start(terminator.clone()).await?;
+        let store_future = Store::new(&self.server_config).await?.start(terminator.clone()).await?;
+        let beacon_service = Beacon::new(&self.server_config).await?;
+        let index_service = Index::new(&self.server_config);
+        let metrics_server_future = Metrics::new(&self.server_config).await?.start(&index_service, terminator.clone()).await?;
+        let grpc_server_future = Grpc::new(&self.server_config, &beacon_service, &index_service)?
             .start(terminator.clone())
             .await?;
 
         Ok(async move {
             index_service.setup_index_holders().await?;
-            try_join!(metrics_server_future, grpc_server_future)?;
+            info!(action = "indices_ready");
+            try_join!(metrics_server_future, grpc_server_future, p2p_future, store_future)?;
             info!(action = "all_systems_down");
             Ok(())
         }
@@ -155,15 +156,15 @@ mod tests {
     use tonic::transport::Channel;
 
     use super::*;
-    use crate::configs::server_config::tests::create_test_server_config;
-    use crate::services::index_service::tests::create_test_schema;
+    use crate::configs::server::tests::create_test_server_config;
+    use crate::services::index::tests::create_test_schema;
 
     async fn create_index_api_client(endpoint: &str) -> IndexApiClient<Channel> {
         IndexApiClient::connect(endpoint.to_owned()).await.unwrap()
     }
 
     async fn create_client_server(root_path: &Path) -> SummaServerResult<(ThreadHandler<SummaServerResult<()>>, IndexApiClient<Channel>)> {
-        let server_config_holder = ServerConfigHolder::from_path_or(root_path.join("summa.yaml"), || create_test_server_config(&root_path.join("data")))?;
+        let server_config_holder = ConfigHolder::from_path_or(root_path.join("summa.yaml"), || create_test_server_config(&root_path.join("data")))?;
         let server_config = server_config_holder.read().await.get().clone();
         tokio::fs::create_dir_all(&server_config.data_path)
             .await

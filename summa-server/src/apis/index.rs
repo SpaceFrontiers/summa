@@ -17,18 +17,17 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, info_span, warn};
 use tracing_futures::Instrument;
 
-use crate::configs::ServerConfig;
 use crate::errors::SummaServerResult;
-use crate::services::IndexService;
+use crate::services::Index;
 
 #[derive(Clone)]
 pub struct IndexApiImpl {
-    server_config: Arc<dyn ConfigProxy<ServerConfig>>,
-    index_service: IndexService,
+    server_config: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
+    index_service: Index,
 }
 
 impl IndexApiImpl {
-    pub fn new(server_config: &Arc<dyn ConfigProxy<ServerConfig>>, index_service: &IndexService) -> SummaServerResult<IndexApiImpl> {
+    pub fn new(server_config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, index_service: &Index) -> SummaServerResult<IndexApiImpl> {
         Ok(IndexApiImpl {
             server_config: server_config.clone(),
             index_service: index_service.clone(),
@@ -88,7 +87,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 let index_holder = index_service.get_index_holder(&request.index_alias).await?;
                 tokio::spawn(async move {
                     if let Err(err) = index_service.commit_and_restart_consumption(&index_holder).await {
-                        warn!(action = "busy", error = format!("{:?}", err))
+                        warn!(action = "busy", error = format!("{err:?}"))
                     }
                 });
                 Ok(Response::new(proto::CommitIndexResponse { elapsed_secs: None }))

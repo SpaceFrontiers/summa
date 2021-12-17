@@ -7,3 +7,11 @@ lto = true
 
 [workspace.dependencies]
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", package = "summavy", version = "0.24.0", default_features = false, features = ["quickwit", "zstd-compression"]}
+iroh-api = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }
+iroh-gateway = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }
+iroh-metrics = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }
+iroh-p2p = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }
+iroh-resolver = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }
+iroh-rpc-client = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }
+iroh-store = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }
+iroh-unixfs = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.1.3" }

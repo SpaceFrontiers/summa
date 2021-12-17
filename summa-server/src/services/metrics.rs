@@ -17,31 +17,28 @@ use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
 use opentelemetry::sdk::metrics::{aggregators, controllers, processors};
 use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
+use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument};
 use tracing_futures::Instrument;
 
-use super::base::BaseServer;
 use crate::components::IndexMeter;
-use crate::configs::MetricsConfig;
 use crate::errors::{Error, SummaServerResult};
-use crate::services::IndexService;
+use crate::services::Index;
 
 lazy_static! {
     static ref EMPTY_HEADER_VALUE: HeaderValue = HeaderValue::from_static("");
 }
 
 #[derive(Clone)]
-pub struct MetricsServer {
-    metrics_config: MetricsConfig,
+pub struct Metrics {
+    config: crate::configs::metrics::Config,
     exporter: PrometheusExporter,
 }
 
-impl BaseServer for MetricsServer {}
-
 struct AppState {
     exporter: PrometheusExporter,
-    index_service: IndexService,
+    index_service: Index,
     index_meter: IndexMeter,
 }
 
@@ -63,12 +60,12 @@ impl AggregatorSelector for CustomAgg {
     }
 }
 
-impl MetricsServer {
-    pub fn new(metrics_config: &MetricsConfig) -> SummaServerResult<MetricsServer> {
+impl Metrics {
+    pub async fn new(config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<Metrics> {
         let controller = controllers::basic(processors::factory(CustomAgg, aggregation::cumulative_temporality_selector()).with_memory(true)).build();
         let exporter = opentelemetry_prometheus::exporter(controller).init();
-        Ok(MetricsServer {
-            metrics_config: metrics_config.clone(),
+        Ok(Metrics {
+            config: config.read().await.get().metrics.clone(),
             exporter,
         })
     }
@@ -107,8 +104,8 @@ impl MetricsServer {
 
     #[instrument("lifecycle", skip_all)]
     pub async fn start(
-        &self,
-        index_service: &IndexService,
+        self,
+        index_service: &Index,
         mut terminator: Receiver<ControlMessage>,
     ) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let state = Arc::new(AppState {
@@ -118,11 +115,11 @@ impl MetricsServer {
         });
         let service = make_service_fn(move |_conn| {
             let state = state.clone();
-            async move { Ok::<_, Infallible>(service_fn(move |request| MetricsServer::serve_request(request, state.clone()))) }
+            async move { Ok::<_, Infallible>(service_fn(move |request| Metrics::serve_request(request, state.clone()))) }
         });
 
-        let server = Server::bind(&self.metrics_config.endpoint.parse()?).serve(service);
-        info!(action = "binded", endpoint = ?self.metrics_config.endpoint);
+        let server = Server::bind(&self.config.endpoint.parse()?).serve(service);
+        info!(action = "binded", endpoint = ?self.config.endpoint);
         let graceful = server.with_graceful_shutdown(async move {
             let signal_result = terminator.recv().await;
             info!(action = "sigterm_received", received = ?signal_result);
@@ -133,6 +130,6 @@ impl MetricsServer {
             info!(action = "terminated", result = ?result);
             Ok(())
         }
-        .instrument(info_span!("lifecycle")))
+        .instrument(info_span!(parent: None, "lifecycle")))
     }
 }

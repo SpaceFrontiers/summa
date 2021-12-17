@@ -26,7 +26,7 @@
 //! - Tracing with [OpenTelemetry](https://github.com/open-telemetry/opentelemetry-rust) and exposing metrics in Prometheus format
 //! - Reflection API for deep insights about text data
 //! - Configurable tokenizers (including CJK)
-//! - IPFS API for replication (soon)
+//! - IPFS Integration
 //!
 //! ## Getting started
 //! - Look at [examples](crate::examples)
@@ -45,7 +45,6 @@ pub(crate) mod hyper_external_request;
 pub(crate) mod logging;
 pub mod requests;
 pub mod server;
-pub mod servers;
 pub mod services;
 pub(crate) mod utils;
 

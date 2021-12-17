@@ -14,7 +14,6 @@ use tracing::{info, instrument, warn};
 
 use crate::components::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::components::consumers::kafka::ConsumerThread;
-use crate::configs::ConsumerConfig;
 use crate::errors::{Error, SummaServerResult, ValidationError};
 
 pub fn process_message(
@@ -76,7 +75,7 @@ pub struct PreparedConsumption {
 }
 
 impl PreparedConsumption {
-    pub fn from_config(consumer_name: &str, consumer_config: &ConsumerConfig) -> SummaServerResult<PreparedConsumption> {
+    pub fn from_config(consumer_name: &str, consumer_config: &crate::configs::consumer::Config) -> SummaServerResult<PreparedConsumption> {
         Ok(PreparedConsumption {
             committed_consumer_thread: ConsumerThread::new(consumer_name, consumer_config)?,
         })
@@ -161,7 +160,7 @@ impl ConsumerManager {
         None
     }
 
-    pub fn find_consumer_config_for(&self, consumer_name: &str) -> Option<&ConsumerConfig> {
+    pub fn find_consumer_config_for(&self, consumer_name: &str) -> Option<&crate::configs::consumer::Config> {
         for consumer_thread in self.consumptions.values() {
             if consumer_thread.consumer_name() == consumer_name {
                 return Some(consumer_thread.config());

@@ -35,6 +35,8 @@ pub enum ValidationError {
 pub enum Error {
     #[error("addr_parse_error: {0}")]
     AddrParse(#[from] std::net::AddrParseError),
+    #[error("anyhow_error: {0}")]
+    Anyhow(#[from] anyhow::Error),
     #[error("clap_matches_error: {0}")]
     ClapMatches(#[from] clap::parser::MatchesError),
     #[error("summa_core: {0}")]
@@ -47,8 +49,6 @@ pub enum Error {
     Internal,
     #[error("{0:?}")]
     IO((std::io::Error, Option<PathBuf>)),
-    #[error("ipfs_error: {0}")]
-    IPFS(#[from] ipfs_api::Error),
     #[error("json_error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("lock_error: {0}")]
@@ -75,7 +75,7 @@ impl From<std::io::Error> for Error {
 
 impl From<Error> for summa_core::Error {
     fn from(error: Error) -> Self {
-        summa_core::Error::External(format!("{:?}", error))
+        summa_core::Error::External(format!("{error:?}"))
     }
 }
 
@@ -99,7 +99,7 @@ impl From<Error> for tonic::Status {
                 Error::Lock(_) => tonic::Code::FailedPrecondition,
                 _ => tonic::Code::Internal,
             },
-            format!("{}", error),
+            format!("{error}"),
         )
     }
 }

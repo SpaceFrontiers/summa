@@ -37,23 +37,23 @@ fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> Summ
         FieldType::Str(_) => Term::from_field_text(field, value),
         FieldType::I64(_) => Term::from_field_i64(
             field,
-            i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as i64", value)))?,
+            i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as i64")))?,
         ),
         FieldType::U64(_) => Term::from_field_u64(
             field,
-            u64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as u64", value)))?,
+            u64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as u64")))?,
         ),
         FieldType::F64(_) => Term::from_field_f64(
             field,
-            f64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f64", value)))?,
+            f64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as f64")))?,
         ),
         FieldType::Bytes(_) => Term::from_field_bytes(
             field,
-            &base64::decode(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as bytes", value)))?,
+            &base64::decode(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as bytes")))?,
         ),
         FieldType::Date(_) => Term::from_field_date(
             field,
-            DateTime::from_timestamp_secs(i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as date", value)))?),
+            DateTime::from_timestamp_secs(i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as date")))?),
         ),
         _ => return Err(Error::InvalidSyntax("invalid range type".to_owned())),
     })
@@ -74,8 +74,8 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
 }
 
 impl QueryParser {
-    pub fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
-        let index_meta = index.load_metas()?;
+    pub async fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
+        let index_meta = index.load_metas_async().await?;
         let attributes: Option<proto::IndexAttributes> = index_meta.attributes()?;
         let default_fields = attributes
             .map(|attributes| attributes.default_fields)
@@ -163,7 +163,7 @@ impl QueryParser {
             )),
             Some(proto::query::Query::Match(match_query_proto)) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
                 Ok(parsed_query) => Ok(parsed_query),
-                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(Error::Validation(ValidationError::MissingField(field))),
+                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(ValidationError::MissingField(field).into()),
                 Err(e) => Err(Error::InvalidTantivySyntax(e, match_query_proto.value.to_owned())),
             }?,
             Some(proto::query::Query::Range(range_query_proto)) => {
@@ -239,7 +239,7 @@ impl QueryParser {
                 }
                 if let Some(ref boost) = more_like_this_query_proto.boost {
                     query_builder =
-                        query_builder.with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", boost)))?);
+                        query_builder.with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {boost} as f32")))?);
                 }
                 query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words.clone());
                 Box::new(query_builder.with_document_fields(field_values))

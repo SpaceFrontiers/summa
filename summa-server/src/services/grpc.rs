@@ -21,26 +21,22 @@ use tower_http::set_header::SetRequestHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, info_span, instrument, warn, Instrument, Span};
 
-use super::base::BaseServer;
 use crate::apis::beacon::BeaconApiImpl;
 use crate::apis::consumer::ConsumerApiImpl;
 use crate::apis::index::IndexApiImpl;
 use crate::apis::reflection::ReflectionApiImpl;
 use crate::apis::search::SearchApiImpl;
-use crate::configs::ServerConfig;
 use crate::errors::SummaServerResult;
-use crate::services::{BeaconService, IndexService};
+use crate::services::{Beacon, Index};
 
 /// GRPC server exposing [API](crate::apis)
-pub struct GrpcServer {
-    server_config: Arc<dyn ConfigProxy<ServerConfig>>,
-    beacon_service: Option<BeaconService>,
-    index_service: IndexService,
+pub struct Grpc {
+    server_config: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
+    beacon_service: Beacon,
+    index_service: Index,
 }
 
-impl BaseServer for GrpcServer {}
-
-impl GrpcServer {
+impl Grpc {
     fn on_request(request: &hyper::Request<hyper::Body>, _span: &Span) {
         info!(path = ?request.uri().path());
     }
@@ -59,15 +55,21 @@ impl GrpcServer {
         )
     }
 
+    fn set_listener(endpoint: &str) -> SummaServerResult<tokio::net::TcpListener> {
+        let std_listener = std::net::TcpListener::bind(endpoint)?;
+        std_listener.set_nonblocking(true)?;
+        Ok(tokio::net::TcpListener::from_std(std_listener)?)
+    }
+
     /// New GRPC server
     pub fn new(
-        server_config: &Arc<dyn ConfigProxy<ServerConfig>>,
-        beacon_service: Option<&BeaconService>,
-        index_service: &IndexService,
-    ) -> SummaServerResult<GrpcServer> {
-        Ok(GrpcServer {
+        server_config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>,
+        beacon_service: &Beacon,
+        index_service: &Index,
+    ) -> SummaServerResult<Grpc> {
+        Ok(Grpc {
             server_config: server_config.clone(),
-            beacon_service: beacon_service.cloned(),
+            beacon_service: beacon_service.clone(),
             index_service: index_service.clone(),
         })
     }
@@ -97,10 +99,10 @@ impl GrpcServer {
             .buffer(100)
             .layer(
                 TraceLayer::new_for_grpc()
-                    .make_span_with(GrpcServer::set_span)
-                    .on_request(GrpcServer::on_request)
-                    .on_response(GrpcServer::on_response)
-                    .on_failure(GrpcServer::on_failure),
+                    .make_span_with(Grpc::set_span)
+                    .on_request(Grpc::on_request)
+                    .on_response(Grpc::on_response)
+                    .on_failure(Grpc::on_failure),
             )
             .into_inner();
 
@@ -113,12 +115,10 @@ impl GrpcServer {
             .add_service(ReflectionApiServer::new(reflection_api))
             .add_service(SearchApiServer::new(search_api));
 
-        if let Some(beacon_service) = self.beacon_service {
-            let beacon_api = BeaconApiImpl::new(&beacon_service, &self.index_service)?;
-            router = router.add_service(BeaconApiServer::new(beacon_api))
-        }
+        let beacon_api = BeaconApiImpl::new(&self.beacon_service, &self.index_service)?;
+        router = router.add_service(BeaconApiServer::new(beacon_api));
 
-        let listener = GrpcServer::set_listener(&grpc_config.endpoint)?;
+        let listener = Grpc::set_listener(&grpc_config.endpoint)?;
         info!(action = "binded", endpoint = ?grpc_config.endpoint);
         let server = async move {
             router
@@ -128,7 +128,7 @@ impl GrpcServer {
                     let service_result = self.index_service.stop(false).await;
                     info!(action = "terminated", result = ?service_result);
                 })
-                .instrument(info_span!("lifecycle"))
+                .instrument(info_span!(parent: None, "lifecycle"))
                 .await?;
             Ok(())
         };

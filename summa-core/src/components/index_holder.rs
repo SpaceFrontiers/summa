@@ -15,7 +15,7 @@ use opentelemetry::{
 };
 use summa_proto::proto;
 use tantivy::collector::MultiCollector;
-use tantivy::directory::OwnedBytes;
+use tantivy::directory::{OwnedBytes, RamDirectory};
 use tantivy::schema::Schema;
 use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, ReloadPolicy};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -27,13 +27,13 @@ use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
-use crate::configs::{ConfigProxy, CoreConfig};
-use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory};
+use crate::configs::ConfigProxy;
+use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, IrohDirectory, NetworkDirectory};
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
 
 pub struct IndexHolder {
-    core_config_holder: Arc<dyn ConfigProxy<CoreConfig>>,
+    core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
     index_engine_config: proto::IndexEngineConfig,
     index_name: String,
     index: Index,
@@ -64,7 +64,6 @@ impl Debug for IndexHolder {
             .field("index_name", &self.index_name)
             .field("index_engine_config", &self.index_engine_config)
             .field("index_settings", &self.index.settings())
-            .field("index_attributes", &self.index_attributes())
             .finish()
     }
 }
@@ -117,7 +116,7 @@ async fn open_network_index<TExternalRequest: ExternalRequest + 'static, TExtern
 impl IndexHolder {
     /// Sets up `IndexHolder`
     pub async fn create_holder(
-        core_config_holder: Arc<dyn ConfigProxy<CoreConfig>>,
+        core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
         mut index: Index,
         index_name: Option<&str>,
         index_engine_config: proto::IndexEngineConfig,
@@ -132,9 +131,11 @@ impl IndexHolder {
                 .expect("no index name")
         });
         let cached_schema = index.schema();
-        let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index)?);
-        let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
-        let index_writer_holder = Arc::new(RwLock::new(IndexWriterHolder::from_config(&index, core_config_holder.read().await.get())?));
+        let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index).await?);
+        let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).build_async().await?;
+        let index_writer_holder = Arc::new(RwLock::new(
+            IndexWriterHolder::from_config(&index, core_config_holder.read().await.get()).await?,
+        ));
 
         Ok(IndexHolder {
             core_config_holder: core_config_holder.clone(),
@@ -155,7 +156,7 @@ impl IndexHolder {
     }
 
     pub async fn reload_query_parser(&self) -> SummaResult<()> {
-        *self.query_parser.write().await = QueryParser::for_index(&self.index_name, self.index_reader().searcher().index())?;
+        *self.query_parser.write().await = QueryParser::for_index(&self.index_name, self.index_reader().searcher().index()).await?;
         Ok(())
     }
 
@@ -204,10 +205,22 @@ impl IndexHolder {
             proto::IndexEngineConfig {
                 config: Some(proto::index_engine_config::Config::Remote(config)),
             } => open_network_index::<TExternalRequest, TExternalRequestGenerator>(config).await?,
+            #[cfg(feature = "ipfs")]
             proto::IndexEngineConfig {
-                config: Some(proto::index_engine_config::Config::Ipfs(_)),
-            } => todo!(),
-            _ => panic!(),
+                config: Some(proto::index_engine_config::Config::Ipfs(config)),
+            } => {
+                let client = iroh_rpc_client::Client::new(iroh_rpc_client::Config::default_network()).await?;
+                let content_loader = iroh_unixfs::content_loader::FullLoader::new(
+                    client.clone(),
+                    iroh_unixfs::content_loader::FullLoaderConfig {
+                        http_gateways: vec![],
+                        indexer: None,
+                    },
+                )?;
+                let iroh_directory = IrohDirectory::new(RamDirectory::create(), content_loader, &config.cid).await?;
+                Index::open_async(iroh_directory).await?
+            }
+            _ => unimplemented!(),
         };
         info!(action = "from_config", index = ?index);
         Ok(index)
@@ -228,8 +241,8 @@ impl IndexHolder {
     }
 
     /// Load index attributes from meta.json
-    pub fn index_attributes(&self) -> SummaResult<Option<proto::IndexAttributes>> {
-        Ok(self.index.load_metas()?.attributes()?)
+    pub async fn index_attributes(&self) -> SummaResult<Option<proto::IndexAttributes>> {
+        Ok(self.index.load_metas_async().await?.attributes()?)
     }
 
     /// Index name
@@ -262,7 +275,7 @@ impl IndexHolder {
     pub async fn warmup(&self) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
-        let index_attributes = self.index_attributes();
+        let index_attributes = self.index_attributes().await;
         let default_fields = index_attributes?
             .map(|index_attributes| {
                 index_attributes
@@ -359,7 +372,8 @@ impl IndexHolder {
         );
         let mut collector_outputs = Vec::with_capacity(extractors.len());
         let multi_fields = self
-            .index_attributes()?
+            .index_attributes()
+            .await?
             .map(|index_attributes| {
                 index_attributes
                     .multi_fields

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry, SummaDocument};
-use summa_core::configs::{CoreConfigBuilder, DirectProxy};
+use summa_core::configs::DirectProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_proto::proto::{IndexAttributes, IndexEngineConfig};
 use tantivy::Executor;
@@ -46,7 +46,10 @@ impl WebIndexRegistry {
         let mut index = IndexHolder::from_index_engine_config::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine).await?;
         index.settings_mut().docstore_compress_dedicated_thread = false;
 
-        let core_config = CoreConfigBuilder::default().writer_threads(0).build().map_err(|e| Error::Core(e.into()))?;
+        let core_config = summa_core::configs::core::ConfigBuilder::default()
+            .writer_threads(0)
+            .build()
+            .map_err(|e| Error::Core(e.into()))?;
 
         index.set_multithread_executor(match self.multithreading {
             true => Executor::GlobalPool,
@@ -55,7 +58,7 @@ impl WebIndexRegistry {
 
         let core_config = Arc::new(DirectProxy::new(core_config));
         let index_holder = IndexHolder::create_holder(core_config, index, None, index_engine).await?;
-        let index_attributes = index_holder.index_attributes()?;
+        let index_attributes = index_holder.index_attributes().await?;
         self.index_registry.add(index_holder).await;
         Ok(index_attributes)
     }

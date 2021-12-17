@@ -16,13 +16,13 @@ pub enum Error {
 
 impl From<serde_wasm_bindgen::Error> for Error {
     fn from(error: serde_wasm_bindgen::Error) -> Self {
-        Error::Serialization(format!("{:?}", error))
+        Error::Serialization(format!("{error:?}"))
     }
 }
 
 impl From<wasm_bindgen::JsValue> for Error {
     fn from(error: wasm_bindgen::JsValue) -> Self {
-        Error::Js(format!("{:?}", error))
+        Error::Js(format!("{error:?}"))
     }
 }
 
@@ -34,13 +34,13 @@ impl From<Error> for io::Error {
 
 impl From<strfmt::FmtError> for Error {
     fn from(error: strfmt::FmtError) -> Self {
-        Error::Serialization(format!("{:?}", error))
+        Error::Serialization(format!("{error:?}"))
     }
 }
 
 impl From<Error> for wasm_bindgen::JsValue {
     fn from(error: Error) -> Self {
-        wasm_bindgen::JsValue::from(format!("{:?}", error))
+        wasm_bindgen::JsValue::from(format!("{error:?}"))
     }
 }
 

@@ -9,7 +9,6 @@ use tracing::info;
 
 use super::SummaSegmentAttributes;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
-use crate::configs::CoreConfig;
 use crate::errors::{SummaResult, ValidationError};
 
 #[derive(Clone)]
@@ -51,7 +50,7 @@ pub enum IndexWriterImpl {
 }
 
 impl IndexWriterImpl {
-    pub fn new(index: &Index, writer_threads: usize, writer_heap_size_bytes: usize) -> SummaResult<Self> {
+    pub async fn new(index: &Index, writer_threads: usize, writer_heap_size_bytes: usize) -> SummaResult<Self> {
         Ok(if writer_threads == 0 {
             IndexWriterImpl::Single(SingleIndexWriter {
                 index: index.clone(),
@@ -59,7 +58,7 @@ impl IndexWriterImpl {
                 writer_heap_size_bytes,
             })
         } else {
-            let index_writer = index.writer_with_num_threads(writer_threads, writer_heap_size_bytes)?;
+            let index_writer = index.writer_with_num_threads_async(writer_threads, writer_heap_size_bytes).await?;
             index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
             IndexWriterImpl::Threaded(index_writer)
         })
@@ -163,11 +162,12 @@ impl IndexWriterHolder {
         })
     }
 
-    /// Creates new `IndexWriterHolder` from `Index` and `CoreConfig`
-    pub fn from_config(index: &Index, core_config: &CoreConfig) -> SummaResult<IndexWriterHolder> {
-        let index_writer = IndexWriterImpl::new(index, core_config.writer_threads as usize, core_config.writer_heap_size_bytes as usize)?;
+    /// Creates new `IndexWriterHolder` from `Index` and `core::Config`
+    pub async fn from_config(index: &Index, core_config: &crate::configs::core::Config) -> SummaResult<IndexWriterHolder> {
+        let index_writer = IndexWriterImpl::new(index, core_config.writer_threads as usize, core_config.writer_heap_size_bytes as usize).await?;
         let primary_key = index
-            .load_metas()?
+            .load_metas_async()
+            .await?
             .attributes()?
             .and_then(|attributes: proto::IndexAttributes| {
                 attributes.primary_key.map(|primary_key| {
@@ -299,7 +299,7 @@ impl IndexWriterHolder {
 
     /// Locking index files for executing operation on them
     #[cfg(feature = "fs")]
-    pub async fn lock_files<P, O, Fut>(&mut self, index_path: P, payload: Option<String>, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
+    pub async fn lock_files<P, O, Fut>(&mut self, index_path: P, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
     where
         P: AsRef<Path>,
         Fut: std::future::Future<Output = SummaResult<O>>,
@@ -310,7 +310,7 @@ impl IndexWriterHolder {
 
         self.commit(None).await?;
         self.vacuum(Some(segment_attributes)).await?;
-        self.commit(payload).await?;
+        self.commit(None).await?;
 
         self.wait_merging_threads();
 
@@ -323,9 +323,9 @@ impl IndexWriterHolder {
             .atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)?;
 
         let segment_files = [
-            ComponentFile::Other(PathBuf::from(".managed.json")),
-            ComponentFile::Other(PathBuf::from("meta.json")),
-            ComponentFile::Other(PathBuf::from("hotcache.bin")),
+            ComponentFile::Other(index_path.as_ref().join(".managed.json")),
+            ComponentFile::Other(index_path.as_ref().join("meta.json")),
+            ComponentFile::Other(index_path.as_ref().join("hotcache.bin")),
         ]
         .into_iter()
         .chain(self.get_index_files(index_path.as_ref().to_path_buf())?)
@@ -342,7 +342,7 @@ impl IndexWriterHolder {
                     let relative_path = segment.meta().relative_path(*segment_component);
                     index_path.join(relative_path).exists().then(|| {
                         ComponentFile::SegmentComponent(SegmentComponent {
-                            path: segment.meta().relative_path(*segment_component),
+                            path: index_path.join(segment.meta().relative_path(*segment_component)),
                             segment_component: *segment_component,
                         })
                     })

@@ -33,9 +33,10 @@ summa-proto = { version = "0.11.0", path = "../summa-proto", features = ["test-u
 tempdir = "0.3.7"
 
 [dependencies]
+anyhow = "1.0"
 async-broadcast = "0.4"
 async-trait = "0.1"
-base64 = "0.13"
+base64 = "0.20.0"
 clap = { version = "4.0", features = ["cargo"] }
 config = "0.13"
 crossbeam-channel = "0.5"
@@ -43,8 +44,10 @@ derive_builder = "0.12"
 futures = "0.3"
 futures-util = "0.3"
 hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
-ipfs-api = { version = "0.16.3", package = "izihawa-ipfs-api" }
-ipfs-api-backend-hyper = { version = "0.5.2", features = ["with-send-sync"], package = "izihawa-ipfs-api-backend-hyper" }
+iroh-api = { workspace = true }
+iroh-p2p = { workspace = true }
+iroh-store = { workspace = true }
+iroh-unixfs = { workspace = true }
 itertools = "0.10"
 lazy_static = "1.4"
 multihash = "0.18"
@@ -60,7 +63,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1.0"
 serde_json = "1.0"
 serde_yaml = "0.8.26"
-summa-core = { version = "0.11.0", path = "../summa-core", features = ["fs"] }
+summa-core = { version = "0.11.0", path = "../summa-core", features = ["fs", "ipfs"] }
 summa-proto = { version = "0.11.0", path = "../summa-proto" }
 take_mut = "0.2"
 tantivy = { workspace = true }

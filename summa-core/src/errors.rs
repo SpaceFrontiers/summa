@@ -46,6 +46,8 @@ pub enum ValidationError {
 pub enum Error {
     #[error("addr_parse_error: {0}")]
     AddrParse(#[from] std::net::AddrParseError),
+    #[error("anyhow_error: {0}")]
+    Anyhow(#[from] anyhow::Error),
     #[error("index_error: {0}")]
     AsyncIo(#[from] tantivy::error::AsyncIoError),
     #[error("config_error: {0}")]
@@ -85,7 +87,7 @@ pub enum Error {
     #[error("unknown_directory_error: {0}")]
     UnknownDirectory(String),
     #[error("{0}")]
-    Validation(#[from] ValidationError),
+    Validation(Box<ValidationError>),
     #[error("{0}")]
     Yaml(#[from] serde_yaml::Error),
 }
@@ -100,7 +102,13 @@ pub enum BuilderError {
 
 impl From<BuilderError> for Error {
     fn from(error: BuilderError) -> Self {
-        Error::Validation(ValidationError::Builder(error))
+        Error::Validation(Box::new(ValidationError::Builder(error)))
+    }
+}
+
+impl From<ValidationError> for Error {
+    fn from(error: ValidationError) -> Self {
+        Error::Validation(Box::new(error))
     }
 }
 
@@ -143,8 +151,8 @@ impl From<Error> for tantivy::error::AsyncIoError {
 impl Display for BuilderError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuilderError::UninitializedField(s) => write!(f, "UninitializedField({})", s),
-            BuilderError::ValidationError(s) => write!(f, "ValidationError({})", s),
+            BuilderError::UninitializedField(s) => write!(f, "UninitializedField({s})"),
+            BuilderError::ValidationError(s) => write!(f, "ValidationError({s})"),
         }
     }
 }

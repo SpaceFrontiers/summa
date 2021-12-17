@@ -87,12 +87,12 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         for (header_name, header_value) in self.remote_engine_config.headers_template.iter() {
             headers.push(Header {
                 name: header_name.clone(),
-                value: strfmt(header_value, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
+                value: strfmt(header_value, &vars).map_err(|e| Error::Validation(Box::new(ValidationError::from(e))))?,
             });
         }
         Ok(TExternalRequest::new(
             &self.remote_engine_config.method,
-            &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
+            &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(Box::new(ValidationError::from(e))))?,
             &headers,
         ))
     }
@@ -102,7 +102,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         vars.insert("file_name".to_string(), file_name);
         Ok(TExternalRequest::new(
             "HEAD",
-            &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(ValidationError::from(e)))?,
+            &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(Box::new(ValidationError::from(e))))?,
             &[],
         ))
     }

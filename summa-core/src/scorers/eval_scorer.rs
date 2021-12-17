@@ -4,7 +4,7 @@ use fasteval2::Evaler;
 use tantivy::schema::Schema;
 use tantivy::SegmentReader;
 
-use crate::errors::{Error, SummaResult, ValidationError};
+use crate::errors::{SummaResult, ValidationError};
 use crate::scorers::SegmentEvalScorer;
 
 lazy_static! {
@@ -31,7 +31,7 @@ impl EvalScorer {
             let field = schema.get_field(var_name);
             let field = field.ok_or_else(|| ValidationError::MissingField(var_name.to_owned()))?;
             if !schema.get_field_entry(field).is_fast() {
-                return Err(Error::Validation(ValidationError::RequiredFastField(var_name.to_owned())));
+                return Err(ValidationError::RequiredFastField(var_name.to_owned()).into());
             }
             var_names.push(var_name.to_owned());
         }

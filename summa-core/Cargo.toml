@@ -13,18 +13,24 @@ doc = true
 
 [features]
 fs = ["tantivy/mmap", "tokio/fs"]
+ipfs = ["iroh-metrics", "iroh-resolver", "iroh-rpc-client", "iroh-unixfs"]
 metrics = ["opentelemetry"]
 
 [dependencies]
+anyhow = "1.0.68"
 async-broadcast = "0.4"
 async-trait = "0.1"
-base64 = "0.13"
+base64 = "0.20.0"
 config = "0.13"
 crossbeam-channel = "0.5"
 derive_builder = "0.12"
 fasteval2 = { version = "2.0", features = ["unsafe-vars"] }
 futures = "0.3"
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
+iroh-metrics = { workspace = true, optional = true }
+iroh-resolver = { workspace = true, optional = true }
+iroh-rpc-client = { workspace = true, optional = true }
+iroh-unixfs = { workspace = true, optional = true }
 itertools = "0.10"
 lazy_static = "1.4"
 lru = "0.8"

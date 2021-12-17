@@ -43,7 +43,7 @@ impl IndexRegistry {
             .read()
             .await
             .get(index_name)
-            .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_name.to_owned())))?
+            .ok_or_else(|| Error::Validation(Box::new(ValidationError::MissingIndex(index_name.to_owned()))))?
             .handler())
     }
 
@@ -68,7 +68,7 @@ impl IndexRegistry {
             .map(|index_query| {
                 let index_holder = index_holders
                     .get(&index_query.index_name)
-                    .ok_or_else(|| Error::Validation(ValidationError::MissingIndex(index_query.index_name.to_owned())))?
+                    .ok_or_else(|| Error::Validation(Box::new(ValidationError::MissingIndex(index_query.index_name.to_owned()))))?
                     .handler();
                 Ok(async move { index_holder.search(&index_query.index_name, &index_query.query, &index_query.collectors).await })
             })

@@ -6,15 +6,15 @@ use summa_proto::proto;
 use tonic::{Request, Response, Status};
 
 use crate::errors::SummaServerResult;
-use crate::services::{BeaconService, IndexService};
+use crate::services::{Beacon, Index};
 
 pub struct BeaconApiImpl {
-    beacon_service: BeaconService,
-    index_service: IndexService,
+    beacon_service: Beacon,
+    index_service: Index,
 }
 
 impl BeaconApiImpl {
-    pub fn new(beacon_service: &BeaconService, index_service: &IndexService) -> SummaServerResult<BeaconApiImpl> {
+    pub fn new(beacon_service: &Beacon, index_service: &Index) -> SummaServerResult<BeaconApiImpl> {
         Ok(BeaconApiImpl {
             beacon_service: beacon_service.clone(),
             index_service: index_service.clone(),
@@ -28,10 +28,7 @@ impl proto::beacon_api_server::BeaconApi for BeaconApiImpl {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         let prepared_consumption = self.index_service.commit(&index_holder).await?;
-        let hash = self
-            .beacon_service
-            .publish_index(&format!("/index/{}", index_holder.index_name()), index_holder.clone(), proto_request.payload)
-            .await?;
+        let hash = self.beacon_service.publish_index(index_holder.clone()).await?;
         if let Some(prepared_consumption) = prepared_consumption {
             self.index_service
                 .consumer_manager()

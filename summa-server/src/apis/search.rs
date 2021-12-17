@@ -9,14 +9,14 @@ use tonic::{Request, Response, Status};
 use tracing::{info_span, Instrument};
 
 use crate::errors::SummaServerResult;
-use crate::services::IndexService;
+use crate::services::Index;
 
 pub struct SearchApiImpl {
-    index_service: IndexService,
+    index_service: Index,
 }
 
 impl SearchApiImpl {
-    pub fn new(index_service: &IndexService) -> SummaServerResult<SearchApiImpl> {
+    pub fn new(index_service: &Index) -> SummaServerResult<SearchApiImpl> {
         Ok(SearchApiImpl {
             index_service: index_service.clone(),
         })

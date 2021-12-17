@@ -10,7 +10,7 @@ pub fn create_runtime() -> runtime::Runtime {
         .thread_name_fn(|| {
             static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
             let id = ATOMIC_ID.fetch_add(1, Ordering::SeqCst);
-            format!("tokio-runtime-workers-{}", id)
+            format!("tokio-runtime-workers-{id}")
         })
         .build()
         .unwrap()

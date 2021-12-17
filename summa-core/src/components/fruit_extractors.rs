@@ -64,7 +64,7 @@ fn get_strict_fields<'a, F: Iterator<Item = &'a String>>(schema: &Schema, fields
         .map(|field| {
             schema
                 .get_field(field)
-                .ok_or_else(|| Error::Validation(ValidationError::MissingField(field.to_owned())))
+                .ok_or_else(|| Error::Validation(Box::new(ValidationError::MissingField(field.to_owned()))))
         })
         .collect::<SummaResult<HashSet<Field>>>()?;
     Ok((!fields.is_empty()).then_some(fields))

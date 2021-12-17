@@ -1,9 +1,14 @@
 //! Services responsible for various aspects a search engine like indices management or aliasing
 
-pub(crate) mod beacon_service;
-pub(crate) mod differential_updater;
-pub(crate) mod index_service;
+pub(crate) mod beacon;
+pub(crate) mod grpc;
+pub(crate) mod index;
+pub(crate) mod metrics;
+pub(crate) mod p2p;
+pub(crate) mod store;
 
-pub use beacon_service::BeaconService;
-pub use differential_updater::DifferentialUpdater;
-pub use index_service::IndexService;
+pub use beacon::Beacon;
+pub use grpc::Grpc;
+pub use index::Index;
+pub use metrics::Metrics;
+pub use p2p::P2p;

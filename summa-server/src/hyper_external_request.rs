@@ -37,7 +37,7 @@ impl ExternalRequest for HyperExternalRequest {
     async fn request_async(self) -> SummaResult<ExternalResponse> {
         let mut request = Request::builder().uri(&self.url).method(
             Method::from_bytes(self.method.as_bytes())
-                .map_err(|_| summa_core::Error::Validation(ValidationError::InvalidHttpMethod(self.method.to_string())))?,
+                .map_err(|_| summa_core::Error::Validation(Box::new(ValidationError::InvalidHttpMethod(self.method.to_string()))))?,
         );
         for header in self.headers.iter() {
             request = request.header(&header.name, &header.value);

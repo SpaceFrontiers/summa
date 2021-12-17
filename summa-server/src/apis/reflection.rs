@@ -9,14 +9,14 @@ use summa_proto::proto;
 use tonic::{Request, Response, Status};
 
 use crate::errors::{SummaServerResult, ValidationError};
-use crate::services::IndexService;
+use crate::services::Index;
 
 pub struct ReflectionApiImpl {
-    index_service: IndexService,
+    index_service: Index,
 }
 
 impl ReflectionApiImpl {
-    pub fn new(index_service: &IndexService) -> SummaServerResult<ReflectionApiImpl> {
+    pub fn new(index_service: &Index) -> SummaServerResult<ReflectionApiImpl> {
         Ok(ReflectionApiImpl {
             index_service: index_service.clone(),
         })
