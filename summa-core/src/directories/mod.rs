@@ -3,6 +3,7 @@ mod chunked_caching_directory;
 mod debug_proxy_directory;
 mod external_requests;
 mod hot_cache_directory;
+#[cfg(feature = "ipfs")]
 mod iroh_directory;
 mod memory_sized_cache;
 mod network_directory;
@@ -15,10 +16,11 @@ pub use debug_proxy_directory::DebugProxyDirectory;
 pub use external_requests::{
     DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, ExternalResponse, Header,
 };
-pub use hot_cache_directory::{write_hotcache, HotDirectory};
+pub use hot_cache_directory::{deserialize_cbor, write_hotcache, HotDirectory, StaticDirectoryCache};
+#[cfg(feature = "ipfs")]
 pub use iroh_directory::IrohDirectory;
 pub use memory_sized_cache::MemorySizedCache;
-pub use network_directory::NetworkDirectory;
+pub use network_directory::{NetworkDirectory, NetworkFile};
 
 struct Noop {}
 

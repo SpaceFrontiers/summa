@@ -1,7 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
     let files = &[
-        "proto/beacon_service.proto",
         "proto/consumer_service.proto",
         "proto/index_service.proto",
         "proto/query.proto",

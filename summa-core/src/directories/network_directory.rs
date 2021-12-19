@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::path::PathBuf;
-use std::sync::RwLock;
 use std::{io, ops::Range, path::Path, sync::Arc, usize};
 
 use tantivy::directory::DirectoryClone;
 use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
-    AsyncIoResult, Directory, HasLen,
+    Directory, HasLen,
 };
 
 use super::ExternalRequestGenerator;
@@ -16,7 +13,6 @@ use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
 
 pub struct NetworkDirectory<TExternalRequest: ExternalRequest> {
-    file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
     external_request_generator: Box<dyn ExternalRequestGenerator<TExternalRequest>>,
 }
 
@@ -27,21 +23,19 @@ impl<TExternalRequest: ExternalRequest> Debug for NetworkDirectory<TExternalRequ
 }
 
 impl<TExternalRequest: ExternalRequest> NetworkDirectory<TExternalRequest> {
-    pub fn open(
-        external_request_generator: Box<dyn ExternalRequestGenerator<TExternalRequest>>,
-        file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
-    ) -> NetworkDirectory<TExternalRequest> {
-        NetworkDirectory {
-            file_lengths,
-            external_request_generator,
-        }
+    pub fn open(external_request_generator: Box<dyn ExternalRequestGenerator<TExternalRequest>>) -> NetworkDirectory<TExternalRequest> {
+        NetworkDirectory { external_request_generator }
+    }
+
+    pub fn get_network_file_handle(&self, file_name: &Path) -> NetworkFile<TExternalRequest> {
+        let file_name_str = file_name.to_string_lossy();
+        NetworkFile::new(file_name_str.to_string(), self.external_request_generator.box_clone())
     }
 }
 
 impl<TExternalRequest: ExternalRequest + 'static> DirectoryClone for NetworkDirectory<TExternalRequest> {
     fn box_clone(&self) -> Box<dyn Directory> {
         Box::new(NetworkDirectory {
-            file_lengths: self.file_lengths.clone(),
             external_request_generator: self.external_request_generator.box_clone(),
         })
     }
@@ -49,12 +43,7 @@ impl<TExternalRequest: ExternalRequest + 'static> DirectoryClone for NetworkDire
 
 impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory<TExternalRequest> {
     fn get_file_handle(&self, file_name: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        let file_name_str = file_name.to_string_lossy();
-        Ok(Arc::new(NetworkFile::new(
-            file_name_str.to_string(),
-            self.file_lengths.read().expect("poisoned").get(file_name).cloned(),
-            self.external_request_generator.box_clone(),
-        )?))
+        Ok(Arc::new(self.get_network_file_handle(file_name)))
     }
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
@@ -62,9 +51,9 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-        let file_handle = self.get_file_handle(path)?;
+        let file_handle = self.get_network_file_handle(path);
         Ok(file_handle
-            .read_bytes(0..file_handle.len())
+            .do_read_bytes(None)
             .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?
             .to_vec())
     }
@@ -73,67 +62,61 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
 }
 
 #[derive(Debug)]
-struct NetworkFile<TExternalRequest: ExternalRequest> {
+pub struct NetworkFile<TExternalRequest: ExternalRequest> {
     file_name: String,
-    file_length: Option<u64>,
     request_generator: Box<dyn ExternalRequestGenerator<TExternalRequest>>,
 }
 
 impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
-    pub fn new(
-        file_name: String,
-        file_length: Option<u64>,
-        request_generator: Box<dyn ExternalRequestGenerator<TExternalRequest>>,
-    ) -> Result<NetworkFile<TExternalRequest>, OpenReadError> {
-        Ok(NetworkFile {
-            file_name,
-            file_length,
-            request_generator,
-        })
+    pub fn new(file_name: String, request_generator: Box<dyn ExternalRequestGenerator<TExternalRequest>>) -> NetworkFile<TExternalRequest> {
+        NetworkFile { file_name, request_generator }
+    }
+
+    fn do_read_bytes(&self, byte_range: Option<Range<usize>>) -> io::Result<OwnedBytes> {
+        let request_response = self.request_generator.generate_range_request(&self.file_name, byte_range)?.request()?;
+        Ok(OwnedBytes::new(request_response.data))
+    }
+
+    pub(crate) async fn do_read_bytes_async(&self, byte_range: Option<Range<usize>>) -> io::Result<OwnedBytes> {
+        let request = self.request_generator.generate_range_request(&self.file_name, byte_range)?;
+        let request_fut = request.request_async();
+        Ok(OwnedBytes::new(request_fut.await?.data))
     }
 
     pub fn internal_length(&self) -> SummaResult<u64> {
-        Ok(match self.file_length {
-            Some(file_length) => file_length,
-            None => {
-                let external_response = self.request_generator.generate_length_request(&self.file_name)?.request()?;
-                external_response
-                    .headers
-                    .iter()
-                    .find_map(|header| {
-                        if header.name == "content-length" {
-                            Some(
-                                header
-                                    .value
-                                    .parse::<u64>()
-                                    .map_err(|_| InvalidHttpHeader(header.name.clone(), header.value.clone())),
-                            )
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| ValidationError::MissingHeader("content_range".to_string()))??
-            }
-        })
+        let external_response = self.request_generator.generate_length_request(&self.file_name)?.request()?;
+        Ok(external_response
+            .headers
+            .iter()
+            .find_map(|header| {
+                if header.name == "content-length" {
+                    Some(
+                        header
+                            .value
+                            .parse::<u64>()
+                            .map_err(|_| InvalidHttpHeader(header.name.clone(), header.value.clone())),
+                    )
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| ValidationError::MissingHeader("content_range".to_string()))??)
     }
 }
 
 #[async_trait]
 impl<TExternalRequest: ExternalRequest + Debug + 'static> FileHandle for NetworkFile<TExternalRequest> {
     fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        let request_response = self.request_generator.generate_range_request(&self.file_name, byte_range)?.request()?;
-        Ok(OwnedBytes::new(request_response.data))
+        self.do_read_bytes(Some(byte_range))
     }
 
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> AsyncIoResult<OwnedBytes> {
-        let request = self.request_generator.generate_range_request(&self.file_name, byte_range)?;
-        let request_fut = request.request_async();
-        Ok(OwnedBytes::new(request_fut.await?.data))
+    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+        self.do_read_bytes_async(Some(byte_range)).await
     }
 }
 
 impl<TExternalRequest: ExternalRequest> HasLen for NetworkFile<TExternalRequest> {
     fn len(&self) -> usize {
-        self.internal_length().unwrap_or(0) as usize
+        self.internal_length().unwrap_or_default() as usize
     }
 }

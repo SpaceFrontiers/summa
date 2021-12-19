@@ -1,12 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Debug;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use futures::future::try_join_all;
 #[cfg(feature = "metrics")]
 use instant::Instant;
+use iroh_unixfs::builder::FileBuilder;
+use iroh_unixfs::chunker::Chunker;
+use iroh_unixfs::content_loader::GatewayUrl;
 #[cfg(feature = "metrics")]
 use opentelemetry::{
     global,
@@ -14,8 +19,9 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use summa_proto::proto;
+use summa_proto::proto::ChunkedCacheConfig;
 use tantivy::collector::MultiCollector;
-use tantivy::directory::{OwnedBytes, RamDirectory};
+use tantivy::directory::{MmapDirectory, OwnedBytes};
 use tantivy::schema::Schema;
 use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, ReloadPolicy};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -26,17 +32,18 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
+use crate::components::{ComponentFile, IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
-use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, IrohDirectory, NetworkDirectory};
+use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
 
 pub struct IndexHolder {
     core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
-    index_engine_config: proto::IndexEngineConfig,
+    index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
     index_name: String,
     index: Index,
+    cached_index_attributes: Option<proto::IndexAttributes>,
     cached_schema: Schema,
     index_reader: IndexReader,
     index_writer_holder: Arc<RwLock<IndexWriterHolder>>,
@@ -62,7 +69,6 @@ impl Debug for IndexHolder {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("IndexHolder")
             .field("index_name", &self.index_name)
-            .field("index_engine_config", &self.index_engine_config)
             .field("index_settings", &self.index.settings())
             .finish()
     }
@@ -77,65 +83,99 @@ fn register_default_tokenizers(index: &Index) {
     }
 }
 
-async fn open_network_index<TExternalRequest: ExternalRequest + 'static, TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static>(
-    remote_engine_config: &proto::RemoteEngineConfig,
-) -> SummaResult<Index> {
-    let file_lengths = Arc::new(std::sync::RwLock::new(HashMap::<PathBuf, u64>::new()));
-    let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())), file_lengths.clone());
-
-    let hotcache_bytes = match network_directory.get_file_handle("hotcache.bin".as_ref()) {
-        Ok(hotcache_handle) => Some(hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await?),
-        Err(_) => None,
-    };
-
-    let next_directory = match &remote_engine_config.chunked_cache_config {
+fn wrap_with_caches<D: Directory>(
+    directory: D,
+    hotcache_bytes: Option<OwnedBytes>,
+    chunked_cache_config: Option<&ChunkedCacheConfig>,
+) -> SummaResult<Box<dyn Directory>> {
+    let static_cache = hotcache_bytes.map(StaticDirectoryCache::open).transpose()?;
+    let file_lengths = static_cache
+        .as_ref()
+        .map(|static_cache| static_cache.file_lengths().clone())
+        .unwrap_or_default();
+    let next_directory = match &chunked_cache_config {
         Some(chunked_cache_config) => match chunked_cache_config.cache_size {
             Some(cache_size) => Box::new(ChunkedCachingDirectory::new_with_capacity_in_bytes(
-                Arc::new(network_directory),
+                Arc::new(directory),
                 chunked_cache_config.chunk_size as usize,
                 cache_size as usize,
                 CACHE_METRICS.clone(),
+                file_lengths,
             )) as Box<dyn Directory>,
             None => Box::new(ChunkedCachingDirectory::new(
-                Arc::new(network_directory),
+                Arc::new(directory),
                 chunked_cache_config.chunk_size as usize,
+                file_lengths,
             )) as Box<dyn Directory>,
         },
-        None => Box::new(network_directory) as Box<dyn Directory>,
+        None => Box::new(directory) as Box<dyn Directory>,
     };
-
-    Ok(match hotcache_bytes {
-        Some(hotcache_bytes) => {
-            let hotcache_directory = HotDirectory::open(next_directory, OwnedBytes::new(hotcache_bytes.to_vec()), file_lengths)?;
-            Index::open(hotcache_directory)?
-        }
-        None => Index::open(next_directory)?,
+    Ok(match static_cache {
+        Some(static_cache) => Box::new(HotDirectory::open(next_directory, static_cache)?),
+        None => next_directory,
     })
+}
+
+#[cfg(feature = "ipfs")]
+async fn migrate_to_iroh(files: Vec<ComponentFile>, ipfs_engine_config: &mut proto::IpfsEngineConfig) -> SummaResult<()> {
+    info!(files = ?files);
+    let iroh = iroh_api::Api::new(iroh_api::Config::default()).await?;
+    let mut entries = vec![];
+    for file in files.iter() {
+        entries.push(iroh_unixfs::builder::Entry::File(
+            FileBuilder::new()
+                .name(file.path().file_name().expect("should have name").to_string_lossy().to_string())
+                .chunker(Chunker::Fixed(iroh_unixfs::chunker::Fixed { chunk_size: 1024 * 1024 }))
+                .content_reader(tokio::fs::File::open(file.path()).await?)
+                .build()
+                .await
+                .map_err(|e| Error::External(e.to_string()))?,
+        ))
+    }
+    let cid = iroh
+        .add(iroh_api::UnixfsEntry::Directory(iroh_unixfs::builder::Directory::basic(
+            "".to_string(),
+            entries,
+        )))
+        .await
+        .map_err(|e| Error::External(e.to_string()))?
+        .to_string();
+    ipfs_engine_config.cid = cid;
+    for file in files.iter() {
+        tokio::fs::remove_file(file.path()).await?;
+    }
+    Ok(())
 }
 
 impl IndexHolder {
     /// Sets up `IndexHolder`
-    pub async fn create_holder(
+    pub fn create_holder(
         core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
+        core_config: &crate::configs::core::Config,
         mut index: Index,
         index_name: Option<&str>,
-        index_engine_config: proto::IndexEngineConfig,
+        index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
         index.set_segment_attributes_merger(Arc::new(SegmentAttributesMergerImpl::<SummaSegmentAttributes>::new()));
 
         let index_name = index_name.map(|x| x.to_string()).unwrap_or_else(|| {
-            serde_json::from_value::<proto::IndexAttributes>(index.load_metas().expect("no metas").attributes.expect("no attributes"))
-                .expect("wrong json")
-                .default_index_name
-                .expect("no index name")
+            serde_json::from_value::<proto::IndexAttributes>(
+                index
+                    .load_metas()
+                    .expect("no metas")
+                    .index_attributes()
+                    .expect("no attributes")
+                    .expect("no attributes"),
+            )
+            .expect("wrong json")
+            .default_index_name
+            .expect("no index name")
         });
         let cached_schema = index.schema();
-        let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index).await?);
-        let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).build_async().await?;
-        let index_writer_holder = Arc::new(RwLock::new(
-            IndexWriterHolder::from_config(&index, core_config_holder.read().await.get()).await?,
-        ));
+        let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index)?);
+        let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
+        let index_writer_holder = Arc::new(RwLock::new(IndexWriterHolder::from_config(&index, core_config)?));
 
         Ok(IndexHolder {
             core_config_holder: core_config_holder.clone(),
@@ -144,6 +184,7 @@ impl IndexHolder {
             index: index.clone(),
             query_parser,
             cached_schema,
+            cached_index_attributes: index.load_metas()?.index_attributes()?,
             index_reader,
             index_writer_holder,
             #[cfg(feature = "metrics")]
@@ -156,7 +197,7 @@ impl IndexHolder {
     }
 
     pub async fn reload_query_parser(&self) -> SummaResult<()> {
-        *self.query_parser.write().await = QueryParser::for_index(&self.index_name, self.index_reader().searcher().index()).await?;
+        *self.query_parser.write().await = QueryParser::for_index(&self.index_name, self.index_reader().searcher().index())?;
         Ok(())
     }
 
@@ -176,7 +217,7 @@ impl IndexHolder {
     /// Creates index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
-    pub async fn create_file_index(index_path: &std::path::Path, index_builder: IndexBuilder) -> SummaResult<Index> {
+    pub async fn create_file_index(index_path: &Path, index_builder: IndexBuilder) -> SummaResult<Index> {
         if index_path.exists() {
             return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
         }
@@ -194,32 +235,19 @@ impl IndexHolder {
     >(
         index_engine_config: &proto::IndexEngineConfig,
     ) -> SummaResult<Index> {
-        let index = match index_engine_config {
+        let index = match &index_engine_config.config {
             #[cfg(feature = "fs")]
-            proto::IndexEngineConfig {
-                config: Some(proto::index_engine_config::Config::File(config)),
-            } => Index::open_in_dir(&config.path)?,
-            proto::IndexEngineConfig {
-                config: Some(proto::index_engine_config::Config::Memory(config)),
-            } => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
-            proto::IndexEngineConfig {
-                config: Some(proto::index_engine_config::Config::Remote(config)),
-            } => open_network_index::<TExternalRequest, TExternalRequestGenerator>(config).await?,
-            #[cfg(feature = "ipfs")]
-            proto::IndexEngineConfig {
-                config: Some(proto::index_engine_config::Config::Ipfs(config)),
-            } => {
-                let client = iroh_rpc_client::Client::new(iroh_rpc_client::Config::default_network()).await?;
-                let content_loader = iroh_unixfs::content_loader::FullLoader::new(
-                    client.clone(),
-                    iroh_unixfs::content_loader::FullLoaderConfig {
-                        http_gateways: vec![],
-                        indexer: None,
-                    },
-                )?;
-                let iroh_directory = IrohDirectory::new(RamDirectory::create(), content_loader, &config.cid).await?;
-                Index::open_async(iroh_directory).await?
+            Some(proto::index_engine_config::Config::File(config)) => Index::open_in_dir(&config.path)?,
+            Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
+            Some(proto::index_engine_config::Config::Remote(config)) => {
+                let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(config.clone())));
+                let hotcache_handle = network_directory.get_network_file_handle("hotcache.bin".as_ref());
+                let hotcache_bytes = hotcache_handle.do_read_bytes_async(None).await.expect("cannot read hotcache");
+                let directory = wrap_with_caches(network_directory, Some(hotcache_bytes), config.chunked_cache_config.as_ref())?;
+                Index::open(directory)?
             }
+            #[cfg(feature = "ipfs")]
+            Some(proto::index_engine_config::Config::Ipfs(config)) => Self::attach_ipfs_index(config).await?,
             _ => unimplemented!(),
         };
         info!(action = "from_config", index = ?index);
@@ -229,8 +257,37 @@ impl IndexHolder {
     /// Attaches index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
-    pub async fn attach_file_index(index_path: &std::path::Path) -> SummaResult<Index> {
-        let index = Index::open_in_dir(index_path)?;
+    pub async fn attach_file_index(file_engine_config: &proto::FileEngineConfig) -> SummaResult<Index> {
+        let index = Index::open_in_dir(&file_engine_config.path)?;
+        info!(action = "attached", index = ?index);
+        Ok(index)
+    }
+
+    /// Attaches index and sets it up via `setup`
+    #[cfg(feature = "ipfs")]
+    #[instrument(skip_all)]
+    pub async fn attach_ipfs_index(ipfs_engine_config: &proto::IpfsEngineConfig) -> SummaResult<Index> {
+        let client = iroh_rpc_client::Client::new(iroh_rpc_client::Config::default_network()).await?;
+        let content_loader = iroh_unixfs::content_loader::FullLoader::new(
+            client.clone(),
+            iroh_unixfs::content_loader::FullLoaderConfig {
+                http_gateways: vec![GatewayUrl::from_str("https://ipfs.io")?, GatewayUrl::from_str("https://cloudflare-ipfs.com")?],
+                indexer: None,
+            },
+        )?;
+        let index_path = Path::new(&ipfs_engine_config.path);
+        if !index_path.exists() {
+            tokio::fs::create_dir_all(index_path).await?;
+        }
+        let mmap_directory = MmapDirectory::open(index_path)?;
+        let iroh_directory = crate::directories::IrohDirectory::new(mmap_directory, content_loader, &ipfs_engine_config.cid).await?;
+        let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
+        let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
+            Ok(hotcache_handle) => hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok(),
+            Err(_) => None,
+        };
+        let directory = tokio::task::spawn_blocking(move || wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())).await??;
+        let index = Index::open(directory)?;
         info!(action = "attached", index = ?index);
         Ok(index)
     }
@@ -241,8 +298,8 @@ impl IndexHolder {
     }
 
     /// Load index attributes from meta.json
-    pub async fn index_attributes(&self) -> SummaResult<Option<proto::IndexAttributes>> {
-        Ok(self.index.load_metas_async().await?.attributes()?)
+    pub fn index_attributes(&self) -> Option<&proto::IndexAttributes> {
+        self.cached_index_attributes.as_ref()
     }
 
     /// Index name
@@ -259,7 +316,7 @@ impl IndexHolder {
         Ok(self.index.load_metas()?.payload)
     }
 
-    pub fn index_engine_config(&self) -> &proto::IndexEngineConfig {
+    pub fn index_engine_config(&self) -> &Arc<dyn ConfigProxy<proto::IndexEngineConfig>> {
         &self.index_engine_config
     }
 
@@ -275,8 +332,8 @@ impl IndexHolder {
     pub async fn warmup(&self) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
-        let index_attributes = self.index_attributes().await;
-        let default_fields = index_attributes?
+        let index_attributes = self.index_attributes();
+        let default_fields = index_attributes
             .map(|index_attributes| {
                 index_attributes
                     .default_fields
@@ -311,15 +368,20 @@ impl IndexHolder {
     #[instrument(skip(self), fields(index_name = %self.index_name))]
     pub async fn delete(self) -> SummaResult<()> {
         info!(action = "delete_directory");
-        self.core_config_holder.write().await.get_mut().indices.remove(self.index_name());
-        match self.index_engine_config {
+        let index_engine_config = self
+            .core_config_holder
+            .write()
+            .await
+            .get_mut()
+            .indices
+            .remove(self.index_name())
+            .expect("cannot retrieve config");
+        match index_engine_config.config {
             #[cfg(feature = "fs")]
-            proto::IndexEngineConfig {
-                config: Some(proto::index_engine_config::Config::File(ref config)),
-            } => {
+            Some(proto::index_engine_config::Config::File(ref config)) => {
                 tokio::fs::remove_dir_all(&config.path)
                     .await
-                    .map_err(|e| Error::IO((e, Some(PathBuf::from(&config.path)))))?;
+                    .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
             }
             _ => (),
         };
@@ -373,7 +435,6 @@ impl IndexHolder {
         let mut collector_outputs = Vec::with_capacity(extractors.len());
         let multi_fields = self
             .index_attributes()
-            .await?
             .map(|index_attributes| {
                 index_attributes
                     .multi_fields
@@ -428,6 +489,19 @@ impl IndexHolder {
     /// Commits index
     #[instrument(skip(self))]
     pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
-        self.index_writer_holder.write().await.commit(payload).await
+        self.index_writer_holder.write().await.commit(payload).await?;
+        let mut index_engine_config = self.index_engine_config().write().await;
+        #[cfg(feature = "ipfs")]
+        if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
+            self.index_writer_holder()
+                .write()
+                .await
+                .lock_files(ipfs_engine_config.path.clone(), |files: Vec<ComponentFile>| {
+                    migrate_to_iroh(files, ipfs_engine_config)
+                })
+                .await?;
+            index_engine_config.commit().await?;
+        }
+        Ok(())
     }
 }

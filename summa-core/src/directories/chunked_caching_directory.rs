@@ -1,12 +1,12 @@
-use std::fmt;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{fmt, io};
 
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, OwnedBytes};
-use tantivy::error::AsyncIoError;
 use tantivy::{Directory, HasLen};
 
 use crate::directories::chunk_generator::{Chunk, ChunkGenerator};
@@ -19,33 +19,44 @@ pub struct ChunkedCachingDirectory {
     chunk_size: usize,
     cache: Option<Arc<MemorySizedCache>>,
     underlying: Arc<dyn Directory>,
+    file_lengths: HashMap<PathBuf, u64>,
 }
 
 impl ChunkedCachingDirectory {
-    pub fn new(underlying: Arc<dyn Directory>, chunk_size: usize) -> ChunkedCachingDirectory {
+    pub fn new(underlying: Arc<dyn Directory>, chunk_size: usize, file_lengths: HashMap<PathBuf, u64>) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
             cache: None,
             underlying,
+            file_lengths,
         }
     }
+
     pub fn new_with_capacity_in_bytes(
         underlying: Arc<dyn Directory>,
         chunk_size: usize,
         capacity_in_bytes: usize,
         cache_metrics: CacheMetrics,
+        file_lengths: HashMap<PathBuf, u64>,
     ) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
             cache: Some(Arc::new(MemorySizedCache::with_capacity_in_bytes(capacity_in_bytes, cache_metrics))),
             underlying,
+            file_lengths,
         }
     }
-    pub fn new_unbounded(underlying: Arc<dyn Directory>, chunk_size: usize, cache_metrics: CacheMetrics) -> ChunkedCachingDirectory {
+    pub fn new_unbounded(
+        underlying: Arc<dyn Directory>,
+        chunk_size: usize,
+        cache_metrics: CacheMetrics,
+        file_lengths: HashMap<PathBuf, u64>,
+    ) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
             cache: Some(Arc::new(MemorySizedCache::with_infinite_capacity(cache_metrics))),
             underlying,
+            file_lengths,
         }
     }
 }
@@ -64,6 +75,7 @@ impl Directory for ChunkedCachingDirectory {
             cache: self.cache.clone(),
             chunk_size: self.chunk_size,
             underlying_filehandle,
+            file_length: self.file_lengths.get(path).cloned().map(|n| n as usize),
         }))
     }
 
@@ -88,6 +100,7 @@ struct ChunkedCachingFileHandle {
     cache: Option<Arc<MemorySizedCache>>,
     chunk_size: usize,
     underlying_filehandle: Arc<dyn FileHandle>,
+    file_length: Option<usize>,
 }
 
 impl Debug for ChunkedCachingFileHandle {
@@ -132,7 +145,7 @@ impl ChunkedCachingFileHandle {
 
 #[async_trait]
 impl FileHandle for ChunkedCachingFileHandle {
-    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         let mut response_buffer = vec![0; range.end - range.start];
         let missing_chunks = self.try_fill_from_cache(range, &mut response_buffer);
 
@@ -143,7 +156,7 @@ impl FileHandle for ChunkedCachingFileHandle {
         Ok(OwnedBytes::new(response_buffer))
     }
 
-    async fn read_bytes_async(&self, range: Range<usize>) -> Result<OwnedBytes, AsyncIoError> {
+    async fn read_bytes_async(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
         let mut response_buffer = vec![0; range.end - range.start];
         let missing_chunks = self.try_fill_from_cache(range, &mut response_buffer);
 
@@ -158,6 +171,6 @@ impl FileHandle for ChunkedCachingFileHandle {
 
 impl HasLen for ChunkedCachingFileHandle {
     fn len(&self) -> usize {
-        self.underlying_filehandle.len()
+        self.file_length.unwrap_or_else(|| self.underlying_filehandle.len())
     }
 }

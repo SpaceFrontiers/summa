@@ -46,7 +46,7 @@ pub trait ExternalRequestGenerator<TExternalRequest: ExternalRequest>: ExternalR
     fn new(network_config: RemoteEngineConfig) -> Self
     where
         Self: Sized;
-    fn generate_range_request(&self, file_name: &str, range: Range<usize>) -> SummaResult<TExternalRequest>;
+    fn generate_range_request(&self, file_name: &str, range: Option<Range<usize>>) -> SummaResult<TExternalRequest>;
     fn generate_length_request(&self, file_name: &str) -> SummaResult<TExternalRequest>;
 }
 
@@ -76,13 +76,19 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         }
     }
 
-    fn generate_range_request(&self, file_name: &str, range: Range<usize>) -> SummaResult<TExternalRequest> {
+    fn generate_range_request(&self, file_name: &str, range: Option<Range<usize>>) -> SummaResult<TExternalRequest> {
         let mut vars = HashMap::new();
-        let start = range.start.to_string();
-        let end = (range.end - 1).to_string();
-        vars.insert("file_name".to_string(), file_name);
-        vars.insert("start".to_string(), &start);
-        vars.insert("end".to_string(), &end);
+        vars.insert("file_name".to_string(), file_name.to_string());
+        if let Some(range) = range {
+            let start = range.start.to_string();
+            let end = (range.end - 1).to_string();
+            vars.insert("start".to_string(), start);
+            vars.insert("end".to_string(), end);
+        } else {
+            vars.insert("start".to_string(), "0".to_string());
+            vars.insert("end".to_string(), "".to_string());
+        }
+
         let mut headers = Vec::with_capacity(self.remote_engine_config.headers_template.len());
         for (header_name, header_value) in self.remote_engine_config.headers_template.iter() {
             headers.push(Header {

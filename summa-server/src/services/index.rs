@@ -11,6 +11,7 @@ use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::ThreadHandler;
 use summa_proto::proto;
+use summa_proto::proto::ChunkedCacheConfig;
 use tokio::sync::RwLock;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
@@ -125,29 +126,47 @@ impl Index {
         }
     }
 
+    async fn derive_configs(
+        &self,
+        index_name: &str,
+    ) -> (
+        Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
+        Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
+    ) {
+        let core_config_holder = Arc::new(PartialProxy::new(
+            &self.server_config,
+            |server_config| &server_config.core,
+            |server_config| &mut server_config.core,
+        ));
+        let index_engine_config_holder = Arc::new(PartialProxy::new(
+            &self.server_config,
+            {
+                let index_name = index_name.to_string();
+                move |server_config| server_config.core.indices.get(&index_name).unwrap()
+            },
+            {
+                let index_name = index_name.to_string();
+                move |server_config| server_config.core.indices.get_mut(&index_name).unwrap()
+            },
+        ));
+        (core_config_holder, index_engine_config_holder)
+    }
+
     /// Create `IndexHolder`s from config
     pub(crate) async fn setup_index_holders(&self) -> SummaServerResult<()> {
         let mut index_holders = HashMap::new();
-        for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.iter() {
+        for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
             let index =
-                IndexHolder::from_index_engine_config::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(index_engine_config)
+                IndexHolder::from_index_engine_config::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(&index_engine_config)
                     .await?;
-            index_holders.insert(
-                index_name.clone(),
-                OwningHandler::new(
-                    IndexHolder::create_holder(
-                        Arc::new(PartialProxy::new(
-                            &self.server_config,
-                            |server_config| &server_config.core,
-                            |server_config| &mut server_config.core,
-                        )),
-                        index,
-                        Some(index_name),
-                        index_engine_config.clone(),
-                    )
-                    .await?,
-                ),
-            );
+            let core_config = self.server_config.read().await.get().core.clone();
+            let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
+            let index_holder = tokio::task::spawn_blocking(move || {
+                IndexHolder::create_holder(core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder)
+            })
+            .await
+            .unwrap()?;
+            index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
         }
         info!(action = "setting_index_holders", index_holders = ?index_holders);
         *self.index_registry.index_holders().write().await = index_holders;
@@ -177,38 +196,50 @@ impl Index {
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?attach_index_request.index_name))]
     pub async fn attach_index(&self, attach_index_request: AttachIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+        let index_path = self.server_config.read().await.get().get_path_for_index_data(&attach_index_request.index_name);
         let (index, index_engine_config) = match attach_index_request.attach_index_request {
             proto::attach_index_request::Request::AttachFileEngineRequest(proto::AttachFileEngineRequest {}) => {
-                let index_path = self.server_config.read().await.get().get_path_for_index_data(&attach_index_request.index_name);
                 if !index_path.exists() {
                     return Err(ValidationError::MissingIndex(attach_index_request.index_name.to_string()).into());
                 }
-                let index = IndexHolder::attach_file_index(&index_path).await?;
+                let file_engine_config = proto::FileEngineConfig {
+                    path: index_path.to_string_lossy().to_string(),
+                };
+                let index = IndexHolder::attach_file_index(&file_engine_config).await?;
                 let index_engine_config = proto::IndexEngineConfig {
-                    config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
-                        path: index_path.to_string_lossy().to_string(),
-                    })),
+                    config: Some(proto::index_engine_config::Config::File(file_engine_config)),
+                };
+                (index, index_engine_config)
+            }
+            proto::attach_index_request::Request::AttachIpfsEngineRequest(proto::AttachIpfsEngineRequest { cid }) => {
+                let ipfs_index_engine = proto::IpfsEngineConfig {
+                    cid: cid.to_string(),
+                    chunked_cache_config: Some(ChunkedCacheConfig {
+                        chunk_size: 65536,
+                        cache_size: Some(536870912),
+                    }),
+                    path: index_path.to_string_lossy().to_string(),
+                };
+                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine).await?;
+                let index_engine_config = proto::IndexEngineConfig {
+                    config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
                 };
                 (index, index_engine_config)
             }
             _ => unimplemented!(),
         };
         self.insert_config(&attach_index_request.index_name, &index_engine_config).await?;
+        let core_config = self.server_config.read().await.get().core.clone();
+        let (core_config_holder, index_engine_config_holder) = self.derive_configs(&attach_index_request.index_name).await;
         Ok(self
             .index_registry
-            .add(
-                IndexHolder::create_holder(
-                    Arc::new(PartialProxy::new(
-                        &self.server_config,
-                        |server_config| &server_config.core,
-                        |server_config| &mut server_config.core,
-                    )),
-                    index,
-                    Some(&attach_index_request.index_name),
-                    index_engine_config,
-                )
-                .await?,
-            )
+            .add(IndexHolder::create_holder(
+                core_config_holder,
+                &core_config,
+                index,
+                Some(&attach_index_request.index_name),
+                index_engine_config_holder,
+            )?)
             .await)
     }
 
@@ -225,7 +256,7 @@ impl Index {
         let index_builder = tantivy::Index::builder()
             .schema(create_index_request.schema.clone())
             .settings(index_settings)
-            .attributes(index_attributes);
+            .index_attributes(index_attributes);
         let (index, index_engine_config) = match create_index_request.index_engine {
             proto::CreateIndexEngineRequest::File => {
                 let index_path = self.server_config.read().await.get().get_path_for_index_data(&create_index_request.index_name);
@@ -248,21 +279,17 @@ impl Index {
             }
         };
         self.insert_config(&create_index_request.index_name, &index_engine_config).await?;
+        let core_config = self.server_config.read().await.get().core.clone();
+        let (core_config_holder, index_engine_config_holder) = self.derive_configs(&create_index_request.index_name).await;
         Ok(self
             .index_registry
-            .add(
-                IndexHolder::create_holder(
-                    Arc::new(PartialProxy::new(
-                        &self.server_config,
-                        |server_config| &server_config.core,
-                        |server_config| &mut server_config.core,
-                    )),
-                    index,
-                    Some(&create_index_request.index_name),
-                    index_engine_config,
-                )
-                .await?,
-            )
+            .add(IndexHolder::create_holder(
+                core_config_holder,
+                &core_config,
+                index,
+                Some(&create_index_request.index_name),
+                index_engine_config_holder,
+            )?)
             .await)
     }
 

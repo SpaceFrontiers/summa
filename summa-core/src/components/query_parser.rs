@@ -74,11 +74,11 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
 }
 
 impl QueryParser {
-    pub async fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
-        let index_meta = index.load_metas_async().await?;
-        let attributes: Option<proto::IndexAttributes> = index_meta.attributes()?;
-        let default_fields = attributes
-            .map(|attributes| attributes.default_fields)
+    pub fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
+        let index_meta = index.load_metas()?;
+        let index_attributes: Option<proto::IndexAttributes> = index_meta.index_attributes()?;
+        let default_fields = index_attributes
+            .map(|index_attributes| index_attributes.default_fields)
             .unwrap_or_else(Vec::new)
             .iter()
             .map(|field_name| {

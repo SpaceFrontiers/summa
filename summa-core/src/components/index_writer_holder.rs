@@ -50,7 +50,7 @@ pub enum IndexWriterImpl {
 }
 
 impl IndexWriterImpl {
-    pub async fn new(index: &Index, writer_threads: usize, writer_heap_size_bytes: usize) -> SummaResult<Self> {
+    pub fn new(index: &Index, writer_threads: usize, writer_heap_size_bytes: usize) -> SummaResult<Self> {
         Ok(if writer_threads == 0 {
             IndexWriterImpl::Single(SingleIndexWriter {
                 index: index.clone(),
@@ -58,7 +58,7 @@ impl IndexWriterImpl {
                 writer_heap_size_bytes,
             })
         } else {
-            let index_writer = index.writer_with_num_threads_async(writer_threads, writer_heap_size_bytes).await?;
+            let index_writer = index.writer_with_num_threads(writer_threads, writer_heap_size_bytes)?;
             index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
             IndexWriterImpl::Threaded(index_writer)
         })
@@ -163,12 +163,11 @@ impl IndexWriterHolder {
     }
 
     /// Creates new `IndexWriterHolder` from `Index` and `core::Config`
-    pub async fn from_config(index: &Index, core_config: &crate::configs::core::Config) -> SummaResult<IndexWriterHolder> {
-        let index_writer = IndexWriterImpl::new(index, core_config.writer_threads as usize, core_config.writer_heap_size_bytes as usize).await?;
+    pub fn from_config(index: &Index, core_config: &crate::configs::core::Config) -> SummaResult<IndexWriterHolder> {
+        let index_writer = IndexWriterImpl::new(index, core_config.writer_threads as usize, core_config.writer_heap_size_bytes as usize)?;
         let primary_key = index
-            .load_metas_async()
-            .await?
-            .attributes()?
+            .load_metas()?
+            .index_attributes()?
             .and_then(|attributes: proto::IndexAttributes| {
                 attributes.primary_key.map(|primary_key| {
                     index

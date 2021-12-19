@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use async_broadcast::Receiver;
 use hyper::header::{HeaderName, HeaderValue};
-use proto::beacon_api_server::BeaconApiServer;
 use proto::consumer_api_server::ConsumerApiServer;
 use proto::index_api_server::IndexApiServer;
 use proto::reflection_api_server::ReflectionApiServer;
@@ -21,18 +20,16 @@ use tower_http::set_header::SetRequestHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, info_span, instrument, warn, Instrument, Span};
 
-use crate::apis::beacon::BeaconApiImpl;
 use crate::apis::consumer::ConsumerApiImpl;
 use crate::apis::index::IndexApiImpl;
 use crate::apis::reflection::ReflectionApiImpl;
 use crate::apis::search::SearchApiImpl;
 use crate::errors::SummaServerResult;
-use crate::services::{Beacon, Index};
+use crate::services::Index;
 
 /// GRPC server exposing [API](crate::apis)
 pub struct Grpc {
     server_config: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
-    beacon_service: Beacon,
     index_service: Index,
 }
 
@@ -62,14 +59,9 @@ impl Grpc {
     }
 
     /// New GRPC server
-    pub fn new(
-        server_config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>,
-        beacon_service: &Beacon,
-        index_service: &Index,
-    ) -> SummaServerResult<Grpc> {
+    pub fn new(server_config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, index_service: &Index) -> SummaServerResult<Grpc> {
         Ok(Grpc {
             server_config: server_config.clone(),
-            beacon_service: beacon_service.clone(),
             index_service: index_service.clone(),
         })
     }
@@ -106,7 +98,7 @@ impl Grpc {
             )
             .into_inner();
 
-        let mut router = Server::builder()
+        let router = Server::builder()
             .layer(layer)
             .max_frame_size(grpc_config.max_frame_size_bytes.map(|x| x / 256))
             .add_service(grpc_reflection_service)
@@ -114,9 +106,6 @@ impl Grpc {
             .add_service(IndexApiServer::new(index_api))
             .add_service(ReflectionApiServer::new(reflection_api))
             .add_service(SearchApiServer::new(search_api));
-
-        let beacon_api = BeaconApiImpl::new(&self.beacon_service, &self.index_service)?;
-        router = router.add_service(BeaconApiServer::new(beacon_api));
 
         let listener = Grpc::set_listener(&grpc_config.endpoint)?;
         info!(action = "binded", endpoint = ?grpc_config.endpoint);

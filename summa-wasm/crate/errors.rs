@@ -2,8 +2,6 @@ use std::io;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("async_io: {0}")]
-    AsyncIo(#[from] tantivy::error::AsyncIoError),
     #[error("core: {0}")]
     Core(#[from] summa_core::Error),
     #[error("index_error: {0}")]
@@ -41,12 +39,6 @@ impl From<strfmt::FmtError> for Error {
 impl From<Error> for wasm_bindgen::JsValue {
     fn from(error: Error) -> Self {
         wasm_bindgen::JsValue::from(format!("{error:?}"))
-    }
-}
-
-impl From<Error> for tantivy::error::AsyncIoError {
-    fn from(error: Error) -> Self {
-        tantivy::error::AsyncIoError::Io(error.into())
     }
 }
 

@@ -56,9 +56,9 @@ impl WebIndexRegistry {
             false => Executor::SingleThread,
         })?;
 
-        let core_config = Arc::new(DirectProxy::new(core_config));
-        let index_holder = IndexHolder::create_holder(core_config, index, None, index_engine).await?;
-        let index_attributes = index_holder.index_attributes().await?;
+        let core_config_holder = Arc::new(DirectProxy::new(core_config.clone()));
+        let index_holder = IndexHolder::create_holder(core_config_holder, &core_config, index, None, Arc::new(DirectProxy::new(index_engine)))?;
+        let index_attributes = index_holder.index_attributes().cloned();
         self.index_registry.add(index_holder).await;
         Ok(index_attributes)
     }

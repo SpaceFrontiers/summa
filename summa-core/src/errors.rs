@@ -48,8 +48,6 @@ pub enum Error {
     AddrParse(#[from] std::net::AddrParseError),
     #[error("anyhow_error: {0}")]
     Anyhow(#[from] anyhow::Error),
-    #[error("index_error: {0}")]
-    AsyncIo(#[from] tantivy::error::AsyncIoError),
     #[error("config_error: {0}")]
     Config(#[from] config::ConfigError),
     #[error("document_parsing_error: {0}")]
@@ -139,12 +137,6 @@ impl From<Infallible> for Error {
 impl From<Error> for std::io::Error {
     fn from(error: Error) -> Self {
         std::io::Error::new(std::io::ErrorKind::Other, error)
-    }
-}
-
-impl From<Error> for tantivy::error::AsyncIoError {
-    fn from(error: Error) -> Self {
-        tantivy::error::AsyncIoError::Io(error.into())
     }
 }
 

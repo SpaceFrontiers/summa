@@ -17,13 +17,11 @@ from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
 
-from .proto import beacon_service_pb2 as beacon_service_pb
 from .proto import consumer_service_pb2 as consumer_service_pb
 from .proto import index_service_pb2 as index_service_pb
 from .proto import query_pb2 as query_pb
 from .proto import reflection_service_pb2 as reflection_service_pb
 from .proto import search_service_pb2 as search_service_pb
-from .proto.beacon_service_pb2_grpc import BeaconApiStub
 from .proto.consumer_service_pb2_grpc import ConsumerApiStub
 from .proto.index_service_pb2_grpc import IndexApiStub
 from .proto.reflection_service_pb2_grpc import ReflectionApiStub
@@ -45,7 +43,6 @@ def setup_metadata(session_id, request_id):
 
 class SummaClient(BaseGrpcClient):
     stub_clses = {
-        'beacon_api': BeaconApiStub,
         'consumer_api': ConsumerApiStub,
         'index_api': IndexApiStub,
         'reflection_api': ReflectionApiStub,
@@ -56,9 +53,9 @@ class SummaClient(BaseGrpcClient):
     async def attach_index(
         self,
         index_name: str,
-        attach_file_engine_request: Optional[Union[index_service_pb.AttachFileEngineRequest, Dict]] = None,
-        attach_remote_engine_request: Optional[Union[index_service_pb.AttachRemoteEngineRequest, Dict]] = None,
-        attach_ipfs_engine_request: Optional[Union[index_service_pb.AttachIpfsEngineRequest, Dict]] = None,
+        file: Optional[Union[index_service_pb.AttachFileEngineRequest, Dict]] = None,
+        remote: Optional[Union[index_service_pb.AttachRemoteEngineRequest, Dict]] = None,
+        ipfs: Optional[Union[index_service_pb.AttachIpfsEngineRequest, Dict]] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.AttachIndexResponse:
@@ -67,19 +64,21 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            attach_file_engine_request: attaching index placed under `<data_path>/<index_name>` directory
-            attach_remote_engine_request: attaching remote index
-            attach_ipfs_engine_request: attaching ipfs index
+            file: attaching index placed under `<data_path>/<index_name>` directory
+            remote: attaching remote index
+            ipfs: attaching ipfs index
             request_id: request id
             session_id: session id
         """
+        request = {'index_name': index_name}
+        if file:
+            request['attach_file_engine_request'] = file
+        elif remote:
+            request['attach_remote_engine_request'] = remote
+        elif ipfs:
+            request['attach_ipfs_engine_request'] = ipfs
         return await self.stubs['index_api'].attach_index(
-            index_service_pb.AttachIndexRequest(
-                index_name=index_name,
-                attach_file_engine_request=attach_file_engine_request,
-                attach_remote_engine_request=attach_remote_engine_request,
-                attach_ipfs_engine_request=attach_ipfs_engine_request,
-            ),
+            index_service_pb.AttachIndexRequest(**request),
             metadata=setup_metadata(session_id, request_id),
         )
 
@@ -499,30 +498,6 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].merge_segments(
             index_service_pb.MergeSegmentsRequest(index_alias=index_alias, segment_ids=segment_ids),
-            metadata=setup_metadata(session_id, request_id),
-        )
-
-    @expose
-    async def publish_index(
-        self,
-        index_alias: str,
-        payload: Optional[str] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> beacon_service_pb.PublishIndexResponse:
-        """
-        Publish index into IPFS, require `ipfs` section configured in config
-
-        Args:
-            index_alias: index alias
-            payload: extra data stored with publish commit
-            request_id: request id
-            session_id: session id
-        """
-        if isinstance(payload, dict):
-            payload = json.dumps(payload)
-        return await self.stubs['beacon_api'].publish_index(
-            beacon_service_pb.PublishIndexRequest(index_alias=index_alias, payload=payload),
             metadata=setup_metadata(session_id, request_id),
         )
 

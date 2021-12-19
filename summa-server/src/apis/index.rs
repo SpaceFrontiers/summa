@@ -61,7 +61,7 @@ impl IndexApiImpl {
                 .get()
                 .get_index_aliases_for_index(index_holder.index_name()),
             index_name: index_holder.index_name().to_owned(),
-            index_engine: Some(index_holder.index_engine_config().clone()),
+            index_engine: Some(index_holder.index_engine_config().read().await.get().clone()),
             num_docs: index_holder.index_reader().searcher().num_docs(),
             compression: index_holder.compression() as i32,
         }

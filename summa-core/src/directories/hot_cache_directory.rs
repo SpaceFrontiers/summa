@@ -18,17 +18,17 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
 use tantivy::directory::error::OpenReadError;
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes};
 use tantivy::error::DataCorruption;
-use tantivy::{AsyncIoResult, Directory, HasLen, Index, IndexReader, ReloadPolicy};
+use tantivy::{Directory, HasLen, Index, IndexReader, ReloadPolicy};
 
 use super::debug_proxy_directory::DebugProxyDirectory;
 use crate::directories::{ChunkedCachingDirectory, Noop};
@@ -121,7 +121,7 @@ impl StaticDirectoryCacheBuilder {
     }
 }
 
-fn deserialize_cbor<T>(bytes: &mut OwnedBytes) -> serde_cbor::Result<T>
+pub fn deserialize_cbor<T>(bytes: &mut OwnedBytes) -> serde_cbor::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -131,15 +131,24 @@ where
     value
 }
 
-#[derive(Debug)]
-struct StaticDirectoryCache {
-    file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
+pub struct StaticDirectoryCache {
+    file_lengths: HashMap<PathBuf, u64>,
     slices: HashMap<PathBuf, Arc<StaticSliceCache>>,
 }
 
+impl Debug for StaticDirectoryCache {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StaticDirectoryCache")
+            .field("files", &self.file_lengths.len())
+            .field("slices", &self.slices.len())
+            .finish()
+    }
+}
+
 impl StaticDirectoryCache {
-    pub fn open(mut bytes: OwnedBytes, file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>) -> tantivy::Result<StaticDirectoryCache> {
+    pub fn open(mut bytes: OwnedBytes) -> tantivy::Result<StaticDirectoryCache> {
         let format_version = bytes.read_u8();
+        let bytes_len = bytes.len();
 
         if format_version != 0 {
             return Err(tantivy::TantivyError::DataCorruption(DataCorruption::comment_only(format!(
@@ -147,7 +156,8 @@ impl StaticDirectoryCache {
             ))));
         }
 
-        *file_lengths.write().expect("poisoned") = deserialize_cbor(&mut bytes).expect("CBOR failed");
+        let mut file_lengths: HashMap<PathBuf, u64> = deserialize_cbor(&mut bytes).expect("CBOR failed");
+        file_lengths.insert(PathBuf::from("hotcache.bin"), bytes_len as u64);
 
         let mut slice_offsets: Vec<(PathBuf, u64)> = deserialize_cbor(&mut bytes).expect("CBOR failed");
         slice_offsets.push((PathBuf::default(), bytes.len() as u64));
@@ -170,7 +180,11 @@ impl StaticDirectoryCache {
     }
 
     pub fn get_file_length(&self, path: &Path) -> Option<u64> {
-        self.file_lengths.read().expect("poisoned").get(path).map(u64::clone)
+        self.file_lengths.get(path).cloned()
+    }
+
+    pub fn file_lengths(&self) -> &HashMap<PathBuf, u64> {
+        &self.file_lengths
     }
 }
 
@@ -288,8 +302,8 @@ impl StaticSliceCacheBuilder {
     }
 }
 
-impl fmt::Debug for StaticSliceCache {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl Debug for StaticSliceCache {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "SliceCache()")
     }
 }
@@ -309,12 +323,7 @@ pub struct HotDirectory {
 
 impl HotDirectory {
     /// Wraps an index, with a static cache serialized into `hot_cache_bytes`.
-    pub fn open(
-        underlying: Box<dyn Directory>,
-        hot_cache_bytes: OwnedBytes,
-        file_lengths: Arc<RwLock<HashMap<PathBuf, u64>>>,
-    ) -> tantivy::Result<HotDirectory> {
-        let static_cache = StaticDirectoryCache::open(hot_cache_bytes, file_lengths)?;
+    pub fn open(underlying: Box<dyn Directory>, static_cache: StaticDirectoryCache) -> tantivy::Result<HotDirectory> {
         Ok(HotDirectory {
             inner: Arc::new(InnerHotDirectory {
                 underlying,
@@ -327,7 +336,7 @@ impl HotDirectory {
 struct FileSliceWithCache {
     underlying: FileSlice,
     static_cache: Arc<StaticSliceCache>,
-    file_length: u64,
+    file_length: usize,
 }
 
 #[async_trait]
@@ -338,7 +347,7 @@ impl FileHandle for FileSliceWithCache {
         }
         self.underlying.read_bytes_slice(byte_range)
     }
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> AsyncIoResult<OwnedBytes> {
+    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         if let Some(found_bytes) = self.static_cache.try_read_bytes(byte_range.clone()) {
             return Ok(found_bytes);
         }
@@ -346,15 +355,15 @@ impl FileHandle for FileSliceWithCache {
     }
 }
 
-impl fmt::Debug for FileSliceWithCache {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl Debug for FileSliceWithCache {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "FileSliceWithCache({:?})", &self.underlying)
     }
 }
 
 impl HasLen for FileSliceWithCache {
     fn len(&self) -> usize {
-        self.file_length as usize
+        self.file_length
     }
 }
 
@@ -363,8 +372,8 @@ struct InnerHotDirectory {
     cache: Arc<StaticDirectoryCache>,
 }
 
-impl fmt::Debug for HotDirectory {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl Debug for HotDirectory {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "HotDirectory(dir={:?}, cache={:?})",
@@ -386,7 +395,7 @@ impl Directory for HotDirectory {
         let file_slice_with_cache = FileSliceWithCache {
             underlying,
             static_cache: self.inner.cache.get_slice(path),
-            file_length,
+            file_length: file_length as usize,
         };
         Ok(Arc::new(file_slice_with_cache))
     }
@@ -422,7 +431,7 @@ pub fn write_hotcache<D: Directory>(directory: D, chunk_size: usize, output: &mu
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
-    let caching_directory = ChunkedCachingDirectory::new_unbounded(Arc::new(directory), chunk_size, CacheMetrics::default());
+    let caching_directory = ChunkedCachingDirectory::new_unbounded(Arc::new(directory), chunk_size, CacheMetrics::default(), HashMap::new());
     let debug_proxy_directory = DebugProxyDirectory::wrap(caching_directory);
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();
