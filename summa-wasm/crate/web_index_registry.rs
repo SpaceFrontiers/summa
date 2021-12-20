@@ -4,7 +4,8 @@ use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry, SummaDocument};
 use summa_core::configs::DirectProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
-use summa_proto::proto::{IndexAttributes, IndexEngineConfig};
+use summa_proto::proto;
+use summa_proto::proto::{IndexAttributes, IndexEngineConfig, RemoteEngineConfig};
 use tantivy::Executor;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
@@ -37,13 +38,14 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub async fn add(&mut self, index_engine: JsValue) -> Result<JsValue, JsValue> {
-        let index_engine: IndexEngineConfig = serde_wasm_bindgen::from_value(index_engine)?;
-        Ok(self.add_internal(index_engine).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+    pub async fn add(&mut self, remote_engine_config: JsValue) -> Result<JsValue, JsValue> {
+        let remote_engine_config: RemoteEngineConfig = serde_wasm_bindgen::from_value(remote_engine_config)?;
+        Ok(self.add_internal(remote_engine_config).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
-    async fn add_internal(&mut self, index_engine: IndexEngineConfig) -> SummaWasmResult<Option<IndexAttributes>> {
-        let mut index = IndexHolder::from_index_engine_config::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&index_engine).await?;
+    async fn add_internal(&mut self, remote_engine_config: RemoteEngineConfig) -> SummaWasmResult<Option<IndexAttributes>> {
+        let mut index =
+            IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&remote_engine_config).await?;
         index.settings_mut().docstore_compress_dedicated_thread = false;
 
         let core_config = summa_core::configs::core::ConfigBuilder::default()
@@ -57,7 +59,15 @@ impl WebIndexRegistry {
         })?;
 
         let core_config_holder = Arc::new(DirectProxy::new(core_config.clone()));
-        let index_holder = IndexHolder::create_holder(core_config_holder, &core_config, index, None, Arc::new(DirectProxy::new(index_engine)))?;
+        let index_holder = IndexHolder::create_holder(
+            core_config_holder,
+            &core_config,
+            index,
+            None,
+            Arc::new(DirectProxy::new(IndexEngineConfig {
+                config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
+            })),
+        )?;
         let index_attributes = index_holder.index_attributes().cloned();
         self.index_registry.add(index_holder).await;
         Ok(index_attributes)

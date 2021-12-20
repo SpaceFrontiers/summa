@@ -121,7 +121,7 @@ impl Server {
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let p2p_future = P2p::new(&self.server_config).await?.start(terminator.clone()).await?;
         let store_future = Store::new(&self.server_config).await?.start(terminator.clone()).await?;
-        let index_service = Index::new(&self.server_config);
+        let index_service = Index::new(&self.server_config).await?;
         let metrics_server_future = Metrics::new(&self.server_config).await?.start(&index_service, terminator.clone()).await?;
         let grpc_server_future = Grpc::new(&self.server_config, &index_service)?.start(terminator.clone()).await?;
 

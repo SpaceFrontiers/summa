@@ -29,8 +29,8 @@ export class WebIndexService {
       status_callback("status", "");
     }
   }
-  async add(index_engine: { config: { remote: RemoteEngineConfig } | { memory: Object }}): Promise<Object> {
-    return await this.registry!.add(index_engine)
+  async add(remote_engine_config: RemoteEngineConfig): Promise<Object> {
+    return await this.registry!.add(remote_engine_config)
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)

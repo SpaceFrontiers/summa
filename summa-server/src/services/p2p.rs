@@ -2,7 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use async_broadcast::Receiver;
-use iroh_p2p::{DiskStorage, Keychain, Node};
+use iroh_p2p::{DiskStorage, Keychain, Libp2pConfig, Node, DEFAULT_BOOTSTRAP};
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
@@ -17,11 +17,31 @@ pub struct P2p {
 impl P2p {
     pub async fn new(config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<P2p> {
         let config = config.read().await.get().p2p.clone();
+        let bootstrap = config.bootstrap.clone();
         let key_chain = Keychain::<DiskStorage>::new(config.key_store_path.clone()).await?;
         let rpc_addr = config.endpoint.parse()?;
+
+        let bootstrap_peers = DEFAULT_BOOTSTRAP
+            .iter()
+            .map(|x| x.to_string())
+            .chain(bootstrap.into_iter())
+            .map(|node| node.parse().unwrap())
+            .collect();
+        let mut libp2p = Libp2pConfig::default();
+        libp2p.bootstrap_peers = bootstrap_peers;
         Ok(P2p {
-            config,
-            node: Node::new(iroh_p2p::Config::default_network(), rpc_addr, key_chain).await?,
+            config: config.clone(),
+            node: Node::new(
+                iroh_p2p::Config {
+                    libp2p,
+                    rpc_client: iroh_rpc_client::Config::default_network(),
+                    metrics: iroh_metrics::config::Config::default(),
+                    key_store_path: config.key_store_path,
+                },
+                rpc_addr,
+                key_chain,
+            )
+            .await?,
         })
     }
 

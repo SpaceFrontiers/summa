@@ -65,6 +65,8 @@ pub enum Error {
     Validation(#[from] ValidationError),
     #[error("{0}")]
     Kafka(#[from] rdkafka::error::KafkaError),
+    #[error("{0}")]
+    Yaml(#[from] serde_yaml::Error),
 }
 
 impl From<std::io::Error> for Error {

@@ -1,17 +1,19 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use summa_core::components::{IndexHolder, IndexRegistry};
+use iroh_unixfs::content_loader::GatewayUrl;
+use summa_core::components::{IndexHolder, IndexRegistry, IrohClient};
+use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
-use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::ThreadHandler;
 use summa_proto::proto;
-use summa_proto::proto::ChunkedCacheConfig;
+use tantivy::IndexBuilder;
 use tokio::sync::RwLock;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
@@ -29,18 +31,7 @@ pub struct Index {
     consumer_manager: Arc<RwLock<ConsumerManager>>,
     should_terminate: Arc<AtomicBool>,
     autocommit_thread: Arc<RwLock<Option<ThreadHandler<SummaServerResult<()>>>>>,
-}
-
-impl Default for Index {
-    fn default() -> Self {
-        Index {
-            server_config: Arc::new(DirectProxy::default()),
-            index_registry: IndexRegistry::default(),
-            consumer_manager: Arc::default(),
-            should_terminate: Arc::default(),
-            autocommit_thread: Arc::default(),
-        }
-    }
+    iroh_client: IrohClient,
 }
 
 #[derive(Default)]
@@ -116,14 +107,24 @@ impl Index {
     }
 
     /// Creates new `IndexService` with `ConfigHolder`
-    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> Index {
-        Index {
+    pub async fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<Index> {
+        let config = server_config_holder.read().await.get().clone();
+        Ok(Index {
             server_config: server_config_holder.clone(),
             index_registry: IndexRegistry::default(),
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
             autocommit_thread: Arc::default(),
-        }
+            iroh_client: IrohClient::new(
+                config
+                    .p2p
+                    .http_gateways
+                    .into_iter()
+                    .map(|x| GatewayUrl::from_str(&x))
+                    .collect::<Result<_, _>>()?,
+            )
+            .await?,
+        })
     }
 
     async fn derive_configs(
@@ -156,9 +157,7 @@ impl Index {
     pub(crate) async fn setup_index_holders(&self) -> SummaServerResult<()> {
         let mut index_holders = HashMap::new();
         for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
-            let index =
-                IndexHolder::from_index_engine_config::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(&index_engine_config)
-                    .await?;
+            let index = self.create_index_from(&index_engine_config).await?;
             let core_config = self.server_config.read().await.get().core.clone();
             let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
             let index_holder = tokio::task::spawn_blocking(move || {
@@ -214,13 +213,13 @@ impl Index {
             proto::attach_index_request::Request::AttachIpfsEngineRequest(proto::AttachIpfsEngineRequest { cid }) => {
                 let ipfs_index_engine = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
-                    chunked_cache_config: Some(ChunkedCacheConfig {
+                    chunked_cache_config: Some(proto::ChunkedCacheConfig {
                         chunk_size: 65536,
                         cache_size: Some(536870912),
                     }),
                     path: index_path.to_string_lossy().to_string(),
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, &self.iroh_client).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
                 };
@@ -497,6 +496,22 @@ impl Index {
         }
         Ok(())
     }
+
+    /// Opens index and sets it up via `setup`
+    #[instrument(skip_all)]
+    pub async fn create_index_from(&self, index_engine_config: &proto::IndexEngineConfig) -> SummaServerResult<tantivy::Index> {
+        let index = match &index_engine_config.config {
+            Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(&config.path)?,
+            Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
+            Some(proto::index_engine_config::Config::Remote(config)) => {
+                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config).await?
+            }
+            Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(config, &self.iroh_client).await?,
+            _ => unimplemented!(),
+        };
+        info!(action = "from_config", index = ?index);
+        Ok(index)
+    }
 }
 
 #[cfg(test)]
@@ -517,7 +532,7 @@ pub(crate) mod tests {
     use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
 
     pub async fn create_test_index_service(data_path: &Path) -> Index {
-        Index::new(&create_test_server_config_holder(&data_path))
+        Index::new(&create_test_server_config_holder(&data_path)).await.unwrap()
     }
     pub async fn create_test_index_holder(index_service: &Index, schema: &Schema) -> SummaServerResult<Handler<IndexHolder>> {
         index_service
@@ -597,7 +612,7 @@ pub(crate) mod tests {
         let data_path = root_path.path().join("data");
         let server_config_holder = create_test_server_config_holder(&data_path);
 
-        let index_service = Index::new(&server_config_holder);
+        let index_service = Index::new(&server_config_holder).await;
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()

@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use futures::future::try_join_all;
@@ -11,7 +9,6 @@ use futures::future::try_join_all;
 use instant::Instant;
 use iroh_unixfs::builder::FileBuilder;
 use iroh_unixfs::chunker::Chunker;
-use iroh_unixfs::content_loader::GatewayUrl;
 #[cfg(feature = "metrics")]
 use opentelemetry::{
     global,
@@ -32,7 +29,7 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{ComponentFile, IndexWriterHolder, SummaDocument, CACHE_METRICS};
+use crate::components::{ComponentFile, IndexWriterHolder, IrohClient, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
@@ -227,33 +224,6 @@ impl IndexHolder {
         Ok(index)
     }
 
-    /// Opens index and sets it up via `setup`
-    #[instrument(skip_all)]
-    pub async fn from_index_engine_config<
-        TExternalRequest: ExternalRequest + 'static,
-        TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
-    >(
-        index_engine_config: &proto::IndexEngineConfig,
-    ) -> SummaResult<Index> {
-        let index = match &index_engine_config.config {
-            #[cfg(feature = "fs")]
-            Some(proto::index_engine_config::Config::File(config)) => Index::open_in_dir(&config.path)?,
-            Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
-            Some(proto::index_engine_config::Config::Remote(config)) => {
-                let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(config.clone())));
-                let hotcache_handle = network_directory.get_network_file_handle("hotcache.bin".as_ref());
-                let hotcache_bytes = hotcache_handle.do_read_bytes_async(None).await.expect("cannot read hotcache");
-                let directory = wrap_with_caches(network_directory, Some(hotcache_bytes), config.chunked_cache_config.as_ref())?;
-                Index::open(directory)?
-            }
-            #[cfg(feature = "ipfs")]
-            Some(proto::index_engine_config::Config::Ipfs(config)) => Self::attach_ipfs_index(config).await?,
-            _ => unimplemented!(),
-        };
-        info!(action = "from_config", index = ?index);
-        Ok(index)
-    }
-
     /// Attaches index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
@@ -263,31 +233,38 @@ impl IndexHolder {
         Ok(index)
     }
 
+    pub async fn attach_remote_index<
+        TExternalRequest: ExternalRequest + 'static,
+        TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
+    >(
+        remote_engine_config: &proto::RemoteEngineConfig,
+    ) -> SummaResult<Index> {
+        let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
+        let hotcache_handle = network_directory.get_network_file_handle("hotcache.bin".as_ref());
+        let hotcache_bytes = hotcache_handle.do_read_bytes_async(None).await.expect("cannot read hotcache");
+        let directory = wrap_with_caches(network_directory, Some(hotcache_bytes), remote_engine_config.chunked_cache_config.as_ref())?;
+        Ok(Index::open(directory)?)
+    }
+
     /// Attaches index and sets it up via `setup`
     #[cfg(feature = "ipfs")]
     #[instrument(skip_all)]
-    pub async fn attach_ipfs_index(ipfs_engine_config: &proto::IpfsEngineConfig) -> SummaResult<Index> {
-        let client = iroh_rpc_client::Client::new(iroh_rpc_client::Config::default_network()).await?;
-        let content_loader = iroh_unixfs::content_loader::FullLoader::new(
-            client.clone(),
-            iroh_unixfs::content_loader::FullLoaderConfig {
-                http_gateways: vec![GatewayUrl::from_str("https://ipfs.io")?, GatewayUrl::from_str("https://cloudflare-ipfs.com")?],
-                indexer: None,
-            },
-        )?;
+    pub async fn attach_ipfs_index(ipfs_engine_config: &proto::IpfsEngineConfig, iroh_client: &IrohClient) -> SummaResult<Index> {
         let index_path = Path::new(&ipfs_engine_config.path);
         if !index_path.exists() {
             tokio::fs::create_dir_all(index_path).await?;
         }
         let mmap_directory = MmapDirectory::open(index_path)?;
-        let iroh_directory = crate::directories::IrohDirectory::new(mmap_directory, content_loader, &ipfs_engine_config.cid).await?;
+        let iroh_directory = crate::directories::IrohDirectory::new(mmap_directory, iroh_client.content_loader().clone(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok(),
             Err(_) => None,
         };
-        let directory = tokio::task::spawn_blocking(move || wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())).await??;
-        let index = Index::open(directory)?;
+        let index = tokio::task::spawn_blocking(move || {
+            Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
+        })
+        .await??;
         info!(action = "attached", index = ?index);
         Ok(index)
     }
