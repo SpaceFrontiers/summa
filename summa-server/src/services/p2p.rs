@@ -48,6 +48,7 @@ impl P2p {
 
     #[instrument("lifecycle", skip_all)]
     pub async fn start(mut self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+        info!(action = "swarm", local_peer_id = ?self.node.local_peer_id(), listen_addrs = ?self.node.listen_addrs());
         let p2p_task = tokio::task::spawn(async move { self.node.run().await });
         info!(action = "binded", endpoint = ?self.config.endpoint);
         Ok(async move {

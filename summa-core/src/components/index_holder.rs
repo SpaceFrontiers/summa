@@ -1,14 +1,11 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
 use std::sync::Arc;
 
 use futures::future::try_join_all;
 #[cfg(feature = "metrics")]
 use instant::Instant;
-use iroh_unixfs::builder::FileBuilder;
-use iroh_unixfs::chunker::Chunker;
 #[cfg(feature = "metrics")]
 use opentelemetry::{
     global,
@@ -17,7 +14,7 @@ use opentelemetry::{
 };
 use summa_proto::proto;
 use tantivy::collector::MultiCollector;
-use tantivy::directory::{MmapDirectory, OwnedBytes};
+use tantivy::directory::OwnedBytes;
 use tantivy::schema::Schema;
 use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, ReloadPolicy};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -28,7 +25,7 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{ComponentFile, IndexWriterHolder, IrohClient, SummaDocument, CACHE_METRICS};
+use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
@@ -113,15 +110,15 @@ fn wrap_with_caches<D: Directory>(
 }
 
 #[cfg(feature = "ipfs")]
-async fn migrate_to_iroh(files: Vec<ComponentFile>, delete_files: bool) -> SummaResult<String> {
+async fn migrate_to_iroh(files: Vec<crate::components::ComponentFile>, delete_files: bool) -> SummaResult<String> {
     info!(files = ?files);
     let iroh = iroh_api::Api::new(iroh_api::Config::default()).await?;
     let mut entries = vec![];
     for file in files.iter() {
         entries.push(iroh_unixfs::builder::Entry::File(
-            FileBuilder::new()
+            iroh_unixfs::builder::FileBuilder::new()
                 .name(file.path().file_name().expect("should have name").to_string_lossy().to_string())
-                .chunker(Chunker::Fixed(iroh_unixfs::chunker::Fixed { chunk_size: 1024 * 1024 }))
+                .chunker(iroh_unixfs::chunker::Chunker::Fixed(iroh_unixfs::chunker::Fixed { chunk_size: 1024 * 1024 }))
                 .content_reader(tokio::fs::File::open(file.path()).await?)
                 .build()
                 .await
@@ -214,7 +211,7 @@ impl IndexHolder {
     /// Creates index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
-    pub async fn create_file_index(index_path: &Path, index_builder: IndexBuilder) -> SummaResult<Index> {
+    pub async fn create_file_index(index_path: &std::path::Path, index_builder: IndexBuilder) -> SummaResult<Index> {
         if index_path.exists() {
             return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
         }
@@ -249,12 +246,12 @@ impl IndexHolder {
     /// Attaches index and sets it up via `setup`
     #[cfg(feature = "ipfs")]
     #[instrument(skip_all)]
-    pub async fn attach_ipfs_index(ipfs_engine_config: &proto::IpfsEngineConfig, iroh_client: &IrohClient) -> SummaResult<Index> {
-        let index_path = Path::new(&ipfs_engine_config.path);
+    pub async fn attach_ipfs_index(ipfs_engine_config: &proto::IpfsEngineConfig, iroh_client: &crate::components::IrohClient) -> SummaResult<Index> {
+        let index_path = std::path::Path::new(&ipfs_engine_config.path);
         if !index_path.exists() {
             tokio::fs::create_dir_all(index_path).await?;
         }
-        let mmap_directory = MmapDirectory::open(index_path)?;
+        let mmap_directory = tantivy::directory::MmapDirectory::open(index_path)?;
         let iroh_directory = crate::directories::IrohDirectory::new(mmap_directory, iroh_client.content_loader().clone(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
@@ -464,11 +461,11 @@ impl IndexHolder {
     }
 
     #[cfg(feature = "ipfs")]
-    pub async fn migrate_to_iroh<P: AsRef<Path>>(&self, index_path: P, delete_files: bool) -> SummaResult<String> {
+    pub async fn migrate_to_iroh<P: AsRef<std::path::Path>>(&self, index_path: P, delete_files: bool) -> SummaResult<String> {
         self.index_writer_holder()
             .write()
             .await
-            .lock_files(index_path, |files: Vec<ComponentFile>| migrate_to_iroh(files, delete_files))
+            .lock_files(index_path, |files: Vec<crate::components::ComponentFile>| migrate_to_iroh(files, delete_files))
             .await
     }
 
@@ -477,12 +474,14 @@ impl IndexHolder {
     pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
         let mut index_writer_holder = self.index_writer_holder.write().await;
         index_writer_holder.commit(payload).await?;
-        let mut index_engine_config = self.index_engine_config().write().await;
         #[cfg(feature = "ipfs")]
-        if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
-            let cid = self.migrate_to_iroh(&ipfs_engine_config.path, true).await?;
-            ipfs_engine_config.cid = cid;
-            index_engine_config.commit().await?;
+        {
+            let mut index_engine_config = self.index_engine_config().write().await;
+            if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
+                let cid = self.migrate_to_iroh(&ipfs_engine_config.path, true).await?;
+                ipfs_engine_config.cid = cid;
+                index_engine_config.commit().await?;
+            }
         }
         Ok(())
     }

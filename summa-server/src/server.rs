@@ -49,8 +49,7 @@ impl Server {
                         arg!(-m <METRICS_ENDPOINT> "Metrics listen endpoint")
                             .default_value("127.0.0.1:8084")
                             .num_args(1),
-                    )
-                    .arg(arg!(-i <IPFS_API_ENDPOINT> "IPFS API endpoint").num_args(0..=1)),
+                    ),
             )
             .subcommand(
                 command!("serve")

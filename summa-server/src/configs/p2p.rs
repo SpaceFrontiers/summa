@@ -4,6 +4,15 @@ use path_absolutize::Absolutize;
 use serde::{Deserialize, Serialize};
 use summa_core::errors::BuilderError;
 
+fn default_http_gateways() -> Vec<String> {
+    vec![
+        "w3s.link".to_string(),
+        "https://ipfs.io/ipfs/".to_string(),
+        "https://cloudflare-ipfs.com/ipfs/".to_string(),
+        "https://gateway.pinata.cloud/ipfs/".to_string(),
+    ]
+}
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
@@ -12,8 +21,8 @@ pub struct Config {
     pub key_store_path: PathBuf,
     #[builder(default)]
     pub bootstrap: Option<Vec<String>>,
-    #[builder(default)]
-    #[serde(default = "Vec::new")]
+    #[builder(default = "default_http_gateways()")]
+    #[serde(default)]
     pub http_gateways: Vec<String>,
 }
 
@@ -23,12 +32,7 @@ impl Default for Config {
             endpoint: "irpc://127.0.0.1:4401".to_string(),
             key_store_path: PathBuf::new(),
             bootstrap: None,
-            http_gateways: vec![
-                "w3s.link".to_string(),
-                "https://ipfs.io/ipfs/".to_string(),
-                "https://cloudflare-ipfs.com/ipfs/".to_string(),
-                "https://gateway.pinata.cloud/ipfs/".to_string(),
-            ],
+            http_gateways: default_http_gateways(),
         }
     }
 }

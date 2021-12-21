@@ -2295,7 +2295,7 @@ checksum = "11b0d96e660696543b251e58030cf9787df56da39dab19ad60eae7353040917e"
 [[package]]
 name = "iroh-api"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2321,7 +2321,7 @@ dependencies = [
 [[package]]
 name = "iroh-bitswap"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2359,7 +2359,7 @@ dependencies = [
 [[package]]
 name = "iroh-metrics"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "async-trait",
  "config",
@@ -2382,7 +2382,7 @@ dependencies = [
 [[package]]
 name = "iroh-p2p"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2421,7 +2421,7 @@ dependencies = [
 [[package]]
 name = "iroh-resolver"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2447,7 +2447,7 @@ dependencies = [
 [[package]]
 name = "iroh-rpc-client"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2470,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "iroh-rpc-types"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2488,7 +2488,7 @@ dependencies = [
 [[package]]
 name = "iroh-store"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2522,7 +2522,7 @@ dependencies = [
 [[package]]
 name = "iroh-unixfs"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2559,7 +2559,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#629a67c8ef5627770c0d4a078eaa6227afdedc03"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#82b352b4b4a620001ed41158c13ae171c3fd3de0"
 dependencies = [
  "anyhow",
  "cid",

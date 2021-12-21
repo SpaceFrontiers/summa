@@ -4,6 +4,7 @@ members = ["summa-proto", "summa-core", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true
+strip = "debuginfo"
 
 [workspace.dependencies]
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", version = "0.19.0", default_features = false, features = ["quickwit", "zstd-compression"]}
