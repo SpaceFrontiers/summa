@@ -55,6 +55,13 @@ impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
     }
 }
 
+fn default_chunked_cache_config() -> Option<proto::ChunkedCacheConfig> {
+    Some(proto::ChunkedCacheConfig {
+        chunk_size: 65536,
+        cache_size: Some(536870912),
+    })
+}
+
 /// The main entry point for managing Summa indices
 impl Index {
     /// `HashMap` of all indices
@@ -234,10 +241,7 @@ impl Index {
             proto::attach_index_request::Request::AttachIpfsEngineRequest(proto::AttachIpfsEngineRequest { cid }) => {
                 let ipfs_index_engine = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
-                    chunked_cache_config: Some(proto::ChunkedCacheConfig {
-                        chunk_size: 65536,
-                        cache_size: Some(536870912),
-                    }),
+                    chunked_cache_config: default_chunked_cache_config(),
                     path: index_path.to_string_lossy().to_string(),
                 };
                 let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, &self.iroh_client).await?;
@@ -526,7 +530,7 @@ impl Index {
                 let cid = index_holder.migrate_to_iroh(&file_engine_config.path, false).await?;
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid,
-                    chunked_cache_config: None,
+                    chunked_cache_config: default_chunked_cache_config(),
                     path: self
                         .server_config
                         .read()
