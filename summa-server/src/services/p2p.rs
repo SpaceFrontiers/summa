@@ -17,18 +17,19 @@ pub struct P2p {
 impl P2p {
     pub async fn new(config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<P2p> {
         let config = config.read().await.get().p2p.clone();
-        let bootstrap = config.bootstrap.clone();
         let key_chain = Keychain::<DiskStorage>::new(config.key_store_path.clone()).await?;
         let rpc_addr = config.endpoint.parse()?;
 
-        let bootstrap_peers = DEFAULT_BOOTSTRAP
+        let bootstrap_peers = config
+            .bootstrap
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BOOTSTRAP.iter().map(|x| x.to_string()).collect())
             .iter()
-            .map(|x| x.to_string())
-            .chain(bootstrap.into_iter())
-            .map(|node| node.parse().unwrap())
+            .map(|node| node.parse().expect("incorrect bootstrap node"))
             .collect();
         let mut libp2p = Libp2pConfig::default();
         libp2p.bootstrap_peers = bootstrap_peers;
+        libp2p.gossipsub = false;
         Ok(P2p {
             config: config.clone(),
             node: Node::new(

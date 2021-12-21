@@ -193,6 +193,34 @@ class SummaClient(BaseGrpcClient):
             metadata=setup_metadata(session_id, request_id),
         )
 
+    @expose(with_from_file=True)
+    async def migrate_index(
+        self,
+        source_index_name: str,
+        target_index_name: str,
+        target_index_engine: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.CreateIndexResponse:
+        """
+        Migrates existing index to new engine
+
+        Args:
+            source_index_name: source index name
+            target_index_name: target index name
+            target_index_engine: "File", "Memory" or "Ipfs"
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].migrate_index(
+            index_service_pb.MigrateIndexRequest(
+                source_index_name=source_index_name,
+                target_index_name=target_index_name,
+                target_index_engine=target_index_engine,
+            ),
+            metadata=setup_metadata(session_id, request_id),
+        )
+
     @expose
     async def delete_consumer(
         self,

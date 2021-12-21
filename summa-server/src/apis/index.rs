@@ -111,6 +111,14 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         Ok(Response::new(response))
     }
 
+    async fn migrate_index(&self, proto_request: Request<proto::MigrateIndexRequest>) -> Result<Response<proto::MigrateIndexResponse>, Status> {
+        let index_holder = self.index_service.migrate_index(proto_request.into_inner()).await?;
+        let response = proto::MigrateIndexResponse {
+            index: Some(self.get_index_description(&index_holder).await),
+        };
+        Ok(Response::new(response))
+    }
+
     async fn delete_document(&self, request: Request<proto::DeleteDocumentRequest>) -> Result<Response<proto::DeleteDocumentResponse>, Status> {
         let request = request.into_inner();
         self.index_service

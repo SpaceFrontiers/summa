@@ -192,6 +192,27 @@ impl Index {
         Ok(())
     }
 
+    async fn insert_index(
+        &self,
+        index_name: &str,
+        index: tantivy::Index,
+        index_engine_config: &proto::IndexEngineConfig,
+    ) -> SummaServerResult<Handler<IndexHolder>> {
+        self.insert_config(index_name, index_engine_config).await?;
+        let core_config = self.server_config.read().await.get().core.clone();
+        let (core_config_holder, index_engine_config_holder) = self.derive_configs(index_name).await;
+        Ok(self
+            .index_registry
+            .add(IndexHolder::create_holder(
+                core_config_holder,
+                &core_config,
+                index,
+                Some(index_name),
+                index_engine_config_holder,
+            )?)
+            .await)
+    }
+
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?attach_index_request.index_name))]
     pub async fn attach_index(&self, attach_index_request: AttachIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
@@ -227,19 +248,7 @@ impl Index {
             }
             _ => unimplemented!(),
         };
-        self.insert_config(&attach_index_request.index_name, &index_engine_config).await?;
-        let core_config = self.server_config.read().await.get().core.clone();
-        let (core_config_holder, index_engine_config_holder) = self.derive_configs(&attach_index_request.index_name).await;
-        Ok(self
-            .index_registry
-            .add(IndexHolder::create_holder(
-                core_config_holder,
-                &core_config,
-                index,
-                Some(&attach_index_request.index_name),
-                index_engine_config_holder,
-            )?)
-            .await)
+        self.insert_index(&attach_index_request.index_name, index, &index_engine_config).await
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
@@ -276,20 +285,9 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
+            proto::CreateIndexEngineRequest::Ipfs => unimplemented!(),
         };
-        self.insert_config(&create_index_request.index_name, &index_engine_config).await?;
-        let core_config = self.server_config.read().await.get().core.clone();
-        let (core_config_holder, index_engine_config_holder) = self.derive_configs(&create_index_request.index_name).await;
-        Ok(self
-            .index_registry
-            .add(IndexHolder::create_holder(
-                core_config_holder,
-                &core_config,
-                index,
-                Some(&create_index_request.index_name),
-                index_engine_config_holder,
-            )?)
-            .await)
+        self.insert_index(&create_index_request.index_name, index, &index_engine_config).await
     }
 
     /// Delete index, optionally with all its aliases and consumers
@@ -511,6 +509,49 @@ impl Index {
         };
         info!(action = "from_config", index = ?index);
         Ok(index)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn migrate_index(&self, migrate_index_request: proto::MigrateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+        let index_holder = self.get_index_holder(&migrate_index_request.source_index_name).await?;
+        let prepared_consumption = self.commit(&index_holder).await?;
+        let source_index_engine_config = index_holder.index_engine_config().read().await.get().clone();
+
+        let index_holder = match (
+            source_index_engine_config.config.as_ref().expect("index without config"),
+            proto::CreateIndexEngineRequest::from_i32(migrate_index_request.target_index_engine),
+        ) {
+            // File to IPFS
+            (proto::index_engine_config::Config::File(file_engine_config), Some(proto::CreateIndexEngineRequest::Ipfs)) => {
+                let cid = index_holder.migrate_to_iroh(&file_engine_config.path, false).await?;
+                let ipfs_engine_config = proto::IpfsEngineConfig {
+                    cid,
+                    chunked_cache_config: None,
+                    path: self
+                        .server_config
+                        .read()
+                        .await
+                        .get()
+                        .get_path_for_index_data(&migrate_index_request.target_index_name)
+                        .to_string_lossy()
+                        .to_string(),
+                };
+                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, &self.iroh_client).await?;
+                self.insert_index(
+                    &migrate_index_request.target_index_name,
+                    index,
+                    &proto::IndexEngineConfig {
+                        config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)),
+                    },
+                )
+                .await?
+            }
+            _ => unimplemented!(),
+        };
+        if let Some(prepared_consumption) = prepared_consumption {
+            self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
+        }
+        Ok(index_holder)
     }
 }
 

@@ -11,8 +11,7 @@ pub struct Config {
     #[builder(setter(custom))]
     pub key_store_path: PathBuf,
     #[builder(default)]
-    #[serde(default = "Vec::new")]
-    pub bootstrap: Vec<String>,
+    pub bootstrap: Option<Vec<String>>,
     #[builder(default)]
     #[serde(default = "Vec::new")]
     pub http_gateways: Vec<String>,
@@ -23,8 +22,13 @@ impl Default for Config {
         Config {
             endpoint: "irpc://127.0.0.1:4401".to_string(),
             key_store_path: PathBuf::new(),
-            bootstrap: vec![],
-            http_gateways: vec!["https://ipfs.io/ipfs/".to_string(), "https://cloudflare-ipfs.com/ipfs/".to_string()],
+            bootstrap: None,
+            http_gateways: vec![
+                "w3s.link".to_string(),
+                "https://ipfs.io/ipfs/".to_string(),
+                "https://cloudflare-ipfs.com/ipfs/".to_string(),
+                "https://gateway.pinata.cloud/ipfs/".to_string(),
+            ],
         }
     }
 }

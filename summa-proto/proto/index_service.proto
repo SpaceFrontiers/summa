@@ -11,6 +11,8 @@ service IndexApi {
   rpc commit_index (CommitIndexRequest) returns (CommitIndexResponse) {}
   // Creates new index from scratch
   rpc create_index (CreateIndexRequest) returns (CreateIndexResponse) {}
+  // Creates new index from scratch
+  rpc migrate_index (MigrateIndexRequest) returns (MigrateIndexResponse) {}
   // Deletes single document from the index by its primary key (therefore, index must have primary key)
   rpc delete_document (DeleteDocumentRequest) returns (DeleteDocumentResponse) {}
   // Deletes index and physically removes file in the case of `FileEngine`
@@ -75,6 +77,16 @@ message CommitIndexResponse {
   optional double elapsed_secs = 2;
 }
 
+message MigrateIndexRequest {
+  string source_index_name = 1;
+  string target_index_name = 2;
+  CreateIndexEngineRequest target_index_engine = 3;
+}
+
+message MigrateIndexResponse {
+  IndexDescription index = 1;
+}
+
 message SortByField {
   string field = 1;
   Order order = 2;
@@ -83,6 +95,7 @@ message SortByField {
 enum CreateIndexEngineRequest {
   File = 0;
   Memory = 1;
+  Ipfs = 2;
 }
 
 message IndexAttributes {

@@ -8,14 +8,14 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-const ENV_FILTER: &str = "librdkafka=trace,\
-    rdkafka::client=debug,\
+const ENV_FILTER: &str = "librdkafka=info,\
+    rdkafka::client=info,\
     summa_core::components=info,\
     summa_server::services=info,\
     summa_server::components=info,\
     summa_server::servers[lifecycle]=info,\
-    tantivy,\
-    fastfield_codecs=debug,\
+    tantivy=info,\
+    fastfield_codecs=info,\
     warn";
 
 const REQUEST_ENV_FILTER: &str = "summa_server::servers::grpc[request]=info,summa_server::servers::metrics[request]=info";

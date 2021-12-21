@@ -30,6 +30,11 @@ class IndexApiStub(object):
                 request_serializer=index__service__pb2.CreateIndexRequest.SerializeToString,
                 response_deserializer=index__service__pb2.CreateIndexResponse.FromString,
                 )
+        self.migrate_index = channel.unary_unary(
+                '/summa.proto.IndexApi/migrate_index',
+                request_serializer=index__service__pb2.MigrateIndexRequest.SerializeToString,
+                response_deserializer=index__service__pb2.MigrateIndexResponse.FromString,
+                )
         self.delete_document = channel.unary_unary(
                 '/summa.proto.IndexApi/delete_document',
                 request_serializer=index__service__pb2.DeleteDocumentRequest.SerializeToString,
@@ -101,6 +106,13 @@ class IndexApiServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def create_index(self, request, context):
+        """Creates new index from scratch
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def migrate_index(self, request, context):
         """Creates new index from scratch
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -194,6 +206,11 @@ def add_IndexApiServicer_to_server(servicer, server):
                     servicer.create_index,
                     request_deserializer=index__service__pb2.CreateIndexRequest.FromString,
                     response_serializer=index__service__pb2.CreateIndexResponse.SerializeToString,
+            ),
+            'migrate_index': grpc.unary_unary_rpc_method_handler(
+                    servicer.migrate_index,
+                    request_deserializer=index__service__pb2.MigrateIndexRequest.FromString,
+                    response_serializer=index__service__pb2.MigrateIndexResponse.SerializeToString,
             ),
             'delete_document': grpc.unary_unary_rpc_method_handler(
                     servicer.delete_document,
@@ -304,6 +321,23 @@ class IndexApi(object):
         return grpc.experimental.unary_unary(request, target, '/summa.proto.IndexApi/create_index',
             index__service__pb2.CreateIndexRequest.SerializeToString,
             index__service__pb2.CreateIndexResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def migrate_index(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/summa.proto.IndexApi/migrate_index',
+            index__service__pb2.MigrateIndexRequest.SerializeToString,
+            index__service__pb2.MigrateIndexResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 

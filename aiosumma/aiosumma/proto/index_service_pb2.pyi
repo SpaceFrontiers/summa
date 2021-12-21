@@ -9,6 +9,7 @@ Async: CommitMode
 Brotli: Compression
 DESCRIPTOR: _descriptor.FileDescriptor
 File: CreateIndexEngineRequest
+Ipfs: CreateIndexEngineRequest
 Lz4: Compression
 Memory: CreateIndexEngineRequest
 None: Compression
@@ -276,6 +277,22 @@ class MergeSegmentsRequest(_message.Message):
 class MergeSegmentsResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
+
+class MigrateIndexRequest(_message.Message):
+    __slots__ = ["source_index_name", "target_index_engine", "target_index_name"]
+    SOURCE_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    TARGET_INDEX_ENGINE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    source_index_name: str
+    target_index_engine: CreateIndexEngineRequest
+    target_index_name: str
+    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., target_index_engine: _Optional[_Union[CreateIndexEngineRequest, str]] = ...) -> None: ...
+
+class MigrateIndexResponse(_message.Message):
+    __slots__ = ["index"]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    index: IndexDescription
+    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class PrimaryKey(_message.Message):
     __slots__ = ["i64", "str"]

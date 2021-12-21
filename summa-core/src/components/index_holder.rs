@@ -16,7 +16,6 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use summa_proto::proto;
-use summa_proto::proto::ChunkedCacheConfig;
 use tantivy::collector::MultiCollector;
 use tantivy::directory::{MmapDirectory, OwnedBytes};
 use tantivy::schema::Schema;
@@ -83,7 +82,7 @@ fn register_default_tokenizers(index: &Index) {
 fn wrap_with_caches<D: Directory>(
     directory: D,
     hotcache_bytes: Option<OwnedBytes>,
-    chunked_cache_config: Option<&ChunkedCacheConfig>,
+    chunked_cache_config: Option<&proto::ChunkedCacheConfig>,
 ) -> SummaResult<Box<dyn Directory>> {
     let static_cache = hotcache_bytes.map(StaticDirectoryCache::open).transpose()?;
     let file_lengths = static_cache
@@ -114,7 +113,7 @@ fn wrap_with_caches<D: Directory>(
 }
 
 #[cfg(feature = "ipfs")]
-async fn migrate_to_iroh(files: Vec<ComponentFile>, ipfs_engine_config: &mut proto::IpfsEngineConfig) -> SummaResult<()> {
+async fn migrate_to_iroh(files: Vec<ComponentFile>, delete_files: bool) -> SummaResult<String> {
     info!(files = ?files);
     let iroh = iroh_api::Api::new(iroh_api::Config::default()).await?;
     let mut entries = vec![];
@@ -137,11 +136,12 @@ async fn migrate_to_iroh(files: Vec<ComponentFile>, ipfs_engine_config: &mut pro
         .await
         .map_err(|e| Error::External(e.to_string()))?
         .to_string();
-    ipfs_engine_config.cid = cid;
-    for file in files.iter() {
-        tokio::fs::remove_file(file.path()).await?;
+    if delete_files {
+        for file in files.iter() {
+            tokio::fs::remove_file(file.path()).await?;
+        }
     }
-    Ok(())
+    Ok(cid)
 }
 
 impl IndexHolder {
@@ -463,20 +463,25 @@ impl IndexHolder {
         (success_docs, failed_docs)
     }
 
+    #[cfg(feature = "ipfs")]
+    pub async fn migrate_to_iroh<P: AsRef<Path>>(&self, index_path: P, delete_files: bool) -> SummaResult<String> {
+        self.index_writer_holder()
+            .write()
+            .await
+            .lock_files(index_path, |files: Vec<ComponentFile>| migrate_to_iroh(files, delete_files))
+            .await
+    }
+
     /// Commits index
     #[instrument(skip(self))]
     pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
-        self.index_writer_holder.write().await.commit(payload).await?;
+        let mut index_writer_holder = self.index_writer_holder.write().await;
+        index_writer_holder.commit(payload).await?;
         let mut index_engine_config = self.index_engine_config().write().await;
         #[cfg(feature = "ipfs")]
         if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
-            self.index_writer_holder()
-                .write()
-                .await
-                .lock_files(ipfs_engine_config.path.clone(), |files: Vec<ComponentFile>| {
-                    migrate_to_iroh(files, ipfs_engine_config)
-                })
-                .await?;
+            let cid = self.migrate_to_iroh(&ipfs_engine_config.path, true).await?;
+            ipfs_engine_config.cid = cid;
             index_engine_config.commit().await?;
         }
         Ok(())
