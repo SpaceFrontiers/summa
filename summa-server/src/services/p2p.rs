@@ -1,9 +1,7 @@
 use std::future::Future;
-use std::sync::Arc;
 
 use async_broadcast::Receiver;
 use iroh_p2p::{DiskStorage, Keychain, Libp2pConfig, Node, DEFAULT_BOOTSTRAP};
-use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
 
@@ -15,8 +13,9 @@ pub struct P2p {
 }
 
 impl P2p {
-    pub async fn new(config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<P2p> {
-        let config = config.read().await.get().p2p.clone();
+    pub async fn new(config: crate::configs::p2p::Config) -> SummaServerResult<P2p> {
+        eprintln!("{:?}", config.key_store_path);
+        tokio::fs::create_dir_all(&config.key_store_path).await?;
         let key_chain = Keychain::<DiskStorage>::new(config.key_store_path.clone()).await?;
         let rpc_addr = config.endpoint.parse()?;
 

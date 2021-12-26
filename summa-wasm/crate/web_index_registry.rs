@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
+use summa_core::configs::core::ExecutionStrategy;
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_proto::proto;
 use summa_proto::proto::{IndexAttributes, IndexEngineConfig, RemoteEngineConfig};
-use tantivy::Executor;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 
@@ -17,7 +17,6 @@ use crate::SERIALIZER;
 #[wasm_bindgen]
 pub struct WebIndexRegistry {
     index_registry: IndexRegistry,
-    multithreading: bool,
     core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
 }
 
@@ -28,12 +27,15 @@ impl WebIndexRegistry {
         console_error_panic_hook::set_once();
         let core_config = summa_core::configs::core::ConfigBuilder::default()
             .writer_threads(0)
+            .execution_strategy(match multithreading {
+                true => ExecutionStrategy::GlobalPool,
+                false => ExecutionStrategy::Async,
+            })
             .build()
             .expect("cannot build");
         let core_config = Arc::new(DirectProxy::new(core_config)) as Arc<dyn ConfigProxy<_>>;
         WebIndexRegistry {
             index_registry: IndexRegistry::new(&core_config),
-            multithreading,
             core_config,
         }
     }
@@ -54,10 +56,6 @@ impl WebIndexRegistry {
         let mut index =
             IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&remote_engine_config).await?;
         index.settings_mut().docstore_compress_dedicated_thread = false;
-        index.set_multithread_executor(match self.multithreading {
-            true => Executor::GlobalPool,
-            false => Executor::SingleThread,
-        })?;
         let core_config_value = self.core_config.read().await.get().clone();
 
         let index_holder = IndexHolder::create_holder(

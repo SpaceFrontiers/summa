@@ -104,10 +104,9 @@ impl Index {
             iroh_client: IrohClient::new(
                 config
                     .p2p
-                    .http_gateways
-                    .into_iter()
-                    .map(|x| GatewayUrl::from_str(&x))
-                    .collect::<Result<_, _>>()?,
+                    .map(|p2p| p2p.http_gateways.into_iter().map(|x| GatewayUrl::from_str(&x)).collect::<Result<_, _>>())
+                    .transpose()?
+                    .unwrap_or_default(),
             )
             .await?,
         })
@@ -129,11 +128,11 @@ impl Index {
             &self.server_config,
             {
                 let index_name = index_name.to_string();
-                move |server_config| server_config.core.indices.get(&index_name).unwrap()
+                move |server_config| server_config.core.indices.get(&index_name).expect("index disappeared")
             },
             {
                 let index_name = index_name.to_string();
-                move |server_config| server_config.core.indices.get_mut(&index_name).unwrap()
+                move |server_config| server_config.core.indices.get_mut(&index_name).expect("index disappeared")
             },
         ));
         (core_config_holder, index_engine_config_holder)
@@ -149,8 +148,7 @@ impl Index {
             let index_holder = tokio::task::spawn_blocking(move || {
                 IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder)
             })
-            .await
-            .unwrap()?;
+            .await??;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
         }
         info!(action = "setting_index_holders", index_holders = ?index_holders);
@@ -287,7 +285,7 @@ impl Index {
                     .entry(delete_index_request.index_name.to_owned()),
                 server_config.get_mut().core.indices.entry(delete_index_request.index_name.to_owned()),
             ) {
-                (Entry::Occupied(index_holder_entry), Entry::Occupied(config_entry)) => {
+                (Entry::Occupied(index_holder_entry), Entry::Occupied(_)) => {
                     let index_holder = index_holder_entry.get();
                     if !aliases.is_empty() {
                         return Err(ValidationError::Aliased(aliases.join(", ")).into());
@@ -302,10 +300,7 @@ impl Index {
                     {
                         return Err(ValidationError::ExistingConsumer(consumer_name).into());
                     }
-                    config_entry.remove();
-                    let index_holder = index_holder_entry.remove();
-                    server_config.commit().await?;
-                    index_holder
+                    index_holder_entry.remove()
                 }
                 (Entry::Vacant(_), Entry::Vacant(_)) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
                 (Entry::Occupied(index_holder_entry), Entry::Vacant(_)) => {
@@ -550,8 +545,8 @@ pub(crate) mod tests {
     use std::default::Default;
     use std::path::Path;
 
-    use rdkafka::admin::ConfigSource::Default;
     use summa_core::components::SummaDocument;
+    use summa_core::configs::DirectProxy;
     use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
     use summa_proto::proto_traits::query::shortcuts::match_query;
     use tantivy::doc;
@@ -608,9 +603,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_same_name_index() {
+    async fn test_same_name_index() -> SummaServerResult<()> {
         logging::tests::initialize_default_once();
-        let index_service = Index::default();
+        let index_service = Index::new(&(Arc::new(DirectProxy::default()) as Arc<dyn ConfigProxy<_>>)).await?;
         assert!(index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -634,6 +629,7 @@ pub(crate) mod tests {
             )
             .await
             .is_err());
+        Ok(())
     }
 
     #[tokio::test]
@@ -643,7 +639,7 @@ pub(crate) mod tests {
         let data_path = root_path.path().join("data");
         let server_config_holder = create_test_server_config_holder(&data_path);
 
-        let index_service = Index::new(&server_config_holder).await;
+        let index_service = Index::new(&server_config_holder).await?;
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()

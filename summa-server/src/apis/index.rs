@@ -268,4 +268,14 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let response = proto::VacuumIndexResponse {};
         Ok(Response::new(response))
     }
+
+    async fn warmup_index(&self, proto_request: Request<proto::WarmupIndexRequest>) -> Result<Response<proto::WarmupIndexResponse>, Status> {
+        let proto_request = proto_request.into_inner();
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let now = Instant::now();
+        index_holder.warmup().await.map_err(crate::errors::Error::from)?;
+        let elapsed_secs = now.elapsed().as_secs_f64();
+        let response = proto::WarmupIndexResponse { elapsed_secs };
+        Ok(Response::new(response))
+    }
 }

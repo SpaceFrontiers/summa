@@ -1,5 +1,4 @@
 use async_broadcast::{broadcast, Receiver};
-use rand::{distributions::Alphanumeric, Rng};
 use summa_core::errors::SummaResult;
 use summa_core::utils::thread_handler::ControlMessage;
 use tokio::signal::unix::{signal, SignalKind};
@@ -21,8 +20,4 @@ pub fn signal_channel() -> SummaResult<Receiver<ControlMessage>> {
         }
     });
     Ok(receiver)
-}
-
-pub fn random_string(length: usize) -> String {
-    rand::thread_rng().sample_iter(&Alphanumeric).take(length).map(char::from).collect()
 }

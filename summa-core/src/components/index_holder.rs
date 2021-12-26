@@ -17,7 +17,6 @@ use tantivy::collector::MultiCollector;
 use tantivy::directory::OwnedBytes;
 use tantivy::schema::Schema;
 use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, ReloadPolicy};
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -26,6 +25,7 @@ use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
+use crate::configs::core::ExecutionStrategy;
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
@@ -342,14 +342,8 @@ impl IndexHolder {
     #[instrument(skip(self), fields(index_name = %self.index_name))]
     pub async fn delete(self) -> SummaResult<()> {
         info!(action = "delete_directory");
-        let index_engine_config = self
-            .core_config_holder
-            .write()
-            .await
-            .get_mut()
-            .indices
-            .remove(self.index_name())
-            .expect("cannot retrieve config");
+        let mut config = self.core_config_holder.write().await;
+        let index_engine_config = config.get_mut().indices.remove(self.index_name()).expect("cannot retrieve config");
         match index_engine_config.config {
             #[cfg(feature = "fs")]
             Some(proto::index_engine_config::Config::File(ref config)) => {
@@ -359,31 +353,13 @@ impl IndexHolder {
             }
             _ => (),
         };
+        config.commit().await?;
         Ok(())
-    }
-
-    fn spawn<R: Send + 'static, F: Sized + Send + Sync + FnOnce() -> R + 'static>(&self, f: F) -> UnboundedReceiver<R> {
-        let (fruit_sender, fruit_receiver) = tokio::sync::mpsc::unbounded_channel();
-        match self.index.search_executor() {
-            Executor::SingleThread => {
-                fruit_sender.send(f()).map_err(|_| Error::Internal).expect("Send error");
-            }
-            Executor::GlobalPool => {
-                rayon::spawn(move || {
-                    fruit_sender.send(f()).map_err(|_| Error::Internal).expect("Send error");
-                });
-            }
-            Executor::ThreadPool(pool) => {
-                pool.spawn(move || {
-                    fruit_sender.send(f()).map_err(|_| Error::Internal).expect("Send error");
-                });
-            }
-        };
-        fruit_receiver
     }
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
     pub async fn search(&self, external_index_alias: &str, query: &proto::Query, collectors: &[proto::Collector]) -> SummaResult<Vec<proto::CollectorOutput>> {
+        let execution_strategy = self.core_config_holder.read().await.get().execution_strategy.clone();
         let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
@@ -399,7 +375,11 @@ impl IndexHolder {
         );
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        let mut multi_fruit = searcher.search_async(&parsed_query, &multi_collector).await?;
+        let mut multi_fruit = match execution_strategy {
+            ExecutionStrategy::Async => searcher.search_async(&parsed_query, &multi_collector).await?,
+            ExecutionStrategy::GlobalPool => searcher.search_with_executor(&parsed_query, &multi_collector, &Executor::GlobalPool)?,
+            ExecutionStrategy::SingleThread => searcher.search_with_executor(&parsed_query, &multi_collector, &Executor::SingleThread)?,
+        };
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
             &Context::current(),

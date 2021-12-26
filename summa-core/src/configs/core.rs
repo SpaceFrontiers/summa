@@ -6,15 +6,32 @@ use summa_proto::proto::IndexEngineConfig;
 
 use crate::errors::{BuilderError, SummaResult, ValidationError};
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStrategy {
+    Async,
+    GlobalPool,
+    SingleThread,
+}
+
+impl Default for ExecutionStrategy {
+    fn default() -> Self {
+        ExecutionStrategy::Async
+    }
+}
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
     #[serde(default = "HashMap::new")]
     pub aliases: HashMap<String, String>,
-    #[serde(default = "HashMap::new")]
-    pub indices: HashMap<String, IndexEngineConfig>,
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
+    #[builder(default = "ExecutionStrategy::Async")]
+    #[serde(default = "ExecutionStrategy::default")]
+    pub execution_strategy: ExecutionStrategy,
+    #[serde(default = "HashMap::new")]
+    pub indices: HashMap<String, IndexEngineConfig>,
     #[builder(default = "1024 * 1024 * 1024")]
     pub writer_heap_size_bytes: u64,
     #[builder(default = "1")]
@@ -25,8 +42,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             aliases: HashMap::new(),
-            indices: HashMap::new(),
             autocommit_interval_ms: None,
+            execution_strategy: ExecutionStrategy::Async,
+            indices: HashMap::new(),
             writer_heap_size_bytes: 1024 * 1024 * 1024,
             writer_threads: 1,
         }

@@ -8,7 +8,7 @@ use summa_proto::proto;
 use tokio::sync::RwLock;
 
 use super::IndexHolder;
-use crate::configs::ConfigProxy;
+use crate::configs::{ConfigProxy, DirectProxy};
 use crate::errors::{SummaResult, ValidationError};
 use crate::utils::sync::{Handler, OwningHandler};
 use crate::Error;
@@ -18,6 +18,15 @@ use crate::Error;
 pub struct IndexRegistry {
     core_config: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
     index_holders: Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>>,
+}
+
+impl Default for IndexRegistry {
+    fn default() -> Self {
+        IndexRegistry {
+            core_config: Arc::new(DirectProxy::default()),
+            index_holders: Arc::default(),
+        }
+    }
 }
 
 impl Debug for IndexRegistry {
@@ -33,6 +42,7 @@ impl IndexRegistry {
             index_holders: Arc::default(),
         }
     }
+
     /// Read-locked `HashMap` of all indices
     pub fn index_holders(&self) -> &Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>> {
         &self.index_holders
@@ -56,17 +66,16 @@ impl IndexRegistry {
     /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
     /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
     pub async fn get_index_holder(&self, index_alias: &str) -> SummaResult<Handler<IndexHolder>> {
-        Ok(self
-            .get_index_holder_by_name(
-                self.core_config
-                    .read()
-                    .await
-                    .get()
-                    .resolve_index_alias(index_alias)
-                    .as_deref()
-                    .unwrap_or(index_alias),
-            )
-            .await?)
+        self.get_index_holder_by_name(
+            self.core_config
+                .read()
+                .await
+                .get()
+                .resolve_index_alias(index_alias)
+                .as_deref()
+                .unwrap_or(index_alias),
+        )
+        .await
     }
 
     /// Retrieve `IndexHolder` by its name

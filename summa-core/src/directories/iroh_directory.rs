@@ -53,7 +53,7 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, 
     fn get_iroh_file_handle(&self, file_name: &Path) -> Result<IrohFile<T>, OpenReadError> {
         self.files
             .get(file_name)
-            .map(|file| IrohFile::new(file_name.to_path_buf(), file.clone(), self.resolver.clone()))
+            .map(|file| IrohFile::new(file.clone(), self.resolver.clone()))
             .ok_or_else(|| OpenReadError::FileDoesNotExist(file_name.to_path_buf()))
     }
 }
@@ -109,14 +109,13 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
 
 #[derive(Debug, Clone)]
 struct IrohFile<T: ContentLoader + Unpin + 'static> {
-    file_name: PathBuf,
     out: iroh_resolver::resolver::Out,
     resolver: Resolver<T>,
 }
 
 impl<T: ContentLoader + Unpin + 'static> IrohFile<T> {
-    pub fn new(file_name: PathBuf, out: iroh_resolver::resolver::Out, resolver: Resolver<T>) -> IrohFile<T> {
-        IrohFile { file_name, out, resolver }
+    pub fn new(out: iroh_resolver::resolver::Out, resolver: Resolver<T>) -> IrohFile<T> {
+        IrohFile { out, resolver }
     }
 
     fn pretty_reader(&self, end: Option<usize>) -> OutPrettyReader<T> {

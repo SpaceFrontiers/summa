@@ -20,6 +20,7 @@ pub struct CreateIndexRequest {
     pub blocksize: Option<usize>,
     #[builder(default = "None")]
     pub sort_by_field: Option<IndexSortByField>,
+    #[builder(default)]
     pub index_attributes: proto::IndexAttributes,
 }
 

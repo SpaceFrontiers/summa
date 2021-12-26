@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_broadcast::Receiver;
 use clap::{arg, command};
-use futures::try_join;
+use futures_util::future::try_join_all;
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, Instrument};
@@ -78,12 +78,12 @@ impl Server {
                             .build()
                             .map_err(summa_core::Error::from)?,
                     )
-                    .p2p(
+                    .p2p(Some(
                         crate::configs::p2p::ConfigBuilder::default()
                             .key_store_path(data_path.join("ks"))
                             .build()
                             .map_err(summa_core::Error::from)?,
-                    )
+                    ))
                     .store(
                         crate::configs::store::ConfigBuilder::default()
                             .path(data_path.join("store"))
@@ -118,16 +118,23 @@ impl Server {
     }
 
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        let p2p_future = P2p::new(&self.server_config).await?.start(terminator.clone()).await?;
-        let store_future = Store::new(&self.server_config).await?.start(terminator.clone()).await?;
+        let mut futures: Vec<Box<dyn Future<Output = SummaServerResult<()>> + Send>> = vec![];
+        if let Some(p2p_config) = self.server_config.read().await.get().p2p.clone() {
+            let p2p_future = P2p::new(p2p_config).await?.start(terminator.clone()).await?;
+            futures.push(Box::new(p2p_future))
+        }
+        futures.push(Box::new(Store::new(&self.server_config).await?.start(terminator.clone()).await?));
+
         let index_service = Index::new(&self.server_config).await?;
-        let metrics_server_future = Metrics::new(&self.server_config).await?.start(&index_service, terminator.clone()).await?;
-        let grpc_server_future = Grpc::new(&self.server_config, &index_service)?.start(terminator.clone()).await?;
+        futures.push(Box::new(
+            Metrics::new(&self.server_config).await?.start(&index_service, terminator.clone()).await?,
+        ));
+        futures.push(Box::new(Grpc::new(&self.server_config, &index_service)?.start(terminator.clone()).await?));
 
         Ok(async move {
             index_service.setup_index_holders().await?;
             info!(action = "indices_ready");
-            try_join!(metrics_server_future, grpc_server_future, p2p_future, store_future)?;
+            try_join_all(futures.into_iter().map(Box::into_pin)).await?;
             info!(action = "all_systems_down");
             Ok(())
         }
@@ -197,10 +204,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_application() -> SummaServerResult<()> {
+    async fn test_application() {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
-        let (thread_handler, mut index_api_client) = create_client_server(root_path.path()).await?;
+        let (thread_handler, mut index_api_client) = create_client_server(root_path.path()).await.unwrap();
 
         let schema = create_test_schema();
         let schema_str = serde_yaml::to_string(&schema).unwrap();
@@ -220,20 +227,19 @@ mod tests {
                 }),
             }
         );
-        thread_handler.stop().await??;
-        Ok(())
+        thread_handler.stop().await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn test_persistence() -> SummaServerResult<()> {
+    async fn test_persistence() {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
 
-        let (thread_handler_1, mut index_api_client_1) = create_client_server(root_path.path()).await?;
+        let (thread_handler_1, mut index_api_client_1) = create_client_server(root_path.path()).await.unwrap();
         assert!(create_default_index(&mut index_api_client_1).await.is_ok());
-        thread_handler_1.stop().await??;
+        thread_handler_1.stop().await.unwrap().unwrap();
 
-        let (thread_handler_2, mut index_api_client_2) = create_client_server(root_path.path()).await?;
+        let (thread_handler_2, mut index_api_client_2) = create_client_server(root_path.path()).await.unwrap();
         assert_eq!(
             index_api_client_2
                 .get_indices(tonic::Request::new(proto::GetIndicesRequest {}))
@@ -252,8 +258,6 @@ mod tests {
                 }]
             }
         );
-        thread_handler_2.stop().await??;
-
-        Ok(())
+        thread_handler_2.stop().await.unwrap().unwrap();
     }
 }
