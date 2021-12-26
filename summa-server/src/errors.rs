@@ -7,8 +7,6 @@ use tracing::warn;
 pub enum ValidationError {
     #[error("aliased_error: {0}")]
     Aliased(String),
-    #[error("empty_argument_error: {0}")]
-    EmptyArgument(String),
     #[error("existing_consumer_error: {0}")]
     ExistingConsumer(String),
     #[error("existing_index_error: {0}")]

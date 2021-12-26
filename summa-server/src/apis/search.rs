@@ -27,21 +27,17 @@ impl SearchApiImpl {
 impl proto::search_api_server::SearchApi for SearchApiImpl {
     async fn search(&self, proto_request: Request<proto::SearchRequest>) -> Result<Response<proto::SearchResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
-
-        let query = proto_request.query.unwrap_or(proto::Query {
-            query: Some(proto::query::Query::All(proto::AllQuery {})),
-        });
         let now = Instant::now();
-
-        let collector_outputs = index_holder
-            .search(&proto_request.index_alias, &query, &proto_request.collectors)
-            .instrument(info_span!("search", tags = ?proto_request.tags))
+        let tags = proto_request.tags.clone();
+        let collector_outputs = self
+            .index_service
+            .search(proto_request)
+            .instrument(info_span!("search", tags = ?tags))
             .await
             .map_err(crate::errors::Error::from)?;
+
         let elapsed_secs = now.elapsed().as_secs_f64();
         Ok(Response::new(proto::SearchResponse {
-            index_name: index_holder.index_name().to_owned(),
             collector_outputs,
             elapsed_secs,
         }))

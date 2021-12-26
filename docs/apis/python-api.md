@@ -21,16 +21,18 @@ async def main():
     # Collectors are described at https://izihawa.github.io/summa/core/collectors
     # Here we are requesting `TopDocs` collector with limit 10 that means 
     # that top-10 documents will be returned
-    results = await client.search({
-        'boolean': {'subqueries': [
-            {'occur': 'should', 'query': {'match': {'value': 'three'}}},
-            {'occur': 'should', 'query': {'match': {'value': 'dogs'}}},
-            {'occur': 'should', 'query': {
-                'boost': {'query': {'match': {'value': 'dog'}}, 'score': '0.65'}}
-            }]}
+    results = await client.search([{
+        'index_alias': 'books',
+        'query': {
+            'boolean': {'subqueries': [
+                {'occur': 'should', 'query': {'match': {'value': 'three'}}},
+                {'occur': 'should', 'query': {'match': {'value': 'dogs'}}},
+                {'occur': 'should', 'query': {
+                    'boost': {'query': {'match': {'value': 'dog'}}, 'score': '0.65'}}
+                }]}
         },
-        collectors=[{'top_docs': {'limit': 10}}],
-    )
+        'collectors': [{'top_docs': {'limit': 10}}]
+    }])
     return results
 
 asyncio.run(main())

@@ -10,6 +10,11 @@ service SearchApi {
 }
 
 message SearchRequest {
+  repeated IndexQuery index_queries = 1;
+  map<string, string> tags = 2;
+}
+
+message IndexQuery {
   // The index name or alias
   string index_alias = 1;
   // Query DSL. Use `MatchQuery` to pass a free-form query
@@ -17,6 +22,4 @@ message SearchRequest {
   // Every collector is responsible of processing and storing documents and/or their derivatives (like counters)
   // to return them to the caller
   repeated Collector collectors = 3;
-  // Extra fields used only for logging purposes
-  map<string, string> tags = 4;
 }

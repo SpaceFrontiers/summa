@@ -4,12 +4,10 @@ package summa.proto;
 import "utils.proto";
 
 message SearchResponse {
-  // The real index name got through alias resolution
-  string index_name = 1;
   // An array of collector outputs
-  repeated CollectorOutput collector_outputs = 2;
+  repeated CollectorOutput collector_outputs = 1;
   // Time spent inside of `search` handler
-  double elapsed_secs = 3;
+  double elapsed_secs = 2;
 }
 
 // Recursive query DSL

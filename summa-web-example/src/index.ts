@@ -1,6 +1,6 @@
 import * as Comlink from "comlink";
 
-import { WebIndexService } from "summa-wasm";
+import { ChunkedCacheConfig, RemoteEngineConfig, WebIndexService } from "summa-wasm";
 
 // IPFS hash of directory with the index of interest
 const ipfs_hash = "bafyb4ibkmzobsfgyjleeqiintntxehqarrpmipwpxrqrmvxgqlgxysdbiq";
@@ -28,20 +28,20 @@ const index_bg_wasm = new URL(
 await web_index_service_worker.setup(index_bg_wasm, 0)
 
 // `remote_engine_config` is a configuration object used for telling Summa how to reach remote index
-const remote_engine_config = {
-    method: "GET",
-    url_template: `${directory_url}{file_name}`,
-    headers_template: [{name: "range", value: "bytes={start}-{end}"}],
-}
-
+const remote_engine_config = new RemoteEngineConfig(
+    "GET",
+    `${directory_url}{file_name}`,
+    new Map([["range", "bytes={start}-{end}"]]),
+    new ChunkedCacheConfig(16 * 1024, 128 * 1024 * 1024)
+)
 // `index_payload` is the payload we have stored in index when have been publishing it
-const index_name = await web_index_service_worker.add({config: { remote: remote_engine_config}});
+const index_alias = await web_index_service_worker.add(remote_engine_config);
 const omnibox = document.getElementById("omnibox");
 
 omnibox.onkeydown = ((e) => {
     if(e.code == "Enter") {
         const index_query = {
-            index_name: index_name,
+            index_alias: index_alias,
             query: {query: {match: {value: (omnibox as HTMLInputElement).value}}},
             collectors: [{collector: {top_docs: {limit: 5}}}],
         }

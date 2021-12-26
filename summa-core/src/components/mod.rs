@@ -15,7 +15,7 @@ mod summa_tokenizer;
 pub use default_tokenizers::default_tokenizers;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor};
 pub use index_holder::IndexHolder;
-pub use index_registry::{IndexQuery, IndexRegistry};
+pub use index_registry::IndexRegistry;
 pub use index_writer_holder::{ComponentFile, IndexWriterHolder, SegmentComponent};
 #[cfg(feature = "ipfs")]
 pub use iroh_client::IrohClient;

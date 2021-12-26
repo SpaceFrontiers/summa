@@ -464,9 +464,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def search(
         self,
-        index_alias: str,
-        query: dict,
-        collectors: Union[dict, List[dict]],
+        index_queries: List[dict],
         tags: Optional[Dict[str, str]] = None,
         ignore_not_found: bool = False,
         request_id: Optional[str] = None,
@@ -475,29 +473,20 @@ class SummaClient(BaseGrpcClient):
         """Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
 
         Args:
-            index_alias: index alias
-            query: parsed `Query`
-            collectors: query_pb.Collector list
+            index_queries: index queries
             tags: extra dict for logging purposes
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id
         """
-        if isinstance(collectors, (Dict, query_pb.Collector)):
-            collectors = [collectors]
-
         try:
-            search_request = search_service_pb.SearchRequest(
-                index_alias=index_alias,
-                query=query,
-                tags=tags,
-            )
-            for collector in collectors:
-                if isinstance(collector, Dict):
-                    dict_collector = collector
-                    collector = query_pb.Collector()
-                    ParseDict(dict_collector, collector)
-                search_request.collectors.append(collector)
+            search_request = search_service_pb.SearchRequest(tags=tags)
+            for index_query in index_queries:
+                if isinstance(index_query, Dict):
+                    dict_index_query = index_query
+                    index_query = search_service_pb.IndexQuery()
+                    ParseDict(dict_index_query, index_query)
+                search_request.index_queries.append(index_query)
             return await self.stubs['search_api'].search(
                 search_request,
                 metadata=setup_metadata(session_id, request_id),

@@ -1,39 +1,72 @@
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use futures::future::join_all;
 use itertools::Itertools;
-use serde::{Deserialize, Serialize};
 use summa_proto::proto;
 use tokio::sync::RwLock;
 
 use super::IndexHolder;
+use crate::configs::ConfigProxy;
 use crate::errors::{SummaResult, ValidationError};
 use crate::utils::sync::{Handler, OwningHandler};
 use crate::Error;
 
-/// Packed query to a single index
-#[derive(Deserialize, Serialize)]
-pub struct IndexQuery {
-    index_name: String,
-    query: proto::Query,
-    collectors: Vec<proto::Collector>,
-}
-
 /// The main struct responsible for combining different indices and managing their lifetime.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone)]
 pub struct IndexRegistry {
+    core_config: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
     index_holders: Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>>,
 }
 
+impl Debug for IndexRegistry {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexRegistry").field("index_holders", &self.index_holders).finish()
+    }
+}
+
 impl IndexRegistry {
+    pub fn new(core_config: &Arc<dyn ConfigProxy<crate::configs::core::Config>>) -> IndexRegistry {
+        IndexRegistry {
+            core_config: core_config.clone(),
+            index_holders: Arc::default(),
+        }
+    }
     /// Read-locked `HashMap` of all indices
     pub fn index_holders(&self) -> &Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>> {
         &self.index_holders
     }
 
+    pub async fn index_holders_cloned(&self) -> HashMap<String, Handler<IndexHolder>> {
+        self.index_holders()
+            .read()
+            .await
+            .iter()
+            .map(|(index_name, handler)| (index_name.to_string(), handler.handler()))
+            .collect()
+    }
+
     pub async fn clear(self) {
         self.index_holders().write().await.clear();
+    }
+
+    /// Returns `Handler` to `IndexHolder`.
+    ///
+    /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
+    /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
+    pub async fn get_index_holder(&self, index_alias: &str) -> SummaResult<Handler<IndexHolder>> {
+        Ok(self
+            .get_index_holder_by_name(
+                self.core_config
+                    .read()
+                    .await
+                    .get()
+                    .resolve_index_alias(index_alias)
+                    .as_deref()
+                    .unwrap_or(index_alias),
+            )
+            .await?)
     }
 
     /// Retrieve `IndexHolder` by its name
@@ -61,16 +94,22 @@ impl IndexRegistry {
     }
 
     /// Searches in several indices simultaneously and merges results
-    pub async fn search(&self, index_queries: &[IndexQuery]) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let index_holders = self.index_holders().read().await;
+    pub async fn search(&self, index_queries: &[proto::IndexQuery]) -> SummaResult<Vec<proto::CollectorOutput>> {
         let futures = index_queries
             .iter()
             .map(|index_query| {
-                let index_holder = index_holders
-                    .get(&index_query.index_name)
-                    .ok_or_else(|| Error::Validation(Box::new(ValidationError::MissingIndex(index_query.index_name.to_owned()))))?
-                    .handler();
-                Ok(async move { index_holder.search(&index_query.index_name, &index_query.query, &index_query.collectors).await })
+                Ok(async move {
+                    let index_holder = self.get_index_holder(&index_query.index_alias).await?;
+                    index_holder
+                        .search(
+                            &index_query.index_alias,
+                            index_query.query.as_ref().unwrap_or_else(|| &proto::Query {
+                                query: Some(proto::query::Query::All(proto::AllQuery {})),
+                            }),
+                            &index_query.collectors,
+                        )
+                        .await
+                })
             })
             .collect::<SummaResult<Vec<_>>>()?;
         self.merge_responses(&join_all(futures).await.into_iter().collect::<SummaResult<Vec<_>>>()?)
@@ -78,6 +117,9 @@ impl IndexRegistry {
 
     /// Merges several `proto::CollectorOutput`
     fn merge_responses(&self, collectors_outputs: &[Vec<proto::CollectorOutput>]) -> SummaResult<Vec<proto::CollectorOutput>> {
+        if collectors_outputs.is_empty() {
+            return Err(Error::Validation(Box::new(ValidationError::EmptyArgument("collectors".to_string()))));
+        }
         let mut merged_response = vec![];
         for (ix, first_collector_output) in collectors_outputs[0].iter().enumerate() {
             merged_response.push(proto::CollectorOutput {

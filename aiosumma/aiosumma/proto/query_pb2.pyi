@@ -471,14 +471,12 @@ class Scorer(_message.Message):
     def __init__(self, eval_expr: _Optional[str] = ..., order_by: _Optional[str] = ...) -> None: ...
 
 class SearchResponse(_message.Message):
-    __slots__ = ["collector_outputs", "elapsed_secs", "index_name"]
+    __slots__ = ["collector_outputs", "elapsed_secs"]
     COLLECTOR_OUTPUTS_FIELD_NUMBER: _ClassVar[int]
     ELAPSED_SECS_FIELD_NUMBER: _ClassVar[int]
-    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     collector_outputs: _containers.RepeatedCompositeFieldContainer[CollectorOutput]
     elapsed_secs: float
-    index_name: str
-    def __init__(self, index_name: _Optional[str] = ..., collector_outputs: _Optional[_Iterable[_Union[CollectorOutput, _Mapping]]] = ..., elapsed_secs: _Optional[float] = ...) -> None: ...
+    def __init__(self, collector_outputs: _Optional[_Iterable[_Union[CollectorOutput, _Mapping]]] = ..., elapsed_secs: _Optional[float] = ...) -> None: ...
 
 class SingleMetricResult(_message.Message):
     __slots__ = ["value"]

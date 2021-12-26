@@ -8,13 +8,11 @@ use serde::{Deserialize, Serialize};
 use summa_core::configs::{ConfigProxy, DirectProxy, FileProxy, Loadable};
 use summa_core::errors::BuilderError;
 
-use crate::errors::{SummaServerResult, ValidationError};
+use crate::errors::SummaServerResult;
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
-    #[serde(default = "HashMap::new")]
-    pub aliases: HashMap<String, String>,
     #[builder(setter(custom))]
     pub data_path: PathBuf,
     pub debug: bool,
@@ -35,7 +33,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            aliases: HashMap::new(),
             data_path: PathBuf::new(),
             debug: true,
             grpc: crate::configs::grpc::Config::default(),
@@ -52,41 +49,6 @@ impl Default for Config {
 impl Config {
     pub fn get_path_for_index_data(&self, index_name: &str) -> PathBuf {
         self.data_path.join(index_name)
-    }
-
-    /// Copy aliases for the index
-    pub fn get_index_aliases_for_index(&self, index_name: &str) -> Vec<String> {
-        self.aliases
-            .iter()
-            .filter(|(_, v)| *v == index_name)
-            .map(|(k, _)| k.clone())
-            .collect::<Vec<String>>()
-    }
-
-    /// Find index by alias
-    pub fn resolve_index_alias(&self, alias: &str) -> Option<String> {
-        self.aliases.get(alias).cloned()
-    }
-
-    /// Set new alias for index
-    pub fn set_index_alias(&mut self, alias: &str, index_name: &str) -> SummaServerResult<Option<String>> {
-        if alias.is_empty() {
-            return Err(ValidationError::EmptyArgument("alias".to_owned()).into());
-        }
-        if index_name.is_empty() {
-            return Err(ValidationError::EmptyArgument("index_name".to_owned()).into());
-        }
-        if !self.core.indices.contains_key(index_name) {
-            return Err(ValidationError::MissingIndex(index_name.to_owned()).into());
-        }
-        Ok(self.aliases.insert(alias.to_owned(), index_name.to_owned()))
-    }
-
-    /// Delete all aliases listed in `index_aliases`
-    pub fn delete_index_aliases(&mut self, index_aliases: &Vec<String>) {
-        for alias in index_aliases {
-            self.aliases.remove(alias);
-        }
     }
 }
 

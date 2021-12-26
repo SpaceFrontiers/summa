@@ -79,7 +79,7 @@ impl Metrics {
         info!(path = ?request.uri().path());
         let response = match request.method() {
             &Method::GET => {
-                for index_holder in state.index_service.index_holders().read().await.values() {
+                for index_holder in state.index_service.index_registry().index_holders().read().await.values() {
                     state
                         .index_meter
                         .record_metrics(index_holder)

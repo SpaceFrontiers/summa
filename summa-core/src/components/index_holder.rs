@@ -144,7 +144,7 @@ async fn migrate_to_iroh(files: Vec<crate::components::ComponentFile>, delete_fi
 impl IndexHolder {
     /// Sets up `IndexHolder`
     pub fn create_holder(
-        core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
+        core_config_holder: &Arc<dyn ConfigProxy<crate::configs::core::Config>>,
         core_config: &crate::configs::core::Config,
         mut index: Index,
         index_name: Option<&str>,

@@ -20,6 +20,8 @@ pub enum ValidationError {
     InvalidHttpMethod(String),
     #[error("invalid_primary_key_type_error: {0:?}")]
     InvalidPrimaryKeyType(FieldType),
+    #[error("empty_argument_error: {0}")]
+    EmptyArgument(String),
     #[error("existing_path_error: {0}")]
     ExistingPath(PathBuf),
     #[error("missing_index_error: {0}")]

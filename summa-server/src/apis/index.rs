@@ -59,6 +59,7 @@ impl IndexApiImpl {
                 .read()
                 .await
                 .get()
+                .core
                 .get_index_aliases_for_index(index_holder.index_name()),
             index_name: index_holder.index_name().to_owned(),
             index_engine: Some(index_holder.index_engine_config().read().await.get().clone()),
@@ -199,7 +200,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
-        let index_holders = self.index_service.index_holders().read().await;
+        let index_holders = self.index_service.index_registry().index_holders().read().await;
         let mut indices = Vec::with_capacity(index_holders.len());
         for index_holder in index_holders.values() {
             indices.push(self.get_index_description(&index_holder.handler()).await)
@@ -209,7 +210,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {
         Ok(Response::new(proto::GetIndicesAliasesResponse {
-            indices_aliases: self.server_config.read().await.get().aliases.clone(),
+            indices_aliases: self.server_config.read().await.get().core.aliases.clone(),
         }))
     }
 
@@ -242,6 +243,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let mut server_config = self.server_config.write().await;
         let old_index_name = server_config
             .get_mut()
+            .core
             .set_index_alias(&proto_request.index_alias, &proto_request.index_name)
             .map_err(crate::errors::Error::from)?;
         server_config.commit().await.map_err(crate::errors::Error::from)?;

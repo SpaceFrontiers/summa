@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use summa_core::components::{IndexHolder, IndexQuery, IndexRegistry, SummaDocument};
-use summa_core::configs::DirectProxy;
+use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
+use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_proto::proto;
 use summa_proto::proto::{IndexAttributes, IndexEngineConfig, RemoteEngineConfig};
@@ -18,6 +18,7 @@ use crate::SERIALIZER;
 pub struct WebIndexRegistry {
     index_registry: IndexRegistry,
     multithreading: bool,
+    core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
 }
 
 #[wasm_bindgen]
@@ -25,15 +26,21 @@ impl WebIndexRegistry {
     #[wasm_bindgen(constructor)]
     pub fn new(multithreading: bool) -> WebIndexRegistry {
         console_error_panic_hook::set_once();
+        let core_config = summa_core::configs::core::ConfigBuilder::default()
+            .writer_threads(0)
+            .build()
+            .expect("cannot build");
+        let core_config = Arc::new(DirectProxy::new(core_config)) as Arc<dyn ConfigProxy<_>>;
         WebIndexRegistry {
-            index_registry: IndexRegistry::default(),
+            index_registry: IndexRegistry::new(&core_config),
             multithreading,
+            core_config,
         }
     }
 
     #[wasm_bindgen]
     pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
-        let index_queries: Vec<IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
+        let index_queries: Vec<proto::IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
         Ok(self.index_registry.search(&index_queries).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
@@ -47,21 +54,15 @@ impl WebIndexRegistry {
         let mut index =
             IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&remote_engine_config).await?;
         index.settings_mut().docstore_compress_dedicated_thread = false;
-
-        let core_config = summa_core::configs::core::ConfigBuilder::default()
-            .writer_threads(0)
-            .build()
-            .map_err(|e| Error::Core(e.into()))?;
-
         index.set_multithread_executor(match self.multithreading {
             true => Executor::GlobalPool,
             false => Executor::SingleThread,
         })?;
+        let core_config_value = self.core_config.read().await.get().clone();
 
-        let core_config_holder = Arc::new(DirectProxy::new(core_config.clone()));
         let index_holder = IndexHolder::create_holder(
-            core_config_holder,
-            &core_config,
+            &self.core_config,
+            &core_config_value,
             index,
             None,
             Arc::new(DirectProxy::new(IndexEngineConfig {

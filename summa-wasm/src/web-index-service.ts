@@ -3,11 +3,11 @@ import { RemoteEngineConfig } from "./configs";
 
 export type StatusCallback = (type: string, message: string) => void;
 export class IndexQuery {
-  index_name: string
+  index_alias: string
   query: Object;
   collectors: Object[];
-  constructor(index_name: string, query: Object, collectors: Object[]) {
-    this.index_name = index_name;
+  constructor(index_alias: string, query: Object, collectors: Object[]) {
+    this.index_alias = index_alias;
     this.query = query;
     this.collectors = collectors
   }

@@ -63,7 +63,10 @@ impl ChunkedCachingDirectory {
 
 impl Debug for ChunkedCachingDirectory {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "ChunkedCachingDirectory({:?})", self.underlying)
+        f.debug_struct("ChunkedCachingDirectory")
+            .field("chunk_size", &self.chunk_size)
+            .field("underlying", &self.underlying)
+            .finish()
     }
 }
 

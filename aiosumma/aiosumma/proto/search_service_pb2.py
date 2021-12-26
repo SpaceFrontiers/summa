@@ -14,7 +14,7 @@ _sym_db = _symbol_database.Default()
 from . import query_pb2 as query__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14search_service.proto\x12\x0bsumma.proto\x1a\x0bquery.proto\"\xd4\x01\n\rSearchRequest\x12\x13\n\x0bindex_alias\x18\x01 \x01(\t\x12!\n\x05query\x18\x02 \x01(\x0b\x32\x12.summa.proto.Query\x12*\n\ncollectors\x18\x03 \x03(\x0b\x32\x16.summa.proto.Collector\x12\x32\n\x04tags\x18\x04 \x03(\x0b\x32$.summa.proto.SearchRequest.TagsEntry\x1a+\n\tTagsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x32P\n\tSearchApi\x12\x43\n\x06search\x12\x1a.summa.proto.SearchRequest\x1a\x1b.summa.proto.SearchResponse\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14search_service.proto\x12\x0bsumma.proto\x1a\x0bquery.proto\"\xa0\x01\n\rSearchRequest\x12.\n\rindex_queries\x18\x01 \x03(\x0b\x32\x17.summa.proto.IndexQuery\x12\x32\n\x04tags\x18\x02 \x03(\x0b\x32$.summa.proto.SearchRequest.TagsEntry\x1a+\n\tTagsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"p\n\nIndexQuery\x12\x13\n\x0bindex_alias\x18\x01 \x01(\t\x12!\n\x05query\x18\x02 \x01(\x0b\x32\x12.summa.proto.Query\x12*\n\ncollectors\x18\x03 \x03(\x0b\x32\x16.summa.proto.Collector2P\n\tSearchApi\x12\x43\n\x06search\x12\x1a.summa.proto.SearchRequest\x1a\x1b.summa.proto.SearchResponse\"\x00\x62\x06proto3')
 
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, globals())
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'search_service_pb2', globals())
@@ -24,9 +24,11 @@ if _descriptor._USE_C_DESCRIPTORS == False:
   _SEARCHREQUEST_TAGSENTRY._options = None
   _SEARCHREQUEST_TAGSENTRY._serialized_options = b'8\001'
   _SEARCHREQUEST._serialized_start=51
-  _SEARCHREQUEST._serialized_end=263
-  _SEARCHREQUEST_TAGSENTRY._serialized_start=220
-  _SEARCHREQUEST_TAGSENTRY._serialized_end=263
-  _SEARCHAPI._serialized_start=265
-  _SEARCHAPI._serialized_end=345
+  _SEARCHREQUEST._serialized_end=211
+  _SEARCHREQUEST_TAGSENTRY._serialized_start=168
+  _SEARCHREQUEST_TAGSENTRY._serialized_end=211
+  _INDEXQUERY._serialized_start=213
+  _INDEXQUERY._serialized_end=325
+  _SEARCHAPI._serialized_start=327
+  _SEARCHAPI._serialized_end=407
 # @@protoc_insertion_point(module_scope)

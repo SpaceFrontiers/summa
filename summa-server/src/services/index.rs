@@ -64,19 +64,12 @@ fn default_chunked_cache_config() -> Option<proto::ChunkedCacheConfig> {
 
 /// The main entry point for managing Summa indices
 impl Index {
-    /// `HashMap` of all indices
-    pub fn index_holders(&self) -> &Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>> {
-        self.index_registry.index_holders()
+    pub fn index_registry(&self) -> &IndexRegistry {
+        &self.index_registry
     }
 
-    pub async fn index_holders_cloned(&self) -> HashMap<String, Handler<IndexHolder>> {
-        self.index_registry
-            .index_holders()
-            .read()
-            .await
-            .iter()
-            .map(|(index_name, handler)| (index_name.to_string(), handler.handler()))
-            .collect()
+    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Handler<IndexHolder>> {
+        Ok(self.index_registry.get_index_holder(index_alias).await?)
     }
 
     /// Returns `ConsumerManager`
@@ -94,31 +87,17 @@ impl Index {
         self.should_terminate.load(Ordering::Relaxed)
     }
 
-    /// Returns `Handler` to `IndexHolder`.
-    ///
-    /// It is safe to keep `Handler<IndexHolder>` cause `Index` won't be deleted until `Handler` is alive.
-    /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
-    pub async fn get_index_holder(&self, index_alias: &str) -> SummaServerResult<Handler<IndexHolder>> {
-        Ok(self
-            .index_registry
-            .get_index_holder_by_name(
-                self.server_config
-                    .read()
-                    .await
-                    .get()
-                    .resolve_index_alias(index_alias)
-                    .as_deref()
-                    .unwrap_or(index_alias),
-            )
-            .await?)
-    }
-
     /// Creates new `IndexService` with `ConfigHolder`
     pub async fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<Index> {
         let config = server_config_holder.read().await.get().clone();
+        let core_config_holder = Arc::new(PartialProxy::new(
+            server_config_holder,
+            |server_config| &server_config.core,
+            |server_config| &mut server_config.core,
+        )) as Arc<dyn ConfigProxy<_>>;
         Ok(Index {
             server_config: server_config_holder.clone(),
-            index_registry: IndexRegistry::default(),
+            index_registry: IndexRegistry::new(&core_config_holder),
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
             autocommit_thread: Arc::default(),
@@ -168,7 +147,7 @@ impl Index {
             let core_config = self.server_config.read().await.get().core.clone();
             let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
             let index_holder = tokio::task::spawn_blocking(move || {
-                IndexHolder::create_holder(core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder)
+                IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder)
             })
             .await
             .unwrap()?;
@@ -178,7 +157,7 @@ impl Index {
         *self.index_registry.index_holders().write().await = index_holders;
 
         for (consumer_name, consumer_config) in self.server_config.read().await.get().consumers.iter() {
-            let index_holder = self.get_index_holder(&consumer_config.index_name).await?;
+            let index_holder = self.index_registry.get_index_holder(&consumer_config.index_name).await?;
             let prepared_consumption = PreparedConsumption::from_config(consumer_name, consumer_config)?;
             self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         }
@@ -211,7 +190,7 @@ impl Index {
         Ok(self
             .index_registry
             .add(IndexHolder::create_holder(
-                core_config_holder,
+                &core_config_holder,
                 &core_config,
                 index,
                 Some(index_name),
@@ -299,7 +278,7 @@ impl Index {
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
         let index_holder = {
             let mut server_config = self.server_config.write().await;
-            let aliases = server_config.get().get_index_aliases_for_index(&delete_index_request.index_name);
+            let aliases = server_config.get().core.get_index_aliases_for_index(&delete_index_request.index_name);
             match (
                 self.index_registry
                     .index_holders()
@@ -354,7 +333,10 @@ impl Index {
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?create_consumer_request.consumer_name))]
     pub async fn create_consumer(&self, create_consumer_request: &CreateConsumerRequest) -> SummaServerResult<String> {
-        let index_holder = self.get_index_holder(&create_consumer_request.consumer_config.index_name).await?;
+        let index_holder = self
+            .index_registry
+            .get_index_holder(&create_consumer_request.consumer_config.index_name)
+            .await?;
         let prepared_consumption = PreparedConsumption::from_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?;
         prepared_consumption.on_create().await?;
         self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
@@ -462,7 +444,7 @@ impl Index {
                         tokio::select! {
                             _ = tick_task.tick() => {
                                 info!(action = "autocommit_thread_tick");
-                                let index_holders = index_service.index_holders_cloned().await;
+                                let index_holders = index_service.index_registry.index_holders_cloned().await;
                                 for index_holder in index_holders.into_values() {
                                     let result = index_service.try_commit_and_restart_consumption(&index_holder).await;
                                     if let Err(error) = result {
@@ -517,7 +499,7 @@ impl Index {
 
     #[instrument(skip(self))]
     pub async fn migrate_index(&self, migrate_index_request: proto::MigrateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_holder = self.get_index_holder(&migrate_index_request.source_index_name).await?;
+        let index_holder = self.index_registry.get_index_holder(&migrate_index_request.source_index_name).await?;
         let prepared_consumption = self.commit(&index_holder).await?;
         let source_index_engine_config = index_holder.index_engine_config().read().await.get().clone();
 
@@ -556,6 +538,10 @@ impl Index {
             self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         }
         Ok(index_holder)
+    }
+
+    pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
+        Ok(self.index_registry.search(&search_request.index_queries).await?)
     }
 }
 

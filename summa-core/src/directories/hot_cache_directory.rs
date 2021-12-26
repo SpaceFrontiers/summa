@@ -374,12 +374,7 @@ struct InnerHotDirectory {
 
 impl Debug for HotDirectory {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "HotDirectory(dir={:?}, cache={:?})",
-            self.inner.underlying.as_ref(),
-            self.inner.cache.as_ref()
-        )
+        f.debug_struct("HotDirectory").field("underlying", &self.inner.underlying).finish()
     }
 }
 
