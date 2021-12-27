@@ -126,8 +126,10 @@ impl Metrics {
         });
 
         Ok(async move {
-            let result = graceful.await;
-            info!(action = "terminated", result = ?result);
+            match graceful.await {
+                Ok(_) => info!(action = "terminated"),
+                Err(e) => info!(action = "terminated", error = ?e),
+            }
             Ok(())
         }
         .instrument(info_span!(parent: None, "lifecycle")))

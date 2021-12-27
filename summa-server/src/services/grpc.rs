@@ -114,8 +114,10 @@ impl Grpc {
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     let signal_result = terminator.recv().await;
                     info!(action = "sigterm_received", received = ?signal_result);
-                    let service_result = self.index_service.stop(false).await;
-                    info!(action = "terminated", result = ?service_result);
+                    match self.index_service.stop(false).await {
+                        Ok(_) => info!(action = "terminated"),
+                        Err(e) => info!(action = "terminated", error = ?e),
+                    }
                 })
                 .instrument(info_span!(parent: None, "lifecycle"))
                 .await?;

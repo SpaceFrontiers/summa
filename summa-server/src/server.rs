@@ -1,10 +1,13 @@
 use std::future::Future;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_broadcast::Receiver;
 use clap::{arg, command};
 use futures_util::future::try_join_all;
+use iroh_unixfs::content_loader::GatewayUrl;
+use summa_core::components::IrohClient;
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, Instrument};
@@ -12,6 +15,7 @@ use tracing::{info, info_span, Instrument};
 use crate::configs::server::ConfigHolder;
 use crate::errors::{Error, SummaServerResult};
 use crate::logging;
+use crate::services::gateway::Gateway;
 use crate::services::store::Store;
 use crate::services::{Grpc, Index, Metrics, P2p};
 use crate::utils::signal_channel;
@@ -119,13 +123,39 @@ impl Server {
 
     pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let mut futures: Vec<Box<dyn Future<Output = SummaServerResult<()>> + Send>> = vec![];
-        if let Some(p2p_config) = self.server_config.read().await.get().p2p.clone() {
-            let p2p_future = P2p::new(p2p_config).await?.start(terminator.clone()).await?;
-            futures.push(Box::new(p2p_future))
-        }
-        futures.push(Box::new(Store::new(&self.server_config).await?.start(terminator.clone()).await?));
+        let mut iroh_config = iroh_rpc_client::Config::default_network();
 
-        let index_service = Index::new(&self.server_config).await?;
+        if let Some(p2p_config) = self.server_config.read().await.get().p2p.clone() {
+            let p2p = P2p::new(p2p_config).await?;
+            iroh_config.p2p_addr = Some(p2p.rpc_addr().clone());
+            let p2p_future = p2p.start(terminator.clone()).await?;
+            futures.push(Box::new(p2p_future));
+        }
+        let store = Store::new(&self.server_config).await?;
+        iroh_config.store_addr = Some(store.rpc_addr().clone());
+        futures.push(Box::new(store.start(terminator.clone()).await?));
+
+        let iroh_client = IrohClient::new(
+            self.server_config
+                .read()
+                .await
+                .get()
+                .p2p
+                .as_ref()
+                .map(|p2p| p2p.http_gateways.iter().map(|x| GatewayUrl::from_str(x)).collect::<Result<_, _>>())
+                .transpose()?
+                .unwrap_or_default(),
+            iroh_config.clone(),
+        )
+        .await?;
+
+        futures.push(Box::new(
+            Gateway::new(self.server_config.read().await.get().gateway.clone(), &iroh_client)
+                .await?
+                .start(terminator.clone())
+                .await?,
+        ));
+        let index_service = Index::new(&self.server_config, iroh_client).await?;
         futures.push(Box::new(
             Metrics::new(&self.server_config).await?.start(&index_service, terminator.clone()).await?,
         ));

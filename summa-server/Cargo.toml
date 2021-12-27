@@ -45,9 +45,12 @@ futures = "0.3"
 futures-util = "0.3"
 hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
 iroh-api = { workspace = true }
+iroh-gateway = { workspace = true }
 iroh-metrics = { workspace = true }
 iroh-p2p = { workspace = true }
+iroh-resolver = { workspace = true }
 iroh-rpc-client = { workspace = true }
+iroh-rpc-types = { workspace = true }
 iroh-store = { workspace = true }
 iroh-unixfs = { workspace = true }
 itertools = "0.10"

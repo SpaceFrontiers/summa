@@ -13,7 +13,7 @@ const ENV_FILTER: &str = "librdkafka=info,\
     summa_core::components=info,\
     summa_server::services=info,\
     summa_server::components=info,\
-    summa_server::servers[lifecycle]=info,\
+    summa_server::server[lifecycle]=info,\
     tantivy=info,\
     fastfield_codecs=info,\
     warn";

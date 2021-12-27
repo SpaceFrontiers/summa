@@ -1,11 +1,9 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh_unixfs::content_loader::GatewayUrl;
 use summa_core::components::{IndexHolder, IndexRegistry, IrohClient};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
@@ -88,8 +86,7 @@ impl Index {
     }
 
     /// Creates new `IndexService` with `ConfigHolder`
-    pub async fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<Index> {
-        let config = server_config_holder.read().await.get().clone();
+    pub async fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, iroh_client: IrohClient) -> SummaServerResult<Index> {
         let core_config_holder = Arc::new(PartialProxy::new(
             server_config_holder,
             |server_config| &server_config.core,
@@ -101,14 +98,7 @@ impl Index {
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
             autocommit_thread: Arc::default(),
-            iroh_client: IrohClient::new(
-                config
-                    .p2p
-                    .map(|p2p| p2p.http_gateways.into_iter().map(|x| GatewayUrl::from_str(&x)).collect::<Result<_, _>>())
-                    .transpose()?
-                    .unwrap_or_default(),
-            )
-            .await?,
+            iroh_client,
         })
     }
 

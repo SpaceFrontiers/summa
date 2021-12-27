@@ -14,5 +14,6 @@ iroh-metrics = { git = "https://github.com/izihawa/iroh", branch = "feature/summ
 iroh-p2p = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-resolver = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-rpc-client = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
+iroh-rpc-types = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-store = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-unixfs = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
