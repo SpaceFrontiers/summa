@@ -17,7 +17,6 @@ use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
 use opentelemetry::sdk::metrics::{aggregators, controllers, processors};
 use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
-use summa_core::configs::ConfigProxy;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument};
 use tracing_futures::Instrument;
@@ -61,11 +60,11 @@ impl AggregatorSelector for CustomAgg {
 }
 
 impl Metrics {
-    pub async fn new(config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<Metrics> {
+    pub fn new(config: &crate::configs::metrics::Config) -> SummaServerResult<Metrics> {
         let controller = controllers::basic(processors::factory(CustomAgg, aggregation::cumulative_temporality_selector()).with_memory(true)).build();
         let exporter = opentelemetry_prometheus::exporter(controller).init();
         Ok(Metrics {
-            config: config.read().await.get().metrics.clone(),
+            config: config.clone(),
             exporter,
         })
     }
@@ -104,7 +103,7 @@ impl Metrics {
 
     #[instrument("lifecycle", skip_all)]
     pub async fn start(
-        self,
+        &self,
         index_service: &Index,
         mut terminator: Receiver<ControlMessage>,
     ) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {

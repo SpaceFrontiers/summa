@@ -29,7 +29,6 @@ use crate::configs::core::ExecutionStrategy;
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
-use crate::Error;
 
 pub struct IndexHolder {
     core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
@@ -107,38 +106,6 @@ fn wrap_with_caches<D: Directory>(
         Some(static_cache) => Box::new(HotDirectory::open(next_directory, static_cache)?),
         None => next_directory,
     })
-}
-
-#[cfg(feature = "ipfs")]
-async fn migrate_to_iroh(files: Vec<crate::components::ComponentFile>, delete_files: bool) -> SummaResult<String> {
-    info!(files = ?files);
-    let iroh = iroh_api::Api::new(iroh_api::Config::default()).await?;
-    let mut entries = vec![];
-    for file in files.iter() {
-        entries.push(iroh_unixfs::builder::Entry::File(
-            iroh_unixfs::builder::FileBuilder::new()
-                .name(file.path().file_name().expect("should have name").to_string_lossy().to_string())
-                .chunker(iroh_unixfs::chunker::Chunker::Fixed(iroh_unixfs::chunker::Fixed { chunk_size: 1024 * 1024 }))
-                .content_reader(tokio::fs::File::open(file.path()).await?)
-                .build()
-                .await
-                .map_err(|e| Error::External(e.to_string()))?,
-        ))
-    }
-    let cid = iroh
-        .add(iroh_api::UnixfsEntry::Directory(iroh_unixfs::builder::Directory::basic(
-            "".to_string(),
-            entries,
-        )))
-        .await
-        .map_err(|e| Error::External(e.to_string()))?
-        .to_string();
-    if delete_files {
-        for file in files.iter() {
-            tokio::fs::remove_file(file.path()).await?;
-        }
-    }
-    Ok(cid)
 }
 
 impl IndexHolder {
@@ -246,20 +213,23 @@ impl IndexHolder {
     /// Attaches index and sets it up via `setup`
     #[cfg(feature = "ipfs")]
     #[instrument(skip_all)]
-    pub async fn attach_ipfs_index(ipfs_engine_config: &proto::IpfsEngineConfig, iroh_client: &crate::components::IrohClient) -> SummaResult<Index> {
+    pub async fn attach_ipfs_index(
+        ipfs_engine_config: &proto::IpfsEngineConfig,
+        content_loader: &iroh_unixfs::content_loader::FullLoader,
+    ) -> SummaResult<Index> {
         let index_path = std::path::Path::new(&ipfs_engine_config.path);
         if !index_path.exists() {
             tokio::fs::create_dir_all(index_path).await?;
         }
         let mmap_directory = tantivy::directory::MmapDirectory::open(index_path)?;
-        let iroh_directory = crate::directories::IrohDirectory::new(mmap_directory, iroh_client.content_loader().clone(), &ipfs_engine_config.cid).await?;
+        let iroh_directory = crate::directories::IrohDirectory::new(mmap_directory, content_loader.clone(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok(),
             Err(_) => None,
         };
         let index = tokio::task::spawn_blocking(move || {
-            Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
+            Ok::<Index, crate::Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
         })
         .await??;
         info!(action = "attached", index = ?index);
@@ -349,7 +319,7 @@ impl IndexHolder {
             Some(proto::index_engine_config::Config::File(ref config)) => {
                 tokio::fs::remove_dir_all(&config.path)
                     .await
-                    .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
+                    .map_err(|e| crate::Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
             }
             _ => (),
         };
@@ -438,31 +408,5 @@ impl IndexHolder {
             }
         }
         (success_docs, failed_docs)
-    }
-
-    #[cfg(feature = "ipfs")]
-    pub async fn migrate_to_iroh<P: AsRef<std::path::Path>>(&self, index_path: P, delete_files: bool) -> SummaResult<String> {
-        self.index_writer_holder()
-            .write()
-            .await
-            .lock_files(index_path, |files: Vec<crate::components::ComponentFile>| migrate_to_iroh(files, delete_files))
-            .await
-    }
-
-    /// Commits index
-    #[instrument(skip(self))]
-    pub async fn commit(&self, payload: Option<String>) -> SummaResult<()> {
-        let mut index_writer_holder = self.index_writer_holder.write().await;
-        index_writer_holder.commit(payload).await?;
-        #[cfg(feature = "ipfs")]
-        {
-            let mut index_engine_config = self.index_engine_config().write().await;
-            if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
-                let cid = self.migrate_to_iroh(&ipfs_engine_config.path, true).await?;
-                ipfs_engine_config.cid = cid;
-                index_engine_config.commit().await?;
-            }
-        }
-        Ok(())
     }
 }

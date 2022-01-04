@@ -19,7 +19,7 @@ pub struct Config {
     pub grpc: crate::configs::grpc::Config,
     pub p2p: Option<crate::configs::p2p::Config>,
     pub store: crate::configs::store::Config,
-    pub gateway: crate::configs::gateway::Config,
+    pub gateway: Option<crate::configs::gateway::Config>,
     #[builder(setter(custom))]
     pub log_path: PathBuf,
     pub metrics: crate::configs::metrics::Config,
@@ -39,7 +39,7 @@ impl Default for Config {
             grpc: crate::configs::grpc::Config::default(),
             p2p: Some(crate::configs::p2p::Config::default()),
             store: crate::configs::store::Config::default(),
-            gateway: crate::configs::gateway::Config::default(),
+            gateway: Some(crate::configs::gateway::Config::default()),
             log_path: PathBuf::new(),
             metrics: crate::configs::metrics::Config::default(),
             consumers: HashMap::new(),
@@ -121,6 +121,7 @@ pub mod tests {
                     .expect("cannot create store config"),
             )
             .p2p(None)
+            .gateway(None)
             .build()
             .expect("cannot create server config")
     }

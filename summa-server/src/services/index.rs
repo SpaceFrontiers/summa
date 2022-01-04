@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use summa_core::components::{IndexHolder, IndexRegistry, IrohClient};
+use summa_core::components::{IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
@@ -29,7 +29,7 @@ pub struct Index {
     consumer_manager: Arc<RwLock<ConsumerManager>>,
     should_terminate: Arc<AtomicBool>,
     autocommit_thread: Arc<RwLock<Option<ThreadHandler<SummaServerResult<()>>>>>,
-    iroh_client: IrohClient,
+    store_service: crate::services::Store,
 }
 
 #[derive(Default)]
@@ -86,7 +86,10 @@ impl Index {
     }
 
     /// Creates new `IndexService` with `ConfigHolder`
-    pub async fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, iroh_client: IrohClient) -> SummaServerResult<Index> {
+    pub async fn new(
+        server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>,
+        store_service: crate::services::Store,
+    ) -> SummaServerResult<Index> {
         let core_config_holder = Arc::new(PartialProxy::new(
             server_config_holder,
             |server_config| &server_config.core,
@@ -98,7 +101,7 @@ impl Index {
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
             autocommit_thread: Arc::default(),
-            iroh_client,
+            store_service,
         })
     }
 
@@ -211,7 +214,7 @@ impl Index {
                     chunked_cache_config: default_chunked_cache_config(),
                     path: index_path.to_string_lossy().to_string(),
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, &self.iroh_client).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader()).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
                 };
@@ -355,7 +358,7 @@ impl Index {
     }
 
     /// Stopping index holders
-    pub async fn stop(self, force: bool) -> SummaServerResult<()> {
+    pub async fn stop(&self, force: bool) -> SummaServerResult<()> {
         self.should_terminate.store(true, Ordering::Relaxed);
         if !force {
             self.consumer_manager.write().await.stop().await?;
@@ -390,11 +393,28 @@ impl Index {
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        index_holder.index_writer_holder().write().await.commit(None).await?;
-        Ok(match stopped_consumption {
+        index_holder.index_writer_holder().write().await.commit().await?;
+        let prepared_consumption = match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
-        })
+        };
+        let mut index_engine_config = index_holder.index_engine_config().write().await;
+        if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
+            let cid = index_holder
+                .index_writer_holder()
+                .write()
+                .await
+                .lock_files(&ipfs_engine_config.path, |files: Vec<summa_core::components::ComponentFile>| async move {
+                    self.store_service
+                        .put(files, true)
+                        .await
+                        .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
+                })
+                .await?;
+            ipfs_engine_config.cid = cid;
+            index_engine_config.commit().await?;
+        }
+        Ok(prepared_consumption)
     }
 
     /// Commits immediately or returns all without restarting consuming threads
@@ -402,7 +422,7 @@ impl Index {
     pub async fn try_commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let mut index_writer = index_holder.index_writer_holder().try_write()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        index_writer.commit(None).await?;
+        index_writer.commit().await?;
         Ok(match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
@@ -475,7 +495,7 @@ impl Index {
             Some(proto::index_engine_config::Config::Remote(config)) => {
                 IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config).await?
             }
-            Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(config, &self.iroh_client).await?,
+            Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(config, self.store_service.content_loader()).await?,
             _ => unimplemented!(),
         };
         info!(action = "from_config", index = ?index);
@@ -494,7 +514,17 @@ impl Index {
         ) {
             // File to IPFS
             (proto::index_engine_config::Config::File(file_engine_config), Some(proto::CreateIndexEngineRequest::Ipfs)) => {
-                let cid = index_holder.migrate_to_iroh(&file_engine_config.path, false).await?;
+                let cid = index_holder
+                    .index_writer_holder()
+                    .write()
+                    .await
+                    .lock_files(&file_engine_config.path, |files: Vec<summa_core::components::ComponentFile>| async move {
+                        self.store_service
+                            .put(files, false)
+                            .await
+                            .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
+                    })
+                    .await?;
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid,
                     chunked_cache_config: default_chunked_cache_config(),
@@ -507,7 +537,7 @@ impl Index {
                         .to_string_lossy()
                         .to_string(),
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, &self.iroh_client).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader()).await?;
                 self.insert_index(
                     &migrate_index_request.target_index_name,
                     index,
@@ -547,8 +577,26 @@ pub(crate) mod tests {
     use crate::logging;
     use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
 
+    pub async fn create_test_store_service(data_path: &Path) -> crate::services::Store {
+        let iroh_config = iroh_rpc_client::Config::default_network();
+        let iroh_rpc_client = iroh_rpc_client::Client::new(iroh_config.clone()).await.unwrap();
+        let content_loader = iroh_unixfs::content_loader::FullLoader::new(
+            iroh_rpc_client,
+            iroh_unixfs::content_loader::FullLoaderConfig {
+                http_gateways: vec![],
+                indexer: None,
+            },
+        )
+        .unwrap();
+        let mut config = crate::configs::store::Config::default();
+        config.path = data_path.join("store").to_path_buf();
+        crate::services::Store::new(config, content_loader).await.unwrap()
+    }
+
     pub async fn create_test_index_service(data_path: &Path) -> Index {
-        Index::new(&create_test_server_config_holder(&data_path)).await.unwrap()
+        Index::new(&create_test_server_config_holder(&data_path), create_test_store_service(data_path).await)
+            .await
+            .unwrap()
     }
     pub async fn create_test_index_holder(index_service: &Index, schema: &Schema) -> SummaServerResult<Handler<IndexHolder>> {
         index_service
@@ -595,7 +643,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_same_name_index() -> SummaServerResult<()> {
         logging::tests::initialize_default_once();
-        let index_service = Index::new(&(Arc::new(DirectProxy::default()) as Arc<dyn ConfigProxy<_>>)).await?;
+        let root_path = tempdir::TempDir::new("summa_test").unwrap();
+        let data_path = root_path.path().join("data");
+        let index_service = Index::new(
+            &(Arc::new(DirectProxy::default()) as Arc<dyn ConfigProxy<_>>),
+            create_test_store_service(&data_path).await,
+        )
+        .await?;
         assert!(index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -627,9 +681,10 @@ pub(crate) mod tests {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
         let data_path = root_path.path().join("data");
+
         let server_config_holder = create_test_server_config_holder(&data_path);
 
-        let index_service = Index::new(&server_config_holder).await?;
+        let index_service = Index::new(&server_config_holder, create_test_store_service(&data_path).await).await?;
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -681,7 +736,7 @@ pub(crate) mod tests {
             Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
             schema.get_field("issued_at").unwrap() => 1652986134i64
         ))).await?;
-        index_holder.index_writer_holder().write().await.commit(None).await?;
+        index_holder.index_writer_holder().write().await.commit().await?;
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)]).await?,
@@ -734,7 +789,7 @@ pub(crate) mod tests {
                 schema.get_field("issued_at").unwrap() => 110i64
             )))
             .await?;
-        index_holder.index_writer_holder().write().await.commit(None).await?;
+        index_holder.index_writer_holder().write().await.commit().await?;
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder

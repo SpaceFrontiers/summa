@@ -29,7 +29,7 @@ use crate::services::Index;
 
 /// GRPC server exposing [API](crate::apis)
 pub struct Grpc {
-    server_config: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
+    server_config_holder: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
     index_service: Index,
 }
 
@@ -59,26 +59,27 @@ impl Grpc {
     }
 
     /// New GRPC server
-    pub fn new(server_config: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, index_service: &Index) -> SummaServerResult<Grpc> {
+    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, index_service: &Index) -> SummaServerResult<Grpc> {
         Ok(Grpc {
-            server_config: server_config.clone(),
+            server_config_holder: server_config_holder.clone(),
             index_service: index_service.clone(),
         })
     }
 
     /// Starts all nested services and start serving requests
     #[instrument("lifecycle", skip_all)]
-    pub async fn start(self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        let consumer_api = ConsumerApiImpl::new(&self.index_service)?;
-        let index_api = IndexApiImpl::new(&self.server_config, &self.index_service)?;
-        let reflection_api = ReflectionApiImpl::new(&self.index_service)?;
-        let search_api = SearchApiImpl::new(&self.index_service)?;
+    pub async fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+        let index_service = self.index_service.clone();
+        let consumer_api = ConsumerApiImpl::new(&index_service)?;
+        let index_api = IndexApiImpl::new(&self.server_config_holder, &index_service)?;
+        let reflection_api = ReflectionApiImpl::new(&index_service)?;
+        let search_api = SearchApiImpl::new(&index_service)?;
         let grpc_reflection_service = tonic_reflection::server::Builder::configure()
             .include_reflection_service(false)
             .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
             .build()
             .expect("cannot build grpc server");
-        let grpc_config = self.server_config.read().await.get().grpc.clone();
+        let grpc_config = self.server_config_holder.read().await.get().grpc.clone();
 
         let layer = ServiceBuilder::new()
             .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("request-id"), |_: &_| {
@@ -114,7 +115,7 @@ impl Grpc {
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     let signal_result = terminator.recv().await;
                     info!(action = "sigterm_received", received = ?signal_result);
-                    match self.index_service.stop(false).await {
+                    match index_service.stop(false).await {
                         Ok(_) => info!(action = "terminated"),
                         Err(e) => info!(action = "terminated", error = ?e),
                     }

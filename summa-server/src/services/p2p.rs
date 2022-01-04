@@ -10,14 +10,13 @@ use crate::errors::SummaServerResult;
 
 pub struct P2p {
     config: crate::configs::p2p::Config,
-    node: Node<DiskStorage>,
     rpc_addr: P2pAddr,
+    libp2p_config: Libp2pConfig,
 }
 
 impl P2p {
     pub async fn new(config: crate::configs::p2p::Config) -> SummaServerResult<P2p> {
         tokio::fs::create_dir_all(&config.key_store_path).await?;
-        let key_chain = Keychain::<DiskStorage>::new(config.key_store_path.clone()).await?;
         let rpc_addr: P2pAddr = config.endpoint.parse()?;
 
         let bootstrap_peers = config
@@ -27,24 +26,14 @@ impl P2p {
             .iter()
             .map(|node| node.parse().expect("incorrect bootstrap node"))
             .collect();
-        let mut libp2p = Libp2pConfig::default();
-        libp2p.bootstrap_peers = bootstrap_peers;
-        libp2p.gossipsub = false;
-        libp2p.max_conns_out = 256;
+        let mut libp2p_config = Libp2pConfig::default();
+        libp2p_config.bootstrap_peers = bootstrap_peers;
+        libp2p_config.gossipsub = false;
+        libp2p_config.max_conns_out = 256;
         Ok(P2p {
             config: config.clone(),
-            node: Node::new(
-                iroh_p2p::Config {
-                    libp2p,
-                    rpc_client: iroh_rpc_client::Config::default_network(),
-                    metrics: iroh_metrics::config::Config::default(),
-                    key_store_path: config.key_store_path,
-                },
-                rpc_addr.clone(),
-                key_chain,
-            )
-            .await?,
             rpc_addr,
+            libp2p_config,
         })
     }
 
@@ -53,9 +42,20 @@ impl P2p {
     }
 
     #[instrument("lifecycle", skip_all)]
-    pub async fn start(mut self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        info!(action = "p2p", local_peer_id = ?self.node.local_peer_id(), listen_addrs = ?self.node.listen_addrs());
-        let p2p_task = tokio::task::spawn(async move { self.node.run().await });
+    pub async fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+        let key_chain = Keychain::<DiskStorage>::new(self.config.key_store_path.clone()).await?;
+        let mut node = Node::new(
+            iroh_p2p::Config {
+                libp2p: self.libp2p_config.clone(),
+                rpc_client: iroh_rpc_client::Config::default_network(),
+                key_store_path: self.config.key_store_path.clone(),
+            },
+            self.rpc_addr.clone(),
+            key_chain,
+        )
+        .await?;
+        info!(action = "p2p", local_peer_id = ?node.local_peer_id(), listen_addrs = ?node.listen_addrs());
+        let p2p_task = tokio::task::spawn(async move { node.run().await });
         info!(action = "binded", endpoint = ?self.config.endpoint);
         Ok(async move {
             let signal_result = terminator.recv().await;

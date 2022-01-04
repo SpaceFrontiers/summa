@@ -101,7 +101,7 @@ impl IndexWriterImpl {
             IndexWriterImpl::Threaded(writer) => Ok(writer.merge_with_attributes(segment_ids, segment_attributes).await?),
         }
     }
-    pub async fn commit(&mut self, payload: Option<String>) -> SummaResult<()> {
+    pub async fn commit(&mut self) -> SummaResult<()> {
         match self {
             IndexWriterImpl::Single(writer) => {
                 let index = writer.index.clone();
@@ -115,11 +115,7 @@ impl IndexWriterImpl {
             }
             IndexWriterImpl::Threaded(writer) => {
                 info!(action = "commit_index");
-                let mut prepared_commit = writer.prepare_commit()?;
-                if let Some(payload) = payload {
-                    prepared_commit.set_payload(&payload);
-                }
-                let opstamp = prepared_commit.commit_future().await?;
+                let opstamp = writer.prepare_commit()?.commit_future().await?;
                 info!(action = "committed_index", opstamp = ?opstamp);
                 Ok(())
             }
@@ -250,9 +246,9 @@ impl IndexWriterHolder {
     ///
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub async fn commit(&mut self, payload: Option<String>) -> SummaResult<()> {
+    pub async fn commit(&mut self) -> SummaResult<()> {
         info!(action = "commit");
-        let result = self.index_writer.commit(payload).await;
+        let result = self.index_writer.commit().await;
         info!(action = "committed");
         result
     }
@@ -307,9 +303,9 @@ impl IndexWriterHolder {
 
         let segment_attributes = SummaSegmentAttributes { is_frozen: true };
 
-        self.commit(None).await?;
+        self.commit().await?;
         self.vacuum(Some(segment_attributes)).await?;
-        self.commit(None).await?;
+        self.commit().await?;
 
         self.wait_merging_threads();
 

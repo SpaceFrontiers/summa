@@ -97,7 +97,7 @@ impl WebIndexRegistry {
     #[wasm_bindgen]
     pub async fn commit(&self, index_name: &str) -> Result<(), JsValue> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
-        index_holder.commit(None).await.map_err(Error::from)?;
+        index_holder.index_writer_holder().write().await.commit().await.map_err(Error::from)?;
         Ok(())
     }
 }

@@ -4,6 +4,8 @@ use iroh_rpc_types::gateway::GatewayAddr;
 use serde::{Deserialize, Serialize};
 use summa_core::errors::BuilderError;
 
+use crate::errors::SummaServerResult;
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
@@ -23,12 +25,12 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn derive_iroh_gateway_config(&self) -> iroh_gateway::config::Config {
-        let gateway_addr = self.p2p_endpoint.parse::<GatewayAddr>().unwrap();
+    pub fn derive_iroh_gateway_config(&self) -> SummaServerResult<iroh_gateway::config::Config> {
+        let gateway_addr = self.p2p_endpoint.parse::<GatewayAddr>()?;
         let mut config = iroh_gateway::config::Config::default();
-        config.rpc_client.gateway_addr = Some(gateway_addr.clone());
-        config.port = self.http_endpoint.parse::<SocketAddr>().unwrap().port();
+        config.rpc_client.gateway_addr = Some(gateway_addr);
+        config.port = self.http_endpoint.parse::<SocketAddr>()?.port();
         config.redirect_to_subdomain = true;
-        config
+        Ok(config)
     }
 }

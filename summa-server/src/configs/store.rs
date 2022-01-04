@@ -7,14 +7,17 @@ use summa_core::errors::BuilderError;
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
+    #[builder(default = "64 * 1024")]
+    pub default_chunk_size: u64,
     pub endpoint: String,
     #[builder(setter(custom))]
-    pub(crate) path: PathBuf,
+    pub path: PathBuf,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
+            default_chunk_size: 64 * 1024,
             endpoint: "irpc://127.0.0.1:4402".to_string(),
             path: PathBuf::new(),
         }

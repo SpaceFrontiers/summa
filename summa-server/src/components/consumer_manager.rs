@@ -127,7 +127,7 @@ impl ConsumerManager {
         join_all(self.consumptions.drain().map(|(index_holder, consumer_thread)| async move {
             consumer_thread.stop().await?;
             let stopped_consumption = StoppedConsumption { consumer_thread };
-            index_holder.index_writer_holder().write().await.commit(None).await?;
+            index_holder.index_writer_holder().write().await.commit().await?;
             stopped_consumption.commit_offsets().await?;
             Ok(())
         }))
