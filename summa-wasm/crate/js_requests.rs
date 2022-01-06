@@ -42,7 +42,7 @@ impl ExternalRequest for JsExternalRequest {
             serde_wasm_bindgen::to_value(&self.headers).map_err(|e| Error::External(e.to_string()))?,
         )
         .map_err(|error| Error::External(format!("{error:?}")))?;
-        let response: ExternalResponse = serde_wasm_bindgen::from_value(response).unwrap_throw();
+        let response = serde_wasm_bindgen::from_value(response).unwrap_throw();
         Ok(response)
     }
 
@@ -50,12 +50,13 @@ impl ExternalRequest for JsExternalRequest {
         let (sender, mut receiver) = unbounded_channel();
         spawn_local(async move {
             let headers = serde_wasm_bindgen::to_value(&self.headers).expect("headers are not serializable");
-            let response = request_async(self.method, self.url, headers)
-                .await
+            let response = request_async(self.method, self.url, headers).await;
+            let response = response
                 .map(|response| serde_wasm_bindgen::from_value(response).unwrap_throw())
                 .map_err(|error| Error::External(format!("{error:?}")));
             sender.send(response).unwrap_throw();
         });
-        Ok(receiver.recv().await.unwrap_throw()?)
+        let response = receiver.recv().await.unwrap_throw()?;
+        Ok(response)
     }
 }

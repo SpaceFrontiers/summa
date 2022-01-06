@@ -363,9 +363,9 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.60"
+version = "0.1.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "677d1d8ab452a3936018a687b20e6f7cf5363d713b732b8884001317b0e48aa3"
+checksum = "705339e0e4a9690e2908d2b3d049d85682cf19fbd5782494498fbf7003a6a282"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1672,7 +1672,7 @@ checksum = "0d240c8aab8f3f9906bd3bd67a5a2104da85525b28462b396923db6f11a898aa"
 [[package]]
 name = "fastfield_codecs"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 dependencies = [
  "fastdivide",
  "itertools",
@@ -4264,7 +4264,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 [[package]]
 name = "ownedbytes"
 version = "0.5.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -6038,6 +6038,7 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "serde",
+ "serde_bytes",
  "serde_cbor",
  "serde_json",
  "serde_yaml",
@@ -6120,6 +6121,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tonic-reflection 0.6.0",
+ "tonic-web",
  "tower",
  "tower-http",
  "tracing",
@@ -6130,12 +6132,13 @@ dependencies = [
 
 [[package]]
 name = "summa-wasm"
-version = "0.66.0"
+version = "0.82.0"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
  "futures",
  "getrandom 0.2.8",
+ "instant",
  "js-sys",
  "once_cell",
  "rayon",
@@ -6243,7 +6246,7 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "tantivy"
 version = "0.19.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -6295,12 +6298,12 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 
 [[package]]
 name = "tantivy-common"
 version = "0.5.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -6321,7 +6324,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.19.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 dependencies = [
  "combine",
  "once_cell",
@@ -6331,7 +6334,7 @@ dependencies = [
 [[package]]
 name = "tantivy-sstable"
 version = "0.1.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 dependencies = [
  "ciborium",
  "serde",
@@ -6342,7 +6345,7 @@ dependencies = [
 [[package]]
 name = "tantivy-stacker"
 version = "0.1.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#f59f997c35c7d35a305dafd7f3af04bdbfc8e441"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
 dependencies = [
  "byteorder",
  "murmurhash32",
@@ -6647,6 +6650,26 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "tonic-web"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9213351ad53b0dcf1c9cf7c372a47533446b1114928a9177bedc6c551e14b7cf"
+dependencies = [
+ "base64 0.13.1",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "hyper",
+ "pin-project",
+ "tonic",
+ "tower-http",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]

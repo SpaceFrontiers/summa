@@ -34,7 +34,7 @@ impl Gateway {
     }
 
     #[instrument("lifecycle", skip_all)]
-    pub async fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+    pub async fn prepare_serving_future(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let server = self.core.clone().server();
         let endpoint = server.local_addr();
         let gateway_task = tokio::task::spawn(async move { server.await });

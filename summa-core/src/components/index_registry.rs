@@ -16,14 +16,14 @@ use crate::Error;
 /// The main struct responsible for combining different indices and managing their lifetime.
 #[derive(Clone)]
 pub struct IndexRegistry {
-    core_config: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
+    core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
     index_holders: Arc<RwLock<HashMap<String, OwningHandler<IndexHolder>>>>,
 }
 
 impl Default for IndexRegistry {
     fn default() -> Self {
         IndexRegistry {
-            core_config: Arc::new(DirectProxy::default()),
+            core_config_holder: Arc::new(DirectProxy::default()),
             index_holders: Arc::default(),
         }
     }
@@ -38,7 +38,7 @@ impl Debug for IndexRegistry {
 impl IndexRegistry {
     pub fn new(core_config: &Arc<dyn ConfigProxy<crate::configs::core::Config>>) -> IndexRegistry {
         IndexRegistry {
-            core_config: core_config.clone(),
+            core_config_holder: core_config.clone(),
             index_holders: Arc::default(),
         }
     }
@@ -67,7 +67,7 @@ impl IndexRegistry {
     /// Though, `IndexHolder` can be removed from the registry of `IndexHolder`s to prevent new queries
     pub async fn get_index_holder(&self, index_alias: &str) -> SummaResult<Handler<IndexHolder>> {
         self.get_index_holder_by_name(
-            self.core_config
+            self.core_config_holder
                 .read()
                 .await
                 .get()
@@ -121,7 +121,9 @@ impl IndexRegistry {
                 })
             })
             .collect::<SummaResult<Vec<_>>>()?;
-        self.merge_responses(&join_all(futures).await.into_iter().collect::<SummaResult<Vec<_>>>()?)
+
+        let collector_outputs = join_all(futures).await.into_iter().collect::<SummaResult<Vec<_>>>()?;
+        self.merge_responses(&collector_outputs)
     }
 
     /// Merges several `proto::CollectorOutput`

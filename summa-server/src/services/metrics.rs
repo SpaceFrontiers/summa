@@ -102,7 +102,7 @@ impl Metrics {
     }
 
     #[instrument("lifecycle", skip_all)]
-    pub async fn start(
+    pub async fn prepare_serving_future(
         &self,
         index_service: &Index,
         mut terminator: Receiver<ControlMessage>,

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
@@ -25,6 +25,12 @@ impl WebIndexRegistry {
     #[wasm_bindgen(constructor)]
     pub fn new(multithreading: bool) -> WebIndexRegistry {
         console_error_panic_hook::set_once();
+        static mut HEAP: Vec<u8> = Vec::new();
+        static START: Once = Once::new();
+        START.call_once(|| unsafe {
+            HEAP.reserve(512 * (1 << 20));
+            HEAP.shrink_to_fit();
+        });
         let core_config = summa_core::configs::core::ConfigBuilder::default()
             .writer_threads(0)
             .execution_strategy(match multithreading {

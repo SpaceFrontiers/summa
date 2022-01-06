@@ -13,8 +13,9 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use summa_proto::proto;
-use tantivy::collector::MultiCollector;
+use tantivy::collector::{Collector, MultiCollector};
 use tantivy::directory::OwnedBytes;
+use tantivy::query::{EnableScoring, Query, Weight};
 use tantivy::schema::Schema;
 use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, ReloadPolicy};
 use tokio::sync::RwLock;
@@ -29,6 +30,7 @@ use crate::configs::core::ExecutionStrategy;
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
+use crate::Error;
 
 pub struct IndexHolder {
     core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
@@ -229,7 +231,7 @@ impl IndexHolder {
             Err(_) => None,
         };
         let index = tokio::task::spawn_blocking(move || {
-            Ok::<Index, crate::Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
+            Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
         })
         .await??;
         info!(action = "attached", index = ?index);
@@ -319,7 +321,7 @@ impl IndexHolder {
             Some(proto::index_engine_config::Config::File(ref config)) => {
                 tokio::fs::remove_dir_all(&config.path)
                     .await
-                    .map_err(|e| crate::Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
+                    .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
             }
             _ => (),
         };
@@ -341,13 +343,41 @@ impl IndexHolder {
             target: "query",
             index_name = ?self.index_name,
             query = ?query,
-            parsed_query = ?parsed_query
+            parsed_query = ?parsed_query,
+            execution_strategy = ?execution_strategy
         );
+
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
         let mut multi_fruit = match execution_strategy {
             ExecutionStrategy::Async => searcher.search_async(&parsed_query, &multi_collector).await?,
-            ExecutionStrategy::GlobalPool => searcher.search_with_executor(&parsed_query, &multi_collector, &Executor::GlobalPool)?,
+            // ToDo: Reduce code here or in Tantivy `search_with_executor`
+            ExecutionStrategy::GlobalPool => {
+                let segment_readers = searcher.segment_readers();
+                let multi_collector_ref = Arc::new(multi_collector);
+                let mut fruit_receiver = {
+                    let (fruit_sender, fruit_receiver) = tokio::sync::mpsc::unbounded_channel();
+                    let weight: Arc<dyn Weight> = Arc::from(parsed_query.weight_async(EnableScoring::Enabled(&searcher)).await?);
+                    for (segment_ord, segment_reader) in segment_readers.iter().enumerate() {
+                        let fruit_sender_ref = fruit_sender.clone();
+                        let multi_collector_ref = multi_collector_ref.clone();
+                        let weight = weight.clone();
+                        let segment_reader = segment_reader.clone();
+                        rayon::spawn(move || {
+                            fruit_sender_ref
+                                .send(multi_collector_ref.collect_segment(weight.as_ref(), segment_ord as u32, &segment_reader))
+                                .map_err(|_| Error::Internal)
+                                .expect("Send error");
+                        });
+                    }
+                    fruit_receiver
+                };
+                let mut fruits = vec![];
+                while let Some(fruit) = fruit_receiver.recv().await {
+                    fruits.push(fruit?);
+                }
+                multi_collector_ref.merge_fruits(fruits)?
+            }
             ExecutionStrategy::SingleThread => searcher.search_with_executor(&parsed_query, &multi_collector, &Executor::SingleThread)?,
         };
         #[cfg(feature = "metrics")]

@@ -16,7 +16,7 @@ use crate::errors::{Error, SummaServerResult};
 use crate::logging;
 use crate::services::gateway::Gateway;
 use crate::services::store::Store;
-use crate::services::{Grpc, Index, Metrics, P2p};
+use crate::services::{Api, Index, Metrics, P2p};
 use crate::utils::signal_channel;
 
 pub struct Server {
@@ -47,7 +47,8 @@ impl Server {
                 command!("generate-config")
                     .about("Generate default config file")
                     .arg(arg!(-d <DATA_PATH> "Path for storing configs and data").default_value("data").num_args(1))
-                    .arg(arg!(-g <GRPC_ENDPOINT> "GRPC listen endpoint").default_value("127.0.0.1:8082").num_args(1))
+                    .arg(arg!(-g <API_GRPC_ENDPOINT> "API GRPC endpoint").default_value("127.0.0.1:8082").num_args(1))
+                    .arg(arg!(-g <API_HTTP_ENDPOINT> "API HTTP endpoint").default_value("127.0.0.1:8081").num_args(1))
                     .arg(
                         arg!(-m <METRICS_ENDPOINT> "Metrics listen endpoint")
                             .default_value("127.0.0.1:8084")
@@ -64,14 +65,16 @@ impl Server {
         match matches.subcommand() {
             Some(("generate-config", submatches)) => {
                 let data_path = PathBuf::from(submatches.try_get_one::<String>("DATA_PATH")?.expect("no value"));
-                let grpc_endpoint = submatches.try_get_one::<String>("GRPC_ENDPOINT")?.expect("no value");
+                let api_grpc_endpoint = submatches.try_get_one::<String>("API_GRPC_ENDPOINT")?.expect("no value");
+                let api_http_endpoint = submatches.try_get_one::<String>("API_HTTP_ENDPOINT")?;
                 let metrics_endpoint = submatches.try_get_one::<String>("METRICS_ENDPOINT")?.expect("no value");
                 let server_config = crate::configs::server::ConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
-                    .grpc(
-                        crate::configs::grpc::ConfigBuilder::default()
-                            .endpoint(grpc_endpoint.to_string())
+                    .api(
+                        crate::configs::api::ConfigBuilder::default()
+                            .grpc_endpoint(api_grpc_endpoint.to_string())
+                            .http_endpoint(api_http_endpoint.cloned())
                             .build()
                             .map_err(summa_core::Error::from)?,
                     )
@@ -120,7 +123,7 @@ impl Server {
         }
     }
 
-    pub async fn serve(&self, terminator: &Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+    pub async fn serve(&self, terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let mut futures: Vec<Box<dyn Future<Output = SummaServerResult<()>> + Send>> = vec![];
         let server_config = self.server_config_holder.read().await.get().clone();
         let mut iroh_config = iroh_rpc_client::Config::default_network();
@@ -142,7 +145,7 @@ impl Server {
         let p2p_service = if let Some(p2p_config) = server_config.p2p.clone() {
             let p2p_service = P2p::new(p2p_config).await?;
             iroh_config.p2p_addr = Some(p2p_service.rpc_addr().clone());
-            let p2p_future = p2p_service.start(terminator.clone()).await?;
+            let p2p_future = p2p_service.prepare_serving_future(terminator.clone()).await?;
             futures.push(Box::new(p2p_future));
             Some(p2p_service)
         } else {
@@ -151,28 +154,27 @@ impl Server {
 
         let store_service = Store::new(server_config.store.clone(), content_loader).await?;
         iroh_config.store_addr = Some(store_service.rpc_addr().clone());
-        futures.push(Box::new(store_service.start(terminator.clone()).await?));
+        futures.push(Box::new(store_service.prepare_serving_future(terminator.clone()).await?));
 
         if let Some(gateway_config) = server_config.gateway.clone() {
             futures.push(Box::new(
                 Gateway::new(gateway_config, &store_service, p2p_service.as_ref())
                     .await?
-                    .start(terminator.clone())
+                    .prepare_serving_future(terminator.clone())
                     .await?,
             ));
         }
 
         let index_service = Index::new(&self.server_config_holder, store_service).await?;
+        futures.push(Box::new(index_service.prepare_serving_future(terminator.clone()).await?));
 
         let metrics_service = Metrics::new(&server_config.metrics)?;
-        futures.push(Box::new(metrics_service.start(&index_service, terminator.clone()).await?));
+        futures.push(Box::new(metrics_service.prepare_serving_future(&index_service, terminator.clone()).await?));
 
-        let grpc_service = Grpc::new(&self.server_config_holder, &index_service)?;
-        futures.push(Box::new(grpc_service.start(terminator.clone()).await?));
+        let api_service = Api::new(&self.server_config_holder, &index_service)?;
+        futures.push(Box::new(api_service.prepare_serving_future(terminator.clone()).await?));
 
         Ok(async move {
-            index_service.setup_index_holders().await?;
-            info!(action = "indices_ready");
             try_join_all(futures.into_iter().map(Box::into_pin)).await?;
             info!(action = "all_systems_down");
             Ok(())
@@ -181,7 +183,7 @@ impl Server {
     }
 
     async fn run(&self) -> SummaServerResult<()> {
-        let server = self.serve(&signal_channel()?).await?;
+        let server = self.serve(signal_channel()?).await?;
         server.await
     }
 }
@@ -211,13 +213,13 @@ mod tests {
         tokio::fs::create_dir_all(&server_config.data_path)
             .await
             .map_err(|e| Error::IO((e, Some(server_config.data_path.clone()))))?;
-        let grpc_endpoint = server_config.grpc.endpoint.clone();
+        let api_grpc_endpoint = server_config.api.grpc_endpoint.clone();
         let (server_terminator, receiver) = broadcast::<ControlMessage>(1);
         let thread_handler = ThreadHandler::new(
             tokio::spawn(Server::from_server_config(server_config_holder).serve(&receiver).await?),
             server_terminator,
         );
-        let client = create_index_api_client(&format!("http://{}", &grpc_endpoint)).await;
+        let client = create_index_api_client(&format!("http://{}", &api_grpc_endpoint)).await;
         Ok((thread_handler, client))
     }
 

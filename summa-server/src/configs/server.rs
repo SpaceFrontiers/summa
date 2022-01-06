@@ -16,7 +16,7 @@ pub struct Config {
     #[builder(setter(custom))]
     pub data_path: PathBuf,
     pub debug: bool,
-    pub grpc: crate::configs::grpc::Config,
+    pub api: crate::configs::api::Config,
     pub p2p: Option<crate::configs::p2p::Config>,
     pub store: crate::configs::store::Config,
     pub gateway: Option<crate::configs::gateway::Config>,
@@ -36,7 +36,7 @@ impl Default for Config {
         Config {
             data_path: PathBuf::new(),
             debug: true,
-            grpc: crate::configs::grpc::Config::default(),
+            api: crate::configs::api::Config::default(),
             p2p: Some(crate::configs::p2p::Config::default()),
             store: crate::configs::store::Config::default(),
             gateway: Some(crate::configs::gateway::Config::default()),
@@ -102,11 +102,11 @@ pub mod tests {
         crate::configs::server::ConfigBuilder::default()
             .debug(true)
             .data_path(data_path)
-            .grpc(
-                crate::configs::grpc::ConfigBuilder::default()
-                    .endpoint(format!("127.0.0.1:{}", BASE_PORT.fetch_add(1, Ordering::Relaxed)))
+            .api(
+                crate::configs::api::ConfigBuilder::default()
+                    .grpc_endpoint(format!("127.0.0.1:{}", BASE_PORT.fetch_add(1, Ordering::Relaxed)))
                     .build()
-                    .expect("cannot create grpc config"),
+                    .expect("cannot create api config"),
             )
             .metrics(
                 crate::configs::metrics::ConfigBuilder::default()

@@ -42,7 +42,7 @@ impl P2p {
     }
 
     #[instrument("lifecycle", skip_all)]
-    pub async fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+    pub async fn prepare_serving_future(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let key_chain = Keychain::<DiskStorage>::new(self.config.key_store_path.clone()).await?;
         let mut node = Node::new(
             iroh_p2p::Config {

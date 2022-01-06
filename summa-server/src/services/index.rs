@@ -1,15 +1,17 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_broadcast::Receiver;
 use summa_core::components::{IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::utils::sync::{Handler, OwningHandler};
-use summa_core::utils::thread_handler::ThreadHandler;
+use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
 use summa_proto::proto;
 use tantivy::IndexBuilder;
 use tokio::sync::RwLock;
@@ -132,7 +134,7 @@ impl Index {
     }
 
     /// Create `IndexHolder`s from config
-    pub(crate) async fn setup_index_holders(&self) -> SummaServerResult<()> {
+    pub(crate) async fn setup_indices(&self) -> SummaServerResult<()> {
         let mut index_holders = HashMap::new();
         for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
             let index = self.create_index_from(&index_engine_config).await?;
@@ -152,8 +154,27 @@ impl Index {
             let prepared_consumption = PreparedConsumption::from_config(consumer_name, consumer_config)?;
             self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         }
-
+        info!(action = "indices_ready");
         Ok(())
+    }
+
+    #[instrument("lifecycle", skip_all)]
+    pub(crate) async fn prepare_serving_future(
+        &self,
+        mut terminator: Receiver<ControlMessage>,
+    ) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+        self.setup_indices().await?;
+        let this = self.clone();
+        Ok(async move {
+            let signal_result = terminator.recv().await;
+            info!(action = "sigterm_received", received = ?signal_result);
+            match this.stop(false).await {
+                Ok(_) => info!(action = "terminated"),
+                Err(error) => info!(action = "terminated", error = ?error),
+            };
+            Ok(())
+        }
+        .instrument(info_span!(parent: None, "lifecycle")))
     }
 
     pub(crate) async fn insert_config(&self, index_name: &str, index_engine_config: &proto::IndexEngineConfig) -> SummaServerResult<()> {

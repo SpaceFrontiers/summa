@@ -80,6 +80,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tonic = { version = "0.8", features = ["gzip"] }
 tonic-reflection = "0.6"
+tonic-web = "0.5.0"
 tower = "0.4"
 tower-http = { version = "0.3", features = ["set-header", "trace"] }
 tracing = "0.1"

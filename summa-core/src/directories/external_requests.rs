@@ -29,6 +29,7 @@ impl Header {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExternalResponse {
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     pub headers: Vec<Header>,
 }

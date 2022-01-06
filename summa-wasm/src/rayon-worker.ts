@@ -7,7 +7,7 @@ type WorkerData =  {
 
 function wait_for_msg_type(target: any, type: any): Promise<WorkerData> {
   return new Promise(resolve => {
-    target.addEventListener('message', function onMsg(message: { data: WorkerData}) {
+    target.addEventListener('message', function onMsg(message: { data: WorkerData }) {
       if (message.data == null || message.data.type !== type) return;
       target.removeEventListener('message', onMsg);
       resolve(message.data);

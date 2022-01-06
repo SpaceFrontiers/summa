@@ -45,7 +45,7 @@ impl Store {
     }
 
     #[instrument("lifecycle", skip_all)]
-    pub async fn start(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+    pub async fn prepare_serving_future(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let rpc_addr = self.config.endpoint.parse()?;
         let store_task = tokio::spawn(iroh_store::rpc::new(rpc_addr, self.store.clone()));
 
