@@ -353,6 +353,18 @@ class VacuumIndexResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
 
+class WarmupIndexRequest(_message.Message):
+    __slots__ = ["index_alias"]
+    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    index_alias: str
+    def __init__(self, index_alias: _Optional[str] = ...) -> None: ...
+
+class WarmupIndexResponse(_message.Message):
+    __slots__ = ["elapsed_secs"]
+    ELAPSED_SECS_FIELD_NUMBER: _ClassVar[int]
+    elapsed_secs: float
+    def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
+
 class CreateIndexEngineRequest(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []
 

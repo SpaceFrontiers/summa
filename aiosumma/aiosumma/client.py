@@ -561,6 +561,26 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
+    async def warmup_index(
+        self,
+        index_alias: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.VacuumIndexResponse:
+        """
+        Warm index up. It loads all hot parts or index into memory and makes further first queries to the index faster.
+
+        Args:
+            index_alias: index alias
+            request_id: request id
+            session_id: session id
+        """
+        return await self.stubs['index_api'].warmup_index(
+            index_service_pb.WarmupIndexRequest(index_alias=index_alias),
+            metadata=setup_metadata(session_id, request_id),
+        )
+
+    @expose
     async def get_top_terms(
         self,
         index_alias: str,

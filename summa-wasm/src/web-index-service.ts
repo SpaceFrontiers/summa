@@ -1,5 +1,5 @@
-import init, { cache_metrics, init_thread_pool, WebIndexRegistry } from "../pkg";
-import { RemoteEngineConfig } from "./configs";
+import init, { init_thread_pool, WebIndexRegistry } from "../pkg";
+import {IndexAttributes, RemoteEngineConfig} from "./configs";
 
 export type StatusCallback = (type: string, message: string) => void;
 export class IndexQuery {
@@ -26,10 +26,9 @@ export class WebIndexService {
     if (threads > 0) {
       status_callback("status", "setting thread pool of size " + threads.toString() + "...");
       await init_thread_pool(threads);
-      status_callback("status", "");
     }
   }
-  async add(remote_engine_config: RemoteEngineConfig): Promise<Object> {
+  async add(remote_engine_config: RemoteEngineConfig): Promise<IndexAttributes> {
     return await this.registry!.add(remote_engine_config)
   }
   async delete(index_name: string) {
@@ -37,9 +36,6 @@ export class WebIndexService {
   }
   async search(index_queries: IndexQuery[]) {
     return await this.registry!.search(index_queries)
-  }
-  async cache_metrics() {
-    return await cache_metrics()
   }
   async warmup(index_name: string) {
     return await this.registry!.warmup(index_name);

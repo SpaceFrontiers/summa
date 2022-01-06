@@ -85,6 +85,11 @@ class IndexApiStub(object):
                 request_serializer=index__service__pb2.VacuumIndexRequest.SerializeToString,
                 response_deserializer=index__service__pb2.VacuumIndexResponse.FromString,
                 )
+        self.warmup_index = channel.unary_unary(
+                '/summa.proto.IndexApi/warmup_index',
+                request_serializer=index__service__pb2.WarmupIndexRequest.SerializeToString,
+                response_deserializer=index__service__pb2.WarmupIndexResponse.FromString,
+                )
 
 
 class IndexApiServicer(object):
@@ -189,6 +194,13 @@ class IndexApiServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def warmup_index(self, request, context):
+        """Loads all hot parts of the index into the memory
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_IndexApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -261,6 +273,11 @@ def add_IndexApiServicer_to_server(servicer, server):
                     servicer.vacuum_index,
                     request_deserializer=index__service__pb2.VacuumIndexRequest.FromString,
                     response_serializer=index__service__pb2.VacuumIndexResponse.SerializeToString,
+            ),
+            'warmup_index': grpc.unary_unary_rpc_method_handler(
+                    servicer.warmup_index,
+                    request_deserializer=index__service__pb2.WarmupIndexRequest.FromString,
+                    response_serializer=index__service__pb2.WarmupIndexResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -508,5 +525,22 @@ class IndexApi(object):
         return grpc.experimental.unary_unary(request, target, '/summa.proto.IndexApi/vacuum_index',
             index__service__pb2.VacuumIndexRequest.SerializeToString,
             index__service__pb2.VacuumIndexResponse.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def warmup_index(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/summa.proto.IndexApi/warmup_index',
+            index__service__pb2.WarmupIndexRequest.SerializeToString,
+            index__service__pb2.WarmupIndexResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
