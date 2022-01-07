@@ -44,7 +44,6 @@ derive_builder = "0.12"
 futures = "0.3"
 futures-util = "0.3"
 hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
-iroh-api = { workspace = true }
 iroh-gateway = { workspace = true }
 iroh-metrics = { workspace = true }
 iroh-p2p = { workspace = true }
@@ -75,7 +74,7 @@ tantivy = { workspace = true }
 tantivy-fst = "0.4.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
 thiserror = "1.0"
-tokio = { version = "1.23", features = ["full", "time"] }
+tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tonic = { version = "0.8", features = ["gzip"] }

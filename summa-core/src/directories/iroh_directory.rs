@@ -14,7 +14,7 @@ use tantivy::{
     Directory, HasLen,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::info;
+use tracing::trace;
 
 use crate::errors::SummaResult;
 
@@ -39,7 +39,7 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, 
         for (file_name, cid) in root_path.named_links()?.into_iter() {
             let file_name = PathBuf::from(file_name.expect("file without name"));
             let resolved_path = resolver.resolve(iroh_resolver::Path::from_cid(cid)).await?;
-            info!(action = "resolved_iroh_file", file_name = ?file_name, cid = ?cid);
+            trace!(action = "resolved_iroh_file", file_name = ?file_name, cid = ?cid);
             files.insert(file_name, resolved_path);
         }
         Ok(IrohDirectory {

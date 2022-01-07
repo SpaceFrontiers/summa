@@ -13,6 +13,10 @@ pub enum ValidationError {
     ExistingIndex(String),
     #[error("invalid_argument: {0}")]
     InvalidArgument(String),
+    #[error("invalid_header_name: {0}")]
+    InvalidHeaderName(#[from] hyper::header::InvalidHeaderName),
+    #[error("invalid_header_value: {0}")]
+    InvalidHeaderValue(#[from] hyper::header::InvalidHeaderValue),
     #[error("invalid_schema_error: {0}")]
     InvalidSchema(String),
     #[error("missing_consumer_error: {0}")]

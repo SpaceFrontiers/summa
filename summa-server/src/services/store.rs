@@ -1,11 +1,14 @@
 use std::future::Future;
 
 use async_broadcast::Receiver;
+use futures_util::StreamExt;
 use iroh_rpc_types::store::StoreAddr;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
 
 use crate::errors::SummaServerResult;
+
+const MAX_CHUNK_SIZE: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Store {
@@ -68,7 +71,6 @@ impl Store {
 
     pub async fn put(&self, files: Vec<summa_core::components::ComponentFile>, delete_files: bool) -> SummaServerResult<String> {
         info!(files = ?files);
-        let iroh = iroh_api::Api::new(iroh_api::Config::default()).await?;
         let mut entries = vec![];
         for file in files.iter() {
             entries.push(iroh_unixfs::builder::Entry::File(
@@ -82,18 +84,34 @@ impl Store {
                     .await?,
             ))
         }
-        let cid = iroh
-            .add(iroh_api::UnixfsEntry::Directory(iroh_unixfs::builder::Directory::basic(
-                "".to_string(),
-                entries,
-            )))
-            .await?
-            .to_string();
+        let root_directory = iroh_unixfs::builder::Entry::Directory(iroh_unixfs::builder::Directory::basic("".to_string(), entries));
+        let mut blocks = root_directory.encode().await?;
+
+        let mut chunk = Vec::new();
+        let mut chunk_size = 0u64;
+        let mut cid = None;
+
+        while let Some(block) = blocks.next().await {
+            let block = block?;
+            let block_size = block.data().len() as u64 + block.links().len() as u64 * 128;
+            cid = Some(*block.cid());
+            if chunk_size + block_size > MAX_CHUNK_SIZE {
+                let store = self.store.clone();
+                let current_chunk = std::mem::take(&mut chunk);
+                tokio::task::spawn_blocking(move || store.put_many(current_chunk)).await??;
+                chunk_size = 0;
+            }
+            chunk.push(block.into_parts());
+            chunk_size += block_size;
+        }
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.put_many(chunk)).await??;
+
         if delete_files {
             for file in files.iter() {
                 tokio::fs::remove_file(file.path()).await?;
             }
         }
-        Ok(cid)
+        Ok(cid.expect("no files found").to_string())
     }
 }

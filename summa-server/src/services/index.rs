@@ -137,6 +137,7 @@ impl Index {
     pub(crate) async fn setup_indices(&self) -> SummaServerResult<()> {
         let mut index_holders = HashMap::new();
         for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
+            info!(action = "from_config", index = ?index_name);
             let index = self.create_index_from(&index_engine_config).await?;
             let core_config = self.server_config.read().await.get().core.clone();
             let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
@@ -146,7 +147,7 @@ impl Index {
             .await??;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
         }
-        info!(action = "setting_index_holders", index_holders = ?index_holders);
+        info!(action = "setting_index_holders", indices = ?index_holders.keys().collect::<Vec<_>>());
         *self.index_registry.index_holders().write().await = index_holders;
 
         for (consumer_name, consumer_config) in self.server_config.read().await.get().consumers.iter() {
@@ -519,7 +520,6 @@ impl Index {
             Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(config, self.store_service.content_loader()).await?,
             _ => unimplemented!(),
         };
-        info!(action = "from_config", index = ?index);
         Ok(index)
     }
 

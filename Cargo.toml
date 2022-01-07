@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["summa-proto", "summa-core", "summa-server", "summa-wasm"]
+members = ["summa-core", "summa-proto", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true
@@ -17,3 +17,4 @@ iroh-rpc-client = { git = "https://github.com/izihawa/iroh", branch = "feature/s
 iroh-rpc-types = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-store = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-unixfs = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
+tokio = { version = "1.24", features = ["full", "time"] }

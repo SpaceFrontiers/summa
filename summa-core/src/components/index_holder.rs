@@ -195,7 +195,7 @@ impl IndexHolder {
     #[cfg(feature = "fs")]
     pub async fn attach_file_index(file_engine_config: &proto::FileEngineConfig) -> SummaResult<Index> {
         let index = Index::open_in_dir(&file_engine_config.path)?;
-        info!(action = "attached", index = ?index);
+        info!(action = "attached", config = ?file_engine_config);
         Ok(index)
     }
 
@@ -234,7 +234,7 @@ impl IndexHolder {
             Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
         })
         .await??;
-        info!(action = "attached", index = ?index);
+        info!(action = "attached", config = ?ipfs_engine_config);
         Ok(index)
     }
 

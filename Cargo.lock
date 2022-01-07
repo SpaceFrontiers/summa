@@ -399,9 +399,9 @@ checksum = "d468802bab17cbc0cc575e9b053f41e72aa36bfa6b7f55e3529ffa43161b97fa"
 
 [[package]]
 name = "axum"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08b108ad2665fa3f6e6a517c3d80ec3e77d224c47d605167aefaa5d7ef97fa48"
+checksum = "1304eab461cf02bd70b083ed8273388f9724c549b316ba3d1e213ce0e9e7fb7e"
 dependencies = [
  "async-trait",
  "axum-core",
@@ -432,9 +432,9 @@ dependencies = [
 
 [[package]]
 name = "axum-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79b8558f5a0581152dc94dcd289132a1d377494bdeafcd41869b3258e3e2ad92"
+checksum = "f487e40dc9daee24d8a1779df88522f159a54a980f99cfbe43db0be0bd3444a8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -695,9 +695,9 @@ dependencies = [
 
 [[package]]
 name = "camino"
-version = "1.1.1"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88ad0e1e3e88dd237a156ab9f571021b8a158caa0ae44b1968a241efb5144c1e"
+checksum = "c77df041dc383319cc661b428b6961a005db4d6808d5e12536931b1ca9556055"
 dependencies = [
  "serde",
 ]
@@ -1213,9 +1213,9 @@ dependencies = [
 
 [[package]]
 name = "cxx"
-version = "1.0.85"
+version = "1.0.86"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5add3fc1717409d029b20c5b6903fc0c0b02fa6741d820054f4a2efa5e5816fd"
+checksum = "51d1075c37807dcf850c379432f0df05ba52cc30f279c5cfc43cc221ce7f8579"
 dependencies = [
  "cc",
  "cxxbridge-flags",
@@ -1225,9 +1225,9 @@ dependencies = [
 
 [[package]]
 name = "cxx-build"
-version = "1.0.85"
+version = "1.0.86"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c87959ba14bc6fbc61df77c3fcfe180fc32b93538c4f1031dd802ccb5f2ff0"
+checksum = "5044281f61b27bc598f2f6647d480aed48d2bf52d6eb0b627d84c0361b17aa70"
 dependencies = [
  "cc",
  "codespan-reporting",
@@ -1240,15 +1240,15 @@ dependencies = [
 
 [[package]]
 name = "cxxbridge-flags"
-version = "1.0.85"
+version = "1.0.86"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69a3e162fde4e594ed2b07d0f83c6c67b745e7f28ce58c6df5e6b6bef99dfb59"
+checksum = "61b50bc93ba22c27b0d31128d2d130a0a6b3d267ae27ef7e4fae2167dfe8781c"
 
 [[package]]
 name = "cxxbridge-macro"
-version = "1.0.85"
+version = "1.0.86"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e7e2adeb6a0d4a282e581096b06e1791532b7d576dcde5ccd9382acf55db8e6"
+checksum = "39e61fda7e62115119469c7b3591fd913ecca96fb766cfd3f2e2502ab7bc87a5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2432,14 +2432,14 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.7.0"
+version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11b0d96e660696543b251e58030cf9787df56da39dab19ad60eae7353040917e"
+checksum = "30e22bd8629359895450b59ea7a776c850561b96a3b1d31321c1949d9e6c9146"
 
 [[package]]
 name = "iroh-api"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2465,7 +2465,7 @@ dependencies = [
 [[package]]
 name = "iroh-bitswap"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "iroh-car"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "cid",
  "futures",
@@ -2517,7 +2517,7 @@ dependencies = [
 [[package]]
 name = "iroh-gateway"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -2577,7 +2577,7 @@ dependencies = [
 [[package]]
 name = "iroh-metrics"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "async-trait",
  "config",
@@ -2600,7 +2600,7 @@ dependencies = [
 [[package]]
 name = "iroh-p2p"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2639,7 +2639,7 @@ dependencies = [
 [[package]]
 name = "iroh-resolver"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2665,7 +2665,7 @@ dependencies = [
 [[package]]
 name = "iroh-rpc-client"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2688,7 +2688,7 @@ dependencies = [
 [[package]]
 name = "iroh-rpc-types"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2706,7 +2706,7 @@ dependencies = [
 [[package]]
 name = "iroh-store"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2740,7 +2740,7 @@ dependencies = [
 [[package]]
 name = "iroh-unixfs"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2777,7 +2777,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#e601a973986495763ad88a866f56bb53a081a606"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
 dependencies = [
  "anyhow",
  "cid",
@@ -2788,7 +2788,7 @@ dependencies = [
  "humansize",
  "rlimit",
  "serde",
- "sysinfo 0.27.2",
+ "sysinfo 0.27.3",
  "thiserror",
  "toml",
  "tracing",
@@ -4881,7 +4881,7 @@ dependencies = [
 [[package]]
 name = "quic-rpc"
 version = "0.3.1"
-source = "git+https://github.com/n0-computer/quic-rpc?branch=framed-http2#4e3d9fd841396aaf0cb4024017605cef19b2cacd"
+source = "git+https://github.com/n0-computer/quic-rpc?branch=main#9cfe24743207a1771b1e29a5f6588a43bfbb3b91"
 dependencies = [
  "bincode",
  "bytes",
@@ -5145,9 +5145,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.7.0"
+version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e076559ef8e241f2ae3479e36f97bd5741c0330689e217ad51ce2c76808b868a"
+checksum = "48aaa5748ba571fb95cd2c85c09f629215d3a6ece942baa100950af03a34f733"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -6069,6 +6069,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "summa-publisher"
+version = "0.1.0"
+dependencies = [
+ "cid",
+ "futures-lite",
+ "iroh-rpc-client",
+ "iroh-rpc-types",
+ "iroh-store",
+ "iroh-unixfs",
+ "tokio",
+]
+
+[[package]]
 name = "summa-server"
 version = "0.11.0"
 dependencies = [
@@ -6083,7 +6096,6 @@ dependencies = [
  "futures",
  "futures-util",
  "hyper",
- "iroh-api",
  "iroh-gateway",
  "iroh-metrics",
  "iroh-p2p",
@@ -6203,9 +6215,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.27.2"
+version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17351d0e9eb8841897b14e9669378f3c69fb57779cc04f8ca9a9d512edfb2563"
+checksum = "1620f9573034c573376acc550f3b9a2be96daeb08abb3c12c8523e1cee06e80f"
 dependencies = [
  "cfg-if",
  "core-foundation-sys",
