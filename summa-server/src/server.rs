@@ -216,7 +216,7 @@ mod tests {
         let api_grpc_endpoint = server_config.api.grpc_endpoint.clone();
         let (server_terminator, receiver) = broadcast::<ControlMessage>(1);
         let thread_handler = ThreadHandler::new(
-            tokio::spawn(Server::from_server_config(server_config_holder).serve(&receiver).await?),
+            tokio::spawn(Server::from_server_config(server_config_holder).serve(receiver).await?),
             server_terminator,
         );
         let client = create_index_api_client(&format!("http://{}", &api_grpc_endpoint)).await;
