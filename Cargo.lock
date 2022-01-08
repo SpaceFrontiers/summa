@@ -1048,9 +1048,9 @@ dependencies = [
 
 [[package]]
 name = "crc-catalog"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d0165d2900ae6778e36e80bbc4da3b5eefccee9ba939761f9c2882a5d9af3ff"
+checksum = "9cace84e55f07e7301bae1c519df89cdad8cc3cd868413d3fdbdeca9ff3db484"
 
 [[package]]
 name = "crc32fast"
@@ -1678,7 +1678,7 @@ checksum = "0d240c8aab8f3f9906bd3bd67a5a2104da85525b28462b396923db6f11a898aa"
 [[package]]
 name = "fastfield_codecs"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "fastdivide",
  "itertools",
@@ -2803,7 +2803,7 @@ dependencies = [
  "humansize",
  "rlimit",
  "serde",
- "sysinfo 0.27.4",
+ "sysinfo 0.27.5",
  "thiserror",
  "toml",
  "tracing",
@@ -4117,9 +4117,9 @@ dependencies = [
 
 [[package]]
 name = "object"
-version = "0.30.1"
+version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d864c91689fdc196779b98dba0aceac6118594c2df6ee5d943eb6a8df4d107a"
+checksum = "2b8c786513eb403643f2a88c244c2aaa270ef2153f55094587d0c48a3cf22a83"
 dependencies = [
  "memchr",
 ]
@@ -4279,7 +4279,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 [[package]]
 name = "ownedbytes"
 version = "0.5.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -4751,9 +4751,9 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.11.5"
+version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c01db6702aa05baa3f57dec92b8eeeeb4cb19e894e73996b32a4093289e54592"
+checksum = "21dc42e00223fc37204bd4aa177e69420c604ca4a183209a8f9de30c6d934698"
 dependencies = [
  "bytes",
  "prost-derive",
@@ -4761,9 +4761,9 @@ dependencies = [
 
 [[package]]
 name = "prost-build"
-version = "0.11.5"
+version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb5320c680de74ba083512704acb90fe00f28f79207286a848e730c45dd73ed6"
+checksum = "a3f8ad728fb08fe212df3c05169e940fbb6d9d16a877ddde14644a983ba2012e"
 dependencies = [
  "bytes",
  "heck",
@@ -4796,9 +4796,9 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.11.5"
+version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8842bad1a5419bca14eac663ba798f6bc19c413c2fdceb5f3ba3b0932d96720"
+checksum = "8bda8c0881ea9f722eb9629376db3d0b903b462477c1aafcb0566610ac28ac5d"
 dependencies = [
  "anyhow",
  "itertools",
@@ -4809,9 +4809,9 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
-version = "0.11.5"
+version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "017f79637768cde62820bc2d4fe0e45daaa027755c323ad077767c6c5f173091"
+checksum = "a5e0526209433e96d83d750dd81a99118edbc55739e7e61a46764fd2ad537788"
 dependencies = [
  "bytes",
  "prost",
@@ -6219,9 +6219,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.26.8"
+version = "0.26.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ddf41e393a9133c81d5f0974195366bd57082deac6e0eb02ed39b8341c2bb6"
+checksum = "5c18a6156d1f27a9592ee18c1a846ca8dd5c258b7179fc193ae87c74ebb666f5"
 dependencies = [
  "cfg-if",
  "core-foundation-sys",
@@ -6233,9 +6233,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.27.4"
+version = "0.27.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "444c7f371193a054273b0a1bbfe1e617b804b7fd62fd3e2794b4be6b0a872b0c"
+checksum = "fcd303550875ba33b137a7c93318cfdeb54c95e63ff7a0982d28425d3f87552c"
 dependencies = [
  "cfg-if",
  "core-foundation-sys",
@@ -6276,7 +6276,7 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "tantivy"
 version = "0.19.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -6329,12 +6329,12 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 
 [[package]]
 name = "tantivy-common"
 version = "0.5.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -6355,7 +6355,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.19.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "combine",
  "once_cell",
@@ -6365,7 +6365,7 @@ dependencies = [
 [[package]]
 name = "tantivy-sstable"
 version = "0.1.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "ciborium",
  "serde",
@@ -6376,7 +6376,7 @@ dependencies = [
 [[package]]
 name = "tantivy-stacker"
 version = "0.1.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "byteorder",
  "murmurhash32",
@@ -6386,7 +6386,7 @@ dependencies = [
 [[package]]
 name = "tantivy-tokenizer-api"
 version = "0.1.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#6791750ddc41b0983f7fd68718e7c20648ba3668"
 dependencies = [
  "serde",
 ]
@@ -6434,7 +6434,7 @@ dependencies = [
  "backtrace",
  "cargo_metadata",
  "once_cell",
- "sysinfo 0.26.8",
+ "sysinfo 0.26.9",
  "whoami",
 ]
 
