@@ -761,7 +761,7 @@ pub(crate) mod tests {
         index_holder.index_writer_holder().write().await.commit().await?;
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
-            index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)]).await?,
+            index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)], NoTracker::default()).await?,
             vec![top_docs_collector_output(
                 vec![scored_doc(
                     "{\
@@ -815,7 +815,7 @@ pub(crate) mod tests {
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder
-                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "issued_at")])
+                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "issued_at")], NoTracker::default())
                 .await?,
             vec![top_docs_collector_output(
                 vec![
@@ -835,7 +835,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             index_holder
-                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "-issued_at")])
+                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "-issued_at")], NoTracker::default())
                 .await?,
             vec![top_docs_collector_output(
                 vec![
