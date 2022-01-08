@@ -20,6 +20,10 @@ impl Default for ExecutionStrategy {
     }
 }
 
+fn return_true() -> bool {
+    true
+}
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
@@ -27,6 +31,9 @@ pub struct Config {
     pub aliases: HashMap<String, String>,
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
+    #[builder(default = "true")]
+    #[serde(default = "return_true")]
+    pub dedicated_compression_thread: bool,
     #[builder(default = "ExecutionStrategy::Async")]
     #[serde(default = "ExecutionStrategy::default")]
     pub execution_strategy: ExecutionStrategy,
@@ -43,6 +50,7 @@ impl Default for Config {
         Config {
             aliases: HashMap::new(),
             autocommit_interval_ms: None,
+            dedicated_compression_thread: true,
             execution_strategy: ExecutionStrategy::Async,
             indices: HashMap::new(),
             writer_heap_size_bytes: 1024 * 1024 * 1024,

@@ -25,6 +25,7 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
+use crate::components::tracker::Tracker;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::core::ExecutionStrategy;
 use crate::configs::ConfigProxy;
@@ -120,6 +121,8 @@ impl IndexHolder {
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
+
+        index.settings_mut().docstore_compress_dedicated_thread = core_config.dedicated_compression_thread;
         index.set_segment_attributes_merger(Arc::new(SegmentAttributesMergerImpl::<SummaSegmentAttributes>::new()));
 
         let index_name = index_name.map(|x| x.to_string()).unwrap_or_else(|| {
@@ -203,10 +206,12 @@ impl IndexHolder {
         TExternalRequest: ExternalRequest + 'static,
         TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
     >(
-        remote_engine_config: &proto::RemoteEngineConfig,
+        remote_engine_config: proto::RemoteEngineConfig,
+        tracker: impl Tracker,
     ) -> SummaResult<Index> {
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
         let hotcache_handle = network_directory.get_network_file_handle("hotcache.bin".as_ref());
+        tracker.set_status(&format!("downloading {}...", hotcache_handle.url()?));
         let hotcache_bytes = hotcache_handle.do_read_bytes_async(None).await.expect("cannot read hotcache");
         let directory = wrap_with_caches(network_directory, Some(hotcache_bytes), remote_engine_config.chunked_cache_config.as_ref())?;
         Ok(Index::open(directory)?)
@@ -330,7 +335,13 @@ impl IndexHolder {
     }
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
-    pub async fn search(&self, external_index_alias: &str, query: &proto::Query, collectors: &[proto::Collector]) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub async fn search(
+        &self,
+        external_index_alias: &str,
+        query: &proto::Query,
+        collectors: &[proto::Collector],
+        tracker: impl Tracker,
+    ) -> SummaResult<Vec<proto::CollectorOutput>> {
         let execution_strategy = self.core_config_holder.read().await.get().execution_strategy.clone();
         let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
@@ -349,6 +360,7 @@ impl IndexHolder {
 
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
+        tracker.set_status("querying index...");
         let mut multi_fruit = match execution_strategy {
             ExecutionStrategy::Async => searcher.search_async(&parsed_query, &multi_collector).await?,
             // ToDo: Reduce code here or in Tantivy `search_with_executor`
@@ -397,6 +409,7 @@ impl IndexHolder {
                     .collect()
             })
             .unwrap_or_else(HashSet::new);
+        tracker.set_status("collecting documents...");
         for extractor in extractors.into_iter() {
             collector_outputs.push(
                 extractor

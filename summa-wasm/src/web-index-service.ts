@@ -1,7 +1,6 @@
-import init, { init_thread_pool, WebIndexRegistry } from "../pkg";
+import init, { init_thread_pool, JsTrackerSnapshot, WebIndexRegistry } from "../pkg";
 import {IndexAttributes, RemoteEngineConfig} from "./configs";
 
-export type StatusCallback = (type: string, message: string) => void;
 export class IndexQuery {
   index_alias: string
   query: Object;
@@ -15,27 +14,30 @@ export class IndexQuery {
 
 export class WebIndexService {
   registry?: WebIndexRegistry;
-  async setup(init_url: string, threads: number, status_callback?: StatusCallback) {
-    if (!status_callback) {
-      status_callback = (type: string, message: string) => console.log(type, message)
-    }
-    status_callback("status", "setting workers " + init_url + "...");
+
+  async setup(init_url: string, threads: number) {
     await init(init_url, new WebAssembly.Memory({ initial: 4096, maximum: 16384, shared: true }));
-    status_callback("status", "creating registry...");
     this.registry = new WebIndexRegistry(threads > 0);
     if (threads > 0) {
-      status_callback("status", "setting thread pool of size " + threads.toString() + "...");
       await init_thread_pool(threads);
     }
   }
-  async add(remote_engine_config: RemoteEngineConfig): Promise<IndexAttributes> {
-    return await this.registry!.add(remote_engine_config)
+  async add(remote_engine_config: RemoteEngineConfig, cb: (tracker_snapshot: JsTrackerSnapshot) => void): Promise<IndexAttributes> {
+    let add_operation = this.registry!.add(remote_engine_config);
+    await add_operation.tracker().add_subscriber((tracker_snapshot: JsTrackerSnapshot) => {
+      cb(tracker_snapshot)
+    });
+    return await add_operation.execute();
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
   }
-  async search(index_queries: IndexQuery[]) {
-    return await this.registry!.search(index_queries)
+  async search(index_queries: IndexQuery[], cb: (tracker_snapshot: JsTrackerSnapshot) => void) {
+    let search_operation = this.registry!.search(index_queries);
+    await search_operation.tracker().add_subscriber((tracker_snapshot: JsTrackerSnapshot) => {
+      cb(tracker_snapshot)
+    });
+    return await search_operation.execute();
   }
   async warmup(index_name: string) {
     return await this.registry!.warmup(index_name);

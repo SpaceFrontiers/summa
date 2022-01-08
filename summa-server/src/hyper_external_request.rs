@@ -60,4 +60,8 @@ impl ExternalRequest for HyperExternalRequest {
             headers,
         })
     }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
 }

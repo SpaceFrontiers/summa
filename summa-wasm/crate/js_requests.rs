@@ -59,4 +59,8 @@ impl ExternalRequest for JsExternalRequest {
         let response = receiver.recv().await.unwrap_throw()?;
         Ok(response)
     }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
 }

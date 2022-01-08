@@ -1,4 +1,3 @@
-export type { StatusCallback } from "./web-index-service";
 export {
   IndexQuery,
   WebIndexService,

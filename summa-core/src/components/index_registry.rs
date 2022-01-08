@@ -8,6 +8,7 @@ use summa_proto::proto;
 use tokio::sync::RwLock;
 
 use super::IndexHolder;
+use crate::components::Tracker;
 use crate::configs::{ConfigProxy, DirectProxy};
 use crate::errors::{SummaResult, ValidationError};
 use crate::utils::sync::{Handler, OwningHandler};
@@ -103,10 +104,11 @@ impl IndexRegistry {
     }
 
     /// Searches in several indices simultaneously and merges results
-    pub async fn search(&self, index_queries: &[proto::IndexQuery]) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub async fn search(&self, index_queries: &[proto::IndexQuery], tracker: impl Tracker) -> SummaResult<Vec<proto::CollectorOutput>> {
         let futures = index_queries
             .iter()
             .map(|index_query| {
+                let tracker = tracker.clone();
                 Ok(async move {
                     let index_holder = self.get_index_holder(&index_query.index_alias).await?;
                     index_holder
@@ -116,6 +118,7 @@ impl IndexRegistry {
                                 query: Some(proto::query::Query::All(proto::AllQuery {})),
                             }),
                             &index_query.collectors,
+                            tracker,
                         )
                         .await
                 })

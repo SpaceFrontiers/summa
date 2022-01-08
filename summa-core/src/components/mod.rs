@@ -9,6 +9,7 @@ mod query_parser;
 mod segment_attributes;
 mod summa_document;
 mod summa_tokenizer;
+mod tracker;
 
 pub use default_tokenizers::default_tokenizers;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor};
@@ -20,6 +21,7 @@ pub use query_parser::QueryParser;
 pub use segment_attributes::SummaSegmentAttributes;
 pub use summa_document::{DocumentParsingError, SummaDocument};
 pub use summa_tokenizer::SummaTokenizer;
+pub use tracker::{NoTracker, Tracker};
 
 use crate::metrics::CacheMetrics;
 

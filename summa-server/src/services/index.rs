@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_broadcast::Receiver;
-use summa_core::components::{IndexHolder, IndexRegistry};
+use summa_core::components::{IndexHolder, IndexRegistry, NoTracker};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
@@ -138,7 +138,7 @@ impl Index {
         let mut index_holders = HashMap::new();
         for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
             info!(action = "from_config", index = ?index_name);
-            let index = self.create_index_from(&index_engine_config).await?;
+            let index = self.create_index_from(index_engine_config).await?;
             let core_config = self.server_config.read().await.get().core.clone();
             let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
             let index_holder = tokio::task::spawn_blocking(move || {
@@ -510,14 +510,15 @@ impl Index {
 
     /// Opens index and sets it up via `setup`
     #[instrument(skip_all)]
-    pub async fn create_index_from(&self, index_engine_config: &proto::IndexEngineConfig) -> SummaServerResult<tantivy::Index> {
-        let index = match &index_engine_config.config {
-            Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(&config.path)?,
+    pub async fn create_index_from(&self, index_engine_config: proto::IndexEngineConfig) -> SummaServerResult<tantivy::Index> {
+        let index = match index_engine_config.config {
+            Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(config.path)?,
             Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
             Some(proto::index_engine_config::Config::Remote(config)) => {
-                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config).await?
+                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, NoTracker::default())
+                    .await?
             }
-            Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(config, self.store_service.content_loader()).await?,
+            Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader()).await?,
             _ => unimplemented!(),
         };
         Ok(index)
@@ -577,7 +578,7 @@ impl Index {
     }
 
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
-        Ok(self.index_registry.search(&search_request.index_queries).await?)
+        Ok(self.index_registry.search(&search_request.index_queries, NoTracker::default()).await?)
     }
 }
 

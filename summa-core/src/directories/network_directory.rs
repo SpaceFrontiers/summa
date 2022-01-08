@@ -72,6 +72,14 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
         NetworkFile { file_name, request_generator }
     }
 
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    pub fn url(&self) -> io::Result<String> {
+        Ok(self.request_generator.generate_length_request(&self.file_name)?.url().to_string())
+    }
+
     fn do_read_bytes(&self, byte_range: Option<Range<usize>>) -> io::Result<OwnedBytes> {
         let request_response = self.request_generator.generate_range_request(&self.file_name, byte_range)?.request()?;
         Ok(OwnedBytes::new(request_response.data))

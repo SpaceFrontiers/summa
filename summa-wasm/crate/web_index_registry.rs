@@ -12,9 +12,98 @@ use wasm_bindgen::JsValue;
 
 use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;
+use crate::tracker::{SubscribeTracker, TrackerEvent};
 use crate::SERIALIZER;
 
 #[wasm_bindgen]
+#[derive(Clone)]
+pub struct JsTrackerSnapshot(TrackerEvent);
+
+#[wasm_bindgen]
+impl JsTrackerSnapshot {
+    pub fn last_status(&self) -> String {
+        self.0.status.to_string()
+    }
+}
+
+#[wasm_bindgen]
+#[derive(Clone, Default)]
+pub struct JsTracker(SubscribeTracker);
+
+#[wasm_bindgen]
+impl JsTracker {
+    #[wasm_bindgen]
+    pub fn add_subscriber(&mut self, subscriber: js_sys::Function) {
+        self.0.add_subscriber(Box::new(move |op| {
+            subscriber
+                .call1(&JsValue::null(), &serde_wasm_bindgen::to_value(&op).expect("cannot serialize"))
+                .expect("set status failed");
+        }))
+    }
+}
+
+#[wasm_bindgen]
+pub struct JsAddOperation {
+    web_index_registry: WebIndexRegistry,
+    remote_engine_config: RemoteEngineConfig,
+    tracker: JsTracker,
+}
+
+#[wasm_bindgen]
+impl JsAddOperation {
+    pub(crate) fn new(web_index_registry: WebIndexRegistry, remote_engine_config: RemoteEngineConfig) -> JsAddOperation {
+        JsAddOperation {
+            web_index_registry,
+            remote_engine_config,
+            tracker: JsTracker::default(),
+        }
+    }
+    pub fn tracker(&self) -> JsTracker {
+        self.tracker.clone()
+    }
+
+    pub async fn execute(self) -> Result<JsValue, JsValue> {
+        Ok(self
+            .web_index_registry
+            .add_internal(self.remote_engine_config, self.tracker.0)
+            .await?
+            .serialize(&*SERIALIZER)?)
+    }
+}
+
+#[wasm_bindgen]
+pub struct JsSearchOperation {
+    web_index_registry: WebIndexRegistry,
+    index_queries: Vec<proto::IndexQuery>,
+    tracker: JsTracker,
+}
+
+#[wasm_bindgen]
+impl JsSearchOperation {
+    pub(crate) fn new(web_index_registry: WebIndexRegistry, index_queries: Vec<proto::IndexQuery>) -> JsSearchOperation {
+        JsSearchOperation {
+            web_index_registry,
+            index_queries,
+            tracker: JsTracker::default(),
+        }
+    }
+    pub fn tracker(&self) -> JsTracker {
+        self.tracker.clone()
+    }
+
+    pub async fn execute(self) -> Result<JsValue, JsValue> {
+        Ok(self
+            .web_index_registry
+            .index_registry
+            .search(&self.index_queries, self.tracker.0)
+            .await
+            .map_err(Error::from)?
+            .serialize(&*SERIALIZER)?)
+    }
+}
+
+#[wasm_bindgen]
+#[derive(Clone)]
 pub struct WebIndexRegistry {
     index_registry: IndexRegistry,
     core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
@@ -22,16 +111,21 @@ pub struct WebIndexRegistry {
 
 #[wasm_bindgen]
 impl WebIndexRegistry {
-    #[wasm_bindgen(constructor)]
-    pub fn new(multithreading: bool) -> WebIndexRegistry {
-        console_error_panic_hook::set_once();
+    fn reserve_heap() {
         static mut HEAP: Vec<u8> = Vec::new();
         static START: Once = Once::new();
         START.call_once(|| unsafe {
             HEAP.reserve(512 * (1 << 20));
             HEAP.shrink_to_fit();
         });
+    }
+
+    #[wasm_bindgen(constructor)]
+    pub fn new(multithreading: bool) -> WebIndexRegistry {
+        console_error_panic_hook::set_once();
+        WebIndexRegistry::reserve_heap();
         let core_config = summa_core::configs::core::ConfigBuilder::default()
+            .dedicated_compression_thread(false)
             .writer_threads(0)
             .execution_strategy(match multithreading {
                 true => ExecutionStrategy::GlobalPool,
@@ -47,23 +141,22 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
+    pub fn search(&self, index_queries: JsValue) -> Result<JsSearchOperation, JsValue> {
         let index_queries: Vec<proto::IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
-        Ok(self.index_registry.search(&index_queries).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+        Ok(JsSearchOperation::new(self.clone(), index_queries))
     }
 
     #[wasm_bindgen]
-    pub async fn add(&mut self, remote_engine_config: JsValue) -> Result<JsValue, JsValue> {
+    pub fn add(&self, remote_engine_config: JsValue) -> Result<JsAddOperation, JsValue> {
         let remote_engine_config: RemoteEngineConfig = serde_wasm_bindgen::from_value(remote_engine_config)?;
-        Ok(self.add_internal(remote_engine_config).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+        Ok(JsAddOperation::new(self.clone(), remote_engine_config))
     }
 
-    async fn add_internal(&mut self, remote_engine_config: RemoteEngineConfig) -> SummaWasmResult<Option<IndexAttributes>> {
-        let mut index =
-            IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(&remote_engine_config).await?;
-        index.settings_mut().docstore_compress_dedicated_thread = false;
+    async fn add_internal(&self, remote_engine_config: RemoteEngineConfig, tracker: SubscribeTracker) -> SummaWasmResult<Option<IndexAttributes>> {
+        let index =
+            IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), tracker)
+                .await?;
         let core_config_value = self.core_config.read().await.get().clone();
-
         let index_holder = IndexHolder::create_holder(
             &self.core_config,
             &core_config_value,

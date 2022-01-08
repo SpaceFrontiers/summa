@@ -487,6 +487,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ea22880d78093b0cbe17c89f64a7d457941e65759157ec6cb31a31d652b05e5"
 
 [[package]]
+name = "base64"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a4ddaa51a5bc52a6948f74c06d20aaaddb71924eab79b8c97a8c556e942d6a"
+
+[[package]]
 name = "base64ct"
 version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1297,7 +1303,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "907076dfda823b0b36d2a1bb5f90c96660a5bbcd7729e10727f07858f22c4edc"
 dependencies = [
  "cfg-if",
- "hashbrown",
+ "hashbrown 0.12.3",
  "lock_api",
  "once_cell",
  "parking_lot_core 0.9.5",
@@ -1672,7 +1678,7 @@ checksum = "0d240c8aab8f3f9906bd3bd67a5a2104da85525b28462b396923db6f11a898aa"
 [[package]]
 name = "fastfield_codecs"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 dependencies = [
  "fastdivide",
  "itertools",
@@ -2056,6 +2062,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ff8ae62cd3a9102e5637afc8452c55acf3844001bd5374e0b0bd7b6616c038"
+dependencies = [
+ "ahash 0.8.2",
+]
+
+[[package]]
 name = "headers"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2363,7 +2378,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1885e79c1fc4b10f0e172c475f458b7f7b93061064d98c3293e98c5ba0c8b399"
 dependencies = [
  "autocfg",
- "hashbrown",
+ "hashbrown 0.12.3",
  "serde",
 ]
 
@@ -2439,7 +2454,7 @@ checksum = "30e22bd8629359895450b59ea7a776c850561b96a3b1d31321c1949d9e6c9146"
 [[package]]
 name = "iroh-api"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2465,7 +2480,7 @@ dependencies = [
 [[package]]
 name = "iroh-bitswap"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2503,7 +2518,7 @@ dependencies = [
 [[package]]
 name = "iroh-car"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "cid",
  "futures",
@@ -2517,7 +2532,7 @@ dependencies = [
 [[package]]
 name = "iroh-gateway"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -2577,7 +2592,7 @@ dependencies = [
 [[package]]
 name = "iroh-metrics"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "async-trait",
  "config",
@@ -2600,7 +2615,7 @@ dependencies = [
 [[package]]
 name = "iroh-p2p"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2639,7 +2654,7 @@ dependencies = [
 [[package]]
 name = "iroh-resolver"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2665,7 +2680,7 @@ dependencies = [
 [[package]]
 name = "iroh-rpc-client"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2688,7 +2703,7 @@ dependencies = [
 [[package]]
 name = "iroh-rpc-types"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2706,7 +2721,7 @@ dependencies = [
 [[package]]
 name = "iroh-store"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "ahash 0.8.2",
  "anyhow",
@@ -2740,7 +2755,7 @@ dependencies = [
 [[package]]
 name = "iroh-unixfs"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2777,7 +2792,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.2.0"
-source = "git+https://github.com/izihawa/iroh?branch=feature/summa#265d3a375b9f9eb083045d10bb649e8b1db0f7c4"
+source = "git+https://github.com/izihawa/iroh?branch=feature/summa#202f168521860a4bcffb5bd4fec602088f3d8d7f"
 dependencies = [
  "anyhow",
  "cid",
@@ -2788,7 +2803,7 @@ dependencies = [
  "humansize",
  "rlimit",
  "serde",
- "sysinfo 0.27.3",
+ "sysinfo 0.27.4",
  "thiserror",
  "toml",
  "tracing",
@@ -3587,20 +3602,20 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e999beba7b6e8345721bd280141ed958096a2e4abdf74f67ff4ce49b4b54e47a"
-dependencies = [
- "hashbrown",
-]
-
-[[package]]
-name = "lru"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e8aaa3f231bb4bd57b84b2d5dc3ae7f350265df8aa96492e0bc394a1571909"
 dependencies = [
- "hashbrown",
+ "hashbrown 0.12.3",
+]
+
+[[package]]
+name = "lru"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e7d46de488603ffdd5f30afbc64fbba2378214a2c3a2fb83abf3d33126df17"
+dependencies = [
+ "hashbrown 0.13.1",
 ]
 
 [[package]]
@@ -4246,7 +4261,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccd746e37177e1711c20dd619a1620f34f5c8b569c53590a72dedd5344d8924a"
 dependencies = [
  "dlv-list",
- "hashbrown",
+ "hashbrown 0.12.3",
 ]
 
 [[package]]
@@ -4264,7 +4279,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 [[package]]
 name = "ownedbytes"
 version = "0.5.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -4880,8 +4895,9 @@ dependencies = [
 
 [[package]]
 name = "quic-rpc"
-version = "0.3.1"
-source = "git+https://github.com/n0-computer/quic-rpc?branch=main#9cfe24743207a1771b1e29a5f6588a43bfbb3b91"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26426ee18cda93ddaf265f73715d90cbf8259d943e13438f89beb093286688b6"
 dependencies = [
  "bincode",
  "bytes",
@@ -5275,7 +5291,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cec2b3485b07d96ddfd3134767b8a447b45ea4eb91448d0a35180ec0ffd5ed15"
 dependencies = [
  "bytecheck",
- "hashbrown",
+ "hashbrown 0.12.3",
  "ptr_meta",
  "rend",
  "rkyv_derive",
@@ -5475,11 +5491,11 @@ dependencies = [
 
 [[package]]
 name = "rustls-pemfile"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0864aeff53f8c05aa08d86e5ef839d3dfcf07aeba2db32f12db0ef716e87bd55"
+checksum = "d194b56d58803a43635bdc398cd17e383d6f71f9182b9a192c127ca42494a59b"
 dependencies = [
- "base64 0.13.1",
+ "base64 0.21.0",
 ]
 
 [[package]]
@@ -5697,9 +5713,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25bf4a5a814902cd1014dbccfa4d4560fb8432c779471e96e035602519f82eef"
+checksum = "30d904179146de381af4c93d3af6ca4984b3152db687dacb9c3c35e86f39809c"
 dependencies = [
  "base64 0.13.1",
  "chrono",
@@ -5713,9 +5729,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3452b4c0f6c1e357f73fdb87cd1efabaa12acf328c7a528e252893baeb3f4aa"
+checksum = "a1966009f3c05f095697c537312f5415d1e3ed31ce0a56942bac4c771c5c335e"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -6033,6 +6049,7 @@ dependencies = [
  "lru 0.8.1",
  "once_cell",
  "opentelemetry",
+ "parking_lot 0.12.1",
  "prost",
  "rand 0.8.5",
  "rayon",
@@ -6144,7 +6161,7 @@ dependencies = [
 
 [[package]]
 name = "summa-wasm"
-version = "0.83.1"
+version = "0.84.3"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -6153,6 +6170,7 @@ dependencies = [
  "instant",
  "js-sys",
  "once_cell",
+ "parking_lot 0.12.1",
  "rayon",
  "serde",
  "serde-wasm-bindgen",
@@ -6215,9 +6233,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.27.3"
+version = "0.27.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1620f9573034c573376acc550f3b9a2be96daeb08abb3c12c8523e1cee06e80f"
+checksum = "444c7f371193a054273b0a1bbfe1e617b804b7fd62fd3e2794b4be6b0a872b0c"
 dependencies = [
  "cfg-if",
  "core-foundation-sys",
@@ -6258,12 +6276,12 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "tantivy"
 version = "0.19.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 dependencies = [
  "aho-corasick",
  "arc-swap",
  "async-trait",
- "base64 0.20.0",
+ "base64 0.21.0",
  "bitpacking",
  "byteorder",
  "census",
@@ -6279,7 +6297,7 @@ dependencies = [
  "itertools",
  "levenshtein_automata",
  "log",
- "lru 0.7.8",
+ "lru 0.9.0",
  "measure_time",
  "memmap2",
  "murmurhash32",
@@ -6299,6 +6317,7 @@ dependencies = [
  "tantivy-query-grammar",
  "tantivy-sstable",
  "tantivy-stacker",
+ "tantivy-tokenizer-api",
  "tempfile",
  "thiserror",
  "time",
@@ -6310,12 +6329,12 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.3.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 
 [[package]]
 name = "tantivy-common"
 version = "0.5.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -6336,7 +6355,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.19.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 dependencies = [
  "combine",
  "once_cell",
@@ -6346,7 +6365,7 @@ dependencies = [
 [[package]]
 name = "tantivy-sstable"
 version = "0.1.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 dependencies = [
  "ciborium",
  "serde",
@@ -6357,11 +6376,19 @@ dependencies = [
 [[package]]
 name = "tantivy-stacker"
 version = "0.1.0"
-source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#e0f23f990d0af4a10615aa561ae22c89686146aa"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
 dependencies = [
  "byteorder",
  "murmurhash32",
  "tantivy-common",
+]
+
+[[package]]
+name = "tantivy-tokenizer-api"
+version = "0.1.0"
+source = "git+https://github.com/izihawa/tantivy?branch=feature/pub-rayon#665a46c484be82bb3521a237ec4dafec831fd36f"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -7807,10 +7834,11 @@ dependencies = [
 
 [[package]]
 name = "zstd-sys"
-version = "2.0.4+zstd.1.5.2"
+version = "2.0.5+zstd.1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fa202f2ef00074143e219d15b62ffc317d17cc33909feac471c044087cad7b0"
+checksum = "edc50ffce891ad571e9f9afe5039c4837bede781ac4bb13052ed7ae695518596"
 dependencies = [
  "cc",
  "libc",
+ "pkg-config",
 ]

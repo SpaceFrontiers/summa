@@ -21,6 +21,7 @@ extern crate async_trait;
 mod errors;
 mod js_requests;
 mod rayon_helper;
+mod tracker;
 mod web_index_registry;
 
 use once_cell::sync::Lazy;

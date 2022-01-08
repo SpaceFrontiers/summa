@@ -41,6 +41,7 @@ pub trait ExternalRequest: Debug + Send + Sync {
         Self: Sized;
     fn request(self) -> SummaResult<ExternalResponse>;
     async fn request_async(self) -> SummaResult<ExternalResponse>;
+    fn url(&self) -> &str;
 }
 
 pub trait ExternalRequestGenerator<TExternalRequest: ExternalRequest>: ExternalRequestGeneratorClone<TExternalRequest> + Debug + Send + Sync {
