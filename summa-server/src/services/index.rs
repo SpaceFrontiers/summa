@@ -815,7 +815,12 @@ pub(crate) mod tests {
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder
-                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "issued_at")], NoTracker::default())
+                .search(
+                    "index",
+                    &match_query("term1"),
+                    &vec![top_docs_collector_with_eval_expr(10, "issued_at")],
+                    NoTracker::default()
+                )
                 .await?,
             vec![top_docs_collector_output(
                 vec![
@@ -835,7 +840,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             index_holder
-                .search("index", &match_query("term1"), &vec![top_docs_collector_with_eval_expr(10, "-issued_at")], NoTracker::default())
+                .search(
+                    "index",
+                    &match_query("term1"),
+                    &vec![top_docs_collector_with_eval_expr(10, "-issued_at")],
+                    NoTracker::default()
+                )
                 .await?,
             vec![top_docs_collector_output(
                 vec![

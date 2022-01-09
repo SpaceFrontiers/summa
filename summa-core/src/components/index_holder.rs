@@ -26,7 +26,7 @@ use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::tracker::Tracker;
-use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
+use crate::components::{IndexWriterHolder, SummaDocument, TrackerEvent, CACHE_METRICS};
 use crate::configs::core::ExecutionStrategy;
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, HotDirectory, NetworkDirectory, StaticDirectoryCache};
@@ -211,8 +211,8 @@ impl IndexHolder {
     ) -> SummaResult<Index> {
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
         let hotcache_handle = network_directory.get_network_file_handle("hotcache.bin".as_ref());
-        tracker.set_status(&format!("downloading {}...", hotcache_handle.url()?));
-        let hotcache_bytes = hotcache_handle.do_read_bytes_async(None).await.expect("cannot read hotcache");
+        tracker.send_event(TrackerEvent::ReadingHotcache);
+        let hotcache_bytes = hotcache_handle.do_read_bytes_async(None, tracker).await.expect("cannot read hotcache");
         let directory = wrap_with_caches(network_directory, Some(hotcache_bytes), remote_engine_config.chunked_cache_config.as_ref())?;
         Ok(Index::open(directory)?)
     }
@@ -280,7 +280,7 @@ impl IndexHolder {
         &self.cached_schema
     }
 
-    pub async fn warmup(&self) -> SummaResult<()> {
+    pub async fn warmup(&self, tracker: impl Tracker) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
         let index_attributes = self.index_attributes();
@@ -307,6 +307,7 @@ impl IndexHolder {
                     });
                 }
             }
+            tracker.send_event(TrackerEvent::WarmingUp);
             try_join_all(warm_up_futures).await?;
         }
         Ok(())
@@ -360,7 +361,7 @@ impl IndexHolder {
 
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        tracker.set_status("querying index...");
+        tracker.send_event(TrackerEvent::QueryingIndex);
         let mut multi_fruit = match execution_strategy {
             ExecutionStrategy::Async => searcher.search_async(&parsed_query, &multi_collector).await?,
             // ToDo: Reduce code here or in Tantivy `search_with_executor`
@@ -409,7 +410,7 @@ impl IndexHolder {
                     .collect()
             })
             .unwrap_or_else(HashSet::new);
-        tracker.set_status("collecting documents...");
+        tracker.send_event(TrackerEvent::CollectingDocuments);
         for extractor in extractors.into_iter() {
             collector_outputs.push(
                 extractor

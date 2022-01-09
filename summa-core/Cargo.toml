@@ -13,7 +13,7 @@ doc = true
 
 [features]
 fs = ["tantivy/mmap", "tokio/fs"]
-ipfs = ["iroh-api", "iroh-metrics", "iroh-resolver", "iroh-rpc-client", "iroh-unixfs"]
+ipfs = ["iroh-metrics", "iroh-resolver", "iroh-rpc-client", "iroh-unixfs"]
 metrics = ["opentelemetry"]
 
 [dependencies]
@@ -27,7 +27,6 @@ derive_builder = "0.12"
 fasteval2 = { version = "2.0", features = ["unsafe-vars"] }
 futures = "0.3"
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
-iroh-api = { workspace = true, optional = true }
 iroh-metrics = { workspace = true, optional = true }
 iroh-resolver = { workspace = true, optional = true }
 iroh-rpc-client = { workspace = true, optional = true }
@@ -52,6 +51,6 @@ summa-proto = { version = "0.11.0", path = "../summa-proto", default_features = 
 take_mut = "0.2"
 tantivy = { workspace = true }
 thiserror = "1.0"
-time = { version = "0.3.14", features = ["serde-well-known", "wasm-bindgen"] }
+time = { version = "0.3.17", features = ["serde-well-known", "wasm-bindgen"] }
 tokio = { version = "1.21.2", default_features = false, features = ["macros", "rt", "signal-hook-registry", "sync"] }
 tracing = "0.1"

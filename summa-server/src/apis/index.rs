@@ -7,7 +7,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Instant;
 
-use summa_core::components::{IndexHolder, SummaDocument};
+use summa_core::components::{IndexHolder, NoTracker, SummaDocument};
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::sync::Handler;
 use summa_proto::proto;
@@ -273,7 +273,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         let now = Instant::now();
-        index_holder.warmup().await.map_err(crate::errors::Error::from)?;
+        index_holder.warmup(NoTracker::default()).await.map_err(crate::errors::Error::from)?;
         let elapsed_secs = now.elapsed().as_secs_f64();
         let response = proto::WarmupIndexResponse { elapsed_secs };
         Ok(Response::new(response))

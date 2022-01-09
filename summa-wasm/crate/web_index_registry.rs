@@ -12,19 +12,8 @@ use wasm_bindgen::JsValue;
 
 use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;
-use crate::tracker::{SubscribeTracker, TrackerEvent};
+use crate::tracker::SubscribeTracker;
 use crate::SERIALIZER;
-
-#[wasm_bindgen]
-#[derive(Clone)]
-pub struct JsTrackerSnapshot(TrackerEvent);
-
-#[wasm_bindgen]
-impl JsTrackerSnapshot {
-    pub fn last_status(&self) -> String {
-        self.0.status.to_string()
-    }
-}
 
 #[wasm_bindgen]
 #[derive(Clone, Default)]
@@ -103,6 +92,37 @@ impl JsSearchOperation {
 }
 
 #[wasm_bindgen]
+pub struct JsWarmupOperation {
+    web_index_registry: WebIndexRegistry,
+    index_name: String,
+    tracker: JsTracker,
+}
+
+#[wasm_bindgen]
+impl JsWarmupOperation {
+    pub(crate) fn new(web_index_registry: WebIndexRegistry, index_name: &str) -> JsWarmupOperation {
+        JsWarmupOperation {
+            web_index_registry,
+            index_name: index_name.to_string(),
+            tracker: JsTracker::default(),
+        }
+    }
+    pub fn tracker(&self) -> JsTracker {
+        self.tracker.clone()
+    }
+
+    pub async fn execute(self) -> Result<(), JsValue> {
+        let index_holder = self
+            .web_index_registry
+            .index_registry
+            .get_index_holder_by_name(&self.index_name)
+            .await
+            .map_err(Error::from)?;
+        Ok(index_holder.warmup(self.tracker.0).await.map_err(Error::from)?)
+    }
+}
+
+#[wasm_bindgen]
 #[derive(Clone)]
 pub struct WebIndexRegistry {
     index_registry: IndexRegistry,
@@ -177,10 +197,8 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub async fn warmup(&self, index_name: &str) -> Result<(), JsValue> {
-        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
-        index_holder.warmup().await.map_err(Error::from)?;
-        Ok(())
+    pub fn warmup(&self, index_name: &str) -> Result<JsWarmupOperation, JsValue> {
+        Ok(JsWarmupOperation::new(self.clone(), index_name))
     }
 
     #[wasm_bindgen]

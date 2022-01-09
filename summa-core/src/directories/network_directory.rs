@@ -8,6 +8,7 @@ use tantivy::{
 };
 
 use super::ExternalRequestGenerator;
+use crate::components::{NoTracker, Tracker, TrackerEvent};
 use crate::directories::{ExternalRequest, Noop};
 use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
@@ -85,9 +86,12 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
         Ok(OwnedBytes::new(request_response.data))
     }
 
-    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<usize>>) -> io::Result<OwnedBytes> {
+    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<usize>>, tracker: impl Tracker) -> io::Result<OwnedBytes> {
         let request = self.request_generator.generate_range_request(&self.file_name, byte_range)?;
+        let url = request.url().to_string();
+        tracker.send_event(TrackerEvent::start_reading_file(&url));
         let request_fut = request.request_async();
+        tracker.send_event(TrackerEvent::finish_reading_file(&url));
         Ok(OwnedBytes::new(request_fut.await?.data))
     }
 
@@ -119,7 +123,7 @@ impl<TExternalRequest: ExternalRequest + Debug + 'static> FileHandle for Network
     }
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        self.do_read_bytes_async(Some(byte_range)).await
+        self.do_read_bytes_async(Some(byte_range), NoTracker::default()).await
     }
 }
 

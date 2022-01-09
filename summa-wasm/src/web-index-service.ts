@@ -1,4 +1,4 @@
-import init, { init_thread_pool, JsTrackerSnapshot, WebIndexRegistry } from "../pkg";
+import init, { init_thread_pool, WebIndexRegistry } from "../pkg";
 import {IndexAttributes, RemoteEngineConfig} from "./configs";
 
 export class IndexQuery {
@@ -22,25 +22,35 @@ export class WebIndexService {
       await init_thread_pool(threads);
     }
   }
-  async add(remote_engine_config: RemoteEngineConfig, cb: (tracker_snapshot: JsTrackerSnapshot) => void): Promise<IndexAttributes> {
+  async add(remote_engine_config: RemoteEngineConfig, cb?: (tracker_event: object) => void): Promise<IndexAttributes> {
     let add_operation = this.registry!.add(remote_engine_config);
-    await add_operation.tracker().add_subscriber((tracker_snapshot: JsTrackerSnapshot) => {
-      cb(tracker_snapshot)
-    });
+    if (cb) {
+      await add_operation.tracker().add_subscriber((tracker_event: object) => {
+        cb(tracker_event)
+      });
+    }
     return await add_operation.execute();
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
   }
-  async search(index_queries: IndexQuery[], cb: (tracker_snapshot: JsTrackerSnapshot) => void) {
+  async search(index_queries: IndexQuery[], cb?: (tracker_event: object) => void) {
     let search_operation = this.registry!.search(index_queries);
-    await search_operation.tracker().add_subscriber((tracker_snapshot: JsTrackerSnapshot) => {
-      cb(tracker_snapshot)
-    });
+    if (cb) {
+      await search_operation.tracker().add_subscriber((tracker_event: object) => {
+        cb(tracker_event)
+      });
+    }
     return await search_operation.execute();
   }
-  async warmup(index_name: string) {
-    return await this.registry!.warmup(index_name);
+  async warmup(index_name: string, cb?: (tracker_event: object) => void) {
+    let warmup_operation = this.registry!.warmup(index_name);
+    if (cb) {
+      await warmup_operation.tracker().add_subscriber((tracker_event: object) => {
+        cb(tracker_event)
+      });
+    }
+    return await warmup_operation.execute();
   }
   async index_document(index_name: string, document: string) {
     return await this.registry!.index_document(index_name, document)
