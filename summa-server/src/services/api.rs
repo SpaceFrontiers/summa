@@ -91,8 +91,8 @@ impl Api {
             .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("session-id"), |_: &_| {
                 Some(HeaderValue::from_str(&generate_request_id()).expect("invalid generated session id"))
             }))
-            .concurrency_limit(10)
-            .buffer(100)
+            .concurrency_limit(api_config.concurrency_limit)
+            .buffer(api_config.buffer)
             .layer(
                 TraceLayer::new_for_grpc()
                     .make_span_with(Api::set_span)

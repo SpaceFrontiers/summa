@@ -13,20 +13,28 @@ use crate::errors::SummaServerResult;
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
+    /// Base path for storing new indices and setting dependent components on initalization
     #[builder(setter(custom))]
     pub data_path: PathBuf,
+    /// Enable debugging logs to `stdout`
     pub debug: bool,
+    /// Summa API configuration
     pub api: crate::configs::api::Config,
+    /// Iroh P2P configuration
     pub p2p: Option<crate::configs::p2p::Config>,
+    /// Iroh Store configuration
     pub store: crate::configs::store::Config,
+    /// Iroh Gateway configuration
     pub gateway: Option<crate::configs::gateway::Config>,
+    /// Path to directory with logs
     #[builder(setter(custom))]
     pub log_path: PathBuf,
+    /// Summa Metrics configuration
     pub metrics: crate::configs::metrics::Config,
-
+    /// Kafka consumers
     #[builder(default = "HashMap::new()")]
     pub consumers: HashMap<String, crate::configs::consumer::Config>,
-
+    /// Summa options
     #[serde(default)]
     pub core: summa_core::configs::core::Config,
 }

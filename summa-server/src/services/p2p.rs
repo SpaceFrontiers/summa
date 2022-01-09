@@ -17,7 +17,7 @@ pub struct P2p {
 impl P2p {
     pub async fn new(config: crate::configs::p2p::Config) -> SummaServerResult<P2p> {
         tokio::fs::create_dir_all(&config.key_store_path).await?;
-        let rpc_addr: P2pAddr = config.endpoint.parse()?;
+        let rpc_addr: P2pAddr = format!("irpc://{}", config.endpoint).parse()?;
 
         let bootstrap_peers = config
             .bootstrap
@@ -26,10 +26,17 @@ impl P2p {
             .iter()
             .map(|node| node.parse().expect("incorrect bootstrap node"))
             .collect();
+        let listening_multiaddrs = config
+            .listening_multiaddrs
+            .clone()
+            .iter()
+            .map(|node| node.parse().expect("incorrect multiaddr"))
+            .collect();
         let mut libp2p_config = Libp2pConfig::default();
         libp2p_config.bootstrap_peers = bootstrap_peers;
         libp2p_config.gossipsub = false;
-        libp2p_config.max_conns_out = 256;
+        libp2p_config.max_conns_out = config.max_conns_out;
+        libp2p_config.listening_multiaddrs = listening_multiaddrs;
         Ok(P2p {
             config: config.clone(),
             rpc_addr,

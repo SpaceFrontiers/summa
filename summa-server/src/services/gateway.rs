@@ -18,7 +18,7 @@ impl Gateway {
         store_service: &crate::services::Store,
         p2p_service: Option<&crate::services::P2p>,
     ) -> SummaServerResult<Gateway> {
-        let rpc_addr: GatewayAddr = config.p2p_endpoint.parse()?;
+        let rpc_addr: GatewayAddr = format!("irpc://{}", config.p2p_endpoint).parse()?;
         let gateway_config = config.derive_iroh_gateway_config(store_service, p2p_service)?;
         let core = iroh_gateway::core::Core::new(
             Arc::new(gateway_config),

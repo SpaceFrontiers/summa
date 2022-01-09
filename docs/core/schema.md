@@ -1,7 +1,7 @@
 ---
 title: Schema
 parent: Core
-nav_order: 3
+nav_order: 4
 ---
 ## Schema
 Summa stores and index objects named `Document`s. Every `Document` may be represented as json object with named fields:

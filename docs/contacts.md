@@ -3,6 +3,8 @@ title: Contacts
 nav_order: 6
 ---
 
+### Support Chat: [@Telegram](https://t.me/+lCDtzXKpXfNmYmUy)
+
 ### Maintainer: [@PashaPodolsky](https://pashapodolsky.t.me)
 - [GitHub](https://github.com/pashapodolsky)
 - [Telegram](https://pashapodolsky.t.me)

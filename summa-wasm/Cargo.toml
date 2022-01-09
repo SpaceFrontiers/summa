@@ -1,6 +1,6 @@
 [package]
 name = "summa-wasm"
-version = "0.84.3"
+version = "0.85.0"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"

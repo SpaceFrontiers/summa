@@ -24,15 +24,14 @@ docker pull izihawa/summa-server:testing
 mkdir data
 
 # Generate config for `summa-server`
-# -g flag is for setting listen address of GRPC API
-# -m flag is for setting listen address of Metrics API
-# add -i flag for setting IPFS endpoint
+# -a flag is for setting listen address of GRPC API
+# -i flag is for setting listen address of Iroh Gateway HTTP
 docker run izihawa/summa-server:testing generate-config -d /data \
--g 0.0.0.0:8082 -m 0.0.0.0:8084 > summa.yaml
+-a 0.0.0.0:8082 -i 0.0.0.0:8080 > summa.yaml
 
 # Launch `summa-server`
 docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data \
--p 8082:8082 -p 8084:8084 \
+-p 8082:8082 -p 8080:8080 \
 izihawa/summa-server:testing serve /summa.yaml
 ```
 
@@ -73,7 +72,7 @@ Let's do a test query:
 
 ```bash
 # Do a match query that returns top-10 documents and its total count
-summa-cli localhost:8082 search '[{"index_alias": "books", "query": {"match": {"value": "astronomy"}}, "collectors": [{"top_docs": {"limit": 10}}, {"count": {}}]}]'
+summa-cli 0.0.0.0:8082 search '[{"index_alias": "books", "query": {"match": {"value": "astronomy"}}, "collectors": [{"top_docs": {"limit": 10}}, {"count": {}}]}]'
 ```
 
 You will see response containing found documents.

@@ -7,9 +7,12 @@ use summa_core::errors::BuilderError;
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
+    /// Default chunk size used in `Store`
     #[builder(default = "64 * 1024")]
     pub default_chunk_size: u64,
+    /// Iroh Store RPC endpoint in format: `127.0.0.1:4402`
     pub endpoint: String,
+    /// Path to store files
     #[builder(setter(custom))]
     pub path: PathBuf,
 }
@@ -18,7 +21,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             default_chunk_size: 64 * 1024,
-            endpoint: "irpc://127.0.0.1:4402".to_string(),
+            endpoint: "127.0.0.1:4402".to_string(),
             path: PathBuf::new(),
         }
     }

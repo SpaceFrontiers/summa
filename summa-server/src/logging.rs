@@ -8,7 +8,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-const ENV_FILTER: &str = "librdkafka=info,\
+const ENV_FILTER: &str = "trust_dns_proto=error,\
+    iroh_bitswap=error,\
+    iroh_resolver=error,\
+    librdkafka=info,\
     rdkafka::client=info,\
     summa_core::components=info,\
     summa_core::apis=info,\

@@ -47,13 +47,8 @@ impl Server {
                 command!("generate-config")
                     .about("Generate default config file")
                     .arg(arg!(-d <DATA_PATH> "Path for storing configs and data").default_value("data").num_args(1))
-                    .arg(arg!(-g <API_GRPC_ENDPOINT> "API GRPC endpoint").default_value("127.0.0.1:8082").num_args(1))
-                    .arg(arg!(-g <API_HTTP_ENDPOINT> "API HTTP endpoint").default_value("127.0.0.1:8081").num_args(1))
-                    .arg(
-                        arg!(-m <METRICS_ENDPOINT> "Metrics listen endpoint")
-                            .default_value("127.0.0.1:8084")
-                            .num_args(1),
-                    ),
+                    .arg(arg!(-a <API_GRPC_ENDPOINT> "API GRPC endpoint").default_value("127.0.0.1:8082").num_args(1))
+                    .arg(arg!(-i <IROH_GATEWAY_HTTP_ENDPOINT> "Iroh Gateway HTTP endpoint")),
             )
             .subcommand(
                 command!("serve")
@@ -66,21 +61,13 @@ impl Server {
             Some(("generate-config", submatches)) => {
                 let data_path = PathBuf::from(submatches.try_get_one::<String>("DATA_PATH")?.expect("no value"));
                 let api_grpc_endpoint = submatches.try_get_one::<String>("API_GRPC_ENDPOINT")?.expect("no value");
-                let api_http_endpoint = submatches.try_get_one::<String>("API_HTTP_ENDPOINT")?;
-                let metrics_endpoint = submatches.try_get_one::<String>("METRICS_ENDPOINT")?.expect("no value");
+                let iroh_gateway_http_endpoint = submatches.try_get_one::<String>("IROH_GATEWAY_HTTP_ENDPOINT")?;
                 let server_config = crate::configs::server::ConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
                     .api(
                         crate::configs::api::ConfigBuilder::default()
                             .grpc_endpoint(api_grpc_endpoint.to_string())
-                            .http_endpoint(api_http_endpoint.cloned())
-                            .build()
-                            .map_err(summa_core::Error::from)?,
-                    )
-                    .metrics(
-                        crate::configs::metrics::ConfigBuilder::default()
-                            .endpoint(metrics_endpoint.to_string())
                             .build()
                             .map_err(summa_core::Error::from)?,
                     )
@@ -95,6 +82,16 @@ impl Server {
                             .path(data_path.join("store"))
                             .build()
                             .map_err(summa_core::Error::from)?,
+                    )
+                    .gateway(
+                        iroh_gateway_http_endpoint
+                            .map(|http_endpoint| {
+                                crate::configs::gateway::ConfigBuilder::default()
+                                    .http_endpoint(http_endpoint.to_string())
+                                    .build()
+                                    .map_err(summa_core::Error::from)
+                            })
+                            .transpose()?,
                     )
                     .build()
                     .map_err(summa_core::Error::from)?;

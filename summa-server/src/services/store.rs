@@ -20,7 +20,7 @@ pub struct Store {
 
 impl Store {
     pub async fn new(config: crate::configs::store::Config, content_loader: iroh_unixfs::content_loader::FullLoader) -> SummaServerResult<Store> {
-        let rpc_addr: StoreAddr = config.endpoint.parse()?;
+        let rpc_addr: StoreAddr = format!("irpc://{}", config.endpoint).parse()?;
         let iroh_store_config = iroh_store::Config::with_rpc_addr(config.path.clone(), rpc_addr.clone());
         let store = if config.path.exists() {
             info!(action = "open_store", path = ?config.path);
@@ -49,7 +49,7 @@ impl Store {
 
     #[instrument("lifecycle", skip_all)]
     pub async fn prepare_serving_future(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        let rpc_addr = self.config.endpoint.parse()?;
+        let rpc_addr = format!("irpc://{}", self.config.endpoint).parse()?;
         let store_task = tokio::spawn(iroh_store::rpc::new(rpc_addr, self.store.clone()));
 
         info!(action = "binded", endpoint = ?self.config.endpoint);

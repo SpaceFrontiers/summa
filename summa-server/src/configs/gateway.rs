@@ -14,10 +14,15 @@ use crate::errors::SummaServerResult;
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
+    /// Iroh Gateway HTTP endpoint in format: `127.0.0.1:8080`
     pub http_endpoint: String,
+    /// Iroh Gateway RPC endpoint in format: `127.0.0.1:4400`
     pub p2p_endpoint: String,
+    /// TLD resolvers for specific domains
     pub dns_resolver: iroh_resolver::dns_resolver::Config,
+    /// Headers that will be added to each HTTP response
     pub headers: HashMap<String, String>,
+    /// Public URL base
     pub public_url_base: String,
 }
 
@@ -25,7 +30,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             http_endpoint: "127.0.0.1:8080".to_string(),
-            p2p_endpoint: "irpc://127.0.0.1:4400".to_string(),
+            p2p_endpoint: "127.0.0.1:4400".to_string(),
             dns_resolver: iroh_resolver::dns_resolver::Config::default(),
             headers: HashMap::default(),
             public_url_base: "http://localhost:8080/".to_string(),
@@ -39,7 +44,7 @@ impl Config {
         store_service: &crate::services::Store,
         p2p_service: Option<&crate::services::P2p>,
     ) -> SummaServerResult<iroh_gateway::config::Config> {
-        let gateway_addr = self.p2p_endpoint.parse::<GatewayAddr>()?;
+        let gateway_addr = format!("irpc://{}", self.p2p_endpoint).parse::<GatewayAddr>()?;
         let mut config = iroh_gateway::config::Config::default();
         config.rpc_client.gateway_addr = Some(gateway_addr);
         config.rpc_client.store_addr = Some(store_service.rpc_addr().clone());

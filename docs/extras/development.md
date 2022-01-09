@@ -1,6 +1,7 @@
 ---
 title: Development
 parent: Extras
+nav_order: 3
 ---
 Summa is armed with both Cargo and Bazel build systems. 
 Feel free to use what is fit to you.
