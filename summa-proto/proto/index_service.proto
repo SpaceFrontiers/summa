@@ -66,10 +66,12 @@ message AttachIndexRequest {
  }
 }
 
+// Attach index response
 message AttachIndexResponse {
   IndexDescription index = 1;
 }
 
+// Commit index request
 message CommitIndexRequest {
   string index_alias = 1;
   CommitMode commit_mode = 2;
@@ -191,6 +193,7 @@ message SetIndexAliasRequest {
 }
 
 message SetIndexAliasResponse {
+  // If set, equals to the previous alias of the index
   optional string old_index_name = 1;
 }
 
@@ -204,9 +207,12 @@ message VacuumIndexResponse {
 
 message WarmupIndexRequest {
   string index_alias = 1;
+  // If set to false, only term dictionaries will be warmed, otherwise the entire index will be read.
+  bool is_full = 2;
 }
 
 message WarmupIndexResponse {
+  // Time spent in warming operation
   double elapsed_secs = 1;
 }
 
@@ -269,7 +275,10 @@ message IndexOperation {
  }
 }
 
+// Commit mode
 enum CommitMode {
+  // Returns immediately and then commits in the background
   Async = 0;
+  // Waits until the end of commit
   Sync = 1;
 }

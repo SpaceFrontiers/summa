@@ -8,19 +8,18 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-const ENV_FILTER: &str = "trust_dns_proto=error,\
-    iroh_bitswap=error,\
-    iroh_resolver=error,\
-    librdkafka=info,\
-    rdkafka::client=info,\
+const ENV_FILTER: &str = "librdkafka=warn,\
+    rdkafka::client=warn,\
     summa_core::components=info,\
     summa_core::apis=info,\
+    summa_core=warn,\
     summa_server::services=info,\
     summa_server::components=info,\
     summa_server::server[lifecycle]=info,\
-    tantivy=info,\
-    fastfield_codecs=info,\
-    warn";
+    summa_server=warn,\
+    tantivy=warn,\
+    fastfield_codecs=warn,\
+    error";
 
 const REQUEST_ENV_FILTER: &str = "summa_server::server::grpc[request]=info,summa_server::server::metrics[request]=info";
 

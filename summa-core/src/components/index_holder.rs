@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 #[cfg(feature = "metrics")]
 use instant::Instant;
 #[cfg(feature = "metrics")]
@@ -280,7 +280,7 @@ impl IndexHolder {
         &self.cached_schema
     }
 
-    pub async fn warmup(&self, tracker: impl Tracker) -> SummaResult<()> {
+    pub async fn partial_warmup(&self, tracker: impl Tracker) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
         let index_attributes = self.index_attributes();
@@ -310,6 +310,20 @@ impl IndexHolder {
             tracker.send_event(TrackerEvent::WarmingUp);
             try_join_all(warm_up_futures).await?;
         }
+        Ok(())
+    }
+
+    pub async fn full_warmup(&self, tracker: impl Tracker) -> SummaResult<()> {
+        let managed_directory = self.index.directory();
+        tracker.send_event(TrackerEvent::WarmingUp);
+        join_all(managed_directory.list_managed_files().iter().map(move |file| {
+            let tracker = tracker.clone();
+            async move {
+                tracker.send_event(TrackerEvent::StartReadingFile(file.to_string_lossy().to_string()));
+                managed_directory.atomic_read_async(file).await
+            }
+        }))
+        .await;
         Ok(())
     }
 

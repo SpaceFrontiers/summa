@@ -564,6 +564,7 @@ class SummaClient(BaseGrpcClient):
     async def warmup_index(
         self,
         index_alias: str,
+        is_full: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.VacuumIndexResponse:
@@ -572,11 +573,12 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_alias: index alias
+            is_full: should full or partial warm up be done
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].warmup_index(
-            index_service_pb.WarmupIndexRequest(index_alias=index_alias),
+            index_service_pb.WarmupIndexRequest(index_alias=index_alias, is_full=is_full),
             metadata=setup_metadata(session_id, request_id),
         )
 

@@ -118,7 +118,7 @@ impl JsWarmupOperation {
             .get_index_holder_by_name(&self.index_name)
             .await
             .map_err(Error::from)?;
-        Ok(index_holder.warmup(self.tracker.0).await.map_err(Error::from)?)
+        Ok(index_holder.partial_warmup(self.tracker.0).await.map_err(Error::from)?)
     }
 }
 

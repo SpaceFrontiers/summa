@@ -273,7 +273,10 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         let now = Instant::now();
-        index_holder.warmup(NoTracker::default()).await.map_err(crate::errors::Error::from)?;
+        match proto_request.is_full {
+            true => index_holder.full_warmup(NoTracker::default()).await.map_err(crate::errors::Error::from)?,
+            false => index_holder.partial_warmup(NoTracker::default()).await.map_err(crate::errors::Error::from)?,
+        }
         let elapsed_secs = now.elapsed().as_secs_f64();
         let response = proto::WarmupIndexResponse { elapsed_secs };
         Ok(Response::new(response))
