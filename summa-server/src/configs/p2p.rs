@@ -18,7 +18,7 @@ fn default_listening_multiaddrs() -> Vec<String> {
 }
 
 fn default_max_conns_out() -> u32 {
-    512
+    256
 }
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
@@ -53,7 +53,7 @@ impl Default for Config {
             key_store_path: PathBuf::new(),
             bootstrap: None,
             http_gateways: default_http_gateways(),
-            max_conns_out: 512,
+            max_conns_out: 256,
             listening_multiaddrs: default_listening_multiaddrs(),
         }
     }
