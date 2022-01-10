@@ -5,7 +5,9 @@
 # Summa
 
 Summa is a full-text, IPFS-friendly and WASM-compatible search server written in Rust
+
 Yes, your data may be replicated and published through IPFS!
+
 Yes, you may launch Summa entirely inside your browser and then search in IPFS published index!
 
 Start with our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start)
