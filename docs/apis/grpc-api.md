@@ -4,12 +4,6 @@ parent: APIs
 ---
 ## GRPC API
 
-- [beacon_service.proto](#beacon_service-proto)
-    - [BeaconApi](#summa-proto-BeaconApi)
-  
-    - [PublishIndexRequest](#summa-proto-PublishIndexRequest)
-    - [PublishIndexResponse](#summa-proto-PublishIndexResponse)
-  
 - [consumer_service.proto](#consumer_service-proto)
     - [ConsumerApi](#summa-proto-ConsumerApi)
   
@@ -26,11 +20,12 @@ parent: APIs
 - [index_service.proto](#index_service-proto)
     - [IndexApi](#summa-proto-IndexApi)
   
-    - [AlterIndexRequest](#summa-proto-AlterIndexRequest)
-    - [AlterIndexRequest.Fields](#summa-proto-AlterIndexRequest-Fields)
-    - [AlterIndexResponse](#summa-proto-AlterIndexResponse)
+    - [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest)
     - [AttachIndexRequest](#summa-proto-AttachIndexRequest)
     - [AttachIndexResponse](#summa-proto-AttachIndexResponse)
+    - [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest)
+    - [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest)
+    - [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig)
     - [CommitIndexRequest](#summa-proto-CommitIndexRequest)
     - [CommitIndexResponse](#summa-proto-CommitIndexResponse)
     - [CreateIndexRequest](#summa-proto-CreateIndexRequest)
@@ -39,6 +34,7 @@ parent: APIs
     - [DeleteDocumentResponse](#summa-proto-DeleteDocumentResponse)
     - [DeleteIndexRequest](#summa-proto-DeleteIndexRequest)
     - [DeleteIndexResponse](#summa-proto-DeleteIndexResponse)
+    - [FileEngineConfig](#summa-proto-FileEngineConfig)
     - [GetIndexRequest](#summa-proto-GetIndexRequest)
     - [GetIndexResponse](#summa-proto-GetIndexResponse)
     - [GetIndicesAliasesRequest](#summa-proto-GetIndicesAliasesRequest)
@@ -46,24 +42,35 @@ parent: APIs
     - [GetIndicesAliasesResponse.IndicesAliasesEntry](#summa-proto-GetIndicesAliasesResponse-IndicesAliasesEntry)
     - [GetIndicesRequest](#summa-proto-GetIndicesRequest)
     - [GetIndicesResponse](#summa-proto-GetIndicesResponse)
-    - [Index](#summa-proto-Index)
+    - [IndexAttributes](#summa-proto-IndexAttributes)
+    - [IndexDescription](#summa-proto-IndexDescription)
     - [IndexDocumentOperation](#summa-proto-IndexDocumentOperation)
     - [IndexDocumentRequest](#summa-proto-IndexDocumentRequest)
     - [IndexDocumentResponse](#summa-proto-IndexDocumentResponse)
     - [IndexDocumentStreamRequest](#summa-proto-IndexDocumentStreamRequest)
     - [IndexDocumentStreamResponse](#summa-proto-IndexDocumentStreamResponse)
+    - [IndexEngineConfig](#summa-proto-IndexEngineConfig)
     - [IndexOperation](#summa-proto-IndexOperation)
+    - [IpfsEngineConfig](#summa-proto-IpfsEngineConfig)
+    - [MemoryEngineConfig](#summa-proto-MemoryEngineConfig)
     - [MergeSegmentsRequest](#summa-proto-MergeSegmentsRequest)
     - [MergeSegmentsResponse](#summa-proto-MergeSegmentsResponse)
+    - [MigrateIndexRequest](#summa-proto-MigrateIndexRequest)
+    - [MigrateIndexResponse](#summa-proto-MigrateIndexResponse)
+    - [PrimaryKey](#summa-proto-PrimaryKey)
+    - [RemoteEngineConfig](#summa-proto-RemoteEngineConfig)
+    - [RemoteEngineConfig.HeadersTemplateEntry](#summa-proto-RemoteEngineConfig-HeadersTemplateEntry)
     - [SetIndexAliasRequest](#summa-proto-SetIndexAliasRequest)
     - [SetIndexAliasResponse](#summa-proto-SetIndexAliasResponse)
     - [SortByField](#summa-proto-SortByField)
     - [VacuumIndexRequest](#summa-proto-VacuumIndexRequest)
     - [VacuumIndexResponse](#summa-proto-VacuumIndexResponse)
+    - [WarmupIndexRequest](#summa-proto-WarmupIndexRequest)
+    - [WarmupIndexResponse](#summa-proto-WarmupIndexResponse)
   
     - [CommitMode](#summa-proto-CommitMode)
     - [Compression](#summa-proto-Compression)
-    - [IndexEngine](#summa-proto-IndexEngine)
+    - [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest)
   
 - [query.proto](#query-proto)
     - [Aggregation](#summa-proto-Aggregation)
@@ -144,6 +151,7 @@ parent: APIs
 - [search_service.proto](#search_service-proto)
     - [SearchApi](#summa-proto-SearchApi)
   
+    - [IndexQuery](#summa-proto-IndexQuery)
     - [SearchRequest](#summa-proto-SearchRequest)
     - [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry)
   
@@ -152,62 +160,6 @@ parent: APIs
   
     - [Order](#summa-proto-Order)
   
-
-
-
-<a name="beacon_service-proto"></a>
-
-## beacon_service.proto
-
-
-
-<a name="summa-proto-PublishIndexRequest"></a>
-
-### PublishIndexRequest
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
-| payload | [string](#string) | optional | Optional string that will be stored as payload for the final commit |
-
-
-
-
-
-
-<a name="summa-proto-PublishIndexResponse"></a>
-
-### PublishIndexResponse
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| hash | [string](#string) |  | IPFS Hash for directory root |
-
-
-
-
-
- <!-- end messages -->
-
- <!-- end enums -->
-
- <!-- end HasExtensions -->
-
-
-<a name="summa-proto-BeaconApi"></a>
-
-### BeaconApi
-Communication with IPFS
-
-| Method Name | Request Type | Response Type | Description |
-| ----------- | ------------ | ------------- | ------------|
-| publish_index | [PublishIndexRequest](#summa-proto-PublishIndexRequest) | [PublishIndexResponse](#summa-proto-PublishIndexResponse) | Put index to IPFS |
-
- <!-- end services -->
 
 
 
@@ -225,8 +177,8 @@ Extra structures
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_name | [string](#string) |  |  |
 | consumer_name | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 
 
 
@@ -243,7 +195,7 @@ Extra structures
 | ----- | ---- | ----- | ----------- |
 | bootstrap_servers | [string](#string) | repeated |  |
 | group_id | [string](#string) |  |  |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | consumer_name | [string](#string) |  |  |
 | topics | [string](#string) | repeated |  |
 
@@ -275,7 +227,6 @@ Extra structures
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
 | consumer_name | [string](#string) |  |  |
 
 
@@ -287,6 +238,11 @@ Extra structures
 
 ### DeleteConsumerResponse
 
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| consumer_name | [string](#string) |  |  |
 
 
 
@@ -358,14 +314,14 @@ Extra structures
 <a name="summa-proto-ConsumerApi"></a>
 
 ### ConsumerApi
-Manages consumers that ingest data from Kafka
+Manages ingestion data from Kafka
 
 | Method Name | Request Type | Response Type | Description |
 | ----------- | ------------ | ------------- | ------------|
 | create_consumer | [CreateConsumerRequest](#summa-proto-CreateConsumerRequest) | [CreateConsumerResponse](#summa-proto-CreateConsumerResponse) | Create a new consumer |
 | get_consumer | [GetConsumerRequest](#summa-proto-GetConsumerRequest) | [GetConsumerResponse](#summa-proto-GetConsumerResponse) | Get a single consumer |
-| get_consumers | [GetConsumersRequest](#summa-proto-GetConsumersRequest) | [GetConsumersResponse](#summa-proto-GetConsumersResponse) |  |
-| delete_consumer | [DeleteConsumerRequest](#summa-proto-DeleteConsumerRequest) | [DeleteConsumerResponse](#summa-proto-DeleteConsumerResponse) |  |
+| get_consumers | [GetConsumersRequest](#summa-proto-GetConsumersRequest) | [GetConsumersResponse](#summa-proto-GetConsumersResponse) | Get a list of all consumers |
+| delete_consumer | [DeleteConsumerRequest](#summa-proto-DeleteConsumerRequest) | [DeleteConsumerResponse](#summa-proto-DeleteConsumerResponse) | Remove a consumer |
 
  <!-- end services -->
 
@@ -377,50 +333,10 @@ Manages consumers that ingest data from Kafka
 
 
 
-<a name="summa-proto-AlterIndexRequest"></a>
+<a name="summa-proto-AttachFileEngineRequest"></a>
 
-### AlterIndexRequest
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| index_name | [string](#string) |  |  |
-| compression | [Compression](#summa-proto-Compression) | optional |  |
-| blocksize | [uint32](#uint32) | optional |  |
-| sort_by_field | [SortByField](#summa-proto-SortByField) | optional |  |
-| default_fields | [AlterIndexRequest.Fields](#summa-proto-AlterIndexRequest-Fields) |  |  |
-| multi_fields | [AlterIndexRequest.Fields](#summa-proto-AlterIndexRequest-Fields) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-AlterIndexRequest-Fields"></a>
-
-### AlterIndexRequest.Fields
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| fields | [string](#string) | repeated |  |
-
-
-
-
-
-
-<a name="summa-proto-AlterIndexResponse"></a>
-
-### AlterIndexResponse
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| index | [Index](#summa-proto-Index) |  |  |
+### AttachFileEngineRequest
+Attach file engine request
 
 
 
@@ -430,12 +346,15 @@ Manages consumers that ingest data from Kafka
 <a name="summa-proto-AttachIndexRequest"></a>
 
 ### AttachIndexRequest
-
+Attach index request
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
+| attach_file_engine_request | [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest) |  |  |
+| attach_remote_engine_request | [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest) |  |  |
+| attach_ipfs_engine_request | [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest) |  |  |
 
 
 
@@ -445,12 +364,53 @@ Manages consumers that ingest data from Kafka
 <a name="summa-proto-AttachIndexResponse"></a>
 
 ### AttachIndexResponse
+Attach index response
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-AttachIpfsEngineRequest"></a>
+
+### AttachIpfsEngineRequest
+Attach file engine request
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| cid | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-AttachRemoteEngineRequest"></a>
+
+### AttachRemoteEngineRequest
+Attach remote engine request
+
+
+
+
+
+
+<a name="summa-proto-ChunkedCacheConfig"></a>
+
+### ChunkedCacheConfig
 
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index | [Index](#summa-proto-Index) |  |  |
+| chunk_size | [uint64](#uint64) |  |  |
+| cache_size | [uint64](#uint64) | optional |  |
 
 
 
@@ -460,7 +420,7 @@ Manages consumers that ingest data from Kafka
 <a name="summa-proto-CommitIndexRequest"></a>
 
 ### CommitIndexRequest
-
+Commit index request
 
 
 | Field | Type | Label | Description |
@@ -497,17 +457,12 @@ Manages consumers that ingest data from Kafka
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
+| index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  |  |
 | schema | [string](#string) |  |  |
-| index_engine | [IndexEngine](#summa-proto-IndexEngine) |  |  |
-| primary_key | [string](#string) | optional |  |
-| default_fields | [string](#string) | repeated |  |
 | compression | [Compression](#summa-proto-Compression) |  |  |
 | blocksize | [uint32](#uint32) | optional |  |
-| writer_heap_size_bytes | [uint64](#uint64) | optional |  |
-| writer_threads | [uint64](#uint64) | optional |  |
-| autocommit_interval_ms | [uint64](#uint64) | optional |  |
 | sort_by_field | [SortByField](#summa-proto-SortByField) | optional |  |
-| multi_fields | [string](#string) | repeated |  |
+| index_attributes | [IndexAttributes](#summa-proto-IndexAttributes) |  |  |
 
 
 
@@ -522,7 +477,7 @@ Manages consumers that ingest data from Kafka
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index | [Index](#summa-proto-Index) |  |  |
+| index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
 
 
 
@@ -538,7 +493,7 @@ Manages consumers that ingest data from Kafka
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_alias | [string](#string) |  |  |
-| primary_key | [int64](#int64) |  |  |
+| primary_key | [PrimaryKey](#summa-proto-PrimaryKey) |  |  |
 
 
 
@@ -576,6 +531,26 @@ Manages consumers that ingest data from Kafka
 
 
 
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index_name | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-FileEngineConfig"></a>
+
+### FileEngineConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| path | [string](#string) |  |  |
+
+
 
 
 
@@ -603,7 +578,7 @@ Manages consumers that ingest data from Kafka
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index | [Index](#summa-proto-Index) |  |  |
+| index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
 
 
 
@@ -669,16 +644,37 @@ Manages consumers that ingest data from Kafka
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| indices | [Index](#summa-proto-Index) | repeated |  |
+| indices | [IndexDescription](#summa-proto-IndexDescription) | repeated |  |
 
 
 
 
 
 
-<a name="summa-proto-Index"></a>
+<a name="summa-proto-IndexAttributes"></a>
 
-### Index
+### IndexAttributes
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| created_at | [uint64](#uint64) |  |  |
+| primary_key | [string](#string) | optional |  |
+| default_fields | [string](#string) | repeated |  |
+| multi_fields | [string](#string) | repeated |  |
+| default_index_name | [string](#string) | optional |  |
+| description | [string](#string) | optional |  |
+| default_snippets | [string](#string) | repeated |  |
+
+
+
+
+
+
+<a name="summa-proto-IndexDescription"></a>
+
+### IndexDescription
 
 
 
@@ -686,7 +682,7 @@ Manages consumers that ingest data from Kafka
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
 | index_aliases | [string](#string) | repeated |  |
-| index_engine | [string](#string) |  |  |
+| index_engine | [IndexEngineConfig](#summa-proto-IndexEngineConfig) |  |  |
 | num_docs | [uint64](#uint64) |  |  |
 | compression | [Compression](#summa-proto-Compression) |  |  |
 
@@ -769,6 +765,24 @@ Manages consumers that ingest data from Kafka
 
 
 
+<a name="summa-proto-IndexEngineConfig"></a>
+
+### IndexEngineConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| file | [FileEngineConfig](#summa-proto-FileEngineConfig) |  |  |
+| memory | [MemoryEngineConfig](#summa-proto-MemoryEngineConfig) |  |  |
+| remote | [RemoteEngineConfig](#summa-proto-RemoteEngineConfig) |  |  |
+| ipfs | [IpfsEngineConfig](#summa-proto-IpfsEngineConfig) |  |  |
+
+
+
+
+
+
 <a name="summa-proto-IndexOperation"></a>
 
 ### IndexOperation
@@ -778,6 +792,38 @@ Manages consumers that ingest data from Kafka
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_document | [IndexDocumentOperation](#summa-proto-IndexDocumentOperation) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-IpfsEngineConfig"></a>
+
+### IpfsEngineConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| cid | [string](#string) |  |  |
+| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
+| path | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-MemoryEngineConfig"></a>
+
+### MemoryEngineConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| schema | [string](#string) |  |  |
 
 
 
@@ -810,6 +856,88 @@ Manages consumers that ingest data from Kafka
 
 
 
+<a name="summa-proto-MigrateIndexRequest"></a>
+
+### MigrateIndexRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| source_index_name | [string](#string) |  |  |
+| target_index_name | [string](#string) |  |  |
+| target_index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-MigrateIndexResponse"></a>
+
+### MigrateIndexResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-PrimaryKey"></a>
+
+### PrimaryKey
+Possible primary keys
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| str | [string](#string) |  |  |
+| i64 | [int64](#int64) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-RemoteEngineConfig"></a>
+
+### RemoteEngineConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| method | [string](#string) |  |  |
+| url_template | [string](#string) |  |  |
+| headers_template | [RemoteEngineConfig.HeadersTemplateEntry](#summa-proto-RemoteEngineConfig-HeadersTemplateEntry) | repeated |  |
+| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-RemoteEngineConfig-HeadersTemplateEntry"></a>
+
+### RemoteEngineConfig.HeadersTemplateEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [string](#string) |  |  |
+
+
+
+
+
+
 <a name="summa-proto-SetIndexAliasRequest"></a>
 
 ### SetIndexAliasRequest
@@ -834,7 +962,7 @@ Manages consumers that ingest data from Kafka
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| old_index_name | [string](#string) | optional |  |
+| old_index_name | [string](#string) | optional | If set, equals to the previous alias of the index |
 
 
 
@@ -881,18 +1009,49 @@ repeated string deleted_files = 1;
 
 
 
+
+<a name="summa-proto-WarmupIndexRequest"></a>
+
+### WarmupIndexRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index_alias | [string](#string) |  |  |
+| is_full | [bool](#bool) |  | If set to false, only term dictionaries will be warmed, otherwise the entire index will be read. |
+
+
+
+
+
+
+<a name="summa-proto-WarmupIndexResponse"></a>
+
+### WarmupIndexResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| elapsed_secs | [double](#double) |  | Time spent in warming operation |
+
+
+
+
+
  <!-- end messages -->
 
 
 <a name="summa-proto-CommitMode"></a>
 
 ### CommitMode
-
+Commit mode
 
 | Name | Number | Description |
 | ---- | ------ | ----------- |
-| Async | 0 |  |
-| Sync | 1 |  |
+| Async | 0 | Returns immediately and then commits in the background |
+| Sync | 1 | Waits until the end of commit |
 
 
 
@@ -911,15 +1070,16 @@ repeated string deleted_files = 1;
 
 
 
-<a name="summa-proto-IndexEngine"></a>
+<a name="summa-proto-CreateIndexEngineRequest"></a>
 
-### IndexEngine
+### CreateIndexEngineRequest
 
 
 | Name | Number | Description |
 | ---- | ------ | ----------- |
 | File | 0 |  |
 | Memory | 1 |  |
+| Ipfs | 2 |  |
 
 
  <!-- end enums -->
@@ -934,20 +1094,21 @@ Manages indices
 
 | Method Name | Request Type | Response Type | Description |
 | ----------- | ------------ | ------------- | ------------|
-| alter_index | [AlterIndexRequest](#summa-proto-AlterIndexRequest) | [AlterIndexResponse](#summa-proto-AlterIndexResponse) |  |
-| attach_index | [AttachIndexRequest](#summa-proto-AttachIndexRequest) | [AttachIndexResponse](#summa-proto-AttachIndexResponse) |  |
-| commit_index | [CommitIndexRequest](#summa-proto-CommitIndexRequest) | [CommitIndexResponse](#summa-proto-CommitIndexResponse) |  |
-| create_index | [CreateIndexRequest](#summa-proto-CreateIndexRequest) | [CreateIndexResponse](#summa-proto-CreateIndexResponse) |  |
-| delete_document | [DeleteDocumentRequest](#summa-proto-DeleteDocumentRequest) | [DeleteDocumentResponse](#summa-proto-DeleteDocumentResponse) |  |
-| delete_index | [DeleteIndexRequest](#summa-proto-DeleteIndexRequest) | [DeleteIndexResponse](#summa-proto-DeleteIndexResponse) |  |
-| get_indices_aliases | [GetIndicesAliasesRequest](#summa-proto-GetIndicesAliasesRequest) | [GetIndicesAliasesResponse](#summa-proto-GetIndicesAliasesResponse) |  |
-| get_index | [GetIndexRequest](#summa-proto-GetIndexRequest) | [GetIndexResponse](#summa-proto-GetIndexResponse) |  |
-| get_indices | [GetIndicesRequest](#summa-proto-GetIndicesRequest) | [GetIndicesResponse](#summa-proto-GetIndicesResponse) |  |
-| index_document_stream | [IndexDocumentStreamRequest](#summa-proto-IndexDocumentStreamRequest) stream | [IndexDocumentStreamResponse](#summa-proto-IndexDocumentStreamResponse) |  |
-| index_document | [IndexDocumentRequest](#summa-proto-IndexDocumentRequest) | [IndexDocumentResponse](#summa-proto-IndexDocumentResponse) |  |
-| merge_segments | [MergeSegmentsRequest](#summa-proto-MergeSegmentsRequest) | [MergeSegmentsResponse](#summa-proto-MergeSegmentsResponse) |  |
-| set_index_alias | [SetIndexAliasRequest](#summa-proto-SetIndexAliasRequest) | [SetIndexAliasResponse](#summa-proto-SetIndexAliasResponse) |  |
-| vacuum_index | [VacuumIndexRequest](#summa-proto-VacuumIndexRequest) | [VacuumIndexResponse](#summa-proto-VacuumIndexResponse) |  |
+| attach_index | [AttachIndexRequest](#summa-proto-AttachIndexRequest) | [AttachIndexResponse](#summa-proto-AttachIndexResponse) | Attaches index to Summa server. Attaching allows to incorporate and start using of downloaded or network indices |
+| commit_index | [CommitIndexRequest](#summa-proto-CommitIndexRequest) | [CommitIndexResponse](#summa-proto-CommitIndexResponse) | Committing all collected writes to the index |
+| create_index | [CreateIndexRequest](#summa-proto-CreateIndexRequest) | [CreateIndexResponse](#summa-proto-CreateIndexResponse) | Creates new index from scratch |
+| migrate_index | [MigrateIndexRequest](#summa-proto-MigrateIndexRequest) | [MigrateIndexResponse](#summa-proto-MigrateIndexResponse) | Creates new index from scratch |
+| delete_document | [DeleteDocumentRequest](#summa-proto-DeleteDocumentRequest) | [DeleteDocumentResponse](#summa-proto-DeleteDocumentResponse) | Deletes single document from the index by its primary key (therefore, index must have primary key) |
+| delete_index | [DeleteIndexRequest](#summa-proto-DeleteIndexRequest) | [DeleteIndexResponse](#summa-proto-DeleteIndexResponse) | Deletes index and physically removes file in the case of `FileEngine` |
+| get_indices_aliases | [GetIndicesAliasesRequest](#summa-proto-GetIndicesAliasesRequest) | [GetIndicesAliasesResponse](#summa-proto-GetIndicesAliasesResponse) | Gets all existing index aliases |
+| get_index | [GetIndexRequest](#summa-proto-GetIndexRequest) | [GetIndexResponse](#summa-proto-GetIndexResponse) | Gets index description |
+| get_indices | [GetIndicesRequest](#summa-proto-GetIndicesRequest) | [GetIndicesResponse](#summa-proto-GetIndicesResponse) | Gets all existing index descriptions |
+| index_document_stream | [IndexDocumentStreamRequest](#summa-proto-IndexDocumentStreamRequest) stream | [IndexDocumentStreamResponse](#summa-proto-IndexDocumentStreamResponse) | Adds document to the index in a streaming way |
+| index_document | [IndexDocumentRequest](#summa-proto-IndexDocumentRequest) | [IndexDocumentResponse](#summa-proto-IndexDocumentResponse) | Adds document to the index |
+| merge_segments | [MergeSegmentsRequest](#summa-proto-MergeSegmentsRequest) | [MergeSegmentsResponse](#summa-proto-MergeSegmentsResponse) | Merges multiple segments into a single one. Used for service purposes |
+| set_index_alias | [SetIndexAliasRequest](#summa-proto-SetIndexAliasRequest) | [SetIndexAliasResponse](#summa-proto-SetIndexAliasResponse) | Sets or replaces existing index alias |
+| vacuum_index | [VacuumIndexRequest](#summa-proto-VacuumIndexRequest) | [VacuumIndexResponse](#summa-proto-VacuumIndexResponse) | Removes deletions from all segments |
+| warmup_index | [WarmupIndexRequest](#summa-proto-WarmupIndexRequest) | [WarmupIndexResponse](#summa-proto-WarmupIndexResponse) | Loads all hot parts of the index into the memory |
 
  <!-- end services -->
 
@@ -1814,7 +1975,6 @@ Recursive query DSL
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_name | [string](#string) |  | The real index name got through alias resolution |
 | collector_outputs | [CollectorOutput](#summa-proto-CollectorOutput) | repeated | An array of collector outputs |
 | elapsed_secs | [double](#double) |  | Time spent inside of `search` handler |
 
@@ -2128,9 +2288,9 @@ Analyzes indices
 
 
 
-<a name="summa-proto-SearchRequest"></a>
+<a name="summa-proto-IndexQuery"></a>
 
-### SearchRequest
+### IndexQuery
 
 
 
@@ -2139,7 +2299,22 @@ Analyzes indices
 | index_alias | [string](#string) |  | The index name or alias |
 | query | [Query](#summa-proto-Query) |  | Query DSL. Use `MatchQuery` to pass a free-form query |
 | collectors | [Collector](#summa-proto-Collector) | repeated | Every collector is responsible of processing and storing documents and/or their derivatives (like counters) to return them to the caller |
-| tags | [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry) | repeated | Extra fields used only for logging purposes |
+
+
+
+
+
+
+<a name="summa-proto-SearchRequest"></a>
+
+### SearchRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index_queries | [IndexQuery](#summa-proto-IndexQuery) | repeated |  |
+| tags | [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry) | repeated |  |
 
 
 

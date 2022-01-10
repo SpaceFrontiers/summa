@@ -2,6 +2,7 @@ use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
 
+use base64::Engine;
 #[cfg(feature = "metrics")]
 use opentelemetry::metrics::Counter;
 #[cfg(feature = "metrics")]
@@ -49,7 +50,9 @@ fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> Summ
         ),
         FieldType::Bytes(_) => Term::from_field_bytes(
             field,
-            &base64::decode(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as bytes")))?,
+            &base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as bytes")))?,
         ),
         FieldType::Date(_) => Term::from_field_date(
             field,

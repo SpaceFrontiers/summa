@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::str::{from_utf8, FromStr};
 
+use base64::Engine;
 use serde_json::Value as JsonValue;
 use tantivy::schema::{Facet, FieldType, IntoIpv6Addr, Schema, Value};
 use tantivy::tokenizer::PreTokenizedString;
@@ -76,7 +77,8 @@ impl<'a> SummaDocument<'a> {
                     json: JsonValue::String(field_text),
                 }),
                 FieldType::Facet(_) => Ok(Value::Facet(Facet::from(&field_text))),
-                FieldType::Bytes(_) => base64::decode(&field_text)
+                FieldType::Bytes(_) => base64::engine::general_purpose::STANDARD
+                    .decode(&field_text)
                     .map(Value::Bytes)
                     .map_err(|_| ValueParsingError::InvalidBase64 { base64: field_text }),
                 FieldType::JsonObject(_) => Err(ValueParsingError::TypeError {

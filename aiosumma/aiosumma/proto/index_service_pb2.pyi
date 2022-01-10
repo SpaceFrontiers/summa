@@ -354,10 +354,12 @@ class VacuumIndexResponse(_message.Message):
     def __init__(self) -> None: ...
 
 class WarmupIndexRequest(_message.Message):
-    __slots__ = ["index_alias"]
+    __slots__ = ["index_alias", "is_full"]
     INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    IS_FULL_FIELD_NUMBER: _ClassVar[int]
     index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ...) -> None: ...
+    is_full: bool
+    def __init__(self, index_alias: _Optional[str] = ..., is_full: bool = ...) -> None: ...
 
 class WarmupIndexResponse(_message.Message):
     __slots__ = ["elapsed_secs"]

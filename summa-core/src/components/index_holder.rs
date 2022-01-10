@@ -320,10 +320,14 @@ impl IndexHolder {
             let tracker = tracker.clone();
             async move {
                 tracker.send_event(TrackerEvent::StartReadingFile(file.to_string_lossy().to_string()));
-                managed_directory.atomic_read_async(file).await
+                let file_handler = managed_directory.get_file_handle(file).expect("cannot open file");
+                file_handler.read_bytes_async(0..file_handler.len()).await?;
+                Ok(())
             }
         }))
-        .await;
+        .await
+        .into_iter()
+        .collect::<SummaResult<Vec<_>>>()?;
         Ok(())
     }
 
