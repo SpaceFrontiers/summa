@@ -317,8 +317,10 @@ impl IndexHolder {
         let managed_directory = self.index.directory();
         tracker.send_event(TrackerEvent::WarmingUp);
         for file in managed_directory.list_managed_files() {
-            tracker.send_event(TrackerEvent::StartReadingFile(file.to_string_lossy().to_string()));
+            let file_name = file.to_string_lossy().to_string();
+            tracker.send_event(TrackerEvent::StartReadingFile(file_name.to_string()));
             managed_directory.atomic_read(&file).expect("cannot open file");
+            tracker.send_event(TrackerEvent::FinishReadingFile(file_name.to_string()));
         }
     }
 

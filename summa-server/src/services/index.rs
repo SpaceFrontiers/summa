@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_broadcast::Receiver;
-use summa_core::components::{IndexHolder, IndexRegistry, NoTracker};
+use summa_core::components::{DefaultTracker, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
@@ -515,8 +515,11 @@ impl Index {
             Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(config.path)?,
             Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
             Some(proto::index_engine_config::Config::Remote(config)) => {
-                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, NoTracker::default())
-                    .await?
+                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
+                    config,
+                    DefaultTracker::default(),
+                )
+                .await?
             }
             Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader()).await?,
             _ => unimplemented!(),
@@ -578,7 +581,7 @@ impl Index {
     }
 
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
-        Ok(self.index_registry.search(&search_request.index_queries, NoTracker::default()).await?)
+        Ok(self.index_registry.search(&search_request.index_queries, DefaultTracker::default()).await?)
     }
 }
 
@@ -761,7 +764,7 @@ pub(crate) mod tests {
         index_holder.index_writer_holder().write().await.commit().await?;
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
-            index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)], NoTracker::default()).await?,
+            index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)], DefaultTracker::default()).await?,
             vec![top_docs_collector_output(
                 vec![scored_doc(
                     "{\
@@ -819,7 +822,7 @@ pub(crate) mod tests {
                     "index",
                     &match_query("term1"),
                     &vec![top_docs_collector_with_eval_expr(10, "issued_at")],
-                    NoTracker::default()
+                    DefaultTracker::default()
                 )
                 .await?,
             vec![top_docs_collector_output(
@@ -844,7 +847,7 @@ pub(crate) mod tests {
                     "index",
                     &match_query("term1"),
                     &vec![top_docs_collector_with_eval_expr(10, "-issued_at")],
-                    NoTracker::default()
+                    DefaultTracker::default()
                 )
                 .await?,
             vec![top_docs_collector_output(

@@ -8,7 +8,7 @@ use tantivy::{
 };
 
 use super::ExternalRequestGenerator;
-use crate::components::{NoTracker, Tracker, TrackerEvent};
+use crate::components::{DefaultTracker, Tracker, TrackerEvent};
 use crate::directories::{ExternalRequest, Noop};
 use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
@@ -123,7 +123,7 @@ impl<TExternalRequest: ExternalRequest + Debug + 'static> FileHandle for Network
     }
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        self.do_read_bytes_async(Some(byte_range), NoTracker::default()).await
+        self.do_read_bytes_async(Some(byte_range), DefaultTracker::default()).await
     }
 }
 

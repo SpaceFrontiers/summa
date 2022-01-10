@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,7 +27,9 @@ pub trait Tracker: Clone {
 }
 
 #[derive(Clone, Default)]
-pub struct NoTracker {}
-impl Tracker for NoTracker {
-    fn send_event(&self, _: TrackerEvent) {}
+pub struct DefaultTracker {}
+impl Tracker for DefaultTracker {
+    fn send_event(&self, event: TrackerEvent) {
+        info!(action = "tracker_event", event = ?event)
+    }
 }

@@ -21,7 +21,7 @@ pub use query_parser::QueryParser;
 pub use segment_attributes::SummaSegmentAttributes;
 pub use summa_document::{DocumentParsingError, SummaDocument};
 pub use summa_tokenizer::SummaTokenizer;
-pub use tracker::{NoTracker, Tracker, TrackerEvent};
+pub use tracker::{DefaultTracker, Tracker, TrackerEvent};
 
 use crate::metrics::CacheMetrics;
 
