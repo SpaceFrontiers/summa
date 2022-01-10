@@ -5,8 +5,8 @@ nav_order: 1
 ---
 
 Summa is composed of multiple various parts, most important ones are 
-- [Iroh](https://github.com/n0-computer/iroh) allowing to download and distribute indices through [IPFS](https://ipfs.tech) network
 - [Tantivy](https://github.com/quickwit-oss/tantivy) using to do search operations in indices
+- [Iroh](https://github.com/n0-computer/iroh) allowing to download and distribute indices through [IPFS](https://ipfs.tech) network
 - [WASM](/summa/core/wasm) for compiling and launching the subset of Summa in browsers 
 
 Summa Server combines all server parts together. It operates indices, put them in Iroh Store and manages Iroh
@@ -37,7 +37,6 @@ summa-cli 0.0.0.0:8082 commit-index test_index
 # Do search
 summa-cli 0.0.0.0:8082 search \
 '[{"index_alias": "test_index", "query": {"term": {"field": "title", "value": "war"}}, "collectors": [{"top_docs": {"limit": 10}}, {"count": {}}]}]'
-# Commit
 ```
 
 #### File
@@ -50,9 +49,25 @@ summa-cli 0.0.0.0:8082 search \
 of files for indices that are using both for serving queries and replication.
 Keeping files in Iroh Store adds an intermediate layer for reading, so you should enable cache for alleviation IO penalty.
 
+```bash 
+# Migrate existing File index to IPFS engine
+summa-cli 0.0.0.0:8082 migrate-index test_index test_index_ipfs Ipfs
+```
+
+After the last step you will see CID of the index that may be used for replication and accessing index through Summa WASM bindings in browsers.
+
+Now, you may get your index at another Summa instance:
+```bash 
+summa-cli 0.0.0.0:8082 attach-index test_index --ipfs '{"cid": "<cid from previous step>" }'
+```
+
+IPFS indices are mutable. After every commit all data is put to Iroh Store and you will obtain new CID for your index.
+
 #### Remote
 
 `Remote` engine allows you to create search retrieving index files from any remote HTTP storage (s3 including).
+
+### Replication
 
 ### Aliases
 Server tracks aliases for indices and allows to atomically switch aliases.
