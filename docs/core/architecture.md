@@ -51,18 +51,6 @@ Stores index data in Iroh Store and serves queries directly from the store. It e
 of files for indices that are using both for serving queries and replication.
 Keeping files in Iroh Store adds an intermediate layer for reading, so you should enable cache for alleviation IO penalty.
 
-```bash 
-# Migrate existing File index to IPFS engine
-summa-cli 0.0.0.0:8082 migrate-index test_index test_index_ipfs Ipfs
-```
-
-After the last step you will see CID of the index that may be used for replication and accessing index through Summa WASM bindings in browsers.
-
-Now, you may get your index at another Summa instance:
-```bash 
-summa-cli 0.0.0.0:8082 attach-index test_index --ipfs '{"cid": "<cid from previous step>" }'
-```
-
 IPFS indices are mutable. After every commit all data is put to Iroh Store and you will obtain new CID for your index.
 
 #### Remote
@@ -74,6 +62,25 @@ IPFS indices are mutable. After every commit all data is put to Iroh Store and y
 Replication is delegated to Iroh. At startup, Summa becomes a part of IPFS swarm capable to distribute files through IPFS to its peers.
 You may create and configure your own private swarm or use public swarms if you need to distribute your data publicly.
 
+#### Kick-start Replication
+Your index must have Iroh-engine for being replicatable:
+
+```bash 
+# Migrate existing File index to IPFS engine
+summa-cli 0.0.0.0:8082 migrate-index test_index test_index_ipfs Ipfs
+```
+
+After the last step you will see CID of the index that may be used for replication and accessing index through Summa WASM bindings in browsers.
+You may retrieve it vie usual IPFS tools or directly attach it at another Summa Server instance:
+
+```bash 
+summa-cli 0.0.0.0:8082 attach-index test_index --ipfs '{"cid": "<cid from previous step>" }'
+```
+
 ### Aliases
-Server tracks aliases for indices and allows to atomically switch aliases.
+Server tracks aliases for indices and allows to atomically switch aliases:
+
+```bash
+summa-cli 0.0.0.0:8082 set-index-alias test_index test_index_20220113
+```
 
