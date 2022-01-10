@@ -131,8 +131,8 @@ impl<T: ContentLoader + Unpin + 'static> FileHandle for IrohFile<T> {
     fn read_bytes(&self, byte_range: Range<usize>) -> std::io::Result<OwnedBytes> {
         let (s, mut r) = tokio::sync::mpsc::unbounded_channel();
         let file = self.clone();
-        tokio::spawn(async move { s.send(file.read_bytes_async(byte_range).await.expect("cannot read")).expect("cannot spawn") });
-        Ok(r.blocking_recv().expect("cannot block on channel"))
+        tokio::spawn(async move { s.send(file.read_bytes_async(byte_range).await).expect("cannot send to channel") });
+        r.blocking_recv().expect("cannot block on channel")
     }
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> std::io::Result<OwnedBytes> {

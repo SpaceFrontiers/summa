@@ -6,4 +6,4 @@ has_toc: true
 ---
 # Extras
 
-Section provides information related to development and performance
+Section provides information related to development, performance and deployment

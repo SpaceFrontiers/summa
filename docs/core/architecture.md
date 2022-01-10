@@ -54,7 +54,6 @@ Keeping files in Iroh Store adds an intermediate layer for reading, so you shoul
 
 `Remote` engine allows you to create search retrieving index files from any remote HTTP storage (s3 including).
 
-
 ### Aliases
 Server tracks aliases for indices and allows to atomically switch aliases.
 
