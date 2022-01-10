@@ -151,7 +151,7 @@ class SummaClient(BaseGrpcClient):
         self,
         index_name: str,
         index_engine: str,
-        schema: str,
+        schema: str | list,
         compression: Optional[Union[str, int]] = None,
         blocksize: Optional[int] = None,
         sort_by_field: Optional[Tuple] = None,
@@ -177,6 +177,8 @@ class SummaClient(BaseGrpcClient):
             compression = index_service_pb.Compression.Value(compression)
         elif isinstance(compression, int):
             compression = index_service_pb.Compression.Name(compression)
+        if isinstance(schema, list):
+            schema = json.dumps(schema)
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
