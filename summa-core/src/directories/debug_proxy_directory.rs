@@ -196,6 +196,7 @@ impl<D: Directory> HasLen for DebugProxyFileHandle<D> {
     }
 }
 
+#[async_trait]
 impl<D: Directory> Directory for DebugProxyDirectory<D> {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let underlying = self.underlying.get_file_handle(path)?;
@@ -213,6 +214,14 @@ impl<D: Directory> Directory for DebugProxyDirectory<D> {
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let read_operation_builder = ReadOperationBuilder::new(path);
         let payload = self.underlying.atomic_read(path)?;
+        let read_operation = read_operation_builder.terminate(payload.len());
+        self.register(read_operation);
+        Ok(payload.to_vec())
+    }
+
+    async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        let read_operation_builder = ReadOperationBuilder::new(path);
+        let payload = self.underlying.atomic_read_async(path).await?;
         let read_operation = read_operation_builder.terminate(payload.len());
         self.register(read_operation);
         Ok(payload.to_vec())

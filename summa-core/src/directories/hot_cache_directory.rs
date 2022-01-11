@@ -378,6 +378,7 @@ impl Debug for HotDirectory {
     }
 }
 
+#[async_trait]
 impl Directory for HotDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let file_length = self
@@ -405,6 +406,14 @@ impl Directory for HotDirectory {
             return Ok(all_bytes.as_slice().to_owned());
         }
         self.inner.underlying.atomic_read(path)
+    }
+
+    async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        let slice_cache = self.inner.cache.get_slice(path);
+        if let Some(all_bytes) = slice_cache.try_read_all() {
+            return Ok(all_bytes.as_slice().to_owned());
+        }
+        self.inner.underlying.atomic_read_async(path).await
     }
 
     super::read_only_directory!();

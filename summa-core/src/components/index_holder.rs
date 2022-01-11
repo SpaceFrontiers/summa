@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 #[cfg(feature = "metrics")]
 use instant::Instant;
 #[cfg(feature = "metrics")]
@@ -313,15 +313,23 @@ impl IndexHolder {
         Ok(())
     }
 
-    pub fn full_warmup(&self, tracker: impl Tracker) {
+    pub async fn full_warmup(&self, tracker: impl Tracker) -> SummaResult<()> {
         let managed_directory = self.index.directory();
         tracker.send_event(TrackerEvent::WarmingUp);
-        for file in managed_directory.list_managed_files() {
+        join_all(managed_directory.list_managed_files().into_iter().map(move |file| {
+            let tracker = tracker.clone();
             let file_name = file.to_string_lossy().to_string();
-            tracker.send_event(TrackerEvent::StartReadingFile(file_name.to_string()));
-            managed_directory.atomic_read(&file).expect("cannot open file");
-            tracker.send_event(TrackerEvent::FinishReadingFile(file_name.to_string()));
-        }
+            async move {
+                tracker.send_event(TrackerEvent::StartReadingFile(file_name.clone()));
+                managed_directory.atomic_read_async(&file).await.map_err(|e| Error::Tantivy(e.into()))?;
+                tracker.send_event(TrackerEvent::FinishReadingFile(file_name));
+                Ok(())
+            }
+        }))
+        .await
+        .into_iter()
+        .collect::<SummaResult<Vec<_>>>()?;
+        Ok(())
     }
 
     /// Delete `IndexHolder` instance

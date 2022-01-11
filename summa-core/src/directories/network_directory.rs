@@ -42,6 +42,7 @@ impl<TExternalRequest: ExternalRequest + 'static> DirectoryClone for NetworkDire
     }
 }
 
+#[async_trait]
 impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory<TExternalRequest> {
     fn get_file_handle(&self, file_name: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         Ok(Arc::new(self.get_network_file_handle(file_name)))
@@ -55,6 +56,15 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
         let file_handle = self.get_network_file_handle(path);
         Ok(file_handle
             .do_read_bytes(None)
+            .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?
+            .to_vec())
+    }
+
+    async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        let file_handle = self.get_network_file_handle(path);
+        Ok(file_handle
+            .do_read_bytes_async(None, DefaultTracker::default())
+            .await
             .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?
             .to_vec())
     }

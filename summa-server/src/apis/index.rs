@@ -274,9 +274,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
         let now = Instant::now();
         match proto_request.is_full {
-            true => tokio::task::spawn_blocking(move || index_holder.full_warmup(DefaultTracker::default()))
-                .await
-                .map_err(crate::errors::Error::from)?,
+            true => index_holder.full_warmup(DefaultTracker::default()).await.map_err(crate::errors::Error::from)?,
             false => index_holder
                 .partial_warmup(DefaultTracker::default())
                 .await

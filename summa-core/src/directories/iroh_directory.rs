@@ -94,6 +94,15 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
         }
     }
 
+    async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        if self.underlying.exists(path)? {
+            self.underlying.atomic_read_async(path).await
+        } else {
+            let file_handle = self.get_iroh_file_handle(path)?;
+            Ok(file_handle.read_bytes_async(0..file_handle.len()).await.expect("cannot read").to_vec())
+        }
+    }
+
     fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
         self.underlying.atomic_write(path, data)
     }

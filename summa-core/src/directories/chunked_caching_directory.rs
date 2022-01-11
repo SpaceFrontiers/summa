@@ -70,6 +70,7 @@ impl Debug for ChunkedCachingDirectory {
     }
 }
 
+#[async_trait]
 impl Directory for ChunkedCachingDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let underlying_filehandle = self.underlying.get_file_handle(path)?;
@@ -91,6 +92,16 @@ impl Directory for ChunkedCachingDirectory {
         let len = file_handle.len();
         let owned_bytes = file_handle
             .read_bytes(0..len)
+            .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
+        Ok(owned_bytes.as_slice().to_vec())
+    }
+
+    async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        let file_handle = self.get_file_handle(path)?;
+        let len = file_handle.len();
+        let owned_bytes = file_handle
+            .read_bytes_async(0..len)
+            .await
             .map_err(|io_error| OpenReadError::wrap_io_error(io_error, path.to_path_buf()))?;
         Ok(owned_bytes.as_slice().to_vec())
     }
