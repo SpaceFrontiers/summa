@@ -4,12 +4,14 @@ nav_exclude: true
 search_exclude: true
 ---
 
-Summa is a full-text, IPFS-friendly and WASM-compatible search server written in Rust
+Summa is a full-text, IPFS-friendly and WASM-compatible blazing fast search engine written in Rust.
 
 - Yes, your data may be replicated and published through IPFS!
-- Yes, you may launch Summa entirely inside your browser and then search in IPFS published index!
+- Yes, you may launch Summa entirely inside your browser and then search in IPFS published index withoud sending queries to centralized servers!
 
-Start with our [Quick Start guide](/summa/guides/quick-start) or [Architecture](/summa/core/architecture) description.
+These both properties allow you to create distributed (hence uncensorable) and privacy-first search systems.
+
+Start with our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start) or [Architecture description](https://izihawa.github.io/summa/core/architecture)
 
 ## Key Features
 

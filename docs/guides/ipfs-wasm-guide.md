@@ -3,7 +3,7 @@ title: IPFS Publish + WASM Browsing
 parent: Guides
 nav_order: 2
 ---
-Current guide is a crossroad of three wonderful technologies: [IPFS](https://docs.ipfs.io/), [WASM](https://webassembly.org/getting-started/developers-guide/) and Summa.
+Current guide is a crossroad of three wonderful technologies: [Iroh](https://github.com/n0-computer/iroh), [WASM](https://webassembly.org/getting-started/developers-guide/) and Summa.
 We learn here how to: 
 **create search index** on the server, 
 **replicate it to IPFS**
@@ -14,43 +14,21 @@ In perspective, such approach may dramatically increase privacy of search in the
 
 Moreover, local processing of search queries would allow to use full-featured search engine on statically hosted sites or even in decentralized systems such as IPFS.
 
-### Configuring Summa
+### Configuring Summa and index
 
-Enable IPFS support during [config generation](/summa/guides/quick-start) with `-i` flag that accepts IPFS API endpoint:
-```bash
-docker run izihawa/summa-server:testing generate-config -d /data \
--g 0.0.0.0:8082 -m 0.0.0.0:8084 -i host.docker.internal:5001 > summa.yaml
-```
-or add IPFS support to existing instance by adding section
-```yaml
-ipfs:
-  api_endpoint: "host.docker.internal:5001"
-```
-into your `summa.yaml`
-
-Keep in mind that for Summa launched in Docker you should use `host.docker.internal:5001` address if IPFS is launched on host
-
-### Creating Sample Dataset
-
-Follow quick-start guide for [creating new index](/summa/guides/quick-start#setup)
-
-In the end you will have index that we will publish to IPFS and view through browser.
+Firstly, you should set up Summa Server with Iroh Store (enalbed by default) and create test index using [Quick-Start guide]((/summa/guides/quick-start) 
 
 ### Publish index to IPFS <a name="ipfs"></a>
 
-Publishing may be done by synchronizing state between local files and remote [MFS](https://docs.ipfs.tech/concepts/file-systems/#mutable-file-system-mfs).
-You need to have IPFS with write access through API. Everything other is delegated to Summa and IPFS.
-
-```bash
-# Publish index to IPFS and return keys
-# Payload is extra settings required for opening and searching in the index. It is subject of changing in the nearest future.
-summa-cli localhost:8082 - publish-index books --payload "{'default_fields': ['title', 'text'], 'multi_fields': [], 'name': 'books'}"
-
-# Check if index is published to MFS
-ipfs files stat /index/books
+For publishing index we should change its engine to IPFS. Then, Iroh P2P automatically makes it available to your IPFS peers:
+```bash 
+summa-cli localhost:8082 - migrate-index books books_iroh Ipfs
 ```
-
-Here you will see hashes and sizes of published index. Copy `Hash` of the index, you will need it on the next step.
+The command will return you CID of published index that you may use further for replicating or opening it through browser.
+For example, you may find your index through `kubo`:
+```bash
+ipfs get <cid>
+```
 
 ### Integrate it with browser <a name="web"></a>
 
