@@ -128,7 +128,7 @@ impl From<AggregationResult> for proto::AggregationResult {
                         }),
                         MetricResult::Stats(stats) => proto::metric_result::MetricResult::Stats(proto::StatsResult {
                             avg: stats.avg,
-                            count: stats.count as u64,
+                            count: stats.count,
                             max: stats.max,
                             min: stats.min,
                             standard_deviation: stats.standard_deviation,

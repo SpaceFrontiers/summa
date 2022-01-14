@@ -47,9 +47,9 @@ Main engine for creating persistent search index. It is the same as memory but b
 
 #### IPFS
 
-Stores index data in Iroh Store and serves queries directly from the store. 
-This engine follows to purposes:
-- Eliminates duplication of files for indices that are using both for serving queries and replication
+Engine stores index data in Iroh Store and serves queries directly from the store. 
+This engine follows two purposes:
+- Eliminates files duplication for indices that are using both for serving queries and replication
 - Allows Iroh P2P to replicate index files
 
 Keeping files in Iroh Store adds an intermediate layer for reading, so you should enable cache for alleviation IO penalty.
