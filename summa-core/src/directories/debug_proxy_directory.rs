@@ -227,5 +227,9 @@ impl<D: Directory> Directory for DebugProxyDirectory<D> {
         Ok(payload.to_vec())
     }
 
+    async fn delete_async(&self, _: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
+        unimplemented!()
+    }
+
     super::read_only_directory!();
 }

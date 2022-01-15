@@ -1,40 +1,49 @@
 use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::RwLock;
 
 use summa_proto::proto;
 use tantivy::schema::{Field, FieldType, Value};
-use tantivy::{Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
+use tantivy::{Directory, Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
 
 use super::SummaSegmentAttributes;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::errors::{SummaResult, ValidationError};
 
-#[derive(Clone)]
-pub struct SegmentComponent {
-    pub path: PathBuf,
-    pub segment_component: tantivy::SegmentComponent,
+pub struct ComponentFile {
+    file_name: String,
+    boxed_reader: Box<dyn Future<Output = Vec<u8>> + Send>,
 }
 
-impl Debug for SegmentComponent {
+impl Debug for ComponentFile {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.path.fmt(f)
+        f.debug_struct("ComponentFile").field("file_name", &self.file_name).finish()
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum ComponentFile {
-    SegmentComponent(SegmentComponent),
-    Other(PathBuf),
-}
-
 impl ComponentFile {
-    pub fn path(&self) -> &Path {
-        match self {
-            ComponentFile::SegmentComponent(segment_component) => &segment_component.path,
-            ComponentFile::Other(path) => path,
+    pub fn new(file_name: &str, boxed_reader: Box<dyn Future<Output = Vec<u8>> + Send>) -> ComponentFile {
+        ComponentFile {
+            file_name: file_name.to_string(),
+            boxed_reader,
         }
+    }
+    pub fn from_directory<D: Directory + Clone>(directory: &D, file_name: &str) -> ComponentFile {
+        let directory = directory.clone();
+        let filepath = PathBuf::from(file_name);
+        ComponentFile::new(
+            file_name,
+            Box::new(async move { directory.atomic_read_async(&filepath).await.expect("cannot open") }),
+        )
+    }
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+    pub fn into_reader(self) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>> {
+        Box::into_pin(self.boxed_reader)
     }
 }
 
@@ -116,6 +125,17 @@ impl IndexWriterImpl {
             IndexWriterImpl::Threaded(writer) => {
                 info!(action = "commit_index");
                 let opstamp = writer.prepare_commit()?.commit_future().await?;
+                info!(action = "committed_index", opstamp = ?opstamp);
+                Ok(())
+            }
+        }
+    }
+    pub async fn rollback(&mut self) -> SummaResult<()> {
+        match self {
+            IndexWriterImpl::Single(_) => unimplemented!(),
+            IndexWriterImpl::Threaded(writer) => {
+                info!(action = "commit_index");
+                let opstamp = writer.rollback_async().await?;
                 info!(action = "committed_index", opstamp = ?opstamp);
                 Ok(())
             }
@@ -249,12 +269,19 @@ impl IndexWriterHolder {
     pub async fn commit(&mut self) -> SummaResult<()> {
         info!(action = "commit");
         let result = self.index_writer.commit().await;
-        info!(action = "committed");
+        info!(action = "committed", result = ?result);
+        result
+    }
+
+    pub async fn rollback(&mut self) -> SummaResult<()> {
+        info!(action = "rollback");
+        let result = self.index_writer.rollback().await;
+        info!(action = "rollbacked", result = ?result);
         result
     }
 
     pub async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
-        let mut segments = self.index().searchable_segments()?;
+        let mut segments = self.index().searchable_segments_async().await?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
 
         let segments = segments
@@ -294,13 +321,10 @@ impl IndexWriterHolder {
 
     /// Locking index files for executing operation on them
     #[cfg(feature = "fs")]
-    pub async fn lock_files<P, O, Fut>(&mut self, index_path: P, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
+    pub async fn lock_files<O, Fut>(&mut self, with_hotcache: bool, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
     where
-        P: AsRef<Path>,
-        Fut: std::future::Future<Output = SummaResult<O>>,
+        Fut: Future<Output = SummaResult<O>>,
     {
-        use tantivy::Directory;
-
         let segment_attributes = SummaSegmentAttributes { is_frozen: true };
 
         self.commit().await?;
@@ -309,38 +333,39 @@ impl IndexWriterHolder {
 
         self.wait_merging_threads();
 
-        let mut hotcache_bytes = vec![];
+        let directory = self.index().directory();
 
-        let read_directory = tantivy::directory::MmapDirectory::open(&index_path)?;
-        crate::directories::write_hotcache(read_directory, 16384, &mut hotcache_bytes)?;
-        self.index()
-            .directory()
-            .atomic_write(&PathBuf::from("hotcache.bin".to_string()), &hotcache_bytes)?;
-
-        let segment_files = [
-            ComponentFile::Other(index_path.as_ref().join(".managed.json")),
-            ComponentFile::Other(index_path.as_ref().join("meta.json")),
-            ComponentFile::Other(index_path.as_ref().join("hotcache.bin")),
-        ]
-        .into_iter()
-        .chain(self.get_index_files(index_path.as_ref().to_path_buf())?)
-        .collect();
+        let segment_files_iter = [".managed.json", "meta.json"]
+            .into_iter()
+            .map(String::from)
+            .map(move |file_name| ComponentFile::from_directory(directory, &file_name))
+            .chain(self.get_index_files().await?);
+        let segment_files = match with_hotcache {
+            true => {
+                let hotcache_bytes = crate::directories::write_hotcache(directory.inner_directory().box_clone(), 16384).await?;
+                segment_files_iter
+                    .chain(std::iter::once(ComponentFile::new("hotcache.bin", Box::new(async move { hotcache_bytes }))))
+                    .collect()
+            }
+            false => segment_files_iter.collect(),
+        };
         f(segment_files).await
     }
 
     /// Get segments
     #[cfg(feature = "fs")]
-    fn get_index_files(&self, index_path: PathBuf) -> SummaResult<impl Iterator<Item = ComponentFile>> {
-        Ok(self.index().searchable_segments()?.into_iter().flat_map(move |segment| {
+    async fn get_index_files(&self) -> SummaResult<impl Iterator<Item = ComponentFile>> {
+        let directory = self.index().directory().clone();
+        Ok(self.index().searchable_segments_async().await?.into_iter().flat_map(move |segment| {
+            let directory = directory.clone();
             tantivy::SegmentComponent::iterator()
-                .filter_map(|segment_component| {
-                    let relative_path = segment.meta().relative_path(*segment_component);
-                    index_path.join(relative_path).exists().then(|| {
-                        ComponentFile::SegmentComponent(SegmentComponent {
-                            path: index_path.join(segment.meta().relative_path(*segment_component)),
-                            segment_component: *segment_component,
-                        })
-                    })
+                .filter_map(move |segment_component| {
+                    let filepath = segment.meta().relative_path(*segment_component);
+                    let file_name = filepath.to_string_lossy().to_string();
+                    directory
+                        .exists(&filepath)
+                        .expect("cannot parse")
+                        .then(|| ComponentFile::from_directory(&directory, &file_name))
                 })
                 .collect::<Vec<_>>()
         }))

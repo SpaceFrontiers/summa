@@ -91,14 +91,14 @@ fn wrap_with_caches<D: Directory>(
     let next_directory = match &chunked_cache_config {
         Some(chunked_cache_config) => match chunked_cache_config.cache_size {
             Some(cache_size) => Box::new(ChunkedCachingDirectory::new_with_capacity_in_bytes(
-                Arc::new(directory),
+                Box::new(directory),
                 chunked_cache_config.chunk_size as usize,
                 cache_size as usize,
                 CACHE_METRICS.clone(),
                 file_lengths,
             )) as Box<dyn Directory>,
             None => Box::new(ChunkedCachingDirectory::new(
-                Arc::new(directory),
+                Box::new(directory),
                 chunked_cache_config.chunk_size as usize,
                 file_lengths,
             )) as Box<dyn Directory>,
@@ -125,18 +125,12 @@ impl IndexHolder {
         index.settings_mut().docstore_compress_dedicated_thread = core_config.dedicated_compression_thread;
         index.set_segment_attributes_merger(Arc::new(SegmentAttributesMergerImpl::<SummaSegmentAttributes>::new()));
 
+        let metas = index.load_metas()?;
         let index_name = index_name.map(|x| x.to_string()).unwrap_or_else(|| {
-            serde_json::from_value::<proto::IndexAttributes>(
-                index
-                    .load_metas()
-                    .expect("no metas")
-                    .index_attributes()
-                    .expect("no attributes")
-                    .expect("no attributes"),
-            )
-            .expect("wrong json")
-            .default_index_name
-            .expect("no index name")
+            serde_json::from_value::<proto::IndexAttributes>(metas.index_attributes().expect("no attributes").expect("no attributes"))
+                .expect("wrong json")
+                .default_index_name
+                .expect("no index name")
         });
         let cached_schema = index.schema();
         let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index)?);
@@ -150,7 +144,7 @@ impl IndexHolder {
             index: index.clone(),
             query_parser,
             cached_schema,
-            cached_index_attributes: index.load_metas()?.index_attributes()?,
+            cached_index_attributes: metas.index_attributes()?,
             index_reader,
             index_writer_holder,
             #[cfg(feature = "metrics")]
@@ -225,14 +219,18 @@ impl IndexHolder {
         content_loader: &iroh_unixfs::content_loader::FullLoader,
     ) -> SummaResult<Index> {
         let index_path = std::path::Path::new(&ipfs_engine_config.path);
-        if !index_path.exists() {
-            tokio::fs::create_dir_all(index_path).await?;
+        if index_path.exists() {
+            tokio::fs::remove_dir_all(index_path).await?;
         }
+        tokio::fs::create_dir_all(index_path).await?;
         let mmap_directory = tantivy::directory::MmapDirectory::open(index_path)?;
         let iroh_directory = crate::directories::IrohDirectory::new(mmap_directory, content_loader.clone(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
-            Ok(hotcache_handle) => hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok(),
+            Ok(hotcache_handle) => {
+                info!(action = "read_hotcache");
+                hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok()
+            }
             Err(_) => None,
         };
         let index = tokio::task::spawn_blocking(move || {
@@ -263,8 +261,8 @@ impl IndexHolder {
         &self.index_reader
     }
 
-    pub fn index_payload(&self) -> SummaResult<Option<String>> {
-        Ok(self.index.load_metas()?.payload)
+    pub async fn index_payload(&self) -> SummaResult<Option<String>> {
+        Ok(self.index.load_metas_async().await?.payload)
     }
 
     pub fn index_engine_config(&self) -> &Arc<dyn ConfigProxy<proto::IndexEngineConfig>> {
@@ -338,12 +336,18 @@ impl IndexHolder {
     /// and then directory with the index is deleted.
     #[instrument(skip(self), fields(index_name = %self.index_name))]
     pub async fn delete(self) -> SummaResult<()> {
-        info!(action = "delete_directory");
         let mut config = self.core_config_holder.write().await;
         let index_engine_config = config.get_mut().indices.remove(self.index_name()).expect("cannot retrieve config");
         match index_engine_config.config {
             #[cfg(feature = "fs")]
             Some(proto::index_engine_config::Config::File(ref config)) => {
+                info!(action = "delete_directory", directory = ?config.path);
+                tokio::fs::remove_dir_all(&config.path)
+                    .await
+                    .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
+            }
+            Some(proto::index_engine_config::Config::Ipfs(ref config)) => {
+                info!(action = "delete_directory", directory = ?config.path);
                 tokio::fs::remove_dir_all(&config.path)
                     .await
                     .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;

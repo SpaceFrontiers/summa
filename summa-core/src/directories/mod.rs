@@ -69,3 +69,33 @@ macro_rules! read_only_directory {
     };
 }
 pub use read_only_directory;
+
+#[macro_export]
+macro_rules! write_proxy_directory {
+    () => {
+        fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            self.underlying.atomic_write(path, data)
+        }
+
+        fn delete(&self, path: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
+            self.underlying.delete(path)
+        }
+
+        fn open_write(&self, path: &Path) -> Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError> {
+            self.underlying.open_write(path)
+        }
+
+        fn sync_directory(&self) -> std::io::Result<()> {
+            self.underlying.sync_directory()
+        }
+
+        fn watch(&self, watch_callback: tantivy::directory::WatchCallback) -> tantivy::Result<tantivy::directory::WatchHandle> {
+            self.underlying.watch(watch_callback)
+        }
+
+        fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
+            self.underlying.acquire_lock(lock)
+        }
+    };
+}
+pub use write_proxy_directory;

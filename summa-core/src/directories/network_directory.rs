@@ -69,6 +69,10 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
             .to_vec())
     }
 
+    async fn delete_async(&self, _: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
+        unimplemented!()
+    }
+
     super::read_only_directory!();
 }
 

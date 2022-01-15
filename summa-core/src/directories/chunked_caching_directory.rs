@@ -11,19 +11,29 @@ use tantivy::{Directory, HasLen};
 
 use crate::directories::chunk_generator::{Chunk, ChunkGenerator};
 use crate::directories::requests_composer::{Request, RequestsComposer};
-use crate::directories::{MemorySizedCache, Noop};
+use crate::directories::MemorySizedCache;
 use crate::metrics::CacheMetrics;
 
-#[derive(Clone)]
 pub struct ChunkedCachingDirectory {
     chunk_size: usize,
     cache: Option<Arc<MemorySizedCache>>,
-    underlying: Arc<dyn Directory>,
+    underlying: Box<dyn Directory>,
     file_lengths: HashMap<PathBuf, u64>,
 }
 
+impl Clone for ChunkedCachingDirectory {
+    fn clone(&self) -> Self {
+        ChunkedCachingDirectory {
+            chunk_size: self.chunk_size,
+            cache: self.cache.clone(),
+            underlying: self.underlying.box_clone(),
+            file_lengths: self.file_lengths.clone(),
+        }
+    }
+}
+
 impl ChunkedCachingDirectory {
-    pub fn new(underlying: Arc<dyn Directory>, chunk_size: usize, file_lengths: HashMap<PathBuf, u64>) -> ChunkedCachingDirectory {
+    pub fn new(underlying: Box<dyn Directory>, chunk_size: usize, file_lengths: HashMap<PathBuf, u64>) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
             cache: None,
@@ -33,7 +43,7 @@ impl ChunkedCachingDirectory {
     }
 
     pub fn new_with_capacity_in_bytes(
-        underlying: Arc<dyn Directory>,
+        underlying: Box<dyn Directory>,
         chunk_size: usize,
         capacity_in_bytes: usize,
         cache_metrics: CacheMetrics,
@@ -47,7 +57,7 @@ impl ChunkedCachingDirectory {
         }
     }
     pub fn new_unbounded(
-        underlying: Arc<dyn Directory>,
+        underlying: Box<dyn Directory>,
         chunk_size: usize,
         cache_metrics: CacheMetrics,
         file_lengths: HashMap<PathBuf, u64>,
@@ -106,7 +116,11 @@ impl Directory for ChunkedCachingDirectory {
         Ok(owned_bytes.as_slice().to_vec())
     }
 
-    super::read_only_directory!();
+    async fn delete_async(&self, path: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
+        self.underlying.delete_async(path).await
+    }
+
+    super::write_proxy_directory!();
 }
 
 struct ChunkedCachingFileHandle {

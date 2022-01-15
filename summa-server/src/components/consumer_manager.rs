@@ -67,6 +67,12 @@ impl StoppedConsumption {
             Err(e) => Err(e),
         }
     }
+
+    pub fn ignore(self) -> PreparedConsumption {
+        PreparedConsumption {
+            committed_consumer_thread: self.consumer_thread,
+        }
+    }
 }
 
 #[derive(Debug)]

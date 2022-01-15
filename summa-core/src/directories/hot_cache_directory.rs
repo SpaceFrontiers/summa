@@ -397,7 +397,7 @@ impl Directory for HotDirectory {
     }
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
-        Ok(self.inner.cache.get_file_length(path).is_some())
+        Ok(self.inner.cache.get_file_length(path).is_some() || self.inner.underlying.exists(path)?)
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
@@ -416,11 +416,15 @@ impl Directory for HotDirectory {
         self.inner.underlying.atomic_read_async(path).await
     }
 
+    async fn delete_async(&self, _: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
+        unimplemented!()
+    }
+
     super::read_only_directory!();
 }
 
-fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
-    let index_meta = index.load_metas()?;
+async fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
+    let index_meta = index.load_metas_async().await?;
     let mut files: HashSet<PathBuf> = index_meta.segments.into_iter().flat_map(|segment_meta| segment_meta.list_files()).collect();
     files.insert(Path::new("meta.json").to_path_buf());
     files.insert(Path::new(".managed.json").to_path_buf());
@@ -431,11 +435,11 @@ fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
 /// and writes a static cache file called hotcache in the `output`.
 ///
 /// See [`HotDirectory`] for more information.
-pub fn write_hotcache<D: Directory>(directory: D, chunk_size: usize, output: &mut dyn io::Write) -> tantivy::Result<()> {
+pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: usize) -> tantivy::Result<Vec<u8>> {
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
-    let caching_directory = ChunkedCachingDirectory::new_unbounded(Arc::new(directory), chunk_size, CacheMetrics::default(), HashMap::new());
+    let caching_directory = ChunkedCachingDirectory::new_unbounded(directory, chunk_size, CacheMetrics::default(), HashMap::new());
     let debug_proxy_directory = DebugProxyDirectory::wrap(caching_directory);
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();
@@ -458,7 +462,7 @@ pub fn write_hotcache<D: Directory>(directory: D, chunk_size: usize, output: &mu
             .or_default()
             .insert(read_operation.offset..read_operation.offset + read_operation.num_bytes);
     }
-    let index_files = list_index_files(&index)?;
+    let index_files = list_index_files(&index).await?;
     for file_path in index_files {
         let file_slice_res = debug_proxy_directory.open_read(&file_path);
         if let Err(OpenReadError::FileDoesNotExist(_)) = file_slice_res {
@@ -483,7 +487,7 @@ pub fn write_hotcache<D: Directory>(directory: D, chunk_size: usize, output: &mu
             }
         }
     }
-    cache_builder.write(output)?;
-    output.flush()?;
-    Ok(())
+    let mut hotcache_bytes = vec![];
+    cache_builder.write(&mut hotcache_bytes)?;
+    Ok(hotcache_bytes)
 }

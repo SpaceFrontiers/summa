@@ -57,6 +57,8 @@ pub enum Error {
     Lock(#[from] tokio::sync::TryLockError),
     #[error("tantivy_error: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
+    #[error("timeout_error: {0}")]
+    Timeout(String),
     #[error("tonic_error: {0}")]
     Tonic(#[from] tonic::transport::Error),
     #[error("upstream_http_status_error: {0}")]

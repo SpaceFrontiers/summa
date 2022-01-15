@@ -107,7 +107,7 @@ pub mod tests {
     static BASE_PORT: AtomicUsize = AtomicUsize::new(50000);
 
     pub fn create_test_server_config(data_path: &Path) -> Config {
-        crate::configs::server::ConfigBuilder::default()
+        ConfigBuilder::default()
             .debug(true)
             .data_path(data_path)
             .api(
@@ -124,6 +124,7 @@ pub mod tests {
             )
             .store(
                 crate::configs::store::ConfigBuilder::default()
+                    .endpoint(format!("127.0.0.1:{}", BASE_PORT.fetch_add(1, Ordering::Relaxed)))
                     .path(data_path.join("ks"))
                     .build()
                     .expect("cannot create store config"),

@@ -60,11 +60,11 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, 
 
 #[async_trait]
 impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for IrohDirectory<D, T> {
-    fn get_file_handle(&self, file_name: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        if self.underlying.exists(file_name)? {
-            Ok(self.underlying.get_file_handle(file_name)?)
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        if self.underlying.exists(path)? {
+            Ok(self.underlying.get_file_handle(path)?)
         } else {
-            Ok(Arc::new(self.get_iroh_file_handle(file_name)?))
+            Ok(Arc::new(self.get_iroh_file_handle(path)?))
         }
     }
 
@@ -72,6 +72,15 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
         if let Ok(exists) = self.underlying.exists(path) {
             if exists {
                 self.underlying.delete(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_async(&self, path: &Path) -> Result<(), DeleteError> {
+        if let Ok(exists) = self.underlying.exists(path) {
+            if exists {
+                self.underlying.delete_async(path).await?;
             }
         }
         Ok(())
