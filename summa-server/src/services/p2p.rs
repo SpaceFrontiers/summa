@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::time::Duration;
 
 use async_broadcast::Receiver;
 use iroh_p2p::{DiskStorage, Keychain, Libp2pConfig, Node, DEFAULT_BOOTSTRAP};
@@ -7,6 +8,7 @@ use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
 
 use crate::errors::SummaServerResult;
+use crate::utils::wait_for_addr;
 
 pub struct P2p {
     config: crate::configs::p2p::Config,
@@ -63,6 +65,7 @@ impl P2p {
         .await?;
         info!(action = "p2p", local_peer_id = ?node.local_peer_id(), listen_addrs = ?node.listen_addrs());
         let p2p_task = tokio::task::spawn(async move { node.run().await });
+        wait_for_addr(self.rpc_addr.try_as_socket_addr().expect("not socket addr"), Duration::from_secs(10)).await?;
         info!(action = "binded", endpoint = ?self.config.endpoint);
         Ok(async move {
             let signal_result = terminator.recv().await;

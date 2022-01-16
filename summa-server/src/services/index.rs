@@ -621,8 +621,11 @@ impl Index {
 pub(crate) mod tests {
     use std::default::Default;
     use std::path::Path;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::AtomicI64;
 
+    use itertools::Itertools;
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
     use summa_core::components::SummaDocument;
     use summa_core::configs::DirectProxy;
     use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
@@ -635,10 +638,11 @@ pub(crate) mod tests {
     use crate::logging;
     use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
     use crate::utils::signal_channel;
+    use crate::utils::tests::acquire_free_port;
 
     pub async fn create_test_store_service(data_path: &Path) -> crate::services::Store {
-        static STORE_PORT: AtomicUsize = AtomicUsize::new(4410);
-        let port = STORE_PORT.fetch_add(1, Ordering::SeqCst);
+        let port = acquire_free_port();
+
         let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
         iroh_rpc_config.store_addr = Some(format!("irpc://127.0.0.1:{}", port).parse().unwrap());
         iroh_rpc_config.p2p_addr = None;
@@ -666,6 +670,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
     }
+
     pub async fn create_test_index_holder(
         index_service: &Index,
         schema: &Schema,
@@ -708,100 +713,80 @@ pub(crate) mod tests {
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
             ),
         );
-
+        schema_builder.add_text_field(
+            "tags",
+            TextOptions::default()
+                .set_stored()
+                .set_indexing_options(TextFieldIndexing::default().set_tokenizer("summa").set_index_option(IndexRecordOption::Basic)),
+        );
         schema_builder.build()
     }
 
-    async fn index_test_documents(index_holder: &Handler<IndexHolder>) -> SummaServerResult<()> {
-        index_holder.index_document(SummaDocument::TantivyDocument(doc!(
-            index_holder.schema().get_field("id").unwrap() => 1i64,
-            index_holder.schema().get_field("title").unwrap() => "Headcrab",
-            index_holder.schema().get_field("body").unwrap() => "Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient to dispatch them. \
-            They are also relatively slow-moving and their attacks inflict very little damage. However, they can leap long distances and heights. \
-            Headcrabs seek out larger human hosts, which are converted into zombie-like mutants that attack any living lifeform nearby. \
-            The converted humans are more resilient than an ordinary human would be and inherit the headcrab's resilience toward toxic and radioactive materials. \
-            Headcrabs and headcrab zombies die slowly when they catch fire. \
-            The games also establish that while headcrabs are parasites that prey on humans, they are also the prey of the creatures of their homeworld. \
-            Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.",
-            index_holder.schema().get_field("issued_at").unwrap() => 1652986134i64
-        ))).await?;
-        Ok(())
+    #[inline]
+    fn generate_term(rng: &mut SmallRng, prefix: &str, power: usize) -> String {
+        if power > 0 {
+            format!("{}{}", prefix, rng.gen_range(0..power))
+        } else {
+            prefix.to_string()
+        }
     }
 
-    async fn index_test_documents_2(index_holder: &Handler<IndexHolder>) -> SummaServerResult<()> {
-        index_holder
-            .index_document(SummaDocument::TantivyDocument(doc!(
-                index_holder.schema().get_field("id").unwrap() => 2i64,
-                index_holder.schema().get_field("title").unwrap() => "Games of Thrones",
-                index_holder.schema().get_field("body").unwrap() => "Game of Thrones is an American fantasy drama television series created by David Benioff \
-                and D. B. Weiss for HBO. It is an adaptation of A Song of Ice and Fire, a series of fantasy novels by George R. R. Martin, the first of which \
-                is A Game of Thrones. The show was shot in the United Kingdom, Canada, Croatia, Iceland, Malta, Morocco, and Spain. It premiered on HBO in the \
-                United States on April 17, 2011, and concluded on May 19, 2019, with 73 episodes broadcast over eight seasons.",
-                index_holder.schema().get_field("issued_at").unwrap() => 1652986135i64
-            )))
-            .await?;
-        index_holder
-            .index_document(SummaDocument::TantivyDocument(doc!(
-                index_holder.schema().get_field("id").unwrap() => 3i64,
-                index_holder.schema().get_field("title").unwrap() => "Breaking Bad",
-                index_holder.schema().get_field("body").unwrap() => "Breaking Bad is an American crime drama television series created and produced by \
-                Vince Gilligan. Set and filmed in Albuquerque, New Mexico, the series follows Walter White (Bryan Cranston), an underpaid, overqualified,\
-                 and dispirited high-school chemistry teacher who is struggling with a recent diagnosis of stage-three lung cancer. \
-                 White turns to a life of crime and partners with a former student, Jesse Pinkman (Aaron Paul), to produce and distribute methamphetamine \
-                 to secure his family's financial future before he dies, while navigating the dangers of the criminal underworld. \
-                 The show aired on AMC from January 20, 2008, to September 29, 2013, consisting of five seasons for a total of 62 episodes.",
-                index_holder.schema().get_field("issued_at").unwrap() => 1652986136i64
-            )))
-            .await?;
-        Ok(())
+    #[inline]
+    fn generate_sentence(rng: &mut SmallRng, prefix: &str, power: usize, length: usize) -> String {
+        (0..length).map(|_| generate_term(rng, prefix, power)).join(" ")
     }
 
-    async fn search_test(index_holder: &IndexHolder) -> SummaServerResult<()> {
-        assert_eq!(
-            index_holder.search("index", &match_query("headcrabs"), &vec![top_docs_collector(10)], DefaultTracker::default()).await?,
-            vec![top_docs_collector_output(
-                vec![scored_doc(
-                    "{\
-                        \"body\":\"Physically, headcrabs are frail: a few bullets or a single strike from the player's melee weapon being sufficient \
-                        to dispatch them. They are also relatively slow-moving and their attacks inflict very little damage. However, they can leap long distances \
-                        and heights. Headcrabs seek out larger human hosts, which are converted into zombie-like mutants that attack any living lifeform nearby. \
-                        The converted humans are more resilient than an ordinary human would be and inherit the headcrab's resilience toward toxic and radioactive materials. \
-                        Headcrabs and headcrab zombies die slowly when they catch fire. \
-                        The games also establish that while headcrabs are parasites that prey on humans, they are also the prey of the creatures of their homeworld. \
-                        Bullsquids, Vortigaunts, barnacles and antlions will all eat headcrabs and Vortigaunts can be seen cooking them in several locations in-game.\",\
-                        \"id\":1,\
-                        \"issued_at\":1652986134,\
-                        \"title\":\"Headcrab\"}",
-                    0.5126588344573975,
-                    0
-                )],
-                false
-            )]
-        );
-        Ok(())
+    pub fn generate_document<'a>(
+        doc_id: Option<i64>,
+        rng: &mut SmallRng,
+        schema: &Schema,
+        title_prefix: &'a str,
+        title_power: usize,
+        body_prefix: &'a str,
+        body_power: usize,
+        tag_prefix: &'a str,
+        tag_power: usize,
+    ) -> SummaDocument<'a> {
+        static DOC_ID: AtomicI64 = AtomicI64::new(1);
+
+        let issued_at = 1674041452i64 - rng.gen_range(100..1000);
+
+        SummaDocument::TantivyDocument(doc!(
+            schema.get_field("id").unwrap() => doc_id.unwrap_or_else(|| DOC_ID.fetch_add(1, Ordering::SeqCst)),
+            schema.get_field("title").unwrap() => generate_sentence(rng, title_prefix, title_power, 3),
+            schema.get_field("body").unwrap() => generate_sentence(rng, body_prefix, body_power, 50),
+            schema.get_field("tags").unwrap() => generate_sentence(rng, tag_prefix, tag_power, 5),
+            schema.get_field("issued_at").unwrap() => issued_at
+        ))
     }
-    async fn search_test_2(index_holder: &IndexHolder) -> SummaServerResult<()> {
-        assert_eq!(
-            index_holder
-                .search("index", &match_query("bad"), &vec![top_docs_collector(10)], DefaultTracker::default())
-                .await?,
-            vec![top_docs_collector_output(
-                vec![scored_doc(
-                    "{\"body\":\"Breaking Bad is an American crime drama television series created and produced by Vince Gilligan. \
-                    Set and filmed in Albuquerque, New Mexico, the series follows Walter White (Bryan Cranston), an underpaid, \
-                    overqualified,and dispirited high-school chemistry teacher who is struggling with a recent diagnosis of \
-                    stage-three lung cancer. White turns to a life of crime and partners with a former student, Jesse Pinkman \
-                    (Aaron Paul), to produce and distribute methamphetamine to secure his family's financial future before he dies, \
-                    while navigating the dangers of the criminal underworld. The show aired on AMC from January 20, 2008, to September 29, \
-                    2013, consisting of five seasons for a total of 62 episodes.\",\"id\":3,\
-                     \"issued_at\":1652986136,\"title\":\"Breaking Bad\"}",
-                    1.8944451808929443,
-                    0
-                )],
-                false
-            )]
-        );
-        Ok(())
+
+    pub fn generate_unique_document<'a>(schema: &'a Schema, title: &'a str) -> SummaDocument<'a> {
+        generate_document(None, &mut SmallRng::seed_from_u64(42), schema, title, 0, "body", 1000, "tag", 100)
+    }
+
+    pub fn generate_documents(schema: &Schema, n: usize) -> Vec<SummaDocument> {
+        let mut rng = SmallRng::seed_from_u64(42);
+        (0..n)
+            .map(|_| generate_document(None, &mut rng, schema, "title", 100, "body", 1000, "tag", 10))
+            .collect()
+    }
+
+    pub fn generate_documents_with_doc_id_gen_and_rng<'a>(doc_id_gen: AtomicI64, rng: &mut SmallRng, schema: &'a Schema, n: usize) -> Vec<SummaDocument<'a>> {
+        (0..n)
+            .map(|_| {
+                generate_document(
+                    Some(doc_id_gen.fetch_add(1, Ordering::SeqCst)),
+                    rng,
+                    schema,
+                    "title",
+                    100,
+                    "body",
+                    1000,
+                    "tag",
+                    10,
+                )
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -825,7 +810,6 @@ pub(crate) mod tests {
             )
             .await
             .is_ok());
-
         assert!(index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -885,14 +869,29 @@ pub(crate) mod tests {
 
         let index_service = create_test_index_service(&data_path).await;
         let index_holder = create_test_index_holder(&index_service, &create_test_schema(), proto::CreateIndexEngineRequest::Ipfs).await?;
-        index_test_documents(&index_holder).await?;
+
+        for d in generate_documents(index_holder.schema(), 1000) {
+            index_holder.index_document(d).await?;
+        }
         index_service.commit(&index_holder).await?;
-        index_test_documents_2(&index_holder).await?;
+        index_holder
+            .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
+            .await?;
+        index_service.commit(&index_holder).await?;
+        for d in generate_documents(index_holder.schema(), 1000) {
+            index_holder.index_document(d).await?;
+        }
         index_service.rollback(&index_holder).await?;
-        index_test_documents_2(&index_holder).await?;
+        for d in generate_documents(index_holder.schema(), 1000) {
+            index_holder.index_document(d).await?;
+        }
         index_service.commit(&index_holder).await?;
         index_holder.index_reader().reload()?;
-        search_test_2(&index_holder).await?;
+
+        let search_response = index_holder
+            .search("index", &match_query("testtitle"), &vec![top_docs_collector(10)], DefaultTracker::default())
+            .await?;
+        assert_eq!(search_response.len(), 1);
         drop(index_holder);
         index_service
             .delete_index(DeleteIndexRequestBuilder::default().index_name("test_index".to_owned()).build().unwrap())
@@ -910,10 +909,21 @@ pub(crate) mod tests {
 
         let index_service = create_test_index_service(&data_path).await;
         let index_holder = create_test_index_holder(&index_service, &schema, proto::CreateIndexEngineRequest::Memory).await?;
-        index_test_documents(&index_holder).await?;
+
+        for d in generate_documents(index_holder.schema(), 1000) {
+            index_holder.index_document(d).await?;
+        }
+        index_holder
+            .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
+            .await?;
         index_service.commit(&index_holder).await?;
         index_holder.index_reader().reload()?;
-        search_test(&index_holder).await?;
+
+        let search_response = index_holder
+            .search("index", &match_query("testtitle"), &vec![top_docs_collector(10)], DefaultTracker::default())
+            .await?;
+        assert_eq!(search_response.len(), 1);
+
         drop(index_holder);
         index_service
             .delete_index(DeleteIndexRequestBuilder::default().index_name("test_index".to_owned()).build().unwrap())
@@ -930,73 +940,35 @@ pub(crate) mod tests {
         let data_path = root_path.path().join("data");
 
         let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(&index_service, &schema, proto::CreateIndexEngineRequest::Memory).await?;
+        let index_holder = create_test_index_holder(&index_service, &schema, proto::CreateIndexEngineRequest::Ipfs).await?;
 
-        index_holder
-            .index_document(SummaDocument::TantivyDocument(doc!(
-                schema.get_field("id").unwrap() => 1i64,
-                schema.get_field("title").unwrap() => "term1 term2",
-                schema.get_field("body").unwrap() => "term3 term4 term5 term6",
-                schema.get_field("issued_at").unwrap() => 100i64
-            )))
-            .await?;
-        index_holder
-            .index_document(SummaDocument::TantivyDocument(doc!(
-                schema.get_field("id").unwrap() => 2i64,
-                schema.get_field("title").unwrap() => "term2 term3",
-                schema.get_field("body").unwrap() => "term1 term7 term8 term9 term10",
-                schema.get_field("issued_at").unwrap() => 110i64
-            )))
-            .await?;
-        index_holder.index_writer_holder().write().await.commit().await?;
+        let mut rng = SmallRng::seed_from_u64(42);
+        for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 30) {
+            index_holder.index_document(d).await?;
+        }
+        index_service.commit(&index_holder).await?;
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder
                 .search(
-                    "index",
-                    &match_query("term1"),
+                    "test_index",
+                    &match_query("title1"),
                     &vec![top_docs_collector_with_eval_expr(10, "issued_at")],
                     DefaultTracker::default()
                 )
                 .await?,
             vec![top_docs_collector_output(
-                vec![
-                    scored_doc(
-                        "{\"body\":\"term1 term7 term8 term9 term10\",\"id\":2,\"issued_at\":110,\"title\":\"term2 term3\"}",
-                        110.0,
-                        0
-                    ),
-                    scored_doc(
-                        "{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}",
-                        100.0,
-                        1
-                    )
-                ],
-                false
-            )]
-        );
-        assert_eq!(
-            index_holder
-                .search(
-                    "index",
-                    &match_query("term1"),
-                    &vec![top_docs_collector_with_eval_expr(10, "-issued_at")],
-                    DefaultTracker::default()
-                )
-                .await?,
-            vec![top_docs_collector_output(
-                vec![
-                    scored_doc(
-                        "{\"body\":\"term3 term4 term5 term6\",\"id\":1,\"issued_at\":100,\"title\":\"term1 term2\"}",
-                        -100.0,
-                        0
-                    ),
-                    scored_doc(
-                        "{\"body\":\"term1 term7 term8 term9 term10\",\"id\":2,\"issued_at\":110,\"title\":\"term2 term3\"}",
-                        -110.0,
-                        1
-                    ),
-                ],
+                vec![scored_doc(
+                    "{\"body\":\"body211 body255 body187 body318 body593 body647 body3 body659 \
+                        body196 body974 body861 body887 body73 body526 body337 body381 body650 body997 body722 \
+                        body307 body260 body542 body958 body25 body40 body237 body806 body547 body177 body633 \
+                        body770 body37 body432 body905 body528 body230 body522 body268 body789 body681 body187 \
+                        body123 body284 body977 body887 body229 body66 body246 body194 body35\",\"id\":23,\
+                        \"issued_at\":1674041335,\"tags\":\"tag5 tag8 tag5 tag2 tag2\",\"title\":\"title96 \
+                        title1 title31\"}",
+                    1674041335.0,
+                    0
+                ),],
                 false
             )]
         );

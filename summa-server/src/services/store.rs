@@ -6,11 +6,11 @@ use futures_util::io::Cursor;
 use futures_util::StreamExt;
 use iroh_rpc_types::store::StoreAddr;
 use summa_core::utils::thread_handler::ControlMessage;
-use tokio::net::TcpStream;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{info, info_span, instrument, Instrument};
 
-use crate::errors::{Error, SummaServerResult};
+use crate::errors::SummaServerResult;
+use crate::utils::wait_for_addr;
 
 const MAX_CHUNK_SIZE: u64 = 1024 * 1024;
 
@@ -62,15 +62,7 @@ impl Store {
     pub async fn prepare_serving_future(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let rpc_addr: StoreAddr = format!("irpc://{}", self.config.endpoint).parse()?;
         let store_task = tokio::spawn(iroh_store::rpc::new(rpc_addr.clone(), self.store.clone()));
-        if tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(rpc_addr.try_as_socket_addr().expect("not socket addr")),
-        )
-        .await
-        .is_err()
-        {
-            return Err(Error::Timeout("store_service".to_string()));
-        }
+        wait_for_addr(rpc_addr.try_as_socket_addr().expect("not socket addr"), Duration::from_secs(10)).await?;
         info!(action = "binded", endpoint = ?self.config.endpoint);
         Ok(async move {
             let signal_result = terminator.recv().await;

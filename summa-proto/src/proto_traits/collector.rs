@@ -38,7 +38,7 @@ pub mod shortcuts {
 
     pub fn scored_doc(document: &str, score: f64, position: u32) -> proto::ScoredDocument {
         proto::ScoredDocument {
-            index_alias: "index".to_string(),
+            index_alias: "test_index".to_string(),
             document: document.to_owned(),
             score: Some(proto::Score {
                 score: Some(proto::score::Score::F64Score(score)),

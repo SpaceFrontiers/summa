@@ -346,6 +346,7 @@ impl IndexHolder {
                     .await
                     .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
             }
+            #[cfg(feature = "fs")]
             Some(proto::index_engine_config::Config::Ipfs(ref config)) => {
                 info!(action = "delete_directory", directory = ?config.path);
                 tokio::fs::remove_dir_all(&config.path)
