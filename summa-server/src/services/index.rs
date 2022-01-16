@@ -138,7 +138,7 @@ impl Index {
         let mut index_holders = HashMap::new();
         for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
             info!(action = "from_config", index = ?index_name);
-            let index = self.create_index_from(index_engine_config).await?;
+            let index = self.create_index_from(index_engine_config, false).await?;
             let core_config = self.server_config.read().await.get().core.clone();
             let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
             let index_holder = tokio::task::spawn_blocking(move || {
@@ -236,7 +236,7 @@ impl Index {
                     chunked_cache_config: None,
                     path: index_path.to_string_lossy().to_string(),
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader()).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), false).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
                 };
@@ -307,7 +307,7 @@ impl Index {
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config.clone())),
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader()).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), false).await?;
                 (index, index_engine_config)
             }
         };
@@ -547,7 +547,7 @@ impl Index {
 
     /// Opens index and sets it up via `setup`
     #[instrument(skip_all)]
-    pub async fn create_index_from(&self, index_engine_config: proto::IndexEngineConfig) -> SummaServerResult<tantivy::Index> {
+    pub async fn create_index_from(&self, index_engine_config: proto::IndexEngineConfig, read_only: bool) -> SummaServerResult<tantivy::Index> {
         let index = match index_engine_config.config {
             Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(config.path)?,
             Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
@@ -555,10 +555,13 @@ impl Index {
                 IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
                     config,
                     DefaultTracker::default(),
+                    read_only,
                 )
                 .await?
             }
-            Some(proto::index_engine_config::Config::Ipfs(config)) => IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader()).await?,
+            Some(proto::index_engine_config::Config::Ipfs(config)) => {
+                IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader(), read_only).await?
+            }
             _ => unimplemented!(),
         };
         Ok(index)
@@ -594,7 +597,7 @@ impl Index {
                         .to_string_lossy()
                         .to_string(),
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader()).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), false).await?;
                 self.insert_index(
                     &migrate_index_request.target_index_name,
                     index,

@@ -174,9 +174,12 @@ impl WebIndexRegistry {
     }
 
     async fn add_internal(&self, remote_engine_config: RemoteEngineConfig, tracker: SubscribeTracker) -> SummaWasmResult<Option<IndexAttributes>> {
-        let index =
-            IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), tracker)
-                .await?;
+        let index = IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(
+            remote_engine_config.clone(),
+            tracker,
+            true,
+        )
+        .await?;
         let core_config_value = self.core_config.read().await.get().clone();
         let index_holder = IndexHolder::create_holder(
             &self.core_config,

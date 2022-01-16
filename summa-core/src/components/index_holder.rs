@@ -211,12 +211,30 @@ impl IndexHolder {
     >(
         remote_engine_config: proto::RemoteEngineConfig,
         tracker: impl Tracker,
+        read_only: bool,
     ) -> SummaResult<Index> {
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
-        let hotcache_handle = network_directory.get_network_file_handle("hotcache.bin".as_ref());
         tracker.send_event(TrackerEvent::ReadingHotcache);
-        let hotcache_bytes = hotcache_handle.do_read_bytes_async(None, tracker).await.expect("cannot read hotcache");
-        let directory = wrap_with_caches(network_directory, Some(hotcache_bytes), remote_engine_config.chunked_cache_config.as_ref())?;
+        let hotcache_bytes = match network_directory
+            .get_network_file_handle("hotcache.bin".as_ref())
+            .do_read_bytes_async(None, tracker)
+            .await
+        {
+            Ok(hotcache_bytes) => {
+                if read_only {
+                    info!(action = "read_hotcache");
+                    Some(hotcache_bytes)
+                } else {
+                    warn!(action = "omit_hotcache");
+                    None
+                }
+            }
+            Err(error) => {
+                warn!(action = "error_hotcache", error = ?error);
+                None
+            }
+        };
+        let directory = wrap_with_caches(network_directory, hotcache_bytes, remote_engine_config.chunked_cache_config.as_ref())?;
         Ok(Index::open(directory)?)
     }
 
@@ -226,6 +244,7 @@ impl IndexHolder {
     pub async fn attach_ipfs_index(
         ipfs_engine_config: &proto::IpfsEngineConfig,
         content_loader: &iroh_unixfs::content_loader::FullLoader,
+        read_only: bool,
     ) -> SummaResult<Index> {
         let index_path = std::path::Path::new(&ipfs_engine_config.path);
         if index_path.exists() {
@@ -237,10 +256,18 @@ impl IndexHolder {
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
-                info!(action = "read_hotcache");
-                hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok()
+                if read_only {
+                    info!(action = "read_hotcache");
+                    hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok()
+                } else {
+                    warn!(action = "omit_hotcache");
+                    None
+                }
             }
-            Err(_) => None,
+            Err(error) => {
+                warn!(action = "error_hotcache", error = ?error);
+                None
+            }
         };
         let index = tokio::task::spawn_blocking(move || {
             Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
