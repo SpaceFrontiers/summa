@@ -123,9 +123,17 @@ impl Server {
     pub async fn serve(&self, terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let mut futures: Vec<Box<dyn Future<Output = SummaServerResult<()>> + Send>> = vec![];
         let server_config = self.server_config_holder.read().await.get().clone();
-        let mut iroh_config = iroh_rpc_client::Config::default_network();
+        let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
 
-        let iroh_rpc_client = iroh_rpc_client::Client::new(iroh_config.clone()).await?;
+        // ToDo: Do something with substitutions here and there
+        iroh_rpc_config.store_addr = Some(format!("irpc://{}", server_config.store.endpoint).parse()?);
+        iroh_rpc_config.p2p_addr = server_config
+            .p2p
+            .as_ref()
+            .map(|p2p_config| format!("irpc://{}", p2p_config.endpoint).parse())
+            .transpose()?;
+
+        let iroh_rpc_client = iroh_rpc_client::Client::new(iroh_rpc_config.clone()).await?;
         let content_loader = iroh_unixfs::content_loader::FullLoader::new(
             iroh_rpc_client,
             iroh_unixfs::content_loader::FullLoaderConfig {
@@ -139,9 +147,8 @@ impl Server {
             },
         )?;
 
-        let p2p_service = if let Some(p2p_config) = server_config.p2p.clone() {
-            let p2p_service = P2p::new(p2p_config).await?;
-            iroh_config.p2p_addr = Some(p2p_service.rpc_addr().clone());
+        let p2p_service = if let Some(p2p_config) = &server_config.p2p {
+            let p2p_service = P2p::new(p2p_config.clone()).await?;
             let p2p_future = p2p_service.prepare_serving_future(terminator.clone()).await?;
             futures.push(Box::new(p2p_future));
             Some(p2p_service)
@@ -149,8 +156,7 @@ impl Server {
             None
         };
 
-        let store_service = Store::new(server_config.store.clone(), content_loader).await?;
-        iroh_config.store_addr = Some(store_service.rpc_addr().clone());
+        let store_service = Store::new(server_config.store.clone(), &iroh_rpc_config, content_loader).await?;
         futures.push(Box::new(store_service.prepare_serving_future(terminator.clone()).await?));
 
         if let Some(gateway_config) = server_config.gateway.clone() {
@@ -191,9 +197,12 @@ mod tests {
     use std::path::Path;
 
     use async_broadcast::broadcast;
+    use serde_json::json;
     use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
     use summa_proto::proto;
     use summa_proto::proto::index_api_client::IndexApiClient;
+    use summa_proto::proto::score::Score::F64Score;
+    use summa_proto::proto::search_api_client::SearchApiClient;
     use tonic::transport::Channel;
 
     use super::*;
@@ -204,7 +213,13 @@ mod tests {
         IndexApiClient::connect(endpoint.to_owned()).await.unwrap()
     }
 
-    async fn create_client_server(root_path: &Path) -> SummaServerResult<(ThreadHandler<SummaServerResult<()>>, IndexApiClient<Channel>)> {
+    async fn create_search_api_client(endpoint: &str) -> SearchApiClient<Channel> {
+        SearchApiClient::connect(endpoint.to_owned()).await.unwrap()
+    }
+
+    async fn create_client_server(
+        root_path: &Path,
+    ) -> SummaServerResult<(ThreadHandler<SummaServerResult<()>>, IndexApiClient<Channel>, SearchApiClient<Channel>)> {
         let server_config_holder = ConfigHolder::from_path_or(root_path.join("summa.yaml"), || create_test_server_config(&root_path.join("data")))?;
         let server_config = server_config_holder.read().await.get().clone();
         tokio::fs::create_dir_all(&server_config.data_path)
@@ -216,8 +231,9 @@ mod tests {
             tokio::spawn(Server::from_server_config(server_config_holder).serve(receiver).await?),
             server_terminator,
         );
-        let client = create_index_api_client(&format!("http://{}", &api_grpc_endpoint)).await;
-        Ok((thread_handler, client))
+        let index_client = create_index_api_client(&format!("http://{}", &api_grpc_endpoint)).await;
+        let search_client = create_search_api_client(&format!("http://{}", &api_grpc_endpoint)).await;
+        Ok((thread_handler, index_client, search_client))
     }
 
     async fn create_index(
@@ -225,14 +241,49 @@ mod tests {
         index_name: &str,
         schema: &str,
     ) -> Result<tonic::Response<proto::CreateIndexResponse>, tonic::Status> {
-        index_api_client
+        let r = index_api_client
             .create_index(tonic::Request::new(proto::CreateIndexRequest {
                 index_name: index_name.to_owned(),
-                index_engine: proto::CreateIndexEngineRequest::File.into(),
+                index_engine: proto::CreateIndexEngineRequest::Ipfs.into(),
+                index_attributes: Some(proto::IndexAttributes {
+                    default_fields: vec!["title".to_owned(), "body".to_owned()],
+                    ..Default::default()
+                }),
                 schema: schema.to_owned(),
                 ..Default::default()
             }))
-            .await
+            .await?;
+        index_api_client
+            .index_document(proto::IndexDocumentRequest {
+                index_alias: "test_index".to_string(),
+                document: json!({"title": "title1", "body": "body1"}).to_string().as_bytes().to_vec(),
+            })
+            .await?;
+        index_api_client
+            .index_document(proto::IndexDocumentRequest {
+                index_alias: "test_index".to_string(),
+                document: json!({"title": "title2", "body": "body2"}).to_string().as_bytes().to_vec(),
+            })
+            .await?;
+        index_api_client
+            .commit_index(proto::CommitIndexRequest {
+                index_alias: "test_index".to_string(),
+                commit_mode: proto::CommitMode::Sync.into(),
+            })
+            .await?;
+        index_api_client
+            .index_document(proto::IndexDocumentRequest {
+                index_alias: "test_index".to_string(),
+                document: json!({"title": "title3", "body": "body3"}).to_string().as_bytes().to_vec(),
+            })
+            .await?;
+        index_api_client
+            .commit_index(proto::CommitIndexRequest {
+                index_alias: "test_index".to_string(),
+                commit_mode: proto::CommitMode::Sync.into(),
+            })
+            .await?;
+        Ok(r)
     }
 
     async fn create_default_index(index_api_client: &mut IndexApiClient<Channel>) -> Result<tonic::Response<proto::CreateIndexResponse>, tonic::Status> {
@@ -245,26 +296,13 @@ mod tests {
     async fn test_application() {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
-        let (thread_handler, mut index_api_client) = create_client_server(root_path.path()).await.unwrap();
+        let (thread_handler, mut index_api_client, _) = create_client_server(root_path.path()).await.unwrap();
 
         let schema = create_test_schema();
         let schema_str = serde_yaml::to_string(&schema).unwrap();
 
         let response = create_index(&mut index_api_client, "test_index", &schema_str).await.unwrap();
-        assert_eq!(
-            response.into_inner(),
-            proto::CreateIndexResponse {
-                index: Some(proto::IndexDescription {
-                    index_name: "test_index".to_owned(),
-                    index_engine: Some(proto::IndexEngineConfig {
-                        config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
-                            path: root_path.into_path().join("data").join("test_index").to_string_lossy().to_string()
-                        }))
-                    }),
-                    ..Default::default()
-                }),
-            }
-        );
+        assert_eq!(response.into_inner().index.unwrap().index_name, "test_index");
         thread_handler.stop().await.unwrap().unwrap();
     }
 
@@ -273,27 +311,86 @@ mod tests {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
 
-        let (thread_handler_1, mut index_api_client_1) = create_client_server(root_path.path()).await.unwrap();
+        let (thread_handler_1, mut index_api_client_1, mut search_api_client_1) = create_client_server(root_path.path()).await.unwrap();
         assert!(create_default_index(&mut index_api_client_1).await.is_ok());
-        thread_handler_1.stop().await.unwrap().unwrap();
-
-        let (thread_handler_2, mut index_api_client_2) = create_client_server(root_path.path()).await.unwrap();
-        assert_eq!(
-            index_api_client_2
-                .get_indices(tonic::Request::new(proto::GetIndicesRequest {}))
-                .await
-                .unwrap()
-                .into_inner(),
-            proto::GetIndicesResponse {
-                indices: vec![proto::IndexDescription {
-                    index_name: "test_index".to_owned(),
-                    index_engine: Some(proto::IndexEngineConfig {
-                        config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
-                            path: root_path.into_path().join("data").join("test_index").to_string_lossy().to_string()
-                        }))
+        let search_response = search_api_client_1
+            .search(tonic::Request::new(proto::SearchRequest {
+                index_queries: vec![proto::IndexQuery {
+                    index_alias: "test_index".to_string(),
+                    query: Some(proto::Query {
+                        query: Some(proto::query::Query::Match(proto::MatchQuery { value: "title3".to_string() })),
                     }),
-                    ..Default::default()
-                }]
+                    collectors: vec![proto::Collector {
+                        collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
+                            limit: 1,
+                            offset: 0,
+                            scorer: None,
+                            snippets: Default::default(),
+                            explain: false,
+                            fields: vec![],
+                        })),
+                    }],
+                }],
+                tags: Default::default(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            search_response.collector_outputs[0],
+            proto::CollectorOutput {
+                collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+                    scored_documents: vec![proto::ScoredDocument {
+                        document: "{\"body\":\"body3\",\"title\":\"title3\"}".to_string(),
+                        score: Some(proto::Score {
+                            score: Some(F64Score(0.9808291792869568))
+                        }),
+                        index_alias: "test_index".to_string(),
+                        ..Default::default()
+                    }],
+                    has_next: false,
+                })),
+            }
+        );
+        thread_handler_1.stop().await.unwrap().unwrap();
+        let (thread_handler_2, _, mut search_api_client_2) = create_client_server(root_path.path()).await.unwrap();
+        let search_response = search_api_client_2
+            .search(tonic::Request::new(proto::SearchRequest {
+                index_queries: vec![proto::IndexQuery {
+                    index_alias: "test_index".to_string(),
+                    query: Some(proto::Query {
+                        query: Some(proto::query::Query::Match(proto::MatchQuery { value: "title3".to_string() })),
+                    }),
+                    collectors: vec![proto::Collector {
+                        collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
+                            limit: 1,
+                            offset: 0,
+                            scorer: None,
+                            snippets: Default::default(),
+                            explain: false,
+                            fields: vec![],
+                        })),
+                    }],
+                }],
+                tags: Default::default(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            search_response.collector_outputs[0],
+            proto::CollectorOutput {
+                collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+                    scored_documents: vec![proto::ScoredDocument {
+                        document: "{\"body\":\"body3\",\"title\":\"title3\"}".to_string(),
+                        score: Some(proto::Score {
+                            score: Some(F64Score(0.9808291792869568))
+                        }),
+                        index_alias: "test_index".to_string(),
+                        ..Default::default()
+                    }],
+                    has_next: false,
+                })),
             }
         );
         thread_handler_2.stop().await.unwrap().unwrap();

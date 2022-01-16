@@ -11,7 +11,7 @@ mod requests_composer;
 mod slice_address;
 mod stored_item;
 
-pub use chunked_caching_directory::ChunkedCachingDirectory;
+pub use chunked_caching_directory::{ChunkedCachingDirectory, FileStat, FileStats};
 pub use debug_proxy_directory::DebugProxyDirectory;
 pub use external_requests::{
     DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, ExternalResponse, Header,
@@ -41,31 +41,35 @@ impl tantivy::directory::TerminatingWrite for Noop {
 }
 
 #[macro_export]
-macro_rules! read_only_directory {
+macro_rules! write_proxy_directory {
     () => {
-        fn atomic_write(&self, _: &Path, _: &[u8]) -> std::io::Result<()> {
-            Ok(())
+        fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            self.underlying.atomic_write(path, data)
         }
 
-        fn delete(&self, _: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
-            Ok(())
+        fn delete(&self, path: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
+            self.underlying.delete(path)
         }
 
-        fn open_write(&self, _: &Path) -> Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError> {
-            Ok(std::io::BufWriter::new(Box::new(Noop {})))
+        async fn delete_async(&self, path: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
+            self.underlying.delete_async(path).await
+        }
+
+        fn open_write(&self, path: &Path) -> Result<tantivy::directory::WritePtr, tantivy::directory::error::OpenWriteError> {
+            self.underlying.open_write(path)
         }
 
         fn sync_directory(&self) -> std::io::Result<()> {
-            Ok(())
+            self.underlying.sync_directory()
         }
 
-        fn watch(&self, _: tantivy::directory::WatchCallback) -> tantivy::Result<tantivy::directory::WatchHandle> {
-            Ok(tantivy::directory::WatchHandle::empty())
+        fn watch(&self, watch_callback: tantivy::directory::WatchCallback) -> tantivy::Result<tantivy::directory::WatchHandle> {
+            self.underlying.watch(watch_callback)
         }
 
-        fn acquire_lock(&self, _lock: &tantivy::directory::Lock) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
-            Ok(tantivy::directory::DirectoryLock::from(Box::new(|| {})))
+        fn acquire_lock(&self, lock: &tantivy::directory::Lock) -> Result<tantivy::directory::DirectoryLock, tantivy::directory::error::LockError> {
+            self.underlying.acquire_lock(lock)
         }
     };
 }
-pub use read_only_directory;
+pub use write_proxy_directory;

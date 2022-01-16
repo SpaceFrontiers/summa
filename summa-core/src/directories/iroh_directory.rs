@@ -7,14 +7,13 @@ use std::{ops::Range, path::Path, sync::Arc, usize};
 use iroh_metrics::resolver::OutMetrics;
 use iroh_resolver::resolver::{OutPrettyReader, Resolver};
 use iroh_unixfs::content_loader::ContentLoader;
-use tantivy::directory::error::{DeleteError, OpenWriteError};
-use tantivy::directory::{WatchCallback, WatchHandle, WritePtr};
+use tantivy::directory::error::{DeleteError, LockError, OpenWriteError};
+use tantivy::directory::{DirectoryLock, Lock, WatchCallback, WatchHandle, WritePtr};
 use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     Directory, HasLen,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::trace;
 
 use crate::errors::SummaResult;
 
@@ -39,7 +38,6 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, 
         for (file_name, cid) in root_path.named_links()?.into_iter() {
             let file_name = PathBuf::from(file_name.expect("file without name"));
             let resolved_path = resolver.resolve(iroh_resolver::Path::from_cid(cid)).await?;
-            trace!(action = "resolved_iroh_file", file_name = ?file_name, cid = ?cid);
             files.insert(file_name, resolved_path);
         }
         Ok(IrohDirectory {
@@ -60,18 +58,27 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, 
 
 #[async_trait]
 impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for IrohDirectory<D, T> {
-    fn get_file_handle(&self, file_name: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        if self.underlying.exists(file_name)? {
-            Ok(self.underlying.get_file_handle(file_name)?)
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        Ok(if self.underlying.exists(path)? {
+            self.underlying.get_file_handle(path)?
         } else {
-            Ok(Arc::new(self.get_iroh_file_handle(file_name)?))
-        }
+            Arc::new(self.get_iroh_file_handle(path)?)
+        })
     }
 
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         if let Ok(exists) = self.underlying.exists(path) {
             if exists {
                 self.underlying.delete(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_async(&self, path: &Path) -> Result<(), DeleteError> {
+        if let Ok(exists) = self.underlying.exists(path) {
+            if exists {
+                self.underlying.delete_async(path).await?;
             }
         }
         Ok(())
@@ -86,20 +93,22 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-        if self.underlying.exists(path)? {
-            self.underlying.atomic_read(path)
-        } else {
-            let file_handle = self.get_iroh_file_handle(path)?;
-            Ok(file_handle.read_bytes(0..file_handle.len()).expect("cannot read").to_vec())
+        match self.underlying.atomic_read(path) {
+            Ok(r) => Ok(r),
+            Err(_) => {
+                let file_handle = self.get_iroh_file_handle(path)?;
+                Ok(file_handle.read_bytes(0..file_handle.len()).expect("cannot read").to_vec())
+            }
         }
     }
 
     async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-        if self.underlying.exists(path)? {
-            self.underlying.atomic_read_async(path).await
-        } else {
-            let file_handle = self.get_iroh_file_handle(path)?;
-            Ok(file_handle.read_bytes_async(0..file_handle.len()).await.expect("cannot read").to_vec())
+        match self.underlying.atomic_read_async(path).await {
+            Ok(r) => Ok(r),
+            Err(_) => {
+                let file_handle = self.get_iroh_file_handle(path)?;
+                Ok(file_handle.read_bytes_async(0..file_handle.len()).await.expect("cannot read").to_vec())
+            }
         }
     }
 
@@ -113,6 +122,10 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
 
     fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
         self.underlying.watch(watch_callback)
+    }
+
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        self.underlying.acquire_lock(lock)
     }
 }
 

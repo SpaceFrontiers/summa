@@ -1,12 +1,16 @@
 use std::future::Future;
+use std::time::Duration;
 
 use async_broadcast::Receiver;
+use futures_util::io::Cursor;
 use futures_util::StreamExt;
 use iroh_rpc_types::store::StoreAddr;
 use summa_core::utils::thread_handler::ControlMessage;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{info, info_span, instrument, Instrument};
 
 use crate::errors::SummaServerResult;
+use crate::utils::wait_for_addr;
 
 const MAX_CHUNK_SIZE: u64 = 1024 * 1024;
 
@@ -19,14 +23,21 @@ pub struct Store {
 }
 
 impl Store {
-    pub async fn new(config: crate::configs::store::Config, content_loader: iroh_unixfs::content_loader::FullLoader) -> SummaServerResult<Store> {
+    pub async fn new(
+        config: crate::configs::store::Config,
+        iroh_rpc_config: &iroh_rpc_client::Config,
+        content_loader: iroh_unixfs::content_loader::FullLoader,
+    ) -> SummaServerResult<Store> {
         let rpc_addr: StoreAddr = format!("irpc://{}", config.endpoint).parse()?;
-        let iroh_store_config = iroh_store::Config::with_rpc_addr(config.path.clone(), rpc_addr.clone());
+        let iroh_store_config = iroh_store::Config {
+            path: config.path.clone(),
+            rpc_client: iroh_rpc_config.clone(),
+        };
         let store = if config.path.exists() {
-            info!(action = "open_store", path = ?config.path);
+            info!(action = "open_store", path = ?config.path, endpoint = ?rpc_addr);
             iroh_store::Store::open(iroh_store_config).await?
         } else {
-            info!(action = "create_store", path = ?config.path);
+            info!(action = "create_store", path = ?config.path, endpoint = ?rpc_addr);
             tokio::fs::create_dir_all(&config.path).await?;
             iroh_store::Store::create(iroh_store_config).await?
         };
@@ -49,9 +60,9 @@ impl Store {
 
     #[instrument("lifecycle", skip_all)]
     pub async fn prepare_serving_future(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
-        let rpc_addr = format!("irpc://{}", self.config.endpoint).parse()?;
-        let store_task = tokio::spawn(iroh_store::rpc::new(rpc_addr, self.store.clone()));
-
+        let rpc_addr: StoreAddr = format!("irpc://{}", self.config.endpoint).parse()?;
+        let store_task = tokio::spawn(iroh_store::rpc::new(rpc_addr.clone(), self.store.clone()));
+        wait_for_addr(rpc_addr.try_as_socket_addr().expect("not socket addr"), Duration::from_secs(10)).await?;
         info!(action = "binded", endpoint = ?self.config.endpoint);
         Ok(async move {
             let signal_result = terminator.recv().await;
@@ -69,17 +80,19 @@ impl Store {
         .instrument(info_span!(parent: None, "lifecycle")))
     }
 
-    pub async fn put(&self, files: Vec<summa_core::components::ComponentFile>, delete_files: bool) -> SummaServerResult<String> {
-        info!(files = ?files);
+    pub async fn put(&self, files: Vec<summa_core::components::ComponentFile>) -> SummaServerResult<String> {
+        info!(action = "prepare_put", files = ?files);
         let mut entries = vec![];
-        for file in files.iter() {
+        for file in files.into_iter() {
+            let file_name = file.file_name().to_string();
+            let reader = Cursor::new(file.into_reader().await);
             entries.push(iroh_unixfs::builder::Entry::File(
                 iroh_unixfs::builder::FileBuilder::new()
-                    .name(file.path().file_name().expect("should have name").to_string_lossy().to_string())
+                    .name(file_name)
                     .chunker(iroh_unixfs::chunker::Chunker::Fixed(iroh_unixfs::chunker::Fixed {
                         chunk_size: self.config.default_chunk_size as usize,
                     }))
-                    .content_reader(tokio::fs::File::open(file.path()).await?)
+                    .content_reader(reader.compat())
                     .build()
                     .await?,
             ))
@@ -90,7 +103,6 @@ impl Store {
         let mut chunk = Vec::new();
         let mut chunk_size = 0u64;
         let mut cid = None;
-
         while let Some(block) = blocks.next().await {
             let block = block?;
             let block_size = block.data().len() as u64 + block.links().len() as u64 * 128;
@@ -106,12 +118,8 @@ impl Store {
         }
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.put_many(chunk)).await??;
-
-        if delete_files {
-            for file in files.iter() {
-                tokio::fs::remove_file(file.path()).await?;
-            }
-        }
-        Ok(cid.expect("no files found").to_string())
+        let cid = cid.expect("no files found").to_string();
+        info!(action = "put", cid = cid);
+        Ok(cid)
     }
 }

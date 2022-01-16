@@ -82,6 +82,8 @@ pub enum Error {
     Tantivy(#[from] tantivy::TantivyError),
     #[error("proto")]
     Proto(#[from] summa_proto::errors::Error),
+    #[error("read_only_index: {0}")]
+    ReadOnlyIndex(String),
     #[error("unbound_document_error")]
     UnboundDocument,
     #[error("unknown_directory_error: {0}")]

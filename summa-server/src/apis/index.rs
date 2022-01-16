@@ -158,7 +158,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                     info!(action = "received_chunk", index_alias = chunk.index_alias, documents = ?chunk.documents.len());
                     let now = Instant::now();
                     let index_holder = self.index_service.get_index_holder(&chunk.index_alias).await?;
-                    let (success_bulk_docs, failed_bulk_docs) = index_holder.index_bulk(&chunk.documents).await;
+                    let (success_bulk_docs, failed_bulk_docs) = index_holder.index_bulk(&chunk.documents).await.map_err(crate::errors::Error::from)?;
                     elapsed_secs += now.elapsed().as_secs_f64();
                     success_docs += success_bulk_docs;
                     failed_docs += failed_bulk_docs;
@@ -217,6 +217,12 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn merge_segments(&self, proto_request: Request<proto::MergeSegmentsRequest>) -> Result<Response<proto::MergeSegmentsResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let mut index_writer_holder = index_holder
+            .index_writer_holder()
+            .map_err(crate::errors::Error::from)?
+            .clone()
+            .write_owned()
+            .await;
         tokio::spawn(async move {
             let index_name = index_holder.index_name().to_string();
             let segment_ids: Vec<_> = proto_request
@@ -226,7 +232,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("wrong uuid");
             async move {
-                let result = index_holder.index_writer_holder().write().await.merge(&segment_ids, None).await;
+                let result = index_writer_holder.merge(&segment_ids, None).await;
                 if let Err(error) = result {
                     error!(error = ?error)
                 }
@@ -254,10 +260,16 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn vacuum_index(&self, proto_request: Request<proto::VacuumIndexRequest>) -> Result<Response<proto::VacuumIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let mut index_writer_holder = index_holder
+            .index_writer_holder()
+            .map_err(crate::errors::Error::from)?
+            .clone()
+            .write_owned()
+            .await;
         tokio::spawn(async move {
             let index_name = index_holder.index_name().to_string();
             async move {
-                let result = index_holder.index_writer_holder().write().await.vacuum(None).await;
+                let result = index_writer_holder.vacuum(None).await;
                 if let Err(error) = result {
                     error!(error = ?error)
                 }

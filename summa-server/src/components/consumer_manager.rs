@@ -67,6 +67,12 @@ impl StoppedConsumption {
             Err(e) => Err(e),
         }
     }
+
+    pub fn ignore(self) -> PreparedConsumption {
+        PreparedConsumption {
+            committed_consumer_thread: self.consumer_thread,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -110,7 +116,7 @@ impl ConsumerManager {
         if self.consumptions.contains_key(index_holder) {
             return Err(ValidationError::ExistingConsumer(index_holder.index_name().to_string()).into());
         }
-        let index_writer_holder = index_holder.index_writer_holder().clone().read_owned().await;
+        let index_writer_holder = index_holder.index_writer_holder()?.clone().read_owned().await;
         let schema = index_holder.schema().clone();
         prepared_consumption
             .committed_consumer_thread
@@ -127,7 +133,7 @@ impl ConsumerManager {
         join_all(self.consumptions.drain().map(|(index_holder, consumer_thread)| async move {
             consumer_thread.stop().await?;
             let stopped_consumption = StoppedConsumption { consumer_thread };
-            index_holder.index_writer_holder().write().await.commit().await?;
+            index_holder.index_writer_holder()?.write().await.commit().await?;
             stopped_consumption.commit_offsets().await?;
             Ok(())
         }))

@@ -99,31 +99,30 @@ impl ConfigHolder {
     }
 }
 
+#[cfg(test)]
 pub mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
-
-    static BASE_PORT: AtomicUsize = AtomicUsize::new(50000);
+    use crate::utils::tests::acquire_free_port;
 
     pub fn create_test_server_config(data_path: &Path) -> Config {
-        crate::configs::server::ConfigBuilder::default()
+        ConfigBuilder::default()
             .debug(true)
             .data_path(data_path)
             .api(
                 crate::configs::api::ConfigBuilder::default()
-                    .grpc_endpoint(format!("127.0.0.1:{}", BASE_PORT.fetch_add(1, Ordering::Relaxed)))
+                    .grpc_endpoint(format!("127.0.0.1:{}", acquire_free_port()))
                     .build()
                     .expect("cannot create api config"),
             )
             .metrics(
                 crate::configs::metrics::ConfigBuilder::default()
-                    .endpoint(format!("127.0.0.1:{}", BASE_PORT.fetch_add(1, Ordering::Relaxed)))
+                    .endpoint(format!("127.0.0.1:{}", acquire_free_port()))
                     .build()
                     .expect("cannot create metrics config"),
             )
             .store(
                 crate::configs::store::ConfigBuilder::default()
+                    .endpoint(format!("127.0.0.1:{}", acquire_free_port()))
                     .path(data_path.join("ks"))
                     .build()
                     .expect("cannot create store config"),

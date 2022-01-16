@@ -23,5 +23,5 @@ rayon = "1.6.1"
 serde = { version = "1.0.152", default_features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.91" }
 serde_yaml = { version = "0.8.26" }
-tantivy = { package = "summavy", version = "0.26.0", default_features = false, features = ["quickwit", "zstd-compression"], path = "../tantivy"}
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", package = "summavy", version = "0.26.0", default_features = false, features = ["quickwit", "zstd-compression"] }
 tokio = { version = "1.24", default_features = false }

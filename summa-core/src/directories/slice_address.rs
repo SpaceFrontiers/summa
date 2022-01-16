@@ -26,6 +26,7 @@ use lru::KeyRef;
 #[derive(Hash, Clone, Eq, PartialEq)]
 pub struct SliceAddress {
     pub path: PathBuf,
+    pub generation: u32,
     pub index: usize,
 }
 
@@ -38,6 +39,7 @@ pub struct SliceAddress {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct SliceAddressRef<'a> {
     pub path: &'a Path,
+    pub generation: u32,
     pub index: usize,
 }
 
@@ -49,6 +51,7 @@ impl SliceAddressKey for SliceAddress {
     fn key(&self) -> SliceAddressRef {
         SliceAddressRef {
             path: self.path.as_path(),
+            generation: self.generation,
             index: self.index,
         }
     }

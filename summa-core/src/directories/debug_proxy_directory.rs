@@ -30,8 +30,6 @@ use tantivy::directory::{FileHandle, OwnedBytes};
 use tantivy::{Directory, HasLen};
 use time::OffsetDateTime;
 
-use crate::directories::Noop;
-
 #[derive(Clone, Default)]
 struct OperationBuffer(Arc<Mutex<Vec<ReadOperation>>>);
 
@@ -226,6 +224,4 @@ impl<D: Directory> Directory for DebugProxyDirectory<D> {
         self.register(read_operation);
         Ok(payload.to_vec())
     }
-
-    super::read_only_directory!();
 }
