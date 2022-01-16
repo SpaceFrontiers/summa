@@ -183,16 +183,16 @@ impl<K: Hash + Eq> MemorySizedCache<K> {
 
 impl MemorySizedCache<SliceAddress> {
     /// If available, returns the cached view of the slice.
-    pub fn get_slice(&self, path: &Path, index: usize) -> Option<OwnedBytes> {
-        let slice_address_ref = SliceAddressRef { path, index };
+    pub fn get_slice(&self, path: &Path, generation: u32, index: usize) -> Option<OwnedBytes> {
+        let slice_address_ref = SliceAddressRef { path, generation, index };
         self.get(&slice_address_ref as &dyn SliceAddressKey)
     }
 
     /// Attempt to put the given amount of data in the cache.
     /// This may fail silently if the owned_bytes slice is larger than the cache
     /// capacity.
-    pub fn put_slice(&self, path: PathBuf, index: usize, bytes: OwnedBytes) {
-        let slice_address = SliceAddress { path, index };
+    pub fn put_slice(&self, path: PathBuf, generation: u32, index: usize, bytes: OwnedBytes) {
+        let slice_address = SliceAddress { path, generation, index };
         self.put(slice_address, bytes);
     }
 }

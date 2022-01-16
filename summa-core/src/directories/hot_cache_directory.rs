@@ -25,13 +25,13 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
-use tantivy::directory::error::OpenReadError;
-use tantivy::directory::{FileHandle, FileSlice, OwnedBytes};
+use tantivy::directory::error::{LockError, OpenReadError};
+use tantivy::directory::{DirectoryLock, FileHandle, FileSlice, Lock, OwnedBytes, WatchCallback, WatchHandle};
 use tantivy::error::DataCorruption;
 use tantivy::{Directory, HasLen, Index, IndexReader, ReloadPolicy};
 
 use super::debug_proxy_directory::DebugProxyDirectory;
-use crate::directories::{ChunkedCachingDirectory, Noop};
+use crate::directories::{ChunkedCachingDirectory, FileStats};
 use crate::metrics::CacheMetrics;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -416,11 +416,13 @@ impl Directory for HotDirectory {
         self.inner.underlying.atomic_read_async(path).await
     }
 
-    async fn delete_async(&self, _: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
-        unimplemented!()
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        self.inner.underlying.acquire_lock(lock)
     }
 
-    super::read_only_directory!();
+    fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.inner.underlying.watch(watch_callback)
+    }
 }
 
 async fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
@@ -439,7 +441,7 @@ pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: usize) ->
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
-    let caching_directory = ChunkedCachingDirectory::new_unbounded(directory, chunk_size, CacheMetrics::default(), HashMap::new());
+    let caching_directory = ChunkedCachingDirectory::new_unbounded(directory, chunk_size, CacheMetrics::default(), FileStats::default());
     let debug_proxy_directory = DebugProxyDirectory::wrap(caching_directory);
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();

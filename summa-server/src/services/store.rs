@@ -81,7 +81,7 @@ impl Store {
     }
 
     pub async fn put(&self, files: Vec<summa_core::components::ComponentFile>) -> SummaServerResult<String> {
-        info!(action = "put", files = ?files);
+        info!(action = "prepare_put", files = ?files);
         let mut entries = vec![];
         for file in files.into_iter() {
             let file_name = file.file_name().to_string();
@@ -118,7 +118,8 @@ impl Store {
         }
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.put_many(chunk)).await??;
-
-        Ok(cid.expect("no files found").to_string())
+        let cid = cid.expect("no files found").to_string();
+        info!(action = "put", cid = cid);
+        Ok(cid)
     }
 }

@@ -311,10 +311,48 @@ mod tests {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
 
-        let (thread_handler_1, mut index_api_client_1, _) = create_client_server(root_path.path()).await.unwrap();
+        let (thread_handler_1, mut index_api_client_1, mut search_api_client_1) = create_client_server(root_path.path()).await.unwrap();
         assert!(create_default_index(&mut index_api_client_1).await.is_ok());
+        let search_response = search_api_client_1
+            .search(tonic::Request::new(proto::SearchRequest {
+                index_queries: vec![proto::IndexQuery {
+                    index_alias: "test_index".to_string(),
+                    query: Some(proto::Query {
+                        query: Some(proto::query::Query::Match(proto::MatchQuery { value: "title3".to_string() })),
+                    }),
+                    collectors: vec![proto::Collector {
+                        collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
+                            limit: 1,
+                            offset: 0,
+                            scorer: None,
+                            snippets: Default::default(),
+                            explain: false,
+                            fields: vec![],
+                        })),
+                    }],
+                }],
+                tags: Default::default(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            search_response.collector_outputs[0],
+            proto::CollectorOutput {
+                collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+                    scored_documents: vec![proto::ScoredDocument {
+                        document: "{\"body\":\"body3\",\"title\":\"title3\"}".to_string(),
+                        score: Some(proto::Score {
+                            score: Some(F64Score(0.9808291792869568))
+                        }),
+                        index_alias: "test_index".to_string(),
+                        ..Default::default()
+                    }],
+                    has_next: false,
+                })),
+            }
+        );
         thread_handler_1.stop().await.unwrap().unwrap();
-
         let (thread_handler_2, _, mut search_api_client_2) = create_client_server(root_path.path()).await.unwrap();
         let search_response = search_api_client_2
             .search(tonic::Request::new(proto::SearchRequest {

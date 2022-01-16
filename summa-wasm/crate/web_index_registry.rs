@@ -5,6 +5,7 @@ use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
 use summa_core::configs::core::ExecutionStrategy;
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
+use summa_core::errors::SummaResult;
 use summa_proto::proto;
 use summa_proto::proto::{IndexAttributes, IndexEngineConfig, RemoteEngineConfig};
 use wasm_bindgen::prelude::*;
@@ -185,6 +186,7 @@ impl WebIndexRegistry {
             Arc::new(DirectProxy::new(IndexEngineConfig {
                 config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
             })),
+            true,
         )?;
         let index_attributes = index_holder.index_attributes().cloned();
         self.index_registry.add(index_holder).await;
@@ -211,10 +213,14 @@ impl WebIndexRegistry {
         Ok(())
     }
 
+    async fn commit_internal(&self, index_name: &str) -> SummaResult<()> {
+        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await?;
+        index_holder.index_writer_holder()?.write().await.commit().await?;
+        Ok(())
+    }
+
     #[wasm_bindgen]
     pub async fn commit(&self, index_name: &str) -> Result<(), JsValue> {
-        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
-        index_holder.index_writer_holder().write().await.commit().await.map_err(Error::from)?;
-        Ok(())
+        Ok(self.commit_internal(index_name).await.map_err(Error::from)?)
     }
 }

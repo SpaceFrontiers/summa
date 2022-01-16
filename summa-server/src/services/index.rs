@@ -142,7 +142,7 @@ impl Index {
             let core_config = self.server_config.read().await.get().core.clone();
             let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
             let index_holder = tokio::task::spawn_blocking(move || {
-                IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder)
+                IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder, false)
             })
             .await??;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
@@ -205,7 +205,7 @@ impl Index {
             .index_registry
             .add(
                 tokio::task::spawn_blocking(move || {
-                    IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder)
+                    IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder, false)
                 })
                 .await??,
             )
@@ -233,7 +233,7 @@ impl Index {
             proto::attach_index_request::Request::AttachIpfsEngineRequest(proto::AttachIpfsEngineRequest { cid }) => {
                 let ipfs_index_engine = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
-                    chunked_cache_config: default_chunked_cache_config(),
+                    chunked_cache_config: None,
                     path: index_path.to_string_lossy().to_string(),
                 };
                 let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader()).await?;
@@ -294,8 +294,7 @@ impl Index {
                 drop(index);
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid,
-                    // ToDo: enable back
-                    chunked_cache_config: None,
+                    chunked_cache_config: default_chunked_cache_config(),
                     path: self
                         .server_config
                         .read()
@@ -444,7 +443,7 @@ impl Index {
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        index_holder.index_writer_holder().write().await.commit().await?;
+        index_holder.index_writer_holder()?.write().await.commit().await?;
         let prepared_consumption = match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
@@ -453,7 +452,7 @@ impl Index {
         info!(action = "config", config = ?index_engine_config.get().config);
         if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
             ipfs_engine_config.cid = index_holder
-                .index_writer_holder()
+                .index_writer_holder()?
                 .write()
                 .await
                 .lock_files(false, |files: Vec<summa_core::components::ComponentFile>| async move {
@@ -464,6 +463,7 @@ impl Index {
                 })
                 .await?;
             index_engine_config.commit().await?;
+            index_holder.index_reader().reload()?;
         }
         Ok(prepared_consumption)
     }
@@ -472,14 +472,14 @@ impl Index {
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn rollback(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        index_holder.index_writer_holder().write().await.rollback().await?;
+        index_holder.index_writer_holder()?.write().await.rollback().await?;
         Ok(stopped_consumption.map(|c| c.ignore()))
     }
 
     /// Commits immediately or returns all without restarting consuming threads
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn try_commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
-        let mut index_writer = index_holder.index_writer_holder().try_write()?;
+        let mut index_writer = index_holder.index_writer_holder()?.try_write()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         index_writer.commit().await?;
         Ok(match stopped_consumption {
@@ -572,7 +572,7 @@ impl Index {
         let index_holder = match proto::CreateIndexEngineRequest::from_i32(migrate_index_request.target_index_engine) {
             Some(proto::CreateIndexEngineRequest::Ipfs) => {
                 let cid = index_holder
-                    .index_writer_holder()
+                    .index_writer_holder()?
                     .write()
                     .await
                     .lock_files(true, |files: Vec<summa_core::components::ComponentFile>| async move {

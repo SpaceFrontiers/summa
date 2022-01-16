@@ -1,7 +1,8 @@
 use std::fmt::{Debug, Formatter};
 use std::{io, ops::Range, path::Path, sync::Arc, usize};
 
-use tantivy::directory::DirectoryClone;
+use tantivy::directory::error::LockError;
+use tantivy::directory::{DirectoryClone, DirectoryLock, Lock, WatchCallback, WatchHandle};
 use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     Directory, HasLen,
@@ -9,7 +10,7 @@ use tantivy::{
 
 use super::ExternalRequestGenerator;
 use crate::components::{DefaultTracker, Tracker, TrackerEvent};
-use crate::directories::{ExternalRequest, Noop};
+use crate::directories::ExternalRequest;
 use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
 
@@ -69,11 +70,13 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
             .to_vec())
     }
 
-    async fn delete_async(&self, _: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
-        unimplemented!()
+    fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
+        Ok(tantivy::directory::DirectoryLock::from(Box::new(|| {})))
     }
 
-    super::read_only_directory!();
+    fn watch(&self, _: WatchCallback) -> tantivy::Result<WatchHandle> {
+        Ok(WatchHandle::empty())
+    }
 }
 
 #[derive(Debug)]
