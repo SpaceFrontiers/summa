@@ -3,7 +3,6 @@ use std::sync::{Arc, Once};
 use futures::future::join_all;
 use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
-use summa_core::configs::core::ExecutionStrategy;
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
@@ -119,7 +118,6 @@ impl WebIndexRegistry {
         let core_config = summa_core::configs::core::ConfigBuilder::default()
             .dedicated_compression_thread(false)
             .writer_threads(0)
-            .execution_strategy(ExecutionStrategy::Async)
             .build()
             .expect("cannot build");
         let core_config = Arc::new(DirectProxy::new(core_config)) as Arc<dyn ConfigProxy<_>>;

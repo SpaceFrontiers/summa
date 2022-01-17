@@ -24,9 +24,7 @@ const index_bg_wasm = new URL(
     import.meta.url
 ).href
 // `web_index_service_worker` is an object used to spawn threads for searching
-// `setup` initializes WASM-module and pool of Web Workers integrated with Rust's `rayon`.
-// If your browser doesn't support Web Workers, pass `0` here to disable multithreading through pooling but it may
-// decrease performance.
+// `setup` initializes WASM-module and pool of Web Workers.
 await web_index_service_worker.setup(index_bg_wasm, 0)
 
 // `remote_engine_config` is a configuration object used for telling Summa how to reach remote index

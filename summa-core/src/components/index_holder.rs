@@ -13,11 +13,10 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use summa_proto::proto;
-use tantivy::collector::{Collector, MultiCollector};
+use tantivy::collector::MultiCollector;
 use tantivy::directory::OwnedBytes;
-use tantivy::query::{EnableScoring, Query, Weight};
 use tantivy::schema::Schema;
-use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, ReloadPolicy};
+use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -27,7 +26,6 @@ use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryPars
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::tracker::Tracker;
 use crate::components::{IndexWriterHolder, SummaDocument, TrackerEvent, CACHE_METRICS};
-use crate::configs::core::ExecutionStrategy;
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
@@ -399,7 +397,6 @@ impl IndexHolder {
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
     pub async fn search(&self, external_index_alias: &str, query: &proto::Query, collectors: &[proto::Collector]) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let execution_strategy = self.core_config_holder.read().await.get().execution_strategy.clone();
         let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
@@ -412,42 +409,11 @@ impl IndexHolder {
             index_name = ?self.index_name,
             query = ?query,
             parsed_query = ?parsed_query,
-            execution_strategy = ?execution_strategy
         );
 
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        let mut multi_fruit = match execution_strategy {
-            ExecutionStrategy::Async => searcher.search_async(&parsed_query, &multi_collector).await?,
-            // ToDo: Reduce code here or in Tantivy `search_with_executor`
-            ExecutionStrategy::GlobalPool => {
-                let segment_readers = searcher.segment_readers();
-                let multi_collector_ref = Arc::new(multi_collector);
-                let mut fruit_receiver = {
-                    let (fruit_sender, fruit_receiver) = tokio::sync::mpsc::unbounded_channel();
-                    let weight: Arc<dyn Weight> = Arc::from(parsed_query.weight_async(EnableScoring::Enabled(&searcher)).await?);
-                    for (segment_ord, segment_reader) in segment_readers.iter().enumerate() {
-                        let fruit_sender_ref = fruit_sender.clone();
-                        let multi_collector_ref = multi_collector_ref.clone();
-                        let weight = weight.clone();
-                        let segment_reader = segment_reader.clone();
-                        rayon::spawn(move || {
-                            fruit_sender_ref
-                                .send(multi_collector_ref.collect_segment(weight.as_ref(), segment_ord as u32, &segment_reader))
-                                .map_err(|_| Error::Internal)
-                                .expect("Send error");
-                        });
-                    }
-                    fruit_receiver
-                };
-                let mut fruits = vec![];
-                while let Some(fruit) = fruit_receiver.recv().await {
-                    fruits.push(fruit?);
-                }
-                multi_collector_ref.merge_fruits(fruits)?
-            }
-            ExecutionStrategy::SingleThread => searcher.search_with_executor(&parsed_query, &multi_collector, &Executor::SingleThread)?,
-        };
+        let mut multi_fruit = searcher.search_async(&parsed_query, &multi_collector).await?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
             &Context::current(),

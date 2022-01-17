@@ -6,20 +6,6 @@ use summa_proto::proto::IndexEngineConfig;
 
 use crate::errors::{BuilderError, SummaResult, ValidationError};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionStrategy {
-    Async,
-    GlobalPool,
-    SingleThread,
-}
-
-impl Default for ExecutionStrategy {
-    fn default() -> Self {
-        ExecutionStrategy::Async
-    }
-}
-
 fn return_true() -> bool {
     true
 }
@@ -34,9 +20,6 @@ pub struct Config {
     #[builder(default = "true")]
     #[serde(default = "return_true")]
     pub dedicated_compression_thread: bool,
-    #[builder(default = "ExecutionStrategy::Async")]
-    #[serde(default = "ExecutionStrategy::default")]
-    pub execution_strategy: ExecutionStrategy,
     #[serde(default = "HashMap::new")]
     pub indices: HashMap<String, IndexEngineConfig>,
     #[builder(default = "1024 * 1024 * 1024")]
@@ -51,7 +34,6 @@ impl Default for Config {
             aliases: HashMap::new(),
             autocommit_interval_ms: None,
             dedicated_compression_thread: true,
-            execution_strategy: ExecutionStrategy::Async,
             indices: HashMap::new(),
             writer_heap_size_bytes: 1024 * 1024 * 1024,
             writer_threads: 1,
