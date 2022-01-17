@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_broadcast::Receiver;
+use futures_util::future::join_all;
 use summa_core::components::{DefaultTracker, IndexHolder, IndexRegistry, IndexWriterHolder};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
+use summa_core::errors::SummaResult;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
 use summa_proto::proto;
@@ -616,7 +618,9 @@ impl Index {
     }
 
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
-        Ok(self.index_registry.search(&search_request.index_queries, DefaultTracker::default()).await?)
+        let futures = self.index_registry.search_futures(&search_request.index_queries).await?;
+        let collector_outputs = join_all(futures).await.into_iter().collect::<SummaResult<Vec<_>>>()?;
+        Ok(self.index_registry.merge_responses(&collector_outputs)?)
     }
 }
 
@@ -891,9 +895,7 @@ pub(crate) mod tests {
         index_service.commit(&index_holder).await?;
         index_holder.index_reader().reload()?;
 
-        let search_response = index_holder
-            .search("index", &match_query("testtitle"), &vec![top_docs_collector(10)], DefaultTracker::default())
-            .await?;
+        let search_response = index_holder.search("index", &match_query("testtitle"), &vec![top_docs_collector(10)]).await?;
         assert_eq!(search_response.len(), 1);
         drop(index_holder);
         index_service
@@ -922,9 +924,7 @@ pub(crate) mod tests {
         index_service.commit(&index_holder).await?;
         index_holder.index_reader().reload()?;
 
-        let search_response = index_holder
-            .search("index", &match_query("testtitle"), &vec![top_docs_collector(10)], DefaultTracker::default())
-            .await?;
+        let search_response = index_holder.search("index", &match_query("testtitle"), &vec![top_docs_collector(10)]).await?;
         assert_eq!(search_response.len(), 1);
 
         drop(index_holder);
@@ -953,12 +953,7 @@ pub(crate) mod tests {
         index_holder.index_reader().reload().unwrap();
         assert_eq!(
             index_holder
-                .search(
-                    "test_index",
-                    &match_query("title1"),
-                    &vec![top_docs_collector_with_eval_expr(10, "issued_at")],
-                    DefaultTracker::default()
-                )
+                .search("test_index", &match_query("title1"), &vec![top_docs_collector_with_eval_expr(10, "issued_at")],)
                 .await?,
             vec![top_docs_collector_output(
                 vec![scored_doc(

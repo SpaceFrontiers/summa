@@ -398,13 +398,7 @@ impl IndexHolder {
     }
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
-    pub async fn search(
-        &self,
-        external_index_alias: &str,
-        query: &proto::Query,
-        collectors: &[proto::Collector],
-        tracker: impl Tracker,
-    ) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub async fn search(&self, external_index_alias: &str, query: &proto::Query, collectors: &[proto::Collector]) -> SummaResult<Vec<proto::CollectorOutput>> {
         let execution_strategy = self.core_config_holder.read().await.get().execution_strategy.clone();
         let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
@@ -423,7 +417,6 @@ impl IndexHolder {
 
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        tracker.send_event(TrackerEvent::QueryingIndex);
         let mut multi_fruit = match execution_strategy {
             ExecutionStrategy::Async => searcher.search_async(&parsed_query, &multi_collector).await?,
             // ToDo: Reduce code here or in Tantivy `search_with_executor`
@@ -472,7 +465,6 @@ impl IndexHolder {
                     .collect()
             })
             .unwrap_or_else(HashSet::new);
-        tracker.send_event(TrackerEvent::CollectingDocuments);
         for extractor in extractors.into_iter() {
             collector_outputs.push(
                 extractor

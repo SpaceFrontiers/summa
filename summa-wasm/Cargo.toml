@@ -1,6 +1,6 @@
 [package]
 name = "summa-wasm"
-version = "0.86.6"
+version = "0.87.1"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -23,11 +23,9 @@ instant = { version = "0.1", default_features = false, features = [ "inaccurate"
 js-sys = "0.3"
 once_cell = "1.16"
 parking_lot = "0.12.1"
-rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde-wasm-bindgen = "0.4"
-spmc = "0.3"
 strfmt = "0.2"
 summa-core = { version = "0.11", path = "../summa-core", default_features = false }
 summa-proto = { version = "0.11", path = "../summa-proto", default_features = false }
@@ -37,6 +35,7 @@ tokio = { workspace = true, default_features = false, features = ["sync"] }
 tracing = "0.1"
 wasm-bindgen = "0.2.83"
 wasm-bindgen-futures = "0.4.33"
+web-sys = { version = "0.3.60", features = ["console", "DedicatedWorkerGlobalScope", "WorkerOptions", "WorkerType"] }
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-O4", "--enable-bulk-memory", "--enable-mutable-globals"]

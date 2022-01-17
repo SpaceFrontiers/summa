@@ -20,11 +20,11 @@ extern crate async_trait;
 
 mod errors;
 mod js_requests;
-mod rayon_helper;
 mod tracker;
 mod web_index_registry;
+mod worker_helper;
 
 use once_cell::sync::Lazy;
 use serde_wasm_bindgen::Serializer;
-
+pub use worker_helper::{worker_entry_point, ThreadPool};
 pub static SERIALIZER: Lazy<Serializer> = Lazy::new(|| Serializer::new().serialize_maps_as_objects(true));

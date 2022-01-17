@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 use std::sync::Arc;
 
-use futures::future::join_all;
 use itertools::Itertools;
 use summa_proto::proto;
 use tokio::sync::RwLock;
 
 use super::IndexHolder;
-use crate::components::Tracker;
 use crate::configs::{ConfigProxy, DirectProxy};
 use crate::errors::{SummaResult, ValidationError};
 use crate::utils::sync::{Handler, OwningHandler};
@@ -104,13 +103,17 @@ impl IndexRegistry {
     }
 
     /// Searches in several indices simultaneously and merges results
-    pub async fn search(&self, index_queries: &[proto::IndexQuery], tracker: impl Tracker) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let futures = index_queries
+    pub async fn search_futures(
+        &self,
+        index_queries: &[proto::IndexQuery],
+    ) -> SummaResult<Vec<impl Future<Output = SummaResult<Vec<proto::CollectorOutput>>>>> {
+        index_queries
             .iter()
+            .cloned()
             .map(|index_query| {
-                let tracker = tracker.clone();
+                let this = self.clone();
                 Ok(async move {
-                    let index_holder = self.get_index_holder(&index_query.index_alias).await?;
+                    let index_holder = this.get_index_holder(&index_query.index_alias).await?;
                     index_holder
                         .search(
                             &index_query.index_alias,
@@ -118,19 +121,15 @@ impl IndexRegistry {
                                 query: Some(proto::query::Query::All(proto::AllQuery {})),
                             }),
                             &index_query.collectors,
-                            tracker,
                         )
                         .await
                 })
             })
-            .collect::<SummaResult<Vec<_>>>()?;
-
-        let collector_outputs = join_all(futures).await.into_iter().collect::<SummaResult<Vec<_>>>()?;
-        self.merge_responses(&collector_outputs)
+            .collect::<SummaResult<Vec<_>>>()
     }
 
     /// Merges several `proto::CollectorOutput`
-    fn merge_responses(&self, collectors_outputs: &[Vec<proto::CollectorOutput>]) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub fn merge_responses(&self, collectors_outputs: &[Vec<proto::CollectorOutput>]) -> SummaResult<Vec<proto::CollectorOutput>> {
         if collectors_outputs.is_empty() {
             return Err(Error::Validation(Box::new(ValidationError::EmptyArgument("collectors".to_string()))));
         }

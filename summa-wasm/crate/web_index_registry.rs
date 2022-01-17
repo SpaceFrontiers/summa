@@ -1,5 +1,6 @@
 use std::sync::{Arc, Once};
 
+use futures::future::join_all;
 use serde::Serialize;
 use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
 use summa_core::configs::core::ExecutionStrategy;
@@ -14,7 +15,7 @@ use wasm_bindgen::JsValue;
 use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;
 use crate::tracker::SubscribeTracker;
-use crate::SERIALIZER;
+use crate::{ThreadPool, SERIALIZER};
 
 #[wasm_bindgen]
 #[derive(Clone, Default)]
@@ -80,15 +81,18 @@ impl JsSearchOperation {
     pub fn tracker(&self) -> JsTracker {
         self.tracker.clone()
     }
-
     pub async fn execute(self) -> Result<JsValue, JsValue> {
-        Ok(self
-            .web_index_registry
-            .index_registry
-            .search(&self.index_queries, self.tracker.0)
+        Ok(self.execute_internal().await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+    }
+
+    async fn execute_internal(self) -> SummaResult<Vec<proto::CollectorOutput>> {
+        let futures = self.web_index_registry.index_registry.search_futures(&self.index_queries).await?;
+        let collectors_outputs = join_all(futures.into_iter().map(|f| self.web_index_registry.thread_pool().spawn(f)))
             .await
-            .map_err(Error::from)?
-            .serialize(&*SERIALIZER)?)
+            .into_iter()
+            .map(|r| r.expect("cannot receive"))
+            .collect::<SummaResult<Vec<_>>>()?;
+        self.web_index_registry.merge_responses(&collectors_outputs)
     }
 }
 
@@ -128,6 +132,7 @@ impl JsWarmupOperation {
 pub struct WebIndexRegistry {
     index_registry: IndexRegistry,
     core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
+    thread_pool: Option<ThreadPool>,
 }
 
 #[wasm_bindgen]
@@ -142,23 +147,27 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen(constructor)]
-    pub fn new(multithreading: bool) -> WebIndexRegistry {
+    pub fn new() -> WebIndexRegistry {
         console_error_panic_hook::set_once();
         WebIndexRegistry::reserve_heap();
         let core_config = summa_core::configs::core::ConfigBuilder::default()
             .dedicated_compression_thread(false)
             .writer_threads(0)
-            .execution_strategy(match multithreading {
-                true => ExecutionStrategy::GlobalPool,
-                false => ExecutionStrategy::Async,
-            })
+            .execution_strategy(ExecutionStrategy::Async)
             .build()
             .expect("cannot build");
         let core_config = Arc::new(DirectProxy::new(core_config)) as Arc<dyn ConfigProxy<_>>;
         WebIndexRegistry {
             index_registry: IndexRegistry::new(&core_config),
             core_config,
+            thread_pool: None,
         }
+    }
+
+    #[wasm_bindgen]
+    pub async fn setup(&mut self, threads: usize) -> Result<(), JsValue> {
+        self.thread_pool = Some(ThreadPool::new(threads).await?);
+        Ok(())
     }
 
     #[wasm_bindgen]
@@ -225,5 +234,21 @@ impl WebIndexRegistry {
     #[wasm_bindgen]
     pub async fn commit(&self, index_name: &str) -> Result<(), JsValue> {
         Ok(self.commit_internal(index_name).await.map_err(Error::from)?)
+    }
+
+    pub(crate) fn merge_responses(&self, collectors_outputs: &[Vec<proto::CollectorOutput>]) -> SummaResult<Vec<proto::CollectorOutput>> {
+        self.index_registry.merge_responses(collectors_outputs)
+    }
+
+    pub(crate) fn thread_pool(&self) -> &ThreadPool {
+        self.thread_pool
+            .as_ref()
+            .expect("thread_pool should be initialized through `setup` call before use")
+    }
+}
+
+impl Default for WebIndexRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }

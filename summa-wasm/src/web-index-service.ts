@@ -1,4 +1,4 @@
-import init, { init_thread_pool, WebIndexRegistry } from "../pkg";
+import init, { WebIndexRegistry } from "../pkg";
 import {IndexAttributes, RemoteEngineConfig} from "./configs";
 
 export class IndexQuery {
@@ -17,12 +17,11 @@ export class WebIndexService {
 
   async setup(init_url: string, threads: number) {
     await init(init_url, new WebAssembly.Memory({ initial: 4096, maximum: 16384, shared: true }));
-    this.registry = new WebIndexRegistry(threads > 0);
-    if (threads > 0) {
-      await init_thread_pool(threads);
-    }
+    this.registry = new WebIndexRegistry();
+    await this.registry.setup(threads);
   }
   async add(remote_engine_config: RemoteEngineConfig, cb?: (tracker_event: object) => void): Promise<IndexAttributes> {
+    console.log('js_add', remote_engine_config, cb);
     let add_operation = this.registry!.add(remote_engine_config);
     if (cb) {
       await add_operation.tracker().add_subscriber((tracker_event: object) => {
