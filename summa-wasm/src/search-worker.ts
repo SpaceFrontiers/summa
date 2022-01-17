@@ -37,7 +37,6 @@ if ('WorkerGlobalScope' in self &&
       const pkg = await import('../pkg');
       await pkg.default(data.module, data.memory);
       postMessage({ type: 'inited' });
-      console.log('inited', data);
       pkg.worker_entry_point(data.state);
     });
 }

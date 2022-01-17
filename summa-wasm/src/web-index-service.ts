@@ -21,7 +21,6 @@ export class WebIndexService {
     await this.registry.setup(threads);
   }
   async add(remote_engine_config: RemoteEngineConfig, cb?: (tracker_event: object) => void): Promise<IndexAttributes> {
-    console.log('js_add', remote_engine_config, cb);
     let add_operation = this.registry!.add(remote_engine_config);
     if (cb) {
       await add_operation.tracker().add_subscriber((tracker_event: object) => {
@@ -33,14 +32,8 @@ export class WebIndexService {
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
   }
-  async search(index_queries: IndexQuery[], cb?: (tracker_event: object) => void) {
-    let search_operation = this.registry!.search(index_queries);
-    if (cb) {
-      await search_operation.tracker().add_subscriber((tracker_event: object) => {
-        cb(tracker_event)
-      });
-    }
-    return await search_operation.execute();
+  async search(index_queries: IndexQuery[]) {
+    return await this.registry!.search(index_queries);
   }
   async warmup(index_name: string, cb?: (tracker_event: object) => void) {
     let warmup_operation = this.registry!.warmup(index_name);

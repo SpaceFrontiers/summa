@@ -63,40 +63,6 @@ impl JsAddOperation {
 }
 
 #[wasm_bindgen]
-pub struct JsSearchOperation {
-    web_index_registry: WebIndexRegistry,
-    index_queries: Vec<proto::IndexQuery>,
-    tracker: JsTracker,
-}
-
-#[wasm_bindgen]
-impl JsSearchOperation {
-    pub(crate) fn new(web_index_registry: WebIndexRegistry, index_queries: Vec<proto::IndexQuery>) -> JsSearchOperation {
-        JsSearchOperation {
-            web_index_registry,
-            index_queries,
-            tracker: JsTracker::default(),
-        }
-    }
-    pub fn tracker(&self) -> JsTracker {
-        self.tracker.clone()
-    }
-    pub async fn execute(self) -> Result<JsValue, JsValue> {
-        Ok(self.execute_internal().await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
-    }
-
-    async fn execute_internal(self) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let futures = self.web_index_registry.index_registry.search_futures(&self.index_queries).await?;
-        let collectors_outputs = join_all(futures.into_iter().map(|f| self.web_index_registry.thread_pool().spawn(f)))
-            .await
-            .into_iter()
-            .map(|r| r.expect("cannot receive"))
-            .collect::<SummaResult<Vec<_>>>()?;
-        self.web_index_registry.merge_responses(&collectors_outputs)
-    }
-}
-
-#[wasm_bindgen]
 pub struct JsWarmupOperation {
     web_index_registry: WebIndexRegistry,
     index_name: String,
@@ -171,9 +137,19 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub fn search(&self, index_queries: JsValue) -> Result<JsSearchOperation, JsValue> {
+    pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
         let index_queries: Vec<proto::IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
-        Ok(JsSearchOperation::new(self.clone(), index_queries))
+        Ok(self.search_internal(index_queries).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+    }
+
+    async fn search_internal(&self, index_queries: Vec<proto::IndexQuery>) -> SummaResult<Vec<proto::CollectorOutput>> {
+        let futures = self.index_registry.search_futures(&index_queries).await?;
+        let collectors_outputs = join_all(futures.into_iter().map(|f| self.thread_pool().spawn(f)))
+            .await
+            .into_iter()
+            .map(|r| r.expect("cannot receive"))
+            .collect::<SummaResult<Vec<_>>>()?;
+        self.merge_responses(&collectors_outputs)
     }
 
     #[wasm_bindgen]
