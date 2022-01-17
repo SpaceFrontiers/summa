@@ -1,10 +1,10 @@
-//! `From` trait implmentations used for creation of `proto::Score`
+use summa_proto::proto;
 
-use crate::proto;
+use crate::proto_traits::Wrapper;
 
-impl From<tantivy::Snippet> for proto::Snippet {
+impl From<tantivy::Snippet> for Wrapper<proto::Snippet> {
     fn from(snippet: tantivy::Snippet) -> Self {
-        proto::Snippet {
+        Wrapper::from(proto::Snippet {
             fragment: snippet.fragment().as_bytes().to_vec(),
             highlights: snippet
                 .highlighted()
@@ -15,6 +15,6 @@ impl From<tantivy::Snippet> for proto::Snippet {
                 })
                 .collect(),
             html: snippet.to_html(),
-        }
+        })
     }
 }

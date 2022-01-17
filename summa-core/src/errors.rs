@@ -64,6 +64,8 @@ pub enum Error {
     Infallible,
     #[error("internal_error")]
     Internal,
+    #[error("invalid_aggregation")]
+    InvalidAggregation,
     #[error("{0:?}: {1:?}")]
     InvalidFieldType(String, FieldType),
     #[error("invalid_index_engine_error: {0:?}")]
@@ -80,8 +82,6 @@ pub enum Error {
     OpenDirectory(#[from] tantivy::directory::error::OpenDirectoryError),
     #[error("tantivy_error: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
-    #[error("proto")]
-    Proto(#[from] summa_proto::errors::Error),
     #[error("read_only_index: {0}")]
     ReadOnlyIndex(String),
     #[error("unbound_document_error")]

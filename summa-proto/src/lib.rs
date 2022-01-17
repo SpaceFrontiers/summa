@@ -1,4 +1,3 @@
-pub mod errors;
 pub mod proto_traits;
 
 #[allow(clippy::derive_partial_eq_without_eq)]

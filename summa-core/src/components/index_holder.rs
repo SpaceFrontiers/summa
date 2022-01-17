@@ -28,6 +28,7 @@ use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
+use crate::proto_traits::Wrapper;
 use crate::Error;
 
 pub struct IndexHolder {
@@ -274,7 +275,7 @@ impl IndexHolder {
 
     /// Compression
     pub fn compression(&self) -> proto::Compression {
-        self.index_reader().searcher().index().settings().docstore_compression.into()
+        Wrapper::from(self.index_reader().searcher().index().settings().docstore_compression).into_inner()
     }
 
     /// Load index attributes from meta.json

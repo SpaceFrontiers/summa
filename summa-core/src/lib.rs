@@ -24,6 +24,7 @@ pub mod configs;
 pub mod directories;
 pub mod errors;
 pub mod metrics;
+pub mod proto_traits;
 pub mod scorers;
 pub mod utils;
 

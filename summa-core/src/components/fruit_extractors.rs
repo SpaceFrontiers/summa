@@ -12,6 +12,7 @@ use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerato
 use super::custom_serializer::NamedFieldDocument;
 use crate::collectors;
 use crate::errors::{BuilderError, Error, SummaResult, ValidationError};
+use crate::proto_traits::Wrapper;
 use crate::scorers::EvalScorer;
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
@@ -41,8 +42,8 @@ pub fn parse_aggregations(aggregations: &HashMap<String, proto::Aggregation>) ->
         .iter()
         .map(|(name, aggregation)| {
             let aggregation = match &aggregation.aggregation {
-                None => Err(Error::Proto(summa_proto::errors::Error::InvalidAggregation)),
-                Some(aggregation) => aggregation.clone().try_into().map_err(Error::Proto),
+                None => Err(Error::InvalidAggregation),
+                Some(aggregation) => Wrapper::from(aggregation.clone()).try_into(),
             }?;
             Ok((name.clone(), aggregation))
         })
@@ -55,7 +56,7 @@ fn parse_aggregation_results(
 ) -> HashMap<String, proto::AggregationResult> {
     aggregation_results
         .into_iter()
-        .map(|(name, aggregation_result)| (name, aggregation_result.into()))
+        .map(|(name, aggregation_result)| (name, Wrapper::from(aggregation_result).into_inner()))
         .collect()
 }
 
@@ -226,7 +227,12 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
                     position: position as u32,
                     snippets: snippet_generators
                         .iter()
-                        .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
+                        .map(|(field_name, snippet_generator)| {
+                            (
+                                field_name.to_string(),
+                                Wrapper::from(snippet_generator.snippet_from_doc(&document)).into_inner(),
+                            )
+                        })
                         .collect(),
                     index_alias: external_index_alias.to_string(),
                 })
@@ -265,7 +271,12 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
                     position: position as u32,
                     snippets: snippet_generators
                         .iter()
-                        .map(|(field_name, snippet_generator)| (field_name.to_string(), snippet_generator.snippet_from_doc(&document).into()))
+                        .map(|(field_name, snippet_generator)| {
+                            (
+                                field_name.to_string(),
+                                Wrapper::from(snippet_generator.snippet_from_doc(&document)).into_inner(),
+                            )
+                        })
                         .collect(),
                     index_alias: external_index_alias.to_string(),
                 }

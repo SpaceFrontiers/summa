@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use summa_core::errors::BuilderError;
+use summa_core::proto_traits::Wrapper;
 use summa_proto::proto;
 use tantivy::schema::Schema;
 use tantivy::IndexSortByField;
@@ -37,7 +38,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
         index_attributes.created_at = SystemTime::now().duration_since(UNIX_EPOCH).expect("cannot retrieve time").as_secs();
 
         let compression = proto::Compression::from_i32(proto_request.compression)
-            .map(proto::Compression::into)
+            .map(|c| Wrapper::from(c).into())
             .unwrap_or(tantivy::store::Compressor::None);
 
         Ok(CreateIndexRequestBuilder::default()
@@ -46,7 +47,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
             .schema(schema)
             .compression(compression)
             .blocksize(proto_request.blocksize.map(|blocksize| blocksize as usize))
-            .sort_by_field(proto_request.sort_by_field.map(proto::SortByField::into))
+            .sort_by_field(proto_request.sort_by_field.map(|s| Wrapper::from(s).into()))
             .index_attributes(index_attributes)
             .build()
             .map_err(summa_core::Error::from)?)
