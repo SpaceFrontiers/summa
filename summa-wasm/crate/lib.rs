@@ -18,13 +18,37 @@
 #[macro_use]
 extern crate async_trait;
 
+use once_cell::sync::Lazy;
+use parking_lot::Once;
+use serde_wasm_bindgen::Serializer;
+use tracing_wasm::{ConsoleConfig, WASMLayerConfigBuilder};
+use wasm_bindgen::prelude::*;
+
 mod errors;
 mod js_requests;
-mod tracker;
 mod web_index_registry;
 mod worker_helper;
 
-use once_cell::sync::Lazy;
-use serde_wasm_bindgen::Serializer;
 pub use worker_helper::{worker_entry_point, ThreadPool};
 pub static SERIALIZER: Lazy<Serializer> = Lazy::new(|| Serializer::new().serialize_maps_as_objects(true));
+
+#[wasm_bindgen]
+pub fn setup_logging(max_level: String) {
+    console_error_panic_hook::set_once();
+    let logging_config = WASMLayerConfigBuilder::new()
+        .set_max_level(max_level.parse().unwrap_or_else(|_| panic!("cannot parse log level: {max_level}")))
+        .set_report_logs_in_timings(true)
+        .set_console_config(ConsoleConfig::ReportWithConsoleColor)
+        .build();
+    tracing_wasm::set_as_global_default_with_config(logging_config);
+}
+
+#[wasm_bindgen]
+pub fn reserve_heap() {
+    static mut HEAP: Vec<u8> = Vec::new();
+    static START: Once = Once::new();
+    START.call_once(|| unsafe {
+        HEAP.reserve(512 * (1 << 20));
+        HEAP.shrink_to_fit();
+    });
+}

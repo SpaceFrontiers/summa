@@ -5,6 +5,8 @@ use tantivy::SegmentMeta;
 
 use super::SummaSegmentAttributes;
 
+/// `FrozenLogMergePolicy` is the same as `LogMergePolicy` except supporting of excluding
+/// some segments marked as `is_frozen` from merging
 #[derive(Debug, Default)]
 pub struct FrozenLogMergePolicy(LogMergePolicy);
 

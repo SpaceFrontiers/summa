@@ -1,5 +1,5 @@
-import init, { WebIndexRegistry } from "../pkg";
-import {IndexAttributes, RemoteEngineConfig} from "./configs";
+import init, { setup_logging, reserve_heap, WebIndexRegistry } from "../pkg";
+import { IndexAttributes, RemoteEngineConfig } from "./configs";
 
 export class IndexQuery {
   index_alias: string
@@ -17,17 +17,15 @@ export class WebIndexService {
 
   async setup(init_url: string, threads: number) {
     await init(init_url, new WebAssembly.Memory({ initial: 4096, maximum: 16384, shared: true }));
+    await setup_logging("info");
+    await reserve_heap();
+
     this.registry = new WebIndexRegistry();
     await this.registry.setup(threads);
   }
-  async add(remote_engine_config: RemoteEngineConfig, cb?: (tracker_event: object) => void): Promise<IndexAttributes> {
-    let add_operation = this.registry!.add(remote_engine_config);
-    if (cb) {
-      await add_operation.tracker().add_subscriber((tracker_event: object) => {
-        cb(tracker_event)
-      });
-    }
-    return await add_operation.execute();
+
+  async add(remote_engine_config: RemoteEngineConfig): Promise<IndexAttributes> {
+    return await this.registry!.add(remote_engine_config);
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
@@ -35,14 +33,8 @@ export class WebIndexService {
   async search(index_queries: IndexQuery[]) {
     return await this.registry!.search(index_queries);
   }
-  async warmup(index_name: string, cb?: (tracker_event: object) => void) {
-    let warmup_operation = this.registry!.warmup(index_name);
-    if (cb) {
-      await warmup_operation.tracker().add_subscriber((tracker_event: object) => {
-        cb(tracker_event)
-      });
-    }
-    return await warmup_operation.execute();
+  async warmup(index_name: string) {
+    return await this.registry!.warmup(index_name);
   }
   async index_document(index_name: string, document: string) {
     return await this.registry!.index_document(index_name, document)

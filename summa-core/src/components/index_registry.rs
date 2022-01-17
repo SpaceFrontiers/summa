@@ -6,6 +6,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use summa_proto::proto;
 use tokio::sync::RwLock;
+use tracing::info;
 
 use super::IndexHolder;
 use crate::configs::{ConfigProxy, DirectProxy};
@@ -91,6 +92,7 @@ impl IndexRegistry {
 
     /// Add new index to `IndexRegistry`
     pub async fn add(&self, index_holder: IndexHolder) -> Handler<IndexHolder> {
+        info!(action = "add", index_name = ?index_holder.index_name());
         let index_holder = OwningHandler::new(index_holder);
         let index_holder_handler = index_holder.handler();
         self.index_holders().write().await.insert(index_holder.index_name().to_string(), index_holder);

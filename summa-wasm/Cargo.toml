@@ -1,6 +1,6 @@
 [package]
 name = "summa-wasm"
-version = "0.87.3"
+version = "0.88.3"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -33,6 +33,7 @@ tantivy = { workspace = true }
 thiserror = "1.0"
 tokio = { workspace = true, default_features = false, features = ["sync"] }
 tracing = "0.1"
+tracing-wasm = "0.2"
 wasm-bindgen = "0.2.83"
 wasm-bindgen-futures = "0.4.33"
 web-sys = { version = "0.3.60", features = ["console", "DedicatedWorkerGlobalScope", "WorkerOptions", "WorkerType"] }

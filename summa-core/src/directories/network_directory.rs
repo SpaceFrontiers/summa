@@ -7,9 +7,9 @@ use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     Directory, HasLen,
 };
+use tracing::trace;
 
 use super::ExternalRequestGenerator;
-use crate::components::{DefaultTracker, Tracker, TrackerEvent};
 use crate::directories::ExternalRequest;
 use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
@@ -64,7 +64,7 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
     async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file_handle = self.get_network_file_handle(path);
         Ok(file_handle
-            .do_read_bytes_async(None, DefaultTracker::default())
+            .do_read_bytes_async(None)
             .await
             .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?
             .to_vec())
@@ -103,12 +103,12 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
         Ok(OwnedBytes::new(request_response.data))
     }
 
-    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<usize>>, tracker: impl Tracker) -> io::Result<OwnedBytes> {
+    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<usize>>) -> io::Result<OwnedBytes> {
         let request = self.request_generator.generate_range_request(&self.file_name, byte_range)?;
         let url = request.url().to_string();
-        tracker.send_event(TrackerEvent::start_reading_file(&url));
+        trace!(action = "start_reading_file", url = ?url);
         let request_fut = request.request_async();
-        tracker.send_event(TrackerEvent::finish_reading_file(&url));
+        trace!(action = "finish_reading_file", url = ?url);
         Ok(OwnedBytes::new(request_fut.await?.data))
     }
 
@@ -140,7 +140,7 @@ impl<TExternalRequest: ExternalRequest + Debug + 'static> FileHandle for Network
     }
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        self.do_read_bytes_async(Some(byte_range), DefaultTracker::default()).await
+        self.do_read_bytes_async(Some(byte_range)).await
     }
 }
 

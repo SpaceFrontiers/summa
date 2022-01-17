@@ -24,8 +24,7 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::tracker::Tracker;
-use crate::components::{IndexWriterHolder, SummaDocument, TrackerEvent, CACHE_METRICS};
+use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
@@ -208,14 +207,12 @@ impl IndexHolder {
         TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
     >(
         remote_engine_config: proto::RemoteEngineConfig,
-        tracker: impl Tracker,
         read_only: bool,
     ) -> SummaResult<Index> {
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
-        tracker.send_event(TrackerEvent::ReadingHotcache);
         let hotcache_bytes = match network_directory
             .get_network_file_handle("hotcache.bin".as_ref())
-            .do_read_bytes_async(None, tracker)
+            .do_read_bytes_async(None)
             .await
         {
             Ok(hotcache_bytes) => {
@@ -314,7 +311,7 @@ impl IndexHolder {
         &self.cached_schema
     }
 
-    pub async fn partial_warmup(&self, tracker: impl Tracker) -> SummaResult<()> {
+    pub async fn partial_warmup(&self) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
         let index_attributes = self.index_attributes();
@@ -337,26 +334,26 @@ impl IndexHolder {
                     let inverted_index = segment_reader.inverted_index(field)?.clone();
                     warm_up_futures.push(async move {
                         let dict = inverted_index.terms();
+                        info!(action = "warming_up_dictionary", index_name = ?self.index_name());
                         dict.warm_up_dictionary().await
                     });
                 }
             }
-            tracker.send_event(TrackerEvent::WarmingUp);
+            info!(action = "warming_up", index_name = ?self.index_name());
             try_join_all(warm_up_futures).await?;
         }
         Ok(())
     }
 
-    pub async fn full_warmup(&self, tracker: impl Tracker) -> SummaResult<()> {
+    pub async fn full_warmup(&self) -> SummaResult<()> {
         let managed_directory = self.index.directory();
-        tracker.send_event(TrackerEvent::WarmingUp);
+        info!(action = "warming_up", index_name = ?self.index_name());
         join_all(managed_directory.list_managed_files().into_iter().map(move |file| {
-            let tracker = tracker.clone();
             let file_name = file.to_string_lossy().to_string();
             async move {
-                tracker.send_event(TrackerEvent::StartReadingFile(file_name.clone()));
+                info!(action = "start_reading_file", index_name = ?self.index_name(), file_name = ?file_name);
                 managed_directory.atomic_read_async(&file).await.map_err(|e| Error::Tantivy(e.into()))?;
-                tracker.send_event(TrackerEvent::FinishReadingFile(file_name));
+                info!(action = "finished_reading_file", index_name = ?self.index_name(), file_name = ?file_name);
                 Ok(())
             }
         }))
@@ -413,6 +410,7 @@ impl IndexHolder {
 
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
+        info!(action = "search", index_name = ?self.index_name());
         let mut multi_fruit = searcher.search_async(&parsed_query, &multi_collector).await?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
@@ -431,6 +429,7 @@ impl IndexHolder {
                     .collect()
             })
             .unwrap_or_else(HashSet::new);
+        info!(action = "extract", index_name = ?self.index_name());
         for extractor in extractors.into_iter() {
             collector_outputs.push(
                 extractor

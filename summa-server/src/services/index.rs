@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
-use summa_core::components::{DefaultTracker, IndexHolder, IndexRegistry, IndexWriterHolder};
+use summa_core::components::{IndexHolder, IndexRegistry, IndexWriterHolder};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
@@ -554,12 +554,7 @@ impl Index {
             Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(config.path)?,
             Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
             Some(proto::index_engine_config::Config::Remote(config)) => {
-                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
-                    config,
-                    DefaultTracker::default(),
-                    read_only,
-                )
-                .await?
+                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, read_only).await?
             }
             Some(proto::index_engine_config::Config::Ipfs(config)) => {
                 IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader(), read_only).await?

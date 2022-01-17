@@ -1,4 +1,4 @@
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use futures::future::join_all;
 use serde::Serialize;
@@ -8,89 +8,13 @@ use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
 use summa_proto::proto;
 use summa_proto::proto::{IndexAttributes, IndexEngineConfig, RemoteEngineConfig};
+use tracing::info;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 
 use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;
-use crate::tracker::SubscribeTracker;
 use crate::{ThreadPool, SERIALIZER};
-
-#[wasm_bindgen]
-#[derive(Clone, Default)]
-pub struct JsTracker(SubscribeTracker);
-
-#[wasm_bindgen]
-impl JsTracker {
-    #[wasm_bindgen]
-    pub fn add_subscriber(&mut self, subscriber: js_sys::Function) {
-        self.0.add_subscriber(Box::new(move |op| {
-            subscriber
-                .call1(&JsValue::null(), &serde_wasm_bindgen::to_value(&op).expect("cannot serialize"))
-                .expect("set status failed");
-        }))
-    }
-}
-
-#[wasm_bindgen]
-pub struct JsAddOperation {
-    web_index_registry: WebIndexRegistry,
-    remote_engine_config: RemoteEngineConfig,
-    tracker: JsTracker,
-}
-
-#[wasm_bindgen]
-impl JsAddOperation {
-    pub(crate) fn new(web_index_registry: WebIndexRegistry, remote_engine_config: RemoteEngineConfig) -> JsAddOperation {
-        JsAddOperation {
-            web_index_registry,
-            remote_engine_config,
-            tracker: JsTracker::default(),
-        }
-    }
-    pub fn tracker(&self) -> JsTracker {
-        self.tracker.clone()
-    }
-
-    pub async fn execute(self) -> Result<JsValue, JsValue> {
-        Ok(self
-            .web_index_registry
-            .add_internal(self.remote_engine_config, self.tracker.0)
-            .await?
-            .serialize(&*SERIALIZER)?)
-    }
-}
-
-#[wasm_bindgen]
-pub struct JsWarmupOperation {
-    web_index_registry: WebIndexRegistry,
-    index_name: String,
-    tracker: JsTracker,
-}
-
-#[wasm_bindgen]
-impl JsWarmupOperation {
-    pub(crate) fn new(web_index_registry: WebIndexRegistry, index_name: &str) -> JsWarmupOperation {
-        JsWarmupOperation {
-            web_index_registry,
-            index_name: index_name.to_string(),
-            tracker: JsTracker::default(),
-        }
-    }
-    pub fn tracker(&self) -> JsTracker {
-        self.tracker.clone()
-    }
-
-    pub async fn execute(self) -> Result<(), JsValue> {
-        let index_holder = self
-            .web_index_registry
-            .index_registry
-            .get_index_holder_by_name(&self.index_name)
-            .await
-            .map_err(Error::from)?;
-        Ok(index_holder.partial_warmup(self.tracker.0).await.map_err(Error::from)?)
-    }
-}
 
 #[wasm_bindgen]
 #[derive(Clone)]
@@ -102,19 +26,8 @@ pub struct WebIndexRegistry {
 
 #[wasm_bindgen]
 impl WebIndexRegistry {
-    fn reserve_heap() {
-        static mut HEAP: Vec<u8> = Vec::new();
-        static START: Once = Once::new();
-        START.call_once(|| unsafe {
-            HEAP.reserve(512 * (1 << 20));
-            HEAP.shrink_to_fit();
-        });
-    }
-
     #[wasm_bindgen(constructor)]
     pub fn new() -> WebIndexRegistry {
-        console_error_panic_hook::set_once();
-        WebIndexRegistry::reserve_heap();
         let core_config = summa_core::configs::core::ConfigBuilder::default()
             .dedicated_compression_thread(false)
             .writer_threads(0)
@@ -142,6 +55,7 @@ impl WebIndexRegistry {
 
     async fn search_internal(&self, index_queries: Vec<proto::IndexQuery>) -> SummaResult<Vec<proto::CollectorOutput>> {
         let futures = self.index_registry.search_futures(&index_queries).await?;
+        info!(action = "search", index_queries = ?index_queries);
         let collectors_outputs = join_all(futures.into_iter().map(|f| self.thread_pool().spawn(f)))
             .await
             .into_iter()
@@ -151,18 +65,15 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub fn add(&self, remote_engine_config: JsValue) -> Result<JsAddOperation, JsValue> {
+    pub async fn add(&self, remote_engine_config: JsValue) -> Result<JsValue, JsValue> {
         let remote_engine_config: RemoteEngineConfig = serde_wasm_bindgen::from_value(remote_engine_config)?;
-        Ok(JsAddOperation::new(self.clone(), remote_engine_config))
+        Ok(self.add_internal(remote_engine_config).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
     }
 
-    async fn add_internal(&self, remote_engine_config: RemoteEngineConfig, tracker: SubscribeTracker) -> SummaWasmResult<Option<IndexAttributes>> {
-        let index = IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(
-            remote_engine_config.clone(),
-            tracker,
-            true,
-        )
-        .await?;
+    async fn add_internal(&self, remote_engine_config: RemoteEngineConfig) -> SummaWasmResult<Option<IndexAttributes>> {
+        let index =
+            IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), true)
+                .await?;
         let core_config_value = self.core_config.read().await.get().clone();
         let index_holder = IndexHolder::create_holder(
             &self.core_config,
@@ -185,8 +96,15 @@ impl WebIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub fn warmup(&self, index_name: &str) -> Result<JsWarmupOperation, JsValue> {
-        Ok(JsWarmupOperation::new(self.clone(), index_name))
+    pub async fn warmup(&self, index_name: &str) -> Result<(), JsValue> {
+        self.index_registry
+            .get_index_holder_by_name(index_name)
+            .await
+            .map_err(Error::from)?
+            .partial_warmup()
+            .await
+            .map_err(Error::from)?;
+        Ok(())
     }
 
     #[wasm_bindgen]
