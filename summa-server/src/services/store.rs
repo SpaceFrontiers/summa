@@ -14,6 +14,7 @@ use crate::utils::wait_for_addr;
 
 const MAX_CHUNK_SIZE: u64 = 1024 * 1024;
 
+/// Store splits data into chunks and make them available through IPFS network.
 #[derive(Clone)]
 pub struct Store {
     config: crate::configs::store::Config,

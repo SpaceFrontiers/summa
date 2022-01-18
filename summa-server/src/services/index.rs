@@ -25,7 +25,7 @@ use crate::errors::ValidationError;
 use crate::hyper_external_request::HyperExternalRequest;
 use crate::requests::{AttachIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
 
-/// The main struct responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
+/// `services::Index` is responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone)]
 pub struct Index {
     server_config: Arc<dyn ConfigProxy<crate::configs::server::Config>>,

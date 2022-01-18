@@ -4,6 +4,6 @@ pub mod query;
 pub mod score;
 
 pub mod shortcuts {
-    pub use collector::shortcuts::*;
-    pub use query::shortcuts::*;
+    pub use super::collector::shortcuts::*;
+    pub use super::query::shortcuts::*;
 }

@@ -10,6 +10,7 @@ use tracing::{info, info_span, instrument, Instrument};
 use crate::errors::SummaServerResult;
 use crate::utils::wait_for_addr;
 
+/// Allows to exchange data blocks with IPFS network
 pub struct P2p {
     config: crate::configs::p2p::Config,
     rpc_addr: P2pAddr,

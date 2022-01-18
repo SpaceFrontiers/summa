@@ -10,6 +10,7 @@ use tracing::{info, info_span, instrument, Instrument};
 use crate::errors::SummaServerResult;
 use crate::utils::wait_for_addr;
 
+/// Gateway provides access to IPFS data through HTTP protocol
 pub struct Gateway {
     core: iroh_gateway::core::Core<iroh_unixfs::content_loader::FullLoader>,
 }

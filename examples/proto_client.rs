@@ -2,8 +2,7 @@ use serde_json::json;
 use summa_proto::proto;
 use summa_proto::proto::index_api_client::IndexApiClient;
 use summa_proto::proto::search_api_client::SearchApiClient;
-use summa_proto::proto::{Compression, CreateIndexEngineRequest, DeleteIndexResponse, IndexAttributes};
-use tonic::{Response, Status};
+use summa_proto::proto::{Compression, CreateIndexEngineRequest, IndexAttributes};
 
 static SCHEMA: &str = r#"
 - name: title
@@ -102,16 +101,15 @@ async fn main() -> Result<(), tonic::Status> {
                             limit: 10,
                             ..Default::default()
                         })),
-                    }
+                    },
                     proto::Collector {
                         collector: Some(proto::collector::Collector::Count(proto::CountCollector {})),
-                    }
+                    },
                 ],
             }],
             tags: Default::default(),
         })
         .await?;
-
     println!("{:?}", search_response);
     Ok(())
 }
