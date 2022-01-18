@@ -1,5 +1,4 @@
-#[cfg(feature = "test-utils")]
-pub mod shortcuts {
+pub(crate) mod shortcuts {
     use crate::proto;
 
     pub fn match_query(value: &str) -> proto::Query {

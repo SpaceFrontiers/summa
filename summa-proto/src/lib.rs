@@ -1,6 +1,7 @@
 pub mod proto_traits;
 
 #[allow(clippy::derive_partial_eq_without_eq)]
+/// Protobuf messages for communicating with Summa
 pub mod proto {
     #[cfg(feature = "grpc")]
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("summa");

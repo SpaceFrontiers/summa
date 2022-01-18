@@ -85,8 +85,11 @@ message CommitIndexResponse {
 
 // Request that changes index engine. Currently possible to convert File to IPFS
 message MigrateIndexRequest {
+  // Name of index that will be migrated. It will be left intact after migration.
   string source_index_name = 1;
+  // Name of index that will be created
   string target_index_name = 2;
+  // Target index engine
   CreateIndexEngineRequest target_index_engine = 3;
 }
 
@@ -219,9 +222,7 @@ message VacuumIndexRequest {
   string index_alias = 1;
 }
 
-message VacuumIndexResponse {
-  // repeated string deleted_files = 1;
-}
+message VacuumIndexResponse {}
 
 message WarmupIndexRequest {
   string index_alias = 1;

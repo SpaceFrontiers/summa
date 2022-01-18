@@ -1,0 +1,16 @@
+[package]
+name = "examples"
+version = "0.0.0"
+authors = ["Pasha Podolsky <ppodolsky@me.com>"]
+edition = "2021"
+publish = false
+
+[dependencies]
+serde_json = "1.0"
+summa-proto = { path = "../summa-proto" }
+tokio = "1.24"
+tonic = { version = "0.8", features = ["channel"] }
+
+[[example]]
+name = "proto_client"
+path = "proto_client.rs"
