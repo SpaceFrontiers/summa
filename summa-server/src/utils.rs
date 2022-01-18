@@ -43,3 +43,19 @@ pub(crate) mod tests {
         PORT.fetch_add(1, Ordering::SeqCst)
     }
 }
+
+#[cfg(unix)]
+const DEFAULT_NOFILE_LIMIT: u64 = 65536;
+#[cfg(unix)]
+const MIN_NOFILE_LIMIT: u64 = 2048;
+#[cfg(unix)]
+pub fn increase_fd_limit() -> std::io::Result<u64> {
+    let (_, hard) = rlimit::Resource::NOFILE.get()?;
+    let target = std::cmp::min(hard, DEFAULT_NOFILE_LIMIT);
+    rlimit::Resource::NOFILE.set(target, hard)?;
+    let (soft, _) = rlimit::Resource::NOFILE.get()?;
+    if soft < MIN_NOFILE_LIMIT {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("NOFILE limit too low: {soft}")));
+    }
+    Ok(soft)
+}

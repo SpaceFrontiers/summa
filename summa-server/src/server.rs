@@ -17,7 +17,7 @@ use crate::logging;
 use crate::services::gateway::Gateway;
 use crate::services::store::Store;
 use crate::services::{Api, Index, Metrics, P2p};
-use crate::utils::signal_channel;
+use crate::utils::{increase_fd_limit, signal_channel};
 
 pub struct Server {
     server_config_holder: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
@@ -121,6 +121,12 @@ impl Server {
     }
 
     pub async fn serve(&self, terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+        #[cfg(unix)]
+        match increase_fd_limit() {
+            Ok(soft) => tracing::debug!("NOFILE limit: soft = {}", soft),
+            Err(err) => tracing::error!("Error increasing NOFILE limit: {}", err),
+        }
+
         let mut futures: Vec<Box<dyn Future<Output = SummaServerResult<()>> + Send>> = vec![];
         let server_config = self.server_config_holder.read().await.get().clone();
         let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
