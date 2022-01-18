@@ -77,16 +77,20 @@ message CommitIndexRequest {
   CommitMode commit_mode = 2;
 }
 
+// Commit index response
 message CommitIndexResponse {
+  // Pure time spent for committing
   optional double elapsed_secs = 2;
 }
 
+// Request that changes index engine. Currently possible to convert File to IPFS
 message MigrateIndexRequest {
   string source_index_name = 1;
   string target_index_name = 2;
   CreateIndexEngineRequest target_index_engine = 3;
 }
 
+// Response describing migrated index
 message MigrateIndexResponse {
   IndexDescription index = 1;
 }
@@ -103,23 +107,37 @@ enum CreateIndexEngineRequest {
 }
 
 message IndexAttributes {
+  // Timestamp when index has been created
   uint64 created_at = 1;
+  // Primary key of the index. Summa maintains unique constraint on primary keys and uses them for deduplicating data
   optional string primary_key = 2;
+  // Default fields that are using in `MatchQuery`
   repeated string default_fields = 3;
+  // Multi fields is ones that may have multiple values and processed as lists. All other fields will be forcefully converted to singular value
   repeated string multi_fields = 4;
+  // Descriptive field that may be used as name for index when indices are replicating over wire
   optional string default_index_name = 5;
+  // Text index description
   optional string description = 6;
+  // (Not-used)
   repeated string default_snippets = 7;
 }
 
+// Request for index creation
 message CreateIndexRequest {
+  // Index name
   string index_name = 1;
+  // Index engine
   CreateIndexEngineRequest index_engine = 2;
+  // Index schema in Tantivy format
   string schema = 3;
+  // Compression for store
   Compression compression = 4;
+  // Size of store blocks
   optional uint32 blocksize = 5;
+  // Field for sorting
   optional SortByField sort_by_field = 6;
-
+  // Optional index fields
   IndexAttributes index_attributes = 7;
 }
 
@@ -216,8 +234,7 @@ message WarmupIndexResponse {
   double elapsed_secs = 1;
 }
 
-// Extra structures
-
+// Compression library for store, implies on both performance and occupied disk space
 enum Compression {
   None = 0;
   Brotli = 1;

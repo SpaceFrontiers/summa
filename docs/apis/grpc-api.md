@@ -172,13 +172,13 @@ parent: APIs
 <a name="summa-proto-Consumer"></a>
 
 ### Consumer
-Extra structures
+Consumer description
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| consumer_name | [string](#string) |  |  |
-| index_name | [string](#string) |  |  |
+| consumer_name | [string](#string) |  | Consumer name |
+| index_name | [string](#string) |  | Summa `index_name` |
 
 
 
@@ -188,16 +188,16 @@ Extra structures
 <a name="summa-proto-CreateConsumerRequest"></a>
 
 ### CreateConsumerRequest
-
+Request describe how new Consumer should be created
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| bootstrap_servers | [string](#string) | repeated |  |
-| group_id | [string](#string) |  |  |
-| index_name | [string](#string) |  |  |
-| consumer_name | [string](#string) |  |  |
-| topics | [string](#string) | repeated |  |
+| bootstrap_servers | [string](#string) | repeated | Kafka boostrap servers |
+| group_id | [string](#string) |  | Kafka group ID |
+| index_name | [string](#string) |  | Summa `index_name` which will ingest data from Kafka topics |
+| consumer_name | [string](#string) |  | Consumer name, used for further referencing consumer in API and configs |
+| topics | [string](#string) | repeated | List of topics to consume |
 
 
 
@@ -314,7 +314,7 @@ Extra structures
 <a name="summa-proto-ConsumerApi"></a>
 
 ### ConsumerApi
-Manages ingestion data from Kafka
+Manage ingestion data from Kafka
 
 | Method Name | Request Type | Response Type | Description |
 | ----------- | ------------ | ------------- | ------------|
@@ -436,12 +436,12 @@ Commit index request
 <a name="summa-proto-CommitIndexResponse"></a>
 
 ### CommitIndexResponse
-
+Commit index response
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| elapsed_secs | [double](#double) | optional |  |
+| elapsed_secs | [double](#double) | optional | Pure time spent for committing |
 
 
 
@@ -451,18 +451,18 @@ Commit index request
 <a name="summa-proto-CreateIndexRequest"></a>
 
 ### CreateIndexRequest
-
+Request for index creation
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_name | [string](#string) |  |  |
-| index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  |  |
-| schema | [string](#string) |  |  |
-| compression | [Compression](#summa-proto-Compression) |  |  |
-| blocksize | [uint32](#uint32) | optional |  |
-| sort_by_field | [SortByField](#summa-proto-SortByField) | optional |  |
-| index_attributes | [IndexAttributes](#summa-proto-IndexAttributes) |  |  |
+| index_name | [string](#string) |  | Index name |
+| index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  | Index engine |
+| schema | [string](#string) |  | Index schema in Tantivy format |
+| compression | [Compression](#summa-proto-Compression) |  | Compression for store |
+| blocksize | [uint32](#uint32) | optional | Size of store blocks |
+| sort_by_field | [SortByField](#summa-proto-SortByField) | optional | Field for sorting |
+| index_attributes | [IndexAttributes](#summa-proto-IndexAttributes) |  | Optional index fields |
 
 
 
@@ -659,13 +659,13 @@ Commit index request
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| created_at | [uint64](#uint64) |  |  |
-| primary_key | [string](#string) | optional |  |
-| default_fields | [string](#string) | repeated |  |
-| multi_fields | [string](#string) | repeated |  |
-| default_index_name | [string](#string) | optional |  |
-| description | [string](#string) | optional |  |
-| default_snippets | [string](#string) | repeated |  |
+| created_at | [uint64](#uint64) |  | Timestamp when index has been created |
+| primary_key | [string](#string) | optional | Primary key of the index. Summa maintains unique constraint on primary keys and uses them for deduplicating data |
+| default_fields | [string](#string) | repeated | Default fields that are using in `MatchQuery` |
+| multi_fields | [string](#string) | repeated | Multi fields is ones that may have multiple values and processed as lists. All other fields will be forcefully converted to singular value |
+| default_index_name | [string](#string) | optional | Descriptive field that may be used as name for index when indices are replicating over wire |
+| description | [string](#string) | optional | Text index description |
+| default_snippets | [string](#string) | repeated | (Not-used) |
 
 
 
@@ -859,7 +859,7 @@ Commit index request
 <a name="summa-proto-MigrateIndexRequest"></a>
 
 ### MigrateIndexRequest
-
+Request that changes index engine. Currently possible to convert File to IPFS
 
 
 | Field | Type | Label | Description |
@@ -876,7 +876,7 @@ Commit index request
 <a name="summa-proto-MigrateIndexResponse"></a>
 
 ### MigrateIndexResponse
-
+Response describing migrated index
 
 
 | Field | Type | Label | Description |
@@ -1058,7 +1058,7 @@ Commit mode
 <a name="summa-proto-Compression"></a>
 
 ### Compression
-
+Compression library for store, implies on both performance and occupied disk space
 
 | Name | Number | Description |
 | ---- | ------ | ----------- |
