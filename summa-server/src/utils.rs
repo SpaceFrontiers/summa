@@ -45,11 +45,10 @@ pub(crate) mod tests {
 }
 
 #[cfg(unix)]
-const DEFAULT_NOFILE_LIMIT: u64 = 65536;
-#[cfg(unix)]
-const MIN_NOFILE_LIMIT: u64 = 2048;
-#[cfg(unix)]
 pub fn increase_fd_limit() -> std::io::Result<u64> {
+    const DEFAULT_NOFILE_LIMIT: u64 = 65536;
+    const MIN_NOFILE_LIMIT: u64 = 2048;
+
     let (_, hard) = rlimit::Resource::NOFILE.get()?;
     let target = std::cmp::min(hard, DEFAULT_NOFILE_LIMIT);
     rlimit::Resource::NOFILE.set(target, hard)?;

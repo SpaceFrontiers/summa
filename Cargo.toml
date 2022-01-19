@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["examples", "summa-core", "summa-proto", "summa-server", "summa-wasm"]
+members = ["examples", "summa-core", "summa-proto", "summa-publisher", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true
 strip = "debuginfo"
 
 [workspace.dependencies]
-async-broadcast = "0.5.0"
-async-trait = "0.1.61"
-base64 = "0.21.0"
+async-broadcast = "0.5"
+async-trait = "0.1"
+base64 = "0.21"
 iroh-api = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-gateway = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-metrics = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
@@ -20,8 +20,8 @@ iroh-rpc-types = { git = "https://github.com/izihawa/iroh", branch = "feature/su
 iroh-store = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-unixfs = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 rayon = "1.6.1"
-serde = { version = "1.0.152", default_features = false, features = ["derive", "std"] }
-serde_json = { version = "1.0.91" }
-serde_yaml = { version = "0.8.26" }
+serde = { version = "1.0", default_features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0" }
+serde_yaml = { version = "0.8" }
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/pub-rayon", package = "summavy", version = "0.26.0", default_features = false, features = ["quickwit", "zstd-compression"] }
 tokio = { version = "1.24", default_features = false }
