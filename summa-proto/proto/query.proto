@@ -346,8 +346,7 @@ message SingleMetricResult {
 message StatsResult {
     uint64 count = 1;
     double sum = 2;
-    optional double standard_deviation = 3;
-    optional double min = 4;
-    optional double max = 5;
-    optional double avg = 6;
+    optional double min = 3;
+    optional double max = 4;
+    optional double avg = 5;
 }

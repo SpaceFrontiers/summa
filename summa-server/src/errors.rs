@@ -21,20 +21,14 @@ pub enum ValidationError {
     InvalidSchema(String),
     #[error("missing_consumer_error: {0}")]
     MissingConsumer(String),
-    #[error("missing_default_field_error: {0}")]
-    MissingDefaultField(String),
     #[error("missing_index_error: {0}")]
     MissingIndex(String),
     #[error("missing_index_engine_error")]
     MissingIndexEngine,
     #[error("missing_field_error: {0}")]
     MissingField(String),
-    #[error("missing_multi_field_error: {0}")]
-    MissingMultiField(String),
     #[error("missing_query_error")]
     MissingQuery,
-    #[error("missing_unique_field_error: {0}")]
-    MissingUniqueField(String),
 }
 
 #[derive(thiserror::Error, Debug)]

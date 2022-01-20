@@ -186,13 +186,8 @@ impl IndexWriterHolder {
                 attributes
                     .unique_fields
                     .iter()
-                    .map(|unique_field| {
-                        index
-                            .schema()
-                            .get_field(unique_field)
-                            .ok_or(ValidationError::MissingUniqueField(unique_field.to_string()).into())
-                    })
-                    .collect::<SummaResult<_>>()
+                    .map(|unique_field| index.schema().get_field(unique_field))
+                    .collect::<Result<_, _>>()
             })
             .transpose()?
             .unwrap_or_default();

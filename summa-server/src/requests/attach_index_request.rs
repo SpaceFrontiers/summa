@@ -16,9 +16,7 @@ impl TryFrom<proto::AttachIndexRequest> for AttachIndexRequest {
             index_name: proto_request.index_name,
             attach_index_request: proto_request
                 .index_engine
-                .unwrap_or(proto::attach_index_request::IndexEngine::File(
-                    proto::AttachFileEngineRequest {},
-                )),
+                .unwrap_or(proto::attach_index_request::IndexEngine::File(proto::AttachFileEngineRequest {})),
         })
     }
 }

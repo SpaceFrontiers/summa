@@ -84,13 +84,8 @@ impl QueryParser {
             .map(|index_attributes| index_attributes.default_fields)
             .unwrap_or_else(Vec::new)
             .iter()
-            .map(|field_name| {
-                index
-                    .schema()
-                    .get_field(field_name)
-                    .ok_or_else(|| ValidationError::MissingField(field_name.to_string()).into())
-            })
-            .collect::<SummaResult<_>>()?;
+            .map(|field_name| index.schema().get_field(field_name))
+            .collect::<Result<_, _>>()?;
         let nested_query_parser = tantivy::query::QueryParser::for_index(index, default_fields);
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
@@ -114,10 +109,7 @@ impl QueryParser {
 
     #[inline]
     pub(crate) fn field_and_field_entry(&self, field_name: &str) -> SummaResult<(Field, &FieldEntry)> {
-        let field = self
-            .cached_schema
-            .get_field(field_name)
-            .ok_or_else(|| ValidationError::MissingField(field_name.to_owned()))?;
+        let field = self.cached_schema.get_field(field_name)?;
         let field_entry = self.cached_schema.get_field_entry(field);
         Ok((field, field_entry))
     }
@@ -174,7 +166,12 @@ impl QueryParser {
                 let value = range_query_proto.value.as_ref().ok_or(ValidationError::MissingRange)?;
                 let left = cast_value_to_bound_term(field, field_entry.field_type(), &value.left, value.including_left)?;
                 let right = cast_value_to_bound_term(field, field_entry.field_type(), &value.right, value.including_right)?;
-                Box::new(RangeQuery::new_term_bounds(field, field_entry.field_type().value_type(), &left, &right))
+                Box::new(RangeQuery::new_term_bounds(
+                    range_query_proto.field.clone(),
+                    field_entry.field_type().value_type(),
+                    &left,
+                    &right,
+                ))
             }
             Some(proto::query::Query::Boost(boost_query_proto)) => Box::new(BoostQuery::new(
                 self.parse_subquery(boost_query_proto.query.as_ref().ok_or(Error::EmptyQuery)?)?,

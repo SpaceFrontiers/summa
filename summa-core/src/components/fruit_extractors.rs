@@ -11,7 +11,7 @@ use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerato
 
 use super::custom_serializer::NamedFieldDocument;
 use crate::collectors;
-use crate::errors::{BuilderError, Error, SummaResult, ValidationError};
+use crate::errors::{BuilderError, Error, SummaResult};
 use crate::proto_traits::Wrapper;
 use crate::scorers::EvalScorer;
 
@@ -61,13 +61,7 @@ fn parse_aggregation_results(
 }
 
 fn get_strict_fields<'a, F: Iterator<Item = &'a String>>(schema: &Schema, fields: F) -> SummaResult<Option<HashSet<Field>>> {
-    let fields = fields
-        .map(|field| {
-            schema
-                .get_field(field)
-                .ok_or_else(|| Error::Validation(Box::new(ValidationError::MissingField(field.to_owned()))))
-        })
-        .collect::<SummaResult<HashSet<Field>>>()?;
+    let fields = fields.map(|field| schema.get_field(field)).collect::<Result<HashSet<Field>, _>>()?;
     Ok((!fields.is_empty()).then_some(fields))
 }
 
@@ -118,9 +112,7 @@ pub fn build_fruit_extractor(
                 Some(proto::Scorer {
                     scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
                 }) => {
-                    let order_by_field = schema
-                        .get_field(field_name)
-                        .ok_or_else(|| ValidationError::MissingField(field_name.to_owned()))?;
+                    let order_by_field = schema.get_field(field_name)?;
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
                         .and_offset(top_docs_collector_proto.offset as usize)
                         .order_by_u64_field(order_by_field);
@@ -148,9 +140,7 @@ pub fn build_fruit_extractor(
         }
         Some(proto::collector::Collector::Count(_)) => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
         Some(proto::collector::Collector::Facet(facet_collector_proto)) => {
-            let field = schema
-                .get_field(&facet_collector_proto.field)
-                .ok_or_else(|| ValidationError::MissingField(facet_collector_proto.field.to_owned()))?;
+            let field = schema.get_field(&facet_collector_proto.field)?;
             let mut facet_collector = tantivy::collector::FacetCollector::for_field(field);
             for facet in &facet_collector_proto.facets {
                 facet_collector.add_facet(facet);
@@ -181,7 +171,7 @@ fn snippet_generators(snippets: &HashMap<String, u32>, query: &dyn Query, search
     snippets
         .iter()
         .filter_map(|(field_name, max_num_chars)| {
-            searcher.schema().get_field(field_name).map(|snippet_field| {
+            searcher.schema().get_field(field_name).ok().map(|snippet_field| {
                 let mut snippet_generator = SnippetGenerator::create(searcher, query, snippet_field).expect("Snippet generator cannot be created");
                 snippet_generator.set_max_num_chars(*max_num_chars as usize);
                 (field_name.to_string(), snippet_generator)
@@ -193,7 +183,7 @@ fn snippet_generators(snippets: &HashMap<String, u32>, query: &dyn Query, search
 async fn snippet_generators_async(snippets: HashMap<String, u32>, query: Box<dyn Query>, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
     let futures = snippets.iter().filter_map(|(field_name, max_num_chars)| {
         let query = query.box_clone();
-        searcher.schema().get_field(field_name).map(|snippet_field| async move {
+        searcher.schema().get_field(field_name).ok().map(|snippet_field| async move {
             let mut snippet_generator = SnippetGenerator::create_async(searcher, &query, snippet_field)
                 .await
                 .expect("Snippet generator cannot be created");

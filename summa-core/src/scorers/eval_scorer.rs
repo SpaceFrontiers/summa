@@ -28,8 +28,7 @@ impl EvalScorer {
         let parsed = parser.parse(eval_expr, &mut slab.ps)?.from(&slab.ps);
         let mut var_names = vec![];
         for var_name in parsed.var_names(&slab).iter().filter(|var_name| !RESERVED_WORDS.contains((*var_name).as_str())) {
-            let field = schema.get_field(var_name);
-            let field = field.ok_or_else(|| ValidationError::MissingField(var_name.to_owned()))?;
+            let field = schema.get_field(var_name)?;
             if !schema.get_field_entry(field).is_fast() {
                 return Err(ValidationError::RequiredFastField(var_name.to_owned()).into());
             }

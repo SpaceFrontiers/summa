@@ -184,7 +184,7 @@ impl<'a> SummaDocument<'a> {
     pub fn json_object_to_doc(&self, schema: &Schema, json_obj: serde_json::Map<String, JsonValue>) -> SummaResult<Document> {
         let mut doc = Document::default();
         for (field_name, json_value) in json_obj {
-            if let Some(field) = schema.get_field(&field_name) {
+            if let Ok(field) = schema.get_field(&field_name) {
                 let field_entry = schema.get_field_entry(field);
                 let field_type = field_entry.field_type();
                 match json_value {

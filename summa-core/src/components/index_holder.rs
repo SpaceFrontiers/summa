@@ -324,12 +324,8 @@ impl IndexHolder {
                 index_attributes
                     .default_fields
                     .iter()
-                    .map(|field_name| {
-                        self.cached_schema
-                            .get_field(field_name)
-                            .ok_or_else(|| ValidationError::MissingField(field_name.to_string()).into())
-                    })
-                    .collect::<SummaResult<Vec<_>>>()
+                    .map(|field_name| self.cached_schema.get_field(field_name))
+                    .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?;
         if let Some(default_fields) = default_fields {
