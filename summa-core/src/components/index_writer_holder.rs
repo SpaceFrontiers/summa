@@ -12,6 +12,7 @@ use tracing::info;
 
 use super::SummaSegmentAttributes;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
+use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
 
 pub struct ComponentFile {
@@ -55,34 +56,35 @@ pub struct SingleIndexWriter {
 }
 
 pub enum IndexWriterImpl {
-    Single(SingleIndexWriter),
+    SameThread(SingleIndexWriter),
     Threaded(IndexWriter),
 }
 
 impl IndexWriterImpl {
-    pub fn new(index: &Index, writer_threads: usize, writer_heap_size_bytes: usize) -> SummaResult<Self> {
-        Ok(if writer_threads == 0 {
-            IndexWriterImpl::Single(SingleIndexWriter {
+    pub fn new(index: &Index, writer_threads: WriterThreads, writer_heap_size_bytes: usize) -> SummaResult<Self> {
+        Ok(match writer_threads {
+            WriterThreads::SameThread => IndexWriterImpl::SameThread(SingleIndexWriter {
                 index: index.clone(),
                 index_writer: RwLock::new(SingleSegmentIndexWriter::new(index.clone(), writer_heap_size_bytes)?),
                 writer_heap_size_bytes,
-            })
-        } else {
-            let index_writer = index.writer_with_num_threads(writer_threads, writer_heap_size_bytes)?;
-            index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
-            IndexWriterImpl::Threaded(index_writer)
+            }),
+            WriterThreads::N(writer_threads) => {
+                let index_writer = index.writer_with_num_threads(writer_threads as usize, writer_heap_size_bytes)?;
+                index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
+                IndexWriterImpl::Threaded(index_writer)
+            }
         })
     }
 
     pub fn delete_documents(&self, query: Box<dyn Query>) -> SummaResult<u64> {
         match self {
-            IndexWriterImpl::Single(_) => Ok(0),
+            IndexWriterImpl::SameThread(_) => Ok(0),
             IndexWriterImpl::Threaded(writer) => Ok(writer.delete_query(query)?),
         }
     }
     pub fn add_document(&self, document: Document) -> SummaResult<()> {
         match self {
-            IndexWriterImpl::Single(writer) => {
+            IndexWriterImpl::SameThread(writer) => {
                 writer.index_writer.write().expect("poisoned").add_document(document)?;
             }
             IndexWriterImpl::Threaded(writer) => {
@@ -93,7 +95,7 @@ impl IndexWriterImpl {
     }
     pub fn index(&self) -> &Index {
         match self {
-            IndexWriterImpl::Single(writer) => &writer.index,
+            IndexWriterImpl::SameThread(writer) => &writer.index,
             IndexWriterImpl::Threaded(writer) => writer.index(),
         }
     }
@@ -103,7 +105,7 @@ impl IndexWriterImpl {
         segment_attributes: Option<serde_json::Value>,
     ) -> SummaResult<Option<SegmentMeta>> {
         match self {
-            IndexWriterImpl::Single(_) => {
+            IndexWriterImpl::SameThread(_) => {
                 unimplemented!()
             }
             IndexWriterImpl::Threaded(writer) => Ok(writer.merge_with_attributes(segment_ids, segment_attributes).await?),
@@ -111,7 +113,7 @@ impl IndexWriterImpl {
     }
     pub async fn commit(&mut self) -> SummaResult<()> {
         match self {
-            IndexWriterImpl::Single(writer) => {
+            IndexWriterImpl::SameThread(writer) => {
                 let index = writer.index.clone();
                 let writer_heap_size_bytes = writer.writer_heap_size_bytes;
                 let writer = writer.index_writer.get_mut().expect("poisoned");
@@ -131,7 +133,7 @@ impl IndexWriterImpl {
     }
     pub async fn rollback(&mut self) -> SummaResult<()> {
         match self {
-            IndexWriterImpl::Single(_) => unimplemented!(),
+            IndexWriterImpl::SameThread(_) => unimplemented!(),
             IndexWriterImpl::Threaded(writer) => {
                 info!(action = "commit_index");
                 let opstamp = writer.rollback_async().await?;
@@ -146,7 +148,7 @@ impl IndexWriterImpl {
 pub struct IndexWriterHolder {
     index_writer: IndexWriterImpl,
     unique_fields: Vec<Field>,
-    writer_threads: usize,
+    writer_threads: WriterThreads,
     writer_heap_size_bytes: usize,
 }
 
@@ -159,7 +161,7 @@ impl IndexWriterHolder {
     pub(super) fn new(
         index_writer: IndexWriterImpl,
         unique_fields: Vec<Field>,
-        writer_threads: usize,
+        writer_threads: WriterThreads,
         writer_heap_size_bytes: usize,
     ) -> SummaResult<IndexWriterHolder> {
         Ok(IndexWriterHolder {
@@ -171,8 +173,8 @@ impl IndexWriterHolder {
     }
 
     /// Creates new `IndexWriterHolder` from `Index` and `core::Config`
-    pub fn from_config(index: &Index, core_config: &crate::configs::core::Config) -> SummaResult<IndexWriterHolder> {
-        let index_writer = IndexWriterImpl::new(index, core_config.writer_threads as usize, core_config.writer_heap_size_bytes as usize)?;
+    pub fn from_config(index: &Index, writer_threads: WriterThreads, writer_heap_size_bytes: usize) -> SummaResult<IndexWriterHolder> {
+        let index_writer = IndexWriterImpl::new(index, writer_threads.clone(), writer_heap_size_bytes)?;
         let unique_fields = index
             .load_metas()?
             .index_attributes()?
@@ -190,12 +192,7 @@ impl IndexWriterHolder {
             })
             .transpose()?
             .unwrap_or_default();
-        IndexWriterHolder::new(
-            index_writer,
-            unique_fields,
-            core_config.writer_threads as usize,
-            core_config.writer_heap_size_bytes as usize,
-        )
+        IndexWriterHolder::new(index_writer, unique_fields, writer_threads, writer_heap_size_bytes)
     }
 
     /// Delete index by its unique fields
@@ -301,12 +298,12 @@ impl IndexWriterHolder {
 
     pub fn wait_merging_threads(&mut self) {
         match &mut self.index_writer {
-            IndexWriterImpl::Single(_) => (),
+            IndexWriterImpl::SameThread(_) => (),
             IndexWriterImpl::Threaded(index_writer) => take_mut::take(index_writer, |index_writer| {
                 let index = index_writer.index().clone();
                 index_writer.wait_merging_threads().expect("cannot wait merging threads");
                 index
-                    .writer_with_num_threads(self.writer_threads, self.writer_heap_size_bytes)
+                    .writer_with_num_threads(self.writer_threads.threads() as usize, self.writer_heap_size_bytes)
                     .expect("cannot create index writer_holder")
             }),
         };

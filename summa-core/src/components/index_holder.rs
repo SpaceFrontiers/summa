@@ -138,10 +138,13 @@ impl IndexHolder {
         let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
         index_reader.reload()?;
 
-        let index_writer_holder = if !read_only {
-            Some(Arc::new(RwLock::new(IndexWriterHolder::from_config(&index, core_config)?)))
-        } else {
-            None
+        let index_writer_holder = match (read_only, &core_config.writer_threads) {
+            (true, _) | (_, None) => None,
+            (_, Some(writer_threads)) => Some(Arc::new(RwLock::new(IndexWriterHolder::from_config(
+                &index,
+                writer_threads.clone(),
+                core_config.writer_heap_size_bytes as usize,
+            )?))),
         };
 
         Ok(IndexHolder {

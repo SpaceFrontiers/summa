@@ -10,6 +10,22 @@ fn return_true() -> bool {
     true
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterThreads {
+    SameThread,
+    N(u64),
+}
+
+impl WriterThreads {
+    pub fn threads(&self) -> u64 {
+        match self {
+            WriterThreads::SameThread => 0,
+            WriterThreads::N(n) => *n,
+        }
+    }
+}
+
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
@@ -24,8 +40,8 @@ pub struct Config {
     pub indices: HashMap<String, IndexEngineConfig>,
     #[builder(default = "1024 * 1024 * 1024")]
     pub writer_heap_size_bytes: u64,
-    #[builder(default = "1")]
-    pub writer_threads: u64,
+    #[builder(default = "Some(WriterThreads::N(1))")]
+    pub writer_threads: Option<WriterThreads>,
 }
 
 impl Default for Config {
@@ -36,7 +52,7 @@ impl Default for Config {
             dedicated_compression_thread: true,
             indices: HashMap::new(),
             writer_heap_size_bytes: 1024 * 1024 * 1024,
-            writer_threads: 1,
+            writer_threads: Some(WriterThreads::N(1)),
         }
     }
 }

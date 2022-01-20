@@ -30,7 +30,7 @@ impl WebIndexRegistry {
     pub fn new() -> WebIndexRegistry {
         let core_config = summa_core::configs::core::ConfigBuilder::default()
             .dedicated_compression_thread(false)
-            .writer_threads(0)
+            .writer_threads(None)
             .build()
             .expect("cannot build");
         let core_config = Arc::new(DirectProxy::new(core_config)) as Arc<dyn ConfigProxy<_>>;

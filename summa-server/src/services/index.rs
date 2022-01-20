@@ -8,6 +8,7 @@ use std::time::Duration;
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
 use summa_core::components::{IndexHolder, IndexRegistry, IndexWriterHolder};
+use summa_core::configs::core::WriterThreads;
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
@@ -285,7 +286,8 @@ impl Index {
             }
             proto::CreateIndexEngineRequest::Ipfs => {
                 let index = index_builder.create_in_ram()?;
-                let cid = IndexWriterHolder::from_config(&index, &self.server_config.read().await.get().core)?
+                let writer_heap_size_bytes = self.server_config.read().await.get().core.writer_heap_size_bytes;
+                let cid = IndexWriterHolder::from_config(&index, WriterThreads::N(1), writer_heap_size_bytes as usize)?
                     .lock_files(false, |files: Vec<summa_core::components::ComponentFile>| async move {
                         self.store_service
                             .put(files)
