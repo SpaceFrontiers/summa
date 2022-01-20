@@ -64,21 +64,18 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
+            index_engine: {"file": {}}, {"memory": {}} or {"remote": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
             file: attaching index placed under `<data_path>/<index_name>` directory
             remote: attaching remote index
             ipfs: attaching ipfs index
             request_id: request id
             session_id: session id
         """
-        request = {'index_name': index_name}
-        if file:
-            request['attach_file_engine_request'] = file
-        elif remote:
-            request['attach_remote_engine_request'] = remote
-        elif ipfs:
-            request['attach_ipfs_engine_request'] = ipfs
         return await self.stubs['index_api'].attach_index(
-            index_service_pb.AttachIndexRequest(**request),
+            index_service_pb.AttachIndexRequest(
+                index_name=index_name,
+                **index_engine,
+            ),
             metadata=setup_metadata(session_id, request_id),
         )
 
@@ -150,8 +147,8 @@ class SummaClient(BaseGrpcClient):
     async def create_index(
         self,
         index_name: str,
-        index_engine: str,
         schema: str | list,
+        index_engine: dict,
         compression: Optional[Union[str, int]] = None,
         blocksize: Optional[int] = None,
         sort_by_field: Optional[Tuple] = None,
@@ -164,7 +161,7 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            index_engine: "File" or "Memory"
+            index_engine: {"file": {}}, {"memory": {}} or {"ipfs": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
             schema: Tantivy index schema
             compression: Tantivy index compression
             blocksize: Docstore blocksize
@@ -182,7 +179,6 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
-                index_engine=index_engine,
                 schema=schema,
                 compression=compression,
                 blocksize=blocksize,
@@ -190,7 +186,8 @@ class SummaClient(BaseGrpcClient):
                 sort_by_field=index_service_pb.SortByField(
                     field=sort_by_field[0],
                     order=sort_by_field[1],
-                ) if sort_by_field else None
+                ) if sort_by_field else None,
+                **index_engine
             ),
             metadata=setup_metadata(session_id, request_id),
         )
@@ -200,7 +197,7 @@ class SummaClient(BaseGrpcClient):
         self,
         source_index_name: str,
         target_index_name: str,
-        target_index_engine: str,
+        target_index_engine: dict,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
@@ -210,7 +207,7 @@ class SummaClient(BaseGrpcClient):
         Args:
             source_index_name: source index name
             target_index_name: target index name
-            target_index_engine: "File", "Memory" or "Ipfs"
+            target_index_engine: {"file": {}}, {"memory": {}} or {"ipfs": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
             request_id: request id
             session_id: session id
         """
@@ -218,7 +215,7 @@ class SummaClient(BaseGrpcClient):
             index_service_pb.MigrateIndexRequest(
                 source_index_name=source_index_name,
                 target_index_name=target_index_name,
-                target_index_engine=target_index_engine,
+                **target_index_engine,
             ),
             metadata=setup_metadata(session_id, request_id),
         )

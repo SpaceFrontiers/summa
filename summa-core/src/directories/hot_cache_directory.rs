@@ -437,12 +437,19 @@ async fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
 /// and writes a static cache file called hotcache in the `output`.
 ///
 /// See [`HotDirectory`] for more information.
-pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: usize) -> tantivy::Result<Vec<u8>> {
+pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>) -> tantivy::Result<Vec<u8>> {
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
-    let caching_directory = ChunkedCachingDirectory::new_unbounded(directory, chunk_size, CacheMetrics::default(), FileStats::default());
-    let debug_proxy_directory = DebugProxyDirectory::wrap(caching_directory);
+    let debug_proxy_directory = match chunk_size {
+        Some(chunk_size) => DebugProxyDirectory::wrap(Box::new(ChunkedCachingDirectory::new_unbounded(
+            directory,
+            chunk_size,
+            CacheMetrics::default(),
+            FileStats::default(),
+        ))),
+        None => DebugProxyDirectory::wrap(directory),
+    };
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();
     let reader: IndexReader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;

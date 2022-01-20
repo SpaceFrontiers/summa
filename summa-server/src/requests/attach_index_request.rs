@@ -5,7 +5,7 @@ use crate::errors::Error;
 #[derive(Builder)]
 pub struct AttachIndexRequest {
     pub index_name: String,
-    pub attach_index_request: proto::attach_index_request::Request,
+    pub attach_index_request: proto::attach_index_request::IndexEngine,
 }
 
 impl TryFrom<proto::AttachIndexRequest> for AttachIndexRequest {
@@ -15,8 +15,10 @@ impl TryFrom<proto::AttachIndexRequest> for AttachIndexRequest {
         Ok(AttachIndexRequest {
             index_name: proto_request.index_name,
             attach_index_request: proto_request
-                .request
-                .unwrap_or(proto::attach_index_request::Request::AttachFileEngineRequest(proto::AttachFileEngineRequest {})),
+                .index_engine
+                .unwrap_or(proto::attach_index_request::IndexEngine::File(
+                    proto::AttachFileEngineRequest {},
+                )),
         })
     }
 }

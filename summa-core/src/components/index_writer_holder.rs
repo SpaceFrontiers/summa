@@ -15,6 +15,10 @@ use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
 
+pub struct HotCacheConfig {
+    pub chunk_size: Option<usize>,
+}
+
 pub struct ComponentFile {
     file_name: String,
     boxed_reader: Box<dyn Future<Output = Vec<u8>> + Send>,
@@ -311,7 +315,7 @@ impl IndexWriterHolder {
 
     /// Locking index files for executing operation on them
     #[cfg(feature = "fs")]
-    pub async fn lock_files<O, Fut>(&mut self, with_hotcache: bool, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
+    pub async fn lock_files<O, Fut>(&mut self, with_hotcache: Option<HotCacheConfig>, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
     where
         Fut: Future<Output = SummaResult<O>>,
     {
@@ -331,13 +335,13 @@ impl IndexWriterHolder {
             .map(move |file_name| ComponentFile::from_directory(directory, &file_name))
             .chain(self.get_index_files().await?);
         let segment_files = match with_hotcache {
-            true => {
-                let hotcache_bytes = crate::directories::write_hotcache(directory.inner_directory().box_clone(), 16384).await?;
+            Some(hotcache_config) => {
+                let hotcache_bytes = crate::directories::write_hotcache(directory.inner_directory().box_clone(), hotcache_config.chunk_size).await?;
                 segment_files_iter
                     .chain(std::iter::once(ComponentFile::new("hotcache.bin", Box::new(async move { hotcache_bytes }))))
                     .collect()
             }
-            false => segment_files_iter.collect(),
+            None => segment_files_iter.collect(),
         };
         f(segment_files).await
     }

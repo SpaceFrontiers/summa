@@ -25,6 +25,8 @@ pub enum ValidationError {
     MissingDefaultField(String),
     #[error("missing_index_error: {0}")]
     MissingIndex(String),
+    #[error("missing_index_engine_error")]
+    MissingIndexEngine,
     #[error("missing_field_error: {0}")]
     MissingField(String),
     #[error("missing_multi_field_error: {0}")]

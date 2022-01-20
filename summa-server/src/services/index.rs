@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
-use summa_core::components::{IndexHolder, IndexRegistry, IndexWriterHolder};
+use summa_core::components::{HotCacheConfig, IndexHolder, IndexRegistry, IndexWriterHolder};
 use summa_core::configs::core::WriterThreads;
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
@@ -56,13 +56,6 @@ impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
             index_name: delete_index_request.index_name,
         }
     }
-}
-
-fn default_chunked_cache_config() -> Option<proto::ChunkedCacheConfig> {
-    Some(proto::ChunkedCacheConfig {
-        chunk_size: 65536,
-        cache_size: Some(536870912),
-    })
 }
 
 /// The main entry point for managing Summa indices
@@ -220,7 +213,7 @@ impl Index {
     pub async fn attach_index(&self, attach_index_request: AttachIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_path = self.server_config.read().await.get().get_path_for_index_data(&attach_index_request.index_name);
         let (index, index_engine_config) = match attach_index_request.attach_index_request {
-            proto::attach_index_request::Request::AttachFileEngineRequest(proto::AttachFileEngineRequest {}) => {
+            proto::attach_index_request::IndexEngine::File(proto::AttachFileEngineRequest {}) => {
                 if !index_path.exists() {
                     return Err(ValidationError::MissingIndex(attach_index_request.index_name.to_string()).into());
                 }
@@ -233,10 +226,10 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
-            proto::attach_index_request::Request::AttachIpfsEngineRequest(proto::AttachIpfsEngineRequest { cid }) => {
+            proto::attach_index_request::IndexEngine::Ipfs(proto::AttachIpfsEngineRequest { cid, chunked_cache_config }) => {
                 let ipfs_index_engine = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
-                    chunked_cache_config: None,
+                    chunked_cache_config,
                     path: index_path.to_string_lossy().to_string(),
                 };
                 let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), false).await?;
@@ -265,7 +258,7 @@ impl Index {
             .settings(index_settings)
             .index_attributes(index_attributes);
         let (index, index_engine_config) = match create_index_request.index_engine {
-            proto::CreateIndexEngineRequest::File => {
+            proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {}) => {
                 let index_path = self.server_config.read().await.get().get_path_for_index_data(&create_index_request.index_name);
                 let index = IndexHolder::create_file_index(&index_path, index_builder).await?;
                 let index_engine_config = proto::IndexEngineConfig {
@@ -275,7 +268,7 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
-            proto::CreateIndexEngineRequest::Memory => {
+            proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}) => {
                 let index = index_builder.create_in_ram()?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Memory(proto::MemoryEngineConfig {
@@ -284,11 +277,11 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
-            proto::CreateIndexEngineRequest::Ipfs => {
+            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config }) => {
                 let index = index_builder.create_in_ram()?;
                 let writer_heap_size_bytes = self.server_config.read().await.get().core.writer_heap_size_bytes;
                 let cid = IndexWriterHolder::from_config(&index, WriterThreads::N(1), writer_heap_size_bytes as usize)?
-                    .lock_files(false, |files: Vec<summa_core::components::ComponentFile>| async move {
+                    .lock_files(None, |files: Vec<summa_core::components::ComponentFile>| async move {
                         self.store_service
                             .put(files)
                             .await
@@ -298,7 +291,7 @@ impl Index {
                 drop(index);
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid,
-                    chunked_cache_config: default_chunked_cache_config(),
+                    chunked_cache_config,
                     path: self
                         .server_config
                         .read()
@@ -459,7 +452,7 @@ impl Index {
                 .index_writer_holder()?
                 .write()
                 .await
-                .lock_files(false, |files: Vec<summa_core::components::ComponentFile>| async move {
+                .lock_files(None, |files: Vec<summa_core::components::ComponentFile>| async move {
                     self.store_service
                         .put(files)
                         .await
@@ -571,22 +564,29 @@ impl Index {
         let index_holder = self.index_registry.get_index_holder(&migrate_index_request.source_index_name).await?;
         let prepared_consumption = self.commit(&index_holder).await?;
 
-        let index_holder = match proto::CreateIndexEngineRequest::from_i32(migrate_index_request.target_index_engine) {
-            Some(proto::CreateIndexEngineRequest::Ipfs) => {
+        let index_holder = match migrate_index_request.target_index_engine {
+            Some(proto::migrate_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
                 let cid = index_holder
                     .index_writer_holder()?
                     .write()
                     .await
-                    .lock_files(true, |files: Vec<summa_core::components::ComponentFile>| async move {
-                        self.store_service
-                            .put(files)
-                            .await
-                            .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
-                    })
+                    .lock_files(
+                        Some(HotCacheConfig {
+                            chunk_size: chunked_cache_config
+                                .as_ref()
+                                .map(|chunked_cache_config| chunked_cache_config.chunk_size as usize),
+                        }),
+                        |files: Vec<summa_core::components::ComponentFile>| async move {
+                            self.store_service
+                                .put(files)
+                                .await
+                                .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
+                        },
+                    )
                     .await?;
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid,
-                    chunked_cache_config: default_chunked_cache_config(),
+                    chunked_cache_config,
                     path: self
                         .server_config
                         .read()
@@ -678,7 +678,7 @@ pub(crate) mod tests {
     pub async fn create_test_index_holder(
         index_service: &Index,
         schema: &Schema,
-        engine: proto::CreateIndexEngineRequest,
+        engine: proto::create_index_request::IndexEngine,
     ) -> SummaServerResult<Handler<IndexHolder>> {
         index_service
             .create_index(
@@ -807,7 +807,7 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::CreateIndexEngineRequest::Memory)
+                    .index_engine(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}))
                     .schema(create_test_schema())
                     .build()
                     .unwrap(),
@@ -818,7 +818,7 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::CreateIndexEngineRequest::Memory)
+                    .index_engine(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}))
                     .schema(create_test_schema())
                     .build()
                     .unwrap(),
@@ -841,7 +841,7 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::CreateIndexEngineRequest::File)
+                    .index_engine(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {}))
                     .schema(create_test_schema())
                     .build()
                     .unwrap(),
@@ -855,7 +855,7 @@ pub(crate) mod tests {
             .create_index(
                 CreateIndexRequestBuilder::default()
                     .index_name("test_index".to_owned())
-                    .index_engine(proto::CreateIndexEngineRequest::Memory)
+                    .index_engine(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}))
                     .schema(create_test_schema())
                     .build()
                     .unwrap()
@@ -872,7 +872,12 @@ pub(crate) mod tests {
         let data_path = root_path.path().join("data");
 
         let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(&index_service, &create_test_schema(), proto::CreateIndexEngineRequest::Ipfs).await?;
+        let index_holder = create_test_index_holder(
+            &index_service,
+            &create_test_schema(),
+            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config: None }),
+        )
+        .await?;
 
         for d in generate_documents(index_holder.schema(), 1000) {
             index_holder.index_document(d).await?;
@@ -910,7 +915,12 @@ pub(crate) mod tests {
         let data_path = root_path.path().join("data");
 
         let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(&index_service, &schema, proto::CreateIndexEngineRequest::Memory).await?;
+        let index_holder = create_test_index_holder(
+            &index_service,
+            &schema,
+            proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}),
+        )
+        .await?;
 
         for d in generate_documents(index_holder.schema(), 1000) {
             index_holder.index_document(d).await?;
@@ -940,7 +950,12 @@ pub(crate) mod tests {
         let data_path = root_path.path().join("data");
 
         let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(&index_service, &schema, proto::CreateIndexEngineRequest::Ipfs).await?;
+        let index_holder = create_test_index_holder(
+            &index_service,
+            &schema,
+            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config: None }),
+        )
+        .await?;
 
         let mut rng = SmallRng::seed_from_u64(42);
         for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 30) {

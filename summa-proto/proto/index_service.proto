@@ -50,20 +50,23 @@ message PrimaryKey {
 message AttachFileEngineRequest {}
 
 // Attach remote engine request
-message AttachRemoteEngineRequest {}
+message AttachRemoteEngineRequest {
+  ChunkedCacheConfig chunked_cache_config = 1;
+}
 
 // Attach file engine request
 message AttachIpfsEngineRequest {
   string cid = 1;
+  ChunkedCacheConfig chunked_cache_config = 2;
 }
 
 // Attach index request
 message AttachIndexRequest {
  string index_name = 1;
- oneof request {
-   AttachFileEngineRequest attach_file_engine_request = 2;
-   AttachRemoteEngineRequest attach_remote_engine_request = 3;
-   AttachIpfsEngineRequest attach_ipfs_engine_request = 4;
+ oneof index_engine {
+   AttachFileEngineRequest file = 2;
+   AttachRemoteEngineRequest remote = 3;
+   AttachIpfsEngineRequest ipfs = 4;
  }
 }
 
@@ -91,7 +94,11 @@ message MigrateIndexRequest {
   // Name of index that will be created
   string target_index_name = 2;
   // Target index engine
-  CreateIndexEngineRequest target_index_engine = 3;
+  oneof target_index_engine {
+    CreateFileEngineRequest file = 3;
+    CreateMemoryEngineRequest memory = 4;
+    CreateIpfsEngineRequest ipfs = 5;
+  }
 }
 
 // Response describing migrated index
@@ -104,12 +111,11 @@ message SortByField {
   Order order = 2;
 }
 
-enum CreateIndexEngineRequest {
-  File = 0;
-  Memory = 1;
-  Ipfs = 2;
+message CreateFileEngineRequest {}
+message CreateMemoryEngineRequest {}
+message CreateIpfsEngineRequest {
+  ChunkedCacheConfig chunked_cache_config = 1;
 }
-
 message IndexAttributes {
   // Timestamp when index has been created
   uint64 created_at = 1;
@@ -132,17 +138,21 @@ message CreateIndexRequest {
   // Index name
   string index_name = 1;
   // Index engine
-  CreateIndexEngineRequest index_engine = 2;
+  oneof index_engine {
+    CreateFileEngineRequest file = 7;
+    CreateMemoryEngineRequest memory = 8;
+    CreateIpfsEngineRequest ipfs = 9;
+  }
   // Index schema in Tantivy format
-  string schema = 3;
+  string schema = 2;
   // Compression for store
-  Compression compression = 4;
+  Compression compression = 3;
   // Size of store blocks
-  optional uint32 blocksize = 5;
+  optional uint32 blocksize = 4;
   // Field for sorting
-  optional SortByField sort_by_field = 6;
+  optional SortByField sort_by_field = 5;
   // Optional index fields
-  IndexAttributes index_attributes = 7;
+  IndexAttributes index_attributes = 6;
 }
 
 message CreateIndexResponse {

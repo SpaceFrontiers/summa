@@ -2,7 +2,6 @@ use serde_json::json;
 use summa_proto::proto;
 use summa_proto::proto::index_api_client::IndexApiClient;
 use summa_proto::proto::search_api_client::SearchApiClient;
-use summa_proto::proto::{Compression, CreateIndexEngineRequest, IndexAttributes};
 
 static SCHEMA: &str = r#"
 - name: title
@@ -36,10 +35,10 @@ async fn main() -> Result<(), tonic::Status> {
     index_api_client
         .create_index(proto::CreateIndexRequest {
             index_name: "test_index".to_string(),
-            index_engine: CreateIndexEngineRequest::File.into(),
+            index_engine: Some(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {})),
             schema: SCHEMA.to_string(),
-            compression: Compression::Zstd.into(),
-            index_attributes: Some(IndexAttributes {
+            compression: proto::Compression::Zstd.into(),
+            index_attributes: Some(proto::IndexAttributes {
                 unique_fields: vec!["title".to_string()],
                 ..Default::default()
             }),

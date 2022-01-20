@@ -116,25 +116,25 @@ impl ReadOperationBuilder {
 /// should be in the hotcache.
 /// - It is used in the search-api to provide debugging/performance information.
 #[derive(Debug)]
-pub struct DebugProxyDirectory<D: Directory> {
-    underlying: Arc<D>,
+pub struct DebugProxyDirectory {
+    underlying: Box<dyn Directory>,
     operations: OperationBuffer,
 }
 
-impl<D: Directory> Clone for DebugProxyDirectory<D> {
+impl Clone for DebugProxyDirectory {
     fn clone(&self) -> Self {
         DebugProxyDirectory {
-            underlying: self.underlying.clone(),
+            underlying: self.underlying.box_clone(),
             operations: self.operations.clone(),
         }
     }
 }
 
-impl<D: Directory> DebugProxyDirectory<D> {
+impl DebugProxyDirectory {
     /// Wraps another directory to log all of its read operations.
-    pub fn wrap(directory: D) -> Self {
+    pub fn wrap(directory: Box<dyn Directory>) -> Self {
         DebugProxyDirectory {
-            underlying: Arc::new(directory),
+            underlying: directory,
             operations: OperationBuffer::default(),
         }
     }
@@ -157,14 +157,14 @@ impl<D: Directory> DebugProxyDirectory<D> {
     }
 }
 
-struct DebugProxyFileHandle<D: Directory> {
-    directory: DebugProxyDirectory<D>,
+struct DebugProxyFileHandle {
+    directory: DebugProxyDirectory,
     underlying: Arc<dyn FileHandle>,
     path: PathBuf,
 }
 
 #[async_trait]
-impl<D: Directory> FileHandle for DebugProxyFileHandle<D> {
+impl FileHandle for DebugProxyFileHandle {
     fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
         let read_operation_builder = ReadOperationBuilder::new(&self.path).with_offset(byte_range.start);
         let payload = self.underlying.read_bytes(byte_range)?;
@@ -182,20 +182,20 @@ impl<D: Directory> FileHandle for DebugProxyFileHandle<D> {
     }
 }
 
-impl<D: Directory> fmt::Debug for DebugProxyFileHandle<D> {
+impl fmt::Debug for DebugProxyFileHandle {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "DebugProxyFileHandle({:?})", &self.underlying)
     }
 }
 
-impl<D: Directory> HasLen for DebugProxyFileHandle<D> {
+impl HasLen for DebugProxyFileHandle {
     fn len(&self) -> usize {
         self.underlying.len()
     }
 }
 
 #[async_trait]
-impl<D: Directory> Directory for DebugProxyDirectory<D> {
+impl Directory for DebugProxyDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         let underlying = self.underlying.get_file_handle(path)?;
         Ok(Arc::new(DebugProxyFileHandle {

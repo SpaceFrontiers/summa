@@ -13,7 +13,7 @@ use crate::requests::validators;
 #[builder(build_fn(error = "BuilderError"))]
 pub struct CreateIndexRequest {
     pub index_name: String,
-    pub index_engine: proto::CreateIndexEngineRequest,
+    pub index_engine: proto::create_index_request::IndexEngine,
     pub schema: Schema,
     #[builder(default = "tantivy::store::Compressor::None")]
     pub compression: tantivy::store::Compressor,
@@ -43,7 +43,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
 
         Ok(CreateIndexRequestBuilder::default()
             .index_name(proto_request.index_name)
-            .index_engine(proto::CreateIndexEngineRequest::from_i32(proto_request.index_engine).expect("unknown engine"))
+            .index_engine(proto_request.index_engine.expect("index_engine not set"))
             .schema(schema)
             .compression(compression)
             .blocksize(proto_request.blocksize.map(|blocksize| blocksize as usize))

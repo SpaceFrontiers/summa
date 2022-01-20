@@ -28,8 +28,11 @@ parent: APIs
     - [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig)
     - [CommitIndexRequest](#summa-proto-CommitIndexRequest)
     - [CommitIndexResponse](#summa-proto-CommitIndexResponse)
+    - [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest)
     - [CreateIndexRequest](#summa-proto-CreateIndexRequest)
     - [CreateIndexResponse](#summa-proto-CreateIndexResponse)
+    - [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest)
+    - [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest)
     - [DeleteDocumentsRequest](#summa-proto-DeleteDocumentsRequest)
     - [DeleteDocumentsResponse](#summa-proto-DeleteDocumentsResponse)
     - [DeleteIndexRequest](#summa-proto-DeleteIndexRequest)
@@ -70,7 +73,6 @@ parent: APIs
   
     - [CommitMode](#summa-proto-CommitMode)
     - [Compression](#summa-proto-Compression)
-    - [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest)
   
 - [query.proto](#query-proto)
     - [Aggregation](#summa-proto-Aggregation)
@@ -352,9 +354,9 @@ Attach index request
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
-| attach_file_engine_request | [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest) |  |  |
-| attach_remote_engine_request | [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest) |  |  |
-| attach_ipfs_engine_request | [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest) |  |  |
+| file | [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest) |  |  |
+| remote | [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest) |  |  |
+| ipfs | [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest) |  |  |
 
 
 
@@ -385,6 +387,7 @@ Attach file engine request
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | cid | [string](#string) |  |  |
+| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
 
 
 
@@ -395,6 +398,11 @@ Attach file engine request
 
 ### AttachRemoteEngineRequest
 Attach remote engine request
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
 
 
 
@@ -448,6 +456,16 @@ Commit index response
 
 
 
+<a name="summa-proto-CreateFileEngineRequest"></a>
+
+### CreateFileEngineRequest
+
+
+
+
+
+
+
 <a name="summa-proto-CreateIndexRequest"></a>
 
 ### CreateIndexRequest
@@ -457,7 +475,9 @@ Request for index creation
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  | Index name |
-| index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  | Index engine |
+| file | [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest) |  |  |
+| memory | [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest) |  |  |
+| ipfs | [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest) |  |  |
 | schema | [string](#string) |  | Index schema in Tantivy format |
 | compression | [Compression](#summa-proto-Compression) |  | Compression for store |
 | blocksize | [uint32](#uint32) | optional | Size of store blocks |
@@ -478,6 +498,31 @@ Request for index creation
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-CreateIpfsEngineRequest"></a>
+
+### CreateIpfsEngineRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-CreateMemoryEngineRequest"></a>
+
+### CreateMemoryEngineRequest
+
 
 
 
@@ -871,7 +916,9 @@ Request that changes index engine. Currently possible to convert File to IPFS
 | ----- | ---- | ----- | ----------- |
 | source_index_name | [string](#string) |  | Name of index that will be migrated. It will be left intact after migration. |
 | target_index_name | [string](#string) |  | Name of index that will be created |
-| target_index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  | Target index engine |
+| file | [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest) |  |  |
+| memory | [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest) |  |  |
+| ipfs | [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest) |  |  |
 
 
 
@@ -1072,19 +1119,6 @@ Compression library for store, implies on both performance and occupied disk spa
 | Lz4 | 2 |  |
 | Snappy | 3 |  |
 | Zstd | 4 |  |
-
-
-
-<a name="summa-proto-CreateIndexEngineRequest"></a>
-
-### CreateIndexEngineRequest
-
-
-| Name | Number | Description |
-| ---- | ------ | ----------- |
-| File | 0 |  |
-| Memory | 1 |  |
-| Ipfs | 2 |  |
 
 
  <!-- end enums -->

@@ -19,7 +19,7 @@ const ENV_FILTER: &str = "librdkafka=warn,\
     summa_server=warn,\
     tantivy=warn,\
     fastfield_codecs=warn,\
-    error";
+    warn";
 
 const REQUEST_ENV_FILTER: &str = "summa_server::server::grpc[request]=info,summa_server::server::metrics[request]=info";
 

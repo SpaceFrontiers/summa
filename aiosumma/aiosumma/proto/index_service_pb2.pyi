@@ -9,10 +9,7 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Map
 Async: CommitMode
 Brotli: Compression
 DESCRIPTOR: _descriptor.FileDescriptor
-File: CreateIndexEngineRequest
-Ipfs: CreateIndexEngineRequest
 Lz4: Compression
-Memory: CreateIndexEngineRequest
 None: Compression
 Snappy: Compression
 Sync: CommitMode
@@ -23,16 +20,16 @@ class AttachFileEngineRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class AttachIndexRequest(_message.Message):
-    __slots__ = ["attach_file_engine_request", "attach_ipfs_engine_request", "attach_remote_engine_request", "index_name"]
-    ATTACH_FILE_ENGINE_REQUEST_FIELD_NUMBER: _ClassVar[int]
-    ATTACH_IPFS_ENGINE_REQUEST_FIELD_NUMBER: _ClassVar[int]
-    ATTACH_REMOTE_ENGINE_REQUEST_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["file", "index_name", "ipfs", "remote"]
+    FILE_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    attach_file_engine_request: AttachFileEngineRequest
-    attach_ipfs_engine_request: AttachIpfsEngineRequest
-    attach_remote_engine_request: AttachRemoteEngineRequest
+    IPFS_FIELD_NUMBER: _ClassVar[int]
+    REMOTE_FIELD_NUMBER: _ClassVar[int]
+    file: AttachFileEngineRequest
     index_name: str
-    def __init__(self, index_name: _Optional[str] = ..., attach_file_engine_request: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., attach_remote_engine_request: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., attach_ipfs_engine_request: _Optional[_Union[AttachIpfsEngineRequest, _Mapping]] = ...) -> None: ...
+    ipfs: AttachIpfsEngineRequest
+    remote: AttachRemoteEngineRequest
+    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., remote: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[AttachIpfsEngineRequest, _Mapping]] = ...) -> None: ...
 
 class AttachIndexResponse(_message.Message):
     __slots__ = ["index"]
@@ -41,14 +38,18 @@ class AttachIndexResponse(_message.Message):
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class AttachIpfsEngineRequest(_message.Message):
-    __slots__ = ["cid"]
+    __slots__ = ["chunked_cache_config", "cid"]
+    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
     CID_FIELD_NUMBER: _ClassVar[int]
+    chunked_cache_config: ChunkedCacheConfig
     cid: str
-    def __init__(self, cid: _Optional[str] = ...) -> None: ...
+    def __init__(self, cid: _Optional[str] = ..., chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
 
 class AttachRemoteEngineRequest(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+    __slots__ = ["chunked_cache_config"]
+    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    chunked_cache_config: ChunkedCacheConfig
+    def __init__(self, chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
 
 class ChunkedCacheConfig(_message.Message):
     __slots__ = ["cache_size", "chunk_size"]
@@ -72,29 +73,47 @@ class CommitIndexResponse(_message.Message):
     elapsed_secs: float
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
 
+class CreateFileEngineRequest(_message.Message):
+    __slots__ = []
+    def __init__(self) -> None: ...
+
 class CreateIndexRequest(_message.Message):
-    __slots__ = ["blocksize", "compression", "index_attributes", "index_engine", "index_name", "schema", "sort_by_field"]
+    __slots__ = ["blocksize", "compression", "file", "index_attributes", "index_name", "ipfs", "memory", "schema", "sort_by_field"]
     BLOCKSIZE_FIELD_NUMBER: _ClassVar[int]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
+    FILE_FIELD_NUMBER: _ClassVar[int]
     INDEX_ATTRIBUTES_FIELD_NUMBER: _ClassVar[int]
-    INDEX_ENGINE_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    IPFS_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_FIELD_NUMBER: _ClassVar[int]
     SCHEMA_FIELD_NUMBER: _ClassVar[int]
     SORT_BY_FIELD_FIELD_NUMBER: _ClassVar[int]
     blocksize: int
     compression: Compression
+    file: CreateFileEngineRequest
     index_attributes: IndexAttributes
-    index_engine: CreateIndexEngineRequest
     index_name: str
+    ipfs: CreateIpfsEngineRequest
+    memory: CreateMemoryEngineRequest
     schema: str
     sort_by_field: SortByField
-    def __init__(self, index_name: _Optional[str] = ..., index_engine: _Optional[_Union[CreateIndexEngineRequest, str]] = ..., schema: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[CreateIpfsEngineRequest, _Mapping]] = ..., schema: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ...) -> None: ...
 
 class CreateIndexResponse(_message.Message):
     __slots__ = ["index"]
     INDEX_FIELD_NUMBER: _ClassVar[int]
     index: IndexDescription
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
+
+class CreateIpfsEngineRequest(_message.Message):
+    __slots__ = ["chunked_cache_config"]
+    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    chunked_cache_config: ChunkedCacheConfig
+    def __init__(self, chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
+
+class CreateMemoryEngineRequest(_message.Message):
+    __slots__ = []
+    def __init__(self) -> None: ...
 
 class DeleteDocumentsRequest(_message.Message):
     __slots__ = ["index_alias", "query"]
@@ -282,14 +301,18 @@ class MergeSegmentsResponse(_message.Message):
     def __init__(self) -> None: ...
 
 class MigrateIndexRequest(_message.Message):
-    __slots__ = ["source_index_name", "target_index_engine", "target_index_name"]
+    __slots__ = ["file", "ipfs", "memory", "source_index_name", "target_index_name"]
+    FILE_FIELD_NUMBER: _ClassVar[int]
+    IPFS_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_FIELD_NUMBER: _ClassVar[int]
     SOURCE_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    TARGET_INDEX_ENGINE_FIELD_NUMBER: _ClassVar[int]
     TARGET_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    file: CreateFileEngineRequest
+    ipfs: CreateIpfsEngineRequest
+    memory: CreateMemoryEngineRequest
     source_index_name: str
-    target_index_engine: CreateIndexEngineRequest
     target_index_name: str
-    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., target_index_engine: _Optional[_Union[CreateIndexEngineRequest, str]] = ...) -> None: ...
+    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[CreateIpfsEngineRequest, _Mapping]] = ...) -> None: ...
 
 class MigrateIndexResponse(_message.Message):
     __slots__ = ["index"]
@@ -369,9 +392,6 @@ class WarmupIndexResponse(_message.Message):
     ELAPSED_SECS_FIELD_NUMBER: _ClassVar[int]
     elapsed_secs: float
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
-
-class CreateIndexEngineRequest(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-    __slots__ = []
 
 class Compression(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []
