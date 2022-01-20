@@ -35,10 +35,10 @@ class IndexApiStub(object):
                 request_serializer=index__service__pb2.MigrateIndexRequest.SerializeToString,
                 response_deserializer=index__service__pb2.MigrateIndexResponse.FromString,
                 )
-        self.delete_document = channel.unary_unary(
-                '/summa.proto.IndexApi/delete_document',
-                request_serializer=index__service__pb2.DeleteDocumentRequest.SerializeToString,
-                response_deserializer=index__service__pb2.DeleteDocumentResponse.FromString,
+        self.delete_documents = channel.unary_unary(
+                '/summa.proto.IndexApi/delete_documents',
+                request_serializer=index__service__pb2.DeleteDocumentsRequest.SerializeToString,
+                response_deserializer=index__service__pb2.DeleteDocumentsResponse.FromString,
                 )
         self.delete_index = channel.unary_unary(
                 '/summa.proto.IndexApi/delete_index',
@@ -124,7 +124,7 @@ class IndexApiServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def delete_document(self, request, context):
+    def delete_documents(self, request, context):
         """Deletes single document from the index by its primary key (therefore, index must have primary key)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -224,10 +224,10 @@ def add_IndexApiServicer_to_server(servicer, server):
                     request_deserializer=index__service__pb2.MigrateIndexRequest.FromString,
                     response_serializer=index__service__pb2.MigrateIndexResponse.SerializeToString,
             ),
-            'delete_document': grpc.unary_unary_rpc_method_handler(
-                    servicer.delete_document,
-                    request_deserializer=index__service__pb2.DeleteDocumentRequest.FromString,
-                    response_serializer=index__service__pb2.DeleteDocumentResponse.SerializeToString,
+            'delete_documents': grpc.unary_unary_rpc_method_handler(
+                    servicer.delete_documents,
+                    request_deserializer=index__service__pb2.DeleteDocumentsRequest.FromString,
+                    response_serializer=index__service__pb2.DeleteDocumentsResponse.SerializeToString,
             ),
             'delete_index': grpc.unary_unary_rpc_method_handler(
                     servicer.delete_index,
@@ -359,7 +359,7 @@ class IndexApi(object):
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 
     @staticmethod
-    def delete_document(request,
+    def delete_documents(request,
             target,
             options=(),
             channel_credentials=None,
@@ -369,9 +369,9 @@ class IndexApi(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(request, target, '/summa.proto.IndexApi/delete_document',
-            index__service__pb2.DeleteDocumentRequest.SerializeToString,
-            index__service__pb2.DeleteDocumentResponse.FromString,
+        return grpc.experimental.unary_unary(request, target, '/summa.proto.IndexApi/delete_documents',
+            index__service__pb2.DeleteDocumentsRequest.SerializeToString,
+            index__service__pb2.DeleteDocumentsResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 

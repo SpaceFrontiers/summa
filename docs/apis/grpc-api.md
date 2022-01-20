@@ -30,8 +30,8 @@ parent: APIs
     - [CommitIndexResponse](#summa-proto-CommitIndexResponse)
     - [CreateIndexRequest](#summa-proto-CreateIndexRequest)
     - [CreateIndexResponse](#summa-proto-CreateIndexResponse)
-    - [DeleteDocumentRequest](#summa-proto-DeleteDocumentRequest)
-    - [DeleteDocumentResponse](#summa-proto-DeleteDocumentResponse)
+    - [DeleteDocumentsRequest](#summa-proto-DeleteDocumentsRequest)
+    - [DeleteDocumentsResponse](#summa-proto-DeleteDocumentsResponse)
     - [DeleteIndexRequest](#summa-proto-DeleteIndexRequest)
     - [DeleteIndexResponse](#summa-proto-DeleteIndexResponse)
     - [FileEngineConfig](#summa-proto-FileEngineConfig)
@@ -484,26 +484,31 @@ Request for index creation
 
 
 
-<a name="summa-proto-DeleteDocumentRequest"></a>
+<a name="summa-proto-DeleteDocumentsRequest"></a>
 
-### DeleteDocumentRequest
+### DeleteDocumentsRequest
 
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_alias | [string](#string) |  |  |
-| primary_key | [PrimaryKey](#summa-proto-PrimaryKey) |  |  |
+| query | [Query](#summa-proto-Query) |  |  |
 
 
 
 
 
 
-<a name="summa-proto-DeleteDocumentResponse"></a>
+<a name="summa-proto-DeleteDocumentsResponse"></a>
 
-### DeleteDocumentResponse
+### DeleteDocumentsResponse
 
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| deleted_documents | [uint64](#uint64) |  |  |
 
 
 
@@ -660,7 +665,7 @@ Request for index creation
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | created_at | [uint64](#uint64) |  | Timestamp when index has been created |
-| primary_key | [string](#string) | optional | Primary key of the index. Summa maintains unique constraint on primary keys and uses them for deduplicating data |
+| unique_fields | [string](#string) | repeated | Unique fields of the index. Summa maintains unique constraint on them and uses for deduplicating data |
 | default_fields | [string](#string) | repeated | Default fields that are using in `MatchQuery` |
 | multi_fields | [string](#string) | repeated | Multi fields is ones that may have multiple values and processed as lists. All other fields will be forcefully converted to singular value |
 | default_index_name | [string](#string) | optional | Descriptive field that may be used as name for index when indices are replicating over wire |
@@ -864,9 +869,9 @@ Request that changes index engine. Currently possible to convert File to IPFS
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| source_index_name | [string](#string) |  |  |
-| target_index_name | [string](#string) |  |  |
-| target_index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  |  |
+| source_index_name | [string](#string) |  | Name of index that will be migrated. It will be left intact after migration. |
+| target_index_name | [string](#string) |  | Name of index that will be created |
+| target_index_engine | [CreateIndexEngineRequest](#summa-proto-CreateIndexEngineRequest) |  | Target index engine |
 
 
 
@@ -1003,7 +1008,7 @@ Possible primary keys
 <a name="summa-proto-VacuumIndexResponse"></a>
 
 ### VacuumIndexResponse
-repeated string deleted_files = 1;
+
 
 
 
@@ -1098,7 +1103,7 @@ Manages indices
 | commit_index | [CommitIndexRequest](#summa-proto-CommitIndexRequest) | [CommitIndexResponse](#summa-proto-CommitIndexResponse) | Committing all collected writes to the index |
 | create_index | [CreateIndexRequest](#summa-proto-CreateIndexRequest) | [CreateIndexResponse](#summa-proto-CreateIndexResponse) | Creates new index from scratch |
 | migrate_index | [MigrateIndexRequest](#summa-proto-MigrateIndexRequest) | [MigrateIndexResponse](#summa-proto-MigrateIndexResponse) | Creates new index from scratch |
-| delete_document | [DeleteDocumentRequest](#summa-proto-DeleteDocumentRequest) | [DeleteDocumentResponse](#summa-proto-DeleteDocumentResponse) | Deletes single document from the index by its primary key (therefore, index must have primary key) |
+| delete_documents | [DeleteDocumentsRequest](#summa-proto-DeleteDocumentsRequest) | [DeleteDocumentsResponse](#summa-proto-DeleteDocumentsResponse) | Deletes single document from the index by its primary key (therefore, index must have primary key) |
 | delete_index | [DeleteIndexRequest](#summa-proto-DeleteIndexRequest) | [DeleteIndexResponse](#summa-proto-DeleteIndexResponse) | Deletes index and physically removes file in the case of `FileEngine` |
 | get_indices_aliases | [GetIndicesAliasesRequest](#summa-proto-GetIndicesAliasesRequest) | [GetIndicesAliasesResponse](#summa-proto-GetIndicesAliasesResponse) | Gets all existing index aliases |
 | get_index | [GetIndexRequest](#summa-proto-GetIndexRequest) | [GetIndexResponse](#summa-proto-GetIndexResponse) | Gets index description |

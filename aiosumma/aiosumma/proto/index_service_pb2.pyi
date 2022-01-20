@@ -1,3 +1,4 @@
+import query_pb2 as _query_pb2
 import utils_pb2 as _utils_pb2
 from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
@@ -95,17 +96,19 @@ class CreateIndexResponse(_message.Message):
     index: IndexDescription
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
-class DeleteDocumentRequest(_message.Message):
-    __slots__ = ["index_alias", "primary_key"]
+class DeleteDocumentsRequest(_message.Message):
+    __slots__ = ["index_alias", "query"]
     INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
-    PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
+    QUERY_FIELD_NUMBER: _ClassVar[int]
     index_alias: str
-    primary_key: PrimaryKey
-    def __init__(self, index_alias: _Optional[str] = ..., primary_key: _Optional[_Union[PrimaryKey, _Mapping]] = ...) -> None: ...
+    query: _query_pb2.Query
+    def __init__(self, index_alias: _Optional[str] = ..., query: _Optional[_Union[_query_pb2.Query, _Mapping]] = ...) -> None: ...
 
-class DeleteDocumentResponse(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+class DeleteDocumentsResponse(_message.Message):
+    __slots__ = ["deleted_documents"]
+    DELETED_DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
+    deleted_documents: int
+    def __init__(self, deleted_documents: _Optional[int] = ...) -> None: ...
 
 class DeleteIndexRequest(_message.Message):
     __slots__ = ["index_name"]
@@ -165,22 +168,22 @@ class GetIndicesResponse(_message.Message):
     def __init__(self, indices: _Optional[_Iterable[_Union[IndexDescription, _Mapping]]] = ...) -> None: ...
 
 class IndexAttributes(_message.Message):
-    __slots__ = ["created_at", "default_fields", "default_index_name", "default_snippets", "description", "multi_fields", "primary_key"]
+    __slots__ = ["created_at", "default_fields", "default_index_name", "default_snippets", "description", "multi_fields", "unique_fields"]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_SNIPPETS_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
     MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
-    PRIMARY_KEY_FIELD_NUMBER: _ClassVar[int]
+    UNIQUE_FIELDS_FIELD_NUMBER: _ClassVar[int]
     created_at: int
     default_fields: _containers.RepeatedScalarFieldContainer[str]
     default_index_name: str
     default_snippets: _containers.RepeatedScalarFieldContainer[str]
     description: str
     multi_fields: _containers.RepeatedScalarFieldContainer[str]
-    primary_key: str
-    def __init__(self, created_at: _Optional[int] = ..., primary_key: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ...) -> None: ...
+    unique_fields: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ["compression", "index_aliases", "index_engine", "index_name", "num_docs"]

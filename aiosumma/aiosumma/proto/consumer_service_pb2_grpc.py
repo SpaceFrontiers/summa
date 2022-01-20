@@ -6,7 +6,7 @@ from . import consumer_service_pb2 as consumer__service__pb2
 
 
 class ConsumerApiStub(object):
-    """Manages ingestion data from Kafka
+    """Manage ingestion data from Kafka
     """
 
     def __init__(self, channel):
@@ -38,7 +38,7 @@ class ConsumerApiStub(object):
 
 
 class ConsumerApiServicer(object):
-    """Manages ingestion data from Kafka
+    """Manage ingestion data from Kafka
     """
 
     def create_consumer(self, request, context):
@@ -100,7 +100,7 @@ def add_ConsumerApiServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class ConsumerApi(object):
-    """Manages ingestion data from Kafka
+    """Manage ingestion data from Kafka
     """
 
     @staticmethod
