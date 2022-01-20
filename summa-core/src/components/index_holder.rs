@@ -441,15 +441,16 @@ impl IndexHolder {
         Ok(collector_outputs)
     }
 
-    /// Delete `SummaDocument` by `primary_key`
-    pub async fn delete_document(&self, primary_key_value: Option<proto::PrimaryKey>) -> SummaResult<()> {
-        self.index_writer_holder()?.read().await.delete_document_by_primary_key(primary_key_value)
+    /// Delete `SummaDocument` by `unq`
+    pub async fn delete_documents(&self, query: proto::Query) -> SummaResult<u64> {
+        let parsed_query = self.query_parser.read().await.parse_query(&query)?;
+        self.index_writer_holder()?.read().await.delete_documents(parsed_query)
     }
 
     /// Index generic `SummaDocument`
     ///
     /// `IndexUpdater` bounds unbounded `SummaDocument` inside
-    pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<()> {
+    pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<u64> {
         let document = document.bound_with(&self.index.schema()).try_into()?;
         self.index_writer_holder()?.read().await.index_document(document)
     }

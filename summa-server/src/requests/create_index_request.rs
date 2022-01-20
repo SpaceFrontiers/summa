@@ -33,7 +33,7 @@ impl TryFrom<proto::CreateIndexRequest> for CreateIndexRequest {
         let mut index_attributes = proto_request.index_attributes.unwrap_or_default();
         validators::parse_default_fields(&schema, &index_attributes.default_fields)?;
         validators::parse_multi_fields(&schema, &index_attributes.multi_fields)?;
-        validators::parse_primary_key(&schema, &index_attributes.primary_key)?;
+        validators::parse_unique_fields(&schema, &index_attributes.unique_fields)?;
 
         index_attributes.created_at = SystemTime::now().duration_since(UNIX_EPOCH).expect("cannot retrieve time").as_secs();
 

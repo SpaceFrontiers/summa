@@ -30,7 +30,7 @@ export class ChunkedCacheConfig {
 
 export class IndexAttributes {
   created_at: number;
-  primary_key?: string;
+  unique_fields?: string[];
   default_fields: string[];
   multi_fields: string[];
   default_index_name?: string;
@@ -40,7 +40,7 @@ export class IndexAttributes {
     created_at: number,
     default_fields: string[],
     multi_fields: string[],
-    primary_key?: string,
+    unique_fields?: string[],
     default_index_name?: string,
     description?: string,
     default_snippets?: string,
@@ -48,7 +48,7 @@ export class IndexAttributes {
     this.created_at = created_at
     this.default_fields = default_fields
     this.multi_fields = multi_fields
-    this.primary_key = primary_key
+    this.unique_fields = unique_fields
     this.default_index_name = default_index_name
     this.description = description
     this.default_snippets = default_snippets

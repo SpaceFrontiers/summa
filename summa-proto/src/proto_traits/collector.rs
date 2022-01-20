@@ -46,7 +46,7 @@ impl proto::CollectorOutput {
     }
 }
 
-pub(crate) mod shortcuts {
+pub mod shortcuts {
     use std::collections::HashMap;
 
     use crate::proto;

@@ -17,7 +17,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, info_span, warn};
 use tracing_futures::Instrument;
 
-use crate::errors::SummaServerResult;
+use crate::errors::{SummaServerResult, ValidationError};
 use crate::services::Index;
 
 #[derive(Clone)]
@@ -120,15 +120,16 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         Ok(Response::new(response))
     }
 
-    async fn delete_document(&self, request: Request<proto::DeleteDocumentRequest>) -> Result<Response<proto::DeleteDocumentResponse>, Status> {
+    async fn delete_documents(&self, request: Request<proto::DeleteDocumentsRequest>) -> Result<Response<proto::DeleteDocumentsResponse>, Status> {
         let request = request.into_inner();
-        self.index_service
+        let deleted_documents = self
+            .index_service
             .get_index_holder(&request.index_alias)
             .await?
-            .delete_document(request.primary_key)
+            .delete_documents(request.query.ok_or(ValidationError::MissingQuery)?)
             .await
             .map_err(crate::errors::Error::from)?;
-        let response = proto::DeleteDocumentResponse {};
+        let response = proto::DeleteDocumentsResponse { deleted_documents };
         Ok(Response::new(response))
     }
 

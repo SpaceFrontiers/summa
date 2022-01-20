@@ -1,6 +1,7 @@
 syntax = "proto3";
 package summa.proto;
 
+import "query.proto";
 import "utils.proto";
 
 // Manages indices
@@ -14,7 +15,7 @@ service IndexApi {
   // Creates new index from scratch
   rpc migrate_index (MigrateIndexRequest) returns (MigrateIndexResponse) {}
   // Deletes single document from the index by its primary key (therefore, index must have primary key)
-  rpc delete_document (DeleteDocumentRequest) returns (DeleteDocumentResponse) {}
+  rpc delete_documents (DeleteDocumentsRequest) returns (DeleteDocumentsResponse) {}
   // Deletes index and physically removes file in the case of `FileEngine`
   rpc delete_index (DeleteIndexRequest) returns (DeleteIndexResponse) {}
   // Gets all existing index aliases
@@ -112,8 +113,8 @@ enum CreateIndexEngineRequest {
 message IndexAttributes {
   // Timestamp when index has been created
   uint64 created_at = 1;
-  // Primary key of the index. Summa maintains unique constraint on primary keys and uses them for deduplicating data
-  optional string primary_key = 2;
+  // Unique fields of the index. Summa maintains unique constraint on them and uses for deduplicating data
+  repeated string unique_fields = 2;
   // Default fields that are using in `MatchQuery`
   repeated string default_fields = 3;
   // Multi fields is ones that may have multiple values and processed as lists. All other fields will be forcefully converted to singular value
@@ -148,12 +149,14 @@ message CreateIndexResponse {
   IndexDescription index = 1;
 }
 
-message DeleteDocumentRequest {
+message DeleteDocumentsRequest {
   string index_alias = 1;
-  PrimaryKey primary_key = 2;
+  Query query = 2;
 }
 
-message DeleteDocumentResponse {}
+message DeleteDocumentsResponse {
+  uint64 deleted_documents = 1;
+}
 
 message DeleteIndexRequest {
   string index_name = 1;

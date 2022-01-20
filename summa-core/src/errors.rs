@@ -18,8 +18,8 @@ pub enum ValidationError {
     InvalidHttpHeader(String, String),
     #[error("invalid_http_method: {0}")]
     InvalidHttpMethod(String),
-    #[error("invalid_primary_key_type_error: {0:?}")]
-    InvalidPrimaryKeyType(FieldType),
+    #[error("invalid_unique_field_type_error: {0:?}")]
+    InvalidUniqueFieldType(FieldType),
     #[error("empty_argument_error: {0}")]
     EmptyArgument(String),
     #[error("existing_path_error: {0}")]
@@ -32,10 +32,10 @@ pub enum ValidationError {
     MissingHeader(String),
     #[error("missing_path_error: {0}")]
     MissingPath(PathBuf),
-    #[error("missing_primary_key_error: {0:?}")]
-    MissingPrimaryKey(Option<String>),
     #[error("missing_range")]
     MissingRange,
+    #[error("missing_unique_field_error: {0:?}")]
+    MissingUniqueField(String),
     #[error("required_fast_field: {0}")]
     RequiredFastField(String),
     #[error("utf8_error: {0}")]

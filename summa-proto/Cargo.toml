@@ -16,6 +16,9 @@ default = ["grpc"]
 grpc = ["tonic", "tonic-build", "tonic-reflection"]
 test-utils = []
 
+[dev-dependencies]
+tokio = "1.24"
+
 [build-dependencies]
 prost-build = { version = "0.11.0" }
 protoc-bin-vendored = "3.0.0"

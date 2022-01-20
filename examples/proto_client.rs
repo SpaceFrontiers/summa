@@ -40,7 +40,7 @@ async fn main() -> Result<(), tonic::Status> {
             schema: SCHEMA.to_string(),
             compression: Compression::Zstd.into(),
             index_attributes: Some(IndexAttributes {
-                primary_key: Some("title".to_string()),
+                unique_fields: vec!["title".to_string()],
                 ..Default::default()
             }),
             ..Default::default()

@@ -28,12 +28,14 @@ pub fn parse_multi_fields(schema: &Schema, multi_fields: &[String]) -> SummaServ
         .collect::<Result<_, _>>()?)
 }
 
-pub fn parse_primary_key(schema: &Schema, primary_key: &Option<String>) -> SummaServerResult<Option<String>> {
-    Ok(match primary_key {
-        Some(primary_key) => Some(match schema.get_field(primary_key) {
-            Some(_) => primary_key.to_owned(),
-            None => return Err(ValidationError::MissingPrimaryKey(Some(primary_key.to_owned())).into()),
-        }),
-        None => None,
-    })
+pub fn parse_unique_fields(schema: &Schema, unique_fields: &[String]) -> SummaServerResult<Vec<String>> {
+    Ok(unique_fields
+        .iter()
+        .map(|unique_field_name| match schema.get_field(unique_field_name) {
+            Some(_) => Ok(unique_field_name.to_owned()),
+            None => Err(ValidationError::MissingUniqueField(unique_field_name.to_owned())),
+        })
+        .collect::<Vec<Result<_, _>>>()
+        .into_iter()
+        .collect::<Result<_, _>>()?)
 }

@@ -244,10 +244,10 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
-    async def delete_document(
+    async def delete_documents(
         self,
         index_alias: str,
-        primary_key: index_service_pb.PrimaryKey,
+        query: query_pb.Query,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentResponse:
@@ -256,14 +256,14 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_alias: index alias
-            primary_key: bytes
+            query: query used for retrieving documents for deletion
             request_id:
             session_id:
         """
-        return await self.stubs['index_api'].delete_document(
-            index_service_pb.DeleteDocumentRequest(
+        return await self.stubs['index_api'].delete_documents(
+            index_service_pb.DeleteDocumentsRequest(
                 index_alias=index_alias,
-                primary_key=primary_key,
+                query=query,
             ),
             metadata=setup_metadata(session_id, request_id),
         )

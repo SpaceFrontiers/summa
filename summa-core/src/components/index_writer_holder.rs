@@ -5,7 +5,8 @@ use std::pin::Pin;
 use std::sync::RwLock;
 
 use summa_proto::proto;
-use tantivy::schema::{Field, FieldType, Value};
+use tantivy::query::{BooleanQuery, Query};
+use tantivy::schema::{Field, Value};
 use tantivy::{Directory, Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
 
@@ -73,13 +74,11 @@ impl IndexWriterImpl {
         })
     }
 
-    pub fn delete_term(&self, term: Term) {
+    pub fn delete_documents(&self, query: Box<dyn Query>) -> SummaResult<u64> {
         match self {
-            IndexWriterImpl::Single(_) => {}
-            IndexWriterImpl::Threaded(writer) => {
-                writer.delete_term(term);
-            }
-        };
+            IndexWriterImpl::Single(_) => Ok(0),
+            IndexWriterImpl::Threaded(writer) => Ok(writer.delete_query(query)?),
+        }
     }
     pub fn add_document(&self, document: Document) -> SummaResult<()> {
         match self {
@@ -146,7 +145,7 @@ impl IndexWriterImpl {
 /// Managing write operations to index
 pub struct IndexWriterHolder {
     index_writer: IndexWriterImpl,
-    primary_key: Option<Field>,
+    unique_fields: Vec<Field>,
     writer_threads: usize,
     writer_heap_size_bytes: usize,
 }
@@ -159,20 +158,13 @@ impl IndexWriterHolder {
     /// The type of primary key is restricted to I64 but it is subjected to be changed in the future.
     pub(super) fn new(
         index_writer: IndexWriterImpl,
-        primary_key: Option<Field>,
+        unique_fields: Vec<Field>,
         writer_threads: usize,
         writer_heap_size_bytes: usize,
     ) -> SummaResult<IndexWriterHolder> {
-        if let Some(primary_key) = primary_key {
-            match index_writer.index().schema().get_field_entry(primary_key).field_type() {
-                FieldType::I64(_) => Ok(()),
-                FieldType::Str(_) => Ok(()),
-                another_type => Err(ValidationError::InvalidPrimaryKeyType(another_type.to_owned())),
-            }?
-        }
         Ok(IndexWriterHolder {
             index_writer,
-            primary_key,
+            unique_fields,
             writer_threads,
             writer_heap_size_bytes,
         })
@@ -181,57 +173,57 @@ impl IndexWriterHolder {
     /// Creates new `IndexWriterHolder` from `Index` and `core::Config`
     pub fn from_config(index: &Index, core_config: &crate::configs::core::Config) -> SummaResult<IndexWriterHolder> {
         let index_writer = IndexWriterImpl::new(index, core_config.writer_threads as usize, core_config.writer_heap_size_bytes as usize)?;
-        let primary_key = index
+        let unique_fields = index
             .load_metas()?
             .index_attributes()?
-            .and_then(|attributes: proto::IndexAttributes| {
-                attributes.primary_key.map(|primary_key| {
-                    index
-                        .schema()
-                        .get_field(&primary_key)
-                        .ok_or(ValidationError::MissingPrimaryKey(Some(primary_key.to_string())))
-                })
+            .map(|attributes: proto::IndexAttributes| {
+                attributes
+                    .unique_fields
+                    .iter()
+                    .map(|unique_field| {
+                        index
+                            .schema()
+                            .get_field(unique_field)
+                            .ok_or(ValidationError::MissingUniqueField(unique_field.to_string()).into())
+                    })
+                    .collect::<SummaResult<_>>()
             })
-            .transpose()?;
+            .transpose()?
+            .unwrap_or_default();
         IndexWriterHolder::new(
             index_writer,
-            primary_key,
+            unique_fields,
             core_config.writer_threads as usize,
             core_config.writer_heap_size_bytes as usize,
         )
     }
 
-    /// Delete index by its primary key
-    pub(super) fn delete_document(&self, document: &Document) -> SummaResult<()> {
-        if let Some(primary_key) = self.primary_key {
-            self.index_writer.delete_term(
-                match document
-                    .get_first(primary_key)
-                    .ok_or_else(|| ValidationError::MissingPrimaryKey(Some(format!("{:?}", self.index_writer.index().schema().to_named_doc(document)))))?
-                {
-                    Value::Str(s) => Term::from_field_text(primary_key, s),
-                    Value::I64(i) => Term::from_field_i64(primary_key, *i),
-                    _ => Err(ValidationError::InvalidPrimaryKeyType(
-                        self.index_writer.index().schema().get_field_entry(primary_key).field_type().clone(),
-                    ))?,
-                },
-            )
-        }
-        Ok(())
+    /// Delete index by its unique fields
+    pub(super) fn delete_documents_by_unique_fields(&self, document: &Document) -> SummaResult<u64> {
+        let unique_terms = self
+            .unique_fields
+            .iter()
+            .map(|unique_field| {
+                Ok(
+                    match document
+                        .get_first(*unique_field)
+                        .ok_or_else(|| ValidationError::MissingUniqueField(format!("{:?}", self.index_writer.index().schema().to_named_doc(document))))?
+                    {
+                        Value::Str(s) => Term::from_field_text(*unique_field, s),
+                        Value::I64(i) => Term::from_field_i64(*unique_field, *i),
+                        _ => Err(ValidationError::InvalidUniqueFieldType(
+                            self.index_writer.index().schema().get_field_entry(*unique_field).field_type().clone(),
+                        ))?,
+                    },
+                )
+            })
+            .collect::<SummaResult<_>>()?;
+        self.delete_documents(Box::new(BooleanQuery::new_multiterms_query(unique_terms)))
     }
 
     /// Delete index by its primary key
-    pub(super) fn delete_document_by_primary_key(&self, primary_key_value: Option<proto::PrimaryKey>) -> SummaResult<()> {
-        self.primary_key
-            .and_then(|primary_key| {
-                primary_key_value.and_then(|primary_key_value| {
-                    primary_key_value.value.map(|value| match value {
-                        proto::primary_key::Value::Str(s) => self.index_writer.delete_term(Term::from_field_text(primary_key, &s)),
-                        proto::primary_key::Value::I64(i) => self.index_writer.delete_term(Term::from_field_i64(primary_key, i)),
-                    })
-                })
-            })
-            .ok_or_else(|| ValidationError::MissingPrimaryKey(None).into())
+    pub(super) fn delete_documents(&self, query: Box<dyn Query>) -> SummaResult<u64> {
+        self.index_writer.delete_documents(query)
     }
 
     /// Tantivy `Index`
@@ -240,9 +232,10 @@ impl IndexWriterHolder {
     }
 
     /// Put document to the index. Before comes searchable it must be committed
-    pub fn index_document(&self, document: Document) -> SummaResult<()> {
-        self.delete_document(&document)?;
-        self.index_writer.add_document(document)
+    pub fn index_document(&self, document: Document) -> SummaResult<u64> {
+        let deleted_documents = self.delete_documents_by_unique_fields(&document)?;
+        self.index_writer.add_document(document)?;
+        Ok(deleted_documents)
     }
 
     /// Merge segments into one.

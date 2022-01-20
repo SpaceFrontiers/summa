@@ -1,4 +1,4 @@
-pub(crate) mod shortcuts {
+pub mod shortcuts {
     use crate::proto;
 
     pub fn match_query(value: &str) -> proto::Query {

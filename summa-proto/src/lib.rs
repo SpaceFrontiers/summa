@@ -3,7 +3,7 @@ pub mod proto_traits;
 #[allow(clippy::derive_partial_eq_without_eq)]
 /// Protobuf messages for communicating with Summa
 ///
-/// ```rust
+/// ```rust,no_run
 /// use summa_proto::proto;
 /// use summa_proto::proto::search_api_client::SearchApiClient;
 ///
