@@ -5,7 +5,8 @@ compression: Zstd
 index_attributes:
   multi_fields: ["category"]
   default_fields: ["opening_text", "title", "text"]
-index_engine: File
+index_engine:
+  file: {}
 schema: >
   - name: category
     type: text

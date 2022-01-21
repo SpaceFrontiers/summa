@@ -28,7 +28,7 @@ serde_json = { workspace = true }
 serde-wasm-bindgen = "0.4"
 strfmt = "0.2"
 summa-core = { version = "0.11", path = "../summa-core", default_features = false }
-summa-proto = { version = "0.13", path = "../summa-proto", default_features = false }
+summa-proto = { version = "0.14", path = "../summa-proto", default_features = false }
 tantivy = { workspace = true }
 thiserror = "1.0"
 tokio = { workspace = true, default_features = false, features = ["sync"] }

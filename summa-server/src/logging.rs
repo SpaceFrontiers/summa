@@ -74,6 +74,8 @@ pub fn default() -> Vec<WorkerGuard> {
 
 pub fn file(log_path: &Path) -> io::Result<Vec<WorkerGuard>> {
     let mut guards = Vec::new();
+
+    std::fs::create_dir_all(log_path)?;
     let file_writer_request = create_writer(log_path, "request", &mut guards)?;
     let file_writer_query = create_writer(log_path, "query", &mut guards)?;
     let file_writer_summa = create_writer(log_path, "summa", &mut guards)?;

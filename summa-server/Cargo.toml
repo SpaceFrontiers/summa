@@ -66,7 +66,7 @@ serde_derive = "1.0"
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 summa-core = { version = "0.11.0", path = "../summa-core", features = ["fs", "ipfs"] }
-summa-proto = { version = "0.13", path = "../summa-proto" }
+summa-proto = { version = "0.14", path = "../summa-proto" }
 take_mut = "0.2"
 tantivy = { workspace = true }
 tantivy-fst = "0.4.0"

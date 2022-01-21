@@ -2079,7 +2079,6 @@ Recursive query DSL
 | ----- | ---- | ----- | ----------- |
 | count | [uint64](#uint64) |  |  |
 | sum | [double](#double) |  |  |
-| standard_deviation | [double](#double) | optional |  |
 | min | [double](#double) | optional |  |
 | max | [double](#double) | optional |  |
 | avg | [double](#double) | optional |  |

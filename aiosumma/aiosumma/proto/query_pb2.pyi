@@ -501,20 +501,18 @@ class StatsAggregation(_message.Message):
     def __init__(self, field: _Optional[str] = ...) -> None: ...
 
 class StatsResult(_message.Message):
-    __slots__ = ["avg", "count", "max", "min", "standard_deviation", "sum"]
+    __slots__ = ["avg", "count", "max", "min", "sum"]
     AVG_FIELD_NUMBER: _ClassVar[int]
     COUNT_FIELD_NUMBER: _ClassVar[int]
     MAX_FIELD_NUMBER: _ClassVar[int]
     MIN_FIELD_NUMBER: _ClassVar[int]
-    STANDARD_DEVIATION_FIELD_NUMBER: _ClassVar[int]
     SUM_FIELD_NUMBER: _ClassVar[int]
     avg: float
     count: int
     max: float
     min: float
-    standard_deviation: float
     sum: float
-    def __init__(self, count: _Optional[int] = ..., sum: _Optional[float] = ..., standard_deviation: _Optional[float] = ..., min: _Optional[float] = ..., max: _Optional[float] = ..., avg: _Optional[float] = ...) -> None: ...
+    def __init__(self, count: _Optional[int] = ..., sum: _Optional[float] = ..., min: _Optional[float] = ..., max: _Optional[float] = ..., avg: _Optional[float] = ...) -> None: ...
 
 class TermQuery(_message.Message):
     __slots__ = ["field", "value"]
