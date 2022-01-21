@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use std::{fmt, io, mem};
 
 use async_trait::async_trait;
-use tantivy::directory::error::OpenReadError;
-use tantivy::directory::{FileHandle, OwnedBytes};
+use tantivy::directory::error::{LockError, OpenReadError};
+use tantivy::directory::{DirectoryLock, FileHandle, Lock, OwnedBytes};
 use tantivy::{Directory, HasLen};
 use time::OffsetDateTime;
 
@@ -223,5 +223,9 @@ impl Directory for DebugProxyDirectory {
         let read_operation = read_operation_builder.terminate(payload.len());
         self.register(read_operation);
         Ok(payload.to_vec())
+    }
+
+    fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
+        Ok(tantivy::directory::DirectoryLock::from(Box::new(|| {})))
     }
 }

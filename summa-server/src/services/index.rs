@@ -447,9 +447,8 @@ impl Index {
             None => None,
         };
         let mut index_engine_config = index_holder.index_engine_config().write().await;
-        info!(action = "config", config = ?index_engine_config.get().config);
         if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
-            ipfs_engine_config.cid = index_holder
+            let cid = index_holder
                 .index_writer_holder()?
                 .write()
                 .await
@@ -460,7 +459,9 @@ impl Index {
                         .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
                 })
                 .await?;
+            ipfs_engine_config.cid = cid.clone();
             index_engine_config.commit().await?;
+            info!(action = "store_new_cid", cid = ?cid);
             index_holder.index_reader().reload()?;
         }
         Ok(prepared_consumption)

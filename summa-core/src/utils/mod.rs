@@ -14,6 +14,6 @@ where
     if endpoint.starts_with("irpc://") {
         Ok(endpoint.parse()?)
     } else {
-        Ok(format!("irpc://{}", endpoint).parse()?)
+        Ok(format!("irpc://{endpoint}").parse()?)
     }
 }

@@ -214,7 +214,7 @@ impl IndexWriterHolder {
                 })
             })
             .collect::<SummaResult<Vec<_>>>()?;
-        if unique_terms.is_empty() {
+        if !self.unique_fields.is_empty() && unique_terms.is_empty() {
             Err(ValidationError::MissingUniqueField(format!(
                 "{:?}",
                 self.index_writer.index().schema().to_named_doc(document)
