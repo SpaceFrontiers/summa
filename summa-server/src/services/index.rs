@@ -649,7 +649,7 @@ pub(crate) mod tests {
         let port = acquire_free_port();
 
         let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
-        iroh_rpc_config.store_addr = Some(parse_endpoint("127.0.0.1:{}", port).unwrap());
+        iroh_rpc_config.store_addr = Some(parse_endpoint(&format!("127.0.0.1:{port}")).unwrap());
         iroh_rpc_config.p2p_addr = None;
         iroh_rpc_config.gateway_addr = None;
 

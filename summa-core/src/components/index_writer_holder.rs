@@ -14,6 +14,7 @@ use super::SummaSegmentAttributes;
 use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
+use crate::Error;
 
 /// Hotcache config
 pub struct HotCacheConfig {
@@ -132,9 +133,9 @@ impl IndexWriterImpl {
                 Ok(())
             }
             IndexWriterImpl::Threaded(writer) => {
-                info!(action = "commit_index");
+                info!(action = "commit_files");
                 let opstamp = writer.prepare_commit()?.commit_future().await?;
-                info!(action = "committed_index", opstamp = ?opstamp);
+                info!(action = "committed", opstamp = ?opstamp);
                 Ok(())
             }
         }
@@ -143,9 +144,9 @@ impl IndexWriterImpl {
         match self {
             IndexWriterImpl::SameThread(_) => unimplemented!(),
             IndexWriterImpl::Threaded(writer) => {
-                info!(action = "commit_index");
+                info!(action = "rollback_files");
                 let opstamp = writer.rollback_async().await?;
-                info!(action = "committed_index", opstamp = ?opstamp);
+                info!(action = "rollbacked", opstamp = ?opstamp);
                 Ok(())
             }
         }
@@ -203,21 +204,22 @@ impl IndexWriterHolder {
         let unique_terms = self
             .unique_fields
             .iter()
-            .map(|unique_field| {
-                Ok(
-                    match document
-                        .get_first(*unique_field)
-                        .ok_or_else(|| ValidationError::MissingUniqueField(format!("{:?}", self.index_writer.index().schema().to_named_doc(document))))?
-                    {
-                        Value::Str(s) => Term::from_field_text(*unique_field, s),
-                        Value::I64(i) => Term::from_field_i64(*unique_field, *i),
-                        _ => Err(ValidationError::InvalidUniqueFieldType(
-                            self.index_writer.index().schema().get_field_entry(*unique_field).field_type().clone(),
-                        ))?,
-                    },
-                )
+            .filter_map(|unique_field| {
+                document.get_first(*unique_field).map(|value| match value {
+                    Value::Str(s) => Ok(Term::from_field_text(*unique_field, s)),
+                    Value::I64(i) => Ok(Term::from_field_i64(*unique_field, *i)),
+                    _ => Err(Error::Validation(Box::new(ValidationError::InvalidUniqueFieldType(
+                        self.index_writer.index().schema().get_field_entry(*unique_field).field_type().clone(),
+                    )))),
+                })
             })
-            .collect::<SummaResult<_>>()?;
+            .collect::<SummaResult<Vec<_>>>()?;
+        if unique_terms.is_empty() {
+            Err(ValidationError::MissingUniqueField(format!(
+                "{:?}",
+                self.index_writer.index().schema().to_named_doc(document)
+            )))?
+        }
         self.delete_documents(Box::new(BooleanQuery::new_multiterms_query(unique_terms)))
     }
 

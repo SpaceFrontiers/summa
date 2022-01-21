@@ -236,9 +236,10 @@ impl Debug for ChunkedCachingFileHandle {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "ChunkedCachingFileHandle(path={:?}, underlying={:?}, len={len})",
+            "ChunkedCachingFileHandle(path={:?}, underlying={:?}, len={})",
             &self.path,
-            self.underlying_filehandle.as_ref()
+            self.underlying_filehandle.as_ref(),
+            self.len
         )
     }
 }
