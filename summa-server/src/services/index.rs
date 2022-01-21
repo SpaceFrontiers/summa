@@ -53,7 +53,7 @@ impl DeleteIndexResult {
 impl From<DeleteIndexResult> for proto::DeleteIndexResponse {
     fn from(delete_index_request: DeleteIndexResult) -> Self {
         proto::DeleteIndexResponse {
-            index_name: delete_index_request.index_name,
+            deleted_index_name: delete_index_request.index_name,
         }
     }
 }

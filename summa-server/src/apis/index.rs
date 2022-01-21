@@ -65,6 +65,7 @@ impl IndexApiImpl {
             index_engine: Some(index_holder.index_engine_config().read().await.get().clone()),
             num_docs: index_holder.index_reader().searcher().num_docs(),
             compression: index_holder.compression() as i32,
+            index_attributes: index_holder.index_attributes().cloned(),
         }
     }
 }
@@ -202,11 +203,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
         let index_holders = self.index_service.index_registry().index_holders().read().await;
-        let mut indices = Vec::with_capacity(index_holders.len());
-        for index_holder in index_holders.values() {
-            indices.push(self.get_index_description(&index_holder.handler()).await)
-        }
-        Ok(Response::new(proto::GetIndicesResponse { indices }))
+        Ok(Response::new(proto::GetIndicesResponse {
+            index_names: index_holders.keys().cloned().collect(),
+        }))
     }
 
     async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {

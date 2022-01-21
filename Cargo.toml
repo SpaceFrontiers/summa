@@ -7,9 +7,16 @@ lto = true
 strip = "debuginfo"
 
 [workspace.dependencies]
+anyhow = "1.0"
 async-broadcast = "0.5"
 async-trait = "0.1"
 base64 = "0.21"
+config = "0.13"
+crossbeam-channel = "0.5"
+derive_builder = "0.12"
+fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
+futures = "0.3"
+instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
 iroh-api = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-gateway = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-metrics = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
@@ -19,9 +26,25 @@ iroh-rpc-client = { git = "https://github.com/izihawa/iroh", branch = "feature/s
 iroh-rpc-types = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-store = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
 iroh-unixfs = { git = "https://github.com/izihawa/iroh", branch = "feature/summa", version = "0.2.0" }
+itertools = "0.10"
+lazy_static = "1.4"
+lru = "0.9"
+once_cell = "1.16"
+parking_lot = { version = "0.12", features = ["send_guard"] }
+prost = "0.11"
+rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.6.1"
 serde = { version = "1.0", default_features = false, features = ["derive", "std"] }
+serde_bytes = "0.11"
+serde_cbor = "0.11"
 serde_json = { version = "1.0" }
 serde_yaml = { version = "0.8" }
+strfmt = "0.2"
+summa-proto = { version = "0.14", path = "./summa-proto", default_features = false }
+take_mut = "0.2"
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa", package = "summavy", version = "0.27.0", default_features = false, features = ["quickwit", "zstd-compression"] }
+thiserror = "1.0"
+time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
 tokio = { version = "1.24", default_features = false }
+tracing = "0.1"
+

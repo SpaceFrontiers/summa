@@ -17,22 +17,22 @@ path = "crate/lib.rs"
 [dependencies]
 async-trait = { workspace = true }
 console_error_panic_hook = "0.1.7"
-futures = "0.3"
+futures = { workspace = true }
 getrandom = { version = "0.2", features = ["js"] }
-instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
+instant = { workspace = true }
 js-sys = "0.3"
 once_cell = "1.16"
-parking_lot = "0.12.1"
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde-wasm-bindgen = "0.4"
-strfmt = "0.2"
+strfmt = { workspace = true }
 summa-core = { version = "0.11", path = "../summa-core", default_features = false }
-summa-proto = { version = "0.14", path = "../summa-proto", default_features = false }
+summa-proto = { workspace = true }
 tantivy = { workspace = true }
-thiserror = "1.0"
+thiserror = { workspace = true }
 tokio = { workspace = true, default_features = false, features = ["sync"] }
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-wasm = "0.2"
 wasm-bindgen = "0.2.83"
 wasm-bindgen-futures = "0.4.33"
