@@ -262,17 +262,11 @@ impl IndexWriterHolder {
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
     pub async fn commit(&mut self) -> SummaResult<()> {
-        info!(action = "commit");
-        let result = self.index_writer.commit().await;
-        info!(action = "committed", result = ?result);
-        result
+        self.index_writer.commit().await
     }
 
     pub async fn rollback(&mut self) -> SummaResult<()> {
-        info!(action = "rollback");
-        let result = self.index_writer.rollback().await;
-        info!(action = "rollbacked", result = ?result);
-        result
+        self.index_writer.rollback().await
     }
 
     pub async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {

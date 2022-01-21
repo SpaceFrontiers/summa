@@ -392,6 +392,7 @@ impl Index {
             return Err(ValidationError::MissingConsumer(delete_consumer_request.consumer_name.to_string()).into());
         }
         server_config.commit().await?;
+        drop(server_config);
         let index_holder = self.consumer_manager.read().await.find_index_holder_for(&delete_consumer_request.consumer_name);
         if let Some(index_holder) = index_holder {
             let prepared_consumption = self.commit(&index_holder).await?;
