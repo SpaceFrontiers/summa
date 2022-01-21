@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_broadcast::Receiver;
 use iroh_rpc_types::gateway::GatewayAddr;
+use summa_core::utils::parse_endpoint;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
 
@@ -21,7 +22,7 @@ impl Gateway {
         store_service: &crate::services::Store,
         p2p_service: Option<&crate::services::P2p>,
     ) -> SummaServerResult<Gateway> {
-        let rpc_addr: GatewayAddr = format!("irpc://{}", config.p2p_endpoint).parse()?;
+        let rpc_addr: GatewayAddr = parse_endpoint(&config.p2p_endpoint)?;
         let gateway_config = config.derive_iroh_gateway_config(store_service, p2p_service)?;
         let core = iroh_gateway::core::Core::new(
             Arc::new(gateway_config),

@@ -8,6 +8,7 @@ use clap::{arg, command};
 use futures_util::future::try_join_all;
 use iroh_unixfs::content_loader::GatewayUrl;
 use summa_core::configs::ConfigProxy;
+use summa_core::utils::parse_endpoint;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, Instrument};
 
@@ -131,13 +132,8 @@ impl Server {
         let server_config = self.server_config_holder.read().await.get().clone();
         let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
 
-        // ToDo: Do something with substitutions here and there
-        iroh_rpc_config.store_addr = Some(format!("irpc://{}", server_config.store.endpoint).parse()?);
-        iroh_rpc_config.p2p_addr = server_config
-            .p2p
-            .as_ref()
-            .map(|p2p_config| format!("irpc://{}", p2p_config.endpoint).parse())
-            .transpose()?;
+        iroh_rpc_config.store_addr = Some(parse_endpoint(&server_config.store.endpoint)?);
+        iroh_rpc_config.p2p_addr = server_config.p2p.as_ref().map(|p2p_config| parse_endpoint(&p2p_config.endpoint)).transpose()?;
 
         let iroh_rpc_client = iroh_rpc_client::Client::new(iroh_rpc_config.clone()).await?;
         let content_loader = iroh_unixfs::content_loader::FullLoader::new(

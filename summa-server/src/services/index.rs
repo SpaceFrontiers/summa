@@ -632,6 +632,7 @@ pub(crate) mod tests {
     use rand::{Rng, SeedableRng};
     use summa_core::components::SummaDocument;
     use summa_core::configs::DirectProxy;
+    use summa_core::utils::parse_endpoint;
     use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
     use summa_proto::proto_traits::query::shortcuts::match_query;
     use tantivy::doc;
@@ -648,7 +649,7 @@ pub(crate) mod tests {
         let port = acquire_free_port();
 
         let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
-        iroh_rpc_config.store_addr = Some(format!("irpc://127.0.0.1:{}", port).parse().unwrap());
+        iroh_rpc_config.store_addr = Some(parse_endpoint("127.0.0.1:{}", port).unwrap());
         iroh_rpc_config.p2p_addr = None;
         iroh_rpc_config.gateway_addr = None;
 

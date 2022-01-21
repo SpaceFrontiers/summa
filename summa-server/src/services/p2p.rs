@@ -4,6 +4,7 @@ use std::time::Duration;
 use async_broadcast::Receiver;
 use iroh_p2p::{DiskStorage, Keychain, Libp2pConfig, Node, DEFAULT_BOOTSTRAP};
 use iroh_rpc_types::p2p::P2pAddr;
+use summa_core::utils::parse_endpoint;
 use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
 
@@ -20,7 +21,7 @@ pub struct P2p {
 impl P2p {
     pub async fn new(config: crate::configs::p2p::Config) -> SummaServerResult<P2p> {
         tokio::fs::create_dir_all(&config.key_store_path).await?;
-        let rpc_addr: P2pAddr = format!("irpc://{}", config.endpoint).parse()?;
+        let rpc_addr: P2pAddr = parse_endpoint(&config.endpoint)?;
 
         let bootstrap_peers = config
             .bootstrap

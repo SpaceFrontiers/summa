@@ -8,6 +8,7 @@ use hyper::HeaderMap;
 use iroh_rpc_types::gateway::GatewayAddr;
 use serde::{Deserialize, Serialize};
 use summa_core::errors::BuilderError;
+use summa_core::utils::parse_endpoint;
 
 use crate::errors::SummaServerResult;
 
@@ -44,7 +45,7 @@ impl Config {
         store_service: &crate::services::Store,
         p2p_service: Option<&crate::services::P2p>,
     ) -> SummaServerResult<iroh_gateway::config::Config> {
-        let gateway_addr = format!("irpc://{}", self.p2p_endpoint).parse::<GatewayAddr>()?;
+        let gateway_addr: GatewayAddr = parse_endpoint(&self.p2p_endpoint)?;
         let mut config = iroh_gateway::config::Config::default();
         config.rpc_client.gateway_addr = Some(gateway_addr);
         config.rpc_client.store_addr = Some(store_service.rpc_addr().clone());
