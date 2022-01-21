@@ -5,21 +5,20 @@ nav_order: 2
 has_toc: true
 ---
 
-Query describes what documents you want to extract from Summa for further processing. The stream of matched documents are then passed
-to [collectors](/summa/cors/collectors) responsible for final processing. So you should learn the difference between queries and collectors,
-first ones tell what documents should be taken from database and second ones describes how to process them and what to return to users.
+Query describes what documents you want to extract from Summa for further processing.
+The stream of matched documents are then passed to [collectors](/summa/cors/collectors) responsible for final processing.
+Therefore, it is important to understand the difference between queries and collectors.
+Queries tell which documents to take from the database and collectors describe how to process them and what to return to the users.
 
-There are different kinds of possible queries. 
-One kind of queries are just scoring and returning documents. 
-For example, `TermQuery` matches all documents containing specified term and associates score to every matched document. These scores
-may be used for ranking documents by relevance.
-Other queries such as `BooleanQuery` or `DisjunctionMaxQuery` combine documents and scores matched by multiple sub-queries.
+There are different types of possible queries.
+One type of query simply scores and returns documents.
+For example, TermQuery matches all documents containing the specified term and associates a score with every matched document. These scores can be used to rank documents by relevance.
+Other queries, such as BooleanQuery or DisjunctionMaxQuery, combine documents and scores matched by multiple sub-queries.
 
 ## TermQuery
-The most basic kind of query. 
-Match documents that contain the specified term (word) inside the specified field.
-Every matched document also associated with its BM25 score relevant to the query.
-
+The most basic kind of query is a `TermQuery`. 
+This type of query matches all documents that contain the specified term (word) within the specified field. 
+Every matched document is also associated with a BM25 score that is relevant to the query.
 ```json 
 {
   "term": {
@@ -30,12 +29,11 @@ Every matched document also associated with its BM25 score relevant to the query
 ```
 
 ## BooleanQuery
-Allows to combine multiple queries into a single one. Every sub-query has a property named `occur` describing how to do combination
+Allows combining multiple queries into a single one. Every sub-query has a property named `occur` that describes how to combine them.
 
-- `must` tells that all matched documents must match to this sub-query too
-- `must_not` tells that all matched documents must not contain documents matching to this sub-query
-- `should` tells that matched documents may contain documents matching to this sub-query
-
+- `must` tells that all matched documents must match this sub-query as well.
+- `must_not` tells that all matched documents must not contain documents that match this sub-query.
+- `should` tells that matched documents may contain documents that match this sub-query.
 ```json 
 {
   "boolean": {
@@ -72,7 +70,6 @@ Allows to combine multiple queries into a single one. Every sub-query has a prop
 Allows to combine multiple queries into a single one. It is similar to `BooleanQuery` but scores are calculated in other way.
 Instead of summarizing scores of all sub-queries, it takes maximum score of a single sub-query. Such approach may be useful
 in specific cases like searching documents with synonyms.
-
 ```json 
 {
   "disjunction_max": {
@@ -106,8 +103,7 @@ in specific cases like searching documents with synonyms.
 ```
 
 ## BoostQuery
-Modifies scores produced by a nested query. Useful in `BooleanQuery` to penalize or boost
-parts of the query.
+Modifies scores produced by a nested query. Useful in `BooleanQuery` to penalize or boost parts of the query.
 ```json
 {
   "boolean": {

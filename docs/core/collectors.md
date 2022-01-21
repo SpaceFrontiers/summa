@@ -4,10 +4,10 @@ parent: Core
 nav_order: 3
 ---
 Collectors are responsible for processing the stream of documents that matched the query. 
-Every collector ingests this stream and derives output based on what ingested.
-Simple collectors such as `Count` just counting documents in the stream, other collectors such as `TopDocs` maintaining a bounded set of documents havinng highest scores to return them to user.
+Every collector ingests this stream and derives output based on what it ingests.
+Simple collectors such as `Count` just count the documents in the stream, while other collectors like `TopDocs` maintain a bounded set of documents having the highest scores to return them to the user.
 The main goal of every collector is reducing the amount of data that should be returned to the requestor.
-Though collectors looks through the whole set of matched documents, they are limiting the output in various ways.
+Though collectors look through the whole set of matched documents, they limit the output in various ways.
 
 ## TopDocs
 ### Default Scoring

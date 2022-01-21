@@ -4,24 +4,24 @@ parent: Core
 nav_order: 1
 ---
 
-Summa is composed of multiple parts, most important ones are 
+Summa is composed of multiple parts, the most important of which are
 - [Tantivy](https://github.com/quickwit-oss/tantivy) for creating indices and searching in them
 - [Iroh](https://github.com/n0-computer/iroh) for downloading and distributing indices through [IPFS](https://ipfs.tech) network
 - [WASM](/summa/core/wasm) for compiling and launching the subset of Summa in browsers 
 
-Summa Server combines Tantivy and Iroh together. It operates indices, put them in Iroh Store and manages Iroh
-P2P for making indices available through IPFS network.
+Summa Server combines Tantivy and Iroh together. It operates indices and puts them in the Iroh Store, and manages Iroh
+P2P for making indices available through the IPFS network.
 
 ![architecture](/summa/assets/arch.drawio.png)
 
 The main object in Summa is `Index` that represents a set of data with common [schema](/summa/core/schema) and backed with one of available `IndexEngine`.
-`IndexEngine` encapsulates all IO operations. There are ready implementations for `Memory`, `File`, `IPFS` and `Remote`-backed indices.
+`IndexEngine` encapsulates all I/O operations. There are ready implementations for `Memory`, `File`, `IPFS` and `Remote`-backed indices.
 
 ### Index Engines
 
 #### Memory
 
-Ephemeral index having only schema persisted but data is wiped on every server restart.
+Ephemeral index, with only the schema persisted, but data is wiped on every server restart
 
 ```bash 
 # Create new index
@@ -73,11 +73,11 @@ Your index must have IPFS engine for becoming replicatable:
 summa-cli 0.0.0.0:8082 migrate-index test_index test_index_ipfs Ipfs
 ```
 
-After the last step you will see CID of the index that may be used for replication and accessing index through Summa WASM bindings in browsers.
-You may retrieve it vie usual IPFS tools or directly attach it at another Summa Server instance:
+After the last step, you will see the CID of the index that can be used for replication and accessing the index through Summa WASM bindings in browsers.
+You can retrieve it via usual IPFS tools or directly attach it at another Summa Server instance:
 
 ```bash 
-summa-cli 0.0.0.0:8082 attach-index test_index --ipfs '{"cid": "<cid from previous step>" }'
+summa-cli 0.0.0.0:8082 attach-index test_index --ipfs '{"cid": "<cid from the previous step>" }'
 ```
 
 ### Aliases
