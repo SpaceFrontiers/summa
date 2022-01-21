@@ -1,5 +1,6 @@
 use summa_proto::proto;
 
+/// Trait is used for converting data to Prometheus labels
 pub trait ToLabel {
     fn to_label(&self) -> String;
 }

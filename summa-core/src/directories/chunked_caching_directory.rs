@@ -77,6 +77,12 @@ impl FileStats {
     }
 }
 
+/// Caching layer that emits aligned requests to downstream directory.
+///
+/// Alignment of downstream requests makes possible to cache response chunks and reuse them in further requests
+/// For example, for `chunk_size` set to 16 if you call `read_bytes(13..18)` will lead to reading two chunks of data
+/// 0..16 and 16..32. Then, both of these chunks will be stored in cache and may be used to serve further request
+/// laying inside the cached interval, such as `read_bytes(3..9)` or `read_bytes(19..32)`
 pub struct ChunkedCachingDirectory {
     chunk_size: usize,
     cache: Option<Arc<MemorySizedCache>>,
@@ -96,6 +102,10 @@ impl Clone for ChunkedCachingDirectory {
 }
 
 impl ChunkedCachingDirectory {
+    /// Create chunking layer without caching
+    ///
+    /// Cache-less chunking may be useful if downstream directory is responsible for caching and works better with
+    /// chunked requests. Most obvious example is directory-over-HTTP which Range requests may be cached by browser.
     pub fn new(underlying: Box<dyn Directory>, chunk_size: usize, file_stats: FileStats) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
@@ -105,6 +115,7 @@ impl ChunkedCachingDirectory {
         }
     }
 
+    /// Bounded cache
     pub fn new_with_capacity_in_bytes(
         underlying: Box<dyn Directory>,
         chunk_size: usize,
@@ -119,6 +130,8 @@ impl ChunkedCachingDirectory {
             file_stats,
         }
     }
+
+    /// Unbounded cache
     pub fn new_unbounded(underlying: Box<dyn Directory>, chunk_size: usize, cache_metrics: CacheMetrics, file_stats: FileStats) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
@@ -158,14 +171,19 @@ impl Directory for ChunkedCachingDirectory {
         self.underlying.open_read(path)
     }
 
-    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
-        self.underlying.exists(path)
-    }
-
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         // ToDo: May evict caches
         let _lock = self.file_stats.inc_gen(path, None);
         self.underlying.delete(path)
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        self.underlying.exists(path)
+    }
+
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        let _lock = self.file_stats.inc_gen(path, None);
+        self.underlying.open_write(path)
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
@@ -185,19 +203,6 @@ impl Directory for ChunkedCachingDirectory {
         Ok(owned_bytes.as_slice().to_vec())
     }
 
-    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
-        self.underlying.acquire_lock(lock)
-    }
-
-    fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
-        self.underlying.watch(callback)
-    }
-
-    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        let _lock = self.file_stats.inc_gen(path, None);
-        self.underlying.open_write(path)
-    }
-
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         let _lock = self.file_stats.inc_gen(path, None);
         self.underlying.atomic_write(path, data)
@@ -206,13 +211,23 @@ impl Directory for ChunkedCachingDirectory {
     fn sync_directory(&self) -> io::Result<()> {
         self.underlying.sync_directory()
     }
+
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        self.underlying.acquire_lock(lock)
+    }
+
+    fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.underlying.watch(callback)
+    }
 }
 
 struct ChunkedCachingFileHandle {
     path: PathBuf,
     cache: Option<Arc<MemorySizedCache>>,
+    /// Chunk size
     chunk_size: usize,
     underlying_filehandle: Arc<dyn FileHandle>,
+    /// Generation is incremented after each write to file and using for differeing between various versions of file
     generation: u32,
     len: usize,
 }
@@ -221,7 +236,7 @@ impl Debug for ChunkedCachingFileHandle {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "ChunkedCachingFileHandle(path={:?}, underlying={:?})",
+            "ChunkedCachingFileHandle(path={:?}, underlying={:?}, len={len})",
             &self.path,
             self.underlying_filehandle.as_ref()
         )

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
+/// Hold metrics for caches used in `ChunkedCachingDirectory`
 #[derive(Clone, Default)]
 pub struct CacheMetrics {
     pub in_cache_count: Arc<AtomicI64>,

@@ -4,6 +4,9 @@ use serde::{Serialize, Serializer};
 use tantivy::schema::{Field, Schema};
 use tantivy::Document;
 
+/// `Value` is used for representing singular or multi-values of `tantivy::Document`
+///
+/// Required because Tantivy operates with multi-values only and Summa provides an abstraction of singular fields
 pub enum Value {
     SingleValue(Option<tantivy::schema::Value>),
     MultipleValue(Vec<tantivy::schema::Value>),

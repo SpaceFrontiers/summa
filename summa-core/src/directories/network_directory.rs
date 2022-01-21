@@ -14,6 +14,9 @@ use crate::directories::ExternalRequest;
 use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
 
+/// Allow to implement searching over HTTP
+///
+/// `NetworkDirectory` translates `read_bytes` calls into network requests.
 pub struct NetworkDirectory<TExternalRequest: ExternalRequest> {
     external_request_generator: Box<dyn ExternalRequestGenerator<TExternalRequest>>,
 }
@@ -79,6 +82,7 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
     }
 }
 
+/// `NetworkDirectory` creates `NetworkFile` for translating `read_bytes` calls into network requests
 #[derive(Debug)]
 pub struct NetworkFile<TExternalRequest: ExternalRequest> {
     file_name: String,

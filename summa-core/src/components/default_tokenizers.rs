@@ -2,6 +2,7 @@ use tantivy::tokenizer::{LowerCaser, RawTokenizer, RemoveLongFilter, SimpleToken
 
 use super::summa_tokenizer::SummaTokenizer;
 
+/// List of stop words mixed for multiple languages
 const STOP_WORDS: [&str; 318] = [
     "a",
     "an",
@@ -323,6 +324,7 @@ const STOP_WORDS: [&str; 318] = [
     "sí",
 ];
 
+/// Instantiate default tokenizers
 pub fn default_tokenizers() -> [(String, TextAnalyzer); 3] {
     let summa_tokenizer = TextAnalyzer::from(SummaTokenizer)
         .filter(RemoveLongFilter::limit(100))

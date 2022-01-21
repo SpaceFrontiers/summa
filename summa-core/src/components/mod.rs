@@ -23,4 +23,5 @@ pub use summa_tokenizer::SummaTokenizer;
 
 use crate::metrics::CacheMetrics;
 
+/// Static `CacheMetrics` shared by all instances of `crate::directories::ChunkedCachingDirectory`
 pub static CACHE_METRICS: Lazy<CacheMetrics> = Lazy::new(CacheMetrics::default);

@@ -16,6 +16,7 @@ use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;
 use crate::{ThreadPool, SERIALIZER};
 
+/// Hold `IndexRegistry` and wrap it for making WASM-compatible
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct WebIndexRegistry {
@@ -26,6 +27,7 @@ pub struct WebIndexRegistry {
 
 #[wasm_bindgen]
 impl WebIndexRegistry {
+    /// Create new `WebIndexRegistry`
     #[wasm_bindgen(constructor)]
     pub fn new() -> WebIndexRegistry {
         let core_config = summa_core::configs::core::ConfigBuilder::default()
@@ -41,12 +43,14 @@ impl WebIndexRegistry {
         }
     }
 
+    /// Configures WASM-pool for executing queries to different indices
     #[wasm_bindgen]
     pub async fn setup(&mut self, threads: usize) -> Result<(), JsValue> {
         self.thread_pool = Some(ThreadPool::new(threads).await?);
         Ok(())
     }
 
+    /// Do pooled search
     #[wasm_bindgen]
     pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
         let index_queries: Vec<proto::IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
@@ -64,6 +68,7 @@ impl WebIndexRegistry {
         self.merge_responses(&collectors_outputs)
     }
 
+    /// Add new index to `WebIndexRegistry`
     #[wasm_bindgen]
     pub async fn add(&self, remote_engine_config: JsValue) -> Result<JsValue, JsValue> {
         let remote_engine_config: RemoteEngineConfig = serde_wasm_bindgen::from_value(remote_engine_config)?;
@@ -90,11 +95,13 @@ impl WebIndexRegistry {
         Ok(index_attributes)
     }
 
+    /// Remove index from `WebIndexRegistry`
     #[wasm_bindgen]
     pub async fn delete(&mut self, index_name: String) {
         self.index_registry.delete(&index_name).await;
     }
 
+    /// Do [partial warm up](IndexHolder::partial_warmup)
     #[wasm_bindgen]
     pub async fn warmup(&self, index_name: &str) -> Result<(), JsValue> {
         self.index_registry
@@ -107,6 +114,7 @@ impl WebIndexRegistry {
         Ok(())
     }
 
+    /// Index new document
     #[wasm_bindgen]
     pub async fn index_document(&self, index_name: &str, document: &str) -> Result<(), JsValue> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
@@ -123,6 +131,7 @@ impl WebIndexRegistry {
         Ok(())
     }
 
+    /// Make commit
     #[wasm_bindgen]
     pub async fn commit(&self, index_name: &str) -> Result<(), JsValue> {
         Ok(self.commit_internal(index_name).await.map_err(Error::from)?)

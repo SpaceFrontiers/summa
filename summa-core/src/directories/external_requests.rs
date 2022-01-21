@@ -26,6 +26,7 @@ impl Header {
     }
 }
 
+/// Using in `NetworkDirectory` for making requests over network
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExternalResponse {
@@ -71,9 +72,9 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
 }
 
 impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerator<TExternalRequest> for DefaultExternalRequestGenerator<TExternalRequest> {
-    fn new(network_config: RemoteEngineConfig) -> DefaultExternalRequestGenerator<TExternalRequest> {
+    fn new(remote_engine_config: RemoteEngineConfig) -> DefaultExternalRequestGenerator<TExternalRequest> {
         DefaultExternalRequestGenerator {
-            remote_engine_config: network_config,
+            remote_engine_config,
             _pd: PhantomData,
         }
     }

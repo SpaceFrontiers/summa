@@ -12,7 +12,7 @@ lazy_static! {
 }
 
 /// Instantiates `SegmentEvalScorer` for each segment
-pub struct EvalScorer {
+pub(crate) struct EvalScorer {
     eval_expr: String,
     schema: Schema,
     parser: fasteval2::Parser,
@@ -43,6 +43,7 @@ impl EvalScorer {
         })
     }
 
+    /// Instantiates `SegmentEvalScorer` for passed segment
     pub fn get_for_segment_reader(&self, segment_reader: &SegmentReader) -> SummaResult<SegmentEvalScorer> {
         SegmentEvalScorer::for_segment(segment_reader, &self.schema, &self.parser, &self.eval_expr, &self.var_names)
     }

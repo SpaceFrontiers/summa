@@ -15,10 +15,12 @@ use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
 
+/// Hotcache config
 pub struct HotCacheConfig {
     pub chunk_size: Option<usize>,
 }
 
+/// Describe a single index file
 pub struct ComponentFile {
     file_name: String,
     boxed_reader: Box<dyn Future<Output = Vec<u8>> + Send>,
@@ -53,12 +55,14 @@ impl ComponentFile {
     }
 }
 
+/// Wrap `tantivy::SingleSegmentIndexWriter` and allows to recreate it
 pub struct SingleIndexWriter {
     pub index_writer: RwLock<SingleSegmentIndexWriter>,
     pub index: Index,
     pub writer_heap_size_bytes: usize,
 }
 
+/// Hold same-thread or pooled implementation of `IndexWriter`
 pub enum IndexWriterImpl {
     SameThread(SingleIndexWriter),
     Threaded(IndexWriter),

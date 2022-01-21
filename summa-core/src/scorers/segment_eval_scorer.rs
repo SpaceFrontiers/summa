@@ -5,7 +5,8 @@ use tantivy::{DocId, Score, SegmentReader};
 use super::fast_field_iterator::{FastFieldIterator, FastFieldIteratorImpl};
 use crate::errors::{Error, SummaResult, ValidationError};
 
-pub struct SegmentEvalScorer {
+/// Responsible for evaluation `fasteval` formula against documents and fastfields to receive document score
+pub(crate) struct SegmentEvalScorer {
     slab: fasteval2::Slab,
     compiled: Instruction,
     boxed_original_score: Box<f64>,
@@ -52,6 +53,7 @@ fn fast_field_to_iter(schema: &Schema, segment_reader: &SegmentReader, field_nam
 }
 
 impl SegmentEvalScorer {
+    /// Create `SegmentEvalScorer` for segment
     #[inline]
     pub fn for_segment(
         segment_reader: &SegmentReader,

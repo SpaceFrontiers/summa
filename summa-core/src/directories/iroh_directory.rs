@@ -17,6 +17,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::errors::SummaResult;
 
+/// Allow to implement searching over Iroh
+///
+/// `IrohDirectory` translates `read_bytes` calls into Iroh requests to content
 #[derive(Clone)]
 pub struct IrohDirectory<D: Directory + Clone, T: ContentLoader + Unpin + 'static> {
     underlying: D,
@@ -30,6 +33,7 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Debug for IrohDir
         write!(f, "IrohDirectory({:?})", &self.cid)
     }
 }
+
 impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, T> {
     pub async fn new(underlying: D, loader: T, cid: &str) -> SummaResult<IrohDirectory<D, T>> {
         let resolver = Resolver::new(loader);
@@ -129,6 +133,7 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
     }
 }
 
+/// `IrohDirectory` creates `IrohFile` for translating `read_bytes` calls into Iroh requests to content
 #[derive(Debug, Clone)]
 struct IrohFile<T: ContentLoader + Unpin + 'static> {
     out: iroh_resolver::resolver::Out,

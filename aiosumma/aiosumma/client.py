@@ -147,7 +147,7 @@ class SummaClient(BaseGrpcClient):
     async def create_index(
         self,
         index_name: str,
-        schema: str | list,
+        schema: Union[str, list],
         index_engine: dict,
         compression: Optional[Union[str, int]] = None,
         blocksize: Optional[int] = None,
