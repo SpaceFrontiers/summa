@@ -27,7 +27,7 @@ use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
-use crate::errors::{SummaResult, ValidationError};
+use crate::errors::SummaResult;
 use crate::proto_traits::Wrapper;
 use crate::Error;
 
@@ -211,7 +211,7 @@ impl IndexHolder {
     #[cfg(feature = "fs")]
     pub async fn create_file_index(index_path: &std::path::Path, index_builder: IndexBuilder) -> SummaResult<Index> {
         if index_path.exists() {
-            return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
+            return Err(crate::errors::ValidationError::ExistingPath(index_path.to_owned()).into());
         }
         tokio::fs::create_dir_all(index_path).await?;
         let index = index_builder.create_in_dir(index_path)?;

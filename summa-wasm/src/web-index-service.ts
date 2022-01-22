@@ -24,8 +24,8 @@ export class WebIndexService {
     await this.registry.setup(threads);
   }
 
-  async add(remote_engine_config: RemoteEngineConfig): Promise<IndexAttributes> {
-    return await this.registry!.add(remote_engine_config);
+  async add(remote_engine_config: RemoteEngineConfig, index_name?: string): Promise<IndexAttributes> {
+    return await this.registry!.add(remote_engine_config, index_name);
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)

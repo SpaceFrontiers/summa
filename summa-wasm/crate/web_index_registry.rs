@@ -70,19 +70,23 @@ impl WebIndexRegistry {
 
     /// Add new index to `WebIndexRegistry`
     #[wasm_bindgen]
-    pub async fn add(&self, remote_engine_config: JsValue) -> Result<JsValue, JsValue> {
+    pub async fn add(&self, remote_engine_config: JsValue, index_name: Option<String>) -> Result<JsValue, JsValue> {
         let remote_engine_config: RemoteEngineConfig = serde_wasm_bindgen::from_value(remote_engine_config)?;
-        Ok(self.add_internal(remote_engine_config).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+        Ok(self
+            .add_internal(remote_engine_config, index_name)
+            .await
+            .map_err(Error::from)?
+            .serialize(&*SERIALIZER)?)
     }
 
-    async fn add_internal(&self, remote_engine_config: RemoteEngineConfig) -> SummaWasmResult<Option<IndexAttributes>> {
+    async fn add_internal(&self, remote_engine_config: RemoteEngineConfig, index_name: Option<String>) -> SummaWasmResult<Option<IndexAttributes>> {
         let index =
             IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), true)
                 .await?;
         let index_holder = IndexHolder::create_holder(
             self.core_config.read().await.get(),
             index,
-            None,
+            index_name.as_deref(),
             Arc::new(DirectProxy::new(IndexEngineConfig {
                 config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
             })),

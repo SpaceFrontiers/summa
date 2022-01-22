@@ -6,8 +6,7 @@ nav_order: 1
 
 # Intro
 
-Existent approaches for mitigation Internet blocks suggest using VPN for re-routing 
-Internet requests to sites through intermediate nodes that has no restrictions in accessing these sites.
-
-But what if we do the reverse, bring sites closer to the user under censorship pressure?
+Current methods for bypassing internet censorship involve using virtual private networks (VPNs) 
+to reroute requests for restricted websites through intermediate nodes that have unrestricted access to these sites. 
+However, what if the approach was reversed, and websites were brought closer to users facing censorship?
 

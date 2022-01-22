@@ -136,10 +136,10 @@ class DeleteIndexRequest(_message.Message):
     def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class DeleteIndexResponse(_message.Message):
-    __slots__ = ["index_name"]
-    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    index_name: str
-    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
+    __slots__ = ["deleted_index_name"]
+    DELETED_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    deleted_index_name: str
+    def __init__(self, deleted_index_name: _Optional[str] = ...) -> None: ...
 
 class FileEngineConfig(_message.Message):
     __slots__ = ["path"]
@@ -181,10 +181,10 @@ class GetIndicesRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetIndicesResponse(_message.Message):
-    __slots__ = ["indices"]
-    INDICES_FIELD_NUMBER: _ClassVar[int]
-    indices: _containers.RepeatedCompositeFieldContainer[IndexDescription]
-    def __init__(self, indices: _Optional[_Iterable[_Union[IndexDescription, _Mapping]]] = ...) -> None: ...
+    __slots__ = ["index_names"]
+    INDEX_NAMES_FIELD_NUMBER: _ClassVar[int]
+    index_names: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, index_names: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexAttributes(_message.Message):
     __slots__ = ["created_at", "default_fields", "default_index_name", "default_snippets", "description", "multi_fields", "unique_fields"]
@@ -205,18 +205,20 @@ class IndexAttributes(_message.Message):
     def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
-    __slots__ = ["compression", "index_aliases", "index_engine", "index_name", "num_docs"]
+    __slots__ = ["compression", "index_aliases", "index_attributes", "index_engine", "index_name", "num_docs"]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
     INDEX_ALIASES_FIELD_NUMBER: _ClassVar[int]
+    INDEX_ATTRIBUTES_FIELD_NUMBER: _ClassVar[int]
     INDEX_ENGINE_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     NUM_DOCS_FIELD_NUMBER: _ClassVar[int]
     compression: Compression
     index_aliases: _containers.RepeatedScalarFieldContainer[str]
+    index_attributes: IndexAttributes
     index_engine: IndexEngineConfig
     index_name: str
     num_docs: int
-    def __init__(self, index_name: _Optional[str] = ..., index_aliases: _Optional[_Iterable[str]] = ..., index_engine: _Optional[_Union[IndexEngineConfig, _Mapping]] = ..., num_docs: _Optional[int] = ..., compression: _Optional[_Union[Compression, str]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., index_aliases: _Optional[_Iterable[str]] = ..., index_engine: _Optional[_Union[IndexEngineConfig, _Mapping]] = ..., num_docs: _Optional[int] = ..., compression: _Optional[_Union[Compression, str]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ...) -> None: ...
 
 class IndexDocumentOperation(_message.Message):
     __slots__ = ["document"]

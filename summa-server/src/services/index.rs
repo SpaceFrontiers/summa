@@ -328,7 +328,7 @@ impl Index {
                 let removed_config_entry = config_entry.remove();
                 server_config.commit().await?;
                 index_holder_entry.remove();
-                tokio::spawn(async move { cleanup_index(removed_config_entry).await });
+                cleanup_index(removed_config_entry).await?;
                 Ok(DeleteIndexResult::new(&delete_index_request.index_name))
             }
             _ => Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
