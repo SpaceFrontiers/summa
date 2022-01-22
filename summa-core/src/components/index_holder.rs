@@ -32,7 +32,6 @@ use crate::proto_traits::Wrapper;
 use crate::Error;
 
 pub struct IndexHolder {
-    core_config_holder: Arc<dyn ConfigProxy<crate::configs::core::Config>>,
     index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
     index_name: String,
     index: Index,
@@ -76,6 +75,31 @@ fn register_default_tokenizers(index: &Index) {
     }
 }
 
+/// Cleanup after index deletion
+///
+/// Consumers are stopped, then `IndexConfig` is removed from `CoreConfig`
+/// and then directory with the index is deleted.
+pub async fn cleanup_index(index_engine_config: proto::IndexEngineConfig) -> SummaResult<()> {
+    match index_engine_config.config {
+        #[cfg(feature = "fs")]
+        Some(proto::index_engine_config::Config::File(ref config)) => {
+            info!(action = "delete_directory", directory = ?config.path);
+            tokio::fs::remove_dir_all(&config.path)
+                .await
+                .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
+        }
+        #[cfg(feature = "fs")]
+        Some(proto::index_engine_config::Config::Ipfs(ref config)) => {
+            info!(action = "delete_directory", directory = ?config.path);
+            tokio::fs::remove_dir_all(&config.path)
+                .await
+                .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
+        }
+        _ => (),
+    };
+    Ok(())
+}
+
 fn wrap_with_caches<D: Directory>(
     directory: D,
     hotcache_bytes: Option<OwnedBytes>,
@@ -114,7 +138,6 @@ fn wrap_with_caches<D: Directory>(
 impl IndexHolder {
     /// Sets up `IndexHolder`
     pub fn create_holder(
-        core_config_holder: &Arc<dyn ConfigProxy<crate::configs::core::Config>>,
         core_config: &crate::configs::core::Config,
         mut index: Index,
         index_name: Option<&str>,
@@ -148,7 +171,6 @@ impl IndexHolder {
         };
 
         Ok(IndexHolder {
-            core_config_holder: core_config_holder.clone(),
             index_engine_config,
             index_name,
             index: index.clone(),
@@ -360,35 +382,6 @@ impl IndexHolder {
         .await
         .into_iter()
         .collect::<SummaResult<Vec<_>>>()?;
-        Ok(())
-    }
-
-    /// Delete `IndexHolder` instance
-    ///
-    /// Consumers are stopped, then `IndexConfig` is removed from `CoreConfig`
-    /// and then directory with the index is deleted.
-    #[instrument(skip(self), fields(index_name = %self.index_name))]
-    pub async fn delete(self) -> SummaResult<()> {
-        let mut config = self.core_config_holder.write().await;
-        let index_engine_config = config.get_mut().indices.remove(self.index_name()).expect("cannot retrieve config");
-        match index_engine_config.config {
-            #[cfg(feature = "fs")]
-            Some(proto::index_engine_config::Config::File(ref config)) => {
-                info!(action = "delete_directory", directory = ?config.path);
-                tokio::fs::remove_dir_all(&config.path)
-                    .await
-                    .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
-            }
-            #[cfg(feature = "fs")]
-            Some(proto::index_engine_config::Config::Ipfs(ref config)) => {
-                info!(action = "delete_directory", directory = ?config.path);
-                tokio::fs::remove_dir_all(&config.path)
-                    .await
-                    .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
-            }
-            _ => (),
-        };
-        config.commit().await?;
         Ok(())
     }
 

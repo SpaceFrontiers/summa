@@ -79,10 +79,8 @@ impl WebIndexRegistry {
         let index =
             IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), true)
                 .await?;
-        let core_config_value = self.core_config.read().await.get().clone();
         let index_holder = IndexHolder::create_holder(
-            &self.core_config,
-            &core_config_value,
+            self.core_config.read().await.get(),
             index,
             None,
             Arc::new(DirectProxy::new(IndexEngineConfig {

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
-use summa_core::components::{HotCacheConfig, IndexHolder, IndexRegistry, IndexWriterHolder};
+use summa_core::components::{cleanup_index, HotCacheConfig, IndexHolder, IndexRegistry, IndexWriterHolder};
 use summa_core::configs::core::WriterThreads;
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
@@ -103,18 +103,7 @@ impl Index {
         })
     }
 
-    async fn derive_configs(
-        &self,
-        index_name: &str,
-    ) -> (
-        Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
-        Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
-    ) {
-        let core_config_holder = Arc::new(PartialProxy::new(
-            &self.server_config,
-            |server_config| &server_config.core,
-            |server_config| &mut server_config.core,
-        ));
+    async fn derive_configs(&self, index_name: &str) -> Arc<dyn ConfigProxy<proto::IndexEngineConfig>> {
         let index_engine_config_holder = Arc::new(PartialProxy::new(
             &self.server_config,
             {
@@ -126,7 +115,7 @@ impl Index {
                 move |server_config| server_config.core.indices.get_mut(&index_name).expect("index disappeared")
             },
         ));
-        (core_config_holder, index_engine_config_holder)
+        index_engine_config_holder
     }
 
     /// Create `IndexHolder`s from config
@@ -136,11 +125,10 @@ impl Index {
             info!(action = "from_config", index = ?index_name);
             let index = self.create_index_from(index_engine_config, false).await?;
             let core_config = self.server_config.read().await.get().core.clone();
-            let (core_config_holder, index_engine_config_holder) = self.derive_configs(&index_name).await;
-            let index_holder = tokio::task::spawn_blocking(move || {
-                IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder, false)
-            })
-            .await??;
+            let index_engine_config_holder = self.derive_configs(&index_name).await;
+            let index_holder =
+                tokio::task::spawn_blocking(move || IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, false))
+                    .await??;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
         }
         info!(action = "setting_index_holders", indices = ?index_holders.keys().collect::<Vec<_>>());
@@ -195,15 +183,13 @@ impl Index {
     ) -> SummaServerResult<Handler<IndexHolder>> {
         self.insert_config(index_name, index_engine_config).await?;
         let core_config = self.server_config.read().await.get().core.clone();
-        let (core_config_holder, index_engine_config_holder) = self.derive_configs(index_name).await;
+        let index_engine_config_holder = self.derive_configs(index_name).await;
         let index_name = index_name.to_string();
         Ok(self
             .index_registry
             .add(
-                tokio::task::spawn_blocking(move || {
-                    IndexHolder::create_holder(&core_config_holder, &core_config, index, Some(&index_name), index_engine_config_holder, false)
-                })
-                .await??,
+                tokio::task::spawn_blocking(move || IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, false))
+                    .await??,
             )
             .await)
     }
@@ -314,50 +300,39 @@ impl Index {
     /// Delete index, optionally with all its aliases and consumers
     #[instrument(skip_all, fields(index_name = ?delete_index_request.index_name))]
     pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
-        let index_holder = {
-            let mut server_config = self.server_config.write().await;
-            let aliases = server_config.get().core.get_index_aliases_for_index(&delete_index_request.index_name);
-            match (
-                self.index_registry
-                    .index_holders()
-                    .write()
+        let mut server_config = self.server_config.write().await;
+        let aliases = server_config.get().core.get_index_aliases_for_index(&delete_index_request.index_name);
+        match (
+            self.index_registry
+                .index_holders()
+                .write()
+                .await
+                .entry(delete_index_request.index_name.to_owned()),
+            server_config.get_mut().core.indices.entry(delete_index_request.index_name.to_owned()),
+        ) {
+            (Entry::Occupied(index_holder_entry), Entry::Occupied(config_entry)) => {
+                let index_holder = index_holder_entry.get();
+                if !aliases.is_empty() {
+                    return Err(ValidationError::Aliased(aliases.join(", ")).into());
+                }
+                if let Some(consumer_name) = self
+                    .consumer_manager
+                    .read()
                     .await
-                    .entry(delete_index_request.index_name.to_owned()),
-                server_config.get_mut().core.indices.entry(delete_index_request.index_name.to_owned()),
-            ) {
-                (Entry::Occupied(index_holder_entry), Entry::Occupied(_)) => {
-                    let index_holder = index_holder_entry.get();
-                    if !aliases.is_empty() {
-                        return Err(ValidationError::Aliased(aliases.join(", ")).into());
-                    }
-                    if let Some(consumer_name) = self
-                        .consumer_manager
-                        .read()
-                        .await
-                        .get_consumer_for(&index_holder.handler())
-                        .await
-                        .map(|consumer_thread| consumer_thread.consumer_name().to_string())
-                    {
-                        return Err(ValidationError::ExistingConsumer(consumer_name).into());
-                    }
-                    index_holder_entry.remove()
+                    .get_consumer_for(&index_holder.handler())
+                    .await
+                    .map(|consumer_thread| consumer_thread.consumer_name().to_string())
+                {
+                    return Err(ValidationError::ExistingConsumer(consumer_name).into());
                 }
-                (Entry::Vacant(_), Entry::Vacant(_)) => return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
-                (Entry::Occupied(index_holder_entry), Entry::Vacant(_)) => {
-                    warn!(error = "missing_config");
-                    index_holder_entry.remove()
-                }
-                (Entry::Vacant(_), Entry::Occupied(config_entry)) => {
-                    warn!(error = "missing_index_holder");
-                    config_entry.remove();
-                    server_config.commit().await?;
-                    return Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into());
-                }
+                let removed_config_entry = config_entry.remove();
+                server_config.commit().await?;
+                index_holder_entry.remove();
+                tokio::spawn(async move { cleanup_index(removed_config_entry).await });
+                Ok(DeleteIndexResult::new(&delete_index_request.index_name))
             }
-        };
-        let index_name = index_holder.index_name().to_string();
-        index_holder.into_inner().await.delete().await?;
-        Ok(DeleteIndexResult::new(&index_name))
+            _ => Err(ValidationError::MissingIndex(delete_index_request.index_name.to_owned()).into()),
+        }
     }
 
     /// Returns all existent consumers for all indices
@@ -618,7 +593,10 @@ impl Index {
 
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
         let futures = self.index_registry.search_futures(&search_request.index_queries).await?;
-        let collector_outputs = join_all(futures).await.into_iter().collect::<SummaResult<Vec<_>>>()?;
+        let collector_outputs = join_all(futures.into_iter().map(|t| tokio::spawn(async move { t.await })))
+            .await
+            .into_iter()
+            .collect::<Result<SummaResult<Vec<_>>, _>>()??;
         Ok(self.index_registry.merge_responses(&collector_outputs)?)
     }
 }
