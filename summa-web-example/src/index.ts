@@ -1,19 +1,19 @@
 import * as Comlink from "comlink";
 
-import { WebIndexService } from "summa-wasm";
+import { DefaultSearchService } from "summa-wasm";
 
 // IPFS hash of directory with the index of interest
 // Replace it with your index!
-const ipfs_hash = "bafyb4ibkmzobsfgyjleeqiintntxehqarrpmipwpxrqrmvxgqlgxysdbiq";
+const ipfs_hash = "bafybeigpui7vo3rstuyvicx5aeyve2n553lvczkiykj5nsl5e5rj6sb2gq";
 
 // Directory URL that is used to access index
 const directory_url = `http://localhost:8080/ipfs/${ipfs_hash}/`;
 
 // Queries are done through a separate Web Worker
-const web_index_service_worker = Comlink.wrap<WebIndexService>(
+const web_index_service_worker = Comlink.wrap<DefaultSearchService>(
     new Worker(
         new URL(
-          "summa-wasm/dist/worker.js",
+          "summa-wasm/dist/root-worker.js",
           import.meta.url
         ),
         { type: "module" }
@@ -34,14 +34,16 @@ const remote_engine_config = {
     headers_template: new Map([["range", "bytes={start}-{end}"]]),
     chunked_cache_config: { chunk_size: 16 * 1024, cache_size: 128 * 1024 * 1024 }
 }
-const index_attributes = await web_index_service_worker.add(remote_engine_config);
+await web_index_service_worker.add(remote_engine_config, "test_index");
 const omnibox = document.getElementById("omnibox");
 
 omnibox.onkeydown = ((e) => {
     if(e.code == "Enter") {
+        const query = (omnibox as HTMLInputElement).value;
+        console.log("Sending query", query);
         const index_query = {
-            index_alias: index_attributes.default_index_name,
-            query: {query: {match: {value: (omnibox as HTMLInputElement).value}}},
+            index_alias: "test_index",
+            query: {query: {match: {value: query}}},
             collectors: [{collector: {top_docs: {limit: 5}}}],
         }
         web_index_service_worker.search([ index_query ]).then((search_results) => {
