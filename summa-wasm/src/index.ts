@@ -1,6 +1,6 @@
 export {
   IndexQuery,
-  SearchService,
+  ISearchService,
 } from "./search-service";
 export {
   DefaultSearchService
@@ -13,3 +13,7 @@ export {
   IndexAttributes,
   RemoteEngineConfig,
 } from "./configs";
+export {
+  IIndexSeed,
+  LocalDatabaseSeed,
+} from "./seeds"

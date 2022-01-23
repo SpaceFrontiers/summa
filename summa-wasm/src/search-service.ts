@@ -11,7 +11,7 @@ export class IndexQuery {
   }
 }
 
-export interface SearchService {
+export interface ISearchService {
   add(remote_engine_config: RemoteEngineConfig, index_name?: string): Promise<IndexAttributes>;
   delete(index_name: string): Promise<void>;
   search(index_queries: IndexQuery[]): Promise<object[]>;

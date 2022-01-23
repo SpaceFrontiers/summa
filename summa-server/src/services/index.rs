@@ -426,12 +426,17 @@ impl Index {
                 .index_writer_holder()?
                 .write()
                 .await
-                .lock_files(None, |files: Vec<summa_core::components::ComponentFile>| async move {
-                    self.store_service
-                        .put(files)
-                        .await
-                        .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
-                })
+                .lock_files(
+                    ipfs_engine_config.chunked_cache_config.map(|c| HotCacheConfig {
+                        chunk_size: Some(c.chunk_size as usize),
+                    }),
+                    |files: Vec<summa_core::components::ComponentFile>| async move {
+                        self.store_service
+                            .put(files)
+                            .await
+                            .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
+                    },
+                )
                 .await?;
             ipfs_engine_config.cid = cid.clone();
             index_engine_config.commit().await?;

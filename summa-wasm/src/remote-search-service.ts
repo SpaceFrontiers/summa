@@ -1,9 +1,9 @@
 import * as Comlink from "comlink";
-import {IndexQuery, SearchService} from "./search-service";
+import {IndexQuery, ISearchService} from "./search-service";
 import {DefaultSearchService} from "./default-search-service";
 import {RemoteEngineConfig, IndexAttributes} from "./configs";
 
-export class RemoteSearchService implements SearchService {
+export class RemoteSearchService implements ISearchService {
     init_guard: {
         promise: Promise<void>;
     };

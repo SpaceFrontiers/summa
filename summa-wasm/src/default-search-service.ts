@@ -1,8 +1,8 @@
 import init, {reserve_heap, setup_logging, WebIndexRegistry} from "../pkg";
 import {IndexAttributes, RemoteEngineConfig} from "./configs";
-import { IndexQuery, SearchService } from "./search-service";
+import { IndexQuery, ISearchService } from "./search-service";
 
-export class DefaultSearchService implements SearchService {
+export class DefaultSearchService implements ISearchService {
   registry?: WebIndexRegistry;
 
   async setup(init_url: string, threads: number) {
