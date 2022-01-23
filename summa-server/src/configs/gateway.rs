@@ -3,14 +3,65 @@ use std::net::SocketAddr;
 use std::ops::Add;
 use std::str::FromStr;
 
-use hyper::header::{HeaderName, HeaderValue};
-use hyper::HeaderMap;
+use headers::{
+    AcceptRanges, AccessControlAllowHeaders, AccessControlAllowMethods, AccessControlAllowOrigin, AccessControlExposeHeaders, HeaderMapExt, HeaderName,
+    HeaderValue,
+};
+use hyper::header::{ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_NONE_MATCH, RANGE, USER_AGENT};
+use hyper::{HeaderMap, Method};
+use iroh_gateway::constants::{
+    HEADER_SERVICE_WORKER, HEADER_X_CHUNKED_OUTPUT, HEADER_X_IPFS_PATH, HEADER_X_IPFS_ROOTS, HEADER_X_REQUESTED_WITH, HEADER_X_STREAM_OUTPUT,
+};
 use iroh_rpc_types::gateway::GatewayAddr;
 use serde::{Deserialize, Serialize};
 use summa_core::errors::BuilderError;
 use summa_core::utils::parse_endpoint;
 
 use crate::errors::SummaServerResult;
+
+fn default_headers() -> HashMap<String, String> {
+    let mut headers = HeaderMap::new();
+    headers.typed_insert(AccessControlAllowOrigin::ANY);
+    headers.typed_insert(AcceptRanges::bytes());
+    headers.typed_insert(
+        [Method::GET, Method::PUT, Method::POST, Method::DELETE, Method::HEAD, Method::OPTIONS]
+            .into_iter()
+            .collect::<AccessControlAllowMethods>(),
+    );
+    headers.typed_insert(
+        [
+            ACCEPT,
+            CACHE_CONTROL,
+            CONTENT_TYPE,
+            CONTENT_LENGTH,
+            CONTENT_RANGE,
+            HEADER_SERVICE_WORKER.clone(),
+            HEADER_X_REQUESTED_WITH.clone(),
+            IF_NONE_MATCH,
+            RANGE,
+            USER_AGENT,
+        ]
+        .into_iter()
+        .collect::<AccessControlAllowHeaders>(),
+    );
+    headers.typed_insert(
+        [
+            CONTENT_TYPE,
+            CONTENT_LENGTH,
+            CONTENT_RANGE,
+            HEADER_X_IPFS_PATH.clone(),
+            HEADER_X_IPFS_ROOTS.clone(),
+            HEADER_X_CHUNKED_OUTPUT.clone(),
+            HEADER_X_STREAM_OUTPUT.clone(),
+        ]
+        .into_iter()
+        .collect::<AccessControlExposeHeaders>(),
+    );
+    headers
+        .iter()
+        .map(|(header_name, header_value)| (header_name.to_string(), header_value.to_str().expect("default headers seems wrong").to_string()))
+        .collect()
+}
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
@@ -22,6 +73,7 @@ pub struct Config {
     /// TLD resolvers for specific domains
     pub dns_resolver: iroh_resolver::dns_resolver::Config,
     /// Headers that will be added to each HTTP response
+    #[builder(default = "default_headers()")]
     pub headers: HashMap<String, String>,
     /// Public URL base
     pub public_url_base: String,
@@ -33,7 +85,7 @@ impl Default for Config {
             http_endpoint: "127.0.0.1:8080".to_string(),
             p2p_endpoint: "127.0.0.1:4400".to_string(),
             dns_resolver: iroh_resolver::dns_resolver::Config::default(),
-            headers: HashMap::default(),
+            headers: default_headers(),
             public_url_base: "http://localhost:8080/".to_string(),
         }
     }

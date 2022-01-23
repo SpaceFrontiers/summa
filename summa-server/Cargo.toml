@@ -41,6 +41,7 @@ crossbeam-channel = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 futures-util = "0.3"
+headers = "0.3"
 hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
 iroh-gateway = { workspace = true }
 iroh-metrics = { workspace = true }

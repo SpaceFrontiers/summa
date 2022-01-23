@@ -427,7 +427,7 @@ impl Index {
                 .write()
                 .await
                 .lock_files(
-                    ipfs_engine_config.chunked_cache_config.map(|c| HotCacheConfig {
+                    ipfs_engine_config.chunked_cache_config.as_ref().map(|c| HotCacheConfig {
                         chunk_size: Some(c.chunk_size as usize),
                     }),
                     |files: Vec<summa_core::components::ComponentFile>| async move {
