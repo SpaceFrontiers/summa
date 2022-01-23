@@ -104,7 +104,7 @@ impl Index {
     }
 
     async fn derive_configs(&self, index_name: &str) -> Arc<dyn ConfigProxy<proto::IndexEngineConfig>> {
-        let index_engine_config_holder = Arc::new(PartialProxy::new(
+        Arc::new(PartialProxy::new(
             &self.server_config,
             {
                 let index_name = index_name.to_string();
@@ -114,8 +114,7 @@ impl Index {
                 let index_name = index_name.to_string();
                 move |server_config| server_config.core.indices.get_mut(&index_name).expect("index disappeared")
             },
-        ));
-        index_engine_config_holder
+        ))
     }
 
     /// Create `IndexHolder`s from config

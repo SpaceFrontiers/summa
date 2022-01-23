@@ -84,3 +84,6 @@ tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-futures = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.5"

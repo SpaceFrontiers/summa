@@ -1,7 +1,13 @@
 export {
   IndexQuery,
-  WebIndexService,
-} from "./web-index-service";
+  SearchService,
+} from "./search-service";
+export {
+  DefaultSearchService
+} from "./default-search-service";
+export {
+  RemoteSearchService
+} from "./remote-search-service";
 export {
   ChunkedCacheConfig,
   IndexAttributes,

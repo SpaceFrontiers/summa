@@ -1,18 +1,8 @@
-import init, { setup_logging, reserve_heap, WebIndexRegistry } from "../pkg";
-import { IndexAttributes, RemoteEngineConfig } from "./configs";
+import init, {reserve_heap, setup_logging, WebIndexRegistry} from "../pkg";
+import {IndexAttributes, RemoteEngineConfig} from "./configs";
+import { IndexQuery, SearchService } from "./search-service";
 
-export class IndexQuery {
-  index_alias: string
-  query: Object;
-  collectors: Object[];
-  constructor(index_alias: string, query: Object, collectors: Object[]) {
-    this.index_alias = index_alias;
-    this.query = query;
-    this.collectors = collectors
-  }
-}
-
-export class WebIndexService {
+export class DefaultSearchService implements SearchService {
   registry?: WebIndexRegistry;
 
   async setup(init_url: string, threads: number) {
@@ -30,7 +20,7 @@ export class WebIndexService {
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
   }
-  async search(index_queries: IndexQuery[]) {
+  async search(index_queries: IndexQuery[]): Promise<object[]> {
     return await this.registry!.search(index_queries);
   }
   async warmup(index_name: string) {

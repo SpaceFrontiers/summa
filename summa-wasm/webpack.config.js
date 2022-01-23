@@ -8,7 +8,7 @@ const __dirname = path.dirname(__filename);
 export default {
     entry:  {
         'main': './src/index.ts',
-        'worker': './src/web-index-service-worker.ts'
+        'root-worker': './src/root-worker.ts'
     },
     target: "web",
     output: {
