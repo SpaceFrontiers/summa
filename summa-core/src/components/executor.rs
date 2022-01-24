@@ -7,7 +7,7 @@ pub enum Executor {
 }
 
 impl Executor {
-    pub fn new_tokio_executor(handle: tokio::runtime::Handle) -> Executor {
+    pub fn from_tokio_handle(handle: tokio::runtime::Handle) -> Executor {
         Executor::Tokio(handle)
     }
 

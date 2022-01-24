@@ -129,7 +129,7 @@ impl WebIndexRegistry {
 
     async fn commit_internal(&self, index_name: &str) -> SummaResult<()> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await?;
-        index_holder.index_writer_holder()?.write().await.commit().await?;
+        index_holder.index_writer_holder()?.write().await.commit()?;
         Ok(())
     }
 

@@ -133,7 +133,8 @@ impl ConsumerManager {
         join_all(self.consumptions.drain().map(|(index_holder, consumer_thread)| async move {
             consumer_thread.stop().await?;
             let stopped_consumption = StoppedConsumption { consumer_thread };
-            index_holder.index_writer_holder()?.write().await.commit().await?;
+            let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
+            tokio::task::spawn_blocking(move || index_writer_holder.commit()).await??;
             stopped_consumption.commit_offsets().await?;
             Ok(())
         }))

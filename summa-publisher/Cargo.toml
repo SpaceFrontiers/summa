@@ -1,0 +1,24 @@
+[package]
+edition = "2021"
+name = "summa-publisher"
+version = "0.1.0"
+license-file = "LICENSE"
+description = "Tool for publishing directories with symlinks to iroh"
+homepage = "https://github.com/izihawa/summa"
+repository = "https://github.com/izihawa/summa"
+
+[[bin]]
+name = "summa-publisher"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+cid = "0.9"
+clap = { workspace = true }
+futures-lite = "1.12.0"
+iroh-rpc-client = { workspace = true }
+iroh-rpc-types = { workspace = true }
+iroh-unixfs = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }

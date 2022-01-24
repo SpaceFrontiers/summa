@@ -425,8 +425,8 @@ impl Directory for HotDirectory {
     }
 }
 
-async fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
-    let index_meta = index.load_metas_async().await?;
+fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
+    let index_meta = index.load_metas()?;
     let mut files: HashSet<PathBuf> = index_meta.segments.into_iter().flat_map(|segment_meta| segment_meta.list_files()).collect();
     files.insert(Path::new("meta.json").to_path_buf());
     files.insert(Path::new(".managed.json").to_path_buf());
@@ -437,7 +437,7 @@ async fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
 /// and writes a static cache file called hotcache in the `output`.
 ///
 /// See [`HotDirectory`] for more information.
-pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>) -> tantivy::Result<Vec<u8>> {
+pub fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>) -> tantivy::Result<Vec<u8>> {
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
@@ -452,14 +452,14 @@ pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<us
     };
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();
-    let reader: IndexReader = index.reader_builder().reload_policy(ReloadPolicy::Manual).build_async().await?;
+    let reader: IndexReader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
     let searcher = reader.searcher();
     for (field, field_entry) in schema.fields() {
         if !field_entry.is_indexed() {
             continue;
         }
         for reader in searcher.segment_readers() {
-            let _inv_idx = reader.inverted_index_async(field).await?;
+            let _inv_idx = reader.inverted_index(field)?;
         }
     }
     let mut cache_builder = StaticDirectoryCacheBuilder::default();
@@ -471,9 +471,9 @@ pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<us
             .or_default()
             .insert(read_operation.offset..read_operation.offset + read_operation.num_bytes);
     }
-    let index_files = list_index_files(&index).await?;
+    let index_files = list_index_files(&index)?;
     for file_path in index_files {
-        let file_slice_res = debug_proxy_directory.open_read_async(&file_path).await;
+        let file_slice_res = debug_proxy_directory.open_read(&file_path);
         if let Err(OpenReadError::FileDoesNotExist(_)) = file_slice_res {
             continue;
         }

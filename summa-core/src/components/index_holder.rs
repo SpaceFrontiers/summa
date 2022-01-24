@@ -24,7 +24,7 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{Executor, IndexWriterHolder, SummaDocument, CACHE_METRICS};
+use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::SummaResult;
@@ -277,7 +277,7 @@ impl IndexHolder {
             mmap_directory,
             content_loader.clone(),
             &ipfs_engine_config.cid,
-            Executor::new_tokio_executor(tokio::runtime::Handle::current()),
+            crate::components::Executor::from_tokio_handle(tokio::runtime::Handle::current()),
         )
         .await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();

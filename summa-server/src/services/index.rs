@@ -84,10 +84,7 @@ impl Index {
     }
 
     /// Creates new `IndexService` with `ConfigHolder`
-    pub async fn new(
-        server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>,
-        store_service: crate::services::Store,
-    ) -> SummaServerResult<Index> {
+    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, store_service: crate::services::Store) -> SummaServerResult<Index> {
         let core_config_holder = Arc::new(PartialProxy::new(
             server_config_holder,
             |server_config| &server_config.core,
@@ -265,14 +262,9 @@ impl Index {
             proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config }) => {
                 let index = index_builder.create_in_ram()?;
                 let writer_heap_size_bytes = self.server_config.read().await.get().core.writer_heap_size_bytes;
-                let cid = IndexWriterHolder::from_config(&index, WriterThreads::N(1), writer_heap_size_bytes as usize)?
-                    .lock_files(None, |files: Vec<summa_core::components::ComponentFile>| async move {
-                        self.store_service
-                            .put(files)
-                            .await
-                            .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
-                    })
-                    .await?;
+                let mut index_writer_holder = IndexWriterHolder::from_config(&index, WriterThreads::N(1), writer_heap_size_bytes as usize)?;
+                let locked_files = tokio::task::spawn_blocking(move || index_writer_holder.lock_files(None)).await??;
+                let cid = self.store_service.put(locked_files).await?;
                 drop(index);
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid,
@@ -415,33 +407,27 @@ impl Index {
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        index_holder.index_writer_holder()?.write().await.commit().await?;
+
+        let mut index_writer = index_holder.index_writer_holder()?.clone().write_owned().await;
+        tokio::task::spawn_blocking(move || index_writer.commit()).await??;
+
         let prepared_consumption = match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
         };
         let mut index_engine_config = index_holder.index_engine_config().write().await;
         if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
-            let cid = index_holder
-                .index_writer_holder()?
-                .write()
-                .await
-                .lock_files(
-                    ipfs_engine_config.chunked_cache_config.as_ref().map(|c| HotCacheConfig {
-                        chunk_size: Some(c.chunk_size as usize),
-                    }),
-                    |files: Vec<summa_core::components::ComponentFile>| async move {
-                        self.store_service
-                            .put(files)
-                            .await
-                            .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
-                    },
-                )
-                .await?;
+            let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
+            let hot_cache_config = ipfs_engine_config.chunked_cache_config.as_ref().map(|c| HotCacheConfig {
+                chunk_size: Some(c.chunk_size as usize),
+            });
+            let locked_files = tokio::task::spawn_blocking(move || index_writer_holder.lock_files(hot_cache_config)).await??;
+            let cid = self.store_service.put(locked_files).await?;
             ipfs_engine_config.cid = cid.clone();
             index_engine_config.commit().await?;
             info!(action = "store_new_cid", cid = ?cid);
-            index_holder.index_reader().reload_async().await?;
+            let index_holder = index_holder.clone();
+            tokio::task::spawn_blocking(move || index_holder.index_reader().reload()).await??;
         }
         Ok(prepared_consumption)
     }
@@ -457,9 +443,9 @@ impl Index {
     /// Commits immediately or returns all without restarting consuming threads
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn try_commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
-        let mut index_writer = index_holder.index_writer_holder()?.try_write()?;
+        let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        index_writer.commit().await?;
+        tokio::task::spawn_blocking(move || index_writer.commit()).await??;
         Ok(match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
@@ -547,24 +533,14 @@ impl Index {
 
         let index_holder = match migrate_index_request.target_index_engine {
             Some(proto::migrate_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
-                let cid = index_holder
-                    .index_writer_holder()?
-                    .write()
-                    .await
-                    .lock_files(
-                        Some(HotCacheConfig {
-                            chunk_size: chunked_cache_config
-                                .as_ref()
-                                .map(|chunked_cache_config| chunked_cache_config.chunk_size as usize),
-                        }),
-                        |files: Vec<summa_core::components::ComponentFile>| async move {
-                            self.store_service
-                                .put(files)
-                                .await
-                                .map_err(|e| summa_core::errors::Error::External(format!("{e:?}")))
-                        },
-                    )
-                    .await?;
+                let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
+                let hotcache_config = Some(HotCacheConfig {
+                    chunk_size: chunked_cache_config
+                        .as_ref()
+                        .map(|chunked_cache_config| chunked_cache_config.chunk_size as usize),
+                });
+                let locked_files = tokio::task::spawn_blocking(move || index_writer_holder.lock_files(hotcache_config)).await??;
+                let cid = self.store_service.put(locked_files).await?;
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid,
                     chunked_cache_config,
@@ -655,9 +631,7 @@ pub(crate) mod tests {
     }
 
     pub async fn create_test_index_service(data_path: &Path) -> Index {
-        Index::new(&create_test_server_config_holder(&data_path), create_test_store_service(data_path).await)
-            .await
-            .unwrap()
+        Index::new(&create_test_server_config_holder(&data_path), create_test_store_service(data_path).await).unwrap()
     }
 
     pub async fn create_test_index_holder(
@@ -786,8 +760,7 @@ pub(crate) mod tests {
         let index_service = Index::new(
             &(Arc::new(DirectProxy::default()) as Arc<dyn ConfigProxy<_>>),
             create_test_store_service(&data_path).await,
-        )
-        .await?;
+        )?;
         assert!(index_service
             .create_index(
                 CreateIndexRequestBuilder::default()
@@ -821,7 +794,7 @@ pub(crate) mod tests {
 
         let server_config_holder = create_test_server_config_holder(&data_path);
 
-        let index_service = Index::new(&server_config_holder, create_test_store_service(&data_path).await).await?;
+        let index_service = Index::new(&server_config_holder, create_test_store_service(&data_path).await)?;
         index_service
             .create_index(
                 CreateIndexRequestBuilder::default()

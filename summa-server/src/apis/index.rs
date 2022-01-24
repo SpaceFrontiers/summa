@@ -223,22 +223,21 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .clone()
             .write_owned()
             .await;
-        tokio::spawn(async move {
-            let index_name = index_holder.index_name().to_string();
-            let segment_ids: Vec<_> = proto_request
-                .segment_ids
-                .iter()
-                .map(|segment_id| SegmentId::from_uuid_string(segment_id))
-                .collect::<Result<Vec<_>, _>>()
-                .expect("wrong uuid");
-            async move {
-                let result = index_writer_holder.merge(&segment_ids, None).await;
+        let index_name = index_holder.index_name().to_string();
+        tokio::task::spawn_blocking(move || {
+            {
+                let segment_ids: Vec<_> = proto_request
+                    .segment_ids
+                    .iter()
+                    .map(|segment_id| SegmentId::from_uuid_string(segment_id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("wrong uuid");
+                let result = index_writer_holder.merge(&segment_ids, None);
                 if let Err(error) = result {
                     error!(error = ?error)
                 }
             }
             .instrument(info_span!("merge", index_name = ?index_name))
-            .await
         });
         let response = proto::MergeSegmentsResponse {};
         Ok(Response::new(response))
@@ -266,16 +265,15 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .clone()
             .write_owned()
             .await;
-        tokio::spawn(async move {
-            let index_name = index_holder.index_name().to_string();
-            async move {
-                let result = index_writer_holder.vacuum(None).await;
+        let index_name = index_holder.index_name().to_string();
+        tokio::task::spawn_blocking(move || {
+            {
+                let result = index_writer_holder.vacuum(None);
                 if let Err(error) = result {
                     error!(error = ?error)
                 }
             }
-            .instrument(info_span!("merge", index_name = ?index_name))
-            .await
+            .instrument(info_span!("vacuum", index_name = ?index_name))
         });
         let response = proto::VacuumIndexResponse {};
         Ok(Response::new(response))

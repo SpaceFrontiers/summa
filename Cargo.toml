@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["examples", "summa-core", "summa-proto", "summa-server", "summa-wasm"]
+members = ["examples", "summa-core", "summa-proto", "summa-publisher", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true
@@ -11,8 +11,8 @@ anyhow = "1.0"
 async-broadcast = "0.5"
 async-trait = "0.1"
 base64 = "0.21"
+clap = { version = "4.0", features = ["cargo"] }
 config = "0.13"
-crossbeam-channel = "0.5"
 derive_builder = "0.12"
 fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
 futures = "0.3"

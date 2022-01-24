@@ -108,19 +108,15 @@ impl IndexWriterImpl {
             IndexWriterImpl::Threaded(writer) => writer.index(),
         }
     }
-    pub async fn merge_with_attributes(
-        &mut self,
-        segment_ids: &[SegmentId],
-        segment_attributes: Option<serde_json::Value>,
-    ) -> SummaResult<Option<SegmentMeta>> {
+    pub fn merge_with_attributes(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<serde_json::Value>) -> SummaResult<Option<SegmentMeta>> {
         match self {
             IndexWriterImpl::SameThread(_) => {
                 unimplemented!()
             }
-            IndexWriterImpl::Threaded(writer) => Ok(writer.merge_with_attributes(segment_ids, segment_attributes).await?),
+            IndexWriterImpl::Threaded(writer) => Ok(writer.merge_with_attributes(segment_ids, segment_attributes).wait()?),
         }
     }
-    pub async fn commit(&mut self) -> SummaResult<()> {
+    pub fn commit(&mut self) -> SummaResult<()> {
         match self {
             IndexWriterImpl::SameThread(writer) => {
                 let index = writer.index.clone();
@@ -134,7 +130,7 @@ impl IndexWriterImpl {
             }
             IndexWriterImpl::Threaded(writer) => {
                 info!(action = "commit_files");
-                let opstamp = writer.prepare_commit()?.commit_future().await?;
+                let opstamp = writer.prepare_commit()?.commit()?;
                 info!(action = "committed", opstamp = ?opstamp);
                 Ok(())
             }
@@ -244,15 +240,12 @@ impl IndexWriterHolder {
     ///
     /// Also cleans deleted documents and do recompression. Possible to pass the only segment in `segment_ids` to do recompression or clean up.
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub async fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
+    pub fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
         info!(action = "merge_segments", segment_ids = ?segment_ids);
-        let segment_meta = self
-            .index_writer
-            .merge_with_attributes(
-                segment_ids,
-                segment_attributes.map(|segment_attributes| serde_json::to_value(segment_attributes).expect("cannot serialize")),
-            )
-            .await?;
+        let segment_meta = self.index_writer.merge_with_attributes(
+            segment_ids,
+            segment_attributes.map(|segment_attributes| serde_json::to_value(segment_attributes).expect("cannot serialize")),
+        )?;
         info!(action = "merged_segments", segment_ids = ?segment_ids, merged_segment_meta = ?segment_meta);
         Ok(segment_meta)
     }
@@ -261,16 +254,16 @@ impl IndexWriterHolder {
     ///
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub async fn commit(&mut self) -> SummaResult<()> {
-        self.index_writer.commit().await
+    pub fn commit(&mut self) -> SummaResult<()> {
+        self.index_writer.commit()
     }
 
     pub async fn rollback(&mut self) -> SummaResult<()> {
         self.index_writer.rollback().await
     }
 
-    pub async fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
-        let mut segments = self.index().searchable_segments_async().await?;
+    pub fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
+        let mut segments = self.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
 
         let segments = segments
@@ -289,8 +282,7 @@ impl IndexWriterHolder {
             })
             .collect::<Vec<_>>();
         if !segments.is_empty() {
-            self.merge(&segments.iter().map(|segment| segment.id()).collect::<Vec<_>>(), segment_attributes.clone())
-                .await?;
+            self.merge(&segments.iter().map(|segment| segment.id()).collect::<Vec<_>>(), segment_attributes)?;
         }
         Ok(())
     }
@@ -310,16 +302,12 @@ impl IndexWriterHolder {
 
     /// Locking index files for executing operation on them
     #[cfg(feature = "fs")]
-    pub async fn lock_files<O, Fut>(&mut self, with_hotcache: Option<HotCacheConfig>, f: impl FnOnce(Vec<ComponentFile>) -> Fut) -> SummaResult<O>
-    where
-        Fut: Future<Output = SummaResult<O>>,
-    {
+    pub fn lock_files(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<Vec<ComponentFile>> {
         let segment_attributes = SummaSegmentAttributes { is_frozen: true };
 
-        self.commit().await?;
-        self.vacuum(Some(segment_attributes)).await?;
-        self.commit().await?;
-
+        self.commit()?;
+        self.vacuum(Some(segment_attributes))?;
+        self.commit()?;
         self.wait_merging_threads();
 
         let directory = self.index().directory();
@@ -328,24 +316,23 @@ impl IndexWriterHolder {
             .into_iter()
             .map(String::from)
             .map(move |file_name| ComponentFile::from_directory(directory, &file_name))
-            .chain(self.get_index_files().await?);
-        let segment_files = match with_hotcache {
+            .chain(self.get_index_files()?);
+        Ok(match with_hotcache {
             Some(hotcache_config) => {
-                let hotcache_bytes = crate::directories::write_hotcache(directory.inner_directory().box_clone(), hotcache_config.chunk_size).await?;
+                let hotcache_bytes = crate::directories::write_hotcache(directory.inner_directory().box_clone(), hotcache_config.chunk_size)?;
                 segment_files_iter
                     .chain(std::iter::once(ComponentFile::new("hotcache.bin", Box::new(async move { hotcache_bytes }))))
                     .collect()
             }
             None => segment_files_iter.collect(),
-        };
-        f(segment_files).await
+        })
     }
 
     /// Get segments
     #[cfg(feature = "fs")]
-    async fn get_index_files(&self) -> SummaResult<impl Iterator<Item = ComponentFile>> {
+    fn get_index_files(&self) -> SummaResult<impl Iterator<Item = ComponentFile>> {
         let directory = self.index().directory().clone();
-        Ok(self.index().searchable_segments_async().await?.into_iter().flat_map(move |segment| {
+        Ok(self.index().searchable_segments()?.into_iter().flat_map(move |segment| {
             let directory = directory.clone();
             tantivy::SegmentComponent::iterator()
                 .filter_map(move |segment_component| {

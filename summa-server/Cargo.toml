@@ -35,9 +35,8 @@ tempdir = "0.3.7"
 anyhow = { workspace = true }
 async-broadcast = { workspace = true }
 async-trait = { workspace = true }
-clap = { version = "4.0", features = ["cargo"] }
+clap = { workspace = true }
 config = "0.13"
-crossbeam-channel = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 futures-util = "0.3"

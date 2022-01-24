@@ -170,7 +170,7 @@ impl Server {
             ));
         }
 
-        let index_service = Index::new(&self.server_config_holder, store_service).await?;
+        let index_service = Index::new(&self.server_config_holder, store_service)?;
         futures.push(Box::new(index_service.prepare_serving_future(terminator.clone()).await?));
 
         let metrics_service = Metrics::new(&server_config.metrics)?;
