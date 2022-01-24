@@ -16,4 +16,5 @@ export {
 export {
   IIndexSeed,
   LocalDatabaseSeed,
-} from "./seeds"
+} from "./seeds";
+export { IndexConfig, MetaDb } from "./meta-db"

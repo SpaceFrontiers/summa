@@ -4,49 +4,45 @@ import {DefaultSearchService} from "./default-search-service";
 import {RemoteEngineConfig, IndexAttributes} from "./configs";
 
 export class RemoteSearchService implements ISearchService {
-    init_guard: {
-        promise: Promise<void>;
-    };
-    web_index_service_worker: Comlink.Remote<DefaultSearchService>;
+    init_guard: Promise<void>;
+    search_service: Comlink.Remote<DefaultSearchService>;
 
     constructor(worker_url: URL, wasm_url: URL, options: { num_threads: number }) {
-        this.web_index_service_worker = Comlink.wrap<DefaultSearchService>(
+        this.search_service = Comlink.wrap<DefaultSearchService>(
             new Worker(
                 worker_url,
-                {type: "module"}
+                { type: "module" }
             )
         );
-        this.init_guard = {
-            promise: this.setup(wasm_url, options),
-        };
+        this.init_guard = this.setup(wasm_url, options);
     }
 
     add(remote_engine_config: RemoteEngineConfig, index_name?: string | undefined): Promise<IndexAttributes> {
-        return this.web_index_service_worker.add(remote_engine_config, index_name);
+        return this.search_service.add(remote_engine_config, index_name);
     }
 
     delete(index_name: string): Promise<void> {
-        return this.web_index_service_worker.delete(index_name);
+        return this.search_service.delete(index_name);
     }
 
     search(index_queries: IndexQuery[]): Promise<object[]> {
-        return this.web_index_service_worker.search(index_queries)
+        return this.search_service.search(index_queries)
     }
 
     warmup(index_name: string): Promise<void> {
-        return this.web_index_service_worker.warmup(index_name);
+        return this.search_service.warmup(index_name);
     }
 
     index_document(index_name: string, document: string): Promise<void> {
-        return this.web_index_service_worker.index_document(index_name, document)
+        return this.search_service.index_document(index_name, document)
     }
 
     commit(index_name: string): Promise<void> {
-        return this.web_index_service_worker.commit(index_name);
+        return this.search_service.commit(index_name);
     }
 
     async setup(wasm_url: URL, options: { num_threads: number }) {
-        return await this.web_index_service_worker.setup(
+        return await this.search_service.setup(
             wasm_url.href,
             options.num_threads
         );

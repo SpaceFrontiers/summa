@@ -9,7 +9,8 @@ export default {
     entry:  {
         'main': './src/index.ts',
         'root-worker': './src/root-worker.ts',
-        'service-worker': './src/service-worker.js'
+        'service-worker': './src/service-worker.ts',
+        'service-worker-register': './src/service-worker-register.ts'
     },
     target: "web",
     output: {

@@ -23,6 +23,11 @@ fn default_headers() -> HashMap<String, String> {
     let mut headers = HeaderMap::new();
     headers.typed_insert(AccessControlAllowOrigin::ANY);
     headers.typed_insert(AcceptRanges::bytes());
+    headers.insert(
+        HeaderName::from_static("Cross-Origin-Embedder-Policy"),
+        HeaderValue::from_static("require-corp"),
+    );
+    headers.insert(HeaderName::from_static("Cross-Origin-Opener-Policy"), HeaderValue::from_static("same-origin"));
     headers.typed_insert(
         [Method::GET, Method::PUT, Method::POST, Method::DELETE, Method::HEAD, Method::OPTIONS]
             .into_iter()

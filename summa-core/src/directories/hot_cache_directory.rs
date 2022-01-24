@@ -452,14 +452,14 @@ pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<us
     };
     let index = Index::open(debug_proxy_directory.clone())?;
     let schema = index.schema();
-    let reader: IndexReader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
+    let reader: IndexReader = index.reader_builder().reload_policy(ReloadPolicy::Manual).build_async().await?;
     let searcher = reader.searcher();
     for (field, field_entry) in schema.fields() {
         if !field_entry.is_indexed() {
             continue;
         }
         for reader in searcher.segment_readers() {
-            let _inv_idx = reader.inverted_index(field)?;
+            let _inv_idx = reader.inverted_index_async(field).await?;
         }
     }
     let mut cache_builder = StaticDirectoryCacheBuilder::default();
@@ -473,7 +473,7 @@ pub async fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<us
     }
     let index_files = list_index_files(&index).await?;
     for file_path in index_files {
-        let file_slice_res = debug_proxy_directory.open_read(&file_path);
+        let file_slice_res = debug_proxy_directory.open_read_async(&file_path).await;
         if let Err(OpenReadError::FileDoesNotExist(_)) = file_slice_res {
             continue;
         }

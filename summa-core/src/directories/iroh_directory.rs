@@ -15,6 +15,7 @@ use tantivy::{
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+use crate::components::Executor;
 use crate::errors::SummaResult;
 
 /// Allow to implement searching over Iroh
@@ -26,6 +27,7 @@ pub struct IrohDirectory<D: Directory + Clone, T: ContentLoader + Unpin + 'stati
     resolver: Resolver<T>,
     files: HashMap<PathBuf, iroh_resolver::resolver::Out>,
     cid: String,
+    executor: Executor,
 }
 
 impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Debug for IrohDirectory<D, T> {
@@ -35,7 +37,7 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Debug for IrohDir
 }
 
 impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, T> {
-    pub async fn new(underlying: D, loader: T, cid: &str) -> SummaResult<IrohDirectory<D, T>> {
+    pub async fn new(underlying: D, loader: T, cid: &str, executor: Executor) -> SummaResult<IrohDirectory<D, T>> {
         let resolver = Resolver::new(loader);
         let root_path = resolver.resolve(iroh_resolver::Path::from_parts("ipfs", cid, "")?).await?;
         let mut files = HashMap::new();
@@ -49,13 +51,14 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, 
             resolver,
             files,
             cid: cid.to_string(),
+            executor,
         })
     }
 
     fn get_iroh_file_handle(&self, file_name: &Path) -> Result<IrohFile<T>, OpenReadError> {
         self.files
             .get(file_name)
-            .map(|file| IrohFile::new(file.clone(), self.resolver.clone()))
+            .map(|file| IrohFile::new(file.clone(), self.resolver.clone(), self.executor.clone()))
             .ok_or_else(|| OpenReadError::FileDoesNotExist(file_name.to_path_buf()))
     }
 }
@@ -138,11 +141,12 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
 struct IrohFile<T: ContentLoader + Unpin + 'static> {
     out: iroh_resolver::resolver::Out,
     resolver: Resolver<T>,
+    executor: Executor,
 }
 
 impl<T: ContentLoader + Unpin + 'static> IrohFile<T> {
-    pub fn new(out: iroh_resolver::resolver::Out, resolver: Resolver<T>) -> IrohFile<T> {
-        IrohFile { out, resolver }
+    pub fn new(out: iroh_resolver::resolver::Out, resolver: Resolver<T>, executor: Executor) -> IrohFile<T> {
+        IrohFile { out, resolver, executor }
     }
 
     fn pretty_reader(&self, end: Option<usize>) -> OutPrettyReader<T> {
@@ -156,10 +160,8 @@ impl<T: ContentLoader + Unpin + 'static> IrohFile<T> {
 #[async_trait]
 impl<T: ContentLoader + Unpin + 'static> FileHandle for IrohFile<T> {
     fn read_bytes(&self, byte_range: Range<usize>) -> std::io::Result<OwnedBytes> {
-        let (s, mut r) = tokio::sync::mpsc::unbounded_channel();
         let file = self.clone();
-        tokio::spawn(async move { s.send(file.read_bytes_async(byte_range).await).expect("cannot send to channel") });
-        r.blocking_recv().expect("cannot block on channel")
+        self.executor.spawn_blocking(async move { file.read_bytes_async(byte_range).await })
     }
 
     async fn read_bytes_async(&self, byte_range: Range<usize>) -> std::io::Result<OwnedBytes> {

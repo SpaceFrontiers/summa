@@ -1,5 +1,6 @@
 mod custom_serializer;
 mod default_tokenizers;
+mod executor;
 mod frozen_log_merge_policy;
 mod fruit_extractors;
 mod index_holder;
@@ -11,6 +12,7 @@ mod summa_document;
 mod summa_tokenizer;
 
 pub use default_tokenizers::default_tokenizers;
+pub use executor::Executor;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor};
 pub use index_holder::{cleanup_index, IndexHolder};
 pub use index_registry::IndexRegistry;

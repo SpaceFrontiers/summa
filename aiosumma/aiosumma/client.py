@@ -185,7 +185,7 @@ class SummaClient(BaseGrpcClient):
                 index_attributes=index_attributes,
                 sort_by_field=index_service_pb.SortByField(
                     field=sort_by_field[0],
-                    order=sort_by_field[1],
+                    order=sort_by_field[1].capitalize(),
                 ) if sort_by_field else None,
                 **index_engine
             ),

@@ -93,7 +93,7 @@ impl WebIndexRegistry {
             true,
         )?;
         let index_attributes = index_holder.index_attributes().cloned();
-        self.index_registry.add(index_holder).await;
+        self.index_registry.add(index_holder).await?;
         Ok(index_attributes)
     }
 

@@ -39,7 +39,7 @@ pub enum Error {
     Anyhow(#[from] anyhow::Error),
     #[error("clap_matches_error: {0}")]
     ClapMatches(#[from] clap::parser::MatchesError),
-    #[error("summa_core: {0}")]
+    #[error("{0}")]
     Core(#[from] summa_core::Error),
     #[error("hyper_error: {0}")]
     Hyper(#[from] hyper::Error),

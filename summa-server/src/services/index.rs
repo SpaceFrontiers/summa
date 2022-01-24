@@ -190,7 +190,7 @@ impl Index {
                 tokio::task::spawn_blocking(move || IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, false))
                     .await??,
             )
-            .await)
+            .await?)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
@@ -441,7 +441,7 @@ impl Index {
             ipfs_engine_config.cid = cid.clone();
             index_engine_config.commit().await?;
             info!(action = "store_new_cid", cid = ?cid);
-            index_holder.index_reader().reload()?;
+            index_holder.index_reader().reload_async().await?;
         }
         Ok(prepared_consumption)
     }

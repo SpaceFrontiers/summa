@@ -5,10 +5,27 @@ declare let self: ServiceWorkerGlobalScope
 import Dexie from "dexie";
 
 const CHUNK_SIZE = 16 * 1024;
-const db = new Dexie("Cache");
-db.version(1).stores({
-  chunks: "[filename+chunk_id]",
-});
+interface ICacheItem {
+    filename: string,
+    chunk_id: number,
+    blob: Uint8Array
+}
+
+class CacheDatabase extends Dexie {
+    // Declare implicit table properties.
+    // (just to inform Typescript. Instanciated by Dexie in stores() method)
+    chunks!: Dexie.Table<ICacheItem, [string, number]>; // number = type of the primkey
+    //...other tables goes here...
+
+    constructor () {
+        super("Cache");
+        this.version(1).stores({
+          chunks: "[filename+chunk_id]",
+        });
+    }
+}
+
+const db = new CacheDatabase();
 
 function* generate_chunk_ids(start = 0, end = Infinity, step = 1) {
   let iterationCount = 0;
@@ -48,7 +65,7 @@ async function set_from_cache(filename: string, start: number, end: number) {
   }
 }
 
-async function fill_cache(response_body, filename, start, end) {
+async function fill_cache(response_body: ArrayBuffer, filename: string, start: number, end: number) {
   const items = Array.from(generate_chunk_ids(start, end, CHUNK_SIZE)).map(
     function (chunk_id) {
       const left_border = chunk_id - start;
@@ -68,7 +85,7 @@ async function fill_cache(response_body, filename, start, end) {
   });
 }
 
-function fetch_with_retries(url, options, retries) {
+function fetch_with_retries(url: string, options: any, retries: number): any {
   return fetch(url, options)
     .then((res) => {
       if (!res.ok && retries > 0) {
@@ -86,31 +103,32 @@ function fetch_with_retries(url, options, retries) {
     });
 }
 
-function set_same_origin_headers(headers) {
+function set_same_origin_headers(headers: Headers) {
   headers.set("Cross-Origin-Embedder-Policy", "require-corp");
   headers.set("Cross-Origin-Opener-Policy", "same-origin");
   return headers;
 }
 
-function set_keep_alive_headers(headers) {
+function set_keep_alive_headers(headers: Headers) {
   headers.set("Keep-Alive", "timeout=10, max=1000");
   headers.set("Connection", "keep-alive");
   return headers;
 }
 
-async function handle_request(request) {
+async function handle_request(request: Request) {
   let url = request.url;
   let filename = request.url;
   let [range_start, range_end] = [0, Infinity];
-  for (const [name, value] of request.headers) {
+  request.headers.forEach((name, value) => {
     if (name === "range") {
+      // @ts-ignore
       const [_, start, end] = /^bytes=(\d+)-(\d+)?$/g.exec(value);
       range_start = parseInt(start);
       if (end) {
         range_end = parseInt(end) + 1;
       }
     }
-  }
+  });
   let response_body = null;
   let headers = new Headers();
   let status = 200;
@@ -172,6 +190,7 @@ self.addEventListener("message", (ev) => {
         return self.clients.matchAll();
       })
       .then((clients) => {
+        // @ts-ignore
         clients.forEach((client) => client.navigate(client.url));
       });
   }

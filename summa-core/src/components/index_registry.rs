@@ -91,12 +91,19 @@ impl IndexRegistry {
     }
 
     /// Add new index to `IndexRegistry`
-    pub async fn add(&self, index_holder: IndexHolder) -> Handler<IndexHolder> {
-        info!(action = "add", index_name = ?index_holder.index_name());
+    pub async fn add(&self, index_holder: IndexHolder) -> SummaResult<Handler<IndexHolder>> {
         let index_holder = OwningHandler::new(index_holder);
         let index_holder_handler = index_holder.handler();
         self.index_holders().write().await.insert(index_holder.index_name().to_string(), index_holder);
-        index_holder_handler
+        let segments = index_holder_handler
+            .index()
+            .searchable_segments_async()
+            .await?
+            .into_iter()
+            .map(|segment| segment.id())
+            .collect::<Vec<_>>();
+        info!(action = "added", index_name = ?index_holder_handler.index_name(), segments = ?segments);
+        Ok(index_holder_handler)
     }
 
     /// Deletes index from `IndexRegistry`

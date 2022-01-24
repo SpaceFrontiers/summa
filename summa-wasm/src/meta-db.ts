@@ -1,7 +1,7 @@
-import type { RemoteEngineConfig } from "summa-wasm";
+import type { RemoteEngineConfig } from "./configs";
 import Dexie from "dexie";
 
-class SummaDatabase extends Dexie {
+export class MetaDb extends Dexie {
   index_configs!: Dexie.Table<IIndexConfig, string>;
 
   constructor(name: string, version: number) {
@@ -50,5 +50,3 @@ export class IndexConfig implements IIndexConfig {
     this.remote_engine_config = remote_engine_config;
   }
 }
-
-export const db = new SummaDatabase("SummaDatabase", 1);
