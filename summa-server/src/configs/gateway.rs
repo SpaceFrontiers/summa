@@ -21,18 +21,6 @@ use crate::errors::SummaServerResult;
 
 fn default_headers() -> HashMap<String, String> {
     let mut headers = HeaderMap::new();
-    headers.typed_insert(AccessControlAllowOrigin::ANY);
-    headers.typed_insert(AcceptRanges::bytes());
-    headers.insert(
-        HeaderName::from_static("Cross-Origin-Embedder-Policy"),
-        HeaderValue::from_static("require-corp"),
-    );
-    headers.insert(HeaderName::from_static("Cross-Origin-Opener-Policy"), HeaderValue::from_static("same-origin"));
-    headers.typed_insert(
-        [Method::GET, Method::PUT, Method::POST, Method::DELETE, Method::HEAD, Method::OPTIONS]
-            .into_iter()
-            .collect::<AccessControlAllowMethods>(),
-    );
     headers.typed_insert(
         [
             ACCEPT,
@@ -50,6 +38,12 @@ fn default_headers() -> HashMap<String, String> {
         .collect::<AccessControlAllowHeaders>(),
     );
     headers.typed_insert(
+        [Method::GET, Method::PUT, Method::POST, Method::DELETE, Method::HEAD, Method::OPTIONS]
+            .into_iter()
+            .collect::<AccessControlAllowMethods>(),
+    );
+    headers.typed_insert(AccessControlAllowOrigin::ANY);
+    headers.typed_insert(
         [
             CONTENT_TYPE,
             CONTENT_LENGTH,
@@ -62,6 +56,9 @@ fn default_headers() -> HashMap<String, String> {
         .into_iter()
         .collect::<AccessControlExposeHeaders>(),
     );
+    headers.typed_insert(AcceptRanges::bytes());
+    headers.insert("Cross-Origin-Embedder-Policy", "require-corp".parse().expect("programming error, wrong header"));
+    headers.insert("Cross-Origin-Opener-Policy", "same-origin".parse().expect("programming error, wrong header"));
     headers
         .iter()
         .map(|(header_name, header_value)| (header_name.to_string(), header_value.to_str().expect("default headers seems wrong").to_string()))
