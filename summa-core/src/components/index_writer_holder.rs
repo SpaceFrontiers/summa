@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::RwLock;
 
 use summa_proto::proto;
-use tantivy::query::{BooleanQuery, Query};
+use tantivy::query::Query;
 use tantivy::schema::{Field, Value};
 use tantivy::{Directory, Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
@@ -85,12 +85,20 @@ impl IndexWriterImpl {
         })
     }
 
-    pub fn delete_documents(&self, query: Box<dyn Query>) -> SummaResult<u64> {
+    pub fn delete_by_query(&self, query: Box<dyn Query>) -> SummaResult<u64> {
         match self {
-            IndexWriterImpl::SameThread(_) => Ok(0),
+            IndexWriterImpl::SameThread(_) => unimplemented!(),
             IndexWriterImpl::Threaded(writer) => Ok(writer.delete_query(query)?),
         }
     }
+
+    pub fn delete_by_term(&self, term: Term) -> u64 {
+        match self {
+            IndexWriterImpl::SameThread(_) => unimplemented!(),
+            IndexWriterImpl::Threaded(writer) => writer.delete_term(term),
+        }
+    }
+
     pub fn add_document(&self, document: Document) -> SummaResult<()> {
         match self {
             IndexWriterImpl::SameThread(writer) => {
@@ -216,12 +224,21 @@ impl IndexWriterHolder {
                 self.index_writer.index().schema().to_named_doc(document)
             )))?
         }
-        self.delete_documents(Box::new(BooleanQuery::new_multiterms_query(unique_terms)))
+        let mut last_opstamp = None;
+        for term in unique_terms {
+            last_opstamp = Some(self.delete_by_term(term))
+        }
+        Ok(last_opstamp.expect("impossible case, there must be at least one delete"))
     }
 
-    /// Delete index by its primary key
-    pub(super) fn delete_documents(&self, query: Box<dyn Query>) -> SummaResult<u64> {
-        self.index_writer.delete_documents(query)
+    /// Delete documents by query
+    pub(super) fn delete_by_query(&self, query: Box<dyn Query>) -> SummaResult<u64> {
+        self.index_writer.delete_by_query(query)
+    }
+
+    /// Delete documents by `Term`
+    pub(super) fn delete_by_term(&self, term: Term) -> u64 {
+        self.index_writer.delete_by_term(term)
     }
 
     /// Tantivy `Index`

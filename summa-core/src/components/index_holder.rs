@@ -447,7 +447,7 @@ impl IndexHolder {
     /// Delete `SummaDocument` by `unq`
     pub async fn delete_documents(&self, query: proto::Query) -> SummaResult<u64> {
         let parsed_query = self.query_parser.read().await.parse_query(&query)?;
-        self.index_writer_holder()?.read().await.delete_documents(parsed_query)
+        self.index_writer_holder()?.read().await.delete_by_query(parsed_query)
     }
 
     /// Index generic `SummaDocument`
