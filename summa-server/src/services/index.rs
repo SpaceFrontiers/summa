@@ -16,6 +16,7 @@ use summa_core::errors::SummaResult;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
 use summa_proto::proto;
+use tantivy::merge_policy::NoMergePolicy;
 use tantivy::IndexBuilder;
 use tokio::sync::RwLock;
 use tracing::{info, info_span, instrument, warn, Instrument};
@@ -262,7 +263,8 @@ impl Index {
             proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config }) => {
                 let index = index_builder.create_in_ram()?;
                 let writer_heap_size_bytes = self.server_config.read().await.get().core.writer_heap_size_bytes;
-                let mut index_writer_holder = IndexWriterHolder::from_config(&index, WriterThreads::N(1), writer_heap_size_bytes as usize)?;
+                let merge_policy = Box::<NoMergePolicy>::default();
+                let mut index_writer_holder = IndexWriterHolder::create(&index, WriterThreads::N(1), writer_heap_size_bytes as usize, merge_policy)?;
                 let locked_files = tokio::task::spawn_blocking(move || index_writer_holder.lock_files(None)).await??;
                 let cid = self.store_service.put(locked_files).await?;
                 drop(index);

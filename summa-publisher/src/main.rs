@@ -93,8 +93,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match matches.subcommand() {
         Some(("publish", submatches)) => {
             let config_path = submatches.try_get_one::<String>("CONFIG_PATH")?.expect("no config selected");
-            let published_cid = publish(config_path).await?;
-            println!("{published_cid:?}");
+            let published_cid = publish(config_path).await?.expect("no new cid").to_string();
+            println!("{published_cid}");
         }
         _ => unreachable!("Exhausted list of subcommands and subcommand_required prevents `None`"),
     };

@@ -5,13 +5,13 @@ use std::pin::Pin;
 use std::sync::RwLock;
 
 use summa_proto::proto;
+use tantivy::merge_policy::MergePolicy;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Value};
 use tantivy::{Directory, Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
 
 use super::SummaSegmentAttributes;
-use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
@@ -70,7 +70,7 @@ pub enum IndexWriterImpl {
 }
 
 impl IndexWriterImpl {
-    pub fn new(index: &Index, writer_threads: WriterThreads, writer_heap_size_bytes: usize) -> SummaResult<Self> {
+    pub fn new(index: &Index, writer_threads: WriterThreads, writer_heap_size_bytes: usize, merge_policy: Box<dyn MergePolicy>) -> SummaResult<Self> {
         Ok(match writer_threads {
             WriterThreads::SameThread => IndexWriterImpl::SameThread(SingleIndexWriter {
                 index: index.clone(),
@@ -79,7 +79,7 @@ impl IndexWriterImpl {
             }),
             WriterThreads::N(writer_threads) => {
                 let index_writer = index.writer_with_num_threads(writer_threads as usize, writer_heap_size_bytes)?;
-                index_writer.set_merge_policy(Box::<FrozenLogMergePolicy>::default());
+                index_writer.set_merge_policy(merge_policy);
                 IndexWriterImpl::Threaded(index_writer)
             }
         })
@@ -186,8 +186,13 @@ impl IndexWriterHolder {
     }
 
     /// Creates new `IndexWriterHolder` from `Index` and `core::Config`
-    pub fn from_config(index: &Index, writer_threads: WriterThreads, writer_heap_size_bytes: usize) -> SummaResult<IndexWriterHolder> {
-        let index_writer = IndexWriterImpl::new(index, writer_threads.clone(), writer_heap_size_bytes)?;
+    pub fn create(
+        index: &Index,
+        writer_threads: WriterThreads,
+        writer_heap_size_bytes: usize,
+        merge_policy: Box<dyn MergePolicy>,
+    ) -> SummaResult<IndexWriterHolder> {
+        let index_writer = IndexWriterImpl::new(index, writer_threads.clone(), writer_heap_size_bytes, merge_policy)?;
         let unique_fields = index
             .load_metas()?
             .index_attributes()?
@@ -204,7 +209,7 @@ impl IndexWriterHolder {
     }
 
     /// Delete index by its unique fields
-    pub(super) fn delete_documents_by_unique_fields(&self, document: &Document) -> SummaResult<u64> {
+    pub(super) fn delete_documents_by_unique_fields(&self, document: &Document) -> SummaResult<Option<u64>> {
         let unique_terms = self
             .unique_fields
             .iter()
@@ -224,11 +229,12 @@ impl IndexWriterHolder {
                 self.index_writer.index().schema().to_named_doc(document)
             )))?
         }
+
         let mut last_opstamp = None;
         for term in unique_terms {
             last_opstamp = Some(self.delete_by_term(term))
         }
-        Ok(last_opstamp.expect("impossible case, there must be at least one delete"))
+        Ok(last_opstamp)
     }
 
     /// Delete documents by query
@@ -247,10 +253,10 @@ impl IndexWriterHolder {
     }
 
     /// Put document to the index. Before comes searchable it must be committed
-    pub fn index_document(&self, document: Document) -> SummaResult<u64> {
-        let deleted_documents = self.delete_documents_by_unique_fields(&document)?;
+    pub fn index_document(&self, document: Document) -> SummaResult<()> {
+        self.delete_documents_by_unique_fields(&document)?;
         self.index_writer.add_document(document)?;
-        Ok(deleted_documents)
+        Ok(())
     }
 
     /// Merge segments into one.

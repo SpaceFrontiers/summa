@@ -22,9 +22,7 @@
   // In some environments (e.g. Chrome incognito mode) this won't be available
   if (n.serviceWorker) {
     n.serviceWorker
-      .register("/service-worker.js", {
-        type: "module",
-      })
+      .register("/service-worker.js")
       .then(
         (registration) => {
           registration.addEventListener("updatefound", () => {

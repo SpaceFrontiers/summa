@@ -23,6 +23,7 @@ use tracing::{instrument, trace};
 
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
+use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
@@ -163,11 +164,16 @@ impl IndexHolder {
 
         let index_writer_holder = match (read_only, &core_config.writer_threads) {
             (true, _) | (_, None) => None,
-            (_, Some(writer_threads)) => Some(Arc::new(RwLock::new(IndexWriterHolder::from_config(
-                &index,
-                writer_threads.clone(),
-                core_config.writer_heap_size_bytes as usize,
-            )?))),
+            (_, Some(writer_threads)) => {
+                // ToDo: Make it configurable
+                let merge_policy = Box::<FrozenLogMergePolicy>::default();
+                Some(Arc::new(RwLock::new(IndexWriterHolder::create(
+                    &index,
+                    writer_threads.clone(),
+                    core_config.writer_heap_size_bytes as usize,
+                    merge_policy,
+                )?)))
+            }
         };
 
         Ok(IndexHolder {
@@ -453,7 +459,7 @@ impl IndexHolder {
     /// Index generic `SummaDocument`
     ///
     /// `IndexUpdater` bounds unbounded `SummaDocument` inside
-    pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<u64> {
+    pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<()> {
         let document = document.bound_with(&self.index.schema()).try_into()?;
         self.index_writer_holder()?.read().await.index_document(document)
     }
