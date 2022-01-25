@@ -10,6 +10,7 @@ mod query_parser;
 mod segment_attributes;
 mod summa_document;
 mod summa_tokenizer;
+mod temporal_merge_policy;
 
 pub use default_tokenizers::default_tokenizers;
 pub use executor::Executor;
@@ -22,6 +23,7 @@ pub use query_parser::QueryParser;
 pub use segment_attributes::SummaSegmentAttributes;
 pub use summa_document::{DocumentParsingError, SummaDocument};
 pub use summa_tokenizer::SummaTokenizer;
+pub use temporal_merge_policy::TemporalMergePolicy;
 
 use crate::metrics::CacheMetrics;
 

@@ -326,7 +326,7 @@ impl IndexWriterHolder {
     /// Locking index files for executing operation on them
     #[cfg(feature = "fs")]
     pub fn lock_files(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<Vec<ComponentFile>> {
-        let segment_attributes = SummaSegmentAttributes { is_frozen: true };
+        let segment_attributes = SummaSegmentAttributes::frozen();
 
         self.commit()?;
         self.vacuum(Some(segment_attributes))?;

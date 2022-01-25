@@ -1,12 +1,37 @@
 use std::marker::PhantomData;
+use std::time::UNIX_EPOCH;
 
+use instant::SystemTime;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tantivy::SegmentAttributesMerger;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+fn current_time() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummaSegmentAttributes {
     pub is_frozen: bool,
+    pub created_at: Option<u64>,
+}
+
+impl Default for SummaSegmentAttributes {
+    fn default() -> Self {
+        SummaSegmentAttributes {
+            is_frozen: false,
+            created_at: Some(current_time()),
+        }
+    }
+}
+
+impl SummaSegmentAttributes {
+    pub fn frozen() -> Self {
+        SummaSegmentAttributes {
+            is_frozen: true,
+            created_at: Some(current_time()),
+        }
+    }
 }
 
 /// SegmentAttributes implementation owns custom segment attributes and its merging behavior
@@ -42,6 +67,7 @@ impl SegmentAttributes for SummaSegmentAttributes {
     fn merge(segments_attributes: Vec<Self>) -> Self {
         SummaSegmentAttributes {
             is_frozen: segments_attributes.into_iter().map(|v| v.is_frozen).reduce(|a, b| a && b).unwrap_or(false),
+            created_at: Some(current_time()),
         }
     }
 }
