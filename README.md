@@ -23,3 +23,9 @@ If you're ready to experience the power of Summa, be sure to check out our [Quic
 - [github.io](https://izihawa.github.io/summa)
 - [docs.rs](https://docs.rs/summa-core)
 
+## Donate
+
+You may support us at [OpenCollective](https://opencollective.com/izihawa) or by cryptos:
+- `monero: 464Wws65yssHdqGKGkFsHmbqNhBJ7zoPrbPTGAJma4VmTngtrJmQEaG9i739CUJJak3esALHpbWGXdVwMghzpFToLD6Q7Ne`
+- `btc: 3HooXUqJnZ4Ad8AGeqfSZ5QZQE72ZaZgY6`
+- `eth: 0x009AeabF4aeDe417d324077E7858956e6d0962D6`
