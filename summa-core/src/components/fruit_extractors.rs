@@ -180,7 +180,7 @@ fn snippet_generators(snippets: &HashMap<String, u32>, query: &dyn Query, search
         .collect()
 }
 
-async fn snippet_generators_async(snippets: HashMap<String, u32>, query: Box<dyn Query>, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
+async fn snippet_generators_async(snippets: &HashMap<String, u32>, query: Box<dyn Query>, searcher: &Searcher) -> HashMap<String, SnippetGenerator> {
     let futures = snippets.iter().filter_map(|(field_name, max_num_chars)| {
         let query = query.box_clone();
         searcher.schema().get_field(field_name).ok().map(|snippet_field| async move {
@@ -248,15 +248,15 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let length = fruit.len();
 
         let scored_documents = fruit.iter().take(std::cmp::min(self.limit as usize, length));
+        let snippet_generators = snippet_generators_async(&self.snippets, self.query, searcher).await;
+
         let document_futures = scored_documents.enumerate().map(|(position, (score, doc_address))| {
-            let fields = self.fields.clone();
-            let snippets = self.snippets.clone();
-            let query = self.query.box_clone();
+            let snippet_generators = &snippet_generators;
+            let fields = &self.fields;
             async move {
-                let snippet_generators = snippet_generators_async(snippets, query, searcher).await;
                 let document = searcher.doc_async(*doc_address).await.expect("Document retrieving failed");
                 proto::ScoredDocument {
-                    document: NamedFieldDocument::from_document(searcher.schema(), &fields, multi_fields, &document).to_json(),
+                    document: NamedFieldDocument::from_document(searcher.schema(), fields, multi_fields, &document).to_json(),
                     score: Some((*score).into()),
                     position: position as u32,
                     snippets: snippet_generators
