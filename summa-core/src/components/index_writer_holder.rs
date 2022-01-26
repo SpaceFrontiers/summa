@@ -121,7 +121,11 @@ impl IndexWriterImpl {
             IndexWriterImpl::SameThread(_) => {
                 unimplemented!()
             }
-            IndexWriterImpl::Threaded(writer) => Ok(writer.merge_with_attributes(segment_ids, segment_attributes).wait()?),
+            IndexWriterImpl::Threaded(writer) => {
+                let target_segment = writer.merge_with_attributes(segment_ids, segment_attributes).wait()?;
+                writer.garbage_collect_files().wait()?;
+                Ok(target_segment)
+            }
         }
     }
     pub fn commit(&mut self) -> SummaResult<()> {

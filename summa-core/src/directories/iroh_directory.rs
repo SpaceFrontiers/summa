@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{ops::Range, path::Path, sync::Arc, usize};
@@ -8,7 +9,7 @@ use iroh_metrics::resolver::OutMetrics;
 use iroh_resolver::resolver::{OutPrettyReader, Resolver};
 use iroh_unixfs::content_loader::ContentLoader;
 use tantivy::directory::error::{DeleteError, LockError, OpenWriteError};
-use tantivy::directory::{DirectoryLock, Lock, WatchCallback, WatchHandle, WritePtr};
+use tantivy::directory::{AntiCallToken, DirectoryLock, Lock, TerminatingWrite, WatchCallback, WatchHandle, WritePtr};
 use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     Directory, HasLen,
@@ -18,6 +19,26 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::components::Executor;
 use crate::errors::SummaResult;
 
+pub struct IrohTerminatingWrite {
+    inner: WritePtr,
+}
+
+impl Write for IrohTerminatingWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl TerminatingWrite for IrohTerminatingWrite {
+    fn terminate_ref(&mut self, act: AntiCallToken) -> std::io::Result<()> {
+        self.inner.terminate_ref(act)
+    }
+}
+
 /// Allow to implement searching over Iroh
 ///
 /// `IrohDirectory` translates `read_bytes` calls into Iroh requests to content
@@ -25,14 +46,13 @@ use crate::errors::SummaResult;
 pub struct IrohDirectory<D: Directory + Clone, T: ContentLoader + Unpin + 'static> {
     underlying: D,
     resolver: Resolver<T>,
-    files: HashMap<PathBuf, iroh_resolver::resolver::Out>,
-    cid: String,
+    cache: HashMap<PathBuf, iroh_resolver::resolver::Out>,
     executor: Executor,
 }
 
 impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Debug for IrohDirectory<D, T> {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "IrohDirectory({:?})", &self.cid)
+        write!(f, "IrohDirectory")
     }
 }
 
@@ -40,34 +60,33 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> IrohDirectory<D, 
     pub async fn new(underlying: D, loader: T, cid: &str, executor: Executor) -> SummaResult<IrohDirectory<D, T>> {
         let resolver = Resolver::new(loader);
         let root_path = resolver.resolve(iroh_resolver::Path::from_parts("ipfs", cid, "")?).await?;
-        let mut files = HashMap::new();
+        let mut cache = HashMap::new();
         for (file_name, cid) in root_path.named_links()?.into_iter() {
-            let file_name = PathBuf::from(file_name.expect("file without name"));
+            let file_name = PathBuf::from(file_name.expect("file should have name"));
             let resolved_path = resolver.resolve(iroh_resolver::Path::from_cid(cid)).await?;
-            files.insert(file_name, resolved_path);
+            cache.insert(file_name, resolved_path);
         }
         Ok(IrohDirectory {
             underlying,
             resolver,
-            files,
-            cid: cid.to_string(),
+            cache,
             executor,
         })
     }
 
-    fn get_iroh_file_handle(&self, file_name: &Path) -> Result<IrohFile<T>, OpenReadError> {
-        self.files
-            .get(file_name)
+    fn get_iroh_file_handle(&self, path: &Path) -> Result<IrohFile<T>, OpenReadError> {
+        self.cache
+            .get(path)
             .map(|file| IrohFile::new(file.clone(), self.resolver.clone(), self.executor.clone()))
-            .ok_or_else(|| OpenReadError::FileDoesNotExist(file_name.to_path_buf()))
+            .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))
     }
 }
 
 #[async_trait]
 impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for IrohDirectory<D, T> {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        Ok(if self.underlying.exists(path)? {
-            self.underlying.get_file_handle(path)?
+        Ok(if let Ok(file_handle) = self.underlying.get_file_handle(path) {
+            file_handle
         } else {
             Arc::new(self.get_iroh_file_handle(path)?)
         })
@@ -92,7 +111,7 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
     }
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
-        Ok(self.underlying.exists(path)? || self.files.contains_key(path))
+        Ok(self.underlying.exists(path)? || self.cache.contains_key(path))
     }
 
     fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
@@ -127,12 +146,12 @@ impl<D: Directory + Clone, T: ContentLoader + Unpin + 'static> Directory for Iro
         self.underlying.sync_directory()
     }
 
-    fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
-        self.underlying.watch(watch_callback)
-    }
-
     fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
         self.underlying.acquire_lock(lock)
+    }
+
+    fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.underlying.watch(watch_callback)
     }
 }
 

@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let serde_default_structs = &[
         "summa.proto.HistogramAggregation",
+        "summa.proto.IndexAttributes",
         "summa.proto.MoreLikeThisQuery",
         "summa.proto.PhraseQuery",
         "summa.proto.ReservoirSamplingCollector",

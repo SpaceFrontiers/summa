@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "summa-publisher"
-version = "0.1.2"
+version = "0.1.4"
 license-file = "LICENSE"
 description = "Tool for publishing directories with symlinks to iroh"
 homepage = "https://github.com/izihawa/summa"

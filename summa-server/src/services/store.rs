@@ -95,8 +95,7 @@ impl Store {
                         chunk_size: self.config.default_chunk_size as usize,
                     }))
                     .content_reader(reader.compat())
-                    .build()
-                    .await?,
+                    .build()?,
             ))
         }
         let root_directory = iroh_unixfs::builder::Entry::Directory(iroh_unixfs::builder::Directory::basic("".to_string(), entries));

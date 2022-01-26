@@ -33,25 +33,25 @@ struct Config {
 
 static CHUNK_SIZE: usize = 1024 * 1024;
 
-async fn publish(config_path: &str) -> Result<Option<Cid>, Box<dyn Error>> {
-    let config: Config = serde_yaml::from_slice(std::fs::read(config_path)?.as_slice())?;
-
-    let store_addr: StoreAddr = format!("irpc://{}", config.store.endpoint).parse().expect("cannot parse");
+async fn publish(store_endpoint: &str, root_path: &str, data_paths: &[String]) -> Result<Option<Cid>, Box<dyn Error>> {
+    let store_addr: StoreAddr = format!("irpc://{store_endpoint}").parse().expect("cannot parse");
     let store_client = iroh_rpc_client::store::StoreClient::new(store_addr).await.expect("cannot create store client");
 
     let root_directory = iroh_unixfs::builder::DirectoryBuilder::new()
         .chunker(iroh_unixfs::chunker::Chunker::Fixed(iroh_unixfs::chunker::Fixed { chunk_size: CHUNK_SIZE }))
-        .add_path(&config.layout.root)
+        .add_path(root_path)
         .await?;
     let mut data_dir = iroh_unixfs::builder::DirectoryBuilder::new().name("data");
 
-    for data_item in config.layout.data {
-        let cid = Cid::from_str(&data_item.cid)?;
+    for data_item in data_paths {
+        let items: Vec<_> = data_item.split(':').collect();
+        let (name, cid) = (items[0], items[1]);
+        let cid = Cid::from_str(cid)?;
         let block = store_client.get(cid).await?.unwrap_or_else(|| panic!("Cannot find {cid} at store"));
         let node = UnixfsNode::decode(&cid, block)?;
-        data_dir = data_dir.add_raw_block(iroh_unixfs::builder::RawBlock::new(&data_item.name, node.encode()?));
+        data_dir = data_dir.add_raw_block(iroh_unixfs::builder::RawBlock::new(name, node.encode()?));
     }
-    let root_directory = root_directory.add_dir(data_dir.build().await?)?.build().await?;
+    let root_directory = root_directory.add_dir(data_dir.build()?)?.build()?;
 
     let mut blocks = root_directory.encode();
     let mut chunk = Vec::new();
@@ -84,15 +84,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .arg(arg!(-v --verbose ... "Level of verbosity"))
         .subcommand(
             command!("publish")
-                .about("Publish layouted data to storage")
-                .arg(arg!(-c <CONFIG_PATH> "Path to config").default_value("layout.yaml").num_args(1)),
+                .about("Publish data to storage")
+                .arg(arg!(-s <STORE_ENDPOINT> "Iroh Store endpoint").default_value("0.0.0.0:4402").num_args(1))
+                .arg(
+                    arg!(-r <ROOT_PATH> "Path to files that will be put in the root of CAR")
+                        .default_value("web/dist")
+                        .num_args(1),
+                )
+                .arg(arg!(-d <DATA_PATH> "Names and cids of `data` directory members in format <name>:<cid>")),
         )
         .get_matches();
 
     match matches.subcommand() {
         Some(("publish", submatches)) => {
-            let config_path = submatches.try_get_one::<String>("CONFIG_PATH")?.expect("no config selected");
-            let published_cid = publish(config_path).await?.expect("no new cid").to_string();
+            let store_endpoint = submatches.get_one::<String>("STORE_ENDPOINT").expect("wrong STORE_ENDPOINT");
+            let root_path = submatches.get_one::<String>("ROOT_PATH").expect("wrong ROOT_PATH");
+            let data_paths = submatches
+                .get_many::<String>("DATA_PATH")
+                .map(|x| x.cloned().collect::<Vec<String>>())
+                .unwrap_or_default();
+            let published_cid = publish(store_endpoint, root_path, &data_paths).await?.expect("no new cid").to_string();
             println!("{published_cid}");
         }
         _ => unreachable!("Exhausted list of subcommands and subcommand_required prevents `None`"),

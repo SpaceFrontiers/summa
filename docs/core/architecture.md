@@ -77,7 +77,7 @@ After the last step, you will see the CID of the index that can be used for repl
 You can retrieve it via usual IPFS tools or directly attach it at another Summa Server instance:
 
 ```bash 
-summa-cli 0.0.0.0:8082 attach-index test_index --ipfs '{"cid": "<cid from the previous step>" }'
+summa-cli 0.0.0.0:8082 attach-index test_index '{"ipfs": {"cid": "<cid from the previous step>" }}'
 ```
 
 ### Aliases
