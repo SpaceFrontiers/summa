@@ -48,7 +48,6 @@ async fn publish(config_path: &str) -> Result<Option<Cid>, Box<dyn Error>> {
     for data_item in config.layout.data {
         let cid = Cid::from_str(&data_item.cid)?;
         let block = store_client.get(cid).await?.unwrap_or_else(|| panic!("Cannot find {cid} at store"));
-        println!("Adding {cid:?} with size {}", block.len());
         let node = UnixfsNode::decode(&cid, block)?;
         data_dir = data_dir.add_raw_block(iroh_unixfs::builder::RawBlock::new(&data_item.name, node.encode()?));
     }

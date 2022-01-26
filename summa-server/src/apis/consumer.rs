@@ -7,7 +7,6 @@ use tonic::{Request, Response, Status};
 
 use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
-use crate::requests::CreateConsumerRequest;
 use crate::services::Index;
 
 pub struct ConsumerApiImpl {
@@ -26,13 +25,10 @@ impl ConsumerApiImpl {
 impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     async fn create_consumer(&self, proto_request: Request<proto::CreateConsumerRequest>) -> Result<Response<proto::CreateConsumerResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let create_consumer_request = CreateConsumerRequest::from_proto(&proto_request)?;
-        let index_name = self.index_service.create_consumer(&create_consumer_request).await?;
+        let consumer_name = proto_request.consumer_name.clone();
+        let index_name = self.index_service.create_consumer(proto_request).await?;
         let response = proto::CreateConsumerResponse {
-            consumer: Some(proto::Consumer {
-                index_name,
-                consumer_name: create_consumer_request.consumer_name.to_owned(),
-            }),
+            consumer: Some(proto::Consumer { index_name, consumer_name }),
         };
         Ok(Response::new(response))
     }
@@ -70,7 +66,7 @@ impl proto::consumer_api_server::ConsumerApi for ConsumerApiImpl {
     }
 
     async fn delete_consumer(&self, proto_request: Request<proto::DeleteConsumerRequest>) -> Result<Response<proto::DeleteConsumerResponse>, Status> {
-        let delete_consumer_response = self.index_service.delete_consumer(proto_request.into_inner().into()).await?;
+        let delete_consumer_response = self.index_service.delete_consumer(proto_request.into_inner()).await?;
         Ok(Response::new(delete_consumer_response))
     }
 }

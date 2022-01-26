@@ -46,6 +46,13 @@ message PrimaryKey {
   }
 }
 
+message MergePolicy {
+  oneof merge_policy {
+   LogMergePolicy log = 11;
+   TemporalMergePolicy temporal = 12;
+ }
+}
+
 // Attach file engine request
 message AttachFileEngineRequest {}
 
@@ -68,6 +75,7 @@ message AttachIndexRequest {
    AttachRemoteEngineRequest remote = 3;
    AttachIpfsEngineRequest ipfs = 4;
  }
+ MergePolicy merge_policy = 10;
 }
 
 // Attach index response
@@ -99,6 +107,7 @@ message MigrateIndexRequest {
     CreateMemoryEngineRequest memory = 4;
     CreateIpfsEngineRequest ipfs = 5;
   }
+  MergePolicy merge_policy = 6;
 }
 
 // Response describing migrated index
@@ -153,6 +162,8 @@ message CreateIndexRequest {
   optional SortByField sort_by_field = 5;
   // Optional index fields
   IndexAttributes index_attributes = 6;
+  // Merge policy
+  MergePolicy merge_policy = 20;
 }
 
 message CreateIndexResponse {
@@ -279,6 +290,13 @@ message IpfsEngineConfig {
   string path = 3;
 }
 
+message LogMergePolicy {
+  bool is_frozen = 1;
+}
+message TemporalMergePolicy{
+  uint64 merge_older_then_secs = 1;
+}
+
 message IndexEngineConfig {
   oneof config {
     FileEngineConfig file = 1;
@@ -286,6 +304,8 @@ message IndexEngineConfig {
     RemoteEngineConfig remote = 3;
     IpfsEngineConfig ipfs = 4;
   }
+  // Merge policy
+  MergePolicy merge_policy = 10;
 }
 
 message IndexDescription {

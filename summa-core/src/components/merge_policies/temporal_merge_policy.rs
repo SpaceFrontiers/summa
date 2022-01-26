@@ -1,30 +1,28 @@
 use std::fmt::Debug;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use instant::SystemTime;
 use serde::{Deserialize, Serialize};
 use tantivy::merge_policy::{MergeCandidate, MergePolicy};
 use tantivy::{SegmentId, SegmentMeta};
 
-use super::SummaSegmentAttributes;
+use crate::components::SummaSegmentAttributes;
 
 /// `TemporalMergePolicy` collapses segments old enough into a single one
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TemporalMergePolicy {
-    merge_older_then_n_secs: u64,
+    merge_older_then_secs: u64,
 }
 
 impl TemporalMergePolicy {
-    pub fn merge_before(merge_older_then: Duration) -> TemporalMergePolicy {
-        TemporalMergePolicy {
-            merge_older_then_n_secs: merge_older_then.as_secs(),
-        }
+    pub fn new(merge_older_then_secs: u64) -> TemporalMergePolicy {
+        TemporalMergePolicy { merge_older_then_secs }
     }
 }
 
 impl MergePolicy for TemporalMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
-        let merge_pivot = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time goes backward").as_secs() - self.merge_older_then_n_secs;
+        let merge_pivot = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time goes backward").as_secs() - self.merge_older_then_secs;
         let old_segments = segments
             .iter()
             .filter(|segment_meta| {

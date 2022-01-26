@@ -53,9 +53,8 @@ class SummaClient(BaseGrpcClient):
     async def attach_index(
         self,
         index_name: str,
-        file: Optional[Union[index_service_pb.AttachFileEngineRequest, Dict]] = None,
-        remote: Optional[Union[index_service_pb.AttachRemoteEngineRequest, Dict]] = None,
-        ipfs: Optional[Union[index_service_pb.AttachIpfsEngineRequest, Dict]] = None,
+        index_engine: dict,
+        merge_policy: Optional[Dict] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.AttachIndexResponse:
@@ -65,15 +64,14 @@ class SummaClient(BaseGrpcClient):
         Args:
             index_name: index name
             index_engine: {"file": {}}, {"memory": {}} or {"remote": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
-            file: attaching index placed under `<data_path>/<index_name>` directory
-            remote: attaching remote index
-            ipfs: attaching ipfs index
+            merge_policy: describes how to select segments for merging, possible values: {"log": {}}, {"temporal": {}}
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].attach_index(
             index_service_pb.AttachIndexRequest(
                 index_name=index_name,
+                merge_policy=index_service_pb.MergePolicy(**(merge_policy or {})),
                 **index_engine,
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -153,6 +151,7 @@ class SummaClient(BaseGrpcClient):
         blocksize: Optional[int] = None,
         sort_by_field: Optional[Tuple] = None,
         index_attributes: Optional[Dict] = None,
+        merge_policy: Optional[Dict] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
@@ -166,6 +165,7 @@ class SummaClient(BaseGrpcClient):
             compression: Tantivy index compression
             blocksize: Docstore blocksize
             index_attributes: Various index attributes such as default fields, multi fields, primary keys etc.
+            merge_policy: describes how to select segments for merging, possible values: {"log": {}}, {"temporal": {}}
             request_id: request id
             session_id: session id
             sort_by_field: (field_name, order)
@@ -187,6 +187,7 @@ class SummaClient(BaseGrpcClient):
                     field=sort_by_field[0],
                     order=sort_by_field[1].capitalize(),
                 ) if sort_by_field else None,
+                merge_policy=index_service_pb.MergePolicy(**(merge_policy or {})),
                 **index_engine
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -198,6 +199,7 @@ class SummaClient(BaseGrpcClient):
         source_index_name: str,
         target_index_name: str,
         target_index_engine: dict,
+        merge_policy: Optional[Dict] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
@@ -208,6 +210,7 @@ class SummaClient(BaseGrpcClient):
             source_index_name: source index name
             target_index_name: target index name
             target_index_engine: {"file": {}}, {"memory": {}} or {"ipfs": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
+            merge_policy: describes how to select segments for merging, possible values: {"log": {}}, {"temporal": {}}
             request_id: request id
             session_id: session id
         """
@@ -215,6 +218,7 @@ class SummaClient(BaseGrpcClient):
             index_service_pb.MigrateIndexRequest(
                 source_index_name=source_index_name,
                 target_index_name=target_index_name,
+                merge_policy=index_service_pb.MergePolicy(**(merge_policy or {})),
                 **target_index_engine,
             ),
             metadata=setup_metadata(session_id, request_id),

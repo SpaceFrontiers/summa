@@ -68,8 +68,6 @@ pub enum Error {
     InvalidAggregation,
     #[error("{0:?}: {1:?}")]
     InvalidFieldType(String, FieldType),
-    #[error("invalid_index_engine_error: {0:?}")]
-    InvalidIndexEngine(summa_proto::proto::IndexEngineConfig),
     #[error("{0:?}")]
     InvalidSyntax(String),
     #[error("{0:?} for {1:?}")]

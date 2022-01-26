@@ -73,16 +73,15 @@ impl IndexApiImpl {
 #[tonic::async_trait]
 impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn attach_index(&self, proto_request: Request<proto::AttachIndexRequest>) -> Result<Response<proto::AttachIndexResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.attach_index(proto_request.try_into()?).await?;
+        let index_holder = self.index_service.attach_index(proto_request.into_inner()).await?;
         let response = proto::AttachIndexResponse {
             index: Some(self.get_index_description(&index_holder).await),
         };
         Ok(Response::new(response))
     }
 
-    async fn commit_index(&self, request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
-        let request = request.into_inner();
+    async fn commit_index(&self, proto_request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
+        let request = proto_request.into_inner();
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
                 let index_service = self.index_service.clone();
@@ -106,7 +105,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn create_index(&self, proto_request: Request<proto::CreateIndexRequest>) -> Result<Response<proto::CreateIndexResponse>, Status> {
-        let index_holder = self.index_service.create_index(proto_request.into_inner().try_into()?).await?;
+        let index_holder = self.index_service.create_index(proto_request.into_inner()).await?;
         let response = proto::CreateIndexResponse {
             index: Some(self.get_index_description(&index_holder).await),
         };
@@ -190,7 +189,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn delete_index(&self, proto_request: Request<proto::DeleteIndexRequest>) -> Result<Response<proto::DeleteIndexResponse>, Status> {
-        Ok(Response::new(self.index_service.delete_index(proto_request.into_inner().into()).await?.into()))
+        Ok(Response::new(self.index_service.delete_index(proto_request.into_inner()).await?.into()))
     }
 
     async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {

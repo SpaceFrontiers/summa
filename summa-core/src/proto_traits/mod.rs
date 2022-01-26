@@ -1,5 +1,6 @@
 pub mod aggregation;
 pub mod compression;
+pub mod merge_policy;
 pub mod order;
 pub mod snippet;
 pub mod sort_by_field;

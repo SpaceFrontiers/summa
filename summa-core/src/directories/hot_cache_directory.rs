@@ -366,7 +366,7 @@ impl Directory for HotDirectory {
             .inner
             .cache
             .get_file_length(path)
-            .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_owned()))?;
+            .unwrap_or_else(|| panic!("Cache queried for nonexistent file: {path:?}"));
         let underlying_filehandle = self.inner.underlying.get_file_handle(path)?;
         let underlying = FileSlice::new_with_num_bytes(underlying_filehandle, file_length as usize);
         let file_slice_with_cache = FileSliceWithCache {

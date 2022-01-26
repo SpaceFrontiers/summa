@@ -1,16 +1,15 @@
 mod custom_serializer;
 mod default_tokenizers;
 mod executor;
-mod frozen_log_merge_policy;
 mod fruit_extractors;
 mod index_holder;
 mod index_registry;
 mod index_writer_holder;
+pub mod merge_policies;
 mod query_parser;
 mod segment_attributes;
 mod summa_document;
 mod summa_tokenizer;
-mod temporal_merge_policy;
 
 pub use default_tokenizers::default_tokenizers;
 pub use executor::Executor;
@@ -23,7 +22,6 @@ pub use query_parser::QueryParser;
 pub use segment_attributes::SummaSegmentAttributes;
 pub use summa_document::{DocumentParsingError, SummaDocument};
 pub use summa_tokenizer::SummaTokenizer;
-pub use temporal_merge_policy::TemporalMergePolicy;
 
 use crate::metrics::CacheMetrics;
 

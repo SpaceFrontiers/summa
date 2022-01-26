@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
@@ -13,10 +13,12 @@ use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
+use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
 use summa_proto::proto;
 use tantivy::merge_policy::NoMergePolicy;
+use tantivy::store::ZstdCompressor;
 use tantivy::IndexBuilder;
 use tokio::sync::RwLock;
 use tracing::{info, info_span, instrument, warn, Instrument};
@@ -25,7 +27,7 @@ use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
 use crate::hyper_external_request::HyperExternalRequest;
-use crate::requests::{AttachIndexRequest, CreateConsumerRequest, CreateIndexRequest, DeleteConsumerRequest, DeleteIndexRequest};
+use crate::validators;
 
 /// `services::Index` is responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone)]
@@ -123,9 +125,11 @@ impl Index {
             let index = self.create_index_from(index_engine_config, false).await?;
             let core_config = self.server_config.read().await.get().core.clone();
             let index_engine_config_holder = self.derive_configs(&index_name).await;
-            let index_holder =
-                tokio::task::spawn_blocking(move || IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, false))
-                    .await??;
+            let merge_policy = core_config.indices[&index_name].merge_policy.clone();
+            let index_holder = tokio::task::spawn_blocking(move || {
+                IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, merge_policy, false)
+            })
+            .await??;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
         }
         info!(action = "setting_index_holders", indices = ?index_holders.keys().collect::<Vec<_>>());
@@ -181,22 +185,25 @@ impl Index {
         self.insert_config(index_name, index_engine_config).await?;
         let core_config = self.server_config.read().await.get().core.clone();
         let index_engine_config_holder = self.derive_configs(index_name).await;
+        let merge_policy = index_engine_config.merge_policy.clone();
         let index_name = index_name.to_string();
         Ok(self
             .index_registry
             .add(
-                tokio::task::spawn_blocking(move || IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, false))
-                    .await??,
+                tokio::task::spawn_blocking(move || {
+                    IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, merge_policy, false)
+                })
+                .await??,
             )
             .await?)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?attach_index_request.index_name))]
-    pub async fn attach_index(&self, attach_index_request: AttachIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+    pub async fn attach_index(&self, attach_index_request: proto::AttachIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_path = self.server_config.read().await.get().get_path_for_index_data(&attach_index_request.index_name);
-        let (index, index_engine_config) = match attach_index_request.attach_index_request {
-            proto::attach_index_request::IndexEngine::File(proto::AttachFileEngineRequest {}) => {
+        let (index, index_engine_config) = match attach_index_request.index_engine {
+            None | Some(proto::attach_index_request::IndexEngine::File(proto::AttachFileEngineRequest {})) => {
                 if !index_path.exists() {
                     return Err(ValidationError::MissingIndex(attach_index_request.index_name.to_string()).into());
                 }
@@ -206,10 +213,11 @@ impl Index {
                 let index = IndexHolder::attach_file_index(&file_engine_config).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::File(file_engine_config)),
+                    merge_policy: attach_index_request.merge_policy,
                 };
                 (index, index_engine_config)
             }
-            proto::attach_index_request::IndexEngine::Ipfs(proto::AttachIpfsEngineRequest { cid, chunked_cache_config }) => {
+            Some(proto::attach_index_request::IndexEngine::Ipfs(proto::AttachIpfsEngineRequest { cid, chunked_cache_config })) => {
                 let ipfs_index_engine = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
                     chunked_cache_config,
@@ -218,6 +226,7 @@ impl Index {
                 let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), false).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
+                    merge_policy: attach_index_request.merge_policy,
                 };
                 (index, index_engine_config)
             }
@@ -228,39 +237,51 @@ impl Index {
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
-    pub async fn create_index(&self, create_index_request: CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_attributes = create_index_request.index_attributes;
+    pub async fn create_index(&self, create_index_request: proto::CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+        let schema = validators::parse_schema(&create_index_request.schema)?;
+
+        let mut index_attributes = create_index_request.index_attributes.unwrap_or_default();
+        validators::parse_fields(&schema, &index_attributes.default_fields)?;
+        validators::parse_fields(&schema, &index_attributes.multi_fields)?;
+        validators::parse_fields(&schema, &index_attributes.unique_fields)?;
+
+        index_attributes.created_at = SystemTime::now().duration_since(UNIX_EPOCH).expect("cannot retrieve time").as_secs();
+
         let index_settings = tantivy::IndexSettings {
-            docstore_compression: create_index_request.compression,
-            docstore_blocksize: create_index_request.blocksize.unwrap_or(16384),
-            sort_by_field: create_index_request.sort_by_field.clone(),
+            docstore_compression: proto::Compression::from_i32(create_index_request.compression)
+                .map(|c| Wrapper::from(c).into())
+                .unwrap_or(tantivy::store::Compressor::Zstd(ZstdCompressor::default())),
+            docstore_blocksize: create_index_request.blocksize.unwrap_or(16384) as usize,
+            sort_by_field: create_index_request.sort_by_field.map(|s| Wrapper::from(s).into()),
             ..Default::default()
         };
         let index_builder = tantivy::Index::builder()
-            .schema(create_index_request.schema.clone())
+            .schema(schema)
             .settings(index_settings)
             .index_attributes(index_attributes);
         let (index, index_engine_config) = match create_index_request.index_engine {
-            proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {}) => {
+            None | Some(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {})) => {
                 let index_path = self.server_config.read().await.get().get_path_for_index_data(&create_index_request.index_name);
                 let index = IndexHolder::create_file_index(&index_path, index_builder).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::File(proto::FileEngineConfig {
                         path: index_path.to_string_lossy().to_string(),
                     })),
+                    merge_policy: create_index_request.merge_policy,
                 };
                 (index, index_engine_config)
             }
-            proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}) => {
+            Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})) => {
                 let index = index_builder.create_in_ram()?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Memory(proto::MemoryEngineConfig {
                         schema: serde_yaml::to_string(&index.schema()).expect("cannot serialize"),
                     })),
+                    merge_policy: create_index_request.merge_policy,
                 };
                 (index, index_engine_config)
             }
-            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config }) => {
+            Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
                 let index = index_builder.create_in_ram()?;
                 let writer_heap_size_bytes = self.server_config.read().await.get().core.writer_heap_size_bytes;
                 let merge_policy = Box::<NoMergePolicy>::default();
@@ -282,6 +303,7 @@ impl Index {
                 };
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config.clone())),
+                    merge_policy: create_index_request.merge_policy,
                 };
                 let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), false).await?;
                 (index, index_engine_config)
@@ -292,7 +314,7 @@ impl Index {
 
     /// Delete index, optionally with all its aliases and consumers
     #[instrument(skip_all, fields(index_name = ?delete_index_request.index_name))]
-    pub async fn delete_index(&self, delete_index_request: DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
+    pub async fn delete_index(&self, delete_index_request: proto::DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
         let mut server_config = self.server_config.write().await;
         let aliases = server_config.get().core.get_index_aliases_for_index(&delete_index_request.index_name);
         match (
@@ -335,26 +357,29 @@ impl Index {
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?create_consumer_request.consumer_name))]
-    pub async fn create_consumer(&self, create_consumer_request: &CreateConsumerRequest) -> SummaServerResult<String> {
-        let index_holder = self
-            .index_registry
-            .get_index_holder(&create_consumer_request.consumer_config.index_name)
-            .await?;
-        let prepared_consumption = PreparedConsumption::from_config(&create_consumer_request.consumer_name, &create_consumer_request.consumer_config)?;
+    pub async fn create_consumer(&self, create_consumer_request: proto::CreateConsumerRequest) -> SummaServerResult<String> {
+        let index_holder = self.index_registry.get_index_holder(&create_consumer_request.index_name).await?;
+        let consumer_config = crate::configs::consumer::Config::new(
+            &create_consumer_request.index_name,
+            &create_consumer_request.bootstrap_servers,
+            &create_consumer_request.group_id,
+            &create_consumer_request.topics,
+        )?;
+        let prepared_consumption = PreparedConsumption::from_config(&create_consumer_request.consumer_name, &consumer_config)?;
         prepared_consumption.on_create().await?;
         self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         let mut server_config = self.server_config.write().await;
-        server_config.get_mut().consumers.insert(
-            create_consumer_request.consumer_name.to_string(),
-            create_consumer_request.consumer_config.clone(),
-        );
+        server_config
+            .get_mut()
+            .consumers
+            .insert(create_consumer_request.consumer_name.to_string(), consumer_config);
         server_config.commit().await?;
         Ok(index_holder.index_name().to_owned())
     }
 
     /// Delete consumer from the consumer registry and from `IndexHolder` afterwards.
     #[instrument(skip_all, fields(consumer_name = ?delete_consumer_request.consumer_name))]
-    pub async fn delete_consumer(&self, delete_consumer_request: DeleteConsumerRequest) -> SummaServerResult<proto::DeleteConsumerResponse> {
+    pub async fn delete_consumer(&self, delete_consumer_request: proto::DeleteConsumerRequest) -> SummaServerResult<proto::DeleteConsumerResponse> {
         let mut server_config = self.server_config.write().await;
         if server_config.get_mut().consumers.remove(&delete_consumer_request.consumer_name).is_none() {
             return Err(ValidationError::MissingConsumer(delete_consumer_request.consumer_name.to_string()).into());
@@ -561,6 +586,7 @@ impl Index {
                     index,
                     &proto::IndexEngineConfig {
                         config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)),
+                        merge_policy: migrate_index_request.merge_policy,
                     },
                 )
                 .await?
@@ -603,7 +629,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::configs::server::tests::create_test_server_config_holder;
     use crate::logging;
-    use crate::requests::{CreateIndexRequestBuilder, DeleteIndexRequestBuilder};
     use crate::utils::signal_channel;
     use crate::utils::tests::acquire_free_port;
 
@@ -639,21 +664,22 @@ pub(crate) mod tests {
     pub async fn create_test_index_holder(
         index_service: &Index,
         schema: &Schema,
-        engine: proto::create_index_request::IndexEngine,
+        index_engine: proto::create_index_request::IndexEngine,
     ) -> SummaServerResult<Handler<IndexHolder>> {
         index_service
-            .create_index(
-                CreateIndexRequestBuilder::default()
-                    .index_name("test_index".to_owned())
-                    .index_attributes(proto::IndexAttributes {
-                        default_fields: vec!["title".to_owned(), "body".to_owned()],
-                        ..Default::default()
-                    })
-                    .index_engine(engine)
-                    .schema(schema.clone())
-                    .build()
-                    .unwrap(),
-            )
+            .create_index(proto::CreateIndexRequest {
+                index_name: "test_index".to_owned(),
+                schema: serde_yaml::to_string(schema).unwrap(),
+                compression: 0,
+                blocksize: None,
+                sort_by_field: None,
+                index_attributes: Some(proto::IndexAttributes {
+                    default_fields: vec!["title".to_owned(), "body".to_owned()],
+                    ..Default::default()
+                }),
+                index_engine: Some(index_engine),
+                merge_policy: None,
+            })
             .await
     }
 
@@ -764,25 +790,29 @@ pub(crate) mod tests {
             create_test_store_service(&data_path).await,
         )?;
         assert!(index_service
-            .create_index(
-                CreateIndexRequestBuilder::default()
-                    .index_name("test_index".to_owned())
-                    .index_engine(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}))
-                    .schema(create_test_schema())
-                    .build()
-                    .unwrap(),
-            )
+            .create_index(proto::CreateIndexRequest {
+                index_name: "test_index".to_owned(),
+                schema: serde_yaml::to_string(&create_test_schema()).unwrap(),
+                compression: 0,
+                blocksize: None,
+                sort_by_field: None,
+                index_attributes: None,
+                index_engine: Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})),
+                merge_policy: None,
+            },)
             .await
             .is_ok());
         assert!(index_service
-            .create_index(
-                CreateIndexRequestBuilder::default()
-                    .index_name("test_index".to_owned())
-                    .index_engine(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}))
-                    .schema(create_test_schema())
-                    .build()
-                    .unwrap(),
-            )
+            .create_index(proto::CreateIndexRequest {
+                index_name: "test_index".to_owned(),
+                schema: serde_yaml::to_string(&create_test_schema()).unwrap(),
+                compression: 0,
+                blocksize: None,
+                sort_by_field: None,
+                index_attributes: None,
+                index_engine: Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})),
+                merge_policy: None,
+            },)
             .await
             .is_err());
         Ok(())
@@ -798,28 +828,34 @@ pub(crate) mod tests {
 
         let index_service = Index::new(&server_config_holder, create_test_store_service(&data_path).await)?;
         index_service
-            .create_index(
-                CreateIndexRequestBuilder::default()
-                    .index_name("test_index".to_owned())
-                    .index_engine(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {}))
-                    .schema(create_test_schema())
-                    .build()
-                    .unwrap(),
-            )
+            .create_index(proto::CreateIndexRequest {
+                index_name: "test_index".to_owned(),
+                schema: serde_yaml::to_string(&create_test_schema()).unwrap(),
+                compression: 0,
+                blocksize: None,
+                sort_by_field: None,
+                index_attributes: None,
+                index_engine: Some(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {})),
+                merge_policy: None,
+            })
             .await?;
         assert!(index_service
-            .delete_index(DeleteIndexRequestBuilder::default().index_name("test_index".to_owned()).build().unwrap())
+            .delete_index(proto::DeleteIndexRequest {
+                index_name: "test_index".to_string()
+            })
             .await
             .is_ok());
         assert!(index_service
-            .create_index(
-                CreateIndexRequestBuilder::default()
-                    .index_name("test_index".to_owned())
-                    .index_engine(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {}))
-                    .schema(create_test_schema())
-                    .build()
-                    .unwrap()
-            )
+            .create_index(proto::CreateIndexRequest {
+                index_name: "test_index".to_owned(),
+                schema: serde_yaml::to_string(&create_test_schema()).unwrap(),
+                compression: 0,
+                blocksize: None,
+                sort_by_field: None,
+                index_attributes: None,
+                index_engine: Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})),
+                merge_policy: None,
+            },)
             .await
             .is_ok());
         Ok(())
@@ -861,7 +897,9 @@ pub(crate) mod tests {
         assert_eq!(search_response.len(), 1);
         drop(index_holder);
         index_service
-            .delete_index(DeleteIndexRequestBuilder::default().index_name("test_index".to_owned()).build().unwrap())
+            .delete_index(proto::DeleteIndexRequest {
+                index_name: "test_index".to_string(),
+            })
             .await?;
         Ok(())
     }
@@ -896,7 +934,9 @@ pub(crate) mod tests {
 
         drop(index_holder);
         index_service
-            .delete_index(DeleteIndexRequestBuilder::default().index_name("test_index".to_owned()).build().unwrap())
+            .delete_index(proto::DeleteIndexRequest {
+                index_name: "test_index".to_string(),
+            })
             .await?;
         Ok(())
     }

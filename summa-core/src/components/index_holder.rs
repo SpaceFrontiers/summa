@@ -23,7 +23,6 @@ use tracing::{instrument, trace};
 
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
-use crate::components::frozen_log_merge_policy::FrozenLogMergePolicy;
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
@@ -143,6 +142,7 @@ impl IndexHolder {
         mut index: Index,
         index_name: Option<&str>,
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
+        merge_policy: Option<proto::MergePolicy>,
         read_only: bool,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
@@ -164,16 +164,12 @@ impl IndexHolder {
 
         let index_writer_holder = match (read_only, &core_config.writer_threads) {
             (true, _) | (_, None) => None,
-            (_, Some(writer_threads)) => {
-                // ToDo: Make it configurable
-                let merge_policy = Box::<FrozenLogMergePolicy>::default();
-                Some(Arc::new(RwLock::new(IndexWriterHolder::create(
-                    &index,
-                    writer_threads.clone(),
-                    core_config.writer_heap_size_bytes as usize,
-                    merge_policy,
-                )?)))
-            }
+            (_, Some(writer_threads)) => Some(Arc::new(RwLock::new(IndexWriterHolder::create(
+                &index,
+                writer_threads.clone(),
+                core_config.writer_heap_size_bytes as usize,
+                Wrapper::from(merge_policy).into(),
+            )?))),
         };
 
         Ok(IndexHolder {
