@@ -244,12 +244,11 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         searcher: &Searcher,
         multi_fields: &HashSet<Field>,
     ) -> SummaResult<proto::CollectorOutput> {
+        let snippet_generators = snippet_generators_async(&self.snippets, self.query, searcher).await;
         let fruit = self.handle.extract(multi_fruit);
         let length = fruit.len();
 
         let scored_documents = fruit.iter().take(std::cmp::min(self.limit as usize, length));
-        let snippet_generators = snippet_generators_async(&self.snippets, self.query, searcher).await;
-
         let document_futures = scored_documents.enumerate().map(|(position, (score, doc_address))| {
             let snippet_generators = &snippet_generators;
             let fields = &self.fields;

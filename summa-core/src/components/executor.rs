@@ -12,11 +12,11 @@ impl Executor {
     }
 
     pub fn spawn_blocking<F: Debug + Send + 'static>(&self, f: impl Future<Output = F> + Send + 'static) -> F {
-        let (s, mut r) = tokio::sync::mpsc::unbounded_channel();
+        let (s, r) = oneshot::channel();
         match self {
             Executor::Tokio(handle) => {
                 handle.spawn(async move { s.send(f.await).expect("cannot send to channel") });
-                r.blocking_recv().expect("cannot block on channel")
+                r.recv().expect("cannot block on channel")
             }
         }
     }
