@@ -29,14 +29,16 @@ If you're ready to experience the power of Summa, be sure to check out our [Quic
 
 ### Server
 
-- [Docker (stable)](https://hub.docker.com/r/izihawa/summa-server/stable)
+⚠️ *The project is under active development, we do not publish `latest` images yet. The best option now
+is `testing`*
+
 - [Docker (testing)](https://hub.docker.com/r/izihawa/summa-server/testing)
+- [Docker (v0.11.0)](https://hub.docker.com/r/izihawa/summa-server/0.11.0)
 
 ### Clients
 
 - [Python](https://pypi.org/project/aiosumma/)
 - [Rust (proto)](https://lib.rs/crates/summa-proto)
-
 
 ## Donate
 
