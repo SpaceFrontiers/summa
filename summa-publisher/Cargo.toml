@@ -19,6 +19,4 @@ futures-lite = "1.12.0"
 iroh-rpc-client = { workspace = true }
 iroh-rpc-types = { workspace = true }
 iroh-unixfs = { workspace = true }
-serde = { workspace = true }
-serde_yaml = { workspace = true }
 tokio = { workspace = true }

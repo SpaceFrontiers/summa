@@ -20,8 +20,23 @@ If you're ready to experience the power of Summa, be sure to check out our [Quic
 
 ## Online-documentation
 
+- [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start)
+- [Architecture](https://izihawa.github.io/summa/core/architecture)
 - [github.io](https://izihawa.github.io/summa)
 - [docs.rs](https://docs.rs/summa-core)
+
+## Distribution
+
+### Server
+
+- [Docker (stable)](https://hub.docker.com/r/izihawa/summa-server/stable)
+- [Docker (testing)](https://hub.docker.com/r/izihawa/summa-server/testing)
+
+### Clients
+
+- [Python](https://pypi.org/project/aiosumma/)
+- [Rust (proto)](https://lib.rs/crates/summa-proto)
+
 
 ## Donate
 

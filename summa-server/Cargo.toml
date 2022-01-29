@@ -37,14 +37,12 @@ async-broadcast = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 config = "0.13"
-console-subscriber = "0.1"
 derive_builder = { workspace = true }
 futures = { workspace = true }
 futures-util = "0.3"
 headers = "0.3"
 hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
 iroh-gateway = { workspace = true }
-iroh-metrics = { workspace = true }
 iroh-p2p = { workspace = true }
 iroh-resolver = { workspace = true }
 iroh-rpc-client = { workspace = true }

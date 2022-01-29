@@ -6,9 +6,7 @@ use clap::{arg, command};
 use futures_lite::stream::StreamExt;
 use iroh_rpc_types::store::StoreAddr;
 use iroh_unixfs::unixfs::UnixfsNode;
-use serde::{Deserialize, Serialize};
 
-static DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 static DEFAULT_CODE: cid::multihash::Code = cid::multihash::Code::Blake3_256;
 
 async fn publish(store_endpoint: &str, root_path: &str, data_paths: &[String], chunk_size: usize) -> Result<Option<Cid>, Box<dyn Error>> {
@@ -25,7 +23,7 @@ async fn publish(store_endpoint: &str, root_path: &str, data_paths: &[String], c
         let items: Vec<_> = data_item.split(':').collect();
         let (name, cid) = (items[0], items[1]);
         let cid = Cid::from_str(cid)?;
-        let block = store_client.get(cid).await??;
+        let block = store_client.get(cid).await?.unwrap_or_else(|| panic!("`{cid}` is not found in Iroh Store"));
         let node = UnixfsNode::decode(&cid, block)?;
         data_dir = data_dir.add_raw_block(iroh_unixfs::builder::RawBlock::new(name, node.encode(&cid::multihash::Code::Blake3_256)?));
     }
@@ -36,10 +34,11 @@ async fn publish(store_endpoint: &str, root_path: &str, data_paths: &[String], c
     let mut chunk_size = 0u64;
     let mut cid = None;
 
-    while let Some(block) = blocks.next().await? {
+    while let Some(block) = blocks.next().await {
+        let block = block?;
         let block_size = block.data().len() as u64 + block.links().len() as u64 * 128;
         cid = Some(*block.cid());
-        if chunk_size + block_size > chunk_size as u64 {
+        if chunk_size + block_size > chunk_size {
             store_client.put_many(std::mem::take(&mut chunk)).await?;
             chunk_size = 0;
         }
@@ -69,20 +68,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .num_args(1),
                 )
                 .arg(arg!(-d <DATA_PATH> "Names and CIDs for mounting under `data` sub-directory in format `<name>:<cid>`"))
-                .arg(arg!(-c <CHUNK_SIZE> "Size of a single block published to IPFS").default_value(DEFAULT_CHUNK_SIZE).num_args(1)),
+                .arg(
+                    arg!(-c <CHUNK_SIZE> "Size of a single block published to IPFS")
+                        .default_value("1048576")
+                        .num_args(1),
+                ),
         )
         .get_matches();
 
     match matches.subcommand() {
         Some(("publish", submatches)) => {
-            let store_endpoint = submatches.get_one::<String>("STORE_ENDPOINT")?;
-            let root_path = submatches.get_one::<String>("ROOT_PATH")?;
-            let chunk_size = submatches.get_one::<usize>("CHUNK_SIZE")?;
+            let store_endpoint = submatches.get_one::<String>("STORE_ENDPOINT").expect("should be set");
+            let root_path = submatches.get_one::<String>("ROOT_PATH").expect("should be set");
+            let chunk_size = submatches.get_one::<usize>("CHUNK_SIZE").expect("should be set");
             let data_paths = submatches
                 .get_many::<String>("DATA_PATH")
                 .map(|x| x.cloned().collect::<Vec<String>>())
                 .unwrap_or_default();
-            let published_cid = publish(store_endpoint, root_path, &data_paths, *chunk_size).await??.to_string();
+            let published_cid = publish(store_endpoint, root_path, &data_paths, *chunk_size)
+                .await?
+                .expect("no CID has been pubished, probably there is no data?")
+                .to_string();
             println!("{published_cid}");
         }
         _ => unreachable!("Exhausted list of subcommands and subcommand_required prevents `None`"),
