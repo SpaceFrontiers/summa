@@ -1,4 +1,3 @@
-#![feature(cursor_remaining)]
 #![deny(
     non_shorthand_field_patterns,
     no_mangle_generic_items,

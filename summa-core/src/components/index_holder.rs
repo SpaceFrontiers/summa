@@ -264,7 +264,7 @@ impl IndexHolder {
         read_only: bool,
     ) -> SummaResult<Index> {
         let iroh_directory =
-            crate::components::IrohDirectory::from_cid(content_loader, store, crate::components::Driver::current_tokio(), &ipfs_engine_config.cid).await?;
+            crate::directories::IrohDirectory::from_cid(content_loader, store, crate::components::Driver::current_tokio(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
