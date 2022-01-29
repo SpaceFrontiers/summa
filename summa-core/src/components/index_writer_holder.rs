@@ -281,6 +281,7 @@ impl IndexWriterHolder {
             IndexWriterImpl::SameThread(_) => (),
             IndexWriterImpl::Threaded(index_writer) => take_mut::take(index_writer, |index_writer| {
                 let index = index_writer.index().clone();
+                info!(action = "wait_merging_threads", mode = "threaded");
                 index_writer.wait_merging_threads().expect("cannot wait merging threads");
                 index
                     .writer_with_num_threads(self.writer_threads.threads() as usize, self.writer_heap_size_bytes)
@@ -290,17 +291,21 @@ impl IndexWriterHolder {
     }
 
     /// Locking index files for executing operation on them
-    #[cfg(feature = "fs")]
     pub fn prepare_index(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<()> {
         let segment_attributes = SummaSegmentAttributes::frozen();
 
         self.vacuum(Some(segment_attributes))?;
         self.commit()?;
-        self.wait_merging_threads();
 
         if let Some(hotcache_config) = with_hotcache {
             let directory = self.index().directory();
-            let hotcache_bytes = crate::directories::create_hotcache(directory.inner_directory().box_clone(), hotcache_config.chunk_size)?;
+            let hotcache_bytes = crate::directories::create_hotcache(
+                directory
+                    .underlying_directory()
+                    .expect("managed directory should contain nested directory")
+                    .box_clone(),
+                hotcache_config.chunk_size,
+            )?;
             directory.atomic_write(Path::new("hotcache.bin"), &hotcache_bytes)?;
         }
         Ok(())

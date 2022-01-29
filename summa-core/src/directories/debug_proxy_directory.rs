@@ -214,4 +214,11 @@ impl Directory for DebugProxyDirectory {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn underlying_directory(&self) -> Option<&dyn Directory> {
+        Some(self.underlying.as_ref())
+    }
+
+    fn real_directory(&self) -> &dyn Directory {
+        self.underlying.real_directory()
+    }
 }

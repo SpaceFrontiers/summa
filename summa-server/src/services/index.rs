@@ -437,14 +437,13 @@ impl Index {
                 chunk_size: Some(c.chunk_size as usize),
             });
             tokio::task::spawn_blocking(move || index_writer_holder.prepare_index(hot_cache_config)).await??;
-            let iroh_directory = index_holder
-                .index()
-                .directory()
-                .inner_directory()
+            let cid = index_holder
+                .real_directory()
                 .as_any()
                 .downcast_ref::<IrohDirectory>()
-                .expect("should be `IrohDirectory`");
-            let cid = iroh_directory.cid().expect("should be `cid`");
+                .expect("should be `IrohDirectory`")
+                .cid()
+                .expect("should be `cid`");
             ipfs_engine_config.cid = cid.to_string();
             index_engine_config.commit().await?;
             info!(action = "store_new_cid", cid = ?cid);

@@ -300,14 +300,14 @@ impl Debug for StaticSliceCache {
 /// hotcache.
 #[derive(Clone)]
 pub struct HotDirectory {
-    inner: Arc<InnerHotDirectory>,
+    inner: Box<InnerHotDirectory>,
 }
 
 impl HotDirectory {
     /// Wraps an index, with a static cache serialized into `hot_cache_bytes`.
     pub fn open(underlying: Box<dyn Directory>, static_cache: StaticDirectoryCache) -> tantivy::Result<HotDirectory> {
         Ok(HotDirectory {
-            inner: Arc::new(InnerHotDirectory {
+            inner: Box::new(InnerHotDirectory {
                 underlying,
                 cache: Arc::new(static_cache),
             }),
@@ -360,6 +360,15 @@ impl Debug for HotDirectory {
     }
 }
 
+impl Clone for InnerHotDirectory {
+    fn clone(&self) -> Self {
+        InnerHotDirectory {
+            underlying: self.underlying.box_clone(),
+            cache: self.cache.clone(),
+        }
+    }
+}
+
 #[async_trait]
 impl Directory for HotDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
@@ -408,6 +417,14 @@ impl Directory for HotDirectory {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn underlying_directory(&self) -> Option<&dyn Directory> {
+        Some(self.inner.underlying.as_ref())
+    }
+
+    fn real_directory(&self) -> &dyn Directory {
+        self.inner.underlying.real_directory()
     }
 }
 

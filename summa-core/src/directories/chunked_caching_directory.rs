@@ -9,7 +9,7 @@ use std::{fmt, io};
 use parking_lot::lock_api::RwLockWriteGuard;
 use parking_lot::{RawRwLock, RwLock, RwLockUpgradableReadGuard};
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
-use tantivy::directory::{DirectoryLock, FileHandle, FileSlice, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr};
+use tantivy::directory::{DirectoryLock, FileHandle, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr};
 use tantivy::{Directory, HasLen};
 
 use crate::directories::chunk_generator::{Chunk, ChunkGenerator};
@@ -168,10 +168,6 @@ impl Directory for ChunkedCachingDirectory {
         }))
     }
 
-    fn open_read(&self, path: &Path) -> Result<FileSlice, OpenReadError> {
-        self.underlying.open_read(path)
-    }
-
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
         // ToDo: May evict caches
         let _lock = self.file_stats.inc_gen(path, None);
@@ -223,6 +219,14 @@ impl Directory for ChunkedCachingDirectory {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn underlying_directory(&self) -> Option<&dyn Directory> {
+        Some(self.underlying.as_ref())
+    }
+
+    fn real_directory(&self) -> &dyn Directory {
+        self.underlying.real_directory()
     }
 }
 

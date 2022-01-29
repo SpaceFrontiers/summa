@@ -85,6 +85,10 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn real_directory(&self) -> &dyn Directory {
+        self
+    }
 }
 
 /// `NetworkDirectory` creates `NetworkFile` for translating `read_bytes` calls into network requests

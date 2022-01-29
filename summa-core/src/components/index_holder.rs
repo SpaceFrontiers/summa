@@ -331,6 +331,11 @@ impl IndexHolder {
         &self.cached_schema
     }
 
+    /// Return internal Tantivy index
+    pub fn real_directory(&self) -> &dyn Directory {
+        self.index.directory().real_directory()
+    }
+
     pub async fn partial_warmup(&self) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();

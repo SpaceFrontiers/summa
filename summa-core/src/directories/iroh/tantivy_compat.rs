@@ -68,6 +68,10 @@ impl Directory for IrohDirectory {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn real_directory(&self) -> &dyn Directory {
+        self
+    }
 }
 
 #[async_trait]

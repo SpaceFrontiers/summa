@@ -38,7 +38,7 @@ pub trait FruitExtractor: Sync + Send {
 }
 
 pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
-    Ok(aggregations
+    aggregations
         .into_iter()
         .map(|(name, aggregation)| {
             let aggregation = match aggregation.aggregation {
@@ -47,7 +47,7 @@ pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> 
             }?;
             Ok((name, aggregation))
         })
-        .collect::<SummaResult<HashMap<_, _>>>()?)
+        .collect::<SummaResult<HashMap<_, _>>>()
 }
 
 fn parse_aggregation_results(
