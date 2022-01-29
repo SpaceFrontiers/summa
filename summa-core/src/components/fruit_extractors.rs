@@ -41,7 +41,7 @@ pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> 
     Ok(aggregations
         .into_iter()
         .map(|(name, aggregation)| {
-            let aggregation = match &aggregation.aggregation {
+            let aggregation = match aggregation.aggregation {
                 None => Err(Error::InvalidAggregation),
                 Some(aggregation) => Wrapper::from(aggregation).try_into(),
             }?;

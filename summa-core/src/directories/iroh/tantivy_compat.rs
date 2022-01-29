@@ -43,8 +43,8 @@ impl Directory for IrohDirectory {
     }
 
     async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-        // ToDo: Use async
-        self.atomic_read(path)
+        let file_handle = self.get_file_handle(path)?;
+        Ok(file_handle.read_bytes_async(0..file_handle.len()).await.expect("cannot read").to_vec())
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
