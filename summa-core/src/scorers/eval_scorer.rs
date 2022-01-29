@@ -47,4 +47,9 @@ impl EvalScorer {
     pub fn get_for_segment_reader(&self, segment_reader: &SegmentReader) -> SummaResult<SegmentEvalScorer> {
         SegmentEvalScorer::for_segment(segment_reader, &self.schema, &self.parser, &self.eval_expr, &self.var_names)
     }
+
+    /// Instantiates `SegmentEvalScorer` for passed segment in async way
+    pub async fn get_for_segment_reader_async(&self, segment_reader: &SegmentReader) -> SummaResult<SegmentEvalScorer> {
+        SegmentEvalScorer::for_segment_async(segment_reader, &self.schema, &self.parser, &self.eval_expr, &self.var_names).await
+    }
 }

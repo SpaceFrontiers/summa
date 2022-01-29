@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Range;
@@ -404,6 +405,10 @@ impl Directory for HotDirectory {
     fn watch(&self, watch_callback: WatchCallback) -> tantivy::Result<WatchHandle> {
         self.inner.underlying.watch(watch_callback)
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
@@ -418,7 +423,7 @@ fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
 /// and writes a static cache file called hotcache in the `output`.
 ///
 /// See [`HotDirectory`] for more information.
-pub fn write_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>) -> tantivy::Result<Vec<u8>> {
+pub fn create_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>) -> tantivy::Result<Vec<u8>> {
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.

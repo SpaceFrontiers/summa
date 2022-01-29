@@ -26,7 +26,7 @@ impl MergePolicy for LogMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
         if self.is_frozen {
             let filtered_segments = segments
-                .iter()
+                .into_iter()
                 .filter(|segment_meta| {
                     let segment_attributes = segment_meta.segment_attributes();
                     let is_frozen = segment_attributes

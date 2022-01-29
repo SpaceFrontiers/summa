@@ -24,9 +24,12 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
+use crate::components::Driver;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
-use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
+use crate::directories::{
+    ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, IrohDirectory, NetworkDirectory, StaticDirectoryCache,
+};
 use crate::errors::SummaResult;
 use crate::proto_traits::Wrapper;
 use crate::Error;
@@ -83,13 +86,6 @@ pub async fn cleanup_index(index_engine_config: proto::IndexEngineConfig) -> Sum
     match index_engine_config.config {
         #[cfg(feature = "fs")]
         Some(proto::index_engine_config::Config::File(ref config)) => {
-            info!(action = "delete_directory", directory = ?config.path);
-            tokio::fs::remove_dir_all(&config.path)
-                .await
-                .map_err(|e| Error::IO((e, Some(std::path::PathBuf::from(&config.path)))))?;
-        }
-        #[cfg(feature = "fs")]
-        Some(proto::index_engine_config::Config::Ipfs(ref config)) => {
             info!(action = "delete_directory", directory = ?config.path);
             tokio::fs::remove_dir_all(&config.path)
                 .await
@@ -267,21 +263,10 @@ impl IndexHolder {
     pub async fn attach_ipfs_index(
         ipfs_engine_config: &proto::IpfsEngineConfig,
         content_loader: &iroh_unixfs::content_loader::FullLoader,
+        store: &iroh_store::Store,
         read_only: bool,
     ) -> SummaResult<Index> {
-        let index_path = std::path::Path::new(&ipfs_engine_config.path);
-        if index_path.exists() {
-            tokio::fs::remove_dir_all(index_path).await?;
-        }
-        tokio::fs::create_dir_all(index_path).await?;
-        let mmap_directory = tantivy::directory::MmapDirectory::open(index_path)?;
-        let iroh_directory = crate::directories::IrohDirectory::new(
-            mmap_directory,
-            content_loader.clone(),
-            &ipfs_engine_config.cid,
-            crate::components::Executor::from_tokio_handle(tokio::runtime::Handle::current()),
-        )
-        .await?;
+        let iroh_directory = IrohDirectory::from_cid(content_loader, store, Driver::current_tokio(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
@@ -329,10 +314,6 @@ impl IndexHolder {
     /// Return internal Tantivy index
     pub fn index(&self) -> &Index {
         &self.index
-    }
-
-    pub async fn index_payload(&self) -> SummaResult<Option<String>> {
-        Ok(self.index.load_metas_async().await?.payload)
     }
 
     pub fn index_engine_config(&self) -> &Arc<dyn ConfigProxy<proto::IndexEngineConfig>> {
@@ -399,12 +380,17 @@ impl IndexHolder {
     }
 
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
-    pub async fn search(&self, external_index_alias: &str, query: &proto::Query, collectors: &[proto::Collector]) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub async fn search(
+        &self,
+        external_index_alias: &str,
+        query: &proto::Query,
+        collectors: Vec<proto::Collector>,
+    ) -> SummaResult<Vec<proto::CollectorOutput>> {
         let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let extractors: Vec<Box<dyn FruitExtractor>> = collectors
-            .iter()
+            .into_iter()
             .map(|collector_proto| build_fruit_extractor(collector_proto, &parsed_query, &self.cached_schema, &mut multi_collector))
             .collect::<SummaResult<_>>()?;
         trace!(

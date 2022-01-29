@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::Range;
@@ -218,6 +219,10 @@ impl Directory for ChunkedCachingDirectory {
 
     fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
         self.underlying.watch(callback)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

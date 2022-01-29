@@ -4,7 +4,7 @@ mod debug_proxy_directory;
 mod external_requests;
 mod hot_cache_directory;
 #[cfg(feature = "ipfs")]
-mod iroh_directory;
+pub(crate) mod iroh;
 mod memory_sized_cache;
 mod network_directory;
 mod requests_composer;
@@ -16,9 +16,9 @@ pub use debug_proxy_directory::DebugProxyDirectory;
 pub use external_requests::{
     DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, ExternalResponse, Header,
 };
-pub use hot_cache_directory::{deserialize_cbor, write_hotcache, HotDirectory, StaticDirectoryCache};
+pub use hot_cache_directory::{create_hotcache, deserialize_cbor, HotDirectory, StaticDirectoryCache};
 #[cfg(feature = "ipfs")]
-pub use iroh_directory::IrohDirectory;
+pub use iroh::IrohDirectory;
 pub use memory_sized_cache::MemorySizedCache;
 pub use network_directory::{NetworkDirectory, NetworkFile};
 

@@ -7,9 +7,9 @@ use tantivy::Document;
 /// `Value` is used for representing singular or multi-values of `tantivy::Document`
 ///
 /// Required because Tantivy operates with multi-values only and Summa provides an abstraction of singular fields
-pub enum Value {
-    SingleValue(Option<tantivy::schema::Value>),
-    MultipleValue(Vec<tantivy::schema::Value>),
+pub enum Value<'a> {
+    SingleValue(Option<&'a tantivy::schema::Value>),
+    MultipleValue(Vec<&'a tantivy::schema::Value>),
 }
 
 /// Internal representation of a document used for JSON
@@ -19,10 +19,10 @@ pub enum Value {
 /// as a `BTreeMap<String, Vec<Value>>`. It is base on `tantivy::schema::NamedFieldDocument`
 /// but with a support of multi fields
 #[derive(Serialize)]
-pub struct NamedFieldDocument(pub BTreeMap<String, Value>);
+pub struct NamedFieldDocument<'a>(pub BTreeMap<&'a str, Value<'a>>);
 
-impl NamedFieldDocument {
-    pub fn from_document(schema: &Schema, fields: &Option<HashSet<Field>>, multi_fields: &HashSet<Field>, document: &Document) -> Self {
+impl<'a> NamedFieldDocument<'a> {
+    pub fn from_document(schema: &'a Schema, fields: &'a Option<HashSet<Field>>, multi_fields: &HashSet<Field>, document: &'a Document) -> Self {
         let mut field_map = BTreeMap::new();
         for (field, field_values) in document.get_sorted_field_values() {
             let field_name = schema.get_field_name(field);
@@ -32,12 +32,11 @@ impl NamedFieldDocument {
                 }
             }
             let values = if multi_fields.contains(&field) {
-                Value::MultipleValue(field_values.into_iter().cloned().collect())
+                Value::MultipleValue(field_values)
             } else {
-                let value = field_values.get(0).cloned().cloned();
-                Value::SingleValue(value)
+                Value::SingleValue(field_values.get(0).copied())
             };
-            field_map.insert(field_name.to_string(), values);
+            field_map.insert(field_name, values);
         }
         NamedFieldDocument(field_map)
     }
@@ -46,7 +45,7 @@ impl NamedFieldDocument {
     }
 }
 
-impl Serialize for Value {
+impl Serialize for Value<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,

@@ -95,14 +95,7 @@ impl IndexRegistry {
         let index_holder = OwningHandler::new(index_holder);
         let index_holder_handler = index_holder.handler();
         self.index_holders().write().await.insert(index_holder.index_name().to_string(), index_holder);
-        let segments = index_holder_handler
-            .index()
-            .searchable_segments_async()
-            .await?
-            .into_iter()
-            .map(|segment| segment.id())
-            .collect::<Vec<_>>();
-        info!(action = "added", index_name = ?index_holder_handler.index_name(), segments = ?segments);
+        info!(action = "added", index_name = ?index_holder_handler.index_name());
         Ok(index_holder_handler)
     }
 
@@ -114,11 +107,10 @@ impl IndexRegistry {
     /// Searches in several indices simultaneously and merges results
     pub async fn search_futures(
         &self,
-        index_queries: &[proto::IndexQuery],
+        index_queries: Vec<proto::IndexQuery>,
     ) -> SummaResult<Vec<impl Future<Output = SummaResult<Vec<proto::CollectorOutput>>>>> {
         index_queries
-            .iter()
-            .cloned()
+            .into_iter()
             .map(|index_query| {
                 let this = self.clone();
                 Ok(async move {
@@ -129,7 +121,7 @@ impl IndexRegistry {
                             index_query.query.as_ref().unwrap_or_else(|| &proto::Query {
                                 query: Some(proto::query::Query::All(proto::AllQuery {})),
                             }),
-                            &index_query.collectors,
+                            index_query.collectors,
                         )
                         .await
                 })

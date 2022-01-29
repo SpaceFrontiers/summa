@@ -233,8 +233,8 @@ mod tests {
             tokio::spawn(Server::from_server_config(server_config_holder).serve(receiver).await?),
             server_terminator,
         );
-        let index_client = create_index_api_client(&format!("http://{}", &api_grpc_endpoint)).await;
-        let search_client = create_search_api_client(&format!("http://{}", &api_grpc_endpoint)).await;
+        let index_client = create_index_api_client(&format!("http://{api_grpc_endpoint}")).await;
+        let search_client = create_search_api_client(&format!("http://{api_grpc_endpoint}")).await;
         Ok((thread_handler, index_client, search_client))
     }
 

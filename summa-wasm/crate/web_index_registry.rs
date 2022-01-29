@@ -58,8 +58,8 @@ impl WebIndexRegistry {
     }
 
     async fn search_internal(&self, index_queries: Vec<proto::IndexQuery>) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let futures = self.index_registry.search_futures(&index_queries).await?;
         info!(action = "search", index_queries = ?index_queries);
+        let futures = self.index_registry.search_futures(index_queries).await?;
         let collectors_outputs = join_all(futures.into_iter().map(|f| self.thread_pool().spawn(f)))
             .await
             .into_iter()

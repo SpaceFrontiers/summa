@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::{io, ops::Range, path::Path, sync::Arc, usize};
 
@@ -79,6 +80,10 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
 
     fn watch(&self, _: WatchCallback) -> tantivy::Result<WatchHandle> {
         Ok(WatchHandle::empty())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

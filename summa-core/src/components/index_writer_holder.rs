@@ -1,7 +1,4 @@
-use std::fmt::{Debug, Formatter};
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
+use std::path::Path;
 use std::sync::RwLock;
 
 use summa_proto::proto;
@@ -19,41 +16,6 @@ use crate::Error;
 /// Hotcache config
 pub struct HotCacheConfig {
     pub chunk_size: Option<usize>,
-}
-
-/// Describe a single index file
-pub struct ComponentFile {
-    file_name: String,
-    boxed_reader: Box<dyn Future<Output = Vec<u8>> + Send>,
-}
-
-impl Debug for ComponentFile {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ComponentFile").field("file_name", &self.file_name).finish()
-    }
-}
-
-impl ComponentFile {
-    pub fn new(file_name: &str, boxed_reader: Box<dyn Future<Output = Vec<u8>> + Send>) -> ComponentFile {
-        ComponentFile {
-            file_name: file_name.to_string(),
-            boxed_reader,
-        }
-    }
-    pub fn from_directory<D: Directory + Clone>(directory: &D, file_name: &str) -> ComponentFile {
-        let directory = directory.clone();
-        let filepath = PathBuf::from(file_name);
-        ComponentFile::new(
-            file_name,
-            Box::new(async move { directory.atomic_read_async(&filepath).await.expect("cannot open") }),
-        )
-    }
-    pub fn file_name(&self) -> &str {
-        &self.file_name
-    }
-    pub fn into_reader(self) -> Pin<Box<dyn Future<Output = Vec<u8>> + Send>> {
-        Box::into_pin(self.boxed_reader)
-    }
 }
 
 /// Wrap `tantivy::SingleSegmentIndexWriter` and allows to recreate it
@@ -148,12 +110,12 @@ impl IndexWriterImpl {
             }
         }
     }
-    pub async fn rollback(&mut self) -> SummaResult<()> {
+    pub fn rollback(&mut self) -> SummaResult<()> {
         match self {
             IndexWriterImpl::SameThread(_) => unimplemented!(),
             IndexWriterImpl::Threaded(writer) => {
                 info!(action = "rollback_files");
-                let opstamp = writer.rollback_async().await?;
+                let opstamp = writer.rollback()?;
                 info!(action = "rollbacked", opstamp = ?opstamp);
                 Ok(())
             }
@@ -285,8 +247,8 @@ impl IndexWriterHolder {
         self.index_writer.commit()
     }
 
-    pub async fn rollback(&mut self) -> SummaResult<()> {
-        self.index_writer.rollback().await
+    pub fn rollback(&mut self) -> SummaResult<()> {
+        self.index_writer.rollback()
     }
 
     pub fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
@@ -329,46 +291,42 @@ impl IndexWriterHolder {
 
     /// Locking index files for executing operation on them
     #[cfg(feature = "fs")]
-    pub fn lock_files(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<Vec<ComponentFile>> {
+    pub fn prepare_index(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<()> {
         let segment_attributes = SummaSegmentAttributes::frozen();
 
-        self.commit()?;
         self.vacuum(Some(segment_attributes))?;
         self.commit()?;
         self.wait_merging_threads();
 
-        let directory = self.index().directory();
+        if let Some(hotcache_config) = with_hotcache {
+            let directory = self.index().directory();
+            let hotcache_bytes = crate::directories::create_hotcache(directory.inner_directory().box_clone(), hotcache_config.chunk_size)?;
+            directory.atomic_write(Path::new("hotcache.bin"), &hotcache_bytes)?;
+        }
+        Ok(())
+    }
 
-        let segment_files_iter = [".managed.json", "meta.json"]
-            .into_iter()
-            .map(String::from)
-            .map(move |file_name| ComponentFile::from_directory(directory, &file_name))
-            .chain(self.get_index_files()?);
-        Ok(match with_hotcache {
-            Some(hotcache_config) => {
-                let hotcache_bytes = crate::directories::write_hotcache(directory.inner_directory().box_clone(), hotcache_config.chunk_size)?;
-                segment_files_iter
-                    .chain(std::iter::once(ComponentFile::new("hotcache.bin", Box::new(async move { hotcache_bytes }))))
-                    .collect()
-            }
-            None => segment_files_iter.collect(),
-        })
+    pub fn lock_files(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<Vec<String>> {
+        let mut segment_files = vec![".managed.json".to_string(), "meta.json".to_string()];
+
+        if with_hotcache.is_some() {
+            segment_files.push("hotcache.bin".to_string())
+        }
+
+        self.prepare_index(with_hotcache)?;
+        segment_files.extend(self.get_index_files()?);
+
+        Ok(segment_files)
     }
 
     /// Get segments
-    #[cfg(feature = "fs")]
-    fn get_index_files(&self) -> SummaResult<impl Iterator<Item = ComponentFile>> {
-        let directory = self.index().directory().clone();
-        Ok(self.index().searchable_segments()?.into_iter().flat_map(move |segment| {
-            let directory = directory.clone();
+    fn get_index_files(&self) -> SummaResult<impl Iterator<Item = String> + '_> {
+        Ok(self.index().searchable_segments()?.into_iter().flat_map(|segment| {
             tantivy::SegmentComponent::iterator()
-                .filter_map(move |segment_component| {
+                .filter_map(|segment_component| {
                     let filepath = segment.meta().relative_path(*segment_component);
                     let file_name = filepath.to_string_lossy().to_string();
-                    directory
-                        .exists(&filepath)
-                        .expect("cannot parse")
-                        .then(|| ComponentFile::from_directory(&directory, &file_name))
+                    self.index().directory().exists(&filepath).expect("cannot parse").then_some(file_name)
                 })
                 .collect::<Vec<_>>()
         }))

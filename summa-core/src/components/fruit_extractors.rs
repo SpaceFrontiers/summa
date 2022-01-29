@@ -4,16 +4,16 @@ use futures::future::join_all;
 use rustc_hash::FxHashMap;
 use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
-use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
+use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit, ScoreSegmentTweaker, ScoreTweaker};
 use tantivy::query::{Query, QueryClone};
 use tantivy::schema::{Field, Schema};
-use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader, SnippetGenerator};
+use tantivy::{DocAddress, DocId, Searcher, SegmentReader, SnippetGenerator};
 
 use super::custom_serializer::NamedFieldDocument;
 use crate::collectors;
 use crate::errors::{BuilderError, Error, SummaResult};
 use crate::proto_traits::Wrapper;
-use crate::scorers::EvalScorer;
+use crate::scorers::{EvalScorer, SegmentEvalScorer};
 
 /// Extracts data from `MultiFruit` and moving it to the `proto::CollectorOutput`
 #[async_trait]
@@ -37,18 +37,17 @@ pub trait FruitExtractor: Sync + Send {
     }
 }
 
-pub fn parse_aggregations(aggregations: &HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
-    let aggregations = aggregations
-        .iter()
+pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
+    Ok(aggregations
+        .into_iter()
         .map(|(name, aggregation)| {
             let aggregation = match &aggregation.aggregation {
                 None => Err(Error::InvalidAggregation),
-                Some(aggregation) => Wrapper::from(aggregation.clone()).try_into(),
+                Some(aggregation) => Wrapper::from(aggregation).try_into(),
             }?;
-            Ok((name.clone(), aggregation))
+            Ok((name, aggregation))
         })
-        .collect::<SummaResult<Vec<_>>>()?;
-    Ok(HashMap::from_iter(aggregations.into_iter()))
+        .collect::<SummaResult<HashMap<_, _>>>()?)
 }
 
 fn parse_aggregation_results(
@@ -65,13 +64,59 @@ fn get_strict_fields<'a, F: Iterator<Item = &'a String>>(schema: &Schema, fields
     Ok((!fields.is_empty()).then_some(fields))
 }
 
+struct EvalScorerSegmentScoreTweaker {
+    segment_eval_scorer: SegmentEvalScorer,
+}
+
+impl EvalScorerSegmentScoreTweaker {
+    pub fn new(segment_eval_scorer: SegmentEvalScorer) -> Self {
+        EvalScorerSegmentScoreTweaker { segment_eval_scorer }
+    }
+}
+
+impl ScoreSegmentTweaker<f64> for EvalScorerSegmentScoreTweaker {
+    fn score(&mut self, doc: DocId, score: f32) -> f64 {
+        self.segment_eval_scorer.score(doc, score)
+    }
+}
+
+struct EvalScorerTweaker {
+    eval_scorer_seed: EvalScorer,
+}
+
+impl EvalScorerTweaker {
+    pub fn new(eval_scorer_seed: EvalScorer) -> Self {
+        EvalScorerTweaker { eval_scorer_seed }
+    }
+}
+
+#[async_trait]
+impl ScoreTweaker<f64> for EvalScorerTweaker {
+    type Child = EvalScorerSegmentScoreTweaker;
+
+    fn segment_tweaker(&self, segment_reader: &SegmentReader) -> tantivy::Result<Self::Child> {
+        Ok(EvalScorerSegmentScoreTweaker::new(
+            self.eval_scorer_seed.get_for_segment_reader(segment_reader).expect("Wrong eval expression"),
+        ))
+    }
+
+    async fn segment_tweaker_async(&self, segment_reader: &SegmentReader) -> tantivy::Result<Self::Child> {
+        Ok(EvalScorerSegmentScoreTweaker::new(
+            self.eval_scorer_seed
+                .get_for_segment_reader_async(segment_reader)
+                .await
+                .expect("Wrong eval expression"),
+        ))
+    }
+}
+
 pub fn build_fruit_extractor(
-    collector_proto: &proto::Collector,
+    collector_proto: proto::Collector,
     query: &dyn Query,
     schema: &Schema,
     multi_collector: &mut MultiCollector,
 ) -> SummaResult<Box<dyn FruitExtractor>> {
-    match &collector_proto.collector {
+    match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
             let fields = get_strict_fields(schema, top_docs_collector_proto.fields.iter())?;
             Ok(match top_docs_collector_proto.scorer {
@@ -85,7 +130,7 @@ pub fn build_fruit_extractor(
                         )
                         .query(query.box_clone())
                         .limit(top_docs_collector_proto.limit)
-                        .snippets(top_docs_collector_proto.snippets.clone())
+                        .snippets(top_docs_collector_proto.snippets)
                         .fields(fields)
                         .build()?,
                 ) as Box<dyn FruitExtractor>,
@@ -95,16 +140,13 @@ pub fn build_fruit_extractor(
                     let eval_scorer_seed = EvalScorer::new(eval_expr, schema)?;
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
                         .and_offset(top_docs_collector_proto.offset as usize)
-                        .tweak_score(move |segment_reader: &SegmentReader| {
-                            let mut eval_scorer = eval_scorer_seed.get_for_segment_reader(segment_reader).expect("Wrong eval expression");
-                            move |doc_id: DocId, original_score: Score| eval_scorer.score(doc_id, original_score)
-                        });
+                        .tweak_score(EvalScorerTweaker::new(eval_scorer_seed));
                     Box::new(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))
                             .query(query.box_clone())
                             .limit(top_docs_collector_proto.limit)
-                            .snippets(top_docs_collector_proto.snippets.clone())
+                            .snippets(top_docs_collector_proto.snippets)
                             .fields(fields)
                             .build()?,
                     ) as Box<dyn FruitExtractor>
@@ -121,7 +163,7 @@ pub fn build_fruit_extractor(
                             .handle(multi_collector.add_collector(top_docs_collector))
                             .query(query.box_clone())
                             .limit(top_docs_collector_proto.limit)
-                            .snippets(top_docs_collector_proto.snippets.clone())
+                            .snippets(top_docs_collector_proto.snippets)
                             .fields(fields)
                             .build()?,
                     ) as Box<dyn FruitExtractor>
@@ -149,7 +191,7 @@ pub fn build_fruit_extractor(
         }
         Some(proto::collector::Collector::Aggregation(aggregation_collector_proto)) => {
             let aggregation_collector =
-                tantivy::aggregation::AggregationCollector::from_aggs(parse_aggregations(&aggregation_collector_proto.aggregations)?, None, schema.clone());
+                tantivy::aggregation::AggregationCollector::from_aggs(parse_aggregations(aggregation_collector_proto.aggregations)?, None, schema.clone());
             Ok(Box::new(Aggregation(multi_collector.add_collector(aggregation_collector))) as Box<dyn FruitExtractor>)
         }
         None => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),

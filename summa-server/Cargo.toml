@@ -37,6 +37,7 @@ async-broadcast = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 config = "0.13"
+console-subscriber = "0.1"
 derive_builder = { workspace = true }
 futures = { workspace = true }
 futures-util = "0.3"

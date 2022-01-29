@@ -287,7 +287,6 @@ message RemoteEngineConfig {
 message IpfsEngineConfig {
   string cid = 1;
   ChunkedCacheConfig chunked_cache_config = 2;
-  string path = 3;
 }
 
 message LogMergePolicy {

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -208,5 +209,9 @@ impl Directory for DebugProxyDirectory {
 
     fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
         Ok(tantivy::directory::DirectoryLock::from(Box::new(|| {})))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

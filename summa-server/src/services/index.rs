@@ -1,31 +1,32 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
-use summa_core::components::{cleanup_index, HotCacheConfig, IndexHolder, IndexRegistry, IndexWriterHolder};
-use summa_core::configs::core::WriterThreads;
+use summa_core::components::{cleanup_index, Driver, HotCacheConfig, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
+use summa_core::directories::IrohDirectory;
 use summa_core::errors::SummaResult;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
 use summa_proto::proto;
-use tantivy::merge_policy::NoMergePolicy;
 use tantivy::store::ZstdCompressor;
-use tantivy::IndexBuilder;
+use tantivy::{Directory, IndexBuilder};
 use tokio::sync::RwLock;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 use crate::components::{ConsumerManager, PreparedConsumption};
-use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
+use crate::errors::{Error, SummaServerResult};
 use crate::hyper_external_request::HyperExternalRequest;
 use crate::validators;
 
@@ -221,9 +222,8 @@ impl Index {
                 let ipfs_index_engine = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
                     chunked_cache_config,
-                    path: index_path.to_string_lossy().to_string(),
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), false).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
                     merge_policy: attach_index_request.merge_policy,
@@ -282,30 +282,18 @@ impl Index {
                 (index, index_engine_config)
             }
             Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
-                let index = index_builder.create_in_ram()?;
-                let writer_heap_size_bytes = self.server_config.read().await.get().core.writer_heap_size_bytes;
-                let merge_policy = Box::<NoMergePolicy>::default();
-                let mut index_writer_holder = IndexWriterHolder::create(&index, WriterThreads::N(1), writer_heap_size_bytes as usize, merge_policy)?;
-                let locked_files = tokio::task::spawn_blocking(move || index_writer_holder.lock_files(None)).await??;
-                let cid = self.store_service.put(locked_files).await?;
-                drop(index);
+                let iroh_directory = IrohDirectory::new(self.store_service.content_loader(), self.store_service.store(), Driver::current_tokio());
+                index_builder.open_or_create(iroh_directory.clone())?;
+                let cid = iroh_directory.cid().expect("directory should be created");
                 let ipfs_engine_config = proto::IpfsEngineConfig {
-                    cid,
+                    cid: cid.to_string(),
                     chunked_cache_config,
-                    path: self
-                        .server_config
-                        .read()
-                        .await
-                        .get()
-                        .get_path_for_index_data(&create_index_request.index_name)
-                        .to_string_lossy()
-                        .to_string(),
                 };
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config.clone())),
                     merge_policy: create_index_request.merge_policy,
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), false).await?;
+                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 (index, index_engine_config)
             }
         };
@@ -448,9 +436,16 @@ impl Index {
             let hot_cache_config = ipfs_engine_config.chunked_cache_config.as_ref().map(|c| HotCacheConfig {
                 chunk_size: Some(c.chunk_size as usize),
             });
-            let locked_files = tokio::task::spawn_blocking(move || index_writer_holder.lock_files(hot_cache_config)).await??;
-            let cid = self.store_service.put(locked_files).await?;
-            ipfs_engine_config.cid = cid.clone();
+            tokio::task::spawn_blocking(move || index_writer_holder.prepare_index(hot_cache_config)).await??;
+            let iroh_directory = index_holder
+                .index()
+                .directory()
+                .inner_directory()
+                .as_any()
+                .downcast_ref::<IrohDirectory>()
+                .expect("should be `IrohDirectory`");
+            let cid = iroh_directory.cid().expect("should be `cid`");
+            ipfs_engine_config.cid = cid.to_string();
             index_engine_config.commit().await?;
             info!(action = "store_new_cid", cid = ?cid);
             let index_holder = index_holder.clone();
@@ -462,8 +457,9 @@ impl Index {
     /// Rollbacks everything without restarting consuming threads
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn rollback(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
+        let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        index_holder.index_writer_holder()?.write().await.rollback().await?;
+        tokio::task::spawn_blocking(move || index_writer.rollback()).await??;
         Ok(stopped_consumption.map(|c| c.ignore()))
     }
 
@@ -546,7 +542,7 @@ impl Index {
                 IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, read_only).await?
             }
             Some(proto::index_engine_config::Config::Ipfs(config)) => {
-                IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader(), read_only).await?
+                IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader(), self.store_service.store(), read_only).await?
             }
             _ => unimplemented!(),
         };
@@ -566,21 +562,24 @@ impl Index {
                         .as_ref()
                         .map(|chunked_cache_config| chunked_cache_config.chunk_size as usize),
                 });
-                let locked_files = tokio::task::spawn_blocking(move || index_writer_holder.lock_files(hotcache_config)).await??;
-                let cid = self.store_service.put(locked_files).await?;
-                let ipfs_engine_config = proto::IpfsEngineConfig {
-                    cid,
-                    chunked_cache_config,
-                    path: self
-                        .server_config
-                        .read()
-                        .await
-                        .get()
-                        .get_path_for_index_data(&migrate_index_request.target_index_name)
-                        .to_string_lossy()
-                        .to_string(),
-                };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), false).await?;
+                let iroh_directory = IrohDirectory::new(
+                    self.store_service.content_loader(),
+                    self.store_service.store(),
+                    Driver::Tokio(tokio::runtime::Handle::current()),
+                );
+                let cid = tokio::task::spawn_blocking(move || {
+                    let locked_files = index_writer_holder.lock_files(hotcache_config)?;
+                    for file in locked_files {
+                        // ToDo: Avoid reading to memory
+                        let mut writer = iroh_directory.get_writer(&file);
+                        writer.write_all(&index_holder.index().directory().atomic_read(Path::new(&file)).expect("cannot read"))?;
+                        writer.terminate()?;
+                    }
+                    Ok::<String, Error>(iroh_directory.cid().expect("should be non empty").to_string())
+                })
+                .await??;
+                let ipfs_engine_config = proto::IpfsEngineConfig { cid, chunked_cache_config };
+                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 self.insert_index(
                     &migrate_index_request.target_index_name,
                     index,
@@ -600,7 +599,7 @@ impl Index {
     }
 
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
-        let futures = self.index_registry.search_futures(&search_request.index_queries).await?;
+        let futures = self.index_registry.search_futures(search_request.index_queries).await?;
         let collector_outputs = join_all(futures.into_iter().map(|t| tokio::spawn(async move { t.await })))
             .await
             .into_iter()
@@ -621,7 +620,7 @@ pub(crate) mod tests {
     use summa_core::components::SummaDocument;
     use summa_core::configs::DirectProxy;
     use summa_core::utils::parse_endpoint;
-    use summa_proto::proto_traits::collector::shortcuts::{scored_doc, top_docs_collector, top_docs_collector_output, top_docs_collector_with_eval_expr};
+    use summa_proto::proto_traits::collector::shortcuts::{top_docs_collector, top_docs_collector_with_eval_expr};
     use summa_proto::proto_traits::query::shortcuts::match_query;
     use tantivy::doc;
     use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
@@ -891,9 +890,8 @@ pub(crate) mod tests {
             index_holder.index_document(d).await?;
         }
         index_service.commit(&index_holder).await?;
-        index_holder.index_reader().reload()?;
 
-        let search_response = index_holder.search("index", &match_query("testtitle"), &vec![top_docs_collector(10)]).await?;
+        let search_response = index_holder.search("index", &match_query("testtitle"), vec![top_docs_collector(10)]).await?;
         assert_eq!(search_response.len(), 1);
         drop(index_holder);
         index_service
@@ -927,9 +925,8 @@ pub(crate) mod tests {
             .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
             .await?;
         index_service.commit(&index_holder).await?;
-        index_holder.index_reader().reload()?;
 
-        let search_response = index_holder.search("index", &match_query("testtitle"), &vec![top_docs_collector(10)]).await?;
+        let search_response = index_holder.search("index", &match_query("testtitle"), vec![top_docs_collector(10)]).await?;
         assert_eq!(search_response.len(), 1);
 
         drop(index_holder);
@@ -938,6 +935,57 @@ pub(crate) mod tests {
                 index_name: "test_index".to_string(),
             })
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_migrate_index() -> SummaServerResult<()> {
+        logging::tests::initialize_default_once();
+        let schema = create_test_schema();
+
+        let root_path = tempdir::TempDir::new("summa_test").unwrap();
+        let data_path = root_path.path().join("data");
+
+        let index_service = create_test_index_service(&data_path).await;
+        let index_holder = create_test_index_holder(
+            &index_service,
+            &schema,
+            proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {}),
+        )
+        .await?;
+
+        for d in generate_documents(index_holder.schema(), 1000) {
+            index_holder.index_document(d).await?;
+        }
+        index_holder
+            .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
+            .await?;
+        index_service.commit(&index_holder).await?;
+
+        index_service
+            .migrate_index(proto::MigrateIndexRequest {
+                source_index_name: "test_index".to_string(),
+                target_index_name: "migrated_index".to_string(),
+                merge_policy: None,
+                target_index_engine: Some(proto::migrate_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
+                    chunked_cache_config: Some(proto::ChunkedCacheConfig {
+                        chunk_size: 16 * 1024,
+                        cache_size: None,
+                    }),
+                })),
+            })
+            .await?;
+
+        let search_response = index_holder
+            .search("migrated_index", &match_query("testtitle"), vec![top_docs_collector(10)])
+            .await?;
+        assert_eq!(search_response.len(), 1);
+
+        let search_response = index_holder
+            .search("test_index", &match_query("testtitle"), vec![top_docs_collector(10)])
+            .await?;
+        assert_eq!(search_response.len(), 1);
+
         Ok(())
     }
 
@@ -958,30 +1006,24 @@ pub(crate) mod tests {
         .await?;
 
         let mut rng = SmallRng::seed_from_u64(42);
-        for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 30) {
-            index_holder.index_document(d).await?;
+        for _ in 0..4 {
+            for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 30000) {
+                index_holder.index_document(d).await?;
+            }
+            index_service.commit(&index_holder).await?;
         }
-        index_service.commit(&index_holder).await?;
-        index_holder.index_reader().reload().unwrap();
-        assert_eq!(
-            index_holder
-                .search("test_index", &match_query("title1"), &vec![top_docs_collector_with_eval_expr(10, "issued_at")],)
-                .await?,
-            vec![top_docs_collector_output(
-                vec![scored_doc(
-                    "{\"body\":\"body211 body255 body187 body318 body593 body647 body3 body659 \
-                        body196 body974 body861 body887 body73 body526 body337 body381 body650 body997 body722 \
-                        body307 body260 body542 body958 body25 body40 body237 body806 body547 body177 body633 \
-                        body770 body37 body432 body905 body528 body230 body522 body268 body789 body681 body187 \
-                        body123 body284 body977 body887 body229 body66 body246 body194 body35\",\"id\":23,\
-                        \"issued_at\":1674041335,\"tags\":\"tag5 tag8 tag5 tag2 tag2\",\"title\":\"title96 \
-                        title1 title31\"}",
-                    1674041335.0,
-                    0
-                ),],
-                false
-            )]
-        );
+        let index_holder_clone = index_holder.clone();
+        let mut index_writer = index_holder.index_writer_holder().unwrap().clone().write_owned().await;
+        tokio::task::spawn_blocking(move || {
+            index_writer.vacuum(None)?;
+            index_holder_clone.index_reader().reload()?;
+            Ok::<_, Error>(())
+        })
+        .await??;
+        assert!(index_holder
+            .search("test_index", &match_query("title1"), vec![top_docs_collector_with_eval_expr(1, "issued_at")],)
+            .await
+            .is_ok());
         Ok(())
     }
 }

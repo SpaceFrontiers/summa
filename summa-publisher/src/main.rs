@@ -49,11 +49,11 @@ async fn publish(store_endpoint: &str, root_path: &str, data_paths: &[String]) -
         let cid = Cid::from_str(cid)?;
         let block = store_client.get(cid).await?.unwrap_or_else(|| panic!("Cannot find {cid} at store"));
         let node = UnixfsNode::decode(&cid, block)?;
-        data_dir = data_dir.add_raw_block(iroh_unixfs::builder::RawBlock::new(name, node.encode()?));
+        data_dir = data_dir.add_raw_block(iroh_unixfs::builder::RawBlock::new(name, node.encode(&cid::multihash::Code::Blake3_256)?));
     }
     let root_directory = root_directory.add_dir(data_dir.build()?)?.build()?;
 
-    let mut blocks = root_directory.encode();
+    let mut blocks = root_directory.encode(&cid::multihash::Code::Blake3_256);
     let mut chunk = Vec::new();
     let mut chunk_size = 0u64;
     let mut cid = None;
