@@ -281,14 +281,12 @@ class IndexOperation(_message.Message):
     def __init__(self, index_document: _Optional[_Union[IndexDocumentOperation, _Mapping]] = ...) -> None: ...
 
 class IpfsEngineConfig(_message.Message):
-    __slots__ = ["chunked_cache_config", "cid", "path"]
+    __slots__ = ["chunked_cache_config", "cid"]
     CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
     CID_FIELD_NUMBER: _ClassVar[int]
-    PATH_FIELD_NUMBER: _ClassVar[int]
     chunked_cache_config: ChunkedCacheConfig
     cid: str
-    path: str
-    def __init__(self, cid: _Optional[str] = ..., chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ..., path: _Optional[str] = ...) -> None: ...
+    def __init__(self, cid: _Optional[str] = ..., chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
 
 class LogMergePolicy(_message.Message):
     __slots__ = ["is_frozen"]

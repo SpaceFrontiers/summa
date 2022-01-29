@@ -1,14 +1,9 @@
 use std::marker::PhantomData;
-use std::time::UNIX_EPOCH;
 
-use instant::SystemTime;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tantivy::SegmentAttributesMerger;
-
-fn current_time() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs()
-}
+use crate::utils::current_time;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummaSegmentAttributes {

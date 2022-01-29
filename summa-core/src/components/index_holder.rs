@@ -24,12 +24,9 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::Driver;
 use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
-use crate::directories::{
-    ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, IrohDirectory, NetworkDirectory, StaticDirectoryCache,
-};
+use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::SummaResult;
 use crate::proto_traits::Wrapper;
 use crate::Error;
@@ -266,7 +263,8 @@ impl IndexHolder {
         store: &iroh_store::Store,
         read_only: bool,
     ) -> SummaResult<Index> {
-        let iroh_directory = IrohDirectory::from_cid(content_loader, store, Driver::current_tokio(), &ipfs_engine_config.cid).await?;
+        let iroh_directory =
+            crate::components::IrohDirectory::from_cid(content_loader, store, crate::components::Driver::current_tokio(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {

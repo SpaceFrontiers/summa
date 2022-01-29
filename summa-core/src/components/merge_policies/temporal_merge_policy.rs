@@ -1,12 +1,11 @@
 use std::fmt::Debug;
-use std::time::UNIX_EPOCH;
 
-use instant::SystemTime;
 use serde::{Deserialize, Serialize};
 use tantivy::merge_policy::{MergeCandidate, MergePolicy};
 use tantivy::{SegmentId, SegmentMeta};
 
 use crate::components::SummaSegmentAttributes;
+use crate::utils::current_time;
 
 /// `TemporalMergePolicy` collapses segments old enough into a single one
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -22,7 +21,7 @@ impl TemporalMergePolicy {
 
 impl MergePolicy for TemporalMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
-        let merge_pivot = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time goes backward").as_secs() - self.merge_older_then_secs;
+        let merge_pivot = current_time() - self.merge_older_then_secs;
         let old_segments = segments
             .iter()
             .filter(|segment_meta| {

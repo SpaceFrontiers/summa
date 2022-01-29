@@ -17,3 +17,7 @@ where
         Ok(format!("irpc://{endpoint}").parse()?)
     }
 }
+
+pub fn current_time() -> u64 {
+    (instant::now() / 1000.0) as u64
+}
