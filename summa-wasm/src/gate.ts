@@ -21,6 +21,7 @@ function parse_headers(xhr: XMLHttpRequest): Header[] {
 export function request(method: string, url: string, headers: {name: string, value: string}[]): { data: Uint8Array, headers: Header[]} | {status: number, status_text: string} {
     var xhr = new XMLHttpRequest();
     xhr.responseType = "arraybuffer"
+    xhr.withCredentials = true;
     xhr.open(method, url, false);
     if (headers !== undefined) {
         headers.forEach((header) => {
@@ -43,6 +44,7 @@ export function request_async(method: string, url: string, headers: Array<{name:
     return new Promise(function (resolve, reject) {
         let xhr = new XMLHttpRequest();
         xhr.responseType = "arraybuffer"
+        xhr.withCredentials = true;
         xhr.open(method, url);
         if (headers !== undefined) {
           headers.forEach((header) => {

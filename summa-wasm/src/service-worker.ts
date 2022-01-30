@@ -51,6 +51,7 @@ async function set_from_cache(filename: string, start: number, end: number) {
           .toArray();
     });
     if (cached_chunks.length < chunk_ixs.length) {
+      console.debug("cache_miss", filename, start, end);
       return null;
     }
     const cached_response = new ArrayBuffer(end - start);
@@ -58,6 +59,7 @@ async function set_from_cache(filename: string, start: number, end: number) {
     chunk_ixs.map((current, ix) => {
       cached_response_view.set(cached_chunks[ix].blob, current - start);
     });
+    console.debug("cache_hit", filename, start, end);
     return cached_response_view;
   } catch (e) {
     console.error(e, filename, CHUNK_SIZE, start, end);
@@ -80,6 +82,7 @@ async function fill_cache(response_body: ArrayBuffer, filename: string, start: n
       };
     }
   );
+  console.debug("cache_fill", filename, start, end);
   db.transaction("rw!", db.chunks, async () => {
     await db.table("chunks").bulkPut(items);
   });
@@ -119,28 +122,31 @@ async function handle_request(request: Request) {
   let url = request.url;
   let filename = request.url;
   let [range_start, range_end] = [0, Infinity];
-  request.headers.forEach((name, value) => {
-    if (name === "range") {
-      // @ts-ignore
-      const [_, start, end] = /^bytes=(\d+)-(\d+)?$/g.exec(value);
+  const range = request.headers.get("range")
+  if (range !== null) {
+    // @ts-ignore
+      const [_, start, end] = /^bytes=(\d+)-(\d+)?$/g.exec(range);
       range_start = parseInt(start);
       if (end) {
         range_end = parseInt(end) + 1;
       }
-    }
-  });
+  }
   let response_body = null;
   let headers = new Headers();
   let status = 200;
   let caching_enabled =
     (filename.endsWith(".fast") ||
+      filename.endsWith(".bin") ||
       filename.endsWith(".term") ||
       filename.endsWith(".pos") ||
       filename.endsWith(".store") ||
       filename.endsWith(".fieldnorm") ||
-      filename.endsWith(".idx")) &&
+      filename.endsWith(".idx") ||
+      filename.endsWith(".del") ||
+      filename.endsWith(".json")) &&
     request.method === "GET" &&
     range_end !== Infinity;
+  console.debug("service_worker", filename, range_start, range_end, request)
   if (caching_enabled) {
     response_body = await set_from_cache(filename, range_start, range_end);
     url += "?r=" + range_start;
