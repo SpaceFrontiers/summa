@@ -134,14 +134,11 @@ async function handle_request(request: Request) {
   let status = 200;
   let caching_enabled =
     (filename.endsWith(".fast") ||
-      filename.endsWith(".bin") ||
       filename.endsWith(".term") ||
       filename.endsWith(".pos") ||
       filename.endsWith(".store") ||
       filename.endsWith(".fieldnorm") ||
-      filename.endsWith(".idx") ||
-      filename.endsWith(".del") ||
-      filename.endsWith(".json")) &&
+      filename.endsWith(".idx")) &&
     request.method === "GET" &&
     range_end !== Infinity;
   if (caching_enabled) {
