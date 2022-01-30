@@ -7,6 +7,6 @@ parent: APIs
 
 The most direct and native way for accessing Summa through Rust 
 is [summa_proto](https://docs.rs/summa-proto/latest/summa_proto/index.html) crate. It contains
-proto bindings used in `summa-server`. Examplesm of usage may be found 
+proto bindings used in `summa-server`. Examples of usage may be found 
 in [summa/examples](https://github.com/izihawa/summa/tree/master/examples)
 

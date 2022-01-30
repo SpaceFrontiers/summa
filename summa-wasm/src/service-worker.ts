@@ -51,7 +51,6 @@ async function set_from_cache(filename: string, start: number, end: number) {
           .toArray();
     });
     if (cached_chunks.length < chunk_ixs.length) {
-      console.debug("cache_miss", filename, start, end);
       return null;
     }
     const cached_response = new ArrayBuffer(end - start);
@@ -59,7 +58,6 @@ async function set_from_cache(filename: string, start: number, end: number) {
     chunk_ixs.map((current, ix) => {
       cached_response_view.set(cached_chunks[ix].blob, current - start);
     });
-    console.debug("cache_hit", filename, start, end);
     return cached_response_view;
   } catch (e) {
     console.error(e, filename, CHUNK_SIZE, start, end);
@@ -82,7 +80,6 @@ async function fill_cache(response_body: ArrayBuffer, filename: string, start: n
       };
     }
   );
-  console.debug("cache_fill", filename, start, end);
   db.transaction("rw!", db.chunks, async () => {
     await db.table("chunks").bulkPut(items);
   });
@@ -97,7 +94,7 @@ function fetch_with_retries(url: string, options: any, retries: number): any {
       return res;
     })
     .catch((error) => {
-      console.error("retry failed", error);
+      console.debug("retry failed", error);
       let retries_left = retries - 1;
       if (!retries_left) {
         throw error;
@@ -122,7 +119,7 @@ async function handle_request(request: Request) {
   let url = request.url;
   let filename = request.url;
   let [range_start, range_end] = [0, Infinity];
-  const range = request.headers.get("range")
+  const range = request.headers.get("range");
   if (range !== null) {
     // @ts-ignore
       const [_, start, end] = /^bytes=(\d+)-(\d+)?$/g.exec(range);
@@ -134,19 +131,16 @@ async function handle_request(request: Request) {
   let response_body = null;
   let headers = new Headers();
   let status = 200;
-  let caching_enabled =
-    (filename.endsWith(".fast") ||
-      filename.endsWith(".bin") ||
+  let is_immutable_file = filename.endsWith(".fast") ||
       filename.endsWith(".term") ||
       filename.endsWith(".pos") ||
       filename.endsWith(".store") ||
       filename.endsWith(".fieldnorm") ||
       filename.endsWith(".idx") ||
-      filename.endsWith(".del") ||
-      filename.endsWith(".json")) &&
+      filename.endsWith(".del");
+  let caching_enabled = is_immutable_file &&
     request.method === "GET" &&
     range_end !== Infinity;
-  console.debug("service_worker", filename, range_start, range_end, request)
   if (caching_enabled) {
     response_body = await set_from_cache(filename, range_start, range_end);
     url += "?r=" + range_start;
@@ -173,7 +167,9 @@ async function handle_request(request: Request) {
     headers = new Headers(response.headers);
   }
   headers = set_same_origin_headers(headers);
-  headers.set("Cache-Control", "public, max-age=3600");
+  if (is_immutable_file) {
+      headers.set("Cache-Control", "public, max-age=3600");
+  }
   return new Response(response_body, {
     status: status,
     headers: headers,

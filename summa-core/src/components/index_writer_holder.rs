@@ -292,10 +292,8 @@ impl IndexWriterHolder {
 
     /// Locking index files for executing operation on them
     pub fn prepare_index(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<()> {
-        let segment_attributes = SummaSegmentAttributes::frozen();
-
-        self.vacuum(Some(segment_attributes))?;
         self.commit()?;
+        self.wait_merging_threads();
 
         if let Some(hotcache_config) = with_hotcache {
             let directory = self.index().directory();

@@ -99,11 +99,13 @@ fn wrap_with_caches<D: Directory>(
     chunked_cache_config: Option<&proto::ChunkedCacheConfig>,
 ) -> SummaResult<Box<dyn Directory>> {
     let static_cache = hotcache_bytes.map(StaticDirectoryCache::open).transpose()?;
-    // ToDo: Hotcache should use same cache
+    info!(action = "opened_static_cache");
     let file_lengths = static_cache
         .as_ref()
         .map(|static_cache| static_cache.file_lengths().clone())
         .unwrap_or_default();
+
+    info!(action = "read_file_lengths", file_lengths = ?file_lengths);
     let file_stats = FileStats::from_file_lengths(file_lengths);
     let next_directory = match &chunked_cache_config {
         Some(chunked_cache_config) => match chunked_cache_config.cache_size {
@@ -122,8 +124,13 @@ fn wrap_with_caches<D: Directory>(
         },
         None => Box::new(directory) as Box<dyn Directory>,
     };
+    info!(action = "wrapped_with_cache", chunked_cache_config = ?chunked_cache_config);
     Ok(match static_cache {
-        Some(static_cache) => Box::new(HotDirectory::open(next_directory, static_cache)?),
+        Some(static_cache) => {
+            let hot_directory = HotDirectory::open(next_directory, static_cache);
+            info!(action = "opened_hotcache", hot_directory = ?hot_directory);
+            Box::new(hot_directory?)
+        }
         None => next_directory,
     })
 }
@@ -238,7 +245,7 @@ impl IndexHolder {
         {
             Ok(hotcache_bytes) => {
                 if read_only {
-                    info!(action = "read_hotcache");
+                    info!(action = "read_hotcache", len = hotcache_bytes.len());
                     Some(hotcache_bytes)
                 } else {
                     warn!(action = "omit_hotcache");
@@ -269,8 +276,9 @@ impl IndexHolder {
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
                 if read_only {
-                    info!(action = "read_hotcache");
-                    hotcache_handle.read_bytes_async(0..hotcache_handle.len()).await.ok()
+                    let len = hotcache_handle.len();
+                    info!(action = "read_hotcache", len = len);
+                    hotcache_handle.read_bytes_async(0..len).await.ok()
                 } else {
                     warn!(action = "omit_hotcache");
                     None

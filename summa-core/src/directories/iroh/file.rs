@@ -3,7 +3,6 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use bytes::Bytes;
 use cid::Cid;
 use instant::Instant;
 use iroh_metrics::resolver::OutMetrics;
@@ -19,7 +18,6 @@ use crate::errors::SummaResult;
 pub struct IrohFileDescriptor {
     pub cid: Cid,
     pub path: PathBuf,
-    pub data: Bytes,
     pub links: Vec<Cid>,
     pub size: u64,
 }
@@ -29,7 +27,6 @@ impl IrohFileDescriptor {
         IrohFileDescriptor {
             cid,
             path: path.as_ref().to_path_buf(),
-            data: Bytes::new(),
             links: vec![],
             size,
         }

@@ -1,5 +1,5 @@
 ---
-title: WASM
+title: JS
 parent: APIs
 ---
 

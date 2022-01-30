@@ -1,10 +1,10 @@
 ![Maintenance](https://img.shields.io/badge/maintenance-activly--developed-brightgreen.svg)
-[![Crates.io](https://img.shields.io/crates/v/summa-core.svg?label=summa-core)](https://crates.io/crates/summa-core)
-[![Crates.io](https://img.shields.io/crates/v/summa-server.svg?label=summa-server)](https://crates.io/crates/summa-server)
+[![Crates.io](https://img.shields.io/crates/v/summa-proto.svg?label=summa-proto)](https://crates.io/crates/summa-proto)
+[![PyPI Version](https://img.shields.io/pypi/v/aiosumma.svg?label=aiosumma)](https://pypi.python.org/pypi/aiosumma)
 
 # Summa
 
-Summa is a full-text, IPFS-friendly, and WASM-compatible search engine that is designed to be lightning fast.
+Summa is a full-text, IPFS-friendly, and WASM-compatible search engine.
 
 With Summa, your data can be replicated and published through IPFS, allowing for a truly distributed and uncensorable search experience. And, thanks to its compatibility with WASM, Summa can be launched entirely inside your browser, enabling you to search through IPFS-published indexes without ever having to send queries to centralized servers.
 
@@ -15,7 +15,7 @@ If you're ready to experience the power of Summa, be sure to check out our [Quic
 - Full-text index with a wide range of supported queries and ranking functions
 - GRPC API, Python asynchronous client [library](https://izihawa.github.io/summa/apis/python-api) and [CLI](https://izihawa.github.io/summa/apis/python-api)
 - [Embedded IPFS implementation](https://github.com/n0-computer/iroh) allowing to seed and replicate index through IPFS network
-- [WASM-bindings](https://izihawa.github.io/summa/apis/wasm-api) to launch Summa in browsers
+- [JS-bindings](https://izihawa.github.io/summa/apis/js-api) to launch Summa in browsers
 - Also, you may use Kafka for indexing
 
 ## Online-documentation
@@ -23,7 +23,6 @@ If you're ready to experience the power of Summa, be sure to check out our [Quic
 - [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start)
 - [Architecture](https://izihawa.github.io/summa/core/architecture)
 - [github.io](https://izihawa.github.io/summa)
-- [docs.rs](https://docs.rs/summa-core)
 
 ## Distribution
 

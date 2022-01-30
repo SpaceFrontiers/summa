@@ -6,6 +6,7 @@
     doReload: () => window.location.reload(),
   };
 
+
   const n = navigator;
   if (coi.shouldDeregister() && n.serviceWorker && n.serviceWorker.controller) {
     n.serviceWorker.controller.postMessage({ type: "deregister" });
@@ -28,11 +29,11 @@
           registration.addEventListener("updatefound", () => {
             coi.doReload();
           });
-
           // If the registration is active, but it's not controlling the page
           if (registration.active && !n.serviceWorker.controller) {
             coi.doReload();
           }
+          n.serviceWorker.controller.postMessage({type: "ipfs"})
         },
         (err) => {
           console.error("COOP/COEP Service Worker failed to register:", err);

@@ -80,12 +80,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(("publish", submatches)) => {
             let store_endpoint = submatches.get_one::<String>("STORE_ENDPOINT").expect("should be set");
             let root_path = submatches.get_one::<String>("ROOT_PATH").expect("should be set");
-            let chunk_size = submatches.get_one::<usize>("CHUNK_SIZE").expect("should be set");
+            let chunk_size: usize = submatches.get_one::<String>("CHUNK_SIZE").expect("should be set").parse()?;
             let data_paths = submatches
                 .get_many::<String>("DATA_PATH")
                 .map(|x| x.cloned().collect::<Vec<String>>())
                 .unwrap_or_default();
-            let published_cid = publish(store_endpoint, root_path, &data_paths, *chunk_size)
+            let published_cid = publish(store_endpoint, root_path, &data_paths, chunk_size)
                 .await?
                 .expect("no CID has been pubished, probably there is no data?")
                 .to_string();

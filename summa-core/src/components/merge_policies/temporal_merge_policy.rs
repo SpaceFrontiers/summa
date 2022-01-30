@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 use tantivy::merge_policy::{MergeCandidate, MergePolicy};
 use tantivy::{SegmentId, SegmentMeta};
+use tracing::info;
 
 use crate::components::SummaSegmentAttributes;
 use crate::utils::current_time;
@@ -22,7 +23,8 @@ impl TemporalMergePolicy {
 impl MergePolicy for TemporalMergePolicy {
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
         let merge_pivot = current_time() - self.merge_older_then_secs;
-        let old_segments = segments
+        let original_segments: Vec<SegmentId> = segments.iter().map(|segment| segment.id()).collect();
+        let merging_segments = segments
             .iter()
             .filter(|segment_meta| {
                 let segment_attributes = segment_meta.segment_attributes();
@@ -40,6 +42,11 @@ impl MergePolicy for TemporalMergePolicy {
             })
             .map(|segment| segment.id())
             .collect::<Vec<SegmentId>>();
-        vec![MergeCandidate(old_segments)]
+        info!(action = "computed_merge_candidates", merge_pivot = merge_pivot, original_segments = ?original_segments, merging_segments = ?merging_segments);
+        if !merging_segments.is_empty() {
+            vec![MergeCandidate(merging_segments)]
+        } else {
+            vec![]
+        }
     }
 }
