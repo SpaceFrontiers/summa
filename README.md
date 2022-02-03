@@ -6,6 +6,8 @@
 
 # Summa
 
+<img src="docs/assets/gear-logo.png" width=256 height=256>
+
 Summa is a full-text, IPFS-friendly, and WASM-compatible search engine.
 
 With Summa, your data can be replicated and published through IPFS, allowing for a truly distributed and uncensorable search experience. And, thanks to its compatibility with WASM, Summa can be launched entirely inside your browser, enabling you to search through IPFS-published indexes without ever having to send queries to centralized servers.

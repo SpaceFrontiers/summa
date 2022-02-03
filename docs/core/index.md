@@ -67,15 +67,15 @@ Replication is delegated to Iroh. At startup, Summa becomes a part of IPFS swarm
 You may create and configure your own private swarm or use public swarms if you need to distribute your data publicly.
 
 #### Kick-start Replication
-Your index must have IPFS engine for becoming replicatable:
+Your index must have IPFS engine:
 
 ```bash
 # Migrate existing File index to IPFS engine
 summa-cli 0.0.0.0:8082 migrate-index test_index test_index_ipfs Ipfs
 ```
 
-After the last step, you will see the CID of the index that can be used for replication and accessing the index through Summa WASM bindings in browsers.
-You can retrieve it via usual IPFS tools or directly attach it at another Summa Server instance:
+After, you will see the CID of the index that can be used for replication and accessing the index through Summa WASM bindings in browsers.
+You can retrieve index files via usual IPFS tools or by attaching index at another Summa Server instance:
 
 ```bash
 summa-cli 0.0.0.0:8082 attach-index test_index '{"ipfs": {"cid": "<cid from the previous step>" }}'

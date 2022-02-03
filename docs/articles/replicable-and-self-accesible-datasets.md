@@ -1,6 +1,6 @@
 ---
 title: Replicable and Self-Accessible Datasets for Mitigating Internet Censorship and Privacy Issues in Practice
-parent: articles
+parent: Articles
 nav_order: 1
 ---
 
