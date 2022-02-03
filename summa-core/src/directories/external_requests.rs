@@ -82,7 +82,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
     fn generate_range_request(&self, file_name: &str, range: Option<Range<usize>>) -> SummaResult<TExternalRequest> {
         let mut vars = HashMap::new();
         vars.insert("file_name".to_string(), file_name.to_string());
-        if let Some(range) = range {
+        if let Some(range) = &range {
             let start = range.start.to_string();
             let end = (range.end - 1).to_string();
             vars.insert("start".to_string(), start);
@@ -94,6 +94,10 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
 
         let mut headers = Vec::with_capacity(self.remote_engine_config.headers_template.len());
         for (header_name, header_value) in self.remote_engine_config.headers_template.iter() {
+            // ToDo: temporary fix
+            if range.is_none() && header_name == "range" {
+                continue;
+            }
             headers.push(Header {
                 name: header_name.clone(),
                 value: strfmt(header_value, &vars).map_err(|e| Error::Validation(Box::new(ValidationError::from(e))))?,

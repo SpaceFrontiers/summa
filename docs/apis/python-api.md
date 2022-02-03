@@ -2,6 +2,7 @@
 title: Python
 parent: APIs
 ---
+[![PyPI Version](https://img.shields.io/pypi/v/aiosumma.svg?label=aiosumma)](https://pypi.python.org/pypi/aiosumma)
 
 # Aiosumma
 Aiosumma consists of two parts: Python client for GRPC API and query library. While Python client for GRPC API

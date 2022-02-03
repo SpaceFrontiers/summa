@@ -9,17 +9,17 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 const ENV_FILTER: &str = "librdkafka=warn,\
+    libp2p_quic::endpoint=error,\
+    quinn_proto::connection=error,\
     rdkafka::client=warn,\
-    summa_core::apis=info,\
     summa_core::components=info,\
     summa_core::directories=info,\
     summa_core=warn,\
     summa_server::services=info,\
+    summa_server::services::api=warn,\
     summa_server::components=info,\
     summa_server::server[lifecycle]=info,\
     summa_server=warn,\
-    tantivy=warn,\
-    fastfield_codecs=warn,\
     warn";
 
 const REQUEST_ENV_FILTER: &str = "summa_server::server::grpc[request]=info,summa_server::server::metrics[request]=info";

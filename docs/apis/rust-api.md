@@ -2,6 +2,7 @@
 title: Rust
 parent: APIs
 ---
+[![Crates.io](https://img.shields.io/crates/v/summa-proto.svg?label=summa-proto)](https://crates.io/crates/summa-proto)
 
 # Crate `summa_proto`
 

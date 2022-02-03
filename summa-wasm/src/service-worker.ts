@@ -109,13 +109,8 @@ function set_same_origin_headers(headers: Headers) {
   return headers;
 }
 
-function set_keep_alive_headers(headers: Headers) {
-  headers.set("Keep-Alive", "timeout=10, max=1000");
-  headers.set("Connection", "keep-alive");
-  return headers;
-}
-
-async function handle_request(request: Request) {
+async function handle_request(event: FetchEvent) {
+  const request = event.request
   let url = request.url;
   let filename = request.url;
   let [range_start, range_end] = [0, Infinity];
@@ -150,7 +145,7 @@ async function handle_request(request: Request) {
       url,
       {
         method: request.method,
-        headers: set_keep_alive_headers(new Headers(request.headers)),
+        headers: request.headers,
       },
       7
     );
@@ -178,7 +173,13 @@ async function handle_request(request: Request) {
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) =>
-  event.waitUntil(self.clients.claim())
+    event.waitUntil((async () => {
+    if (self.registration.navigationPreload) {
+      // Disable navigation preloads!
+      await self.registration.navigationPreload.disable();
+    }
+    await self.clients.claim();
+  })())
 );
 
 self.addEventListener("message", (ev) => {
@@ -201,5 +202,5 @@ self.addEventListener("fetch", (event) => {
   ) {
     return;
   }
-  event.respondWith(handle_request(event.request));
+  event.respondWith(handle_request(event));
 });

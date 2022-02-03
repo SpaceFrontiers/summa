@@ -4,11 +4,11 @@ nav_exclude: true
 search_exclude: true
 ---
 
-Summa is a full-text, IPFS-friendly, and WASM-compatible search engine.
+[Summa](https://github.com/izihawa/summa) is a full-text, IPFS-friendly, and WASM-compatible search engine.
 
 With Summa, your data can be replicated and published through IPFS, allowing for a truly distributed and uncensorable search experience. And, thanks to its compatibility with WASM, Summa can be launched entirely inside your browser, enabling you to search through IPFS-published indexes without ever having to send queries to centralized servers.
 
-If you're ready to experience the power of Summa, be sure to check out our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start) or our detailed [Architecture description](https://izihawa.github.io/summa/core/architecture). 
+If you're ready to experience the power of Summa, be sure to check out our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start) or our detailed [Core documentation](https://izihawa.github.io/summa/core). 
 
 ## Key Features
 
@@ -19,6 +19,10 @@ If you're ready to experience the power of Summa, be sure to check out our [Quic
 - Also, you may use Kafka for indexing
 
 ## Distribution
+
+### Sources
+
+- [GitHub](https://github.com/izihawa/summa)
 
 ### Server
 

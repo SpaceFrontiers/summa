@@ -1,6 +1,8 @@
 ![Maintenance](https://img.shields.io/badge/maintenance-activly--developed-brightgreen.svg)
-[![Crates.io](https://img.shields.io/crates/v/summa-proto.svg?label=summa-proto)](https://crates.io/crates/summa-proto)
-[![PyPI Version](https://img.shields.io/pypi/v/aiosumma.svg?label=aiosumma)](https://pypi.python.org/pypi/aiosumma)
+
+[![PyPI Version](https://img.shields.io/pypi/v/aiosumma.svg?label=aiosumma%20(Python))](https://pypi.python.org/pypi/aiosumma)
+[![Crates.io](https://img.shields.io/crates/v/summa-proto.svg?label=summa-proto%20(Rust))](https://crates.io/crates/summa-proto)
+[![NPM](https://img.shields.io/npm/v/summa-wasm.svg?label=summa-wasm%20(JS))](https://www.npmjs.com/package/summa-wasm)
 
 # Summa
 
@@ -8,7 +10,7 @@ Summa is a full-text, IPFS-friendly, and WASM-compatible search engine.
 
 With Summa, your data can be replicated and published through IPFS, allowing for a truly distributed and uncensorable search experience. And, thanks to its compatibility with WASM, Summa can be launched entirely inside your browser, enabling you to search through IPFS-published indexes without ever having to send queries to centralized servers.
 
-If you're ready to experience the power of Summa, be sure to check out our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start) or our detailed [Architecture description](https://izihawa.github.io/summa/core/architecture). 
+If you're ready to experience the power of Summa, be sure to check out our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start) or our detailed [Core documentation](https://izihawa.github.io/summa/core). 
 
 ## Key Features
 
@@ -21,7 +23,7 @@ If you're ready to experience the power of Summa, be sure to check out our [Quic
 ## Online-documentation
 
 - [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start)
-- [Architecture](https://izihawa.github.io/summa/core/architecture)
+- [Core documentation](https://izihawa.github.io/summa/core)
 - [github.io](https://izihawa.github.io/summa)
 
 ## Distribution

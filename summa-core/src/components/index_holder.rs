@@ -342,6 +342,7 @@ impl IndexHolder {
         self.index.directory().real_directory()
     }
 
+    /// Load term dictionaries into memory
     pub async fn partial_warmup(&self) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
@@ -372,6 +373,7 @@ impl IndexHolder {
         Ok(())
     }
 
+    /// Load all index files into memory
     pub async fn full_warmup(&self) -> SummaResult<()> {
         let managed_directory = self.index.directory();
         info!(action = "warming_up", index_name = ?self.index_name());

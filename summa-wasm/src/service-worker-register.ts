@@ -33,7 +33,6 @@
           if (registration.active && !n.serviceWorker.controller) {
             coi.doReload();
           }
-          n.serviceWorker.controller.postMessage({type: "ipfs"})
         },
         (err) => {
           console.error("COOP/COEP Service Worker failed to register:", err);

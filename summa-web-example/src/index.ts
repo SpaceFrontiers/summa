@@ -34,7 +34,10 @@ const remote_engine_config = {
     headers_template: new Map([["range", "bytes={start}-{end}"]]),
     chunked_cache_config: { chunk_size: 16 * 1024, cache_size: 128 * 1024 * 1024 }
 }
+
+// Adding index to the worker makes is searchable.
 await web_index_service_worker.add(remote_engine_config, "test_index");
+
 const omnibox = document.getElementById("omnibox");
 
 omnibox.onkeydown = ((e) => {
