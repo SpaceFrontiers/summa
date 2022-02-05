@@ -28,24 +28,56 @@ For example, you can find your index using `kubo`:
 ipfs get <cid>
 ```
 
-### Integrate it with browsers <a name="web"></a>
-The Summa repository has [an example web interface](https://github.com/izihawa/summa/tree/master/summa-web-example) that is capable of using an IPFS-hosted search index.
-You need to have `node and `npm installed to launch the web interface locally.
-```bash
-# Clone repository to local disk
-git clone https://github.com/izihawa/summa
+### Create web-application
+It can be imported via URL into a browser:
+```html
+<script type="module">
+  import * as Summa from "https://cdn.jsdelivr.net/npm/summa-wasm@0.98.0/dist/main.js";
+</script>
+```
+Then, you will be able to instantiate your own search service:
+```js
+// IPFS hash of directory with the index of interest
+// Replace it with your index!
+const ipfs_hash = "bafybeigpui7vo3rstuyvicx5aeyve2n553lvczkiykj5nsl5e5rj6sb2gq";
 
-# Move to web interface example
-cd summa/summa-web-example
+// Directory URL that is used to access index
+const directory_url = `http://localhost:8080/ipfs/${ipfs_hash}/`;
+
+const worker_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.98.0/dist/root-worker.js";
+const wasm_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.98.0/dist/index_bg.wasm"
+
+// `remote_index_registry` is an object used to spawn threads for searching
+// `setup` initializes WASM-module and pool of Web Workers.
+const remote_index_registry = new Summa.RemoteIndexRegistry(worker_url, wasm_url, {num_threads: 4});
+// Wait until workers will be set up
+await remote_index_registry.init_guard;
+```
+Now, you have initialized search service that may be used for requesting remote indices:
+```js
+// `remote_engine_config` is a configuration object used for telling Summa how to reach remote index
+const remote_engine_config = {
+    method: "GET",
+    url_template: `${directory_url}{file_name}`,
+    headers_template: new Map([["range", "bytes={start}-{end}"]]),
+    chunked_cache_config: { chunk_size: 16 * 1024, cache_size: 128 * 1024 * 1024 }
+}
+
+// Adding index to the worker makes is searchable.
+await remote_index_registry.add(remote_engine_config, "test_index");
+```
+This is all! Just use it:
+```js
+const query = "Games of Thrones";
+const index_query = {
+    index_alias: "test_index",
+    query: {query: {match: {value: query}}},
+    collectors: [{collector: {top_docs: {limit: 5}}}],
+}
+const response = await remote_index_registry.search([ index_query ]);
+console.log(response);
 ```
 
-Open `src/index.ts` and set the IPFS hash that you retrieved in the previous section.
-
-It's launch time!
-
-```bash
-npm i && npm run dev
-```
-
-Now, open the link that appeared in your Terminal after typing the last command.
-Type a 1-2 word search query into the input box and press Enter. Search results will appear in seconds.
+### Working example <a name="web"></a>
+We have developed a working example that mirrors news agency feed to IPFS. Live example is available at `ipns://earthtimes.space`
+Sources are committed to [GitHub](https://github.com/izihawa/earth-times) with a guide how to build it.

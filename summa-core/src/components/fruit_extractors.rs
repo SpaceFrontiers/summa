@@ -295,11 +295,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             let snippet_generators = &snippet_generators;
             let fields = &self.fields;
             async move {
-                let searcher_cloned = searcher.clone();
-                let document = tokio::task::spawn_blocking(move || searcher_cloned.doc(doc_address))
-                    .await
-                    .expect("Cannot spawn task")
-                    .expect("Document retrieving failed");
+                let document = searcher.doc_async(doc_address).await.expect("Document retrieving failed");
                 proto::ScoredDocument {
                     document: NamedFieldDocument::from_document(searcher.schema(), fields, multi_fields, &document).to_json(),
                     score: Some(score.into()),

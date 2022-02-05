@@ -46,6 +46,5 @@ pub(crate) mod logging;
 pub mod server;
 pub mod services;
 pub(crate) mod utils;
-pub(crate) mod validators;
 
 pub use server::Server;

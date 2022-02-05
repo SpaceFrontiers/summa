@@ -7,7 +7,7 @@ use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
 use summa_proto::proto;
-use summa_proto::proto::{IndexAttributes, IndexEngineConfig, RemoteEngineConfig};
+use tantivy::IndexBuilder;
 use tracing::info;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
@@ -19,24 +19,24 @@ use crate::{ThreadPool, SERIALIZER};
 /// Hold `IndexRegistry` and wrap it for making WASM-compatible
 #[wasm_bindgen]
 #[derive(Clone)]
-pub struct WebIndexRegistry {
+pub struct WrappedIndexRegistry {
     index_registry: IndexRegistry,
     core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
     thread_pool: Option<ThreadPool>,
 }
 
 #[wasm_bindgen]
-impl WebIndexRegistry {
-    /// Create new `WebIndexRegistry`
+impl WrappedIndexRegistry {
+    /// Create new `WrappedIndexRegistry`
     #[wasm_bindgen(constructor)]
-    pub fn new() -> WebIndexRegistry {
+    pub fn new() -> WrappedIndexRegistry {
         let core_config = summa_core::configs::core::ConfigBuilder::default()
             .dedicated_compression_thread(false)
             .writer_threads(None)
             .build()
             .expect("cannot build");
         let core_config = Arc::new(DirectProxy::new(core_config)) as Arc<dyn ConfigProxy<_>>;
-        WebIndexRegistry {
+        WrappedIndexRegistry {
             index_registry: IndexRegistry::new(&core_config),
             core_config,
             thread_pool: None,
@@ -68,30 +68,35 @@ impl WebIndexRegistry {
         self.merge_responses(&collectors_outputs)
     }
 
-    /// Add new index to `WebIndexRegistry`
+    /// Add new index to `WrappedIndexRegistry`
     #[wasm_bindgen]
-    pub async fn add(&self, remote_engine_config: JsValue, index_name: Option<String>) -> Result<JsValue, JsValue> {
-        let remote_engine_config: RemoteEngineConfig = serde_wasm_bindgen::from_value(remote_engine_config)?;
+    pub async fn add(&self, index_engine_config: JsValue, index_name: Option<String>) -> Result<JsValue, JsValue> {
+        let index_engine_config: proto::IndexEngineConfig = serde_wasm_bindgen::from_value(index_engine_config)?;
         Ok(self
-            .add_internal(remote_engine_config, index_name)
+            .add_internal(index_engine_config, index_name)
             .await
             .map_err(Error::from)?
             .serialize(&*SERIALIZER)?)
     }
 
-    async fn add_internal(&self, remote_engine_config: RemoteEngineConfig, index_name: Option<String>) -> SummaWasmResult<Option<IndexAttributes>> {
-        let index =
-            IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), true)
-                .await?;
-
+    async fn add_internal(&self, index_engine_config: proto::IndexEngineConfig, index_name: Option<String>) -> SummaWasmResult<Option<proto::IndexAttributes>> {
+        let index = match &index_engine_config.config {
+            Some(proto::index_engine_config::Config::Memory(memory_engine_config)) => {
+                let schema = serde_wasm_bindgen::from_value(memory_engine_config.schema.clone().into()).expect("cannot parse schema");
+                let index_builder = IndexBuilder::new().schema(schema);
+                IndexHolder::create_memory_index(index_builder)?
+            }
+            Some(proto::index_engine_config::Config::Remote(remote_engine_config)) => {
+                IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), true)
+                    .await?
+            }
+            _ => unimplemented!(),
+        };
         let index_holder = IndexHolder::create_holder(
             self.core_config.read().await.get(),
             index,
             index_name.as_deref(),
-            Arc::new(DirectProxy::new(IndexEngineConfig {
-                config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
-                merge_policy: None,
-            })),
+            Arc::new(DirectProxy::new(index_engine_config)),
             None,
             true,
         )?;
@@ -100,7 +105,7 @@ impl WebIndexRegistry {
         Ok(index_attributes)
     }
 
-    /// Remove index from `WebIndexRegistry`
+    /// Remove index from `WrappedIndexRegistry`
     #[wasm_bindgen]
     pub async fn delete(&mut self, index_name: String) {
         self.index_registry.delete(&index_name).await;
@@ -153,7 +158,7 @@ impl WebIndexRegistry {
     }
 }
 
-impl Default for WebIndexRegistry {
+impl Default for WrappedIndexRegistry {
     fn default() -> Self {
         Self::new()
     }

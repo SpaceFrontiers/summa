@@ -1,22 +1,12 @@
 export {
   IndexQuery,
-  ISearchService,
-} from "./search-service";
+  IndexRegistry,
+  IIndexRegistry,
+} from "./index-registry";
 export {
-  DefaultSearchService
-} from "./default-search-service";
-export {
-  RemoteSearchService
-} from "./remote-search-service";
-export {
-  ChunkedCacheConfig,
-  IndexAttributes,
-  RemoteEngineConfig,
-} from "./configs";
-export {
-  IIndexSeed,
-  IpfsDatabaseSeed,
-  LocalDatabaseSeed,
-} from "./seeds";
+  RemoteIndexRegistry
+} from "./remote-index-registry";
 export { IndexConfig, MetaDb } from "./meta-db";
-export * as options from "./options";
+export * as configs from "./configs";
+export * as seeds from "./seeds";
+export * as utils from "./utils";

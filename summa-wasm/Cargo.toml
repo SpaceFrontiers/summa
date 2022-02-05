@@ -1,6 +1,6 @@
 [package]
 name = "summa-wasm"
-version = "0.95.2"
+version = "0.98.0"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -24,7 +24,6 @@ js-sys = "0.3"
 once_cell = "1.16"
 parking_lot = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 serde-wasm-bindgen = "0.4"
 strfmt = { workspace = true }
 summa-core = { version = "0.11", path = "../summa-core", default_features = false }

@@ -201,12 +201,7 @@ impl IndexHolder {
 
     /// Creates index and sets it up via `setup`
     #[instrument(skip_all)]
-    pub async fn create_memory_index<
-        TExternalRequest: ExternalRequest + 'static,
-        TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
-    >(
-        index_builder: IndexBuilder,
-    ) -> SummaResult<Index> {
+    pub fn create_memory_index(index_builder: IndexBuilder) -> SummaResult<Index> {
         let index = index_builder.create_in_ram()?;
         info!(action = "created", index = ?index);
         Ok(index)
@@ -419,7 +414,6 @@ impl IndexHolder {
 
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        info!(action = "search", index_name = ?self.index_name());
         let mut multi_fruit = searcher.search_async(&parsed_query, &multi_collector).await?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
@@ -438,7 +432,7 @@ impl IndexHolder {
                     .collect()
             })
             .unwrap_or_else(HashSet::new);
-        info!(action = "extract", index_name = ?self.index_name());
+        trace!(action = "extract");
         for extractor in extractors.into_iter() {
             collector_outputs.push(
                 extractor

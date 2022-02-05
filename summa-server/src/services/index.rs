@@ -18,6 +18,7 @@ use summa_core::errors::SummaResult;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
+use summa_core::validators;
 use summa_proto::proto;
 use tantivy::store::ZstdCompressor;
 use tantivy::{Directory, IndexBuilder};
@@ -28,7 +29,6 @@ use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::errors::ValidationError;
 use crate::errors::{Error, SummaServerResult};
 use crate::hyper_external_request::HyperExternalRequest;
-use crate::validators;
 
 /// `services::Index` is responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone)]
@@ -272,7 +272,7 @@ impl Index {
                 (index, index_engine_config)
             }
             Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})) => {
-                let index = index_builder.create_in_ram()?;
+                let index = IndexHolder::create_memory_index(index_builder)?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Memory(proto::MemoryEngineConfig {
                         schema: serde_yaml::to_string(&index.schema()).expect("cannot serialize"),

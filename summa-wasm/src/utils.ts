@@ -1,14 +1,5 @@
-export const is_development =
-  process.env.NODE_ENV === "development" || window.location.port === "4173";
-export const num_threads = 4;
-export const hostname =
-  window.location.hostname +
-  (window.location.port == "" ? "" : ":" + window.location.port);
-export const ipfs_url = detect_ipfs_url(window.location.hostname);
-export const { ipfs_hostname, ipfs_http_protocol } =
-  get_ipfs_hostname(ipfs_url);
-
-function get_ipfs_hostname(ipfs_url: string) {
+export function get_ipfs_hostname(ipfs_url?: string) {
+  ipfs_url = ipfs_url || get_ipfs_url();
   const parsed_url = new URL(ipfs_url);
   let ipfs_hostname = parsed_url.hostname;
   if (parsed_url.port !== "") {
@@ -17,11 +8,8 @@ function get_ipfs_hostname(ipfs_url: string) {
   return { ipfs_hostname, ipfs_http_protocol: parsed_url.protocol };
 }
 
-function detect_ipfs_url(hostname: string) {
-  let ipfs_url = hostname;
-  if (is_development) {
-    return "http://localhost:8080";
-  }
+export function get_ipfs_url(hostname?: string) {
+  let ipfs_url = hostname || window.location.hostname;
   const hostname_parts = window.location.hostname.split(".");
   if (hostname_parts[-1] === "localhost") {
     ipfs_url = "http://localhost";

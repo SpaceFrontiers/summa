@@ -1,3 +1,19 @@
+export type IndexEngineConfigType = {remote: RemoteEngineConfig} | {memory: MemoryEngineConfig};
+
+export class IndexEngineConfig {
+  config: IndexEngineConfigType
+  constructor(config: IndexEngineConfigType) {
+    this.config = config;
+  }
+}
+
+export class MemoryEngineConfig {
+  schema: string;
+  constructor(schema: string) {
+    this.schema = schema
+  }
+}
+
 export class RemoteEngineConfig {
   method: string;
   url_template: string;

@@ -1,5 +1,5 @@
 import {ChunkedCacheConfig, RemoteEngineConfig} from "./configs";
-import {ipfs_hostname, ipfs_http_protocol, ipfs_url} from "./options";
+import {get_ipfs_hostname, get_ipfs_url} from "./utils";
 import axios from "axios";
 
 export interface IIndexSeed {
@@ -31,13 +31,17 @@ export class LocalDatabaseSeed implements IIndexSeed {
 export class IpfsDatabaseSeed implements IIndexSeed {
   ipfs_path: string;
   chunked_cache_config: ChunkedCacheConfig;
+  ipfs_url?: string;
 
-  constructor(ipfs_path: string, chunked_cache_config: ChunkedCacheConfig) {
+  constructor(ipfs_path: string, chunked_cache_config: ChunkedCacheConfig, ipfs_url?: string) {
     this.ipfs_path = ipfs_path;
     this.chunked_cache_config = chunked_cache_config;
+    this.ipfs_url = ipfs_url;
   }
 
   async retrieve_remote_engine_config(): Promise<RemoteEngineConfig> {
+    const ipfs_url = this.ipfs_url || get_ipfs_url();
+    const { ipfs_hostname, ipfs_http_protocol } = get_ipfs_hostname(ipfs_url)
     const response = await axios.get(ipfs_url + this.ipfs_path);
     let ipfs_hash = response.headers["x-ipfs-roots"];
     if (

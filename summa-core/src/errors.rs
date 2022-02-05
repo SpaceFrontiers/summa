@@ -18,6 +18,8 @@ pub enum ValidationError {
     InvalidHttpHeader(String, String),
     #[error("invalid_http_method: {0}")]
     InvalidHttpMethod(String),
+    #[error("invalid_schema_error: {0}")]
+    InvalidSchema(String),
     #[error("invalid_unique_field_type_error: {0:?}")]
     InvalidUniqueFieldType(FieldType),
     #[error("empty_argument_error: {0}")]

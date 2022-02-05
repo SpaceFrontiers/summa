@@ -27,6 +27,7 @@ pub mod metrics;
 pub mod proto_traits;
 pub mod scorers;
 pub mod utils;
+pub mod validators;
 
 pub use errors::Error;
 

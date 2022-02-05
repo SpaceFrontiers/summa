@@ -17,8 +17,6 @@ pub enum ValidationError {
     InvalidHeaderName(#[from] hyper::header::InvalidHeaderName),
     #[error("invalid_header_value: {0}")]
     InvalidHeaderValue(#[from] hyper::header::InvalidHeaderValue),
-    #[error("invalid_schema_error: {0}")]
-    InvalidSchema(String),
     #[error("missing_consumer_error: {0}")]
     MissingConsumer(String),
     #[error("missing_index_error: {0}")]

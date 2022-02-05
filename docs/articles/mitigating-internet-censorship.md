@@ -1,5 +1,5 @@
 ---
-title: Replicable and Self-Accessible Datasets for Mitigating Internet Censorship and Privacy Issues in Practice
+title: Mitigating Internet Censorship and Privacy Issues with IPFS in Practice
 parent: Articles
 nav_order: 1
 ---
