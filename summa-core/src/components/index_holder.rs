@@ -159,7 +159,11 @@ impl IndexHolder {
         });
         let cached_schema = index.schema();
         let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index)?);
-        let index_reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommit).try_into()?;
+        let index_reader = index
+            .reader_builder()
+            .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)
+            .reload_policy(ReloadPolicy::OnCommit)
+            .try_into()?;
         index_reader.reload()?;
 
         let index_writer_holder = match (read_only, &core_config.writer_threads) {

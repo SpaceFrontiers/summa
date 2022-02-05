@@ -9,6 +9,9 @@ use crate::errors::{BuilderError, SummaResult, ValidationError};
 fn return_true() -> bool {
     true
 }
+fn return_100() -> usize {
+    100
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +45,9 @@ pub struct Config {
     pub writer_heap_size_bytes: u64,
     #[builder(default = "Some(WriterThreads::N(1))")]
     pub writer_threads: Option<WriterThreads>,
+    #[builder(default = "100")]
+    #[serde(default = "return_100")]
+    pub doc_store_cache_num_blocks: usize,
 }
 
 impl Default for Config {
@@ -53,6 +59,7 @@ impl Default for Config {
             indices: HashMap::new(),
             writer_heap_size_bytes: 1024 * 1024 * 1024,
             writer_threads: Some(WriterThreads::N(1)),
+            doc_store_cache_num_blocks: 100,
         }
     }
 }

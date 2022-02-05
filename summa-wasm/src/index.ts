@@ -15,6 +15,8 @@ export {
 } from "./configs";
 export {
   IIndexSeed,
+  IpfsDatabaseSeed,
   LocalDatabaseSeed,
 } from "./seeds";
-export { IndexConfig, MetaDb } from "./meta-db"
+export { IndexConfig, MetaDb } from "./meta-db";
+export * as options from "./options";

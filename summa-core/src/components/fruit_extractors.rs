@@ -290,15 +290,19 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let fruit = self.handle.extract(multi_fruit);
         let length = fruit.len();
 
-        let scored_documents = fruit.iter().take(std::cmp::min(self.limit as usize, length));
+        let scored_documents = fruit.into_iter().take(std::cmp::min(self.limit as usize, length));
         let document_futures = scored_documents.enumerate().map(|(position, (score, doc_address))| {
             let snippet_generators = &snippet_generators;
             let fields = &self.fields;
             async move {
-                let document = searcher.doc_async(*doc_address).await.expect("Document retrieving failed");
+                let searcher_cloned = searcher.clone();
+                let document = tokio::task::spawn_blocking(move || searcher_cloned.doc(doc_address))
+                    .await
+                    .expect("Cannot spawn task")
+                    .expect("Document retrieving failed");
                 proto::ScoredDocument {
                     document: NamedFieldDocument::from_document(searcher.schema(), fields, multi_fields, &document).to_json(),
-                    score: Some((*score).into()),
+                    score: Some(score.into()),
                     position: position as u32,
                     snippets: snippet_generators
                         .iter()
