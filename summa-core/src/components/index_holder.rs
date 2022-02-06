@@ -223,13 +223,13 @@ impl IndexHolder {
     /// Attaches index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
-    pub async fn attach_file_index(file_engine_config: &proto::FileEngineConfig) -> SummaResult<Index> {
+    pub async fn open_file_index(file_engine_config: &proto::FileEngineConfig) -> SummaResult<Index> {
         let index = Index::open_in_dir(&file_engine_config.path)?;
         info!(action = "attached", config = ?file_engine_config);
         Ok(index)
     }
 
-    pub async fn attach_remote_index<
+    pub async fn open_remote_index<
         TExternalRequest: ExternalRequest + 'static,
         TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
     >(
@@ -263,7 +263,7 @@ impl IndexHolder {
     /// Attaches index and sets it up via `setup`
     #[cfg(feature = "ipfs")]
     #[instrument(skip_all)]
-    pub async fn attach_ipfs_index(
+    pub async fn open_ipfs_index(
         ipfs_engine_config: &proto::IpfsEngineConfig,
         content_loader: &iroh_unixfs::content_loader::FullLoader,
         store: &iroh_store::Store,
@@ -288,10 +288,13 @@ impl IndexHolder {
                 None
             }
         };
+        #[cfg(feature = "tokio-rt")]
         let index = tokio::task::spawn_blocking(move || {
             Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
         })
         .await??;
+        #[cfg(not(feature = "tokio-rt"))]
+        let index = Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?);
         info!(action = "attached", config = ?ipfs_engine_config);
         Ok(index)
     }

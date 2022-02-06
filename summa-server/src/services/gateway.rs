@@ -5,10 +5,10 @@ use std::time::Duration;
 use async_broadcast::Receiver;
 use iroh_rpc_types::gateway::GatewayAddr;
 use summa_core::utils::parse_endpoint;
-use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
 
 use crate::errors::SummaServerResult;
+use crate::utils::thread_handler::ControlMessage;
 use crate::utils::wait_for_addr;
 
 /// Gateway provides access to IPFS data through HTTP protocol

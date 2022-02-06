@@ -87,7 +87,7 @@ impl WrappedIndexRegistry {
                 IndexHolder::create_memory_index(index_builder)?
             }
             Some(proto::index_engine_config::Config::Remote(remote_engine_config)) => {
-                IndexHolder::attach_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), true)
+                IndexHolder::open_remote_index::<JsExternalRequest, DefaultExternalRequestGenerator<JsExternalRequest>>(remote_engine_config.clone(), true)
                     .await?
             }
             _ => unimplemented!(),

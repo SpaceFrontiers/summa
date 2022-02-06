@@ -15,10 +15,10 @@ doc = true
 fs = ["tantivy/mmap", "tokio/fs"]
 ipfs = ["iroh-metrics", "iroh-resolver", "iroh-rpc-client", "iroh-store", "iroh-unixfs"]
 metrics = ["opentelemetry"]
+tokio-rt = ["tokio/rt"]
 
 [dependencies]
 anyhow = { workspace = true }
-async-broadcast = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -56,5 +56,5 @@ take_mut = { workspace = true }
 tantivy = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true, default_features = false, features = ["macros", "rt", "signal-hook-registry", "sync"] }
+tokio = { workspace = true, default_features = false, features = ["macros", "signal-hook-registry", "sync"] }
 tracing = { workspace = true }

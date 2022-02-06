@@ -17,7 +17,6 @@ use summa_core::directories::IrohDirectory;
 use summa_core::errors::SummaResult;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
-use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
 use summa_core::validators;
 use summa_proto::proto;
 use tantivy::store::ZstdCompressor;
@@ -29,6 +28,7 @@ use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::errors::ValidationError;
 use crate::errors::{Error, SummaServerResult};
 use crate::hyper_external_request::HyperExternalRequest;
+use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
 
 /// `services::Index` is responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.
 #[derive(Clone)]
@@ -123,7 +123,10 @@ impl Index {
         let mut index_holders = HashMap::new();
         for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
             info!(action = "from_config", index = ?index_name);
-            let index = self.create_index_from(index_engine_config, false).await?;
+            let index = self
+                .open_index_from_config(index_engine_config, false)
+                .instrument(info_span!("open_index_from_config", index_name = ?index_name))
+                .await?;
             let core_config = self.server_config.read().await.get().core.clone();
             let index_engine_config_holder = self.derive_configs(&index_name).await;
             let merge_policy = core_config.indices[&index_name].merge_policy.clone();
@@ -211,7 +214,7 @@ impl Index {
                 let file_engine_config = proto::FileEngineConfig {
                     path: index_path.to_string_lossy().to_string(),
                 };
-                let index = IndexHolder::attach_file_index(&file_engine_config).await?;
+                let index = IndexHolder::open_file_index(&file_engine_config).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::File(file_engine_config)),
                     merge_policy: attach_index_request.merge_policy,
@@ -223,7 +226,7 @@ impl Index {
                     cid: cid.to_string(),
                     chunked_cache_config,
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), self.store_service.store(), false).await?;
+                let index = IndexHolder::open_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
                     merge_policy: attach_index_request.merge_policy,
@@ -293,7 +296,7 @@ impl Index {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config.clone())),
                     merge_policy: create_index_request.merge_policy,
                 };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
+                let index = IndexHolder::open_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 (index, index_engine_config)
             }
         };
@@ -532,16 +535,15 @@ impl Index {
     }
 
     /// Opens index and sets it up via `setup`
-    #[instrument(skip_all)]
-    pub async fn create_index_from(&self, index_engine_config: proto::IndexEngineConfig, read_only: bool) -> SummaServerResult<tantivy::Index> {
+    pub async fn open_index_from_config(&self, index_engine_config: proto::IndexEngineConfig, read_only: bool) -> SummaServerResult<tantivy::Index> {
         let index = match index_engine_config.config {
             Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(config.path)?,
             Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
             Some(proto::index_engine_config::Config::Remote(config)) => {
-                IndexHolder::attach_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, read_only).await?
+                IndexHolder::open_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, read_only).await?
             }
             Some(proto::index_engine_config::Config::Ipfs(config)) => {
-                IndexHolder::attach_ipfs_index(&config, self.store_service.content_loader(), self.store_service.store(), read_only).await?
+                IndexHolder::open_ipfs_index(&config, self.store_service.content_loader(), self.store_service.store(), read_only).await?
             }
             _ => unimplemented!(),
         };
@@ -578,7 +580,7 @@ impl Index {
                 })
                 .await??;
                 let ipfs_engine_config = proto::IpfsEngineConfig { cid, chunked_cache_config };
-                let index = IndexHolder::attach_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
+                let index = IndexHolder::open_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 self.insert_index(
                     &migrate_index_request.target_index_name,
                     index,
@@ -1006,7 +1008,7 @@ pub(crate) mod tests {
 
         let mut rng = SmallRng::seed_from_u64(42);
         for _ in 0..4 {
-            for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 30000) {
+            for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 3000) {
                 index_holder.index_document(d).await?;
             }
             index_service.commit(&index_holder).await?;

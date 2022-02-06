@@ -11,7 +11,6 @@ use proto::reflection_api_server::ReflectionApiServer;
 use proto::search_api_server::SearchApiServer;
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::random::generate_request_id;
-use summa_core::utils::thread_handler::ControlMessage;
 use summa_proto::proto;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -28,6 +27,7 @@ use crate::apis::reflection::ReflectionApiImpl;
 use crate::apis::search::SearchApiImpl;
 use crate::errors::SummaServerResult;
 use crate::services::Index;
+use crate::utils::thread_handler::ControlMessage;
 
 /// GRPC server exposing [API](crate::apis)
 pub struct Api {

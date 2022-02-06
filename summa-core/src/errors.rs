@@ -114,6 +114,7 @@ impl From<ValidationError> for Error {
     }
 }
 
+#[cfg(feature = "tokio-rt")]
 impl From<tokio::task::JoinError> for Error {
     fn from(_error: tokio::task::JoinError) -> Self {
         Error::Internal
@@ -123,12 +124,6 @@ impl From<tokio::task::JoinError> for Error {
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Error::IO((error, None))
-    }
-}
-
-impl<T> From<async_broadcast::SendError<T>> for Error {
-    fn from(_: async_broadcast::SendError<T>) -> Self {
-        Error::Internal
     }
 }
 

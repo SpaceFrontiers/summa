@@ -1,7 +1,7 @@
 use async_broadcast::Sender;
 use tokio::task::JoinHandle;
 
-use crate::errors::SummaResult;
+use crate::errors::SummaServerResult;
 
 #[derive(Clone, Debug)]
 pub enum ControlMessage {
@@ -20,7 +20,7 @@ impl<T> ThreadHandler<T> {
         ThreadHandler { join_handle, shutdown_trigger }
     }
 
-    pub async fn stop(self) -> SummaResult<T> {
+    pub async fn stop(self) -> SummaServerResult<T> {
         self.shutdown_trigger.broadcast(ControlMessage::Shutdown).await?;
         Ok(self.join_handle.await?)
     }

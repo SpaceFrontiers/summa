@@ -4,7 +4,6 @@ use crate::errors::SummaResult;
 
 pub mod random;
 pub mod sync;
-pub mod thread_handler;
 
 /// Parse `iroh` endpoints.
 pub fn parse_endpoint<P: FromStr>(endpoint: &str) -> SummaResult<P>

@@ -5,10 +5,10 @@ use async_broadcast::Receiver;
 use iroh_p2p::{DiskStorage, Keychain, Libp2pConfig, Node, DEFAULT_BOOTSTRAP};
 use iroh_rpc_types::p2p::P2pAddr;
 use summa_core::utils::parse_endpoint;
-use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument, Instrument};
 
 use crate::errors::SummaServerResult;
+use crate::utils::thread_handler::ControlMessage;
 use crate::utils::wait_for_addr;
 
 /// Allows to exchange data blocks with IPFS network

@@ -10,12 +10,12 @@ use rdkafka::consumer::{CommitMode, Consumer as KafkaConsumer, StreamConsumer as
 use rdkafka::error::KafkaError;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
-use summa_core::utils::thread_handler::ThreadHandler;
 use tokio::sync::Mutex;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 use super::status::{KafkaConsumingError, KafkaConsumingStatus};
 use crate::errors::{Error, SummaServerResult};
+use crate::utils::thread_handler::ThreadHandler;
 
 enum ConsumingState {
     Enabled(ThreadHandler<SummaServerResult<StreamConsumer>>),

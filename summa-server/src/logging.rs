@@ -8,7 +8,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-const ENV_FILTER: &str = "librdkafka=warn,\
+const ENV_FILTER: &str = "iroh_bitswap=error,\
+    librdkafka=warn,\
+    libp2p_kad::handler=error,\
     libp2p_quic::endpoint=error,\
     quinn_proto::connection=error,\
     rdkafka::client=warn,\

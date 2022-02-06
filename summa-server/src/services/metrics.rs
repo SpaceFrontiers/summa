@@ -17,13 +17,13 @@ use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
 use opentelemetry::sdk::metrics::{aggregators, controllers, processors};
 use opentelemetry_prometheus::PrometheusExporter;
 use prometheus::{Encoder, TextEncoder};
-use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, instrument};
 use tracing_futures::Instrument;
 
 use crate::components::IndexMeter;
 use crate::errors::{Error, SummaServerResult};
 use crate::services::Index;
+use crate::utils::thread_handler::ControlMessage;
 
 lazy_static! {
     static ref EMPTY_HEADER_VALUE: HeaderValue = HeaderValue::from_static("");

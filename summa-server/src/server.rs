@@ -9,7 +9,6 @@ use futures_util::future::try_join_all;
 use iroh_unixfs::content_loader::GatewayUrl;
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::parse_endpoint;
-use summa_core::utils::thread_handler::ControlMessage;
 use tracing::{info, info_span, Instrument};
 
 use crate::configs::server::ConfigHolder;
@@ -18,6 +17,7 @@ use crate::logging;
 use crate::services::gateway::Gateway;
 use crate::services::store::Store;
 use crate::services::{Api, Index, Metrics, P2p};
+use crate::utils::thread_handler::ControlMessage;
 use crate::utils::{increase_fd_limit, signal_channel};
 
 pub struct Server {
@@ -200,7 +200,6 @@ mod tests {
 
     use async_broadcast::broadcast;
     use serde_json::json;
-    use summa_core::utils::thread_handler::{ControlMessage, ThreadHandler};
     use summa_proto::proto;
     use summa_proto::proto::index_api_client::IndexApiClient;
     use summa_proto::proto::score::Score::F64Score;
@@ -210,6 +209,7 @@ mod tests {
     use super::*;
     use crate::configs::server::tests::create_test_server_config;
     use crate::services::index::tests::create_test_schema;
+    use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
 
     async fn create_index_api_client(endpoint: &str) -> IndexApiClient<Channel> {
         IndexApiClient::connect(endpoint.to_owned()).await.unwrap()

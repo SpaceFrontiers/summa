@@ -295,6 +295,16 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             let snippet_generators = &snippet_generators;
             let fields = &self.fields;
             async move {
+                // Calling `doc` may be computationally expensive. For better performance it is better to spawn it on blocking pool
+                #[cfg(feature = "tokio-rt")]
+                let document = {
+                    let searcher_cloned = searcher.clone();
+                    tokio::task::spawn_blocking(move || searcher_cloned.doc(doc_address))
+                        .await
+                        .expect("Cannot spawn")
+                        .expect("Document retrieving failed")
+                };
+                #[cfg(not(feature = "tokio-rt"))]
                 let document = searcher.doc_async(doc_address).await.expect("Document retrieving failed");
                 proto::ScoredDocument {
                     document: NamedFieldDocument::from_document(searcher.schema(), fields, multi_fields, &document).to_json(),
