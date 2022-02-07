@@ -45,7 +45,7 @@ serde_yaml = { version = "0.8" }
 strfmt = "0.2"
 summa-proto = { version = "0.16.2", path = "./summa-proto", default_features = false }
 take_mut = "0.2"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa", package = "summavy", version = "0.27.0", default_features = false, features = ["quickwit", "zstd-compression"] }
+tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa", default_features = false, features = ["quickwit", "zstd-compression"] }
 thiserror = "1.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
 tokio = { version = "1.25", default_features = false }

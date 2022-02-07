@@ -1,4 +1,4 @@
-![Maintenance](https://img.shields.io/badge/maintenance-activly--developed-brightgreen.svg)
+![Maintenance](https://img.shields.io/badge/maintenance-activly--developing-brightgreen.svg)
 
 [![PyPI Version](https://img.shields.io/pypi/v/aiosumma.svg?label=aiosumma%20(Python))](https://pypi.python.org/pypi/aiosumma)
 [![Crates.io](https://img.shields.io/crates/v/summa-proto.svg?label=summa-proto%20(Rust))](https://crates.io/crates/summa-proto)
@@ -6,20 +6,26 @@
 
 # Summa
 
-<img src="docs/assets/gear-logo.png" width=256 height=256>
+Summa is a full-text IPFS-friendly search engine that may be launched on both large servers and inside your browser.
 
-Summa is a full-text, IPFS-friendly, and WASM-compatible search engine.
+<img src="docs/assets/gear-logo-removebg.png" width=256 height=256>
 
-With Summa, your data can be replicated and published through IPFS, allowing for a truly distributed and uncensorable search experience. And, thanks to its compatibility with WASM, Summa can be launched entirely inside your browser, enabling you to search through IPFS-published indexes without ever having to send queries to centralized servers.
+Thanks to embedded IPFS daemon, your data can be replicated and published through P2P, allowing for a truly distributed and
+uncensorable search experience. And, thanks to compatibility with WASM, Summa can be launched entirely
+inside your browser, enabling you to search in network published indices without ever having to execute search queries
+on remote servers.
 
-If you're ready to experience the power of Summa, be sure to check out our [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start) or our detailed [Core documentation](https://izihawa.github.io/summa/core). 
+If you're ready to start, be sure to check out our docs:
+- [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start)
+- Detailed [Core documentation](https://izihawa.github.io/summa/core)
 
 ## Key Features
 
-- Full-text index with a wide range of supported queries and ranking functions
-- GRPC API, Python asynchronous client [library](https://izihawa.github.io/summa/apis/python-api) and [CLI](https://izihawa.github.io/summa/apis/python-api)
-- [Embedded IPFS implementation](https://github.com/n0-computer/iroh) allowing to seed and replicate index through IPFS network
-- [JS-bindings](https://izihawa.github.io/summa/apis/js-api) to launch Summa in browsers
+- Full-text search engine written in Rust with a wide range of supported queries and ranking functions
+- Server with GRPC API for using the search engine 
+- Python asynchronous client [library and CLI](https://izihawa.github.io/summa/apis/python-api) for the API
+- [JS-bindings](https://izihawa.github.io/summa/apis/js-api) to launch subset of Summa in browsers
+- Has ready [embedded IPFS implementation](https://github.com/n0-computer/iroh) allowing to seed and replicate index through IPFS network
 - Also, you may use Kafka for indexing
 
 ## Online-documentation
