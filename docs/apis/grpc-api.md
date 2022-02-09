@@ -28,6 +28,10 @@ parent: APIs
     - [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig)
     - [CommitIndexRequest](#summa-proto-CommitIndexRequest)
     - [CommitIndexResponse](#summa-proto-CommitIndexResponse)
+    - [CopyDocumentsRequest](#summa-proto-CopyDocumentsRequest)
+    - [CopyDocumentsResponse](#summa-proto-CopyDocumentsResponse)
+    - [CopyIndexRequest](#summa-proto-CopyIndexRequest)
+    - [CopyIndexResponse](#summa-proto-CopyIndexResponse)
     - [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest)
     - [CreateIndexRequest](#summa-proto-CreateIndexRequest)
     - [CreateIndexResponse](#summa-proto-CreateIndexResponse)
@@ -37,6 +41,8 @@ parent: APIs
     - [DeleteDocumentsResponse](#summa-proto-DeleteDocumentsResponse)
     - [DeleteIndexRequest](#summa-proto-DeleteIndexRequest)
     - [DeleteIndexResponse](#summa-proto-DeleteIndexResponse)
+    - [DocumentsRequest](#summa-proto-DocumentsRequest)
+    - [DocumentsResponse](#summa-proto-DocumentsResponse)
     - [FileEngineConfig](#summa-proto-FileEngineConfig)
     - [GetIndexRequest](#summa-proto-GetIndexRequest)
     - [GetIndexResponse](#summa-proto-GetIndexResponse)
@@ -55,17 +61,18 @@ parent: APIs
     - [IndexEngineConfig](#summa-proto-IndexEngineConfig)
     - [IndexOperation](#summa-proto-IndexOperation)
     - [IpfsEngineConfig](#summa-proto-IpfsEngineConfig)
+    - [LogMergePolicy](#summa-proto-LogMergePolicy)
     - [MemoryEngineConfig](#summa-proto-MemoryEngineConfig)
+    - [MergePolicy](#summa-proto-MergePolicy)
     - [MergeSegmentsRequest](#summa-proto-MergeSegmentsRequest)
     - [MergeSegmentsResponse](#summa-proto-MergeSegmentsResponse)
-    - [MigrateIndexRequest](#summa-proto-MigrateIndexRequest)
-    - [MigrateIndexResponse](#summa-proto-MigrateIndexResponse)
     - [PrimaryKey](#summa-proto-PrimaryKey)
     - [RemoteEngineConfig](#summa-proto-RemoteEngineConfig)
     - [RemoteEngineConfig.HeadersTemplateEntry](#summa-proto-RemoteEngineConfig-HeadersTemplateEntry)
     - [SetIndexAliasRequest](#summa-proto-SetIndexAliasRequest)
     - [SetIndexAliasResponse](#summa-proto-SetIndexAliasResponse)
     - [SortByField](#summa-proto-SortByField)
+    - [TemporalMergePolicy](#summa-proto-TemporalMergePolicy)
     - [VacuumIndexRequest](#summa-proto-VacuumIndexRequest)
     - [VacuumIndexResponse](#summa-proto-VacuumIndexResponse)
     - [WarmupIndexRequest](#summa-proto-WarmupIndexRequest)
@@ -357,6 +364,7 @@ Attach index request
 | file | [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest) |  |  |
 | remote | [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest) |  |  |
 | ipfs | [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest) |  |  |
+| merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  |  |
 
 
 
@@ -456,6 +464,67 @@ Commit index response
 
 
 
+<a name="summa-proto-CopyDocumentsRequest"></a>
+
+### CopyDocumentsRequest
+Copy documents request
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| source_index_name | [string](#string) |  |  |
+| target_index_name | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-CopyDocumentsResponse"></a>
+
+### CopyDocumentsResponse
+Copy documents response
+
+
+
+
+
+
+<a name="summa-proto-CopyIndexRequest"></a>
+
+### CopyIndexRequest
+Request that changes index engine. Currently possible to convert File to IPFS
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| source_index_name | [string](#string) |  | Name of index that will be migrated. It will be left intact after migration. |
+| target_index_name | [string](#string) |  | Name of index that will be created |
+| file | [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest) |  |  |
+| memory | [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest) |  |  |
+| ipfs | [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest) |  |  |
+| merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-CopyIndexResponse"></a>
+
+### CopyIndexResponse
+Response describing migrated index
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
+
+
+
+
+
+
 <a name="summa-proto-CreateFileEngineRequest"></a>
 
 ### CreateFileEngineRequest
@@ -483,6 +552,7 @@ Request for index creation
 | blocksize | [uint32](#uint32) | optional | Size of store blocks |
 | sort_by_field | [SortByField](#summa-proto-SortByField) | optional | Field for sorting |
 | index_attributes | [IndexAttributes](#summa-proto-IndexAttributes) |  | Optional index fields |
+| merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  | Merge policy |
 
 
 
@@ -583,7 +653,37 @@ Request for index creation
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_name | [string](#string) |  |  |
+| deleted_index_name | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-DocumentsRequest"></a>
+
+### DocumentsRequest
+Request a stream of all documents from the index
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index_alias | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-DocumentsResponse"></a>
+
+### DocumentsResponse
+Single document from the index
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| document | [string](#string) |  |  |
 
 
 
@@ -694,7 +794,7 @@ Request for index creation
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| indices | [IndexDescription](#summa-proto-IndexDescription) | repeated |  |
+| index_names | [string](#string) | repeated |  |
 
 
 
@@ -725,16 +825,17 @@ Request for index creation
 <a name="summa-proto-IndexDescription"></a>
 
 ### IndexDescription
-
+Description containing `Index` metadata fields
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
-| index_aliases | [string](#string) | repeated |  |
+| index_aliases | [string](#string) | repeated | All index aliases |
 | index_engine | [IndexEngineConfig](#summa-proto-IndexEngineConfig) |  |  |
-| num_docs | [uint64](#uint64) |  |  |
-| compression | [Compression](#summa-proto-Compression) |  |  |
+| num_docs | [uint64](#uint64) |  | The number of committed documents |
+| compression | [Compression](#summa-proto-Compression) |  | Used compression for `store` |
+| index_attributes | [IndexAttributes](#summa-proto-IndexAttributes) |  | All custom index attributes |
 
 
 
@@ -744,7 +845,7 @@ Request for index creation
 <a name="summa-proto-IndexDocumentOperation"></a>
 
 ### IndexDocumentOperation
-
+Indexing operations that contains document serialized in JSON format
 
 
 | Field | Type | Label | Description |
@@ -827,6 +928,7 @@ Request for index creation
 | memory | [MemoryEngineConfig](#summa-proto-MemoryEngineConfig) |  |  |
 | remote | [RemoteEngineConfig](#summa-proto-RemoteEngineConfig) |  |  |
 | ipfs | [IpfsEngineConfig](#summa-proto-IpfsEngineConfig) |  |  |
+| merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  | Merge policy |
 
 
 
@@ -836,7 +938,7 @@ Request for index creation
 <a name="summa-proto-IndexOperation"></a>
 
 ### IndexOperation
-
+Message that should be put in Kafka for ingesting by Summa consumers
 
 
 | Field | Type | Label | Description |
@@ -858,7 +960,21 @@ Request for index creation
 | ----- | ---- | ----- | ----------- |
 | cid | [string](#string) |  |  |
 | chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
-| path | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-LogMergePolicy"></a>
+
+### LogMergePolicy
+Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/tantivy/merge_policy/struct.LogMergePolicy.html)
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| is_frozen | [bool](#bool) |  | Set if once merged segment should be left intact |
 
 
 
@@ -874,6 +990,22 @@ Request for index creation
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | schema | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-MergePolicy"></a>
+
+### MergePolicy
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| log | [LogMergePolicy](#summa-proto-LogMergePolicy) |  |  |
+| temporal | [TemporalMergePolicy](#summa-proto-TemporalMergePolicy) |  |  |
 
 
 
@@ -900,40 +1032,6 @@ Request for index creation
 
 ### MergeSegmentsResponse
 
-
-
-
-
-
-
-<a name="summa-proto-MigrateIndexRequest"></a>
-
-### MigrateIndexRequest
-Request that changes index engine. Currently possible to convert File to IPFS
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| source_index_name | [string](#string) |  | Name of index that will be migrated. It will be left intact after migration. |
-| target_index_name | [string](#string) |  | Name of index that will be created |
-| file | [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest) |  |  |
-| memory | [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest) |  |  |
-| ipfs | [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-MigrateIndexResponse"></a>
-
-### MigrateIndexResponse
-Response describing migrated index
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
 
 
 
@@ -1031,6 +1129,21 @@ Possible primary keys
 | ----- | ---- | ----- | ----------- |
 | field | [string](#string) |  |  |
 | order | [Order](#summa-proto-Order) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-TemporalMergePolicy"></a>
+
+### TemporalMergePolicy
+Merge policy for compressing old segments
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| merge_older_then_secs | [uint64](#uint64) |  |  |
 
 
 
@@ -1135,10 +1248,12 @@ Manages indices
 | ----------- | ------------ | ------------- | ------------|
 | attach_index | [AttachIndexRequest](#summa-proto-AttachIndexRequest) | [AttachIndexResponse](#summa-proto-AttachIndexResponse) | Attaches index to Summa server. Attaching allows to incorporate and start using of downloaded or network indices |
 | commit_index | [CommitIndexRequest](#summa-proto-CommitIndexRequest) | [CommitIndexResponse](#summa-proto-CommitIndexResponse) | Committing all collected writes to the index |
+| copy_documents | [CopyDocumentsRequest](#summa-proto-CopyDocumentsRequest) | [CopyDocumentsResponse](#summa-proto-CopyDocumentsResponse) | Copy documents from one index to another |
 | create_index | [CreateIndexRequest](#summa-proto-CreateIndexRequest) | [CreateIndexResponse](#summa-proto-CreateIndexResponse) | Creates new index from scratch |
-| migrate_index | [MigrateIndexRequest](#summa-proto-MigrateIndexRequest) | [MigrateIndexResponse](#summa-proto-MigrateIndexResponse) | Creates new index from scratch |
+| copy_index | [CopyIndexRequest](#summa-proto-CopyIndexRequest) | [CopyIndexResponse](#summa-proto-CopyIndexResponse) | Creates new index from scratch |
 | delete_documents | [DeleteDocumentsRequest](#summa-proto-DeleteDocumentsRequest) | [DeleteDocumentsResponse](#summa-proto-DeleteDocumentsResponse) | Deletes single document from the index by its primary key (therefore, index must have primary key) |
 | delete_index | [DeleteIndexRequest](#summa-proto-DeleteIndexRequest) | [DeleteIndexResponse](#summa-proto-DeleteIndexResponse) | Deletes index and physically removes file in the case of `FileEngine` |
+| documents | [DocumentsRequest](#summa-proto-DocumentsRequest) | [DocumentsResponse](#summa-proto-DocumentsResponse) stream | Stream of all documents from the index |
 | get_indices_aliases | [GetIndicesAliasesRequest](#summa-proto-GetIndicesAliasesRequest) | [GetIndicesAliasesResponse](#summa-proto-GetIndicesAliasesResponse) | Gets all existing index aliases |
 | get_index | [GetIndexRequest](#summa-proto-GetIndexRequest) | [GetIndexResponse](#summa-proto-GetIndexResponse) | Gets index description |
 | get_indices | [GetIndicesRequest](#summa-proto-GetIndicesRequest) | [GetIndicesResponse](#summa-proto-GetIndicesResponse) | Gets all existing index descriptions |

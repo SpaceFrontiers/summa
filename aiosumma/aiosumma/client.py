@@ -1,5 +1,7 @@
 import sys
+import typing
 from typing import (
+    AsyncIterator,
     Dict,
     Iterable,
     List,
@@ -107,6 +109,33 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose
+    async def copy_documents(
+        self,
+        source_index_name: str,
+        target_index_name: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> index_service_pb.CopyDocumentsResponse:
+        """
+        Copies all documents from `source` to `target` index
+
+        Args:
+            source_index_name: source index name
+            target_index_name: target index name
+            request_id: request id
+            session_id: session id
+        Returns:
+            Commit scheduling result
+        """
+        return await self.stubs['index_api'].copy_documents(
+            index_service_pb.CopyDocumentsRequest(
+                source_index_name=source_index_name,
+                target_index_name=target_index_name,
+            ),
+            metadata=setup_metadata(session_id, request_id),
+        )
+
+    @expose
     async def create_consumer(
         self,
         index_name: str,
@@ -194,7 +223,7 @@ class SummaClient(BaseGrpcClient):
         )
 
     @expose(with_from_file=True)
-    async def migrate_index(
+    async def copy_index(
         self,
         source_index_name: str,
         target_index_name: str,
@@ -204,7 +233,7 @@ class SummaClient(BaseGrpcClient):
         session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
         """
-        Migrates existing index to new engine
+        Copies existing index to new engine
 
         Args:
             source_index_name: source index name
@@ -214,8 +243,8 @@ class SummaClient(BaseGrpcClient):
             request_id: request id
             session_id: session id
         """
-        return await self.stubs['index_api'].migrate_index(
-            index_service_pb.MigrateIndexRequest(
+        return await self.stubs['index_api'].copy_index(
+            index_service_pb.CopyIndexRequest(
                 source_index_name=source_index_name,
                 target_index_name=target_index_name,
                 merge_policy=index_service_pb.MergePolicy(**(merge_policy or {})),
@@ -392,6 +421,27 @@ class SummaClient(BaseGrpcClient):
             index_service_pb.GetIndicesAliasesRequest(),
             metadata=setup_metadata(session_id, request_id),
         )
+
+    @expose
+    async def documents(
+        self,
+        index_alias: str,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """
+        Retrieve all documents from the index
+
+        Args:
+            index_alias: index alias
+            request_id: request id
+            session_id: session id
+        """
+        async for document in self.stubs['index_api'].documents(
+            index_service_pb.DocumentsRequest(index_alias=index_alias),
+            metadata=setup_metadata(session_id, request_id),
+        ):
+            print(document.document)
 
     @expose
     async def index_document_stream(

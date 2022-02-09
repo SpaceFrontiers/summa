@@ -238,6 +238,28 @@ impl Index {
         self.insert_index(&attach_index_request.index_name, index, &index_engine_config).await
     }
 
+    pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<()> {
+        let target_index_writer = self
+            .get_index_holder(&copy_documents_request.target_index_name)
+            .await?
+            .index_writer_holder()?
+            .clone()
+            .read_owned()
+            .await;
+        let source_documents_receiver = self.get_index_holder(&copy_documents_request.source_index_name).await?.documents()?;
+        let mut documents = 0u64;
+        while let Ok(document) = source_documents_receiver.as_async().recv().await {
+            target_index_writer
+                .index_document(document.map_err(crate::errors::Error::from)?)
+                .map_err(crate::errors::Error::from)?;
+            documents += 1;
+            if documents % 100_000 == 0 {
+                info!(action = "copied", documents = documents)
+            }
+        }
+        Ok(())
+    }
+
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(index_name = ?create_index_request.index_name))]
     pub async fn create_index(&self, create_index_request: proto::CreateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
@@ -551,12 +573,12 @@ impl Index {
     }
 
     #[instrument(skip(self))]
-    pub async fn migrate_index(&self, migrate_index_request: proto::MigrateIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_holder = self.index_registry.get_index_holder(&migrate_index_request.source_index_name).await?;
+    pub async fn copy_index(&self, copy_index_request: proto::CopyIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
+        let index_holder = self.index_registry.get_index_holder(&copy_index_request.source_index_name).await?;
         let prepared_consumption = self.commit(&index_holder).await?;
 
-        let index_holder = match migrate_index_request.target_index_engine {
-            Some(proto::migrate_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
+        let index_holder = match copy_index_request.target_index_engine {
+            Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
                 let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
                 let hotcache_config = Some(HotCacheConfig {
                     chunk_size: chunked_cache_config
@@ -582,11 +604,11 @@ impl Index {
                 let ipfs_engine_config = proto::IpfsEngineConfig { cid, chunked_cache_config };
                 let index = IndexHolder::open_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 self.insert_index(
-                    &migrate_index_request.target_index_name,
+                    &copy_index_request.target_index_name,
                     index,
                     &proto::IndexEngineConfig {
                         config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)),
-                        merge_policy: migrate_index_request.merge_policy,
+                        merge_policy: copy_index_request.merge_policy,
                     },
                 )
                 .await?
@@ -940,7 +962,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_migrate_index() -> SummaServerResult<()> {
+    async fn test_copy_index() -> SummaServerResult<()> {
         logging::tests::initialize_default_once();
         let schema = create_test_schema();
 
@@ -964,11 +986,11 @@ pub(crate) mod tests {
         index_service.commit(&index_holder).await?;
 
         index_service
-            .migrate_index(proto::MigrateIndexRequest {
+            .copy_index(proto::CopyIndexRequest {
                 source_index_name: "test_index".to_string(),
-                target_index_name: "migrated_index".to_string(),
+                target_index_name: "copied_index".to_string(),
                 merge_policy: None,
-                target_index_engine: Some(proto::migrate_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
+                target_index_engine: Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
                     chunked_cache_config: Some(proto::ChunkedCacheConfig {
                         chunk_size: 16 * 1024,
                         cache_size: None,
@@ -978,7 +1000,7 @@ pub(crate) mod tests {
             .await?;
 
         let search_response = index_holder
-            .search("migrated_index", &match_query("testtitle"), vec![top_docs_collector(10)])
+            .search("copied_index", &match_query("testtitle"), vec![top_docs_collector(10)])
             .await?;
         assert_eq!(search_response.len(), 1);
 

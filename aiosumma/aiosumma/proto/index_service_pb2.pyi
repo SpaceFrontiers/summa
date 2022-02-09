@@ -75,6 +75,40 @@ class CommitIndexResponse(_message.Message):
     elapsed_secs: float
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
 
+class CopyDocumentsRequest(_message.Message):
+    __slots__ = ["source_index_name", "target_index_name"]
+    SOURCE_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    TARGET_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    source_index_name: str
+    target_index_name: str
+    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ...) -> None: ...
+
+class CopyDocumentsResponse(_message.Message):
+    __slots__ = []
+    def __init__(self) -> None: ...
+
+class CopyIndexRequest(_message.Message):
+    __slots__ = ["file", "ipfs", "memory", "merge_policy", "source_index_name", "target_index_name"]
+    FILE_FIELD_NUMBER: _ClassVar[int]
+    IPFS_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_FIELD_NUMBER: _ClassVar[int]
+    MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    TARGET_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    file: CreateFileEngineRequest
+    ipfs: CreateIpfsEngineRequest
+    memory: CreateMemoryEngineRequest
+    merge_policy: MergePolicy
+    source_index_name: str
+    target_index_name: str
+    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[CreateIpfsEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+
+class CopyIndexResponse(_message.Message):
+    __slots__ = ["index"]
+    INDEX_FIELD_NUMBER: _ClassVar[int]
+    index: IndexDescription
+    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
+
 class CreateFileEngineRequest(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
@@ -144,6 +178,18 @@ class DeleteIndexResponse(_message.Message):
     DELETED_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     deleted_index_name: str
     def __init__(self, deleted_index_name: _Optional[str] = ...) -> None: ...
+
+class DocumentsRequest(_message.Message):
+    __slots__ = ["index_alias"]
+    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    index_alias: str
+    def __init__(self, index_alias: _Optional[str] = ...) -> None: ...
+
+class DocumentsResponse(_message.Message):
+    __slots__ = ["document"]
+    DOCUMENT_FIELD_NUMBER: _ClassVar[int]
+    document: str
+    def __init__(self, document: _Optional[str] = ...) -> None: ...
 
 class FileEngineConfig(_message.Message):
     __slots__ = ["path"]
@@ -319,28 +365,6 @@ class MergeSegmentsRequest(_message.Message):
 class MergeSegmentsResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
-
-class MigrateIndexRequest(_message.Message):
-    __slots__ = ["file", "ipfs", "memory", "merge_policy", "source_index_name", "target_index_name"]
-    FILE_FIELD_NUMBER: _ClassVar[int]
-    IPFS_FIELD_NUMBER: _ClassVar[int]
-    MEMORY_FIELD_NUMBER: _ClassVar[int]
-    MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
-    SOURCE_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    TARGET_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    file: CreateFileEngineRequest
-    ipfs: CreateIpfsEngineRequest
-    memory: CreateMemoryEngineRequest
-    merge_policy: MergePolicy
-    source_index_name: str
-    target_index_name: str
-    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[CreateIpfsEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
-
-class MigrateIndexResponse(_message.Message):
-    __slots__ = ["index"]
-    INDEX_FIELD_NUMBER: _ClassVar[int]
-    index: IndexDescription
-    def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class PrimaryKey(_message.Message):
     __slots__ = ["i64", "str"]

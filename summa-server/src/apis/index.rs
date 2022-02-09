@@ -11,7 +11,9 @@ use summa_core::components::{IndexHolder, SummaDocument};
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::sync::Handler;
 use summa_proto::proto;
+use summa_proto::proto::DocumentsResponse;
 use tantivy::SegmentId;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, info_span, warn};
@@ -104,6 +106,16 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         }
     }
 
+    async fn copy_documents(&self, proto_request: Request<proto::CopyDocumentsRequest>) -> Result<Response<proto::CopyDocumentsResponse>, Status> {
+        let copy_documents_request = proto_request.into_inner();
+        self.index_service
+            .copy_documents(copy_documents_request)
+            .await
+            .map_err(crate::errors::Error::from)?;
+        let response = proto::CopyDocumentsResponse {};
+        Ok(Response::new(response))
+    }
+
     async fn create_index(&self, proto_request: Request<proto::CreateIndexRequest>) -> Result<Response<proto::CreateIndexResponse>, Status> {
         let index_holder = self.index_service.create_index(proto_request.into_inner()).await?;
         let response = proto::CreateIndexResponse {
@@ -112,9 +124,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         Ok(Response::new(response))
     }
 
-    async fn migrate_index(&self, proto_request: Request<proto::MigrateIndexRequest>) -> Result<Response<proto::MigrateIndexResponse>, Status> {
-        let index_holder = self.index_service.migrate_index(proto_request.into_inner()).await?;
-        let response = proto::MigrateIndexResponse {
+    async fn copy_index(&self, proto_request: Request<proto::CopyIndexRequest>) -> Result<Response<proto::CopyIndexResponse>, Status> {
+        let index_holder = self.index_service.copy_index(proto_request.into_inner()).await?;
+        let response = proto::CopyIndexResponse {
             index: Some(self.get_index_description(&index_holder).await),
         };
         Ok(Response::new(response))
@@ -133,16 +145,55 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         Ok(Response::new(response))
     }
 
-    async fn index_document(&self, request: Request<proto::IndexDocumentRequest>) -> Result<Response<proto::IndexDocumentResponse>, Status> {
-        let request = request.into_inner();
-        self.index_service
-            .get_index_holder(&request.index_alias)
-            .await?
-            .index_document(SummaDocument::UnboundJsonBytes(&request.document))
-            .await
-            .map_err(crate::errors::Error::from)?;
-        let response = proto::IndexDocumentResponse {};
-        Ok(Response::new(response))
+    async fn delete_index(&self, proto_request: Request<proto::DeleteIndexRequest>) -> Result<Response<proto::DeleteIndexResponse>, Status> {
+        Ok(Response::new(self.index_service.delete_index(proto_request.into_inner()).await?.into()))
+    }
+
+    type documentsStream = ReceiverStream<Result<DocumentsResponse, Status>>;
+
+    async fn documents(&self, proto_request: Request<proto::DocumentsRequest>) -> Result<Response<Self::documentsStream>, Status> {
+        let proto_request = proto_request.into_inner();
+        let (sender, receiver) = tokio::sync::mpsc::channel(128);
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let schema = index_holder.schema().clone();
+        let documents_receiver = index_holder.documents().map_err(crate::errors::Error::from)?;
+        tokio::task::spawn(async move {
+            while let Ok(document) = documents_receiver.as_async().recv().await {
+                if sender
+                    .send(Ok(DocumentsResponse {
+                        document: schema.to_json(&document?),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    info!(action = "grpc_client_dropped");
+                    return Ok::<_, crate::errors::Error>(());
+                }
+            }
+            Ok(())
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {
+        Ok(Response::new(proto::GetIndicesAliasesResponse {
+            indices_aliases: self.server_config.read().await.get().core.aliases.clone(),
+        }))
+    }
+
+    async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
+        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_alias).await?;
+        let index_description = self.get_index_description(&index_holder).await;
+        Ok(Response::new(proto::GetIndexResponse {
+            index: Some(index_description),
+        }))
+    }
+
+    async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
+        let index_holders = self.index_service.index_registry().index_holders().read().await;
+        Ok(Response::new(proto::GetIndicesResponse {
+            index_names: index_holders.keys().cloned().collect(),
+        }))
     }
 
     async fn index_document_stream(
@@ -188,29 +239,16 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         Ok(Response::new(response))
     }
 
-    async fn delete_index(&self, proto_request: Request<proto::DeleteIndexRequest>) -> Result<Response<proto::DeleteIndexResponse>, Status> {
-        Ok(Response::new(self.index_service.delete_index(proto_request.into_inner()).await?.into()))
-    }
-
-    async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
-        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_alias).await?;
-        let index_description = self.get_index_description(&index_holder).await;
-        Ok(Response::new(proto::GetIndexResponse {
-            index: Some(index_description),
-        }))
-    }
-
-    async fn get_indices(&self, _: Request<proto::GetIndicesRequest>) -> Result<Response<proto::GetIndicesResponse>, Status> {
-        let index_holders = self.index_service.index_registry().index_holders().read().await;
-        Ok(Response::new(proto::GetIndicesResponse {
-            index_names: index_holders.keys().cloned().collect(),
-        }))
-    }
-
-    async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {
-        Ok(Response::new(proto::GetIndicesAliasesResponse {
-            indices_aliases: self.server_config.read().await.get().core.aliases.clone(),
-        }))
+    async fn index_document(&self, request: Request<proto::IndexDocumentRequest>) -> Result<Response<proto::IndexDocumentResponse>, Status> {
+        let request = request.into_inner();
+        self.index_service
+            .get_index_holder(&request.index_alias)
+            .await?
+            .index_document(SummaDocument::UnboundJsonBytes(&request.document))
+            .await
+            .map_err(crate::errors::Error::from)?;
+        let response = proto::IndexDocumentResponse {};
+        Ok(Response::new(response))
     }
 
     async fn merge_segments(&self, proto_request: Request<proto::MergeSegmentsRequest>) -> Result<Response<proto::MergeSegmentsResponse>, Status> {

@@ -16,7 +16,7 @@ use summa_proto::proto;
 use tantivy::collector::MultiCollector;
 use tantivy::directory::OwnedBytes;
 use tantivy::schema::Schema;
-use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy};
+use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -478,5 +478,26 @@ impl IndexHolder {
             }
         }
         Ok((success_docs, failed_docs))
+    }
+
+    pub fn documents(&self) -> SummaResult<kanal::Receiver<tantivy::Result<Document>>> {
+        let searcher = self.index_reader().searcher();
+        let segment_readers = searcher.segment_readers();
+        let (tx, rx) = kanal::bounded(segment_readers.len() * 2 - 1);
+        for segment_reader in searcher.segment_readers() {
+            let tx = tx.clone();
+            let segment_reader = segment_reader.clone();
+            tokio::task::spawn_blocking(move || {
+                let store_reader = segment_reader.get_store_reader(1)?;
+                for document in store_reader.iter(segment_reader.alive_bitset()) {
+                    if tx.send(document).is_err() {
+                        info!(action = "documents_client_dropped");
+                        return Ok::<_, Error>(());
+                    }
+                }
+                Ok(())
+            });
+        }
+        Ok(rx)
     }
 }
