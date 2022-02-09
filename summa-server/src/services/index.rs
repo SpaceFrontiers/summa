@@ -447,9 +447,10 @@ impl Index {
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-
         let mut index_writer = index_holder.index_writer_holder()?.clone().write_owned().await;
-        tokio::task::spawn_blocking(move || index_writer.commit()).await??;
+
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit())).await??;
 
         let prepared_consumption = match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
@@ -461,7 +462,8 @@ impl Index {
             let hot_cache_config = ipfs_engine_config.chunked_cache_config.as_ref().map(|c| HotCacheConfig {
                 chunk_size: Some(c.chunk_size as usize),
             });
-            tokio::task::spawn_blocking(move || index_writer_holder.prepare_index(hot_cache_config)).await??;
+            let span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || span.in_scope(|| index_writer_holder.prepare_index(hot_cache_config))).await??;
             let cid = index_holder
                 .real_directory()
                 .as_any()
@@ -473,7 +475,8 @@ impl Index {
             index_engine_config.commit().await?;
             info!(action = "store_new_cid", cid = ?cid);
             let index_holder = index_holder.clone();
-            tokio::task::spawn_blocking(move || index_holder.index_reader().reload()).await??;
+            let span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || span.in_scope(|| index_holder.index_reader().reload())).await??;
         }
         Ok(prepared_consumption)
     }
@@ -483,7 +486,8 @@ impl Index {
     pub async fn rollback(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        tokio::task::spawn_blocking(move || index_writer.rollback()).await??;
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.rollback())).await??;
         Ok(stopped_consumption.map(|c| c.ignore()))
     }
 
@@ -492,7 +496,8 @@ impl Index {
     pub async fn try_commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
-        tokio::task::spawn_blocking(move || index_writer.commit()).await??;
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit())).await??;
         Ok(match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
@@ -590,15 +595,18 @@ impl Index {
                     self.store_service.store(),
                     Driver::Tokio(tokio::runtime::Handle::current()),
                 );
+                let span = tracing::Span::current();
                 let cid = tokio::task::spawn_blocking(move || {
-                    let locked_files = index_writer_holder.lock_files(hotcache_config)?;
-                    for file in locked_files {
-                        // ToDo: Avoid reading to memory
-                        let mut writer = iroh_directory.get_writer(&file);
-                        writer.write_all(&index_holder.index().directory().atomic_read(Path::new(&file)).expect("cannot read"))?;
-                        writer.terminate()?;
-                    }
-                    Ok::<String, Error>(iroh_directory.cid().expect("should be non empty").to_string())
+                    span.in_scope(|| {
+                        let locked_files = index_writer_holder.lock_files(hotcache_config)?;
+                        for file in locked_files {
+                            // ToDo: Avoid reading to memory
+                            let mut writer = iroh_directory.get_writer(&file);
+                            writer.write_all(&index_holder.index().directory().atomic_read(Path::new(&file)).expect("cannot read"))?;
+                            writer.terminate()?;
+                        }
+                        Ok::<String, Error>(iroh_directory.cid().expect("should be non empty").to_string())
+                    })
                 })
                 .await??;
                 let ipfs_engine_config = proto::IpfsEngineConfig { cid, chunked_cache_config };
