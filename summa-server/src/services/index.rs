@@ -20,7 +20,7 @@ use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::validators;
 use summa_proto::proto;
 use tantivy::store::ZstdCompressor;
-use tantivy::{Directory, IndexBuilder};
+use tantivy::{Directory, IndexBuilder, SegmentId};
 use tokio::sync::RwLock;
 use tracing::{info, info_span, instrument, warn, Instrument};
 
@@ -636,6 +636,26 @@ impl Index {
             .into_iter()
             .collect::<Result<SummaResult<Vec<_>>, _>>()??;
         Ok(self.index_registry.merge_responses(&collector_outputs)?)
+    }
+
+    #[instrument(skip(self), fields(index_name = merge_segments_request.index_name))]
+    pub async fn merge_segments(&self, merge_segments_request: proto::MergeSegmentsRequest) -> SummaServerResult<Option<SegmentId>> {
+        let index_holder = self.get_index_holder(&merge_segments_request.index_name).await?;
+        let mut index_writer_holder = index_holder
+            .index_writer_holder()
+            .map_err(crate::errors::Error::from)?
+            .clone()
+            .write_owned()
+            .await;
+        let span = tracing::Span::current();
+        let segment_ids: Vec<_> = merge_segments_request
+            .segment_ids
+            .iter()
+            .map(|segment_id| SegmentId::from_uuid_string(segment_id))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("wrong uuid");
+        let segment_meta = tokio::task::spawn_blocking(move || span.in_scope(|| index_writer_holder.merge(&segment_ids, None))).await??;
+        Ok(segment_meta.map(|segment_meta| segment_meta.id()))
     }
 }
 

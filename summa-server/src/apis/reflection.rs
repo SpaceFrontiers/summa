@@ -27,7 +27,7 @@ impl ReflectionApiImpl {
 impl proto::reflection_api_server::ReflectionApi for ReflectionApiImpl {
     async fn get_top_terms(&self, proto_request: Request<proto::GetTopTermsRequest>) -> Result<Response<proto::GetTopTermsResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
         let field = index_holder.schema().get_field(&proto_request.field_name).map_err(crate::errors::Error::from)?;
 
         let top_k = proto_request

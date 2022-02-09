@@ -12,7 +12,6 @@ use summa_core::configs::ConfigProxy;
 use summa_core::utils::sync::Handler;
 use summa_proto::proto;
 use summa_proto::proto::DocumentsResponse;
-use tantivy::SegmentId;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -87,7 +86,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         match proto::CommitMode::from_i32(request.commit_mode) {
             None | Some(proto::CommitMode::Async) => {
                 let index_service = self.index_service.clone();
-                let index_holder = index_service.get_index_holder(&request.index_alias).await?;
+                let index_holder = index_service.get_index_holder(&request.index_name).await?;
                 tokio::spawn(async move {
                     if let Err(err) = index_service.commit_and_restart_consumption(&index_holder).await {
                         warn!(action = "busy", error = format!("{err:?}"))
@@ -97,7 +96,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             }
             Some(proto::CommitMode::Sync) => {
                 let now = Instant::now();
-                let index_holder = self.index_service.get_index_holder(&request.index_alias).await?;
+                let index_holder = self.index_service.get_index_holder(&request.index_name).await?;
                 self.index_service.commit_and_restart_consumption(&index_holder).await?;
                 Ok(Response::new(proto::CommitIndexResponse {
                     elapsed_secs: Some(now.elapsed().as_secs_f64()),
@@ -136,7 +135,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let request = request.into_inner();
         let deleted_documents = self
             .index_service
-            .get_index_holder(&request.index_alias)
+            .get_index_holder(&request.index_name)
             .await?
             .delete_documents(request.query.ok_or(ValidationError::MissingQuery)?)
             .await
@@ -154,7 +153,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn documents(&self, proto_request: Request<proto::DocumentsRequest>) -> Result<Response<Self::documentsStream>, Status> {
         let proto_request = proto_request.into_inner();
         let (sender, receiver) = tokio::sync::mpsc::channel(128);
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
         let schema = index_holder.schema().clone();
         let documents_receiver = index_holder.documents().map_err(crate::errors::Error::from)?;
         tokio::task::spawn(async move {
@@ -182,7 +181,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
-        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_alias).await?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_name).await?;
         let index_description = self.get_index_description(&index_holder).await;
         Ok(Response::new(proto::GetIndexResponse {
             index: Some(index_description),
@@ -207,9 +206,9 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         while let Some(chunk) = in_stream.next().await {
             match chunk {
                 Ok(chunk) => {
-                    info!(action = "received_chunk", index_alias = chunk.index_alias, documents = ?chunk.documents.len());
+                    info!(action = "received_chunk", index_name = chunk.index_name, documents = ?chunk.documents.len());
                     let now = Instant::now();
-                    let index_holder = self.index_service.get_index_holder(&chunk.index_alias).await?;
+                    let index_holder = self.index_service.get_index_holder(&chunk.index_name).await?;
                     let (success_bulk_docs, failed_bulk_docs) = index_holder.index_bulk(&chunk.documents).await.map_err(crate::errors::Error::from)?;
                     elapsed_secs += now.elapsed().as_secs_f64();
                     success_docs += success_bulk_docs;
@@ -240,11 +239,11 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn index_document(&self, request: Request<proto::IndexDocumentRequest>) -> Result<Response<proto::IndexDocumentResponse>, Status> {
-        let request = request.into_inner();
+        let proto_request = request.into_inner();
         self.index_service
-            .get_index_holder(&request.index_alias)
+            .get_index_holder(&proto_request.index_name)
             .await?
-            .index_document(SummaDocument::UnboundJsonBytes(&request.document))
+            .index_document(SummaDocument::UnboundJsonBytes(&proto_request.document))
             .await
             .map_err(crate::errors::Error::from)?;
         let response = proto::IndexDocumentResponse {};
@@ -252,31 +251,10 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn merge_segments(&self, proto_request: Request<proto::MergeSegmentsRequest>) -> Result<Response<proto::MergeSegmentsResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
-        let mut index_writer_holder = index_holder
-            .index_writer_holder()
-            .map_err(crate::errors::Error::from)?
-            .clone()
-            .write_owned()
-            .await;
-        let index_name = index_holder.index_name().to_string();
-        tokio::task::spawn_blocking(move || {
-            {
-                let segment_ids: Vec<_> = proto_request
-                    .segment_ids
-                    .iter()
-                    .map(|segment_id| SegmentId::from_uuid_string(segment_id))
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("wrong uuid");
-                let result = index_writer_holder.merge(&segment_ids, None);
-                if let Err(error) = result {
-                    error!(error = ?error)
-                }
-            }
-            .instrument(info_span!("merge", index_name = ?index_name))
-        });
-        let response = proto::MergeSegmentsResponse {};
+        let segment_id = self.index_service.merge_segments(proto_request.into_inner()).await?;
+        let response = proto::MergeSegmentsResponse {
+            segment_id: segment_id.map(|segment_id| segment_id.to_string()),
+        };
         Ok(Response::new(response))
     }
 
@@ -294,8 +272,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn vacuum_index(&self, proto_request: Request<proto::VacuumIndexRequest>) -> Result<Response<proto::VacuumIndexResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_name).await?;
         let mut index_writer_holder = index_holder
             .index_writer_holder()
             .map_err(crate::errors::Error::from)?
@@ -318,7 +295,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn warmup_index(&self, proto_request: Request<proto::WarmupIndexRequest>) -> Result<Response<proto::WarmupIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
-        let index_holder = self.index_service.get_index_holder(&proto_request.index_alias).await?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
         let now = Instant::now();
         match proto_request.is_full {
             true => index_holder.full_warmup().await.map_err(crate::errors::Error::from)?,
