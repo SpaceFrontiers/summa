@@ -131,7 +131,15 @@ impl Index {
             let index_engine_config_holder = self.derive_configs(&index_name).await;
             let merge_policy = core_config.indices[&index_name].merge_policy.clone();
             let index_holder = tokio::task::spawn_blocking(move || {
-                IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, merge_policy, false, Driver::current_tokio())
+                IndexHolder::create_holder(
+                    &core_config,
+                    index,
+                    Some(&index_name),
+                    index_engine_config_holder,
+                    merge_policy,
+                    false,
+                    Driver::current_tokio(),
+                )
             })
             .await??;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
@@ -195,7 +203,15 @@ impl Index {
             .index_registry
             .add(
                 tokio::task::spawn_blocking(move || {
-                    IndexHolder::create_holder(&core_config, index, Some(&index_name), index_engine_config_holder, merge_policy, false, Driver::current_tokio())
+                    IndexHolder::create_holder(
+                        &core_config,
+                        index,
+                        Some(&index_name),
+                        index_engine_config_holder,
+                        merge_policy,
+                        false,
+                        Driver::current_tokio(),
+                    )
                 })
                 .await??,
             )

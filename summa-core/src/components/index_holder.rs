@@ -15,9 +15,9 @@ use opentelemetry::{
 use summa_proto::proto;
 use tantivy::collector::{Collector, MultiCollector};
 use tantivy::directory::OwnedBytes;
+use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::Schema;
 use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
-use tantivy::query::{EnableScoring, Query};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -25,7 +25,7 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS, Driver};
+use crate::components::{Driver, IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::SummaResult;
@@ -399,12 +399,7 @@ impl IndexHolder {
     }
 
     /// Runs a query on the segment readers wrapped by the searcher asynchronously.
-    pub async fn search_async<C: Collector>(
-        &self,
-        searcher: &Searcher,
-        query: &dyn Query,
-        collector: &C,
-    ) -> tantivy::Result<C::Fruit> {
+    pub async fn search_async<C: Collector>(&self, searcher: &Searcher, query: &dyn Query, collector: &C) -> tantivy::Result<C::Fruit> {
         let enabled_scoring = if collector.requires_scoring() {
             EnableScoring::enabled_from_searcher(searcher)
         } else {
@@ -412,16 +407,10 @@ impl IndexHolder {
         };
         let segment_readers = searcher.segment_readers();
         let weight = query.weight_async(enabled_scoring).await?;
-        let fruits = join_all(segment_readers.iter().enumerate().map(
-            |(segment_ord, segment_reader)| {
-                let weight_ref = weight.as_ref();
-                async move {
-                    collector
-                        .collect_segment_async(weight_ref, segment_ord as u32, segment_reader)
-                        .await
-                }
-            },
-        ))
+        let fruits = join_all(segment_readers.iter().enumerate().map(|(segment_ord, segment_reader)| {
+            let weight_ref = weight.as_ref();
+            async move { collector.collect_segment_async(weight_ref, segment_ord as u32, segment_reader).await }
+        }))
         .await
         .into_iter()
         .collect::<tantivy::Result<Vec<_>>>()?;

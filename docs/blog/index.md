@@ -1,7 +1,7 @@
 ---
-title: Articles
-nav_order: 4
+title: Blog
+nav_order: 5
 has_children: true 
 has_toc: true
 ---
-# Articles
+# Blog

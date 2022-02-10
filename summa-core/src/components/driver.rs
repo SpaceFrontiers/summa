@@ -1,6 +1,8 @@
 use std::fmt::Debug;
 use std::future::Future;
 
+use crate::errors::SummaResult;
+
 #[derive(Clone)]
 pub enum Driver {
     Native,
@@ -24,11 +26,11 @@ impl Driver {
     }
 
     #[inline]
-    pub async fn execute_blocking<O>(&self, f: impl FnOnce() -> O) -> O {
+    pub async fn execute_blocking<O: Send + 'static>(&self, f: impl FnOnce() -> O + Send + 'static) -> SummaResult<O> {
         match self {
-            Driver::Native => f(),
+            Driver::Native => Ok(f()),
             #[cfg(feature = "tokio-rt")]
-            Driver::Tokio(handle) => handle.spawn_blocking(f).await,
+            Driver::Tokio(handle) => Ok(handle.spawn_blocking(f).await?),
         }
     }
 }

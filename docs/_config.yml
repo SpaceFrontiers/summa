@@ -7,3 +7,7 @@ show_downloads: false
 aux_links:
   "Our GitHub":
     - "//github.com/izihawa/summa"
+favicon_ico: "/assets/favicon.ico"
+logo: "/assets/favicon.ico"
+color_scheme: dark
+permalink: pretty

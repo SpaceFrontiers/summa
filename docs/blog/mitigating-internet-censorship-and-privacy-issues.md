@@ -1,8 +1,20 @@
 ---
 title: Mitigating Internet Censorship and Privacy Issues
-parent: Articles
-nav_order: 1
+parent: Blog
+nav_order: 2
 ---
+<style rel="stylesheet">
+figure > img {
+    display:block; 
+    margin-left:auto;
+    margin-right:auto;
+    border: 5px solid #444;
+}
+figure > figcaption {
+    text-align: center;
+    font-size: 75%;
+}
+</style>
 # Mitigating Internet Censorship and Privacy Issues with IPFS and WASM
 <i>[@PashaPodolsky](https://github.com/ppodolsky)</i>
 
@@ -10,7 +22,7 @@ The purpose of this article is to propose a unique combination of modern web tec
 to address the increasing problems of website censorship and privacy breaches.
 
 We will explore how Tantivy, WebAssembly (WASM), and the InterPlanetary File System (IPFS) 
-can be used to create web application with embedded databases that can be delivered and run
+can be used to create web applications with embedded databases that can be delivered and run
 directly in a user's browser without relying on a remote server.
 
 Let's start from the model that is a root of all our issues.
@@ -22,8 +34,8 @@ Despite ongoing efforts to revise and improve the model, it continues to be used
 with all its advantages and disadvantages.
 
 <figure>
-  <img src="/summa/assets/client-server.drawio.png" alt="client-server-model" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">Client-server model</figcaption>
+  <img src="/summa/assets/client-server.drawio.png" alt="client-server-model">
+  <figcaption>Client-server model</figcaption>
 </figure>
 
 In a client-server model, the server provides services to clients and may have extensive computing capacities
@@ -32,18 +44,18 @@ and record a history of interactions with all clients.
 For example, a user may create an account and a server records this account and allows the user to log in later.
 Another example is a search engine that collects search logs to improve its search quality in the future.
 
-These two traits are very beneficial and allows to create very complicated and functional web services
+These two traits are very beneficial and allow to create very complicated and functional web services
 such as social networks, search engines, mobile offices, messengers and many others. However, the client-server model
 has three major drawbacks that may render its usage unsuitable in particular conditions.
 
 Firstly, the interaction between a user and a remote server is carried out through a hostile environment, 
 such as wires **controlled by state agencies or telecom companies**. Encryption can protect the content of
 messages, but the fact of interaction is still exposed and communication can be cut by those who have physical
-access to the wires or political power over telecom companies.
+access to wires or political power over telecom companies.
 
 <figure>
-  <img src="/summa/assets/censor.drawio.png" alt="censoring" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">Censoring</figcaption>
+  <img src="/summa/assets/censor.drawio.png" alt="censoring">
+  <figcaption>Censoring</figcaption>
 </figure>
 
 Secondly, websites often log your requests, which fundamentally **leaks your privacy** because the history of your
@@ -54,8 +66,8 @@ Even if the connection is secure, the company owning this server may use your da
 leak your data to a third party.
 
 <figure>
-  <img src="https://imgs.xkcd.com/comics/privacy_opinions.png"  width=400px height=400px alt="privacy" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">XKCD Privacy Opinions</figcaption>
+  <img src="https://imgs.xkcd.com/comics/privacy_opinions.png"  width=400px height=400px alt="privacy">
+  <figcaption>XKCD Privacy Opinions</figcaption>
 </figure>
 
 While laws like GDPR, CCPA and others aim to protect users from uncontrolled tracking, they may paradoxically
@@ -67,7 +79,7 @@ Thirdly, the **server may go offline**, and there is nothing you can do about it
 
 What if the client-server model were revised for increased resilience against censorship and
 privacy concerns? This article explores a refreshed approach that brings websites closer to
-users by using their browsers.
+users.
 
 It's important to note that this approach does have its limitations and to manage expectations,
 we'll only focus on web applications that:
@@ -90,15 +102,15 @@ A typical website consists of three components:
 - A database that stores valuable information
 
 <figure>
-  <img src="/summa/assets/3-part-site-arch.drawio.png" alt="3-part-site-arch" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">3-part site architecture</figcaption>
+  <img src="/summa/assets/3-part-site-arch.drawio.png" alt="3-part-site-arch">
+  <figcaption>3-part site architecture</figcaption>
 </figure>
 
 What if we package all three components into a single web bundle that runs in a user's browser? 
 
 <figure>
-  <img src="/summa/assets/web-bundle.drawio.png" alt="Web bundle" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">Web bundle</figcaption>
+  <img src="/summa/assets/web-bundle.drawio.png" alt="Web bundle">
+  <figcaption>Web bundle</figcaption>
 </figure>
 
 Packaging involves making all components executable within browsers, and delivering these components into browsers.
@@ -114,26 +126,26 @@ for text searches.
 
 Here we are going to consider Tantivy search library, published by a former Google employee in 2017.
 Tantivy's architecture is similar to Lucene, but it is faster and has a smaller code base. Its architecture
-is described in detail in [my earlier article (ru)](https://habr.com/ru/post/545634/), 
+is described in detail in [other article](/summa/blog/how-search-engines-work), 
 here I will only mention the most important properties of Tantivy for our case:
 
-- The **performance of the library is faster** than Lucene/ES 
+- The performance of the library **is faster** than Lucene/ES 
 - Data files generated by Tantivy are **immutable**
 - **Every search request is local** and requires reading only a small amount of data from disk
 
-By data immutability I mean the following: after a commit, the data is saved in a set of files
-called a segment, which is not modified. The next commit saves a new batch of data in new files, and
+By data immutability I mean the following: the data is saved in a set of files
+called a segment after, and files are not modified after commit. The next commit saves a new batch of data in new files, and
 the fact of deletion of a row is stored as a bit in a bit mask next to the existing segment. Data updates 
 are implemented as delete and insert operations, and therefore the segment itself remains unchanged during
 any operations with data. Data immutability is essential in a network environment because aggressive
 caching of everything becomes possible.
 
-Poor locality is the main problem that prevents simply running an arbitrary database on top of a 
+Poor locality is the main problem that prevents running an arbitrary database on top of a 
 p2p system or network file system. Random reads overload the network and simply exhaust it with
 any significant load. By combining certain approaches, Tantivy was able
 to achieve high locality for all components of the search index.
 
-In practical terms, locality means that not all index files need to be downloaded into the browser
+In practice, locality means that not all index files need to be downloaded into the browser
 for executing search queries locally, but only a portion of the relevant files.
 
 ### WASM
@@ -152,8 +164,8 @@ with range network requests. As a result, every search request that previously
 required 5-10 32KB disk reads may be translated into 5-10 network requests that download 32KB of data.
 
 <figure>
-  <img src="/summa/assets/web-bundle-explained.drawio.png" alt="web-bundle" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">Web bundle</figcaption>
+  <img src="/summa/assets/web-bundle-explained.drawio.png" alt="web-bundle">
+  <figcaption>Web bundle</figcaption>
 </figure>
 
 Furthermore, the `summa-wasm` library implements aggressive caching policies that dramatically reduce
@@ -175,8 +187,8 @@ which allows you to load files from IPFS using standard HTTP protocol.
 The gateway opens browsers to IPFS and hence bridges the software executing within the browser with IPFS.
 
 <figure>
-  <img src="/summa/assets/web-bundle-explained-ipfs.drawio.png" alt="web-bundle-with-ipfs" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">Web-bundle with IPFS</figcaption>
+  <img src="/summa/assets/web-bundle-explained-ipfs.drawio.png" alt="web-bundle-with-ipfs">
+  <figcaption>Web-bundle with IPFS</figcaption>
 </figure>
 
 The general idea is straightforward: we put web applications and data files in a single IPFS directory
@@ -208,8 +220,8 @@ have been shaped into `summa-wasm` module which now allows you to execute search
 over Summa indices directly in browser.
 
 <figure>
-  <img src="/summa/assets/arch.drawio.png" alt="architecture" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">Summa architecture</figcaption>
+  <img src="/summa/assets/arch.drawio.png" alt="architecture">
+  <figcaption>Summa architecture</figcaption>
 </figure>
 
 ### Why It Is So Special?
@@ -251,8 +263,8 @@ Summa provides [an example of news feed site](https://github.com/izihawa/earth-t
 Now we should bundle all together manually or with `summa-publisher` script.
 
 <figure>
-  <img src="/summa/assets/summa-publisher.drawio.png" alt="web-bundle-with-ipfs" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">What summa-publisher does</figcaption>
+  <img src="/summa/assets/summa-publisher.drawio.png" alt="web-bundle-with-ipfs">
+  <figcaption>What summa-publisher does</figcaption>
 </figure>
 
 `summa-publisher` is distributed through Cargo and may be installed if you have configured Rust toolchain.
@@ -313,8 +325,8 @@ queries will be seeded more often and thus, more actively distributed.
 This characteristic makes the entire system more self-balancing.
 
 <figure>
-  <img src="/summa/assets/p2p-search.drawio.png" alt="p2p-search" style="display:block; margin-left:auto; margin-right:auto">
-  <figcaption style="text-align: center; font-size: 75%">Distribution of index parts</figcaption>
+  <img src="/summa/assets/p2p-search.drawio.png" alt="p2p-search">
+  <figcaption>Distribution of index parts</figcaption>
 </figure>
 
 The chunking and caching in IPFS also offer advantages, as even after updates, most of the search
