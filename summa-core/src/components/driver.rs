@@ -22,4 +22,13 @@ impl Driver {
             Driver::Tokio(handle) => handle.block_on(f),
         }
     }
+
+    #[inline]
+    pub async fn execute_blocking<O>(&self, f: impl FnOnce() -> O) -> O {
+        match self {
+            Driver::Native => f(),
+            #[cfg(feature = "tokio-rt")]
+            Driver::Tokio(handle) => handle.spawn_blocking(f).await,
+        }
+    }
 }

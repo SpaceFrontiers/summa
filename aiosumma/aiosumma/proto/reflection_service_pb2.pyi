@@ -6,14 +6,14 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Map
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class GetTopTermsRequest(_message.Message):
-    __slots__ = ["field_name", "index_alias", "top_k"]
+    __slots__ = ["field_name", "index_name", "top_k"]
     FIELD_NAME_FIELD_NUMBER: _ClassVar[int]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     TOP_K_FIELD_NUMBER: _ClassVar[int]
     field_name: str
-    index_alias: str
+    index_name: str
     top_k: int
-    def __init__(self, index_alias: _Optional[str] = ..., field_name: _Optional[str] = ..., top_k: _Optional[int] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., field_name: _Optional[str] = ..., top_k: _Optional[int] = ...) -> None: ...
 
 class GetTopTermsResponse(_message.Message):
     __slots__ = ["per_segment"]

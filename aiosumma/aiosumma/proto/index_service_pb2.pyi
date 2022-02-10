@@ -62,12 +62,12 @@ class ChunkedCacheConfig(_message.Message):
     def __init__(self, chunk_size: _Optional[int] = ..., cache_size: _Optional[int] = ...) -> None: ...
 
 class CommitIndexRequest(_message.Message):
-    __slots__ = ["commit_mode", "index_alias"]
+    __slots__ = ["commit_mode", "index_name"]
     COMMIT_MODE_FIELD_NUMBER: _ClassVar[int]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     commit_mode: CommitMode
-    index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ..., commit_mode: _Optional[_Union[CommitMode, str]] = ...) -> None: ...
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ..., commit_mode: _Optional[_Union[CommitMode, str]] = ...) -> None: ...
 
 class CommitIndexResponse(_message.Message):
     __slots__ = ["elapsed_secs"]
@@ -154,12 +154,12 @@ class CreateMemoryEngineRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class DeleteDocumentsRequest(_message.Message):
-    __slots__ = ["index_alias", "query"]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["index_name", "query"]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     QUERY_FIELD_NUMBER: _ClassVar[int]
-    index_alias: str
+    index_name: str
     query: _query_pb2.Query
-    def __init__(self, index_alias: _Optional[str] = ..., query: _Optional[_Union[_query_pb2.Query, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., query: _Optional[_Union[_query_pb2.Query, _Mapping]] = ...) -> None: ...
 
 class DeleteDocumentsResponse(_message.Message):
     __slots__ = ["deleted_documents"]
@@ -180,10 +180,10 @@ class DeleteIndexResponse(_message.Message):
     def __init__(self, deleted_index_name: _Optional[str] = ...) -> None: ...
 
 class DocumentsRequest(_message.Message):
-    __slots__ = ["index_alias"]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
-    index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ...) -> None: ...
+    __slots__ = ["index_name"]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class DocumentsResponse(_message.Message):
     __slots__ = ["document"]
@@ -198,10 +198,10 @@ class FileEngineConfig(_message.Message):
     def __init__(self, path: _Optional[str] = ...) -> None: ...
 
 class GetIndexRequest(_message.Message):
-    __slots__ = ["index_alias"]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
-    index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ...) -> None: ...
+    __slots__ = ["index_name"]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class GetIndexResponse(_message.Message):
     __slots__ = ["index"]
@@ -277,24 +277,24 @@ class IndexDocumentOperation(_message.Message):
     def __init__(self, document: _Optional[bytes] = ...) -> None: ...
 
 class IndexDocumentRequest(_message.Message):
-    __slots__ = ["document", "index_alias"]
+    __slots__ = ["document", "index_name"]
     DOCUMENT_FIELD_NUMBER: _ClassVar[int]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     document: bytes
-    index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ..., document: _Optional[bytes] = ...) -> None: ...
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ..., document: _Optional[bytes] = ...) -> None: ...
 
 class IndexDocumentResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
 
 class IndexDocumentStreamRequest(_message.Message):
-    __slots__ = ["documents", "index_alias"]
+    __slots__ = ["documents", "index_name"]
     DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     documents: _containers.RepeatedScalarFieldContainer[bytes]
-    index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ..., documents: _Optional[_Iterable[bytes]] = ...) -> None: ...
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ..., documents: _Optional[_Iterable[bytes]] = ...) -> None: ...
 
 class IndexDocumentStreamResponse(_message.Message):
     __slots__ = ["elapsed_secs", "failed_docs", "success_docs"]
@@ -355,16 +355,18 @@ class MergePolicy(_message.Message):
     def __init__(self, log: _Optional[_Union[LogMergePolicy, _Mapping]] = ..., temporal: _Optional[_Union[TemporalMergePolicy, _Mapping]] = ...) -> None: ...
 
 class MergeSegmentsRequest(_message.Message):
-    __slots__ = ["index_alias", "segment_ids"]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["index_name", "segment_ids"]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     SEGMENT_IDS_FIELD_NUMBER: _ClassVar[int]
-    index_alias: str
+    index_name: str
     segment_ids: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, index_alias: _Optional[str] = ..., segment_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., segment_ids: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class MergeSegmentsResponse(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+    __slots__ = ["segment_id"]
+    SEGMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    segment_id: str
+    def __init__(self, segment_id: _Optional[str] = ...) -> None: ...
 
 class PrimaryKey(_message.Message):
     __slots__ = ["i64", "str"]
@@ -422,22 +424,22 @@ class TemporalMergePolicy(_message.Message):
     def __init__(self, merge_older_then_secs: _Optional[int] = ...) -> None: ...
 
 class VacuumIndexRequest(_message.Message):
-    __slots__ = ["index_alias"]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
-    index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ...) -> None: ...
+    __slots__ = ["index_name"]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class VacuumIndexResponse(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
 
 class WarmupIndexRequest(_message.Message):
-    __slots__ = ["index_alias", "is_full"]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["index_name", "is_full"]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     IS_FULL_FIELD_NUMBER: _ClassVar[int]
-    index_alias: str
+    index_name: str
     is_full: bool
-    def __init__(self, index_alias: _Optional[str] = ..., is_full: bool = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., is_full: bool = ...) -> None: ...
 
 class WarmupIndexResponse(_message.Message):
     __slots__ = ["elapsed_secs"]

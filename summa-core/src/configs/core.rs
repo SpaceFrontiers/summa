@@ -39,15 +39,15 @@ pub struct Config {
     #[builder(default = "true")]
     #[serde(default = "return_true")]
     pub dedicated_compression_thread: bool,
+    #[builder(default = "100")]
+    #[serde(default = "return_100")]
+    pub doc_store_cache_num_blocks: usize,
     #[serde(default = "HashMap::new")]
     pub indices: HashMap<String, IndexEngineConfig>,
     #[builder(default = "1024 * 1024 * 1024")]
     pub writer_heap_size_bytes: u64,
     #[builder(default = "Some(WriterThreads::N(1))")]
     pub writer_threads: Option<WriterThreads>,
-    #[builder(default = "100")]
-    #[serde(default = "return_100")]
-    pub doc_store_cache_num_blocks: usize,
 }
 
 impl Default for Config {

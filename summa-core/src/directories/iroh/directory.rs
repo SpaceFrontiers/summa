@@ -54,7 +54,7 @@ impl IrohDirectory {
         }
     }
 
-    pub async fn from_cid(loader: &FullLoader, store: &iroh_store::Store, executor: Driver, cid: &str) -> SummaResult<Self> {
+    pub async fn from_cid(loader: &FullLoader, store: &iroh_store::Store, driver: Driver, cid: &str) -> SummaResult<Self> {
         let resolver = Resolver::new(loader.clone());
         let root_path = resolver.resolve(iroh_resolver::Path::from_parts("ipfs", cid, "")?).await?;
         let mut files = HashMap::new();
@@ -80,7 +80,7 @@ impl IrohDirectory {
                 Cid::from_str(cid).expect("should be cid"),
                 files,
             ))),
-            driver: executor.clone(),
+            driver: driver.clone(),
         })
     }
 

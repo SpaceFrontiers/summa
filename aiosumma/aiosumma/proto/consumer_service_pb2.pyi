@@ -46,12 +46,12 @@ class DeleteConsumerResponse(_message.Message):
     def __init__(self, consumer_name: _Optional[str] = ...) -> None: ...
 
 class GetConsumerRequest(_message.Message):
-    __slots__ = ["consumer_name", "index_alias"]
+    __slots__ = ["consumer_name", "index_name"]
     CONSUMER_NAME_FIELD_NUMBER: _ClassVar[int]
-    INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     consumer_name: str
-    index_alias: str
-    def __init__(self, index_alias: _Optional[str] = ..., consumer_name: _Optional[str] = ...) -> None: ...
+    index_name: str
+    def __init__(self, index_name: _Optional[str] = ..., consumer_name: _Optional[str] = ...) -> None: ...
 
 class GetConsumerResponse(_message.Message):
     __slots__ = ["consumer"]

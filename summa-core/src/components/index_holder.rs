@@ -13,10 +13,11 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use summa_proto::proto;
-use tantivy::collector::MultiCollector;
+use tantivy::collector::{Collector, MultiCollector};
 use tantivy::directory::OwnedBytes;
 use tantivy::schema::Schema;
-use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy};
+use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
+use tantivy::query::{EnableScoring, Query};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -24,7 +25,7 @@ use tracing::{instrument, trace};
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS};
+use crate::components::{IndexWriterHolder, SummaDocument, CACHE_METRICS, Driver};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::SummaResult;
@@ -43,6 +44,7 @@ pub struct IndexHolder {
     /// Counters
     #[cfg(feature = "metrics")]
     search_times_meter: Histogram<f64>,
+    driver: Driver,
 }
 
 impl Hash for IndexHolder {
@@ -144,6 +146,7 @@ impl IndexHolder {
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
         merge_policy: Option<proto::MergePolicy>,
         read_only: bool,
+        driver: Driver,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
 
@@ -191,6 +194,7 @@ impl IndexHolder {
                 .with_unit(Unit::new("seconds"))
                 .with_description("Search times")
                 .init(),
+            driver,
         })
     }
 
@@ -394,6 +398,36 @@ impl IndexHolder {
         Ok(())
     }
 
+    /// Runs a query on the segment readers wrapped by the searcher asynchronously.
+    pub async fn search_async<C: Collector>(
+        &self,
+        searcher: &Searcher,
+        query: &dyn Query,
+        collector: &C,
+    ) -> tantivy::Result<C::Fruit> {
+        let enabled_scoring = if collector.requires_scoring() {
+            EnableScoring::enabled_from_searcher(searcher)
+        } else {
+            EnableScoring::disabled_from_searcher(searcher)
+        };
+        let segment_readers = searcher.segment_readers();
+        let weight = query.weight_async(enabled_scoring).await?;
+        let fruits = join_all(segment_readers.iter().enumerate().map(
+            |(segment_ord, segment_reader)| {
+                let weight_ref = weight.as_ref();
+                async move {
+                    collector
+                        .collect_segment_async(weight_ref, segment_ord as u32, segment_reader)
+                        .await
+                }
+            },
+        ))
+        .await
+        .into_iter()
+        .collect::<tantivy::Result<Vec<_>>>()?;
+        collector.merge_fruits(fruits)
+    }
+
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
     pub async fn search(
         &self,
@@ -417,7 +451,7 @@ impl IndexHolder {
 
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        let mut multi_fruit = searcher.search_async(&parsed_query, &multi_collector).await?;
+        let mut multi_fruit = self.search_async(&searcher, &parsed_query, &multi_collector).await?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
             &Context::current(),

@@ -82,7 +82,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def commit_index(
         self,
-        index_alias: str,
+        index_name: str,
         commit_mode: Optional[str] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -93,7 +93,7 @@ class SummaClient(BaseGrpcClient):
         after.
 
         Args:
-            index_alias: index alias
+            index_name: index name
             commit_mode: Sync | Async
             request_id: request id
             session_id: session id
@@ -102,7 +102,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['index_api'].commit_index(
             index_service_pb.CommitIndexRequest(
-                index_alias=index_alias,
+                index_name=index_name,
                 commit_mode=commit_mode,
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -276,7 +276,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def delete_documents(
         self,
-        index_alias: str,
+        index_name: str,
         query: query_pb.Query,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -285,14 +285,14 @@ class SummaClient(BaseGrpcClient):
         Delete document with primary key
 
         Args:
-            index_alias: index alias
+            index_name: index name
             query: query used for retrieving documents for deletion
             request_id:
             session_id:
         """
         return await self.stubs['index_api'].delete_documents(
             index_service_pb.DeleteDocumentsRequest(
-                index_alias=index_alias,
+                index_name=index_name,
                 query=query,
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -363,7 +363,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def get_index(
         self,
-        index_alias: str,
+        index_name: str,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.GetIndexResponse:
@@ -371,14 +371,14 @@ class SummaClient(BaseGrpcClient):
         Index metadata
 
         Args:
-            index_alias: index alias
+            index_name: index name
             request_id: request id
             session_id: session id
         Returns:
             Index description
         """
         return await self.stubs['index_api'].get_index(
-            index_service_pb.GetIndexRequest(index_alias=index_alias),
+            index_service_pb.GetIndexRequest(index_name=index_name),
             metadata=setup_metadata(session_id, request_id),
         )
 
@@ -425,7 +425,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def documents(
         self,
-        index_alias: str,
+        index_name: str,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
@@ -433,20 +433,20 @@ class SummaClient(BaseGrpcClient):
         Retrieve all documents from the index
 
         Args:
-            index_alias: index alias
+            index_name: index name
             request_id: request id
             session_id: session id
         """
         async for document in self.stubs['index_api'].documents(
-            index_service_pb.DocumentsRequest(index_alias=index_alias),
+            index_service_pb.DocumentsRequest(index_name=index_name),
             metadata=setup_metadata(session_id, request_id),
         ):
-            print(document.document)
+            yield document.document
 
     @expose
     async def index_document_stream(
         self,
-        index_alias: str,
+        index_name: str,
         documents: Union[Iterable[str], str] = None,
         bulk_size: int = 1000,
         request_id: Optional[str] = None,
@@ -456,7 +456,7 @@ class SummaClient(BaseGrpcClient):
         Index documents bulky
 
         Args:
-            index_alias: index alias
+            index_name: index name
             documents: list of bytes
             bulk_size: document portion size to send
             request_id: request id
@@ -474,13 +474,13 @@ class SummaClient(BaseGrpcClient):
                 documents_portion.append(document)
                 if len(documents_portion) > bulk_size:
                     yield index_service_pb.IndexDocumentStreamRequest(
-                        index_alias=index_alias,
+                        index_name=index_name,
                         documents=documents_portion,
                     )
                     documents_portion = []
             if documents_portion:
                 yield index_service_pb.IndexDocumentStreamRequest(
-                    index_alias=index_alias,
+                    index_name=index_name,
                     documents=documents_portion,
                 )
 
@@ -492,7 +492,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def index_document(
         self,
-        index_alias: str,
+        index_name: str,
         document: Union[dict, bytes, str],
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -501,14 +501,14 @@ class SummaClient(BaseGrpcClient):
         Index document
 
         Args:
-            index_alias: index alias
+            index_name: index name
             document: bytes
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].index_document(
             index_service_pb.IndexDocumentRequest(
-                index_alias=index_alias,
+                index_name=index_name,
                 document=json.dumps(document) if isinstance(document, dict) else document,
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -552,7 +552,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def merge_segments(
         self,
-        index_alias: str,
+        index_name: str,
         segment_ids: List[str],
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -561,13 +561,13 @@ class SummaClient(BaseGrpcClient):
         Merge a list of segments into a single one
 
         Args:
-            index_alias: index alias
+            index_name: index name
             segment_ids: segment ids
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].merge_segments(
-            index_service_pb.MergeSegmentsRequest(index_alias=index_alias, segment_ids=segment_ids),
+            index_service_pb.MergeSegmentsRequest(index_name=index_name, segment_ids=segment_ids),
             metadata=setup_metadata(session_id, request_id),
         )
 
@@ -596,7 +596,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def vacuum_index(
         self,
-        index_alias: str,
+        index_name: str,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.VacuumIndexResponse:
@@ -604,19 +604,19 @@ class SummaClient(BaseGrpcClient):
         Vacuuming index. It cleans every segment from deleted documents, one by one.
 
         Args:
-            index_alias: index alias
+            index_name: index name
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].vacuum_index(
-            index_service_pb.VacuumIndexRequest(index_alias=index_alias),
+            index_service_pb.VacuumIndexRequest(index_name=index_name),
             metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
     async def warmup_index(
         self,
-        index_alias: str,
+        index_name: str,
         is_full: bool = False,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -625,20 +625,20 @@ class SummaClient(BaseGrpcClient):
         Warm index up. It loads all hot parts or index into memory and makes further first queries to the index faster.
 
         Args:
-            index_alias: index alias
+            index_name: index name
             is_full: should full or partial warm up be done
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].warmup_index(
-            index_service_pb.WarmupIndexRequest(index_alias=index_alias, is_full=is_full),
+            index_service_pb.WarmupIndexRequest(index_name=index_name, is_full=is_full),
             metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
     async def get_top_terms(
         self,
-        index_alias: str,
+        index_name: str,
         field_name: str,
         top_k: int,
         request_id: Optional[str] = None,
@@ -648,7 +648,7 @@ class SummaClient(BaseGrpcClient):
         Get top terms by the number for the index
 
         Args:
-            index_alias: index alias
+            index_name: index name
             field_name: field name
             top_k: extract top-K terms
             request_id: request id
@@ -656,7 +656,7 @@ class SummaClient(BaseGrpcClient):
         """
         return await self.stubs['reflection_api'].get_top_terms(
             reflection_service_pb.GetTopTermsRequest(
-                index_alias=index_alias,
+                index_name=index_name,
                 field_name=field_name,
                 top_k=top_k,
             ),
