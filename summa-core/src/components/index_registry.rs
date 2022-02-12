@@ -3,15 +3,24 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 
+use futures::future::join_all;
 use itertools::Itertools;
 use summa_proto::proto;
+use summa_proto::proto::collector_output::CollectorOutput;
+use summa_proto::proto::Score;
+use tantivy::DocAddress;
 use tokio::sync::RwLock;
 use tracing::info;
 
 use super::IndexHolder;
+use crate::components::custom_serializer::NamedFieldDocument;
+use crate::components::fruit_extractors::{IntermediateExtractionResult, ReadyCollectorOutput, ScoredDocAddress};
+use crate::components::Driver;
 use crate::configs::{ConfigProxy, DirectProxy};
 use crate::errors::{SummaResult, ValidationError};
+use crate::proto_traits::Wrapper;
 use crate::utils::sync::{Handler, OwningHandler};
+use crate::utils::transpose;
 use crate::Error;
 
 /// The main struct responsible for combining different indices and managing their lifetime.
@@ -33,6 +42,21 @@ impl Default for IndexRegistry {
 impl Debug for IndexRegistry {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexRegistry").field("index_holders", &self.index_holders).finish()
+    }
+}
+
+struct ScoredDocAddressRefWithAlias<'a> {
+    index_alias: &'a str,
+    scored_doc_address: &'a ScoredDocAddress,
+}
+
+impl ScoredDocAddressRefWithAlias<'_> {
+    pub fn doc_address(&self) -> DocAddress {
+        self.scored_doc_address.doc_address
+    }
+
+    pub fn score(&self) -> &Option<Score> {
+        &self.scored_doc_address.score
     }
 }
 
@@ -108,7 +132,7 @@ impl IndexRegistry {
     pub async fn search_futures(
         &self,
         index_queries: Vec<proto::IndexQuery>,
-    ) -> SummaResult<Vec<impl Future<Output = SummaResult<Vec<proto::CollectorOutput>>>>> {
+    ) -> SummaResult<Vec<impl Future<Output = SummaResult<Vec<IntermediateExtractionResult>>>>> {
         index_queries
             .into_iter()
             .map(|index_query| {
@@ -118,9 +142,11 @@ impl IndexRegistry {
                     index_holder
                         .search(
                             &index_query.index_alias,
-                            index_query.query.as_ref().unwrap_or_else(|| &proto::Query {
-                                query: Some(proto::query::Query::All(proto::AllQuery {})),
-                            }),
+                            index_query
+                                .query
+                                .and_then(|query| query.query)
+                                .as_ref()
+                                .unwrap_or_else(|| &proto::query::Query::All(proto::AllQuery {})),
                             index_query.collectors,
                         )
                         .await
@@ -130,45 +156,109 @@ impl IndexRegistry {
     }
 
     /// Merges several `proto::CollectorOutput`
-    pub fn merge_responses(&self, collectors_outputs: &[Vec<proto::CollectorOutput>]) -> SummaResult<Vec<proto::CollectorOutput>> {
-        if collectors_outputs.is_empty() {
-            return Err(Error::Validation(Box::new(ValidationError::EmptyArgument("collectors".to_string()))));
-        }
+    pub async fn finalize_extraction(
+        &self,
+        intermediate_extractions_results: Vec<Vec<IntermediateExtractionResult>>,
+        driver: Driver,
+    ) -> SummaResult<Vec<proto::CollectorOutput>> {
+        let extractions_results = transpose(intermediate_extractions_results);
         let mut merged_response = vec![];
-        for (ix, first_collector_output) in collectors_outputs[0].iter().enumerate() {
+
+        for intermediate_extraction_results in extractions_results.into_iter() {
             merged_response.push(proto::CollectorOutput {
-                collector_output: match &first_collector_output.collector_output {
-                    Some(proto::collector_output::CollectorOutput::Aggregation(_)) => todo!(),
-                    Some(proto::collector_output::CollectorOutput::Count(_)) => {
-                        let counts = collectors_outputs
-                            .iter()
-                            .map(|collectors_output| collectors_output[ix].as_count().expect("expected count collector").count);
-                        Some(proto::collector_output::CollectorOutput::Count(proto::CountCollectorOutput {
-                            count: counts.sum(),
-                        }))
+                collector_output: Some(match intermediate_extraction_results.first() {
+                    None => return Err(Error::Validation(Box::new(ValidationError::EmptyArgument("collectors".to_string())))),
+                    Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Aggregation(_))) => todo!(),
+                    Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Count(_))) => {
+                        let counts = intermediate_extraction_results
+                            .into_iter()
+                            .map(|extraction_result| extraction_result.as_count().expect("expected count collector").count);
+                        CollectorOutput::Count(proto::CountCollectorOutput { count: counts.sum() })
                     }
-                    Some(proto::collector_output::CollectorOutput::Facet(_)) => todo!(),
-                    Some(proto::collector_output::CollectorOutput::ReservoirSampling(_)) => todo!(),
-                    Some(proto::collector_output::CollectorOutput::TopDocs(_)) => {
-                        let top_docs = collectors_outputs
-                            .iter()
-                            .map(|collectors_output| collectors_output[ix].as_top_docs().expect("expected top_docs collector"));
-                        let has_next = top_docs.clone().any(|top_docs| top_docs.has_next);
-                        let mut scored_documents: Vec<_> = top_docs
-                            .map(|top_docs| top_docs.scored_documents.iter())
-                            .kmerge_by(|a, b| a > b)
-                            .cloned()
+                    Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Facet(_))) => todo!(),
+                    Some(IntermediateExtractionResult::PreparedDocumentReferences(first_prepared_document_references)) => {
+                        let offset = first_prepared_document_references.offset as usize;
+                        let limit = first_prepared_document_references.limit as usize;
+                        let prepared_documents_references: Vec<_> = intermediate_extraction_results
+                            .into_iter()
+                            .map(|extraction_result| extraction_result.as_document_references().expect("expected top_docs collector"))
                             .collect();
-                        for (position, scored_document) in scored_documents.iter_mut().enumerate() {
-                            scored_document.position = position as u32;
-                        }
-                        Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
-                            has_next,
-                            scored_documents,
+                        let mut extraction_toolings = HashMap::new();
+                        let mut has_next = false;
+
+                        let snippet_generators: HashMap<_, _> = join_all(prepared_documents_references.iter().map(|prepared_document_references| async move {
+                            (
+                                prepared_document_references.index_alias.as_str(),
+                                if let Some(snippet_generator_config) = prepared_document_references.snippet_generator_config.as_ref() {
+                                    snippet_generator_config.as_tantivy_async().await
+                                } else {
+                                    Vec::default()
+                                },
+                            )
                         }))
+                        .await
+                        .into_iter()
+                        .collect();
+
+                        for prepared_document_references in &prepared_documents_references {
+                            has_next |= prepared_document_references.has_next;
+                            extraction_toolings.insert(
+                                prepared_document_references.index_alias.as_str(),
+                                &prepared_document_references.extraction_tooling,
+                            );
+                        }
+                        let merged_scored_doc_address_refs: Vec<_> = prepared_documents_references
+                            .iter()
+                            .map(|top_docs| {
+                                top_docs.scored_doc_addresses.iter().map(|scored_doc_address| ScoredDocAddressRefWithAlias {
+                                    index_alias: top_docs.index_alias.as_str(),
+                                    scored_doc_address,
+                                })
+                            })
+                            .kmerge_by(|a, b| a.score() > b.score())
+                            .collect();
+
+                        let extraction_toolings_ref = &extraction_toolings;
+                        let snippet_generators_ref = &snippet_generators;
+                        let driver_ref = &driver;
+
+                        let scored_documents = join_all(merged_scored_doc_address_refs.into_iter().enumerate().skip(offset).take(limit).map(
+                            |(position, scored_doc_address_ref)| {
+                                let doc_address = scored_doc_address_ref.doc_address();
+                                let extraction_tooling = extraction_toolings_ref[scored_doc_address_ref.index_alias];
+                                let searcher = extraction_tooling.searcher.clone();
+                                async move {
+                                    let document = driver_ref.execute_blocking(move || searcher.doc(doc_address)).await??;
+                                    Ok(proto::ScoredDocument {
+                                        document: NamedFieldDocument::from_document(
+                                            extraction_tooling.searcher.schema(),
+                                            &extraction_tooling.query_fields,
+                                            &extraction_tooling.multi_fields,
+                                            &document,
+                                        )
+                                        .to_json_string(),
+                                        score: scored_doc_address_ref.score().clone(),
+                                        position: position as u32,
+                                        snippets: snippet_generators_ref[scored_doc_address_ref.index_alias]
+                                            .iter()
+                                            .map(|(field_name, snippet_generator)| {
+                                                (
+                                                    field_name.to_string(),
+                                                    Wrapper::from(snippet_generator.snippet_from_doc(&document)).into_inner(),
+                                                )
+                                            })
+                                            .collect(),
+                                        index_alias: scored_doc_address_ref.index_alias.to_string(),
+                                    })
+                                }
+                            },
+                        ))
+                        .await
+                        .into_iter()
+                        .collect::<SummaResult<Vec<_>>>()?;
+                        CollectorOutput::TopDocs(proto::TopDocsCollectorOutput { has_next, scored_documents })
                     }
-                    None => todo!(),
-                },
+                }),
             });
         }
         Ok(merged_response)

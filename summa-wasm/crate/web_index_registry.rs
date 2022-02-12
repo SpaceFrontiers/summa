@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 use serde::Serialize;
-use summa_core::components::{Driver, IndexHolder, IndexRegistry, SummaDocument};
+use summa_core::components::{Driver, IndexHolder, IndexRegistry, IntermediateExtractionResult, SummaDocument};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
@@ -60,12 +60,12 @@ impl WrappedIndexRegistry {
     async fn search_internal(&self, index_queries: Vec<proto::IndexQuery>) -> SummaResult<Vec<proto::CollectorOutput>> {
         info!(action = "search", index_queries = ?index_queries);
         let futures = self.index_registry.search_futures(index_queries).await?;
-        let collectors_outputs = join_all(futures.into_iter().map(|f| self.thread_pool().spawn(f)))
+        let extraction_results = join_all(futures.into_iter().map(|f| self.thread_pool().spawn(f)))
             .await
             .into_iter()
             .map(|r| r.expect("cannot receive"))
             .collect::<SummaResult<Vec<_>>>()?;
-        self.merge_responses(&collectors_outputs)
+        self.finalize_collectors_output(extraction_results).await
     }
 
     /// Add new index to `WrappedIndexRegistry`
@@ -148,8 +148,11 @@ impl WrappedIndexRegistry {
         Ok(self.commit_internal(index_name).await.map_err(Error::from)?)
     }
 
-    pub(crate) fn merge_responses(&self, collectors_outputs: &[Vec<proto::CollectorOutput>]) -> SummaResult<Vec<proto::CollectorOutput>> {
-        self.index_registry.merge_responses(collectors_outputs)
+    pub(crate) async fn finalize_collectors_output(
+        &self,
+        extraction_results: Vec<Vec<IntermediateExtractionResult>>,
+    ) -> SummaResult<Vec<proto::CollectorOutput>> {
+        self.index_registry.finalize_extraction(extraction_results, Driver::Native).await
     }
 
     pub(crate) fn thread_pool(&self) -> &ThreadPool {

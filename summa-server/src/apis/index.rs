@@ -137,7 +137,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
             .index_service
             .get_index_holder(&request.index_name)
             .await?
-            .delete_documents(request.query.ok_or(ValidationError::MissingQuery)?)
+            .delete_documents(request.query.and_then(|query| query.query).ok_or(ValidationError::MissingQuery)?)
             .await
             .map_err(crate::errors::Error::from)?;
         let response = proto::DeleteDocumentsResponse { deleted_documents };

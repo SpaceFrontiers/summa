@@ -13,10 +13,11 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use summa_proto::proto;
-use tantivy::collector::{Collector, MultiCollector};
+use summa_proto::proto::IndexAttributes;
+use tantivy::collector::{Collector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
-use tantivy::schema::Schema;
+use tantivy::schema::{Field, Schema};
 use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -24,6 +25,7 @@ use tracing::{instrument, trace};
 
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
+use crate::components::fruit_extractors::IntermediateExtractionResult;
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{Driver, IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
@@ -36,8 +38,9 @@ pub struct IndexHolder {
     index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
     index_name: String,
     index: Index,
-    cached_index_attributes: Option<proto::IndexAttributes>,
+    cached_index_attributes: Option<IndexAttributes>,
     cached_schema: Schema,
+    cached_multi_fields: HashSet<Field>,
     index_reader: IndexReader,
     index_writer_holder: Option<Arc<RwLock<IndexWriterHolder>>>,
     query_parser: RwLock<QueryParser>,
@@ -155,7 +158,7 @@ impl IndexHolder {
 
         let metas = index.load_metas()?;
         let index_name = index_name.map(|x| x.to_string()).unwrap_or_else(|| {
-            serde_json::from_value::<proto::IndexAttributes>(metas.index_attributes().expect("no attributes").expect("no attributes"))
+            serde_json::from_value::<IndexAttributes>(metas.index_attributes().expect("no attributes").expect("no attributes"))
                 .expect("wrong json")
                 .default_index_name
                 .expect("no index name")
@@ -179,13 +182,27 @@ impl IndexHolder {
             )?))),
         };
 
+        let cached_index_attributes: Option<IndexAttributes> = metas.index_attributes()?;
+        let cached_multi_fields = cached_index_attributes
+            .as_ref()
+            .map(|index_attributes| {
+                index_attributes
+                    .multi_fields
+                    .iter()
+                    .map(|field_name| Ok::<_, Error>(cached_schema.get_field(field_name)?))
+                    .collect()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(IndexHolder {
             index_engine_config,
             index_name,
             index: index.clone(),
             query_parser,
             cached_schema,
-            cached_index_attributes: metas.index_attributes()?,
+            cached_index_attributes,
+            cached_multi_fields,
             index_reader,
             index_writer_holder,
             #[cfg(feature = "metrics")]
@@ -273,8 +290,7 @@ impl IndexHolder {
         store: &iroh_store::Store,
         read_only: bool,
     ) -> SummaResult<Index> {
-        let iroh_directory =
-            crate::directories::IrohDirectory::from_cid(content_loader, store, crate::components::Driver::current_tokio(), &ipfs_engine_config.cid).await?;
+        let iroh_directory = crate::directories::IrohDirectory::from_cid(content_loader, store, Driver::current_tokio(), &ipfs_engine_config.cid).await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
@@ -309,7 +325,7 @@ impl IndexHolder {
     }
 
     /// Load index attributes from meta.json
-    pub fn index_attributes(&self) -> Option<&proto::IndexAttributes> {
+    pub fn index_attributes(&self) -> Option<&IndexAttributes> {
         self.cached_index_attributes.as_ref()
     }
 
@@ -341,6 +357,11 @@ impl IndexHolder {
     /// Index schema
     pub fn schema(&self) -> &Schema {
         &self.cached_schema
+    }
+
+    /// Multi fields
+    pub fn multi_fields(&self) -> &HashSet<Field> {
+        &self.cached_multi_fields
     }
 
     /// Return internal Tantivy index
@@ -399,7 +420,7 @@ impl IndexHolder {
     }
 
     /// Runs a query on the segment readers wrapped by the searcher asynchronously.
-    pub async fn search_async<C: Collector>(&self, searcher: &Searcher, query: &dyn Query, collector: &C) -> tantivy::Result<C::Fruit> {
+    pub async fn search_in_segments(&self, searcher: &Searcher, query: &dyn Query, collector: &MultiCollector<'_>) -> tantivy::Result<MultiFruit> {
         let enabled_scoring = if collector.requires_scoring() {
             EnableScoring::enabled_from_searcher(searcher)
         } else {
@@ -420,16 +441,16 @@ impl IndexHolder {
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
     pub async fn search(
         &self,
-        external_index_alias: &str,
-        query: &proto::Query,
+        index_alias: &str,
+        query: &proto::query::Query,
         collectors: Vec<proto::Collector>,
-    ) -> SummaResult<Vec<proto::CollectorOutput>> {
+    ) -> SummaResult<Vec<IntermediateExtractionResult>> {
         let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.read().await.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let extractors: Vec<Box<dyn FruitExtractor>> = collectors
             .into_iter()
-            .map(|collector_proto| build_fruit_extractor(collector_proto, &parsed_query, &self.cached_schema, &mut multi_collector))
+            .map(|collector_proto| build_fruit_extractor(self, index_alias, searcher.clone(), collector_proto, &parsed_query, &mut multi_collector))
             .collect::<SummaResult<_>>()?;
         trace!(
             target: "query",
@@ -437,10 +458,9 @@ impl IndexHolder {
             query = ?query,
             parsed_query = ?parsed_query,
         );
-
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        let mut multi_fruit = self.search_async(&searcher, &parsed_query, &multi_collector).await?;
+        let mut multi_fruit = self.search_in_segments(&searcher, &parsed_query, &multi_collector).await?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
             &Context::current(),
@@ -448,29 +468,15 @@ impl IndexHolder {
             &[KeyValue::new("index_name", self.index_name.to_owned())],
         );
         let mut collector_outputs = Vec::with_capacity(extractors.len());
-        let multi_fields = self
-            .index_attributes()
-            .map(|index_attributes| {
-                index_attributes
-                    .multi_fields
-                    .iter()
-                    .map(|field_name| self.cached_schema.get_field(field_name).expect("Field not found"))
-                    .collect()
-            })
-            .unwrap_or_else(HashSet::new);
         trace!(action = "extract");
         for extractor in extractors.into_iter() {
-            collector_outputs.push(
-                extractor
-                    .extract_async(external_index_alias, &mut multi_fruit, &searcher, &multi_fields)
-                    .await?,
-            )
+            collector_outputs.push(extractor.extract(&mut multi_fruit)?)
         }
         Ok(collector_outputs)
     }
 
     /// Delete `SummaDocument` by `unq`
-    pub async fn delete_documents(&self, query: proto::Query) -> SummaResult<u64> {
+    pub async fn delete_documents(&self, query: proto::query::Query) -> SummaResult<u64> {
         let parsed_query = self.query_parser.read().await.parse_query(&query)?;
         self.index_writer_holder()?.read().await.delete_by_query(parsed_query)
     }

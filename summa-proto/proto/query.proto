@@ -278,14 +278,14 @@ message RandomDocument {
 }
 
 message ReservoirSamplingCollectorOutput {
-  repeated RandomDocument random_documents = 1;
+  repeated RandomDocument documents = 1;
 }
 
 message TopDocsCollector {
   uint32 limit = 1;
   uint32 offset = 2;
   optional Scorer scorer = 3;
-  map<string, uint32> snippets = 4;
+  map<string, uint32> snippet_configs = 4;
   bool explain = 5;
   repeated string fields = 6;
 }

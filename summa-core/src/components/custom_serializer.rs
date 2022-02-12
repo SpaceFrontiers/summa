@@ -22,7 +22,7 @@ pub enum Value<'a> {
 pub struct NamedFieldDocument<'a>(pub BTreeMap<&'a str, Value<'a>>);
 
 impl<'a> NamedFieldDocument<'a> {
-    pub fn from_document(schema: &'a Schema, fields: &'a Option<HashSet<Field>>, multi_fields: &HashSet<Field>, document: &'a Document) -> Self {
+    pub fn from_document(schema: &'a Schema, fields: &Option<HashSet<Field>>, multi_fields: &HashSet<Field>, document: &'a Document) -> Self {
         let mut field_map = BTreeMap::new();
         for (field, field_values) in document.get_sorted_field_values() {
             let field_name = schema.get_field_name(field);
@@ -40,7 +40,7 @@ impl<'a> NamedFieldDocument<'a> {
         }
         NamedFieldDocument(field_map)
     }
-    pub fn to_json(&self) -> String {
+    pub fn to_json_string(&self) -> String {
         serde_json::to_string(self).expect("must be serializable")
     }
 }

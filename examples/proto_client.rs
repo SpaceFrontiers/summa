@@ -48,7 +48,7 @@ async fn main() -> Result<(), tonic::Status> {
 
     index_api_client
         .index_document(proto::IndexDocumentRequest {
-            index_alias: "test_index".to_string(),
+            index_name: "test_index".to_string(),
             document: serde_json::to_vec(&json!({
                 "title": "Game of Thrones",
                 "body": r#"Game of Thrones is an American fantasy drama television series created
@@ -64,7 +64,7 @@ async fn main() -> Result<(), tonic::Status> {
         .await?;
     index_api_client
         .index_document(proto::IndexDocumentRequest {
-            index_alias: "test_index".to_string(),
+            index_name: "test_index".to_string(),
             document: serde_json::to_vec(&json!({
                 "title": "Breaking Bad",
                 "body": r#"Breaking Bad is an American crime drama television series created and produced
@@ -82,7 +82,7 @@ async fn main() -> Result<(), tonic::Status> {
 
     index_api_client
         .commit_index(proto::CommitIndexRequest {
-            index_alias: "test_index".to_string(),
+            index_name: "test_index".to_string(),
             // Does not return until commit is finished
             commit_mode: proto::CommitMode::Sync.into(),
         })

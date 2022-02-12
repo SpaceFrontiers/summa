@@ -651,7 +651,7 @@ impl Index {
             .await
             .into_iter()
             .collect::<Result<SummaResult<Vec<_>>, _>>()??;
-        Ok(self.index_registry.merge_responses(&collector_outputs)?)
+        Ok(self.index_registry.finalize_extraction(collector_outputs, Driver::current_tokio()).await?)
     }
 
     #[instrument(skip(self), fields(index_name = merge_segments_request.index_name))]
@@ -1074,7 +1074,7 @@ pub(crate) mod tests {
 
         let mut rng = SmallRng::seed_from_u64(42);
         for _ in 0..4 {
-            for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 3000) {
+            for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 300) {
                 index_holder.index_document(d).await?;
             }
             index_service.commit(&index_holder).await?;

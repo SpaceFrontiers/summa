@@ -5,21 +5,20 @@ pub trait ToLabel {
     fn to_label(&self) -> String;
 }
 
-impl ToLabel for proto::Query {
+impl ToLabel for proto::query::Query {
     fn to_label(&self) -> String {
-        match &self.query {
-            None => "none",
-            Some(proto::query::Query::All(_)) => "all",
-            Some(proto::query::Query::Boolean(_)) => "boolean",
-            Some(proto::query::Query::Empty(_)) => "empty",
-            Some(proto::query::Query::Match(_)) => "match",
-            Some(proto::query::Query::Range(_)) => "range",
-            Some(proto::query::Query::Boost(_)) => "boost",
-            Some(proto::query::Query::Regex(_)) => "regex",
-            Some(proto::query::Query::Phrase(_)) => "phrase",
-            Some(proto::query::Query::Term(_)) => "term",
-            Some(proto::query::Query::MoreLikeThis(_)) => "more_like_this",
-            Some(proto::query::Query::DisjunctionMax(_)) => "disjunction_max",
+        match &self {
+            proto::query::Query::All(_) => "all",
+            proto::query::Query::Boolean(_) => "boolean",
+            proto::query::Query::Empty(_) => "empty",
+            proto::query::Query::Match(_) => "match",
+            proto::query::Query::Range(_) => "range",
+            proto::query::Query::Boost(_) => "boost",
+            proto::query::Query::Regex(_) => "regex",
+            proto::query::Query::Phrase(_) => "phrase",
+            proto::query::Query::Term(_) => "term",
+            proto::query::Query::MoreLikeThis(_) => "more_like_this",
+            proto::query::Query::DisjunctionMax(_) => "disjunction_max",
         }
         .to_owned()
     }

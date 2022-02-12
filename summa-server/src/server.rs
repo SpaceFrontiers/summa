@@ -259,31 +259,31 @@ mod tests {
             .await?;
         index_api_client
             .index_document(proto::IndexDocumentRequest {
-                index_alias: "test_index".to_string(),
+                index_name: "test_index".to_string(),
                 document: json!({"title": "title1", "body": "body1"}).to_string().as_bytes().to_vec(),
             })
             .await?;
         index_api_client
             .index_document(proto::IndexDocumentRequest {
-                index_alias: "test_index".to_string(),
+                index_name: "test_index".to_string(),
                 document: json!({"title": "title2", "body": "body2"}).to_string().as_bytes().to_vec(),
             })
             .await?;
         index_api_client
             .commit_index(proto::CommitIndexRequest {
-                index_alias: "test_index".to_string(),
+                index_name: "test_index".to_string(),
                 commit_mode: proto::CommitMode::Sync.into(),
             })
             .await?;
         index_api_client
             .index_document(proto::IndexDocumentRequest {
-                index_alias: "test_index".to_string(),
+                index_name: "test_index".to_string(),
                 document: json!({"title": "title3", "body": "body3"}).to_string().as_bytes().to_vec(),
             })
             .await?;
         index_api_client
             .commit_index(proto::CommitIndexRequest {
-                index_alias: "test_index".to_string(),
+                index_name: "test_index".to_string(),
                 commit_mode: proto::CommitMode::Sync.into(),
             })
             .await?;
@@ -329,7 +329,7 @@ mod tests {
                             limit: 1,
                             offset: 0,
                             scorer: None,
-                            snippets: Default::default(),
+                            snippet_configs: Default::default(),
                             explain: false,
                             fields: vec![],
                         })),
@@ -370,7 +370,7 @@ mod tests {
                             limit: 1,
                             offset: 0,
                             scorer: None,
-                            snippets: Default::default(),
+                            snippet_configs: Default::default(),
                             explain: false,
                             fields: vec![],
                         })),

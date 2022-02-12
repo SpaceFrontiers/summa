@@ -28,24 +28,6 @@ impl PartialOrd for proto::ScoredDocument {
     }
 }
 
-impl proto::CollectorOutput {
-    pub fn as_top_docs(&self) -> Option<&proto::TopDocsCollectorOutput> {
-        if let Some(proto::collector_output::CollectorOutput::TopDocs(top_docs)) = &self.collector_output {
-            Some(top_docs)
-        } else {
-            None
-        }
-    }
-
-    pub fn as_count(&self) -> Option<&proto::CountCollectorOutput> {
-        if let Some(proto::collector_output::CollectorOutput::Count(count)) = &self.collector_output {
-            Some(count)
-        } else {
-            None
-        }
-    }
-}
-
 pub mod shortcuts {
     use std::collections::HashMap;
 
@@ -57,7 +39,7 @@ pub mod shortcuts {
                 limit,
                 offset: 0,
                 scorer: None,
-                snippets: HashMap::new(),
+                snippet_configs: HashMap::new(),
                 explain: false,
                 fields: Vec::new(),
             })),
@@ -72,7 +54,7 @@ pub mod shortcuts {
                 scorer: Some(proto::Scorer {
                     scorer: Some(proto::scorer::Scorer::EvalExpr(eval_expr.to_owned())),
                 }),
-                snippets: HashMap::new(),
+                snippet_configs: HashMap::new(),
                 explain: false,
                 fields: Vec::new(),
             })),

@@ -8,12 +8,13 @@ mod index_writer_holder;
 pub mod merge_policies;
 mod query_parser;
 mod segment_attributes;
+mod snippet_generator;
 mod summa_document;
 mod summa_tokenizer;
 
 pub use default_tokenizers::default_tokenizers;
 pub use driver::Driver;
-pub use fruit_extractors::{build_fruit_extractor, FruitExtractor};
+pub use fruit_extractors::{build_fruit_extractor, FruitExtractor, IntermediateExtractionResult};
 pub use index_holder::{cleanup_index, IndexHolder};
 pub use index_registry::IndexRegistry;
 pub use index_writer_holder::{HotCacheConfig, IndexWriterHolder};
