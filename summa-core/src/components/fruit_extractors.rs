@@ -124,11 +124,9 @@ pub fn build_fruit_extractor(
             Ok(match top_docs_collector_proto.scorer {
                 None | Some(proto::Scorer { scorer: None }) => Box::new(
                     TopDocsBuilder::default()
-                        .handle(
-                            multi_collector.add_collector(
-                                tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize),
-                            ),
-                        )
+                        .handle(multi_collector.add_collector(tantivy::collector::TopDocs::with_limit(
+                            (top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize,
+                        )))
                         .index_alias(index_alias.to_string())
                         .searcher(searcher)
                         .query(query.box_clone())
@@ -143,8 +141,9 @@ pub fn build_fruit_extractor(
                     scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
                 }) => {
                     let eval_scorer_seed = EvalScorer::new(eval_expr, searcher.schema())?;
-                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
-                        .tweak_score(EvalScorerTweaker::new(eval_scorer_seed));
+                    let top_docs_collector =
+                        tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
+                            .tweak_score(EvalScorerTweaker::new(eval_scorer_seed));
                     Box::new(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))
@@ -160,11 +159,11 @@ pub fn build_fruit_extractor(
                     ) as Box<dyn FruitExtractor>
                 }
                 Some(proto::Scorer {
-                    scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
+                    scorer: Some(proto::scorer::Scorer::OrderBy(field_name)),
                 }) => {
-                    let order_by_field = searcher.schema().get_field(field_name)?;
-                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
-                        .order_by_u64_field(order_by_field);
+                    let top_docs_collector =
+                        tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
+                            .order_by_u64_field(field_name);
                     Box::new(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))
@@ -197,8 +196,7 @@ pub fn build_fruit_extractor(
         }
         Some(proto::collector::Collector::Count(_)) => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
         Some(proto::collector::Collector::Facet(facet_collector_proto)) => {
-            let field = searcher.schema().get_field(&facet_collector_proto.field)?;
-            let mut facet_collector = tantivy::collector::FacetCollector::for_field(field);
+            let mut facet_collector = tantivy::collector::FacetCollector::for_field(facet_collector_proto.field);
             for facet in &facet_collector_proto.facets {
                 facet_collector.add_facet(facet);
             }

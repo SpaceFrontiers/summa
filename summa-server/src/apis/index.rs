@@ -299,7 +299,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let now = Instant::now();
         match proto_request.is_full {
             true => index_holder.full_warmup().await.map_err(crate::errors::Error::from)?,
-            false => index_holder.partial_warmup().await.map_err(crate::errors::Error::from)?,
+            false => index_holder.partial_warmup(true).await.map_err(crate::errors::Error::from)?,
         }
         let elapsed_secs = now.elapsed().as_secs_f64();
         let response = proto::WarmupIndexResponse { elapsed_secs };

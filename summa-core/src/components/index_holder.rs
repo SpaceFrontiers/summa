@@ -370,7 +370,7 @@ impl IndexHolder {
     }
 
     /// Load term dictionaries into memory
-    pub async fn partial_warmup(&self) -> SummaResult<()> {
+    pub async fn partial_warmup(&self, load_dictionaries: bool) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
         let index_attributes = self.index_attributes();
@@ -386,12 +386,14 @@ impl IndexHolder {
         if let Some(default_fields) = default_fields {
             for field in default_fields {
                 for segment_reader in searcher.segment_readers() {
-                    let inverted_index = segment_reader.inverted_index(field)?.clone();
-                    warm_up_futures.push(async move {
-                        let dict = inverted_index.terms();
-                        info!(action = "warming_up_dictionary", index_name = ?self.index_name());
-                        dict.warm_up_dictionary().await
-                    });
+                    let inverted_index = segment_reader.inverted_index_async(field).await?.clone();
+                    if load_dictionaries {
+                        warm_up_futures.push(async move {
+                            let dict = inverted_index.terms();
+                            info!(action = "warming_up_dictionary", index_name = ?self.index_name());
+                            dict.warm_up_dictionary().await
+                        });
+                    }
                 }
             }
             info!(action = "warming_up", index_name = ?self.index_name());

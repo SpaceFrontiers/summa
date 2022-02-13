@@ -8,7 +8,7 @@ use itertools::Itertools;
 use summa_proto::proto;
 use summa_proto::proto::collector_output::CollectorOutput;
 use summa_proto::proto::Score;
-use tantivy::DocAddress;
+use tantivy::{DocAddress, SnippetGenerator};
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -155,10 +155,7 @@ impl IndexRegistry {
     }
 
     /// Merges several `IntermediateExtractionResult`
-    pub async fn finalize_extraction(
-        &self,
-        ie_results: Vec<Vec<IntermediateExtractionResult>>,
-    ) -> SummaResult<Vec<proto::CollectorOutput>> {
+    pub async fn finalize_extraction(&self, ie_results: Vec<Vec<IntermediateExtractionResult>>) -> SummaResult<Vec<proto::CollectorOutput>> {
         let ie_results = transpose(ie_results);
         let mut collector_outputs = vec![];
 
@@ -185,50 +182,49 @@ impl IndexRegistry {
                         } else {
                             todo!();
                         }
-                    },
+                    }
                     Some(IntermediateExtractionResult::PreparedDocumentReferences(first_prepared_document_references)) => {
                         let offset = first_prepared_document_references.offset as usize;
                         let limit = first_prepared_document_references.limit as usize;
+
                         let docs_references: Vec<_> = ie_result
                             .into_iter()
                             .map(|ie_result| ie_result.as_document_references().expect("expected top_docs collector"))
                             .collect();
-                        let mut extraction_toolings = HashMap::new();
+
                         let mut has_next = false;
                         let mut total_documents = 0;
-
-                        let snippet_generators: HashMap<_, _> = join_all(docs_references.iter().map(|doc_references| async move {
-                            (
-                                doc_references.index_alias.as_str(),
-                                if let Some(sg_config) = doc_references.snippet_generator_config.as_ref() {
-                                    sg_config.as_tantivy_async().await
-                                } else {
-                                    Vec::default()
-                                },
-                            )
-                        }))
-                        .await
-                        .into_iter()
-                        .collect();
+                        let mut extraction_toolings = HashMap::new();
+                        let mut snippet_generators_futures = vec![];
 
                         for doc_references in &docs_references {
                             has_next |= doc_references.has_next;
                             total_documents += doc_references.scored_doc_addresses.len();
-                            extraction_toolings.insert(
-                                doc_references.index_alias.as_str(),
-                                &doc_references.extraction_tooling,
-                            );
+                            extraction_toolings.insert(doc_references.index_alias.as_str(), &doc_references.extraction_tooling);
+                            if let Some(sg_config) = &doc_references.snippet_generator_config {
+                                snippet_generators_futures.push(async move { (doc_references.index_alias.as_str(), sg_config.as_tantivy_async().await) });
+                            }
                         }
 
-                        info!(action = "retrieving_documents", limit = limit, offset = offset, total_documents = total_documents);
+                        let snippet_generators: HashMap<&str, Vec<(String, SnippetGenerator)>> =
+                            join_all(snippet_generators_futures).await.into_iter().collect();
 
+                        info!(
+                            action = "retrieving_documents",
+                            limit = limit,
+                            offset = offset,
+                            total_documents = total_documents
+                        );
                         let merged_scored_doc_address_refs: Vec<_> = docs_references
                             .iter()
                             .map(|doc_references| {
-                                doc_references.scored_doc_addresses.iter().map(|scored_doc_address| ScoredDocAddressRefWithAlias {
-                                    index_alias: doc_references.index_alias.as_str(),
-                                    scored_doc_address,
-                                })
+                                doc_references
+                                    .scored_doc_addresses
+                                    .iter()
+                                    .map(|scored_doc_address| ScoredDocAddressRefWithAlias {
+                                        index_alias: doc_references.index_alias.as_str(),
+                                        scored_doc_address,
+                                    })
                             })
                             .kmerge_by(|a, b| a.score() > b.score())
                             .skip(offset)
@@ -238,40 +234,48 @@ impl IndexRegistry {
                         let extraction_toolings_ref = &extraction_toolings;
                         let snippet_generators_ref = &snippet_generators;
 
-                        let scored_documents = join_all(merged_scored_doc_address_refs.into_iter().enumerate().map(
-                            |(position, scored_doc_address_ref)| {
-                                let doc_address = scored_doc_address_ref.doc_address();
-                                let extraction_tooling = extraction_toolings_ref[scored_doc_address_ref.index_alias];
-                                let searcher = extraction_tooling.searcher.clone();
-                                async move {
-                                    #[cfg(feature = "tokio-rt")]
-                                    let document = tokio::task::spawn_blocking(|| searcher.doc(doc_address)).await??;
-                                    #[cfg(not(feature = "tokio-rt"))]
-                                    let document = searcher.doc_async(doc_address).await?;
-                                    Ok(proto::ScoredDocument {
-                                        document: NamedFieldDocument::from_document(
-                                            extraction_tooling.searcher.schema(),
-                                            &extraction_tooling.query_fields,
-                                            &extraction_tooling.multi_fields,
-                                            &document,
-                                        )
-                                        .to_json_string(),
-                                        score: scored_doc_address_ref.score().clone(),
-                                        position: position as u32,
-                                        snippets: snippet_generators_ref[scored_doc_address_ref.index_alias]
-                                            .iter()
-                                            .map(|(field_name, snippet_generator)| {
-                                                (
-                                                    field_name.to_string(),
-                                                    Wrapper::from(snippet_generator.snippet_from_doc(&document)).into_inner(),
-                                                )
-                                            })
-                                            .collect(),
-                                        index_alias: scored_doc_address_ref.index_alias.to_string(),
-                                    })
-                                }
-                            },
-                        ))
+                        let scored_documents = join_all(
+                            merged_scored_doc_address_refs
+                                .into_iter()
+                                .enumerate()
+                                .map(|(position, scored_doc_address_ref)| {
+                                    let doc_address = scored_doc_address_ref.doc_address();
+                                    let extraction_tooling = extraction_toolings_ref[scored_doc_address_ref.index_alias];
+                                    let searcher = extraction_tooling.searcher.clone();
+                                    async move {
+                                        #[cfg(feature = "tokio-rt")]
+                                        let document = tokio::task::spawn_blocking(move || searcher.doc(doc_address)).await??;
+                                        #[cfg(not(feature = "tokio-rt"))]
+                                        let document = searcher.doc_async(doc_address).await?;
+                                        Ok(proto::ScoredDocument {
+                                            document: NamedFieldDocument::from_document(
+                                                extraction_tooling.searcher.schema(),
+                                                &extraction_tooling.query_fields,
+                                                &extraction_tooling.multi_fields,
+                                                &document,
+                                            )
+                                            .to_json_string(),
+                                            score: scored_doc_address_ref.score().clone(),
+                                            position: position as u32,
+                                            snippets: snippet_generators_ref
+                                                .get(scored_doc_address_ref.index_alias)
+                                                .map(|snippet_generator| {
+                                                    snippet_generator
+                                                        .iter()
+                                                        .map(|(field_name, snippet_generator)| {
+                                                            (
+                                                                field_name.to_string(),
+                                                                Wrapper::from(snippet_generator.snippet_from_doc(&document)).into_inner(),
+                                                            )
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default(),
+                                            index_alias: scored_doc_address_ref.index_alias.to_string(),
+                                        })
+                                    }
+                                }),
+                        )
                         .await
                         .into_iter()
                         .collect::<SummaResult<Vec<_>>>()?;

@@ -56,42 +56,10 @@ async fn fast_field_to_iter_async(schema: &Schema, segment_reader: &SegmentReade
     let field = schema.get_field(field_name)?;
     let field_type = schema.get_field_entry(field).field_type();
     let fast_field = match field_type {
-        FieldType::U64(_) => {
-            FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().u64_async(field_name).await.map_err(|tantivy_error| {
-                ValidationError::InvalidFastFieldType {
-                    field: field_name.to_owned(),
-                    field_type: field_type.to_owned(),
-                    tantivy_error,
-                }
-            })?)
-        }
-        FieldType::I64(_) => {
-            FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().i64_async(field_name).await.map_err(|tantivy_error| {
-                ValidationError::InvalidFastFieldType {
-                    field: field_name.to_owned(),
-                    field_type: field_type.to_owned(),
-                    tantivy_error,
-                }
-            })?)
-        }
-        FieldType::F64(_) => {
-            FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().f64_async(field_name).await.map_err(|tantivy_error| {
-                ValidationError::InvalidFastFieldType {
-                    field: field_name.to_owned(),
-                    field_type: field_type.to_owned(),
-                    tantivy_error,
-                }
-            })?)
-        }
-        FieldType::Date(_) => {
-            FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().date_async(field_name).await.map_err(|tantivy_error| {
-                ValidationError::InvalidFastFieldType {
-                    field: field_name.to_owned(),
-                    field_type: field_type.to_owned(),
-                    tantivy_error,
-                }
-            })?)
-        }
+        FieldType::U64(_) => FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().u64_async(field_name).await?),
+        FieldType::I64(_) => FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().i64_async(field_name).await?),
+        FieldType::F64(_) => FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().f64_async(field_name).await?),
+        FieldType::Date(_) => FastFieldIteratorImpl::from_fast_field_reader(segment_reader.fast_fields().date_async(field_name).await?),
         field_type => return Err(Error::InvalidFieldType(field_name.to_owned(), field_type.to_owned())),
     };
     Ok(fast_field)

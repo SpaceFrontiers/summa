@@ -142,6 +142,7 @@ impl Index {
                 )
             })
             .await??;
+            index_holder.partial_warmup(false).await?;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
         }
         info!(action = "setting_index_holders", indices = ?index_holders.keys().collect::<Vec<_>>());
@@ -251,7 +252,9 @@ impl Index {
             }
             _ => unimplemented!(),
         };
-        self.insert_index(&attach_index_request.index_name, index, &index_engine_config).await
+        let index_holder = self.insert_index(&attach_index_request.index_name, index, &index_engine_config).await?;
+        index_holder.partial_warmup(false).await?;
+        Ok(index_holder)
     }
 
     pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<()> {
@@ -338,7 +341,9 @@ impl Index {
                 (index, index_engine_config)
             }
         };
-        self.insert_index(&create_index_request.index_name, index, &index_engine_config).await
+        let index_holder = self.insert_index(&create_index_request.index_name, index, &index_engine_config).await?;
+        index_holder.partial_warmup(false).await?;
+        Ok(index_holder)
     }
 
     /// Delete index, optionally with all its aliases and consumers
@@ -640,6 +645,7 @@ impl Index {
             }
             _ => unimplemented!(),
         };
+        index_holder.partial_warmup(false).await?;
         if let Some(prepared_consumption) = prepared_consumption {
             self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         }

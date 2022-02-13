@@ -119,7 +119,7 @@ impl WrappedIndexRegistry {
             .get_index_holder_by_name(index_name)
             .await
             .map_err(Error::from)?
-            .partial_warmup()
+            .partial_warmup(false)
             .await
             .map_err(Error::from)?;
         Ok(())
