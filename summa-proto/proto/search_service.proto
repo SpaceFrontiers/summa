@@ -6,11 +6,14 @@ import "query.proto";
 
 // Searches documents in the stored indices
 service SearchApi {
+  // Make search in Summa
   rpc search (SearchRequest) returns (SearchResponse) {}
 }
 
 message SearchRequest {
+  // List of index queries. Multiple queries will be merged into a single list
   repeated IndexQuery index_queries = 1;
+  // Tags for logging purposes
   map<string, string> tags = 2;
 }
 

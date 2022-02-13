@@ -126,8 +126,7 @@ pub fn build_fruit_extractor(
                     TopDocsBuilder::default()
                         .handle(
                             multi_collector.add_collector(
-                                tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
-                                    .and_offset(top_docs_collector_proto.offset as usize),
+                                tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize),
                             ),
                         )
                         .index_alias(index_alias.to_string())
@@ -144,8 +143,7 @@ pub fn build_fruit_extractor(
                     scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
                 }) => {
                     let eval_scorer_seed = EvalScorer::new(eval_expr, searcher.schema())?;
-                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
-                        .and_offset(top_docs_collector_proto.offset as usize)
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
                         .tweak_score(EvalScorerTweaker::new(eval_scorer_seed));
                     Box::new(
                         TopDocsBuilder::default()
@@ -165,8 +163,7 @@ pub fn build_fruit_extractor(
                     scorer: Some(proto::scorer::Scorer::OrderBy(ref field_name)),
                 }) => {
                     let order_by_field = searcher.schema().get_field(field_name)?;
-                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
-                        .and_offset(top_docs_collector_proto.offset as usize)
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
                         .order_by_u64_field(order_by_field);
                     Box::new(
                         TopDocsBuilder::default()
@@ -241,7 +238,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let length = fruit.len();
         let doc_addresses = fruit
             .into_iter()
-            .take(std::cmp::min(self.limit as usize, length))
+            .take(std::cmp::min((self.offset + self.limit) as usize, length))
             .map(|(score, doc_address)| ScoredDocAddress {
                 doc_address,
                 score: Some(score.into()),

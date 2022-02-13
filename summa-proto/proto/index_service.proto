@@ -50,6 +50,7 @@ message PrimaryKey {
   }
 }
 
+// Merge policy that describes how to merge committed segments
 message MergePolicy {
   oneof merge_policy {
    LogMergePolicy log = 11;
@@ -67,41 +68,46 @@ message AttachRemoteEngineRequest {
 
 // Attach file engine request
 message AttachIpfsEngineRequest {
+  // [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/)
   string cid = 1;
   ChunkedCacheConfig chunked_cache_config = 2;
 }
 
 // Attach index request
 message AttachIndexRequest {
- string index_name = 1;
- oneof index_engine {
-   AttachFileEngineRequest file = 2;
-   AttachRemoteEngineRequest remote = 3;
-   AttachIpfsEngineRequest ipfs = 4;
- }
- MergePolicy merge_policy = 10;
+  // Index name for attaching
+  string index_name = 1;
+  // Attach index engine request
+  oneof index_engine {
+    AttachFileEngineRequest file = 2;
+    AttachRemoteEngineRequest remote = 3;
+    AttachIpfsEngineRequest ipfs = 4;
+  }
+  MergePolicy merge_policy = 10;
 }
 
-// Attach index response
+// Description of the attached index
 message AttachIndexResponse {
   IndexDescription index = 1;
 }
 
-// Commit index request
+// Store the state of index to the storage
 message CommitIndexRequest {
   string index_name = 1;
   CommitMode commit_mode = 2;
 }
 
-// Commit index response
+// Returned data from the commit command
 message CommitIndexResponse {
   // Pure time spent for committing
   optional double elapsed_secs = 2;
 }
 
-// Copy documents request
+// Copy documents from one index to another. Their schemes must be compatible
 message CopyDocumentsRequest {
+  // Where documents should be taken from
   string source_index_name = 1;
+  // Where documents should be copied to
   string target_index_name = 2;
 }
 
@@ -298,23 +304,34 @@ message FileEngineConfig {
 }
 
 message MemoryEngineConfig {
+  // Schema of the index for memory engine
   string schema = 1;
 }
 
 message ChunkedCacheConfig {
+  // Chunk size in bytes
   uint64 chunk_size = 1;
+  // Total cache size in bytes
   optional uint64 cache_size = 2;
 }
 
+// Remote HTTP engine config
 message RemoteEngineConfig {
+  // Which method should be used to request remote endpoint
   string method = 1;
+  // URL template which will be used to generate real URL by variables substitution
   string url_template = 2;
+  // Headers template which will be used to generate real URL by variables substitution
   map<string, string> headers_template = 3;
+  // Description of the cache for the engine
   ChunkedCacheConfig chunked_cache_config = 4;
 }
 
+// IPFS index engine
 message IpfsEngineConfig {
+  // [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/)
   string cid = 1;
+  // Description of the cache for the engine
   ChunkedCacheConfig chunked_cache_config = 2;
 }
 
@@ -329,6 +346,7 @@ message TemporalMergePolicy{
   uint64 merge_older_then_secs = 1;
 }
 
+// Description of the `IndexEngine` responsible for managing files in the persistent storage
 message IndexEngineConfig {
   oneof config {
     FileEngineConfig file = 1;

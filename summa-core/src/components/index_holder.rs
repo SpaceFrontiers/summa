@@ -18,7 +18,7 @@ use tantivy::collector::{Collector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
-use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
+use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -509,11 +509,12 @@ impl IndexHolder {
         Ok((success_docs, failed_docs))
     }
 
-    pub fn documents(&self) -> SummaResult<kanal::Receiver<tantivy::Result<Document>>> {
+    #[cfg(feature = "tokio-rt")]
+    pub fn documents(&self) -> SummaResult<kanal::Receiver<tantivy::Result<tantivy::Document>>> {
         let searcher = self.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
         let (tx, rx) = kanal::bounded(segment_readers.len() * 2 - 1);
-        for segment_reader in searcher.segment_readers() {
+        for segment_reader in segment_readers {
             let tx = tx.clone();
             let segment_reader = segment_reader.clone();
             tokio::task::spawn_blocking(move || {

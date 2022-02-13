@@ -143,7 +143,7 @@ parent: APIs
     - [TermsAggregation](#summa-proto-TermsAggregation)
     - [TermsResult](#summa-proto-TermsResult)
     - [TopDocsCollector](#summa-proto-TopDocsCollector)
-    - [TopDocsCollector.SnippetsEntry](#summa-proto-TopDocsCollector-SnippetsEntry)
+    - [TopDocsCollector.SnippetConfigsEntry](#summa-proto-TopDocsCollector-SnippetConfigsEntry)
     - [TopDocsCollectorOutput](#summa-proto-TopDocsCollectorOutput)
   
     - [Occur](#summa-proto-Occur)
@@ -266,7 +266,7 @@ Request describe how new Consumer should be created
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | consumer_name | [string](#string) |  |  |
 
 
@@ -360,7 +360,7 @@ Attach index request
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_name | [string](#string) |  |  |
+| index_name | [string](#string) |  | Index name for attaching |
 | file | [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest) |  |  |
 | remote | [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest) |  |  |
 | ipfs | [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest) |  |  |
@@ -374,7 +374,7 @@ Attach index request
 <a name="summa-proto-AttachIndexResponse"></a>
 
 ### AttachIndexResponse
-Attach index response
+Description of the attached index
 
 
 | Field | Type | Label | Description |
@@ -394,7 +394,7 @@ Attach file engine request
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| cid | [string](#string) |  |  |
+| cid | [string](#string) |  | [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/) |
 | chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
 
 
@@ -425,8 +425,8 @@ Attach remote engine request
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| chunk_size | [uint64](#uint64) |  |  |
-| cache_size | [uint64](#uint64) | optional |  |
+| chunk_size | [uint64](#uint64) |  | Chunk size in bytes |
+| cache_size | [uint64](#uint64) | optional | Total cache size in bytes |
 
 
 
@@ -436,12 +436,12 @@ Attach remote engine request
 <a name="summa-proto-CommitIndexRequest"></a>
 
 ### CommitIndexRequest
-Commit index request
+Store the state of index to the storage
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | commit_mode | [CommitMode](#summa-proto-CommitMode) |  |  |
 
 
@@ -452,7 +452,7 @@ Commit index request
 <a name="summa-proto-CommitIndexResponse"></a>
 
 ### CommitIndexResponse
-Commit index response
+Returned data from the commit command
 
 
 | Field | Type | Label | Description |
@@ -467,13 +467,13 @@ Commit index response
 <a name="summa-proto-CopyDocumentsRequest"></a>
 
 ### CopyDocumentsRequest
-Copy documents request
+Copy documents from one index to another. Their schemes must be compatible
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| source_index_name | [string](#string) |  |  |
-| target_index_name | [string](#string) |  |  |
+| source_index_name | [string](#string) |  | Where documents should be taken from |
+| target_index_name | [string](#string) |  | Where documents should be copied to |
 
 
 
@@ -607,7 +607,7 @@ Request for index creation
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | query | [Query](#summa-proto-Query) |  |  |
 
 
@@ -668,7 +668,7 @@ Request a stream of all documents from the index
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 
 
 
@@ -713,7 +713,7 @@ Single document from the index
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 
 
 
@@ -865,7 +865,7 @@ Indexing operations that contains document serialized in JSON format
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | document | [bytes](#bytes) |  |  |
 
 
@@ -891,7 +891,7 @@ Indexing operations that contains document serialized in JSON format
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | documents | [bytes](#bytes) | repeated |  |
 
 
@@ -919,7 +919,7 @@ Indexing operations that contains document serialized in JSON format
 <a name="summa-proto-IndexEngineConfig"></a>
 
 ### IndexEngineConfig
-
+Description of the `IndexEngine` responsible for managing files in the persistent storage
 
 
 | Field | Type | Label | Description |
@@ -953,13 +953,13 @@ Message that should be put in Kafka for ingesting by Summa consumers
 <a name="summa-proto-IpfsEngineConfig"></a>
 
 ### IpfsEngineConfig
-
+IPFS index engine
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| cid | [string](#string) |  |  |
-| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
+| cid | [string](#string) |  | [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/) |
+| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  | Description of the cache for the engine |
 
 
 
@@ -989,7 +989,7 @@ Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/ta
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| schema | [string](#string) |  |  |
+| schema | [string](#string) |  | Schema of the index for memory engine |
 
 
 
@@ -999,7 +999,7 @@ Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/ta
 <a name="summa-proto-MergePolicy"></a>
 
 ### MergePolicy
-
+Merge policy that describes how to merge committed segments
 
 
 | Field | Type | Label | Description |
@@ -1020,7 +1020,7 @@ Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/ta
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | segment_ids | [string](#string) | repeated |  |
 
 
@@ -1032,6 +1032,11 @@ Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/ta
 
 ### MergeSegmentsResponse
 
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| segment_id | [string](#string) | optional |  |
 
 
 
@@ -1057,15 +1062,15 @@ Possible primary keys
 <a name="summa-proto-RemoteEngineConfig"></a>
 
 ### RemoteEngineConfig
-
+Remote HTTP engine config
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| method | [string](#string) |  |  |
-| url_template | [string](#string) |  |  |
-| headers_template | [RemoteEngineConfig.HeadersTemplateEntry](#summa-proto-RemoteEngineConfig-HeadersTemplateEntry) | repeated |  |
-| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
+| method | [string](#string) |  | Which method should be used to request remote endpoint |
+| url_template | [string](#string) |  | URL template which will be used to generate real URL by variables substitution |
+| headers_template | [RemoteEngineConfig.HeadersTemplateEntry](#summa-proto-RemoteEngineConfig-HeadersTemplateEntry) | repeated | Headers template which will be used to generate real URL by variables substitution |
+| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  | Description of the cache for the engine |
 
 
 
@@ -1158,7 +1163,7 @@ Merge policy for compressing old segments
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 
 
 
@@ -1183,7 +1188,7 @@ Merge policy for compressing old segments
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | is_full | [bool](#bool) |  | If set to false, only term dictionaries will be warmed, otherwise the entire index will be read. |
 
 
@@ -1477,7 +1482,7 @@ Aggregation
 <a name="summa-proto-BucketEntry"></a>
 
 ### BucketEntry
-
+Extra structures
 
 
 | Field | Type | Label | Description |
@@ -1527,7 +1532,7 @@ Aggregation
 <a name="summa-proto-Collector"></a>
 
 ### Collector
-
+Collectors and CollectorOutputs
 
 
 | Field | Type | Label | Description |
@@ -2047,7 +2052,7 @@ Recursive query DSL
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| random_documents | [RandomDocument](#summa-proto-RandomDocument) | repeated |  |
+| documents | [RandomDocument](#summa-proto-RandomDocument) | repeated |  |
 
 
 
@@ -2268,7 +2273,7 @@ Recursive query DSL
 | limit | [uint32](#uint32) |  |  |
 | offset | [uint32](#uint32) |  |  |
 | scorer | [Scorer](#summa-proto-Scorer) | optional |  |
-| snippets | [TopDocsCollector.SnippetsEntry](#summa-proto-TopDocsCollector-SnippetsEntry) | repeated |  |
+| snippet_configs | [TopDocsCollector.SnippetConfigsEntry](#summa-proto-TopDocsCollector-SnippetConfigsEntry) | repeated |  |
 | explain | [bool](#bool) |  |  |
 | fields | [string](#string) | repeated |  |
 
@@ -2277,9 +2282,9 @@ Recursive query DSL
 
 
 
-<a name="summa-proto-TopDocsCollector-SnippetsEntry"></a>
+<a name="summa-proto-TopDocsCollector-SnippetConfigsEntry"></a>
 
-### TopDocsCollector.SnippetsEntry
+### TopDocsCollector.SnippetConfigsEntry
 
 
 
@@ -2345,7 +2350,7 @@ Recursive query DSL
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  |  |
+| index_name | [string](#string) |  |  |
 | field_name | [string](#string) |  |  |
 | top_k | [uint32](#uint32) |  |  |
 
@@ -2466,8 +2471,8 @@ Analyzes indices
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| index_queries | [IndexQuery](#summa-proto-IndexQuery) | repeated |  |
-| tags | [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry) | repeated |  |
+| index_queries | [IndexQuery](#summa-proto-IndexQuery) | repeated | List of index queries. Multiple queries will be merged into a single list |
+| tags | [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry) | repeated | Tags for logging purposes |
 
 
 
@@ -2503,7 +2508,7 @@ Searches documents in the stored indices
 
 | Method Name | Request Type | Response Type | Description |
 | ----------- | ------------ | ------------- | ------------|
-| search | [SearchRequest](#summa-proto-SearchRequest) | [SearchResponse](#summa-proto-SearchResponse) |  |
+| search | [SearchRequest](#summa-proto-SearchRequest) | [SearchResponse](#summa-proto-SearchResponse) | Make search in Summa |
 
  <!-- end services -->
 

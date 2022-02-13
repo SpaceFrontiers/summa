@@ -617,6 +617,7 @@ impl Index {
                         let locked_files = index_writer_holder.lock_files(hotcache_config)?;
                         for file in locked_files {
                             // ToDo: Avoid reading to memory
+                            info!(action = "copy_file", file = file);
                             let mut writer = iroh_directory.get_writer(&file);
                             writer.write_all(&index_holder.index().directory().atomic_read(Path::new(&file)).expect("cannot read"))?;
                             writer.terminate()?;
@@ -651,7 +652,7 @@ impl Index {
             .await
             .into_iter()
             .collect::<Result<SummaResult<Vec<_>>, _>>()??;
-        Ok(self.index_registry.finalize_extraction(collector_outputs, Driver::current_tokio()).await?)
+        Ok(self.index_registry.finalize_extraction(collector_outputs).await?)
     }
 
     #[instrument(skip(self), fields(index_name = merge_segments_request.index_name))]

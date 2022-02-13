@@ -47,6 +47,7 @@ message GetConsumerRequest {
 message GetConsumerResponse {
   Consumer consumer = 1;
 }
+
 message GetConsumersRequest {}
 
 message GetConsumersResponse {

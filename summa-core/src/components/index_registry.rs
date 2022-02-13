@@ -15,7 +15,6 @@ use tracing::info;
 use super::IndexHolder;
 use crate::components::custom_serializer::NamedFieldDocument;
 use crate::components::fruit_extractors::{IntermediateExtractionResult, ReadyCollectorOutput, ScoredDocAddress};
-use crate::components::Driver;
 use crate::configs::{ConfigProxy, DirectProxy};
 use crate::errors::{SummaResult, ValidationError};
 use crate::proto_traits::Wrapper;
@@ -155,42 +154,54 @@ impl IndexRegistry {
             .collect::<SummaResult<Vec<_>>>()
     }
 
-    /// Merges several `proto::CollectorOutput`
+    /// Merges several `IntermediateExtractionResult`
     pub async fn finalize_extraction(
         &self,
-        intermediate_extractions_results: Vec<Vec<IntermediateExtractionResult>>,
-        driver: Driver,
+        ie_results: Vec<Vec<IntermediateExtractionResult>>,
     ) -> SummaResult<Vec<proto::CollectorOutput>> {
-        let extractions_results = transpose(intermediate_extractions_results);
-        let mut merged_response = vec![];
+        let ie_results = transpose(ie_results);
+        let mut collector_outputs = vec![];
 
-        for intermediate_extraction_results in extractions_results.into_iter() {
-            merged_response.push(proto::CollectorOutput {
-                collector_output: Some(match intermediate_extraction_results.first() {
+        for ie_result in ie_results.into_iter() {
+            collector_outputs.push(proto::CollectorOutput {
+                collector_output: Some(match ie_result.first() {
                     None => return Err(Error::Validation(Box::new(ValidationError::EmptyArgument("collectors".to_string())))),
-                    Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Aggregation(_))) => todo!(),
+                    Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Aggregation(aggregation_collector_output))) => {
+                        if ie_result.len() == 1 {
+                            CollectorOutput::Aggregation(aggregation_collector_output.clone())
+                        } else {
+                            todo!();
+                        }
+                    }
                     Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Count(_))) => {
-                        let counts = intermediate_extraction_results
+                        let counts = ie_result
                             .into_iter()
-                            .map(|extraction_result| extraction_result.as_count().expect("expected count collector").count);
+                            .map(|ie_result| ie_result.as_count().expect("expected count collector").count);
                         CollectorOutput::Count(proto::CountCollectorOutput { count: counts.sum() })
                     }
-                    Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Facet(_))) => todo!(),
+                    Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Facet(facet_collector_output))) => {
+                        if ie_result.len() == 1 {
+                            CollectorOutput::Facet(facet_collector_output.clone())
+                        } else {
+                            todo!();
+                        }
+                    },
                     Some(IntermediateExtractionResult::PreparedDocumentReferences(first_prepared_document_references)) => {
                         let offset = first_prepared_document_references.offset as usize;
                         let limit = first_prepared_document_references.limit as usize;
-                        let prepared_documents_references: Vec<_> = intermediate_extraction_results
+                        let docs_references: Vec<_> = ie_result
                             .into_iter()
-                            .map(|extraction_result| extraction_result.as_document_references().expect("expected top_docs collector"))
+                            .map(|ie_result| ie_result.as_document_references().expect("expected top_docs collector"))
                             .collect();
                         let mut extraction_toolings = HashMap::new();
                         let mut has_next = false;
+                        let mut total_documents = 0;
 
-                        let snippet_generators: HashMap<_, _> = join_all(prepared_documents_references.iter().map(|prepared_document_references| async move {
+                        let snippet_generators: HashMap<_, _> = join_all(docs_references.iter().map(|doc_references| async move {
                             (
-                                prepared_document_references.index_alias.as_str(),
-                                if let Some(snippet_generator_config) = prepared_document_references.snippet_generator_config.as_ref() {
-                                    snippet_generator_config.as_tantivy_async().await
+                                doc_references.index_alias.as_str(),
+                                if let Some(sg_config) = doc_references.snippet_generator_config.as_ref() {
+                                    sg_config.as_tantivy_async().await
                                 } else {
                                     Vec::default()
                                 },
@@ -200,35 +211,43 @@ impl IndexRegistry {
                         .into_iter()
                         .collect();
 
-                        for prepared_document_references in &prepared_documents_references {
-                            has_next |= prepared_document_references.has_next;
+                        for doc_references in &docs_references {
+                            has_next |= doc_references.has_next;
+                            total_documents += doc_references.scored_doc_addresses.len();
                             extraction_toolings.insert(
-                                prepared_document_references.index_alias.as_str(),
-                                &prepared_document_references.extraction_tooling,
+                                doc_references.index_alias.as_str(),
+                                &doc_references.extraction_tooling,
                             );
                         }
-                        let merged_scored_doc_address_refs: Vec<_> = prepared_documents_references
+
+                        info!(action = "retrieving_documents", limit = limit, offset = offset, total_documents = total_documents);
+
+                        let merged_scored_doc_address_refs: Vec<_> = docs_references
                             .iter()
-                            .map(|top_docs| {
-                                top_docs.scored_doc_addresses.iter().map(|scored_doc_address| ScoredDocAddressRefWithAlias {
-                                    index_alias: top_docs.index_alias.as_str(),
+                            .map(|doc_references| {
+                                doc_references.scored_doc_addresses.iter().map(|scored_doc_address| ScoredDocAddressRefWithAlias {
+                                    index_alias: doc_references.index_alias.as_str(),
                                     scored_doc_address,
                                 })
                             })
                             .kmerge_by(|a, b| a.score() > b.score())
+                            .skip(offset)
+                            .take(limit)
                             .collect();
 
                         let extraction_toolings_ref = &extraction_toolings;
                         let snippet_generators_ref = &snippet_generators;
-                        let driver_ref = &driver;
 
-                        let scored_documents = join_all(merged_scored_doc_address_refs.into_iter().enumerate().skip(offset).take(limit).map(
+                        let scored_documents = join_all(merged_scored_doc_address_refs.into_iter().enumerate().map(
                             |(position, scored_doc_address_ref)| {
                                 let doc_address = scored_doc_address_ref.doc_address();
                                 let extraction_tooling = extraction_toolings_ref[scored_doc_address_ref.index_alias];
                                 let searcher = extraction_tooling.searcher.clone();
                                 async move {
-                                    let document = driver_ref.execute_blocking(move || searcher.doc(doc_address)).await??;
+                                    #[cfg(feature = "tokio-rt")]
+                                    let document = tokio::task::spawn_blocking(|| searcher.doc(doc_address)).await??;
+                                    #[cfg(not(feature = "tokio-rt"))]
+                                    let document = searcher.doc_async(doc_address).await?;
                                     Ok(proto::ScoredDocument {
                                         document: NamedFieldDocument::from_document(
                                             extraction_tooling.searcher.schema(),
@@ -261,6 +280,6 @@ impl IndexRegistry {
                 }),
             });
         }
-        Ok(merged_response)
+        Ok(collector_outputs)
     }
 }

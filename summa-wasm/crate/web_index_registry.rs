@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 use serde::Serialize;
-use summa_core::components::{Driver, IndexHolder, IndexRegistry, IntermediateExtractionResult, SummaDocument};
+use summa_core::components::{Driver, IndexHolder, IndexRegistry, SummaDocument};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
@@ -65,7 +65,7 @@ impl WrappedIndexRegistry {
             .into_iter()
             .map(|r| r.expect("cannot receive"))
             .collect::<SummaResult<Vec<_>>>()?;
-        self.finalize_collectors_output(extraction_results).await
+        self.index_registry.finalize_extraction(extraction_results).await
     }
 
     /// Add new index to `WrappedIndexRegistry`
@@ -146,13 +146,6 @@ impl WrappedIndexRegistry {
     #[wasm_bindgen]
     pub async fn commit(&self, index_name: &str) -> Result<(), JsValue> {
         Ok(self.commit_internal(index_name).await.map_err(Error::from)?)
-    }
-
-    pub(crate) async fn finalize_collectors_output(
-        &self,
-        extraction_results: Vec<Vec<IntermediateExtractionResult>>,
-    ) -> SummaResult<Vec<proto::CollectorOutput>> {
-        self.index_registry.finalize_extraction(extraction_results, Driver::Native).await
     }
 
     pub(crate) fn thread_pool(&self) -> &ThreadPool {

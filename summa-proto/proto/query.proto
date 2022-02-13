@@ -163,7 +163,6 @@ message StatsAggregation {
 }
 
 // Extra structures
-
 message BucketEntry {
   Key key = 1;
   uint64 doc_count = 2;
@@ -232,7 +231,6 @@ message Scorer {
 }
 
 // Collectors and CollectorOutputs
-
 message Collector {
   oneof collector {
     TopDocsCollector top_docs = 1;

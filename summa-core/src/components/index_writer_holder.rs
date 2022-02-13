@@ -283,6 +283,7 @@ impl IndexWriterHolder {
                 let index = index_writer.index().clone();
                 info!(action = "wait_merging_threads", mode = "threaded");
                 index_writer.wait_merging_threads().expect("cannot wait merging threads");
+                info!(action = "merging_threads_finished", mode = "threaded");
                 index
                     .writer_with_num_threads(self.writer_threads.threads() as usize, self.writer_heap_size_bytes)
                     .expect("cannot create index writer_holder")
