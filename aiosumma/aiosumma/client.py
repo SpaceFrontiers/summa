@@ -445,7 +445,7 @@ class SummaClient(BaseGrpcClient):
         self,
         index_name: str,
         documents: Union[Iterable[str], str] = None,
-        bulk_size: int = 1000,
+        bulk_size: int = 100,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentStreamResponse:

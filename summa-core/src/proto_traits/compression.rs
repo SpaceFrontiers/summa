@@ -10,7 +10,12 @@ impl From<Wrapper<proto::Compression>> for Compressor {
             proto::Compression::Brotli => Compressor::Brotli,
             proto::Compression::Lz4 => Compressor::Lz4,
             proto::Compression::Snappy => Compressor::Snappy,
-            proto::Compression::Zstd => Compressor::Zstd(ZstdCompressor { compression_level: None }),
+            proto::Compression::Zstd => Compressor::Zstd(ZstdCompressor { compression_level: Some(3) }),
+            proto::Compression::Zstd7 => Compressor::Zstd(ZstdCompressor { compression_level: Some(7) }),
+            proto::Compression::Zstd9 => Compressor::Zstd(ZstdCompressor { compression_level: Some(9) }),
+            proto::Compression::Zstd14 => Compressor::Zstd(ZstdCompressor { compression_level: Some(14) }),
+            proto::Compression::Zstd19 => Compressor::Zstd(ZstdCompressor { compression_level: Some(19) }),
+            proto::Compression::Zstd22 => Compressor::Zstd(ZstdCompressor { compression_level: Some(22) }),
         }
     }
 }
@@ -22,7 +27,13 @@ impl From<Compressor> for Wrapper<proto::Compression> {
             Compressor::Brotli => proto::Compression::Brotli,
             Compressor::Lz4 => proto::Compression::Lz4,
             Compressor::Snappy => proto::Compression::Snappy,
-            Compressor::Zstd(_) => proto::Compression::Zstd,
+            Compressor::Zstd(ZstdCompressor { compression_level: Some(3) }) => proto::Compression::Zstd,
+            Compressor::Zstd(ZstdCompressor { compression_level: Some(7) }) => proto::Compression::Zstd7,
+            Compressor::Zstd(ZstdCompressor { compression_level: Some(9) }) => proto::Compression::Zstd9,
+            Compressor::Zstd(ZstdCompressor { compression_level: Some(14) }) => proto::Compression::Zstd14,
+            Compressor::Zstd(ZstdCompressor { compression_level: Some(19) }) => proto::Compression::Zstd19,
+            Compressor::Zstd(ZstdCompressor { compression_level: Some(22) }) => proto::Compression::Zstd22,
+            Compressor::Zstd(ZstdCompressor { .. }) => panic!("Unsupported panic"),
         })
     }
 }

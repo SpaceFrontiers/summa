@@ -266,12 +266,10 @@ impl Index {
             .clone()
             .read_owned()
             .await;
-        let source_documents_receiver = self.get_index_holder(&copy_documents_request.source_index_name).await?.documents()?;
+        let mut source_documents_receiver = self.get_index_holder(&copy_documents_request.source_index_name).await?.documents(|d| d)?;
         let mut documents = 0u64;
-        while let Ok(document) = source_documents_receiver.as_async().recv().await {
-            target_index_writer
-                .index_document(document.map_err(crate::errors::Error::from)?)
-                .map_err(crate::errors::Error::from)?;
+        while let Some(document) = source_documents_receiver.recv().await {
+            target_index_writer.index_document(document).map_err(crate::errors::Error::from)?;
             documents += 1;
             if documents % 100_000 == 0 {
                 info!(action = "copied", documents = documents)
@@ -599,7 +597,7 @@ impl Index {
         Ok(index)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, copy_index_request), fields(source_index_name = copy_index_request.source_index_name, target_index_name = copy_index_request.target_index_name))]
     pub async fn copy_index(&self, copy_index_request: proto::CopyIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_holder = self.index_registry.get_index_holder(&copy_index_request.source_index_name).await?;
         let prepared_consumption = self.commit(&index_holder).await?;
@@ -662,7 +660,7 @@ impl Index {
         Ok(self.index_registry.finalize_extraction(collector_outputs).await?)
     }
 
-    #[instrument(skip(self), fields(index_name = merge_segments_request.index_name))]
+    #[instrument(skip(self, merge_segments_request), fields(index_name = merge_segments_request.index_name))]
     pub async fn merge_segments(&self, merge_segments_request: proto::MergeSegmentsRequest) -> SummaServerResult<Option<SegmentId>> {
         let index_holder = self.get_index_holder(&merge_segments_request.index_name).await?;
         let mut index_writer_holder = index_holder
@@ -682,7 +680,7 @@ impl Index {
         Ok(segment_meta.map(|segment_meta| segment_meta.id()))
     }
 
-    #[instrument(skip(self), fields(index_name = vacuum_index_request.index_name))]
+    #[instrument(skip(self, vacuum_index_request), fields(index_name = vacuum_index_request.index_name))]
     pub async fn vacuum_index(&self, vacuum_index_request: proto::VacuumIndexRequest) -> SummaServerResult<()> {
         let index_holder = self.get_index_holder(&vacuum_index_request.index_name).await?;
         let mut index_writer_holder = index_holder

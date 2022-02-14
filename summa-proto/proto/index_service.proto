@@ -296,6 +296,11 @@ enum Compression {
   Lz4 = 2;
   Snappy = 3;
   Zstd = 4;
+  Zstd7 = 5;
+  Zstd9 = 6;
+  Zstd14 = 7;
+  Zstd19 = 8;
+  Zstd22 = 9;
 }
 
 message FileEngineConfig {

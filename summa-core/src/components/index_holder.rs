@@ -18,7 +18,7 @@ use tantivy::collector::{Collector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
-use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
+use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -512,11 +512,12 @@ impl IndexHolder {
     }
 
     #[cfg(feature = "tokio-rt")]
-    pub fn documents(&self) -> SummaResult<kanal::Receiver<tantivy::Result<tantivy::Document>>> {
+    pub fn documents<O: Send + 'static>(&self, f: impl Fn(Document) -> O + Clone + Send + Sync + 'static) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         let searcher = self.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
-        let (tx, rx) = kanal::bounded(segment_readers.len() * 2 - 1);
+        let (tx, rx) = tokio::sync::mpsc::channel(segment_readers.len() * 2 + 1);
         for segment_reader in segment_readers {
+            let f = f.clone();
             let tx = tx.clone();
             let segment_reader = segment_reader.clone();
             let span = tracing::Span::current();
@@ -524,7 +525,12 @@ impl IndexHolder {
                 span.in_scope(|| {
                     let store_reader = segment_reader.get_store_reader(1)?;
                     for document in store_reader.iter(segment_reader.alive_bitset()) {
-                        if tx.send(document).is_err() {
+                        let Ok(document) = document
+                        else {
+                            info!(action = "broken_document", document = ?document);
+                            return Ok::<_, Error>(());
+                        };
+                        if tx.blocking_send(f(document)).is_err() {
                             info!(action = "documents_client_dropped");
                             return Ok::<_, Error>(());
                         }

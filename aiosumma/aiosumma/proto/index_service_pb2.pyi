@@ -12,6 +12,11 @@ Lz4: Compression
 None: Compression
 Snappy: Compression
 Zstd: Compression
+Zstd14: Compression
+Zstd19: Compression
+Zstd22: Compression
+Zstd7: Compression
+Zstd9: Compression
 
 class AttachFileEngineRequest(_message.Message):
     __slots__ = []

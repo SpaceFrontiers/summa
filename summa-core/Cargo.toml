@@ -35,7 +35,6 @@ iroh-rpc-client = { workspace = true, optional = true }
 iroh-store = { workspace = true, optional = true }
 iroh-unixfs = { workspace = true, optional = true }
 itertools = { workspace = true }
-kanal = { workspace = true }
 lazy_static = { workspace = true }
 lru = { workspace = true }
 once_cell = { workspace = true }

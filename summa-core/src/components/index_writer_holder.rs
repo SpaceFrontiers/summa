@@ -176,6 +176,9 @@ impl IndexWriterHolder {
 
     /// Delete index by its unique fields
     pub(super) fn delete_documents_by_unique_fields(&self, document: &Document) -> SummaResult<Option<u64>> {
+        if self.unique_fields.is_empty() {
+            return Ok(None);
+        }
         let unique_terms = self
             .unique_fields
             .iter()
@@ -189,7 +192,7 @@ impl IndexWriterHolder {
                 })
             })
             .collect::<SummaResult<Vec<_>>>()?;
-        if !self.unique_fields.is_empty() && unique_terms.is_empty() {
+        if unique_terms.is_empty() {
             Err(ValidationError::MissingUniqueField(format!(
                 "{:?}",
                 self.index_writer.index().schema().to_named_doc(document)

@@ -9,6 +9,7 @@ use cid::Cid;
 use iroh_unixfs::balanced_tree::{LinkInfo, TreeNode};
 use iroh_unixfs::codecs::Codec;
 use tantivy::directory::{AntiCallToken, TerminatingWrite};
+use tracing::info;
 
 use crate::directories::iroh::directory::{DEFAULT_CHUNK_SIZE, DEFAULT_CODE, DEFAULT_DEGREE};
 use crate::directories::iroh::file::IrohFileDescriptor;
@@ -80,7 +81,9 @@ impl IrohWriter {
         // clean up, aka yield the rest of the stem nodes
         // since all the stem nodes are able to receive links
         // we don't have to worry about "overflow"
+        info!(action = "tree_depth", links = self.tree.len());
         while let Some(links) = self.tree.pop_front() {
+            info!(action = "emit_links", links = links.len());
             let (block, link_info) = TreeNode::Stem(links).encode(&DEFAULT_CODE).expect("cannot encode");
             let (cid, data, links) = block.into_parts();
             self.store.put(cid, data, links).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

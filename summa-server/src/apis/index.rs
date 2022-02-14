@@ -16,7 +16,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, info_span};
-use tracing_futures::Instrument;
 
 use crate::errors::{SummaServerResult, ValidationError};
 use crate::services::Index;
@@ -140,29 +139,12 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let proto_request = proto_request.into_inner();
         let span = info_span!("documents", index_name = proto_request.index_name);
         let _ = span.enter();
-        let (sender, receiver) = tokio::sync::mpsc::channel(128);
         let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
         let schema = index_holder.schema().clone();
-        let documents_receiver = index_holder.documents().map_err(crate::errors::Error::from)?;
-        tokio::task::spawn(
-            async move {
-                while let Ok(document) = documents_receiver.as_async().recv().await {
-                    if sender
-                        .send(Ok(DocumentsResponse {
-                            document: schema.to_json(&document?),
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        info!(action = "grpc_client_dropped");
-                        return Ok::<_, crate::errors::Error>(());
-                    }
-                }
-                Ok(())
-            }
-            .in_current_span(),
-        );
-        Ok(Response::new(ReceiverStream::new(receiver)))
+        let documents_receiver = index_holder
+            .documents(move |d| Ok(DocumentsResponse { document: schema.to_json(&d) }))
+            .map_err(crate::errors::Error::from)?;
+        Ok(Response::new(ReceiverStream::new(documents_receiver)))
     }
 
     async fn get_indices_aliases(&self, _: Request<proto::GetIndicesAliasesRequest>) -> Result<Response<proto::GetIndicesAliasesResponse>, Status> {
