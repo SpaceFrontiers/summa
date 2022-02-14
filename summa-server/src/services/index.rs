@@ -22,7 +22,7 @@ use summa_proto::proto;
 use tantivy::store::ZstdCompressor;
 use tantivy::{Directory, IndexBuilder, SegmentId};
 use tokio::sync::RwLock;
-use tracing::{info, info_span, instrument, warn, Instrument};
+use tracing::{error, info, info_span, instrument, warn, Instrument};
 
 use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::errors::ValidationError;
@@ -257,6 +257,7 @@ impl Index {
         Ok(index_holder)
     }
 
+    #[instrument(skip_all, fields(source_index_name = ?copy_documents_request.source_index_name, target_index_name = ?copy_documents_request.target_index_name))]
     pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<()> {
         let target_index_writer = self
             .get_index_holder(&copy_documents_request.target_index_name)
@@ -679,6 +680,28 @@ impl Index {
             .expect("wrong uuid");
         let segment_meta = tokio::task::spawn_blocking(move || span.in_scope(|| index_writer_holder.merge(&segment_ids, None))).await??;
         Ok(segment_meta.map(|segment_meta| segment_meta.id()))
+    }
+
+    #[instrument(skip(self), fields(index_name = vacuum_index_request.index_name))]
+    pub async fn vacuum_index(&self, vacuum_index_request: proto::VacuumIndexRequest) -> SummaServerResult<()> {
+        let index_holder = self.get_index_holder(&vacuum_index_request.index_name).await?;
+        let mut index_writer_holder = index_holder
+            .index_writer_holder()
+            .map_err(crate::errors::Error::from)?
+            .clone()
+            .write_owned()
+            .await;
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                let result = index_writer_holder.vacuum(None);
+                if let Err(error) = result {
+                    error!(error = ?error)
+                }
+            });
+        })
+        .await?;
+        Ok(())
     }
 }
 

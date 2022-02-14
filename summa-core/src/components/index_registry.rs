@@ -118,7 +118,7 @@ impl IndexRegistry {
         let index_holder = OwningHandler::new(index_holder);
         let index_holder_handler = index_holder.handler();
         self.index_holders().write().await.insert(index_holder.index_name().to_string(), index_holder);
-        info!(action = "added", index_name = ?index_holder_handler.index_name());
+        info!(action = "added");
         Ok(index_holder_handler)
     }
 

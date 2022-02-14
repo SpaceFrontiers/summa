@@ -6,13 +6,11 @@ from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
 
-Async: CommitMode
 Brotli: Compression
 DESCRIPTOR: _descriptor.FileDescriptor
 Lz4: Compression
 None: Compression
 Snappy: Compression
-Sync: CommitMode
 Zstd: Compression
 
 class AttachFileEngineRequest(_message.Message):
@@ -62,12 +60,10 @@ class ChunkedCacheConfig(_message.Message):
     def __init__(self, chunk_size: _Optional[int] = ..., cache_size: _Optional[int] = ...) -> None: ...
 
 class CommitIndexRequest(_message.Message):
-    __slots__ = ["commit_mode", "index_name"]
-    COMMIT_MODE_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["index_name"]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    commit_mode: CommitMode
     index_name: str
-    def __init__(self, index_name: _Optional[str] = ..., commit_mode: _Optional[_Union[CommitMode, str]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class CommitIndexResponse(_message.Message):
     __slots__ = ["elapsed_secs"]
@@ -448,7 +444,4 @@ class WarmupIndexResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
 
 class Compression(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-    __slots__ = []
-
-class CommitMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []

@@ -21,7 +21,7 @@ impl<T: FastValue + SafeIntoF64> FastFieldIteratorImpl<T> {
 
 impl<T: FastValue + SafeIntoF64> FastFieldIterator for FastFieldIteratorImpl<T> {
     fn advance(&mut self, doc_id: DocId) {
-        self.value = self.ff.first(doc_id).unwrap().safe_into_f64();
+        self.value = self.ff.first(doc_id).map(|x| x.safe_into_f64()).unwrap_or(0.0f64);
     }
     fn value(&self) -> &f64 {
         &self.value

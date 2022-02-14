@@ -15,7 +15,7 @@ use summa_proto::proto::DocumentsResponse;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, info, info_span, warn};
+use tracing::{info, info_span};
 use tracing_futures::Instrument;
 
 use crate::errors::{SummaServerResult, ValidationError};
@@ -83,26 +83,12 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn commit_index(&self, proto_request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let request = proto_request.into_inner();
-        match proto::CommitMode::from_i32(request.commit_mode) {
-            None | Some(proto::CommitMode::Async) => {
-                let index_service = self.index_service.clone();
-                let index_holder = index_service.get_index_holder(&request.index_name).await?;
-                tokio::spawn(async move {
-                    if let Err(err) = index_service.commit_and_restart_consumption(&index_holder).await {
-                        warn!(action = "busy", error = format!("{err:?}"))
-                    }
-                });
-                Ok(Response::new(proto::CommitIndexResponse { elapsed_secs: None }))
-            }
-            Some(proto::CommitMode::Sync) => {
-                let now = Instant::now();
-                let index_holder = self.index_service.get_index_holder(&request.index_name).await?;
-                self.index_service.commit_and_restart_consumption(&index_holder).await?;
-                Ok(Response::new(proto::CommitIndexResponse {
-                    elapsed_secs: Some(now.elapsed().as_secs_f64()),
-                }))
-            }
-        }
+        let now = Instant::now();
+        let index_holder = self.index_service.get_index_holder(&request.index_name).await?;
+        self.index_service.commit_and_restart_consumption(&index_holder).await?;
+        Ok(Response::new(proto::CommitIndexResponse {
+            elapsed_secs: Some(now.elapsed().as_secs_f64()),
+        }))
     }
 
     async fn copy_documents(&self, proto_request: Request<proto::CopyDocumentsRequest>) -> Result<Response<proto::CopyDocumentsResponse>, Status> {
@@ -152,25 +138,30 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn documents(&self, proto_request: Request<proto::DocumentsRequest>) -> Result<Response<Self::documentsStream>, Status> {
         let proto_request = proto_request.into_inner();
+        let span = info_span!("documents", index_name = proto_request.index_name);
+        let _ = span.enter();
         let (sender, receiver) = tokio::sync::mpsc::channel(128);
         let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
         let schema = index_holder.schema().clone();
         let documents_receiver = index_holder.documents().map_err(crate::errors::Error::from)?;
-        tokio::task::spawn(async move {
-            while let Ok(document) = documents_receiver.as_async().recv().await {
-                if sender
-                    .send(Ok(DocumentsResponse {
-                        document: schema.to_json(&document?),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    info!(action = "grpc_client_dropped");
-                    return Ok::<_, crate::errors::Error>(());
+        tokio::task::spawn(
+            async move {
+                while let Ok(document) = documents_receiver.as_async().recv().await {
+                    if sender
+                        .send(Ok(DocumentsResponse {
+                            document: schema.to_json(&document?),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        info!(action = "grpc_client_dropped");
+                        return Ok::<_, crate::errors::Error>(());
+                    }
                 }
+                Ok(())
             }
-            Ok(())
-        });
+            .in_current_span(),
+        );
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
@@ -272,23 +263,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn vacuum_index(&self, proto_request: Request<proto::VacuumIndexRequest>) -> Result<Response<proto::VacuumIndexResponse>, Status> {
-        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_name).await?;
-        let mut index_writer_holder = index_holder
-            .index_writer_holder()
-            .map_err(crate::errors::Error::from)?
-            .clone()
-            .write_owned()
-            .await;
-        let index_name = index_holder.index_name().to_string();
-        tokio::task::spawn_blocking(move || {
-            {
-                let result = index_writer_holder.vacuum(None);
-                if let Err(error) = result {
-                    error!(error = ?error)
-                }
-            }
-            .instrument(info_span!("vacuum", index_name = ?index_name))
-        });
+        let vacuum_index_request = proto_request.into_inner();
+        self.index_service.vacuum_index(vacuum_index_request).await?;
         let response = proto::VacuumIndexResponse {};
         Ok(Response::new(response))
     }

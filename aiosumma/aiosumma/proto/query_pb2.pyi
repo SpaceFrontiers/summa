@@ -428,10 +428,10 @@ class ReservoirSamplingCollector(_message.Message):
     def __init__(self, limit: _Optional[int] = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ReservoirSamplingCollectorOutput(_message.Message):
-    __slots__ = ["random_documents"]
-    RANDOM_DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
-    random_documents: _containers.RepeatedCompositeFieldContainer[RandomDocument]
-    def __init__(self, random_documents: _Optional[_Iterable[_Union[RandomDocument, _Mapping]]] = ...) -> None: ...
+    __slots__ = ["documents"]
+    DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
+    documents: _containers.RepeatedCompositeFieldContainer[RandomDocument]
+    def __init__(self, documents: _Optional[_Iterable[_Union[RandomDocument, _Mapping]]] = ...) -> None: ...
 
 class Score(_message.Message):
     __slots__ = ["f64_score", "u64_score"]
@@ -551,8 +551,8 @@ class TermsResult(_message.Message):
     def __init__(self, buckets: _Optional[_Iterable[_Union[BucketEntry, _Mapping]]] = ..., sum_other_doc_count: _Optional[int] = ..., doc_count_error_upper_bound: _Optional[int] = ...) -> None: ...
 
 class TopDocsCollector(_message.Message):
-    __slots__ = ["explain", "fields", "limit", "offset", "scorer", "snippets"]
-    class SnippetsEntry(_message.Message):
+    __slots__ = ["explain", "fields", "limit", "offset", "scorer", "snippet_configs"]
+    class SnippetConfigsEntry(_message.Message):
         __slots__ = ["key", "value"]
         KEY_FIELD_NUMBER: _ClassVar[int]
         VALUE_FIELD_NUMBER: _ClassVar[int]
@@ -564,14 +564,14 @@ class TopDocsCollector(_message.Message):
     LIMIT_FIELD_NUMBER: _ClassVar[int]
     OFFSET_FIELD_NUMBER: _ClassVar[int]
     SCORER_FIELD_NUMBER: _ClassVar[int]
-    SNIPPETS_FIELD_NUMBER: _ClassVar[int]
+    SNIPPET_CONFIGS_FIELD_NUMBER: _ClassVar[int]
     explain: bool
     fields: _containers.RepeatedScalarFieldContainer[str]
     limit: int
     offset: int
     scorer: Scorer
-    snippets: _containers.ScalarMap[str, int]
-    def __init__(self, limit: _Optional[int] = ..., offset: _Optional[int] = ..., scorer: _Optional[_Union[Scorer, _Mapping]] = ..., snippets: _Optional[_Mapping[str, int]] = ..., explain: bool = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
+    snippet_configs: _containers.ScalarMap[str, int]
+    def __init__(self, limit: _Optional[int] = ..., offset: _Optional[int] = ..., scorer: _Optional[_Union[Scorer, _Mapping]] = ..., snippet_configs: _Optional[_Mapping[str, int]] = ..., explain: bool = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class TopDocsCollectorOutput(_message.Message):
     __slots__ = ["has_next", "scored_documents"]

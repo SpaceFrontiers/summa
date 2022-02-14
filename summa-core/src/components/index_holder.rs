@@ -396,7 +396,7 @@ impl IndexHolder {
                     }
                 }
             }
-            info!(action = "warming_up", index_name = ?self.index_name());
+            info!(action = "warming_up");
             try_join_all(warm_up_futures).await?;
         }
         Ok(())
@@ -405,7 +405,7 @@ impl IndexHolder {
     /// Load all index files into memory
     pub async fn full_warmup(&self) -> SummaResult<()> {
         let managed_directory = self.index.directory();
-        info!(action = "warming_up", index_name = ?self.index_name());
+        info!(action = "warming_up");
         join_all(managed_directory.list_managed_files().into_iter().map(move |file| {
             let file_name = file.to_string_lossy().to_string();
             async move {
@@ -519,15 +519,18 @@ impl IndexHolder {
         for segment_reader in segment_readers {
             let tx = tx.clone();
             let segment_reader = segment_reader.clone();
+            let span = tracing::Span::current();
             tokio::task::spawn_blocking(move || {
-                let store_reader = segment_reader.get_store_reader(1)?;
-                for document in store_reader.iter(segment_reader.alive_bitset()) {
-                    if tx.send(document).is_err() {
-                        info!(action = "documents_client_dropped");
-                        return Ok::<_, Error>(());
+                span.in_scope(|| {
+                    let store_reader = segment_reader.get_store_reader(1)?;
+                    for document in store_reader.iter(segment_reader.alive_bitset()) {
+                        if tx.send(document).is_err() {
+                            info!(action = "documents_client_dropped");
+                            return Ok::<_, Error>(());
+                        }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })
             });
         }
         Ok(rx)
