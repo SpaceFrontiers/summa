@@ -43,7 +43,7 @@ pub struct IndexHolder {
     cached_multi_fields: HashSet<Field>,
     index_reader: IndexReader,
     index_writer_holder: Option<Arc<RwLock<IndexWriterHolder>>>,
-    query_parser: RwLock<QueryParser>,
+    query_parser: QueryParser,
     /// Counters
     #[cfg(feature = "metrics")]
     search_times_meter: Histogram<f64>,
@@ -160,7 +160,7 @@ impl IndexHolder {
                 .expect("no index name")
         });
         let cached_schema = index.schema();
-        let query_parser = RwLock::new(QueryParser::for_index(&index_name, &index)?);
+        let query_parser = QueryParser::for_index(&index_name, &index)?;
         let index_reader = index
             .reader_builder()
             .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)
@@ -209,11 +209,6 @@ impl IndexHolder {
                 .init(),
             driver,
         })
-    }
-
-    pub async fn reload_query_parser(&self) -> SummaResult<()> {
-        *self.query_parser.write().await = QueryParser::for_index(&self.index_name, self.index_reader().searcher().index())?;
-        Ok(())
     }
 
     /// Creates index and sets it up via `setup`
@@ -440,11 +435,11 @@ impl IndexHolder {
     pub async fn search(
         &self,
         index_alias: &str,
-        query: &proto::query::Query,
+        query: proto::query::Query,
         collectors: Vec<proto::Collector>,
     ) -> SummaResult<Vec<IntermediateExtractionResult>> {
         let searcher = self.index_reader().searcher();
-        let parsed_query = self.query_parser.read().await.parse_query(query)?;
+        let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         let extractors: Vec<Box<dyn FruitExtractor>> = collectors
             .into_iter()
@@ -453,7 +448,6 @@ impl IndexHolder {
         trace!(
             target: "query",
             index_name = ?self.index_name,
-            query = ?query,
             parsed_query = ?parsed_query,
         );
         #[cfg(feature = "metrics")]
@@ -475,7 +469,7 @@ impl IndexHolder {
 
     /// Delete `SummaDocument` by `unq`
     pub async fn delete_documents(&self, query: proto::query::Query) -> SummaResult<u64> {
-        let parsed_query = self.query_parser.read().await.parse_query(&query)?;
+        let parsed_query = self.query_parser.parse_query(query)?;
         self.index_writer_holder()?.read().await.delete_by_query(parsed_query)
     }
 

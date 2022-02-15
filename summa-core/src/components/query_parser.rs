@@ -19,13 +19,13 @@ use tantivy::{DateTime, Index, Term};
 use crate::errors::{Error, SummaResult, ValidationError};
 #[cfg(feature = "metrics")]
 use crate::metrics::ToLabel;
+use crate::validators::parse_fields;
 
 /// Responsible for casting `crate::proto::Query` message to `tantivy::query::Query`
 pub struct QueryParser {
     index: Index,
     index_name: String,
     cached_schema: Schema,
-    nested_query_parser: tantivy::query::QueryParser,
     // Counters
     #[cfg(feature = "metrics")]
     query_counter: Counter<u64>,
@@ -78,15 +78,6 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
 
 impl QueryParser {
     pub fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
-        let index_meta = index.load_metas()?;
-        let index_attributes: Option<proto::IndexAttributes> = index_meta.index_attributes()?;
-        let default_fields = index_attributes
-            .map(|index_attributes| index_attributes.default_fields)
-            .unwrap_or_else(Vec::new)
-            .iter()
-            .map(|field_name| index.schema().get_field(field_name))
-            .collect::<Result<_, _>>()?;
-        let nested_query_parser = tantivy::query::QueryParser::for_index(index, default_fields);
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
         #[cfg(feature = "metrics")]
@@ -99,7 +90,6 @@ impl QueryParser {
             index: index.clone(),
             index_name: index_name.to_string(),
             cached_schema: index.schema(),
-            nested_query_parser,
             #[cfg(feature = "metrics")]
             query_counter,
             #[cfg(feature = "metrics")]
@@ -114,11 +104,7 @@ impl QueryParser {
         Ok((field, field_entry))
     }
 
-    pub fn nested_query_parser(&self) -> &tantivy::query::QueryParser {
-        &self.nested_query_parser
-    }
-
-    fn parse_subquery(&self, query: &proto::query::Query) -> SummaResult<Box<dyn Query>> {
+    fn parse_subquery(&self, query: proto::query::Query) -> SummaResult<Box<dyn Query>> {
         #[cfg(feature = "metrics")]
         self.subquery_counter.add(
             &Context::current(),
@@ -128,19 +114,19 @@ impl QueryParser {
                 KeyValue::new("query", query.to_label()),
             ],
         );
-        Ok(match &query {
+        Ok(match query {
             proto::query::Query::All(_) => Box::new(AllQuery),
             proto::query::Query::Empty(_) => Box::new(EmptyQuery),
             proto::query::Query::Boolean(boolean_query_proto) => {
                 let mut subqueries = vec![];
-                for subquery in &boolean_query_proto.subqueries {
+                for subquery in boolean_query_proto.subqueries {
                     subqueries.push((
                         match proto::Occur::from_i32(subquery.occur) {
                             None | Some(proto::Occur::Should) => Occur::Should,
                             Some(proto::Occur::Must) => Occur::Must,
                             Some(proto::Occur::MustNot) => Occur::MustNot,
                         },
-                        self.parse_subquery(subquery.query.as_ref().and_then(|query| query.query.as_ref()).ok_or(Error::EmptyQuery)?)?,
+                        self.parse_subquery(subquery.query.and_then(|query| query.query).ok_or(Error::EmptyQuery)?)?,
                     ))
                 }
                 Box::new(BooleanQuery::new(subqueries))
@@ -148,19 +134,23 @@ impl QueryParser {
             proto::query::Query::DisjunctionMax(disjunction_max_proto) => Box::new(DisjunctionMaxQuery::with_tie_breaker(
                 disjunction_max_proto
                     .disjuncts
-                    .iter()
-                    .map(|disjunct| self.parse_subquery(disjunct.query.as_ref().ok_or(Error::EmptyQuery)?))
+                    .into_iter()
+                    .map(|disjunct| self.parse_subquery(disjunct.query.ok_or(Error::EmptyQuery)?))
                     .collect::<SummaResult<Vec<_>>>()?,
                 match disjunction_max_proto.tie_breaker.as_str() {
                     "" => 0.0,
                     s => f32::from_str(s).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", disjunction_max_proto.tie_breaker)))?,
                 },
             )),
-            proto::query::Query::Match(match_query_proto) => match self.nested_query_parser.parse_query(&match_query_proto.value) {
-                Ok(parsed_query) => Ok(parsed_query),
-                Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(ValidationError::MissingField(field).into()),
-                Err(e) => Err(Error::InvalidTantivySyntax(e, match_query_proto.value.to_owned())),
-            }?,
+            proto::query::Query::Match(match_query_proto) => {
+                let default_fields = parse_fields(&self.cached_schema, &match_query_proto.default_fields)?;
+                let nested_query_parser = tantivy::query::QueryParser::for_index(&self.index, default_fields);
+                match nested_query_parser.parse_query(&match_query_proto.value) {
+                    Ok(parsed_query) => Ok(parsed_query),
+                    Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(ValidationError::MissingField(field).into()),
+                    Err(e) => Err(Error::InvalidTantivySyntax(e, match_query_proto.value.to_owned())),
+                }?
+            }
             proto::query::Query::Range(range_query_proto) => {
                 let (field, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
                 let value = range_query_proto.value.as_ref().ok_or(ValidationError::MissingRange)?;
@@ -174,13 +164,7 @@ impl QueryParser {
                 ))
             }
             proto::query::Query::Boost(boost_query_proto) => Box::new(BoostQuery::new(
-                self.parse_subquery(
-                    boost_query_proto
-                        .query
-                        .as_ref()
-                        .and_then(|query| query.query.as_ref())
-                        .ok_or(Error::EmptyQuery)?,
-                )?,
+                self.parse_subquery(boost_query_proto.query.and_then(|query| query.query).ok_or(Error::EmptyQuery)?)?,
                 f32::from_str(&boost_query_proto.score).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", boost_query_proto.score)))?,
             )),
             proto::query::Query::Regex(regex_query_proto) => {
@@ -253,7 +237,7 @@ impl QueryParser {
         })
     }
 
-    pub fn parse_query(&self, query: &proto::query::Query) -> SummaResult<Box<dyn Query>> {
+    pub fn parse_query(&self, query: proto::query::Query) -> SummaResult<Box<dyn Query>> {
         #[cfg(feature = "metrics")]
         self.query_counter.add(
             &Context::current(),

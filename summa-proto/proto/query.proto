@@ -65,6 +65,7 @@ message RangeQuery {
 
 message MatchQuery {
   string value = 1;
+  repeated string default_fields = 2;
 }
 
 message BooleanSubquery {

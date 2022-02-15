@@ -144,8 +144,7 @@ impl IndexRegistry {
                             index_query
                                 .query
                                 .and_then(|query| query.query)
-                                .as_ref()
-                                .unwrap_or_else(|| &proto::query::Query::All(proto::AllQuery {})),
+                                .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {})),
                             index_query.collectors,
                         )
                         .await

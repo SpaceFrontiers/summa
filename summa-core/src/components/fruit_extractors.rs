@@ -5,16 +5,16 @@ use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
-use tantivy::schema::{Field, Schema};
+use tantivy::schema::Field;
 use tantivy::Searcher;
 
-use crate::collectors;
 use crate::components::snippet_generator::SnippetGeneratorConfig;
 use crate::components::IndexHolder;
 use crate::errors::{BuilderError, Error, SummaResult};
 use crate::proto_traits::Wrapper;
 use crate::scorers::eval_scorer_tweaker::EvalScorerTweaker;
 use crate::scorers::EvalScorer;
+use crate::{collectors, validators};
 
 pub struct ScoredDocAddress {
     pub doc_address: tantivy::DocAddress,
@@ -105,11 +105,6 @@ fn parse_aggregation_results(
         .collect()
 }
 
-fn get_fields<'a, F: Iterator<Item = &'a String>>(schema: &Schema, fields: F) -> SummaResult<Option<HashSet<Field>>> {
-    let fields = fields.map(|field| schema.get_field(field)).collect::<Result<HashSet<Field>, _>>()?;
-    Ok((!fields.is_empty()).then_some(fields))
-}
-
 pub fn build_fruit_extractor(
     index_holder: &IndexHolder,
     index_alias: &str,
@@ -120,7 +115,8 @@ pub fn build_fruit_extractor(
 ) -> SummaResult<Box<dyn FruitExtractor>> {
     match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
-            let query_fields = get_fields(searcher.schema(), top_docs_collector_proto.fields.iter())?;
+            let query_fields = validators::parse_fields(searcher.schema(), &top_docs_collector_proto.fields)?;
+            let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter()));
             Ok(match top_docs_collector_proto.scorer {
                 None | Some(proto::Scorer { scorer: None }) => Box::new(
                     TopDocsBuilder::default()
@@ -181,7 +177,8 @@ pub fn build_fruit_extractor(
             })
         }
         Some(proto::collector::Collector::ReservoirSampling(reservoir_sampling_collector_proto)) => {
-            let query_fields = get_fields(searcher.schema(), reservoir_sampling_collector_proto.fields.iter())?;
+            let query_fields = validators::parse_fields(searcher.schema(), &reservoir_sampling_collector_proto.fields)?;
+            let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter()));
             let reservoir_sampling_collector = collectors::ReservoirSampling::with_limit(reservoir_sampling_collector_proto.limit as usize);
             Ok(Box::new(
                 ReservoirSamplingBuilder::default()
