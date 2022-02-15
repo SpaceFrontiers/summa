@@ -1,12 +1,12 @@
 import * as Comlink from "comlink";
-import {IndexRegistry, IIndexRegistry, IndexQuery} from "./index-registry";
+import {IndexRegistry, IIndexRegistry, IndexQuery, IndexRegistryOptions} from "./index-registry";
 import {IndexAttributes, IndexEngineConfig} from "./configs";
 
 export class RemoteIndexRegistry implements IIndexRegistry {
     init_guard: Promise<void>;
     search_service: Comlink.Remote<IndexRegistry>;
 
-    constructor(worker_url: URL, wasm_url: URL, options: { num_threads: number }) {
+    constructor(worker_url: URL, wasm_url: URL, options: { num_threads: number, logging_level?: string }) {
         this.search_service = Comlink.wrap<IndexRegistry>(
             new Worker(
                 worker_url,
@@ -40,10 +40,13 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         return this.search_service.commit(index_name);
     }
 
-    async setup(wasm_url: URL, options: { num_threads: number }) {
+    async setup(
+        wasm_url: URL,
+        options: IndexRegistryOptions
+    ) {
         return await this.search_service.setup(
             wasm_url.href,
-            options.num_threads
+            options,
         );
     }
 }

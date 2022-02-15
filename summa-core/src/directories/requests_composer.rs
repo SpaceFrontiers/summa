@@ -18,10 +18,10 @@ impl Request {
             other_chunks: vec![],
         }
     }
-    pub fn last_index(&self) -> usize {
+    pub fn last_index(&self) -> u64 {
         self.other_chunks.last().unwrap_or(&self.first_chunk).index
     }
-    pub fn bounds(&self) -> Range<usize> {
+    pub fn bounds(&self) -> Range<u64> {
         self.first_chunk.chunk_left_ix..self.other_chunks.last().unwrap_or(&self.first_chunk).chunk_right_ix
     }
     pub fn chunks(&self) -> Chain<Once<&Chunk>, Iter<'_, Chunk>> {

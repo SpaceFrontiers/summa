@@ -56,20 +56,20 @@ impl IrohFile {
         }
     }
 
-    async fn pretty_reader(&self, end: Option<usize>) -> SummaResult<OutPrettyReader<FullLoader>> {
+    async fn pretty_reader(&self, end: Option<u64>) -> SummaResult<OutPrettyReader<FullLoader>> {
         let resolved = self.resolver.resolve(iroh_resolver::Path::from_cid(self.iroh_fd.cid)).await?;
-        Ok(resolved.pretty(self.resolver.clone(), OutMetrics { start: Instant::now() }, end)?)
+        Ok(resolved.pretty(self.resolver.clone(), OutMetrics { start: Instant::now() }, end.map(|end| end as usize))?)
     }
 
-    pub async fn read_pretty_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    pub async fn read_pretty_bytes_async(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         let mut reader = self.pretty_reader(Some(byte_range.end)).await?;
-        reader.seek(io::SeekFrom::Start(byte_range.start as u64)).await.expect("iroh seek failed");
+        reader.seek(io::SeekFrom::Start(byte_range.start)).await.expect("iroh seek failed");
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
         Ok(OwnedBytes::new(buffer))
     }
 
-    pub fn read_pretty_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    pub fn read_pretty_bytes(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         let file = self.clone();
         // ToDo: consider direct sync reading
         self.driver.block_on(async move { file.read_pretty_bytes_async(byte_range).await })

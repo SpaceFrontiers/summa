@@ -480,7 +480,7 @@ impl Index {
         if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
             let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
             let hot_cache_config = ipfs_engine_config.chunked_cache_config.as_ref().map(|c| HotCacheConfig {
-                chunk_size: Some(c.chunk_size as usize),
+                chunk_size: Some(c.chunk_size),
             });
             let span = tracing::Span::current();
             tokio::task::spawn_blocking(move || span.in_scope(|| index_writer_holder.prepare_index(hot_cache_config))).await??;
@@ -606,9 +606,7 @@ impl Index {
             Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
                 let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
                 let hotcache_config = Some(HotCacheConfig {
-                    chunk_size: chunked_cache_config
-                        .as_ref()
-                        .map(|chunked_cache_config| chunked_cache_config.chunk_size as usize),
+                    chunk_size: chunked_cache_config.as_ref().map(|chunked_cache_config| chunked_cache_config.chunk_size),
                 });
                 let iroh_directory = IrohDirectory::new(
                     self.store_service.content_loader(),

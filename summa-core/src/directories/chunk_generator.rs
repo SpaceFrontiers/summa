@@ -2,12 +2,12 @@ use std::ops::Range;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Chunk {
-    pub index: usize,
-    pub chunk_left_ix: usize,
-    pub chunk_right_ix: usize,
+    pub index: u64,
+    pub chunk_left_ix: u64,
+    pub chunk_right_ix: u64,
     pub inner_left_ix: usize,
     pub inner_right_ix: usize,
-    pub target_ix: usize,
+    pub target_ix: u64,
 }
 
 impl Chunk {
@@ -25,21 +25,21 @@ impl Chunk {
 
     /// Absolute chunk bounds shifted by `shift` to the left
     #[inline]
-    pub fn shifted_chunk_range(&self, shift: usize) -> Range<usize> {
+    pub fn shifted_chunk_range(&self, shift: u64) -> Range<u64> {
         (self.chunk_left_ix - shift)..(self.chunk_right_ix - shift)
     }
 }
 
 /// Used for producing `Chunk`s between left and right border
 pub(crate) struct ChunkGenerator {
-    current: usize,
-    range: Range<usize>,
-    file_size: usize,
-    chunk_size: usize,
+    current: u64,
+    range: Range<u64>,
+    file_size: u64,
+    chunk_size: u64,
 }
 
 impl ChunkGenerator {
-    pub fn new(range: Range<usize>, file_size: usize, chunk_size: usize) -> ChunkGenerator {
+    pub fn new(range: Range<u64>, file_size: u64, chunk_size: u64) -> ChunkGenerator {
         ChunkGenerator {
             current: range.start,
             range,
@@ -50,35 +50,35 @@ impl ChunkGenerator {
 
     /// Absolute chunk index
     #[inline]
-    pub fn index(&self) -> usize {
+    pub fn index(&self) -> u64 {
         self.current / self.chunk_size
     }
 
     /// Starting index of where this chunk should be copied to
     #[inline]
-    pub fn target_ix(&self) -> usize {
+    pub fn target_ix(&self) -> u64 {
         self.current - self.range.start
     }
 
     /// Left index of the chunk
     #[inline]
-    pub fn chunk_left_ix(&self) -> usize {
+    pub fn chunk_left_ix(&self) -> u64 {
         self.current - self.current % self.chunk_size
     }
 
     #[inline]
     pub fn inner_left_ix(&self) -> usize {
-        self.current % self.chunk_size
+        (self.current % self.chunk_size) as usize
     }
 
     #[inline]
-    pub fn chunk_right_ix(&self) -> usize {
+    pub fn chunk_right_ix(&self) -> u64 {
         std::cmp::min(self.chunk_left_ix() + self.chunk_size, self.file_size)
     }
 
     #[inline]
     pub fn inner_right_ix(&self) -> usize {
-        (std::cmp::min(self.chunk_right_ix(), self.range.end) - 1) % self.chunk_size + 1
+        ((std::cmp::min(self.chunk_right_ix(), self.range.end) - 1) % self.chunk_size + 1) as usize
     }
 }
 

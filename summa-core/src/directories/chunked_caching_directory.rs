@@ -58,14 +58,14 @@ impl FileStats {
         write_lock
     }
 
-    pub fn get_or_set(&self, path: &Path, f: impl FnOnce() -> usize) -> MaterializedFileStat {
+    pub fn get_or_set(&self, path: &Path, f: impl FnOnce() -> u64) -> MaterializedFileStat {
         let read_lock = self.0.upgradable_read();
         let file_stat = read_lock.get(path);
         let file_length = file_stat.and_then(|file_stat| file_stat.file_length);
         let generation = file_stat.map(|file_stat| file_stat.generation).unwrap_or_default();
         match file_length {
             None => {
-                let file_length = f() as u64;
+                let file_length = f();
                 let file_stat = FileStat {
                     file_length: Some(file_length),
                     generation,
@@ -85,7 +85,7 @@ impl FileStats {
 /// 0..16 and 16..32. Then, both of these chunks will be stored in cache and may be used to serve further request
 /// laying inside the cached interval, such as `read_bytes(3..9)` or `read_bytes(19..32)`
 pub struct ChunkedCachingDirectory {
-    chunk_size: usize,
+    chunk_size: u64,
     cache: Option<Arc<MemorySizedCache>>,
     underlying: Box<dyn Directory>,
     file_stats: FileStats,
@@ -107,7 +107,7 @@ impl ChunkedCachingDirectory {
     ///
     /// Cache-less chunking may be useful if downstream directory is responsible for caching and works better with
     /// chunked requests. Most obvious example is directory-over-HTTP which Range requests may be cached by browser.
-    pub fn new(underlying: Box<dyn Directory>, chunk_size: usize, file_stats: FileStats) -> ChunkedCachingDirectory {
+    pub fn new(underlying: Box<dyn Directory>, chunk_size: u64, file_stats: FileStats) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
             cache: None,
@@ -119,7 +119,7 @@ impl ChunkedCachingDirectory {
     /// Bounded cache
     pub fn new_with_capacity_in_bytes(
         underlying: Box<dyn Directory>,
-        chunk_size: usize,
+        chunk_size: u64,
         capacity_in_bytes: usize,
         cache_metrics: CacheMetrics,
         file_stats: FileStats,
@@ -133,7 +133,7 @@ impl ChunkedCachingDirectory {
     }
 
     /// Unbounded cache
-    pub fn new_unbounded(underlying: Box<dyn Directory>, chunk_size: usize, cache_metrics: CacheMetrics, file_stats: FileStats) -> ChunkedCachingDirectory {
+    pub fn new_unbounded(underlying: Box<dyn Directory>, chunk_size: u64, cache_metrics: CacheMetrics, file_stats: FileStats) -> ChunkedCachingDirectory {
         ChunkedCachingDirectory {
             chunk_size,
             cache: Some(Arc::new(MemorySizedCache::with_infinite_capacity(cache_metrics))),
@@ -162,7 +162,7 @@ impl Directory for ChunkedCachingDirectory {
             path: path.to_path_buf(),
             cache: self.cache.clone(),
             chunk_size: self.chunk_size,
-            len: file_stat.file_length as usize,
+            len: file_stat.file_length,
             generation: file_stat.generation,
             underlying_filehandle,
         }))
@@ -234,11 +234,11 @@ struct ChunkedCachingFileHandle {
     path: PathBuf,
     cache: Option<Arc<MemorySizedCache>>,
     /// Chunk size
-    chunk_size: usize,
+    chunk_size: u64,
     underlying_filehandle: Arc<dyn FileHandle>,
     /// Generation is incremented after each write to file and using for differeing between various versions of file
     generation: u32,
-    len: usize,
+    len: u64,
 }
 
 impl Debug for ChunkedCachingFileHandle {
@@ -254,7 +254,7 @@ impl Debug for ChunkedCachingFileHandle {
 }
 
 impl ChunkedCachingFileHandle {
-    fn try_fill_from_cache(&self, range: Range<usize>, response_buffer: &mut [u8]) -> Vec<Chunk> {
+    fn try_fill_from_cache(&self, range: Range<u64>, response_buffer: &mut [u8]) -> Vec<Chunk> {
         let chunks = ChunkGenerator::new(range, self.len(), self.chunk_size);
         match &self.cache {
             None => chunks.collect(),
@@ -262,7 +262,7 @@ impl ChunkedCachingFileHandle {
                 let mut missing_chunks = vec![];
                 for chunk in chunks {
                     match cache.get_slice(&self.path, self.generation, chunk.index) {
-                        Some(item) => response_buffer[chunk.target_ix..][..chunk.len()].clone_from_slice(&item.slice(chunk.data_bounds())),
+                        Some(item) => response_buffer[chunk.target_ix as usize..][..chunk.len()].clone_from_slice(&item.slice(chunk.data_bounds())),
                         None => missing_chunks.push(chunk),
                     };
                 }
@@ -273,8 +273,9 @@ impl ChunkedCachingFileHandle {
 
     fn adopt_response(&self, total_response: &mut [u8], response: OwnedBytes, original_request: &Request) {
         for chunk in original_request.chunks() {
-            let item = response.slice(chunk.shifted_chunk_range(original_request.bounds().start));
-            total_response[chunk.target_ix..][..chunk.len()].clone_from_slice(&item.slice(chunk.data_bounds()));
+            let shifted_range = chunk.shifted_chunk_range(original_request.bounds().start);
+            let item = response.slice(shifted_range.start as usize..shifted_range.end as usize);
+            total_response[chunk.target_ix as usize..][..chunk.len()].clone_from_slice(&item.slice(chunk.data_bounds()));
             if let Some(cache) = &self.cache {
                 cache.put_slice(self.path.to_path_buf(), self.generation, chunk.index, item);
             }
@@ -284,8 +285,8 @@ impl ChunkedCachingFileHandle {
 
 #[async_trait]
 impl FileHandle for ChunkedCachingFileHandle {
-    fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        let mut response_buffer = vec![0; range.end - range.start];
+    fn read_bytes(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
+        let mut response_buffer = vec![0; (range.end - range.start) as usize];
         let missing_chunks = self.try_fill_from_cache(range, &mut response_buffer);
 
         for missing_chunks_request in RequestsComposer::for_chunks(missing_chunks).requests() {
@@ -295,8 +296,8 @@ impl FileHandle for ChunkedCachingFileHandle {
         Ok(OwnedBytes::new(response_buffer))
     }
 
-    async fn read_bytes_async(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        let mut response_buffer = vec![0; range.end - range.start];
+    async fn read_bytes_async(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
+        let mut response_buffer = vec![0; (range.end - range.start) as usize];
         let missing_chunks = self.try_fill_from_cache(range, &mut response_buffer);
 
         for missing_chunks_request in RequestsComposer::for_chunks(missing_chunks).requests() {
@@ -309,7 +310,7 @@ impl FileHandle for ChunkedCachingFileHandle {
 }
 
 impl HasLen for ChunkedCachingFileHandle {
-    fn len(&self) -> usize {
+    fn len(&self) -> u64 {
         self.len
     }
 }

@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::io::{BufWriter, Write};
-use std::{io, ops::Range, path::Path, sync::Arc, usize};
+use std::{io, ops::Range, path::Path, sync::Arc};
 
 use tantivy::directory::error::{DeleteError, LockError, OpenWriteError};
 use tantivy::directory::{DirectoryLock, Lock, TerminatingWrite, WatchCallback, WatchHandle, WritePtr};
@@ -76,17 +76,17 @@ impl Directory for IrohDirectory {
 
 #[async_trait]
 impl FileHandle for IrohFile {
-    fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    fn read_bytes(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         self.read_pretty_bytes(byte_range)
     }
 
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_async(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         self.read_pretty_bytes_async(byte_range).await
     }
 }
 
 impl HasLen for IrohFile {
-    fn len(&self) -> usize {
-        self.size() as usize
+    fn len(&self) -> u64 {
+        self.size()
     }
 }

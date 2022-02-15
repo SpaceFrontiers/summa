@@ -21,16 +21,32 @@ export interface IIndexRegistry {
   commit(index_name: string): Promise<void>;
 }
 
+export type IndexRegistryOptions = {
+  num_threads?: number,
+  logging_level?: string
+  memory_config?: WebAssembly.MemoryDescriptor
+}
+
+export const default_options: IndexRegistryOptions = {
+  num_threads: 4,
+  logging_level: "info",
+  memory_config: { initial: 8192, maximum: 65536, shared: true }
+}
+
 export class IndexRegistry implements IIndexRegistry {
   registry?: WrappedIndexRegistry;
 
-  async setup(init_url: string, threads: number) {
-    await init(init_url, new WebAssembly.Memory({ initial: 4096, maximum: 16384, shared: true }));
-    await setup_logging("info");
+  async setup(
+      init_url: string,
+      options: IndexRegistryOptions = default_options,
+  ) {
+    let actual_options = Object.assign({}, default_options, options);
+    await init(init_url, new WebAssembly.Memory(actual_options.memory_config!));
+    await setup_logging(actual_options.logging_level!);
     await reserve_heap();
 
     this.registry = new WrappedIndexRegistry();
-    await this.registry.setup(threads);
+    await this.registry.setup(actual_options.num_threads!);
   }
 
   async add(index_engine_config: IndexEngineConfig, index_name?: string): Promise<IndexAttributes> {

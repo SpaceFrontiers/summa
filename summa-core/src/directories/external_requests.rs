@@ -49,7 +49,7 @@ pub trait ExternalRequestGenerator<TExternalRequest: ExternalRequest>: ExternalR
     fn new(network_config: RemoteEngineConfig) -> Self
     where
         Self: Sized;
-    fn generate_range_request(&self, file_name: &str, range: Option<Range<usize>>) -> SummaResult<TExternalRequest>;
+    fn generate_range_request(&self, file_name: &str, range: Option<Range<u64>>) -> SummaResult<TExternalRequest>;
     fn generate_length_request(&self, file_name: &str) -> SummaResult<TExternalRequest>;
 }
 
@@ -79,7 +79,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
         }
     }
 
-    fn generate_range_request(&self, file_name: &str, range: Option<Range<usize>>) -> SummaResult<TExternalRequest> {
+    fn generate_range_request(&self, file_name: &str, range: Option<Range<u64>>) -> SummaResult<TExternalRequest> {
         let mut vars = HashMap::new();
         vars.insert("file_name".to_string(), file_name.to_string());
         if let Some(range) = &range {

@@ -18,17 +18,17 @@ use crate::metrics::CacheMetrics;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SliceCacheIndexEntry {
-    start: usize, //< legacy. We keep this instead of range due to existing indices.
-    stop: usize,
-    addr: usize,
+    start: u64, //< legacy. We keep this instead of range due to existing indices.
+    stop: u64,
+    addr: u64,
 }
 
 impl SliceCacheIndexEntry {
     pub fn len(&self) -> usize {
-        self.range().len()
+        (self.stop - self.start) as usize
     }
 
-    pub fn range(&self) -> Range<usize> {
+    pub fn range(&self) -> Range<u64> {
         self.start..self.stop
     }
 }
@@ -46,7 +46,7 @@ impl SliceCacheIndex {
         self.slices[0].len() as u64 == self.total_len
     }
 
-    pub fn get(&self, byte_range: Range<usize>) -> Option<usize> {
+    pub fn get(&self, byte_range: Range<u64>) -> Option<usize> {
         let entry_idx = match self.slices.binary_search_by_key(&byte_range.start, |entry| entry.range().start) {
             Ok(idx) => idx,
             Err(0) => {
@@ -58,7 +58,7 @@ impl SliceCacheIndex {
         if entry.range().start > byte_range.start || entry.range().end < byte_range.end {
             return None;
         }
-        Some(entry.addr + byte_range.start - entry.range().start)
+        Some((entry.addr + byte_range.start - entry.range().start) as usize)
     }
 }
 
@@ -207,12 +207,12 @@ impl StaticSliceCache {
         Some(self.bytes.clone())
     }
 
-    pub fn try_read_bytes(&self, byte_range: Range<usize>) -> Option<OwnedBytes> {
+    pub fn try_read_bytes(&self, byte_range: Range<u64>) -> Option<OwnedBytes> {
         if byte_range.is_empty() {
             return Some(OwnedBytes::empty());
         }
         if let Some(start) = self.index.get(byte_range.clone()) {
-            return Some(self.bytes.slice(start..start + byte_range.len()));
+            return Some(self.bytes.slice(start..(start + (byte_range.end - byte_range.start) as usize)));
         }
         None
     }
@@ -235,13 +235,13 @@ impl StaticSliceCacheBuilder {
         }
     }
 
-    pub fn add_bytes(&mut self, bytes: &[u8], start: usize) {
+    pub fn add_bytes(&mut self, bytes: &[u8], start: u64) {
         self.wrt.extend_from_slice(bytes);
-        let end = start + bytes.len();
+        let end = start + bytes.len() as u64;
         self.slices.push(SliceCacheIndexEntry {
             start,
             stop: end,
-            addr: self.offset as usize,
+            addr: self.offset,
         });
         self.offset += bytes.len() as u64;
     }
@@ -260,9 +260,9 @@ impl StaticSliceCacheBuilder {
                     segment.range().start
                 )));
             }
-            if last.stop == segment.range().start && (last.addr + last.range().len() == segment.addr) {
+            if last.stop == segment.range().start && (last.addr + (last.range().end - last.range().start) == segment.addr) {
                 // We merge the current segment with the previous one
-                last.stop += segment.range().len();
+                last.stop += segment.range().end - segment.range().start;
             } else {
                 slices.push(last);
                 last = segment.clone();
@@ -318,18 +318,18 @@ impl HotDirectory {
 struct FileSliceWithCache {
     underlying: FileSlice,
     static_cache: Arc<StaticSliceCache>,
-    file_length: usize,
+    file_length: u64,
 }
 
 #[async_trait]
 impl FileHandle for FileSliceWithCache {
-    fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    fn read_bytes(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         if let Some(found_bytes) = self.static_cache.try_read_bytes(byte_range.clone()) {
             return Ok(found_bytes);
         }
         self.underlying.read_bytes_slice(byte_range)
     }
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_async(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         if let Some(found_bytes) = self.static_cache.try_read_bytes(byte_range.clone()) {
             return Ok(found_bytes);
         }
@@ -344,7 +344,7 @@ impl Debug for FileSliceWithCache {
 }
 
 impl HasLen for FileSliceWithCache {
-    fn len(&self) -> usize {
+    fn len(&self) -> u64 {
         self.file_length
     }
 }
@@ -378,11 +378,11 @@ impl Directory for HotDirectory {
             .get_file_length(path)
             .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_owned()))?;
         let underlying_filehandle = self.inner.underlying.get_file_handle(path)?;
-        let underlying = FileSlice::new_with_num_bytes(underlying_filehandle, file_length as usize);
+        let underlying = FileSlice::new_with_num_bytes(underlying_filehandle, file_length);
         let file_slice_with_cache = FileSliceWithCache {
             underlying,
             static_cache: self.inner.cache.get_slice(path),
-            file_length: file_length as usize,
+            file_length,
         };
         Ok(Arc::new(file_slice_with_cache))
     }
@@ -440,7 +440,7 @@ fn list_index_files(index: &Index) -> tantivy::Result<HashSet<PathBuf>> {
 /// and writes a static cache file called hotcache in the `output`.
 ///
 /// See [`HotDirectory`] for more information.
-pub fn create_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>) -> tantivy::Result<Vec<u8>> {
+pub fn create_hotcache(directory: Box<dyn Directory>, chunk_size: Option<u64>) -> tantivy::Result<Vec<u8>> {
     // We use the caching directory here in order to defensively ensure that
     // the content of the directory that will be written in the hotcache is precisely
     // the same that was read on the first pass.
@@ -467,12 +467,12 @@ pub fn create_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>)
     }
     let mut cache_builder = StaticDirectoryCacheBuilder::default();
     let read_operations = debug_proxy_directory.drain_read_operations();
-    let mut per_file_slices: HashMap<PathBuf, HashSet<Range<usize>>> = HashMap::default();
+    let mut per_file_slices: HashMap<PathBuf, HashSet<Range<u64>>> = HashMap::default();
     for read_operation in read_operations {
         per_file_slices
             .entry(read_operation.path)
             .or_default()
-            .insert(read_operation.offset..read_operation.offset + read_operation.num_bytes);
+            .insert(read_operation.offset..read_operation.offset + read_operation.num_bytes as u64);
     }
     let index_files = list_index_files(&index)?;
     for file_path in index_files {
@@ -481,10 +481,10 @@ pub fn create_hotcache(directory: Box<dyn Directory>, chunk_size: Option<usize>)
             continue;
         }
         let file_slice = file_slice_res?;
-        let file_cache_builder = cache_builder.add_file(&file_path, file_slice.len() as u64);
+        let file_cache_builder = cache_builder.add_file(&file_path, file_slice.len());
         if let Some(intervals) = per_file_slices.get(&file_path) {
             for byte_range in intervals {
-                let len = byte_range.len();
+                let len = byte_range.end - byte_range.start;
                 // We do not want to store slices that are too large in the hotcache,
                 // but on the other hand, the term dictionray index and the docstore
                 // index are required for quickwit to work.

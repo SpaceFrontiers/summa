@@ -8,14 +8,14 @@ use lru::KeyRef;
 pub struct SliceAddress {
     pub path: PathBuf,
     pub generation: u32,
-    pub index: usize,
+    pub index: u64,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct SliceAddressRef<'a> {
     pub path: &'a Path,
     pub generation: u32,
-    pub index: usize,
+    pub index: u64,
 }
 
 pub(crate) trait SliceAddressKey {

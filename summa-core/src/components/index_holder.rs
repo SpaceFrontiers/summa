@@ -18,7 +18,7 @@ use tantivy::collector::{Collector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
-use tantivy::{Directory, Document, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
+use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -116,16 +116,12 @@ fn wrap_with_caches<D: Directory>(
         Some(chunked_cache_config) => match chunked_cache_config.cache_size {
             Some(cache_size) => Box::new(ChunkedCachingDirectory::new_with_capacity_in_bytes(
                 Box::new(directory),
-                chunked_cache_config.chunk_size as usize,
+                chunked_cache_config.chunk_size,
                 cache_size as usize,
                 CACHE_METRICS.clone(),
                 file_stats,
             )) as Box<dyn Directory>,
-            None => Box::new(ChunkedCachingDirectory::new(
-                Box::new(directory),
-                chunked_cache_config.chunk_size as usize,
-                file_stats,
-            )) as Box<dyn Directory>,
+            None => Box::new(ChunkedCachingDirectory::new(Box::new(directory), chunked_cache_config.chunk_size, file_stats)) as Box<dyn Directory>,
         },
         None => Box::new(directory) as Box<dyn Directory>,
     };
@@ -512,7 +508,10 @@ impl IndexHolder {
     }
 
     #[cfg(feature = "tokio-rt")]
-    pub fn documents<O: Send + 'static>(&self, f: impl Fn(Document) -> O + Clone + Send + Sync + 'static) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
+    pub fn documents<O: Send + 'static>(
+        &self,
+        f: impl Fn(tantivy::Document) -> O + Clone + Send + Sync + 'static,
+    ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         let searcher = self.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
         let (tx, rx) = tokio::sync::mpsc::channel(segment_readers.len() * 2 + 1);

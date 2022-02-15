@@ -1,6 +1,7 @@
 export {
   IndexQuery,
   IndexRegistry,
+  IndexRegistryOptions,
   IIndexRegistry,
 } from "./index-registry";
 export {

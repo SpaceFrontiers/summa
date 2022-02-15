@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
-use std::{io, ops::Range, path::Path, sync::Arc, usize};
+use std::{io, ops::Range, path::Path, sync::Arc};
 
 use tantivy::directory::error::LockError;
 use tantivy::directory::{DirectoryClone, DirectoryLock, Lock, WatchCallback, WatchHandle};
@@ -111,12 +111,12 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
         Ok(self.request_generator.generate_length_request(&self.file_name)?.url().to_string())
     }
 
-    fn do_read_bytes(&self, byte_range: Option<Range<usize>>) -> io::Result<OwnedBytes> {
+    fn do_read_bytes(&self, byte_range: Option<Range<u64>>) -> io::Result<OwnedBytes> {
         let request_response = self.request_generator.generate_range_request(&self.file_name, byte_range)?.request()?;
         Ok(OwnedBytes::new(request_response.data))
     }
 
-    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<usize>>) -> io::Result<OwnedBytes> {
+    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<u64>>) -> io::Result<OwnedBytes> {
         let request = self.request_generator.generate_range_request(&self.file_name, byte_range)?;
         let url = request.url().to_string();
         trace!(action = "start_reading_file", url = ?url);
@@ -148,17 +148,17 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
 
 #[async_trait]
 impl<TExternalRequest: ExternalRequest + Debug + 'static> FileHandle for NetworkFile<TExternalRequest> {
-    fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    fn read_bytes(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         self.do_read_bytes(Some(byte_range))
     }
 
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_async(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         self.do_read_bytes_async(Some(byte_range)).await
     }
 }
 
 impl<TExternalRequest: ExternalRequest> HasLen for NetworkFile<TExternalRequest> {
-    fn len(&self) -> usize {
-        self.internal_length().unwrap_or_default() as usize
+    fn len(&self) -> u64 {
+        self.internal_length().unwrap_or_default()
     }
 }

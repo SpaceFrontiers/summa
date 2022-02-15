@@ -41,7 +41,7 @@ pub struct ReadOperation {
     /// Path that was read
     pub path: PathBuf,
     /// If fetching a range of data, the start offset, else 0.
-    pub offset: usize,
+    pub offset: u64,
     /// The number of bytes fetched
     pub num_bytes: usize,
     /// The date at which the operation was performed (UTC timezone).
@@ -54,7 +54,7 @@ struct ReadOperationBuilder {
     start_date: OffsetDateTime,
     start_instant: Instant,
     path: PathBuf,
-    offset: usize,
+    offset: u64,
 }
 
 impl ReadOperationBuilder {
@@ -69,7 +69,7 @@ impl ReadOperationBuilder {
         }
     }
 
-    pub fn with_offset(self, offset: usize) -> Self {
+    pub fn with_offset(self, offset: u64) -> Self {
         ReadOperationBuilder {
             start_date: self.start_date,
             start_instant: self.start_instant,
@@ -147,7 +147,7 @@ struct DebugProxyFileHandle {
 
 #[async_trait]
 impl FileHandle for DebugProxyFileHandle {
-    fn read_bytes(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    fn read_bytes(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         let read_operation_builder = ReadOperationBuilder::new(&self.path).with_offset(byte_range.start);
         let payload = self.underlying.read_bytes(byte_range)?;
         let read_operation = read_operation_builder.terminate(payload.len());
@@ -155,7 +155,7 @@ impl FileHandle for DebugProxyFileHandle {
         Ok(payload)
     }
 
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_async(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
         let read_operation_builder = ReadOperationBuilder::new(&self.path).with_offset(byte_range.start);
         let payload = self.underlying.read_bytes_async(byte_range).await?;
         let read_operation = read_operation_builder.terminate(payload.len());
@@ -171,7 +171,7 @@ impl fmt::Debug for DebugProxyFileHandle {
 }
 
 impl HasLen for DebugProxyFileHandle {
-    fn len(&self) -> usize {
+    fn len(&self) -> u64 {
         self.underlying.len()
     }
 }

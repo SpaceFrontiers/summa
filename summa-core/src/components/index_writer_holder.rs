@@ -15,7 +15,7 @@ use crate::Error;
 
 /// Hotcache config
 pub struct HotCacheConfig {
-    pub chunk_size: Option<usize>,
+    pub chunk_size: Option<u64>,
 }
 
 /// Wrap `tantivy::SingleSegmentIndexWriter` and allows to recreate it

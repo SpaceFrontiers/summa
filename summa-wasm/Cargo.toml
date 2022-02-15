@@ -1,6 +1,6 @@
 [package]
 name = "summa-wasm"
-version = "0.100.3"
+version = "0.101.4"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -28,7 +28,7 @@ serde-wasm-bindgen = "0.4"
 strfmt = { workspace = true }
 summa-core = { version = "0.11", path = "../summa-core", default_features = false }
 summa-proto = { workspace = true }
-tantivy = { workspace = true }
+tantivy = { workspace = true, features = ["wasm"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, default_features = false, features = ["sync"] }
 tracing = { workspace = true }

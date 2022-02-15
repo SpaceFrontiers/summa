@@ -57,7 +57,7 @@ impl IndexMeter {
                 .chain(segment_space_usage.termdict().fields())
             {
                 let counter = per_fields.entry(schema.get_field_name(*field)).or_insert(0u64);
-                *counter += field_usage.total() as u64;
+                *counter += field_usage.total();
             }
             let segment_keys = &[
                 KeyValue::new("index_name", index_holder.index_name().to_string()),
@@ -67,9 +67,8 @@ impl IndexMeter {
             self.documents_count.record(&context, segment_reader.num_docs() as u64, segment_keys);
             self.deleted_documents_count
                 .record(&context, segment_reader.num_deleted_docs() as u64, segment_keys);
-            self.deleted_memory_usage.record(&context, segment_space_usage.deletes() as u64, segment_keys);
-            self.store_memory_usage
-                .record(&context, segment_space_usage.store().total() as u64, segment_keys);
+            self.deleted_memory_usage.record(&context, segment_space_usage.deletes(), segment_keys);
+            self.store_memory_usage.record(&context, segment_space_usage.store().total(), segment_keys);
         }
         for (field_name, memory_usage) in &per_fields {
             let field_keys = &[

@@ -24,6 +24,28 @@ pub struct IrohWriter {
 }
 
 impl IrohWriter {
+    // degree = 8
+    // VecDeque![ vec![] ]
+    // ..
+    // VecDeque![ vec![0, 1, 2, 3, 4, 5, 6, 7] ]
+    // VecDeque![ vec![8], vec![p0] ]
+
+    // ..
+
+    // VecDeque![ vec![0, 1, 2, 3, 4, 5, 6, 7] vec![p0] ]
+    // VecDeque![ vec![], vec![p0, p1]]
+
+    // ..
+
+    // VecDeque![ vec![0, 1, 2, 3, 4, 5, 6, 7] vec![p0, p1, p2, p3, p4, p5, p6, p7], ]
+    // VecDeque![ vec![], vec![p0, p1, p2, p3, p4, p5, p6, p7], vec![] ]
+    // VecDeque![ vec![8], vec![p8], vec![pp0] ]
+    //
+    // A vecdeque of vecs, the first vec representing the lowest layer of stem nodes
+    // and the last vec representing the root node
+    // Since we emit leaf and stem nodes as we go, we only need to keep track of the
+    // most "recent" branch, storing the links to that node's children & yielding them
+    // when each node reaches `degree` number of links
     pub fn new(store: &iroh_store::Store, iroh_dd: IrohDirectory, path: impl AsRef<Path>) -> Self {
         let mut tree = VecDeque::default();
         tree.push_back(Vec::with_capacity(DEFAULT_DEGREE));
@@ -40,11 +62,12 @@ impl IrohWriter {
         let tree_len = self.tree.len();
         if self.tree[0].len() == DEFAULT_DEGREE {
             // if so, iterate through nodes
-            for i in 1..tree_len {
+            for i in 0..tree_len {
                 // if we encounter any nodes that are not full, break
                 if self.tree[i].len() < DEFAULT_DEGREE {
                     break;
                 }
+
                 if i == tree_len - 1 {
                     self.tree.push_back(Vec::with_capacity(DEFAULT_DEGREE));
                 }
@@ -81,7 +104,7 @@ impl IrohWriter {
         // clean up, aka yield the rest of the stem nodes
         // since all the stem nodes are able to receive links
         // we don't have to worry about "overflow"
-        info!(action = "tree_depth", links = self.tree.len());
+        info!(action = "tree_depth", depth = self.tree.len());
         while let Some(links) = self.tree.pop_front() {
             info!(action = "emit_links", links = links.len());
             let (block, link_info) = TreeNode::Stem(links).encode(&DEFAULT_CODE).expect("cannot encode");
