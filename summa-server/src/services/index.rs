@@ -258,7 +258,7 @@ impl Index {
     }
 
     #[instrument(skip_all, fields(source_index_name = ?copy_documents_request.source_index_name, target_index_name = ?copy_documents_request.target_index_name))]
-    pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<()> {
+    pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<u32> {
         let target_index_writer = self
             .get_index_holder(&copy_documents_request.target_index_name)
             .await?
@@ -267,7 +267,7 @@ impl Index {
             .read_owned()
             .await;
         let mut source_documents_receiver = self.get_index_holder(&copy_documents_request.source_index_name).await?.documents(|d| d)?;
-        let mut documents = 0u64;
+        let mut documents = 0u32;
         while let Some(document) = source_documents_receiver.recv().await {
             target_index_writer.index_document(document).map_err(crate::errors::Error::from)?;
             documents += 1;
@@ -275,7 +275,7 @@ impl Index {
                 info!(action = "copied", documents = documents)
             }
         }
-        Ok(())
+        Ok(documents)
     }
 
     /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.

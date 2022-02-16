@@ -4,10 +4,10 @@ package summa.proto;
 import "utils.proto";
 
 message SearchResponse {
-  // An array of collector outputs
-  repeated CollectorOutput collector_outputs = 1;
   // Time spent inside of `search` handler
-  double elapsed_secs = 2;
+  double elapsed_secs = 1;
+  // An array of collector outputs
+  repeated CollectorOutput collector_outputs = 2;
 }
 
 // Recursive query DSL

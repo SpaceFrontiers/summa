@@ -22,6 +22,7 @@ const ENV_FILTER: &str = "iroh_bitswap=error,\
     summa_server::components=info,\
     summa_server::server[lifecycle]=info,\
     summa_server=warn,\
+    tantivy::store::compressors=error,\
     warn";
 
 const REQUEST_ENV_FILTER: &str = "summa_server::server::grpc[request]=info,summa_server::server::metrics[request]=info";

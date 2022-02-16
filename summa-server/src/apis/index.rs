@@ -81,22 +81,24 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     }
 
     async fn commit_index(&self, proto_request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
-        let request = proto_request.into_inner();
         let now = Instant::now();
-        let index_holder = self.index_service.get_index_holder(&request.index_name).await?;
+        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_name).await?;
         self.index_service.commit_and_restart_consumption(&index_holder).await?;
         Ok(Response::new(proto::CommitIndexResponse {
-            elapsed_secs: Some(now.elapsed().as_secs_f64()),
+            elapsed_secs: now.elapsed().as_secs_f64(),
         }))
     }
 
     async fn copy_documents(&self, proto_request: Request<proto::CopyDocumentsRequest>) -> Result<Response<proto::CopyDocumentsResponse>, Status> {
-        let copy_documents_request = proto_request.into_inner();
-        self.index_service
-            .copy_documents(copy_documents_request)
+        let now = Instant::now();
+        let copied_documents = self.index_service
+            .copy_documents(proto_request.into_inner())
             .await
             .map_err(crate::errors::Error::from)?;
-        let response = proto::CopyDocumentsResponse {};
+        let response = proto::CopyDocumentsResponse {
+            elapsed_secs: now.elapsed().as_secs_f64(),
+            copied_documents
+        };
         Ok(Response::new(response))
     }
 

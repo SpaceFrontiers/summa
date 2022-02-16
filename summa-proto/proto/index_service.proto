@@ -99,7 +99,7 @@ message CommitIndexRequest {
 // Returned data from the commit command
 message CommitIndexResponse {
   // Pure time spent for committing
-  optional double elapsed_secs = 2;
+  double elapsed_secs = 1;
 }
 
 // Copy documents from one index to another. Their schemes must be compatible
@@ -111,7 +111,10 @@ message CopyDocumentsRequest {
 }
 
 // Copy documents response
-message CopyDocumentsResponse {}
+message CopyDocumentsResponse {
+  double elapsed_secs = 1;
+  uint32 copied_documents = 2;
+}
 
 // Request that changes index engine. Currently possible to convert File to IPFS
 message CopyIndexRequest {
@@ -231,9 +234,9 @@ message IndexDocumentStreamRequest {
 }
 
 message IndexDocumentStreamResponse {
-  uint64 success_docs = 1;
-  uint64 failed_docs = 2;
-  double elapsed_secs = 3;
+  double elapsed_secs = 1;
+  uint64 success_docs = 2;
+  uint64 failed_docs = 3;
 }
 
 message IndexDocumentRequest {

@@ -231,7 +231,7 @@ impl QueryParser {
                     query_builder =
                         query_builder.with_boost_factor(f32::from_str(boost).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {boost} as f32")))?);
                 }
-                query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words.clone());
+                query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words);
                 Box::new(query_builder.with_document_fields(field_values))
             }
         })
