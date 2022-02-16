@@ -78,7 +78,6 @@ parent: APIs
     - [WarmupIndexRequest](#summa-proto-WarmupIndexRequest)
     - [WarmupIndexResponse](#summa-proto-WarmupIndexResponse)
   
-    - [CommitMode](#summa-proto-CommitMode)
     - [Compression](#summa-proto-Compression)
   
 - [query.proto](#query-proto)
@@ -442,7 +441,6 @@ Store the state of index to the storage
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
-| commit_mode | [CommitMode](#summa-proto-CommitMode) |  |  |
 
 
 
@@ -457,7 +455,7 @@ Returned data from the commit command
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| elapsed_secs | [double](#double) | optional | Pure time spent for committing |
+| elapsed_secs | [double](#double) |  | Pure time spent for committing |
 
 
 
@@ -484,6 +482,12 @@ Copy documents from one index to another. Their schemes must be compatible
 
 ### CopyDocumentsResponse
 Copy documents response
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| elapsed_secs | [double](#double) |  |  |
+| copied_documents | [uint32](#uint32) |  |  |
 
 
 
@@ -907,9 +911,9 @@ Indexing operations that contains document serialized in JSON format
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
+| elapsed_secs | [double](#double) |  |  |
 | success_docs | [uint64](#uint64) |  |  |
 | failed_docs | [uint64](#uint64) |  |  |
-| elapsed_secs | [double](#double) |  |  |
 
 
 
@@ -1213,18 +1217,6 @@ Merge policy for compressing old segments
  <!-- end messages -->
 
 
-<a name="summa-proto-CommitMode"></a>
-
-### CommitMode
-Commit mode
-
-| Name | Number | Description |
-| ---- | ------ | ----------- |
-| Async | 0 | Returns immediately and then commits in the background |
-| Sync | 1 | Waits until the end of commit |
-
-
-
 <a name="summa-proto-Compression"></a>
 
 ### Compression
@@ -1237,6 +1229,11 @@ Compression library for store, implies on both performance and occupied disk spa
 | Lz4 | 2 |  |
 | Snappy | 3 |  |
 | Zstd | 4 |  |
+| Zstd7 | 5 |  |
+| Zstd9 | 6 |  |
+| Zstd14 | 7 |  |
+| Zstd19 | 8 |  |
+| Zstd22 | 9 |  |
 
 
  <!-- end enums -->
@@ -1775,6 +1772,7 @@ Collectors and CollectorOutputs
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | value | [string](#string) |  |  |
+| default_fields | [string](#string) | repeated |  |
 
 
 
@@ -2134,8 +2132,8 @@ Recursive query DSL
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| collector_outputs | [CollectorOutput](#summa-proto-CollectorOutput) | repeated | An array of collector outputs |
 | elapsed_secs | [double](#double) |  | Time spent inside of `search` handler |
+| collector_outputs | [CollectorOutput](#summa-proto-CollectorOutput) | repeated | An array of collector outputs |
 
 
 

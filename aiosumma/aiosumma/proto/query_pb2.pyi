@@ -259,10 +259,12 @@ class Key(_message.Message):
     def __init__(self, str: _Optional[str] = ..., f64: _Optional[float] = ...) -> None: ...
 
 class MatchQuery(_message.Message):
-    __slots__ = ["value"]
+    __slots__ = ["default_fields", "value"]
+    DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
+    default_fields: _containers.RepeatedScalarFieldContainer[str]
     value: str
-    def __init__(self, value: _Optional[str] = ...) -> None: ...
+    def __init__(self, value: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class MetricAggregation(_message.Message):
     __slots__ = ["average", "stats"]
@@ -476,7 +478,7 @@ class SearchResponse(_message.Message):
     ELAPSED_SECS_FIELD_NUMBER: _ClassVar[int]
     collector_outputs: _containers.RepeatedCompositeFieldContainer[CollectorOutput]
     elapsed_secs: float
-    def __init__(self, collector_outputs: _Optional[_Iterable[_Union[CollectorOutput, _Mapping]]] = ..., elapsed_secs: _Optional[float] = ...) -> None: ...
+    def __init__(self, elapsed_secs: _Optional[float] = ..., collector_outputs: _Optional[_Iterable[_Union[CollectorOutput, _Mapping]]] = ...) -> None: ...
 
 class SingleMetricResult(_message.Message):
     __slots__ = ["value"]

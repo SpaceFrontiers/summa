@@ -85,8 +85,12 @@ class CopyDocumentsRequest(_message.Message):
     def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ...) -> None: ...
 
 class CopyDocumentsResponse(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+    __slots__ = ["copied_documents", "elapsed_secs"]
+    COPIED_DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
+    ELAPSED_SECS_FIELD_NUMBER: _ClassVar[int]
+    copied_documents: int
+    elapsed_secs: float
+    def __init__(self, elapsed_secs: _Optional[float] = ..., copied_documents: _Optional[int] = ...) -> None: ...
 
 class CopyIndexRequest(_message.Message):
     __slots__ = ["file", "ipfs", "memory", "merge_policy", "source_index_name", "target_index_name"]
@@ -305,7 +309,7 @@ class IndexDocumentStreamResponse(_message.Message):
     elapsed_secs: float
     failed_docs: int
     success_docs: int
-    def __init__(self, success_docs: _Optional[int] = ..., failed_docs: _Optional[int] = ..., elapsed_secs: _Optional[float] = ...) -> None: ...
+    def __init__(self, elapsed_secs: _Optional[float] = ..., success_docs: _Optional[int] = ..., failed_docs: _Optional[int] = ...) -> None: ...
 
 class IndexEngineConfig(_message.Message):
     __slots__ = ["file", "ipfs", "memory", "merge_policy", "remote"]
