@@ -244,7 +244,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             extraction_tooling: ExtractionTooling::new(self.searcher.clone(), self.query_fields, self.multi_fields),
             snippet_generator_config: Some(SnippetGeneratorConfig::new(self.searcher, self.query, self.snippet_configs)),
             scored_doc_addresses: doc_addresses,
-            has_next: length > self.limit as usize,
+            has_next: length > (self.offset + self.limit) as usize,
             limit: self.limit,
             offset: self.offset,
         }))

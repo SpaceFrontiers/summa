@@ -102,15 +102,18 @@ impl Api {
             )
             .into_inner();
 
+        let consumer_service = ConsumerApiServer::new(consumer_api);
+        let index_service = IndexApiServer::new(index_api);
+        let reflection_service = ReflectionApiServer::new(reflection_api);
         let search_service = SearchApiServer::new(search_api);
 
         let grpc_router = Server::builder()
             .layer(layer)
             .max_frame_size(api_config.max_frame_size_bytes.map(|x| x / 256))
             .add_service(grpc_reflection_service)
-            .add_service(ConsumerApiServer::new(consumer_api))
-            .add_service(IndexApiServer::new(index_api))
-            .add_service(ReflectionApiServer::new(reflection_api))
+            .add_service(consumer_service.clone())
+            .add_service(index_service.clone())
+            .add_service(reflection_service.clone())
             .add_service(search_service.clone());
         let grpc_listener = Api::set_listener(&api_config.grpc_endpoint)?;
         let mut grpc_terminator = terminator.clone();
@@ -128,7 +131,13 @@ impl Api {
         }));
 
         if let Some(http_endpoint) = api_config.http_endpoint {
-            let http_router = Server::builder().accept_http1(true).layer(GrpcWebLayer::new()).add_service(search_service);
+            let http_router = Server::builder()
+                .accept_http1(true)
+                .layer(GrpcWebLayer::new())
+                .add_service(consumer_service.clone())
+                .add_service(index_service.clone())
+                .add_service(reflection_service.clone())
+                .add_service(search_service.clone());
             let http_listener = Api::set_listener(&http_endpoint)?;
             let mut http_terminator = terminator.clone();
             futures.push(Box::new(async move {

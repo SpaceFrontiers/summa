@@ -11,7 +11,7 @@ use iroh_unixfs::codecs::Codec;
 use tantivy::directory::{AntiCallToken, TerminatingWrite};
 use tracing::info;
 
-use crate::directories::iroh::directory::{DEFAULT_CHUNK_SIZE, DEFAULT_CODE, DEFAULT_DEGREE};
+use crate::directories::iroh::directory::{DEFAULT_CODE, DEFAULT_DEGREE};
 use crate::directories::iroh::file::IrohFileDescriptor;
 use crate::directories::IrohDirectory;
 
@@ -21,6 +21,7 @@ pub struct IrohWriter {
     iroh_dd: IrohDirectory,
     store: iroh_store::Store,
     tree: VecDeque<Vec<(Cid, LinkInfo)>>,
+    chunk_size: u64,
 }
 
 impl IrohWriter {
@@ -46,34 +47,35 @@ impl IrohWriter {
     // Since we emit leaf and stem nodes as we go, we only need to keep track of the
     // most "recent" branch, storing the links to that node's children & yielding them
     // when each node reaches `degree` number of links
-    pub fn new(store: &iroh_store::Store, iroh_dd: IrohDirectory, path: impl AsRef<Path>) -> Self {
+    pub fn new(store: &iroh_store::Store, iroh_dd: IrohDirectory, path: impl AsRef<Path>, chunk_size: u64) -> Self {
         let mut tree = VecDeque::default();
-        tree.push_back(Vec::with_capacity(DEFAULT_DEGREE));
+        tree.push_back(Vec::with_capacity(DEFAULT_DEGREE as usize));
         IrohWriter {
             tail: Bytes::new(),
             path: path.as_ref().to_path_buf(),
             iroh_dd,
             store: store.clone(),
             tree,
+            chunk_size,
         }
     }
 
     fn emit_chunk(&mut self, chunk: &[u8]) -> io::Result<Cid> {
         let tree_len = self.tree.len();
-        if self.tree[0].len() == DEFAULT_DEGREE {
+        if self.tree[0].len() as u32 == DEFAULT_DEGREE {
             // if so, iterate through nodes
             for i in 0..tree_len {
                 // if we encounter any nodes that are not full, break
-                if self.tree[i].len() < DEFAULT_DEGREE {
+                if self.tree[i].len() < DEFAULT_DEGREE as usize {
                     break;
                 }
 
                 if i == tree_len - 1 {
-                    self.tree.push_back(Vec::with_capacity(DEFAULT_DEGREE));
+                    self.tree.push_back(Vec::with_capacity(DEFAULT_DEGREE as usize));
                 }
 
                 // create node, keeping the cid
-                let links = std::mem::replace(&mut self.tree[i], Vec::with_capacity(DEFAULT_DEGREE));
+                let links = std::mem::replace(&mut self.tree[i], Vec::with_capacity(DEFAULT_DEGREE as usize));
                 let (block, link_info) = TreeNode::Stem(links).encode(&DEFAULT_CODE).expect("cannot encode stem");
                 let (cid, data, links) = block.into_parts();
                 self.store.put(cid, data, links).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -125,8 +127,8 @@ impl IrohWriter {
 impl Write for IrohWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let data = [&self.tail, buf].concat();
-        for chunk in data.chunks(DEFAULT_CHUNK_SIZE) {
-            if chunk.len() == DEFAULT_CHUNK_SIZE {
+        for chunk in data.chunks(self.chunk_size as usize) {
+            if chunk.len() as u64 == self.chunk_size {
                 self.emit_chunk(chunk)?;
             } else {
                 self.tail = Bytes::from(chunk.to_vec())

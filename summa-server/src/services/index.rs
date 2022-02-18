@@ -12,8 +12,8 @@ use futures_util::future::join_all;
 use summa_core::components::{cleanup_index, Driver, HotCacheConfig, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
-use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::directories::IrohDirectory;
+use summa_core::directories::{DefaultExternalRequestGenerator, DEFAULT_CHUNK_SIZE};
 use summa_core::errors::SummaResult;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
@@ -83,7 +83,7 @@ impl Index {
     }
 
     /// Flag meaning that all dependent operations should be ended as soon as possible
-    pub fn should_terminate(&self) -> bool {
+    pub(crate) fn should_terminate(&self) -> bool {
         self.should_terminate.load(Ordering::Relaxed)
     }
 
@@ -257,19 +257,20 @@ impl Index {
         Ok(index_holder)
     }
 
+    /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(source_index_name = ?copy_documents_request.source_index_name, target_index_name = ?copy_documents_request.target_index_name))]
     pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<u32> {
-        let target_index_writer = self
-            .get_index_holder(&copy_documents_request.target_index_name)
-            .await?
-            .index_writer_holder()?
-            .clone()
-            .read_owned()
-            .await;
-        let mut source_documents_receiver = self.get_index_holder(&copy_documents_request.source_index_name).await?.documents(|d| d)?;
+        let target_index_holder = self.get_index_holder(&copy_documents_request.target_index_name).await?;
+        let target_index_writer = target_index_holder.index_writer_holder()?.clone().read_owned().await;
+        let conflict_strategy = target_index_holder.conflict_strategy();
+        let source_index_holder = self.get_index_holder(&copy_documents_request.source_index_name).await?;
+        let searcher = source_index_holder.index_reader().searcher();
+        let mut source_documents_receiver = source_index_holder.documents(&searcher, Some)?;
         let mut documents = 0u32;
         while let Some(document) = source_documents_receiver.recv().await {
-            target_index_writer.index_document(document).map_err(crate::errors::Error::from)?;
+            target_index_writer
+                .index_document(document, conflict_strategy)
+                .map_err(crate::errors::Error::from)?;
             documents += 1;
             if documents % 100_000 == 0 {
                 info!(action = "copied", documents = documents)
@@ -325,7 +326,15 @@ impl Index {
                 (index, index_engine_config)
             }
             Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
-                let iroh_directory = IrohDirectory::new(self.store_service.content_loader(), self.store_service.store(), Driver::current_tokio());
+                let iroh_directory = IrohDirectory::new(
+                    self.store_service.content_loader(),
+                    self.store_service.store(),
+                    chunked_cache_config
+                        .as_ref()
+                        .map(|chunked_cache_config| chunked_cache_config.chunk_size)
+                        .unwrap_or(DEFAULT_CHUNK_SIZE),
+                    Driver::current_tokio(),
+                );
                 index_builder.open_or_create(iroh_directory.clone())?;
                 let cid = iroh_directory.cid().expect("directory should be created");
                 let ipfs_engine_config = proto::IpfsEngineConfig {
@@ -597,6 +606,7 @@ impl Index {
         Ok(index)
     }
 
+    /// Copies index with changing engine
     #[instrument(skip(self, copy_index_request), fields(source_index_name = copy_index_request.source_index_name, target_index_name = copy_index_request.target_index_name))]
     pub async fn copy_index(&self, copy_index_request: proto::CopyIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_holder = self.index_registry.get_index_holder(&copy_index_request.source_index_name).await?;
@@ -611,6 +621,10 @@ impl Index {
                 let iroh_directory = IrohDirectory::new(
                     self.store_service.content_loader(),
                     self.store_service.store(),
+                    chunked_cache_config
+                        .as_ref()
+                        .map(|chunked_cache_config| chunked_cache_config.chunk_size)
+                        .unwrap_or(DEFAULT_CHUNK_SIZE),
                     Driver::Tokio(tokio::runtime::Handle::current()),
                 );
                 let span = tracing::Span::current();
@@ -649,6 +663,7 @@ impl Index {
         Ok(index_holder)
     }
 
+    /// Search documents
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
         let futures = self.index_registry.search_futures(search_request.index_queries).await?;
         let collector_outputs = join_all(futures.into_iter().map(|t| tokio::spawn(async move { t.await })))
@@ -658,6 +673,7 @@ impl Index {
         Ok(self.index_registry.finalize_extraction(collector_outputs).await?)
     }
 
+    /// Merge several segments into a single one
     #[instrument(skip(self, merge_segments_request), fields(index_name = merge_segments_request.index_name))]
     pub async fn merge_segments(&self, merge_segments_request: proto::MergeSegmentsRequest) -> SummaServerResult<Option<SegmentId>> {
         let index_holder = self.get_index_holder(&merge_segments_request.index_name).await?;
@@ -678,6 +694,7 @@ impl Index {
         Ok(segment_meta.map(|segment_meta| segment_meta.id()))
     }
 
+    /// Merges segments and removes tombstones
     #[instrument(skip(self, vacuum_index_request), fields(index_name = vacuum_index_request.index_name))]
     pub async fn vacuum_index(&self, vacuum_index_request: proto::VacuumIndexRequest) -> SummaServerResult<()> {
         let index_holder = self.get_index_holder(&vacuum_index_request.index_name).await?;
@@ -984,7 +1001,14 @@ pub(crate) mod tests {
         }
         index_service.commit(&index_holder).await?;
 
-        let search_response = index_holder.search("index", &match_query("testtitle"), vec![top_docs_collector(10)]).await?;
+        let search_response = index_holder
+            .search(
+                "index",
+                match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
+                vec![top_docs_collector(10)],
+                None,
+            )
+            .await?;
         assert_eq!(search_response.len(), 1);
         drop(index_holder);
         index_service
@@ -1019,7 +1043,14 @@ pub(crate) mod tests {
             .await?;
         index_service.commit(&index_holder).await?;
 
-        let search_response = index_holder.search("index", &match_query("testtitle"), vec![top_docs_collector(10)]).await?;
+        let search_response = index_holder
+            .search(
+                "index",
+                match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
+                vec![top_docs_collector(10)],
+                None,
+            )
+            .await?;
         assert_eq!(search_response.len(), 1);
 
         drop(index_holder);
@@ -1070,12 +1101,22 @@ pub(crate) mod tests {
             .await?;
 
         let search_response = index_holder
-            .search("copied_index", &match_query("testtitle"), vec![top_docs_collector(10)])
+            .search(
+                "copied_index",
+                match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
+                vec![top_docs_collector(10)],
+                None,
+            )
             .await?;
         assert_eq!(search_response.len(), 1);
 
         let search_response = index_holder
-            .search("test_index", &match_query("testtitle"), vec![top_docs_collector(10)])
+            .search(
+                "test_index",
+                match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
+                vec![top_docs_collector(10)],
+                None,
+            )
             .await?;
         assert_eq!(search_response.len(), 1);
 
@@ -1114,7 +1155,12 @@ pub(crate) mod tests {
         })
         .await??;
         assert!(index_holder
-            .search("test_index", &match_query("title1"), vec![top_docs_collector_with_eval_expr(1, "issued_at")],)
+            .search(
+                "test_index",
+                match_query("title1", vec!["title".to_string(), "body".to_string()]),
+                vec![top_docs_collector_with_eval_expr(1, "issued_at")],
+                None
+            )
             .await
             .is_ok());
         Ok(())

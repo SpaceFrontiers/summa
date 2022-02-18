@@ -19,7 +19,7 @@ pub use index_holder::{cleanup_index, IndexHolder};
 pub use index_registry::IndexRegistry;
 pub use index_writer_holder::{HotCacheConfig, IndexWriterHolder};
 use once_cell::sync::Lazy;
-pub use query_parser::QueryParser;
+pub use query_parser::{ProtoQueryParser, QueryParser, QueryParserError};
 pub use segment_attributes::SummaSegmentAttributes;
 pub use summa_document::{DocumentParsingError, SummaDocument};
 pub use summa_tokenizer::SummaTokenizer;

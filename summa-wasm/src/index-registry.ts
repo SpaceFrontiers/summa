@@ -19,6 +19,7 @@ export interface IIndexRegistry {
   warmup(index_name: string): Promise<void>;
   index_document(index_name: string, document: string): Promise<void>;
   commit(index_name: string): Promise<void>;
+  extract_terms(index_name: string, field_name: string, limit: bigint, start_from?: string): Promise<string[]>;
 }
 
 export type IndexRegistryOptions = {
@@ -28,7 +29,7 @@ export type IndexRegistryOptions = {
 }
 
 export const default_options: IndexRegistryOptions = {
-  num_threads: 4,
+  num_threads: navigator.hardwareConcurrency,
   logging_level: "info",
   memory_config: { initial: 8192, maximum: 65536, shared: true }
 }
@@ -66,5 +67,8 @@ export class IndexRegistry implements IIndexRegistry {
   }
   async commit(index_name: string) {
     return await this.registry!.commit(index_name)
+  }
+  async extract_terms(index_name: string, field_name: string, limit: bigint, start_from?: string): Promise<string[]> {
+    return await this.registry!.extract_terms(index_name, field_name, limit, start_from);
   }
 }

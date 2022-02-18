@@ -16,13 +16,13 @@ use tantivy::query::{
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
 
+use crate::components::query_parser::{QueryParser, QueryParserError};
 use crate::errors::{Error, SummaResult, ValidationError};
 #[cfg(feature = "metrics")]
 use crate::metrics::ToLabel;
-use crate::validators::parse_fields;
 
 /// Responsible for casting `crate::proto::Query` message to `tantivy::query::Query`
-pub struct QueryParser {
+pub struct ProtoQueryParser {
     index: Index,
     index_name: String,
     cached_schema: Schema,
@@ -76,8 +76,8 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
     })
 }
 
-impl QueryParser {
-    pub fn for_index(index_name: &str, index: &Index) -> SummaResult<QueryParser> {
+impl ProtoQueryParser {
+    pub fn for_index(index_name: &str, index: &Index) -> SummaResult<ProtoQueryParser> {
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
         #[cfg(feature = "metrics")]
@@ -86,7 +86,7 @@ impl QueryParser {
             .with_description("Sub-queries counter")
             .init();
 
-        Ok(QueryParser {
+        Ok(ProtoQueryParser {
             index: index.clone(),
             index_name: index_name.to_string(),
             cached_schema: index.schema(),
@@ -121,10 +121,10 @@ impl QueryParser {
                 let mut subqueries = vec![];
                 for subquery in boolean_query_proto.subqueries {
                     subqueries.push((
-                        match proto::Occur::from_i32(subquery.occur) {
-                            None | Some(proto::Occur::Should) => Occur::Should,
-                            Some(proto::Occur::Must) => Occur::Must,
-                            Some(proto::Occur::MustNot) => Occur::MustNot,
+                        match subquery.occur() {
+                            proto::Occur::Should => Occur::Should,
+                            proto::Occur::Must => Occur::Must,
+                            proto::Occur::MustNot => Occur::MustNot,
                         },
                         self.parse_subquery(subquery.query.and_then(|query| query.query).ok_or(Error::EmptyQuery)?)?,
                     ))
@@ -143,12 +143,11 @@ impl QueryParser {
                 },
             )),
             proto::query::Query::Match(match_query_proto) => {
-                let default_fields = parse_fields(&self.cached_schema, &match_query_proto.default_fields)?;
-                let nested_query_parser = tantivy::query::QueryParser::for_index(&self.index, default_fields);
+                let nested_query_parser = QueryParser::new(self.index.schema(), match_query_proto.default_fields, self.index.tokenizers())?;
                 match nested_query_parser.parse_query(&match_query_proto.value) {
                     Ok(parsed_query) => Ok(parsed_query),
-                    Err(tantivy::query::QueryParserError::FieldDoesNotExist(field)) => Err(ValidationError::MissingField(field).into()),
-                    Err(e) => Err(Error::InvalidTantivySyntax(e, match_query_proto.value.to_owned())),
+                    Err(QueryParserError::FieldDoesNotExist(field)) => Err(ValidationError::MissingField(field).into()),
+                    Err(e) => Err(Error::InvalidQuerySyntax(Box::new(e), match_query_proto.value.to_owned())),
                 }?
             }
             proto::query::Query::Range(range_query_proto) => {

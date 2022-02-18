@@ -25,4 +25,6 @@ message IndexQuery {
   // Every collector is responsible of processing and storing documents and/or their derivatives (like counters)
   // to return them to the caller
   repeated Collector collectors = 3;
+  // Is requiring fieldnorms needed for the query?
+  optional bool is_fieldnorms_scoring_enabled = 4;
 }

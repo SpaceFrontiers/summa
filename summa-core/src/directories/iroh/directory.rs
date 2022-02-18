@@ -20,8 +20,8 @@ use crate::directories::iroh::file::{IrohFile, IrohFileDescriptor};
 use crate::directories::iroh::writer::IrohWriter;
 use crate::errors::SummaResult;
 
-pub(crate) const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
-pub(crate) const DEFAULT_DEGREE: usize = 174;
+pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
+pub(crate) const DEFAULT_DEGREE: u32 = 174;
 pub(crate) const DEFAULT_CODE: cid::multihash::Code = cid::multihash::Code::Blake3_256;
 
 /// `IrohDirectory` implements simple file system interface over Iroh Store and Iroh Resolver
@@ -34,6 +34,7 @@ pub struct IrohDirectory {
     resolver: Resolver<FullLoader>,
     store: iroh_store::Store,
     inner: Arc<RwLock<IrohDirectoryInner>>,
+    chunk_size: u64,
     driver: Driver,
 }
 
@@ -44,17 +45,18 @@ impl Debug for IrohDirectory {
 }
 
 impl IrohDirectory {
-    pub fn new(loader: &FullLoader, store: &iroh_store::Store, driver: Driver) -> Self {
+    pub fn new(loader: &FullLoader, store: &iroh_store::Store, chunk_size: u64, driver: Driver) -> Self {
         let resolver = Resolver::new(loader.clone());
         IrohDirectory {
             resolver,
             store: store.clone(),
             inner: Arc::new(RwLock::new(IrohDirectoryInner::new(store))),
             driver,
+            chunk_size,
         }
     }
 
-    pub async fn from_cid(loader: &FullLoader, store: &iroh_store::Store, driver: Driver, cid: &str) -> SummaResult<Self> {
+    pub async fn from_cid(loader: &FullLoader, store: &iroh_store::Store, driver: Driver, cid: &str, chunk_size: u64) -> SummaResult<Self> {
         let resolver = Resolver::new(loader.clone());
         let root_path = resolver.resolve(iroh_resolver::Path::from_parts("ipfs", cid, "")?).await?;
         let mut files = HashMap::new();
@@ -80,6 +82,7 @@ impl IrohDirectory {
                 Cid::from_str(cid).expect("should be cid"),
                 files,
             ))),
+            chunk_size,
             driver: driver.clone(),
         })
     }
@@ -109,7 +112,7 @@ impl IrohDirectory {
     }
 
     pub fn get_writer(&self, path: impl AsRef<Path>) -> IrohWriter {
-        IrohWriter::new(&self.store, self.clone(), path)
+        IrohWriter::new(&self.store, self.clone(), path, self.chunk_size)
     }
 
     pub fn exists(&self, path: impl AsRef<Path>) -> bool {

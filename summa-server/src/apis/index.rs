@@ -91,13 +91,14 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn copy_documents(&self, proto_request: Request<proto::CopyDocumentsRequest>) -> Result<Response<proto::CopyDocumentsResponse>, Status> {
         let now = Instant::now();
-        let copied_documents = self.index_service
+        let copied_documents = self
+            .index_service
             .copy_documents(proto_request.into_inner())
             .await
             .map_err(crate::errors::Error::from)?;
         let response = proto::CopyDocumentsResponse {
             elapsed_secs: now.elapsed().as_secs_f64(),
-            copied_documents
+            copied_documents,
         };
         Ok(Response::new(response))
     }
@@ -142,9 +143,10 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let span = info_span!("documents", index_name = proto_request.index_name);
         let _ = span.enter();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
+        let searcher = index_holder.index_reader().searcher();
         let schema = index_holder.schema().clone();
         let documents_receiver = index_holder
-            .documents(move |d| Ok(DocumentsResponse { document: schema.to_json(&d) }))
+            .documents(&searcher, move |d| Some(Ok(DocumentsResponse { document: schema.to_json(&d) })))
             .map_err(crate::errors::Error::from)?;
         Ok(Response::new(ReceiverStream::new(documents_receiver)))
     }
@@ -157,9 +159,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn get_index(&self, proto_request: Request<proto::GetIndexRequest>) -> Result<Response<proto::GetIndexResponse>, Status> {
         let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_name).await?;
-        let index_description = self.get_index_description(&index_holder).await;
         Ok(Response::new(proto::GetIndexResponse {
-            index: Some(index_description),
+            index: Some(self.get_index_description(&index_holder).await),
         }))
     }
 

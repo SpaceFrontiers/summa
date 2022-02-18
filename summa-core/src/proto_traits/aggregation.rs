@@ -1,7 +1,7 @@
 use summa_proto::proto;
 use tantivy::aggregation::agg_req::{Aggregation, BucketAggregation, BucketAggregationType, MetricAggregation, RangeAggregation};
 use tantivy::aggregation::agg_result::{AggregationResult, BucketEntries, BucketEntry, BucketResult, MetricResult, RangeBucketEntry};
-use tantivy::aggregation::bucket::{CustomOrder, HistogramAggregation, HistogramBounds, Order, OrderTarget, RangeAggregationRange, TermsAggregation};
+use tantivy::aggregation::bucket::{CustomOrder, HistogramAggregation, HistogramBounds, OrderTarget, RangeAggregationRange, TermsAggregation};
 use tantivy::aggregation::metric::{AverageAggregation, StatsAggregation};
 use tantivy::aggregation::Key;
 
@@ -62,14 +62,11 @@ impl TryFrom<Wrapper<proto::aggregation::Aggregation>> for Aggregation {
                         show_term_doc_count_error: terms_aggregation.show_term_doc_count_error,
                         min_doc_count: terms_aggregation.min_doc_count,
                         order: terms_aggregation.order.map(|order| CustomOrder {
+                            order: Wrapper::from(order.order()).into(),
                             target: match order.order_target {
                                 None | Some(proto::custom_order::OrderTarget::Key(_)) => OrderTarget::Key,
                                 Some(proto::custom_order::OrderTarget::Count(_)) => OrderTarget::Count,
                                 Some(proto::custom_order::OrderTarget::SubAggregation(sub_aggregation)) => OrderTarget::SubAggregation(sub_aggregation),
-                            },
-                            order: match proto::Order::from_i32(order.order) {
-                                None => Order::Asc,
-                                Some(order) => Wrapper::from(order).into(),
                             },
                         }),
                     }),

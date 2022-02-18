@@ -18,6 +18,8 @@ pub enum ValidationError {
     InvalidHttpHeader(String, String),
     #[error("invalid_http_method: {0}")]
     InvalidHttpMethod(String),
+    #[error("invalid_segments_number: {0}")]
+    InvalidSegmentsNumber(u32),
     #[error("invalid_schema_error: {0}")]
     InvalidSchema(String),
     #[error("invalid_unique_field_type_error: {0:?}")]
@@ -70,10 +72,10 @@ pub enum Error {
     InvalidAggregation,
     #[error("{0:?}: {1:?}")]
     InvalidFieldType(String, FieldType),
+    #[error("{0:?} for {1:?}")]
+    InvalidQuerySyntax(Box<crate::components::QueryParserError>, String),
     #[error("{0:?}")]
     InvalidSyntax(String),
-    #[error("{0:?} for {1:?}")]
-    InvalidTantivySyntax(tantivy::query::QueryParserError, String),
     #[error("{0:?}")]
     IO((std::io::Error, Option<PathBuf>)),
     #[error("json_error: {0}")]

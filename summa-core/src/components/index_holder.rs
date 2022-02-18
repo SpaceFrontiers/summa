@@ -18,19 +18,19 @@ use tantivy::collector::{Collector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
-use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher};
+use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher, SegmentReader, Term};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
 
 use super::SummaSegmentAttributes;
-use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, QueryParser};
+use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, ProtoQueryParser};
 use crate::components::fruit_extractors::IntermediateExtractionResult;
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{Driver, IndexWriterHolder, SummaDocument, CACHE_METRICS};
 use crate::configs::ConfigProxy;
 use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
-use crate::errors::SummaResult;
+use crate::errors::{SummaResult, ValidationError};
 use crate::proto_traits::Wrapper;
 use crate::Error;
 
@@ -43,7 +43,7 @@ pub struct IndexHolder {
     cached_multi_fields: HashSet<Field>,
     index_reader: IndexReader,
     index_writer_holder: Option<Arc<RwLock<IndexWriterHolder>>>,
-    query_parser: QueryParser,
+    query_parser: ProtoQueryParser,
     /// Counters
     #[cfg(feature = "metrics")]
     search_times_meter: Histogram<f64>,
@@ -160,7 +160,7 @@ impl IndexHolder {
                 .expect("no index name")
         });
         let cached_schema = index.schema();
-        let query_parser = QueryParser::for_index(&index_name, &index)?;
+        let query_parser = ProtoQueryParser::for_index(&index_name, &index)?;
         let index_reader = index
             .reader_builder()
             .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)
@@ -224,7 +224,7 @@ impl IndexHolder {
     #[cfg(feature = "fs")]
     pub async fn create_file_index(index_path: &std::path::Path, index_builder: IndexBuilder) -> SummaResult<Index> {
         if index_path.exists() {
-            return Err(crate::errors::ValidationError::ExistingPath(index_path.to_owned()).into());
+            return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
         }
         tokio::fs::create_dir_all(index_path).await?;
         let index = index_builder.create_in_dir(index_path)?;
@@ -281,7 +281,18 @@ impl IndexHolder {
         store: &iroh_store::Store,
         read_only: bool,
     ) -> SummaResult<Index> {
-        let iroh_directory = crate::directories::IrohDirectory::from_cid(content_loader, store, Driver::current_tokio(), &ipfs_engine_config.cid).await?;
+        let iroh_directory = crate::directories::IrohDirectory::from_cid(
+            content_loader,
+            store,
+            Driver::current_tokio(),
+            &ipfs_engine_config.cid,
+            ipfs_engine_config
+                .chunked_cache_config
+                .as_ref()
+                .map(|chunked_cache_config| chunked_cache_config.chunk_size)
+                .unwrap_or(crate::directories::iroh::directory::DEFAULT_CHUNK_SIZE),
+        )
+        .await?;
         let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
@@ -318,6 +329,11 @@ impl IndexHolder {
     /// Load index attributes from meta.json
     pub fn index_attributes(&self) -> Option<&IndexAttributes> {
         self.cached_index_attributes.as_ref()
+    }
+
+    /// How to resolve conflicts on inserting new documents
+    pub fn conflict_strategy(&self) -> proto::ConflictStrategy {
+        self.index_attributes().as_ref().map(|c| c.conflict_strategy()).unwrap_or_default()
     }
 
     /// Index name
@@ -413,11 +429,17 @@ impl IndexHolder {
     }
 
     /// Runs a query on the segment readers wrapped by the searcher asynchronously.
-    pub async fn search_in_segments(&self, searcher: &Searcher, query: &dyn Query, collector: &MultiCollector<'_>) -> tantivy::Result<MultiFruit> {
-        let enabled_scoring = if collector.requires_scoring() {
-            EnableScoring::enabled_from_searcher(searcher)
-        } else {
-            EnableScoring::disabled_from_searcher(searcher)
+    pub async fn search_in_segments(
+        &self,
+        searcher: &Searcher,
+        query: &dyn Query,
+        collector: &MultiCollector<'_>,
+        is_fieldnorms_scoring_enabled: Option<bool>,
+    ) -> tantivy::Result<MultiFruit> {
+        let enabled_scoring = match (is_fieldnorms_scoring_enabled, collector.requires_scoring()) {
+            (Some(true), true) | (None, true) => EnableScoring::enabled_from_searcher(searcher),
+            (Some(false), true) => EnableScoring::enabled_from_searcher_without_fieldnorms(searcher),
+            (_, false) => EnableScoring::disabled_from_searcher(searcher),
         };
         let segment_readers = searcher.segment_readers();
         let weight = query.weight_async(enabled_scoring).await?;
@@ -437,6 +459,7 @@ impl IndexHolder {
         index_alias: &str,
         query: proto::query::Query,
         collectors: Vec<proto::Collector>,
+        is_fieldnorms_scoring_enabled: Option<bool>,
     ) -> SummaResult<Vec<IntermediateExtractionResult>> {
         let searcher = self.index_reader().searcher();
         let parsed_query = self.query_parser.parse_query(query)?;
@@ -449,10 +472,13 @@ impl IndexHolder {
             target: "query",
             index_name = ?self.index_name,
             parsed_query = ?parsed_query,
+            is_fieldnorms_scoring_enabled = is_fieldnorms_scoring_enabled,
         );
         #[cfg(feature = "metrics")]
         let start_time = Instant::now();
-        let mut multi_fruit = self.search_in_segments(&searcher, &parsed_query, &multi_collector).await?;
+        let mut multi_fruit = self
+            .search_in_segments(&searcher, &parsed_query, &multi_collector, is_fieldnorms_scoring_enabled)
+            .await?;
         #[cfg(feature = "metrics")]
         self.search_times_meter.record(
             &Context::current(),
@@ -478,18 +504,19 @@ impl IndexHolder {
     /// `IndexUpdater` bounds unbounded `SummaDocument` inside
     pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<()> {
         let document = document.bound_with(&self.index.schema()).try_into()?;
-        self.index_writer_holder()?.read().await.index_document(document)
+        self.index_writer_holder()?.read().await.index_document(document, self.conflict_strategy())
     }
 
     /// Index multiple documents at a time
     pub async fn index_bulk(&self, documents: &Vec<Vec<u8>>) -> SummaResult<(u64, u64)> {
         let (mut success_docs, mut failed_docs) = (0u64, 0u64);
         let index_writer_holder = self.index_writer_holder()?.read().await;
+        let conflict_strategy = self.conflict_strategy();
         for document in documents {
             match SummaDocument::UnboundJsonBytes(document)
                 .bound_with(&self.index.schema())
                 .try_into()
-                .and_then(|document| index_writer_holder.index_document(document))
+                .and_then(|document| index_writer_holder.index_document(document, conflict_strategy))
             {
                 Ok(_) => success_docs += 1,
                 Err(error) => {
@@ -504,13 +531,13 @@ impl IndexHolder {
     #[cfg(feature = "tokio-rt")]
     pub fn documents<O: Send + 'static>(
         &self,
-        f: impl Fn(tantivy::Document) -> O + Clone + Send + Sync + 'static,
+        searcher: &Searcher,
+        documents_modifier: impl Fn(tantivy::schema::Document) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
-        let searcher = self.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
         let (tx, rx) = tokio::sync::mpsc::channel(segment_readers.len() * 2 + 1);
         for segment_reader in segment_readers {
-            let f = f.clone();
+            let documents_modifier = documents_modifier.clone();
             let tx = tx.clone();
             let segment_reader = segment_reader.clone();
             let span = tracing::Span::current();
@@ -523,9 +550,11 @@ impl IndexHolder {
                             info!(action = "broken_document", document = ?document);
                             return Ok::<_, Error>(());
                         };
-                        if tx.blocking_send(f(document)).is_err() {
-                            info!(action = "documents_client_dropped");
-                            return Ok::<_, Error>(());
+                        if let Some(document) = documents_modifier(document) {
+                            if tx.blocking_send(document).is_err() {
+                                info!(action = "documents_client_dropped");
+                                return Ok::<_, Error>(());
+                            }
                         }
                     }
                     Ok(())
@@ -533,5 +562,104 @@ impl IndexHolder {
             });
         }
         Ok(rx)
+    }
+
+    pub fn extract_terms_with_freq(
+        &self,
+        searcher: &Searcher,
+        field_name: &str,
+        limit: u64,
+        start_from: Option<&str>,
+        more_frequent_than: Option<u32>,
+    ) -> SummaResult<Vec<Term>> {
+        if searcher.segment_readers().len() > 1 {
+            return Err(Error::Validation(Box::new(ValidationError::InvalidSegmentsNumber(
+                searcher.segment_readers().len() as u32,
+            ))));
+        }
+        let Some(single_segment_reader) = searcher.segment_readers().first()
+        else {
+            return Err(Error::Validation(Box::new(ValidationError::InvalidSegmentsNumber(0))))
+        };
+        self.extract_terms_with_freq_from_single_segment(
+            single_segment_reader,
+            searcher.schema().get_field(field_name)?,
+            limit,
+            start_from,
+            more_frequent_than,
+        )
+    }
+
+    fn extract_terms_with_freq_from_single_segment(
+        &self,
+        segment_reader: &SegmentReader,
+        field: Field,
+        limit: u64,
+        start_from: Option<&str>,
+        more_frequent_than: Option<u32>,
+    ) -> SummaResult<Vec<Term>> {
+        let mut collected_terms = vec![];
+
+        let inverted_index = segment_reader.inverted_index(field)?;
+        let terms = inverted_index.terms();
+        info!(action = "extract_terms", segment_id = ?segment_reader.segment_id(), num_terms = terms.num_terms());
+
+        let mut stream_builder = terms.range();
+        if let Some(start_from) = start_from {
+            stream_builder = stream_builder.gt(start_from);
+        }
+        let mut term_stream = stream_builder.limit(limit).into_stream()?;
+        while let Some((term, term_info)) = term_stream.next() {
+            let term = Term::from_field_bytes(field, term);
+            if let Some(more_frequent_than) = more_frequent_than {
+                if term_info.doc_freq > more_frequent_than {
+                    collected_terms.push(term);
+                }
+            } else {
+                collected_terms.push(term);
+            }
+        }
+        Ok(collected_terms)
+    }
+
+    pub fn extract_terms(&self, searcher: &Searcher, field_name: &str, limit: u64, start_from: Option<&str>) -> SummaResult<Vec<Term>> {
+        self.extract_terms_with_freq(searcher, field_name, limit, start_from, None)
+    }
+
+    #[cfg(feature = "tokio-rt")]
+    pub async fn deduplicate_by_field(&self, field_name: &str) -> SummaResult<()> {
+        const BATCH_SIZE: u64 = 100_000;
+
+        let searcher = self.index_reader().searcher();
+        let index_writer = self.index_writer_holder()?.read().await;
+        let mut start_from = None;
+        loop {
+            let duplicated_terms = self.extract_terms_with_freq(&searcher, field_name, BATCH_SIZE, start_from.as_deref(), Some(1))?;
+            let Some(last_term) = duplicated_terms.last() else {
+                break;
+            };
+            let last_term = last_term.as_str().expect("supported only text fields").to_string();
+            info!(
+                action = "deduplicate_by_field",
+                terms_batch_start_from = start_from,
+                terms_batch_last_term = last_term,
+                duplicated_terms = duplicated_terms.len()
+            );
+            for duplicate_term in duplicated_terms {
+                let collector = tantivy::collector::TopDocs::with_limit(2);
+                let duplicated_documents = searcher.search(
+                    &tantivy::query::TermQuery::new(duplicate_term.clone(), tantivy::schema::IndexRecordOption::Basic),
+                    &collector,
+                )?;
+                // Check again because `extract_terms_with_freq` does not account deleted documents
+                if duplicated_documents.len() > 1 {
+                    let document = searcher.doc(duplicated_documents.first().expect("no documents").1)?;
+                    index_writer.delete_by_term(duplicate_term);
+                    index_writer.index_document(document, proto::ConflictStrategy::DoNothing)?;
+                }
+            }
+            start_from = Some(last_term);
+        }
+        Ok(())
     }
 }

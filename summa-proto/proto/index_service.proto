@@ -146,6 +146,14 @@ message CreateMemoryEngineRequest {}
 message CreateIpfsEngineRequest {
   ChunkedCacheConfig chunked_cache_config = 1;
 }
+
+enum ConflictStrategy {
+  DO_NOTHING = 0;
+  OVERWRITE_ALWAYS = 1;
+  OVERWRITE = 2;
+  MERGE = 3;
+}
+
 message IndexAttributes {
   // Timestamp when index has been created
   uint64 created_at = 1;
@@ -161,6 +169,7 @@ message IndexAttributes {
   optional string description = 6;
   // (Not-used)
   repeated string default_snippets = 7;
+  ConflictStrategy conflict_strategy = 8;
 }
 
 // Request for index creation

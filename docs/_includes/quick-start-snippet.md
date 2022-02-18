@@ -3,17 +3,17 @@ indexing text data and **Summa client** that is required for communicating with 
 
 Although there is a [GRPC API](/summa/apis/grpc-api) you may want to use, here we will use Summa client implemented in Python.
 
-### Setup <a name="setup"></a>
+### Install <a name="setup"></a>
 
 #### Prerequisite:
-- [Python3](https://www.python.org/downloads/)
+- [Python3](https://www.python.org/downloads/) or [grpcurl](https://github.com/fullstorydev/grpcurl)
 - [Docker](https://www.docker.com/)
 
-Both server `summa-server` and Summa client (named `aiosumma`) are distributed through the package systems, `Cargo` and `pip` correspondingly.
-Also, there is a prebuilt `summa-server` Docker image hosted on Dockerhub that we are going to use.
+`summa-server` is distributed as a prebuilt Docker image hosted on Dockerhub, or may be build from sources. Summa exposes its APIs through GRPC what 
+makes available it to use in all languages having GRPC client libraries. Additionally, there is an `aiosumma` Python packages
+that provides Python client and CLI.
 
 #### Summa Server
-`summa-server` is a main guy at the party. This tool manages search indices and allows to do search queries. 
 We are going to pull and launch `summa-server` through Docker. Pulling can be done by `docker pull`
 
 ```bash
@@ -53,21 +53,39 @@ source venv/bin/acticate
 # Install aiosumma
 pip3 install -U aiosumma
 ```
-Now we have `summa-cli` tool for doing queries to `summa-server`
 
-### Fill With Documents <a name="fill"></a>
+#### grpcurl
+
+You may also use `curl`-alike tool for reaching `summa-server` though Terminal.
+You may download its binary from [their repository](https://github.com/fullstorydev/grpcurl/releases) or install through
+brew on MacOS: `brew install grpcurl`
+
+### Create Index
+Summa is a schemaful search engines. It requires from you to define fields what you are going to use. Let's create
+a schema for WikiBooks:
+
+```bash
+# Create index schema in file
+cat << EOF > schema.yaml
+{% include summa-wiki-schema.yaml %}
+EOF
+```
+
+### Add Documents <a name="fill"></a>
 WikiBooks provides weekly dumps of their books' database. 
 Let's download their dump and index it in Summa:
 
 ```bash
 {% include download-dump-snippet.sh %}
+```
 
+```bash   
 {% include import-data-to-summa-snippet.sh %}
 ```
 
 Well, we have WikiBooks database indexed locally.
 
-### Query <a name="query"></a>
+### Search <a name="query"></a>
 Let's do a test query:
 
 ```bash

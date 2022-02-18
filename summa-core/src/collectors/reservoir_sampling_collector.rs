@@ -9,7 +9,7 @@ use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader};
 /// ```rust
 /// use summa_core::collectors::ReservoirSampling;
 /// use tantivy::collector::Count;
-/// use tantivy::query::QueryParser;
+/// use summa_core::components::QueryParser;
 /// use tantivy::schema::{Schema, TEXT};
 /// use tantivy::{doc, Index};
 ///

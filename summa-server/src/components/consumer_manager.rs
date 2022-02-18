@@ -18,6 +18,7 @@ use crate::errors::{Error, SummaServerResult, ValidationError};
 
 pub fn process_message(
     index_writer_holder: &OwnedRwLockReadGuard<IndexWriterHolder>,
+    conflict_strategy: proto::ConflictStrategy,
     schema: &Schema,
     message: Result<BorrowedMessage<'_>, KafkaError>,
 ) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
@@ -31,7 +32,7 @@ pub fn process_message(
                 .try_into()
                 .map_err(KafkaConsumingError::ParseDocument)?;
             index_writer_holder
-                .index_document(parsed_document)
+                .index_document(parsed_document, conflict_strategy)
                 .map_err(|e| KafkaConsumingError::Index(e.into()))?;
             Ok(KafkaConsumingStatus::Consumed)
         }
@@ -118,9 +119,10 @@ impl ConsumerManager {
         }
         let index_writer_holder = index_holder.index_writer_holder()?.clone().read_owned().await;
         let schema = index_holder.schema().clone();
+        let conflict_strategy = index_holder.conflict_strategy();
         prepared_consumption
             .committed_consumer_thread
-            .start(move |message| process_message(&index_writer_holder, &schema, message))
+            .start(move |message| process_message(&index_writer_holder, conflict_strategy, &schema, message))
             .await;
         self.consumptions.insert(index_holder.clone(), prepared_consumption.committed_consumer_thread);
         Ok(())

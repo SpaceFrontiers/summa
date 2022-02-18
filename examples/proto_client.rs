@@ -83,8 +83,6 @@ async fn main() -> Result<(), tonic::Status> {
     index_api_client
         .commit_index(proto::CommitIndexRequest {
             index_name: "test_index".to_string(),
-            // Does not return until commit is finished
-            commit_mode: proto::CommitMode::Sync.into(),
         })
         .await?;
     let search_response = search_api_client
@@ -92,7 +90,10 @@ async fn main() -> Result<(), tonic::Status> {
             index_queries: vec![proto::IndexQuery {
                 index_alias: "test_index".to_string(),
                 query: Some(proto::Query {
-                    query: Some(proto::query::Query::Match(proto::MatchQuery { value: "game".to_string() })),
+                    query: Some(proto::query::Query::Match(proto::MatchQuery {
+                        value: "game".to_string(),
+                        default_fields: vec!["title".to_string(), "body".to_string()],
+                    })),
                 }),
                 collectors: vec![
                     proto::Collector {
@@ -105,6 +106,7 @@ async fn main() -> Result<(), tonic::Status> {
                         collector: Some(proto::collector::Collector::Count(proto::CountCollector {})),
                     },
                 ],
+                is_fieldnorms_scoring_enabled: None,
             }],
             tags: Default::default(),
         })

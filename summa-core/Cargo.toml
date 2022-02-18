@@ -17,6 +17,9 @@ ipfs = ["iroh-metrics", "iroh-resolver", "iroh-rpc-client", "iroh-store", "iroh-
 metrics = ["opentelemetry"]
 tokio-rt = ["tokio/rt"]
 
+[dev-dependencies]
+matches = "0.1"
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -41,6 +44,8 @@ once_cell = { workspace = true }
 oneshot = { workspace = true }
 opentelemetry = { version = "0.18", features = ["rt-tokio"], optional = true }
 parking_lot = { workspace = true }
+pest = { workspace = true }
+pest_derive = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -54,6 +59,7 @@ strfmt = { workspace = true }
 summa-proto = { workspace = true }
 take_mut = { workspace = true }
 tantivy = { workspace = true }
+tantivy-query-grammar = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, default_features = false, features = ["macros", "signal-hook-registry", "sync"] }

@@ -175,10 +175,11 @@ impl IndexWriterHolder {
     }
 
     /// Delete index by its unique fields
-    pub(super) fn delete_documents_by_unique_fields(&self, document: &Document) -> SummaResult<Option<u64>> {
+    pub(super) fn resolve_conflicts(&self, document: &Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<Option<u64>> {
         if self.unique_fields.is_empty() {
             return Ok(None);
         }
+
         let unique_terms = self
             .unique_fields
             .iter()
@@ -192,6 +193,7 @@ impl IndexWriterHolder {
                 })
             })
             .collect::<SummaResult<Vec<_>>>()?;
+
         if unique_terms.is_empty() {
             Err(ValidationError::MissingUniqueField(format!(
                 "{:?}",
@@ -203,6 +205,7 @@ impl IndexWriterHolder {
         for term in unique_terms {
             last_opstamp = Some(self.delete_by_term(term))
         }
+
         Ok(last_opstamp)
     }
 
@@ -222,8 +225,8 @@ impl IndexWriterHolder {
     }
 
     /// Put document to the index. Before comes searchable it must be committed
-    pub fn index_document(&self, document: Document) -> SummaResult<()> {
-        self.delete_documents_by_unique_fields(&document)?;
+    pub fn index_document(&self, document: Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
+        self.resolve_conflicts(&document, conflict_strategy)?;
         self.index_writer.add_document(document)?;
         Ok(())
     }

@@ -146,6 +146,7 @@ impl IndexRegistry {
                                 .and_then(|query| query.query)
                                 .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {})),
                             index_query.collectors,
+                            index_query.is_fieldnorms_scoring_enabled,
                         )
                         .await
                 })

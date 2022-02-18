@@ -320,7 +320,10 @@ mod tests {
                 index_queries: vec![proto::IndexQuery {
                     index_alias: "test_index".to_string(),
                     query: Some(proto::Query {
-                        query: Some(proto::query::Query::Match(proto::MatchQuery { value: "title3".to_string() })),
+                        query: Some(proto::query::Query::Match(proto::MatchQuery {
+                            value: "title3".to_string(),
+                            default_fields: vec!["title".to_owned(), "body".to_owned()],
+                        })),
                     }),
                     collectors: vec![proto::Collector {
                         collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
@@ -332,6 +335,7 @@ mod tests {
                             fields: vec![],
                         })),
                     }],
+                    is_fieldnorms_scoring_enabled: None,
                 }],
                 tags: Default::default(),
             }))
@@ -361,7 +365,10 @@ mod tests {
                 index_queries: vec![proto::IndexQuery {
                     index_alias: "test_index".to_string(),
                     query: Some(proto::Query {
-                        query: Some(proto::query::Query::Match(proto::MatchQuery { value: "title3".to_string() })),
+                        query: Some(proto::query::Query::Match(proto::MatchQuery {
+                            value: "title3".to_string(),
+                            default_fields: vec!["title".to_owned(), "body".to_owned()],
+                        })),
                     }),
                     collectors: vec![proto::Collector {
                         collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
@@ -373,6 +380,7 @@ mod tests {
                             fields: vec![],
                         })),
                     }],
+                    is_fieldnorms_scoring_enabled: None,
                 }],
                 tags: Default::default(),
             }))

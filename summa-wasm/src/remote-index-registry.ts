@@ -6,7 +6,7 @@ export class RemoteIndexRegistry implements IIndexRegistry {
     init_guard: Promise<void>;
     search_service: Comlink.Remote<IndexRegistry>;
 
-    constructor(worker_url: URL, wasm_url: URL, options: { num_threads: number, logging_level?: string }) {
+    constructor(worker_url: URL, wasm_url: URL, options: IndexRegistryOptions) {
         this.search_service = Comlink.wrap<IndexRegistry>(
             new Worker(
                 worker_url,
@@ -38,6 +38,10 @@ export class RemoteIndexRegistry implements IIndexRegistry {
 
     commit(index_name: string): Promise<void> {
         return this.search_service.commit(index_name);
+    }
+
+    extract_terms(index_name: string, field_name: string, limit: bigint, start_from?: string): Promise<string[]> {
+        return this.search_service.extract_terms(index_name, field_name, limit, start_from);
     }
 
     async setup(

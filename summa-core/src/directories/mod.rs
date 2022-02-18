@@ -18,7 +18,7 @@ pub use external_requests::{
 };
 pub use hot_cache_directory::{create_hotcache, deserialize_cbor, HotDirectory, StaticDirectoryCache};
 #[cfg(feature = "ipfs")]
-pub use iroh::IrohDirectory;
+pub use iroh::{IrohDirectory, DEFAULT_CHUNK_SIZE};
 pub use memory_sized_cache::MemorySizedCache;
 pub use network_directory::{NetworkDirectory, NetworkFile};
 
