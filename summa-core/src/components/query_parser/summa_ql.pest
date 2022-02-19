@@ -1,5 +1,5 @@
 quote = _{ "\"" | "'" | "`" | "'" | "“" | "”" | "‘" | "«" | "»" | "„" | "`"}
-statement_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE)}
+statement_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE) | "(" | ")" }
 
 star = { "*" }
 slop = @{ DECIMAL_NUMBER+ }
@@ -7,10 +7,10 @@ boost = { (DECIMAL_NUMBER | ".")+ }
 range = ${ "[" ~ WHITE_SPACE* ~ boundary_word ~ WHITE_SPACE+ ~ ^"to" ~ WHITE_SPACE+ ~ boundary_word ~ WHITE_SPACE* ~ "]" }
 
 field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
-word = @{ ASCII_ALPHANUMERIC ~ (ASCII_ALPHANUMERIC | "_" | "+" | "#" | "-")* }
+word = @{ (LETTER | ASCII_DIGIT) ~ (LETTER | ASCII_DIGIT | "_" | "+" | "#" | "-")* }
 boundary_word = _{ word | star }
 words = @{ word ~ (WHITE_SPACE+ ~ word)* }
-phrase = ${ quote ~ words ~ quote ~ ("~" ~ slop)? }
+phrase = ${ quote ~ words? ~ (quote | EOI) ~ ("~" ~ slop)? }
 
 pre_term = _{ phrase | range | word }
 
@@ -23,5 +23,5 @@ term = { positive_term | negative_term | default_term }
 search_group = ${ field_name ~ ":" ~ (grouping | term)+ }
 
 statement = ${ (search_group | term) ~ ("^" ~ boost)? }
-statements = _{ statement ~ (statement_sep+ ~ statement)* ~ statement_sep? }
+statements = _{ statement_sep* ~ statement? ~ (statement_sep+ ~ statement)* ~ statement_sep* }
 main = _{SOI ~ statements}

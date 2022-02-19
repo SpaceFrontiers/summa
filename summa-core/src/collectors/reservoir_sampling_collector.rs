@@ -29,7 +29,7 @@ use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader};
 /// let searcher = reader.searcher();
 ///
 /// // Here comes the important part
-/// let query_parser = QueryParser::for_index(&index, vec![title]);
+/// let query_parser = QueryParser::for_index(&index, vec!["title".to_string()]).unwrap();
 /// let query = query_parser.parse_query("diary").unwrap();
 /// let documents = searcher.search(&query, &ReservoirSampling::with_limit(2)).unwrap();
 ///
