@@ -22,6 +22,7 @@ struct SummaQlParser;
 pub enum MissingFieldPolicy {
     AsUsualTerms,
     Remove,
+    Fail,
 }
 
 pub struct QueryParser {
@@ -133,19 +134,40 @@ impl QueryParser {
             })
     }
 
-    fn default_fields_literal(&self, literal: Pair<Rule>) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
+    fn default_fields_term(&self, term: Pair<Rule>) -> Result<Subqueries, QueryParserError> {
         Ok(self
             .default_fields
             .iter()
-            .map(|field| self.parse_literal(field, literal.clone()))
+            .map(|field| self.parse_term(field, term.clone()))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
             .collect())
     }
 
-    fn parse_literal(&self, field: &Field, literal: Pair<Rule>) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
-        let literal = literal.into_inner().next().expect("grammar failure");
+    fn parse_range(&self, pre_term: Pair<Rule>, field: &Field) -> Result<RangeQuery, QueryParserError> {
+        let mut range_pairs = pre_term.into_inner();
+        let field_entry = self.schema.get_field_entry(*field);
+        let left = self.parse_boundary_word(*field, range_pairs.next().expect("grammar failure"))?;
+        let right = self.parse_boundary_word(*field, range_pairs.next().expect("grammar failure"))?;
+        Ok(RangeQuery::new_term_bounds(
+            field_entry.name().to_string(),
+            field_entry.field_type().value_type(),
+            &left,
+            &right,
+        ))
+    }
+
+    fn parse_term(&self, field: &Field, term: Pair<Rule>) -> Result<Subqueries, QueryParserError> {
+        let term = term.into_inner().next().expect("grammar failure");
+        let occur = match term.as_rule() {
+            Rule::positive_term => Occur::Must,
+            Rule::negative_term => Occur::MustNot,
+            Rule::default_term => Occur::Should,
+            _ => unreachable!(),
+        };
+        let pre_term = term.into_inner().next().expect("grammar failure");
+
         let field_entry = self.schema.get_field_entry(*field);
         let field_type = field_entry.field_type();
 
@@ -154,49 +176,69 @@ impl QueryParser {
         }
 
         return match *field_type {
-            FieldType::U64(_) => {
-                let val: u64 = u64::from_str(literal.as_str())?;
-                Ok(vec![
-                    Box::new(TermQuery::new(Term::from_field_u64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
-                ])
-            }
-            FieldType::I64(_) => {
-                let val: i64 = i64::from_str(literal.as_str())?;
-                Ok(vec![
-                    Box::new(TermQuery::new(Term::from_field_i64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
-                ])
-            }
-            FieldType::F64(_) => {
-                let val: f64 = f64::from_str(literal.as_str())?;
-                Ok(vec![
-                    Box::new(TermQuery::new(Term::from_field_f64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
-                ])
-            }
-            FieldType::Bool(_) => {
-                let val: bool = bool::from_str(literal.as_str())?;
-                Ok(vec![
-                    Box::new(TermQuery::new(Term::from_field_bool(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
-                ])
-            }
+            FieldType::U64(_) => match pre_term.as_rule() {
+                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::phrase | Rule::word => {
+                    let val: u64 = u64::from_str(pre_term.as_str())?;
+                    Ok(vec![(
+                        occur,
+                        Box::new(TermQuery::new(Term::from_field_u64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                    )])
+                }
+                _ => unreachable!(),
+            },
+            FieldType::I64(_) => match pre_term.as_rule() {
+                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::phrase | Rule::word => {
+                    let val: i64 = i64::from_str(pre_term.as_str())?;
+                    Ok(vec![(
+                        occur,
+                        Box::new(TermQuery::new(Term::from_field_i64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                    )])
+                }
+                _ => unreachable!(),
+            },
+            FieldType::F64(_) => match pre_term.as_rule() {
+                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::phrase | Rule::word => {
+                    let val: f64 = f64::from_str(pre_term.as_str())?;
+                    Ok(vec![(
+                        occur,
+                        Box::new(TermQuery::new(Term::from_field_f64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                    )])
+                }
+                _ => unreachable!(),
+            },
+            FieldType::Bool(_) => match pre_term.as_rule() {
+                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::phrase | Rule::word => {
+                    let val: bool = bool::from_str(pre_term.as_str())?;
+                    Ok(vec![(
+                        occur,
+                        Box::new(TermQuery::new(Term::from_field_bool(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                    )])
+                }
+                _ => unreachable!(),
+            },
             FieldType::Str(ref str_options) => {
                 let option = str_options.get_indexing_options().ok_or_else(|| {
                     // This should have been seen earlier really.
                     QueryParserError::FieldNotIndexed(field_entry.name().to_string())
                 })?;
                 let text_analyzer = self.get_text_analyzer(field_entry, option)?;
-                match literal.as_rule() {
+                match pre_term.as_rule() {
                     Rule::word | Rule::field_name => {
-                        let mut token_stream = text_analyzer.token_stream(literal.as_str());
+                        let mut token_stream = text_analyzer.token_stream(pre_term.as_str());
                         let mut term_queries = Vec::new();
                         token_stream.process(&mut |token| {
                             let term_query =
                                 Box::new(TermQuery::new(Term::from_field_text(*field, &token.text), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
-                            term_queries.push(term_query);
+                            term_queries.push((occur, term_query));
                         });
                         Ok(term_queries)
                     }
                     Rule::phrase => {
-                        let mut phrase_pairs = literal.into_inner();
+                        let mut phrase_pairs = pre_term.into_inner();
                         let words = phrase_pairs.next().expect("grammar failure");
                         let slop = phrase_pairs.next().map(|v| u32::from_str(v.as_str()).expect("grammar failure")).unwrap_or(0);
                         let mut token_stream = text_analyzer.token_stream(words.as_str());
@@ -208,14 +250,15 @@ impl QueryParser {
                         if terms.len() <= 1 {
                             return Ok(terms
                                 .into_iter()
-                                .map(|(_, term)| Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>)
+                                .map(|(_, term)| (occur, Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>))
                                 .collect());
                         }
                         if !option.index_option().has_positions() {
                             return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
                         }
-                        return Ok(vec![Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop))]);
+                        return Ok(vec![(occur, Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)))]);
                     }
+                    Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
                     _ => unreachable!(),
                 }
             }
@@ -286,76 +329,79 @@ impl QueryParser {
         })
     }
 
-    fn parse_statement(&self, pair: Pair<Rule>) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
+    fn parse_statement(&self, pair: Pair<Rule>) -> Result<Subqueries, QueryParserError> {
         let mut statement_pairs = pair.into_inner();
-        let statement = statement_pairs.next().expect("grammar failure");
+        let search_group_or_term = statement_pairs.next().expect("grammar failure");
         let boost = statement_pairs.next().map(|boost| f32::from_str(boost.as_str()).expect("grammar failure"));
-        let mut statement_result = match statement.as_rule() {
+        let statement_result = match search_group_or_term.as_rule() {
             Rule::search_group => {
-                let mut search_group = statement.into_inner();
+                let mut search_group = search_group_or_term.into_inner();
                 let field_name = search_group.next().expect("grammar failure");
-                let literal_or_range = search_group.next().expect("grammar failure");
-                match literal_or_range.as_rule() {
-                    Rule::literal => match self.schema.get_field(field_name.as_str()) {
-                        Ok(field) => self.parse_literal(&field, literal_or_range),
+                let grouping_or_term = search_group.next().expect("grammar failure");
+                match grouping_or_term.as_rule() {
+                    Rule::grouping => {
+                        let mut intermediate_results = vec![];
+                        match self.schema.get_field(field_name.as_str()) {
+                            Ok(field) => {
+                                for term in grouping_or_term.into_inner() {
+                                    intermediate_results.push(self.parse_term(&field, term)?)
+                                }
+                            }
+                            Err(tantivy::TantivyError::FieldNotFound(_)) => match self.missing_field_policy {
+                                MissingFieldPolicy::AsUsualTerms => {
+                                    intermediate_results.push(self.default_fields_term(field_name)?);
+                                    for term in grouping_or_term.into_inner() {
+                                        intermediate_results.push(self.default_fields_term(term)?)
+                                    }
+                                }
+                                MissingFieldPolicy::Remove => return Ok(vec![]),
+                                MissingFieldPolicy::Fail => return Err(QueryParserError::FieldDoesNotExist(field_name.as_str().to_string())),
+                            },
+                            _ => unreachable!(),
+                        }
+                        Ok(intermediate_results.into_iter().flatten().collect())
+                    }
+                    Rule::term => match self.schema.get_field(field_name.as_str()) {
+                        Ok(field) => self.parse_term(&field, grouping_or_term),
                         Err(tantivy::TantivyError::FieldNotFound(_)) => match self.missing_field_policy {
                             MissingFieldPolicy::AsUsualTerms => Ok(self
-                                .default_fields_literal(field_name)?
+                                .default_fields_term(field_name)?
                                 .into_iter()
-                                .chain(self.default_fields_literal(literal_or_range)?.into_iter())
+                                .chain(self.default_fields_term(grouping_or_term)?.into_iter())
                                 .collect()),
                             MissingFieldPolicy::Remove => Ok(vec![]),
+                            MissingFieldPolicy::Fail => Err(QueryParserError::FieldDoesNotExist(field_name.as_str().to_string())),
                         },
                         _ => unreachable!(),
                     },
-                    Rule::range => {
-                        let mut range_pairs = literal_or_range.into_inner();
-                        let field = self.schema.get_field(field_name.as_str()).expect("grammar failure");
-                        let field_entry = self.schema.get_field_entry(field);
-                        let left = self.parse_boundary_word(field, range_pairs.next().expect("grammar failure"))?;
-                        let right = self.parse_boundary_word(field, range_pairs.next().expect("grammar failure"))?;
-                        Ok(vec![Box::new(RangeQuery::new_term_bounds(
-                            field_entry.name().to_string(),
-                            field_entry.field_type().value_type(),
-                            &left,
-                            &right,
-                        )) as Box<dyn Query>])
-                    }
                     _ => unreachable!(),
                 }
             }
-            Rule::literal => self.default_fields_literal(statement),
+            Rule::term => self.default_fields_term(search_group_or_term),
             e => panic!("{e:?}"),
-        };
+        }?;
         if let Some(boost) = boost {
-            statement_result = statement_result.map(|statement_result| {
-                statement_result
-                    .into_iter()
-                    .map(|q| Box::new(BoostQuery::new(q, boost)) as Box<dyn Query>)
-                    .collect()
-            })
+            Ok(statement_result
+                .into_iter()
+                .map(|(occur, query)| (occur, Box::new(BoostQuery::new(query, boost)) as Box<dyn Query>))
+                .collect())
+        } else {
+            Ok(statement_result)
         }
-        statement_result
     }
 
-    fn process_pairs(&self, pairs: Pairs<Rule>) -> Result<Subqueries, QueryParserError> {
+    fn parse_statements(&self, pairs: Pairs<Rule>) -> Result<Subqueries, QueryParserError> {
         let mut subqueries = Subqueries::new();
         for pair in pairs {
-            let (occur, statement) = match pair.as_rule() {
-                Rule::default_expression => (Occur::Should, pair),
-                Rule::positive_expression => (Occur::Must, pair),
-                Rule::negative_expression => (Occur::MustNot, pair),
-                _ => unreachable!(),
-            };
-            let terms = self.parse_statement(statement.into_inner().next().expect("grammar failure"))?;
-            subqueries.extend(terms.into_iter().map(|term| (occur, term)));
+            let parsed_queries = self.parse_statement(pair)?;
+            subqueries.extend(parsed_queries);
         }
-        return Ok(subqueries);
+        Ok(subqueries)
     }
 
     pub(crate) fn parse_query(&self, query: &str) -> Result<Box<dyn Query>, QueryParserError> {
         let pairs = SummaQlParser::parse(Rule::main, query).map_err(Box::new)?;
-        Ok(Box::new(BooleanQuery::new(self.process_pairs(pairs)?)))
+        Ok(Box::new(BooleanQuery::new(self.parse_statements(pairs)?)))
     }
 }
 
@@ -396,12 +442,12 @@ mod tests {
             format!("{:?}", query),
             "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
         );
-        let query = query_parser.parse_query("+body:search -engine");
+        let query = query_parser.parse_query("body:+search -engine");
         assert_eq!(
             format!("{:?}", query),
             "Ok(BooleanQuery { subqueries: [(Must, TermQuery(Term(type=Str, field=1, \"search\"))), (MustNot, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
         );
-        let query = query_parser.parse_query("+body:'search engine'");
+        let query = query_parser.parse_query("body:+'search engine'");
         assert_eq!(
             format!("{:?}", query),
             "Ok(BooleanQuery { subqueries: [(Must, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engine\"))], slop: 0 })] })"
@@ -439,7 +485,9 @@ mod tests {
             "Ok(BooleanQuery { subqueries: [(Should, RangeQuery { field: \"body\", value_type: Str, left_bound: Included([97]), right_bound: Unbounded })] })"
         );
         let query = query_parser.parse_query("timestamp:[ 1000 to 2000 ]");
-        assert_eq!(format!("{:?}", query), "");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]) })] })");
+        let query = query_parser.parse_query("timestamp:(-[1100 to 1200] [ 1000 to 2000 ] -1500 +3000)");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(MustNot, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 4, 76]), right_bound: Included([128, 0, 0, 0, 0, 0, 4, 176]) }), (Should, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]) }), (MustNot, TermQuery(Term(type=I64, field=2, 1500))), (Must, TermQuery(Term(type=I64, field=2, 3000)))] })");
         Ok(())
     }
 }

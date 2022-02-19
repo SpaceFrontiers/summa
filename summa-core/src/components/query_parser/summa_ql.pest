@@ -1,7 +1,5 @@
-// doi = @{ "doi.org/"? ~ "10." ~ ASCII_DIGIT{4,9} ~ WHITE_SPACE? ~ "/" ~ WHITE_SPACE? ~ ("-" | "." | "_" | ";" | "(" | ")" | "<" | ">" | "/" | ":" | ASCII)+ }
-
 quote = _{ "\"" | "'" | "`" | "'" | "“" | "”" | "‘" | "«" | "»" | "„" | "`"}
-expression_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE)}
+statement_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE)}
 
 star = { "*" }
 slop = @{ DECIMAL_NUMBER+ }
@@ -9,20 +7,21 @@ boost = { (DECIMAL_NUMBER | ".")+ }
 range = ${ "[" ~ WHITE_SPACE* ~ boundary_word ~ WHITE_SPACE+ ~ ^"to" ~ WHITE_SPACE+ ~ boundary_word ~ WHITE_SPACE* ~ "]" }
 
 field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
-word = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_" | "+" | "#" | "-")* }
+word = @{ ASCII_ALPHANUMERIC ~ (ASCII_ALPHANUMERIC | "_" | "+" | "#" | "-")* }
 boundary_word = _{ word | star }
 words = @{ word ~ (WHITE_SPACE+ ~ word)* }
 phrase = ${ quote ~ words ~ quote ~ ("~" ~ slop)? }
-literal = { phrase | word }
-search_group = ${ field_name ~ ":" ~ (range | literal) }
 
-statement = ${ (search_group | literal) ~ ("^" ~ boost)? }
+pre_term = _{ phrase | range | word }
 
-positive_expression = ${ "+" ~ statement }
-negative_expression = ${ "-" ~ statement }
-default_expression = ${ statement }
+positive_term = ${ "+" ~ pre_term }
+negative_term = ${ "-" ~ pre_term }
+default_term = ${ pre_term }
 
-expression = _{ positive_expression | negative_expression | default_expression }
+grouping = { "(" ~ WHITE_SPACE? ~ term ~ (WHITE_SPACE ~ term)* ~ WHITE_SPACE? ~ ")" }
+term = { positive_term | negative_term | default_term }
+search_group = ${ field_name ~ ":" ~ (grouping | term)+ }
 
-expressions = _{ expression ~ (expression_sep+ ~ expression)* ~ expression_sep? }
-main = _{SOI ~ expressions}
+statement = ${ (search_group | term) ~ ("^" ~ boost)? }
+statements = _{ statement ~ (statement_sep+ ~ statement)* ~ statement_sep? }
+main = _{SOI ~ statements}
