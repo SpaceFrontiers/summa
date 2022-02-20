@@ -184,7 +184,7 @@ impl QueryParser {
             FieldType::U64(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
                 Rule::phrase | Rule::word => {
-                    let val: u64 = u64::from_str(pre_term.as_str())?;
+                    let val: u64 = u64::from_str(pre_term.as_str()).unwrap();
                     Ok(vec![(
                         occur,
                         Box::new(TermQuery::new(Term::from_field_u64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
@@ -195,7 +195,7 @@ impl QueryParser {
             FieldType::I64(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
                 Rule::phrase | Rule::word => {
-                    let val: i64 = i64::from_str(pre_term.as_str())?;
+                    let val: i64 = i64::from_str(pre_term.as_str()).unwrap();
                     Ok(vec![(
                         occur,
                         Box::new(TermQuery::new(Term::from_field_i64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
@@ -206,7 +206,7 @@ impl QueryParser {
             FieldType::F64(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
                 Rule::phrase | Rule::word => {
-                    let val: f64 = f64::from_str(pre_term.as_str())?;
+                    let val: f64 = f64::from_str(pre_term.as_str()).unwrap();
                     Ok(vec![(
                         occur,
                         Box::new(TermQuery::new(Term::from_field_f64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
@@ -217,7 +217,7 @@ impl QueryParser {
             FieldType::Bool(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
                 Rule::phrase | Rule::word => {
-                    let val: bool = bool::from_str(pre_term.as_str())?;
+                    let val: bool = bool::from_str(pre_term.as_str()).unwrap();
                     Ok(vec![(
                         occur,
                         Box::new(TermQuery::new(Term::from_field_bool(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
@@ -426,7 +426,7 @@ impl QueryParser {
 
 #[cfg(test)]
 mod tests {
-    use tantivy::schema::{INDEXED, TEXT};
+    use tantivy::schema::{INDEXED, STRING, TEXT};
 
     use super::*;
 
@@ -436,6 +436,7 @@ mod tests {
         schema_builder.add_text_field("title", TEXT);
         schema_builder.add_text_field("body", TEXT);
         schema_builder.add_i64_field("timestamp", INDEXED);
+        schema_builder.add_text_field("doi", STRING);
         let schema = schema_builder.build();
         let default_fields = vec!["title".to_string()];
         QueryParser::new(schema, default_fields, &tokenizer_manager).expect("cannot create parser")
@@ -463,6 +464,10 @@ mod tests {
         assert_eq!(
             format!("{:?}", query_parser.parse_query("body:'search engine'")),
             "Ok(BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engine\"))], slop: 0 })] })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("timestamp:10")),
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=I64, field=2, 10)))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("title:search engine")),
@@ -507,6 +512,18 @@ mod tests {
         assert_eq!(
             format!("{:?}", query_parser.parse_query("(a)(b)`")),
             "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"a\"))), (Should, TermQuery(Term(type=Str, field=0, \"b\")))] })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("doi:'10.1182/blood.v53.1.19.bloodjournal53119'")),
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=3, \"10.1182/blood.v53.1.19.bloodjournal53119\")))] })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("doi:10.1182/blood.v53.1.19.bloodjournal53119")),
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=3, \"10.1182/blood.v53.1.19.bloodjournal53119\")))] })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("10.10 10/10")),
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\")))] })"
         );
     }
 
