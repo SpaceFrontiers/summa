@@ -71,7 +71,7 @@ Your index must have IPFS engine:
 
 ```bash
 # Copy existing File index to IPFS engine
-summa-cli 0.0.0.0:8082 copy-index test_index test_index_ipfs Ipfs
+summa-cli 0.0.0.0:8082 copy-index test_index test_index_ipfs '{"ipfs": {}}'
 ```
 
 After, you will see the CID of the index that can be used for replication and accessing the index through Summa WASM bindings in browsers.

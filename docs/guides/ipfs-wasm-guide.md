@@ -5,13 +5,13 @@ nav_order: 2
 ---
 
 ### Configuring Summa and the index
-First, you should set up Summa Server with Iroh Store (enabled by default) and create a test index using our [Quick-Start guide](/summa/guides/quick-start) 
+First, you should set up Summa Server with Iroh Store (enabled by default) and create a test index using our [Quick-Start guide](/summa/quick-start) 
 
 ### Publish the index to IPFS
 To publish the index, we need to change its engine to IPFS. Then, Iroh P2P will automatically make it available to your IPFS peers:
 
 ```bash 
-summa-cli localhost:8082 - copy-index books books_iroh Ipfs
+summa-cli localhost:8082 - copy-index books books_iroh '{"ipfs": {}}'
 ```
 The command will return the CID of the published index that you can use later for replicating or opening it through the browser.
 For example, you can find your index using `kubo`:
@@ -44,12 +44,12 @@ Now we are ready to instantiate `summa-wasm`
 // that supports `Range` queries and used to access index files
 const directory_url = `http://localhost:8080/ipfs/${ipfs_hash}/`;
 
-const worker_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.98.2/dist/root-worker.js";
-const wasm_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.98.2/dist/index_bg.wasm"
+const worker_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.108.2/dist/root-worker.js";
+const wasm_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.108.2/dist/index_bg.wasm"
 
 // `remote_index_registry` is an object used to spawn threads for searching
 // `setup` initializes WASM-module and pool of Web Workers.
-const remote_index_registry = new Summa.RemoteIndexRegistry(worker_url, wasm_url, {num_threads: 4});
+const remote_index_registry = new Summa.RemoteIndexRegistry(worker_url, wasm_url);
 // Wait until workers will be set up
 await remote_index_registry.init_guard;
 ```
@@ -75,7 +75,7 @@ Then, when you will do a search:
 // All types of queries are supported
 const index_query = {
     index_alias: "test_index",
-    query: {query: {match: {value: "Games of Thrones"}}},
+    query: {query: {match: {value: "Game of Thrones"}}},
     collectors: [{collector: {top_docs: {limit: 5}}}],
 }
 const response = await remote_index_registry.search([ index_query ]);

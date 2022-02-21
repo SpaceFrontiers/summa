@@ -247,7 +247,7 @@ Now let's delve into using Summa to build an uncensorable web.
 
 ### Create a search index on the server
 
-Basic example on how to create a search index with Summa you may find in [Quick-start guide](/summa/guides/quick-start).
+Basic example on how to create a search index with Summa you may find in [Quick-start guide](/summa/quick-start).
 The process is not different from any familiar to you process of database population with data.
 
 ### Create web-interface that uses this search index

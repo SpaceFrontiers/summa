@@ -16,7 +16,7 @@ inside your browser, enabling you to search in network published indices without
 on remote servers.
 
 If you're ready to start, be sure to check out our docs:
-- [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start)
+- [Quick Start guide](https://izihawa.github.io/summa/quick-start)
 - Detailed [Core documentation](https://izihawa.github.io/summa/core)
 
 ## Key Features
@@ -30,7 +30,7 @@ If you're ready to start, be sure to check out our docs:
 
 ## Online-documentation
 
-- [Quick Start guide](https://izihawa.github.io/summa/guides/quick-start)
+- [Quick Start guide](https://izihawa.github.io/summa/quick-start)
 - [Core documentation](https://izihawa.github.io/summa/core)
 - [github.io](https://izihawa.github.io/summa)
 
