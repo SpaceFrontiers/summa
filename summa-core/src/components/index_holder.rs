@@ -27,9 +27,9 @@ use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, ProtoQueryParser};
 use crate::components::fruit_extractors::IntermediateExtractionResult;
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{Driver, IndexWriterHolder, SummaDocument, CACHE_METRICS};
+use crate::components::{Driver, IndexWriterHolder, SummaDocument};
 use crate::configs::ConfigProxy;
-use crate::directories::{ChunkedCachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
+use crate::directories::{CachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
 use crate::proto_traits::Wrapper;
 use crate::Error;
@@ -101,7 +101,7 @@ pub async fn cleanup_index(index_engine_config: proto::IndexEngineConfig) -> Sum
 fn wrap_with_caches<D: Directory>(
     directory: D,
     hotcache_bytes: Option<OwnedBytes>,
-    chunked_cache_config: Option<&proto::ChunkedCacheConfig>,
+    cache_config: Option<proto::CacheConfig>,
 ) -> SummaResult<Box<dyn Directory>> {
     let static_cache = hotcache_bytes.map(StaticDirectoryCache::open).transpose()?;
     info!(action = "opened_static_cache");
@@ -112,20 +112,12 @@ fn wrap_with_caches<D: Directory>(
 
     info!(action = "read_file_lengths", file_lengths = ?file_lengths);
     let file_stats = FileStats::from_file_lengths(file_lengths);
-    let next_directory = match &chunked_cache_config {
-        Some(chunked_cache_config) => match chunked_cache_config.cache_size {
-            Some(cache_size) => Box::new(ChunkedCachingDirectory::new_with_capacity_in_bytes(
-                Box::new(directory),
-                chunked_cache_config.chunk_size,
-                cache_size as usize,
-                CACHE_METRICS.clone(),
-                file_stats,
-            )) as Box<dyn Directory>,
-            None => Box::new(ChunkedCachingDirectory::new(Box::new(directory), chunked_cache_config.chunk_size, file_stats)) as Box<dyn Directory>,
-        },
-        None => Box::new(directory) as Box<dyn Directory>,
+    let next_directory = if let Some(cache_config) = cache_config {
+        Box::new(CachingDirectory::bounded(Arc::new(directory), cache_config.cache_size as usize, file_stats)) as Box<dyn Directory>
+    } else {
+        Box::new(directory) as Box<dyn Directory>
     };
-    info!(action = "wrapped_with_cache", chunked_cache_config = ?chunked_cache_config);
+    info!(action = "wrapped_with_cache");
     Ok(match static_cache {
         Some(static_cache) => {
             let hot_directory = HotDirectory::open(next_directory, static_cache);
@@ -268,7 +260,7 @@ impl IndexHolder {
                 None
             }
         };
-        let directory = wrap_with_caches(network_directory, hotcache_bytes, remote_engine_config.chunked_cache_config.as_ref())?;
+        let directory = wrap_with_caches(network_directory, hotcache_bytes, remote_engine_config.cache_config)?;
         Ok(Index::open(directory)?)
     }
 
@@ -286,14 +278,10 @@ impl IndexHolder {
             store,
             Driver::current_tokio(),
             &ipfs_engine_config.cid,
-            ipfs_engine_config
-                .chunked_cache_config
-                .as_ref()
-                .map(|chunked_cache_config| chunked_cache_config.chunk_size)
-                .unwrap_or(crate::directories::iroh::directory::DEFAULT_CHUNK_SIZE),
+            crate::directories::iroh::directory::DEFAULT_CHUNK_SIZE,
         )
         .await?;
-        let chunked_cache_config = ipfs_engine_config.chunked_cache_config.clone();
+        let cache_config = ipfs_engine_config.cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
                 if read_only {
@@ -311,12 +299,10 @@ impl IndexHolder {
             }
         };
         #[cfg(feature = "tokio-rt")]
-        let index = tokio::task::spawn_blocking(move || {
-            Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?)?)
-        })
-        .await??;
+        let index =
+            tokio::task::spawn_blocking(move || Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, cache_config)?)?)).await??;
         #[cfg(not(feature = "tokio-rt"))]
-        let index = Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, chunked_cache_config.as_ref())?);
+        let index = Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, cache_config.as_ref())?);
         info!(action = "opened", config = ?ipfs_engine_config);
         Ok(index)
     }

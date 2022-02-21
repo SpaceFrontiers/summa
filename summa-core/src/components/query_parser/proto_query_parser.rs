@@ -15,6 +15,7 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
+use tracing::info;
 
 use crate::components::query_parser::{QueryParser, QueryParserError};
 use crate::errors::{Error, SummaResult, ValidationError};
@@ -145,7 +146,10 @@ impl ProtoQueryParser {
             proto::query::Query::Match(match_query_proto) => {
                 let nested_query_parser = QueryParser::for_index(&self.index, match_query_proto.default_fields)?;
                 match nested_query_parser.parse_query(&match_query_proto.value) {
-                    Ok(parsed_query) => Ok(parsed_query),
+                    Ok(parsed_query) => {
+                        info!(parsed_match_query = ?parsed_query);
+                        Ok(parsed_query)
+                    }
                     Err(QueryParserError::FieldDoesNotExist(field)) => Err(ValidationError::MissingField(field).into()),
                     Err(e) => Err(Error::InvalidQuerySyntax(Box::new(e), match_query_proto.value.to_owned())),
                 }?

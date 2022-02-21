@@ -1,4 +1,4 @@
-import {ChunkedCacheConfig, RemoteEngineConfig} from "./configs";
+import {CacheConfig, RemoteEngineConfig} from "./configs";
 import {get_ipfs_hostname, get_ipfs_url} from "./utils";
 import axios from "axios";
 
@@ -8,14 +8,14 @@ export interface IIndexSeed {
 
 export class LocalDatabaseSeed implements IIndexSeed {
   ipfs_path: string;
-  chunked_cache_config: ChunkedCacheConfig;
+  cache_config: CacheConfig;
 
-  constructor(ipfs_path: string, chunked_cache_config: ChunkedCacheConfig) {
+  constructor(ipfs_path: string, cache_config: CacheConfig) {
     if (!ipfs_path.endsWith("/")) {
       ipfs_path += "/";
     }
     this.ipfs_path = ipfs_path;
-    this.chunked_cache_config = chunked_cache_config;
+    this.cache_config = cache_config;
   }
 
   async retrieve_remote_engine_config(): Promise<RemoteEngineConfig> {
@@ -23,19 +23,19 @@ export class LocalDatabaseSeed implements IIndexSeed {
       "GET",
       `${this.ipfs_path}{file_name}`,
       new Map([["range", "bytes={start}-{end}"]]),
-      this.chunked_cache_config,
+      this.cache_config,
     );
   }
 }
 
 export class IpfsDatabaseSeed implements IIndexSeed {
   ipfs_path: string;
-  chunked_cache_config: ChunkedCacheConfig;
+  cache_config: CacheConfig;
   ipfs_url?: string;
 
-  constructor(ipfs_path: string, chunked_cache_config: ChunkedCacheConfig, ipfs_url?: string) {
+  constructor(ipfs_path: string, cache_config: CacheConfig, ipfs_url?: string) {
     this.ipfs_path = ipfs_path;
-    this.chunked_cache_config = chunked_cache_config;
+    this.cache_config = cache_config;
     this.ipfs_url = ipfs_url;
   }
 
@@ -75,14 +75,14 @@ export class IpfsDatabaseSeed implements IIndexSeed {
         "GET",
         `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
         new Map([["range", "bytes={start}-{end}"]]),
-        this.chunked_cache_config
+        this.cache_config
       );
     } catch {
       return new RemoteEngineConfig(
         "GET",
         `${ipfs_http_protocol}//${ipfs_hostname}/ipfs/${ipfs_hash}/{file_name}`,
         new Map([["range", "bytes={start}-{end}"]]),
-        this.chunked_cache_config
+        this.cache_config
       );
     }
   }

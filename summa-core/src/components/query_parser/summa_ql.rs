@@ -12,6 +12,7 @@ use tantivy::{Index, Term};
 use tantivy_query_grammar::Occur;
 
 use crate::errors::SummaResult;
+use crate::utils::transpose;
 use crate::validators;
 
 #[derive(Parser)]
@@ -29,6 +30,7 @@ pub struct QueryParser {
     default_fields: Vec<Field>,
     tokenizer_manager: TokenizerManager,
     missing_field_policy: MissingFieldPolicy,
+    limit: usize,
 }
 
 /// Possible error that may happen when parsing a query.
@@ -119,6 +121,7 @@ impl QueryParser {
             default_fields,
             tokenizer_manager: tokenizer_manager.clone(),
             missing_field_policy: MissingFieldPolicy::Remove,
+            limit: 16,
         })
     }
 
@@ -140,14 +143,34 @@ impl QueryParser {
     }
 
     fn default_fields_term(&self, term: Pair<Rule>) -> Result<Subqueries, QueryParserError> {
-        Ok(self
+        let term = term.into_inner().next().expect("grammar failure");
+        let occur = self.parse_occur(&term);
+        let pre_term = term.into_inner().next().expect("grammar failure");
+        let default_field_queries = self
             .default_fields
             .iter()
-            .map(|field| self.parse_term(field, term.clone()))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect())
+            .map(|field| self.parse_pre_term(field, pre_term.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(match occur {
+            Occur::Should | Occur::MustNot => default_field_queries.into_iter().flatten().map(|q| (occur, q)).collect(),
+            Occur::Must => {
+                if self.default_fields.len() == 1 {
+                    default_field_queries.into_iter().flatten().map(|q| (Occur::Must, q)).collect()
+                } else {
+                    let transposed_default_field_queries = transpose(default_field_queries);
+                    transposed_default_field_queries
+                        .into_iter()
+                        .map(|queries| {
+                            (
+                                Occur::Must,
+                                Box::new(BooleanQuery::new(queries.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>,
+                            )
+                        })
+                        .collect()
+                }
+            }
+        })
     }
 
     fn parse_range(&self, pre_term: Pair<Rule>, field: &Field) -> Result<RangeQuery, QueryParserError> {
@@ -163,16 +186,7 @@ impl QueryParser {
         ))
     }
 
-    fn parse_term(&self, field: &Field, term: Pair<Rule>) -> Result<Subqueries, QueryParserError> {
-        let term = term.into_inner().next().expect("grammar failure");
-        let occur = match term.as_rule() {
-            Rule::positive_term => Occur::Must,
-            Rule::negative_term => Occur::MustNot,
-            Rule::default_term => Occur::Should,
-            _ => unreachable!(),
-        };
-        let pre_term = term.into_inner().next().expect("grammar failure");
-
+    fn parse_pre_term(&self, field: &Field, pre_term: Pair<Rule>) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(*field);
         let field_type = field_entry.field_type();
 
@@ -182,46 +196,42 @@ impl QueryParser {
 
         return match *field_type {
             FieldType::U64(_) => match pre_term.as_rule() {
-                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
-                    let val: u64 = u64::from_str(pre_term.as_str()).unwrap();
-                    Ok(vec![(
-                        occur,
-                        Box::new(TermQuery::new(Term::from_field_u64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                    )])
+                    let val: u64 = u64::from_str(pre_term.as_str())?;
+                    Ok(vec![
+                        Box::new(TermQuery::new(Term::from_field_u64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
+                    ])
                 }
                 _ => unreachable!(),
             },
             FieldType::I64(_) => match pre_term.as_rule() {
-                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
-                    let val: i64 = i64::from_str(pre_term.as_str()).unwrap();
-                    Ok(vec![(
-                        occur,
-                        Box::new(TermQuery::new(Term::from_field_i64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                    )])
+                    let val: i64 = i64::from_str(pre_term.as_str())?;
+                    Ok(vec![
+                        Box::new(TermQuery::new(Term::from_field_i64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
+                    ])
                 }
                 _ => unreachable!(),
             },
             FieldType::F64(_) => match pre_term.as_rule() {
-                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
-                    let val: f64 = f64::from_str(pre_term.as_str()).unwrap();
-                    Ok(vec![(
-                        occur,
-                        Box::new(TermQuery::new(Term::from_field_f64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                    )])
+                    let val: f64 = f64::from_str(pre_term.as_str())?;
+                    Ok(vec![
+                        Box::new(TermQuery::new(Term::from_field_f64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
+                    ])
                 }
                 _ => unreachable!(),
             },
             FieldType::Bool(_) => match pre_term.as_rule() {
-                Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
-                    let val: bool = bool::from_str(pre_term.as_str()).unwrap();
-                    Ok(vec![(
-                        occur,
-                        Box::new(TermQuery::new(Term::from_field_bool(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                    )])
+                    let val: bool = bool::from_str(pre_term.as_str())?;
+                    Ok(vec![
+                        Box::new(TermQuery::new(Term::from_field_bool(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>
+                    ])
                 }
                 _ => unreachable!(),
             },
@@ -238,7 +248,7 @@ impl QueryParser {
                         token_stream.process(&mut |token| {
                             let term_query =
                                 Box::new(TermQuery::new(Term::from_field_text(*field, &token.text), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
-                            term_queries.push((occur, term_query));
+                            term_queries.push(term_query);
                         });
                         Ok(term_queries)
                     }
@@ -264,20 +274,36 @@ impl QueryParser {
                         if terms.len() <= 1 {
                             return Ok(terms
                                 .into_iter()
-                                .map(|(_, term)| (occur, Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>))
+                                .map(|(_, term)| Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>)
                                 .collect());
                         }
                         if !option.index_option().has_positions() {
                             return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
                         }
-                        return Ok(vec![(occur, Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)))]);
+                        return Ok(vec![Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop))]);
                     }
-                    Rule::range => Ok(vec![(occur, Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>)]),
+                    Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                     _ => unreachable!(),
                 }
             }
             _ => unreachable!(),
         };
+    }
+
+    fn parse_occur(&self, occur: &Pair<Rule>) -> Occur {
+        match occur.as_rule() {
+            Rule::positive_term => Occur::Must,
+            Rule::negative_term => Occur::MustNot,
+            Rule::default_term => Occur::Should,
+            _ => unreachable!(),
+        }
+    }
+
+    fn parse_term(&self, field: &Field, term: Pair<Rule>) -> Result<Subqueries, QueryParserError> {
+        let term = term.into_inner().next().expect("grammar_failure");
+        let occur = self.parse_occur(&term);
+        let pre_term = term.into_inner().next().expect("grammar failure");
+        Ok(self.parse_pre_term(field, pre_term)?.into_iter().map(|q| (occur, q)).collect())
     }
 
     fn compute_boundary_term(&self, field: Field, phrase: &str) -> Result<Term, QueryParserError> {
@@ -358,7 +384,7 @@ impl QueryParser {
                         match self.schema.get_field(field_name.as_str()) {
                             Ok(field) => {
                                 for term in grouping_or_term.into_inner() {
-                                    intermediate_results.push(self.parse_term(&field, term)?)
+                                    intermediate_results.push(self.parse_term(&field, term)?);
                                 }
                             }
                             Err(tantivy::TantivyError::FieldNotFound(_)) => match self.missing_field_policy {
@@ -408,6 +434,9 @@ impl QueryParser {
         let mut subqueries = Subqueries::new();
         for pair in pairs {
             let parsed_queries = self.parse_statement(pair)?;
+            if subqueries.len() + parsed_queries.len() > self.limit {
+                break;
+            }
             subqueries.extend(parsed_queries);
         }
         Ok(subqueries)
@@ -416,7 +445,7 @@ impl QueryParser {
     pub fn parse_query(&self, query: &str) -> Result<Box<dyn Query>, QueryParserError> {
         let pairs = SummaQlParser::parse(Rule::main, query).map_err(Box::new)?;
         let parsed = self.parse_statements(pairs)?;
-        if parsed.len() == 0 {
+        if parsed.is_empty() {
             Ok(Box::new(tantivy::query::EmptyQuery {}) as Box<dyn Query>)
         } else {
             Ok(Box::new(BooleanQuery::new(parsed)) as Box<dyn Query>)
@@ -426,9 +455,11 @@ impl QueryParser {
 
 #[cfg(test)]
 mod tests {
-    use tantivy::schema::{INDEXED, STRING, TEXT};
+    use tantivy::schema::{TextOptions, INDEXED, STRING, TEXT};
+    use tantivy::tokenizer::{LowerCaser, RemoveLongFilter};
 
     use super::*;
+    use crate::components::SummaTokenizer;
 
     fn create_query_parser() -> QueryParser {
         let tokenizer_manager = TokenizerManager::default();
@@ -439,6 +470,29 @@ mod tests {
         schema_builder.add_text_field("doi", STRING);
         let schema = schema_builder.build();
         let default_fields = vec!["title".to_string()];
+        QueryParser::new(schema, default_fields, &tokenizer_manager).expect("cannot create parser")
+    }
+
+    fn create_complex_query_parser() -> QueryParser {
+        let tokenizer_manager = TokenizerManager::default();
+        tokenizer_manager.register(
+            "summa",
+            TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(100)).filter(LowerCaser),
+        );
+        let mut schema_builder = Schema::builder();
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("summa")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        schema_builder.add_text_field("title", text_options);
+        schema_builder.add_text_field("body", TEXT);
+        schema_builder.add_text_field("authors", TEXT);
+        schema_builder.add_text_field("language", TEXT);
+        schema_builder.add_i64_field("timestamp", INDEXED);
+        schema_builder.add_text_field("doi", STRING);
+        let schema = schema_builder.build();
+        let default_fields = vec!["title".to_string(), "body".to_string()];
         QueryParser::new(schema, default_fields, &tokenizer_manager).expect("cannot create parser")
     }
 
@@ -495,7 +549,15 @@ mod tests {
             "Ok(BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"non\")), (1, Term(type=Str, field=0, \"closed\"))], slop: 0 })] })"
         );
         assert_eq!(
+            format!("{:?}", query_parser.parse_query("\"non closed")),
+            "Ok(BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"non\")), (1, Term(type=Str, field=0, \"closed\"))], slop: 0 })] })"
+        );
+        assert_eq!(
             format!("{:?}", query_parser.parse_query("non closed`")),
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"non\"))), (Should, TermQuery(Term(type=Str, field=0, \"closed\")))] })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("non closed\"")),
             "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"non\"))), (Should, TermQuery(Term(type=Str, field=0, \"closed\")))] })"
         );
         assert_eq!(
@@ -525,6 +587,8 @@ mod tests {
             format!("{:?}", query_parser.parse_query("10.10 10/10")),
             "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\")))] })"
         );
+        let query_parser = create_complex_query_parser();
+        assert_eq!(format!("{:?}", query_parser.parse_query("\"search engines\"")), "Ok(BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"search\")), (1, Term(type=Str, field=0, \"engines\"))], slop: 0 }), (Should, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engines\"))], slop: 0 })] })");
     }
 
     #[test]
@@ -547,16 +611,22 @@ mod tests {
     #[test]
     pub fn test_plus_minus() {
         let query_parser = create_query_parser();
-        let query = query_parser.parse_query("body:+search -engine");
         assert_eq!(
-            format!("{:?}", query),
+            format!("{:?}", query_parser.parse_query("body:+search -engine")),
             "Ok(BooleanQuery { subqueries: [(Must, TermQuery(Term(type=Str, field=1, \"search\"))), (MustNot, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
         );
-        let query = query_parser.parse_query("body:+'search engine'");
         assert_eq!(
-            format!("{:?}", query),
+            format!("{:?}", query_parser.parse_query("body:+'search engine'")),
             "Ok(BooleanQuery { subqueries: [(Must, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engine\"))], slop: 0 })] })"
         );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("+search +engine")),
+            "Ok(BooleanQuery { subqueries: [(Must, TermQuery(Term(type=Str, field=0, \"search\"))), (Must, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
+        );
+        let query_parser = create_complex_query_parser();
+        assert_eq!(format!("{:?}", query_parser.parse_query("+search +engine")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=1, \"search\")))] }), (Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"engine\"))), (Should, TermQuery(Term(type=Str, field=1, \"engine\")))] })] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("+search language:+ru")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=1, \"search\")))] }), (Must, TermQuery(Term(type=Str, field=3, \"ru\")))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("+c++ language:+ru")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"c++\"))), (Should, TermQuery(Term(type=Str, field=1, \"c\")))] }), (Must, TermQuery(Term(type=Str, field=3, \"ru\")))] })");
     }
 
     #[test]

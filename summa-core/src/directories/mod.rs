@@ -1,17 +1,13 @@
-mod chunk_generator;
-mod chunked_caching_directory;
+mod byte_range_cache;
+mod caching_directory;
 mod debug_proxy_directory;
 mod external_requests;
 mod hot_cache_directory;
 #[cfg(feature = "ipfs")]
 pub(crate) mod iroh;
-mod memory_sized_cache;
 mod network_directory;
-mod requests_composer;
-mod slice_address;
-mod stored_item;
 
-pub use chunked_caching_directory::{ChunkedCachingDirectory, FileStat, FileStats};
+pub use caching_directory::{CachingDirectory, FileStat, FileStats};
 pub use debug_proxy_directory::DebugProxyDirectory;
 pub use external_requests::{
     DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, ExternalResponse, Header,
@@ -19,7 +15,6 @@ pub use external_requests::{
 pub use hot_cache_directory::{create_hotcache, deserialize_cbor, HotDirectory, StaticDirectoryCache};
 #[cfg(feature = "ipfs")]
 pub use iroh::{IrohDirectory, DEFAULT_CHUNK_SIZE};
-pub use memory_sized_cache::MemorySizedCache;
 pub use network_directory::{NetworkDirectory, NetworkFile};
 
 struct Noop {}

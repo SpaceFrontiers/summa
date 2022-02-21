@@ -17,7 +17,7 @@ pub use driver::Driver;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor, IntermediateExtractionResult};
 pub use index_holder::{cleanup_index, IndexHolder};
 pub use index_registry::IndexRegistry;
-pub use index_writer_holder::{HotCacheConfig, IndexWriterHolder};
+pub use index_writer_holder::IndexWriterHolder;
 use once_cell::sync::Lazy;
 pub use query_parser::{ProtoQueryParser, QueryParser, QueryParserError};
 pub use segment_attributes::SummaSegmentAttributes;

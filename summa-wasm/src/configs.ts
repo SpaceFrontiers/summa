@@ -18,28 +18,25 @@ export class RemoteEngineConfig {
   method: string;
   url_template: string;
   headers_template: Map<string, string> | null;
-  chunked_cache_config?: ChunkedCacheConfig;
+  cache_config?: CacheConfig;
   constructor(
     method: string,
     url_template: string,
     headers_template: Map<string, string> | null,
-    chunked_cache_config?: ChunkedCacheConfig,
+    cache_config?: CacheConfig,
   ) {
     this.method = method
     this.url_template = url_template
     this.headers_template = headers_template;
-    this.chunked_cache_config = chunked_cache_config;
+    this.cache_config = cache_config;
   }
 }
 
-export class ChunkedCacheConfig {
-  chunk_size: number;
-  cache_size?: number;
+export class CacheConfig {
+  cache_size: number;
   constructor(
-    chunk_size: number,
-    cache_size?: number
+    cache_size: number
   ) {
-    this.chunk_size = chunk_size
     this.cache_size = cache_size
   }
 }

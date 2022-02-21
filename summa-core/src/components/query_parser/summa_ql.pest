@@ -1,6 +1,6 @@
 quote = _{ "\"" | "'" | "`" | "'" | "“" | "”" | "‘" | "«" | "»" | "„" | "`"}
 star = { "*" }
-statement_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE) | "(" | ")" | "\"" | "/" }
+statement_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE) | "(" | ")" | "/" }
 allowed_chars = _{"_" | "+" | "#" | "-"}
 doi = @{ "doi.org/"? ~ "10." ~ ASCII_DIGIT{4,9} ~ WHITE_SPACE? ~ "/" ~ WHITE_SPACE? ~ ASCII+ }
 

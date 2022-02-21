@@ -13,11 +13,6 @@ use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
 
-/// Hotcache config
-pub struct HotCacheConfig {
-    pub chunk_size: Option<u64>,
-}
-
 /// Wrap `tantivy::SingleSegmentIndexWriter` and allows to recreate it
 pub struct SingleIndexWriter {
     pub index_writer: RwLock<SingleSegmentIndexWriter>,
@@ -298,34 +293,30 @@ impl IndexWriterHolder {
     }
 
     /// Locking index files for executing operation on them
-    pub fn prepare_index(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<()> {
+    pub fn prepare_index(&mut self, with_hotcache: bool) -> SummaResult<()> {
         self.commit()?;
         self.wait_merging_threads();
 
-        if let Some(hotcache_config) = with_hotcache {
+        if with_hotcache {
             let directory = self.index().directory();
             let hotcache_bytes = crate::directories::create_hotcache(
                 directory
                     .underlying_directory()
                     .expect("managed directory should contain nested directory")
                     .box_clone(),
-                hotcache_config.chunk_size,
             )?;
             directory.atomic_write(Path::new("hotcache.bin"), &hotcache_bytes)?;
         }
         Ok(())
     }
 
-    pub fn lock_files(&mut self, with_hotcache: Option<HotCacheConfig>) -> SummaResult<Vec<String>> {
+    pub fn lock_files(&mut self, with_hotcache: bool) -> SummaResult<Vec<String>> {
         let mut segment_files = vec![".managed.json".to_string(), "meta.json".to_string()];
-
-        if with_hotcache.is_some() {
+        self.prepare_index(with_hotcache)?;
+        if with_hotcache {
             segment_files.push("hotcache.bin".to_string())
         }
-
-        self.prepare_index(with_hotcache)?;
         segment_files.extend(self.get_index_files()?);
-
         Ok(segment_files)
     }
 
