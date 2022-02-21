@@ -65,7 +65,7 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            index_engine: {"file": {}}, {"memory": {}} or {"remote": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
+            index_engine: {"file": {}}, {"memory": {}} or {"remote": {"cache_config": {"cache_size": ...}}}
             merge_policy: describes how to select segments for merging, possible values: {"log": {}}, {"temporal": {}}
             request_id: request id
             session_id: session id
@@ -186,7 +186,7 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
-            index_engine: {"file": {}}, {"memory": {}} or {"ipfs": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
+            index_engine: {"file": {}}, {"memory": {}} or {"ipfs": {"cache_config": {"cache_size": ...}}}
             schema: Tantivy index schema
             compression: Tantivy index compression
             blocksize: Docstore blocksize
@@ -235,7 +235,7 @@ class SummaClient(BaseGrpcClient):
         Args:
             source_index_name: source index name
             target_index_name: target index name
-            target_index_engine: {"file": {}}, {"memory": {}} or {"ipfs": {"chunked_cache_config": {"chunk_size": ..., "cache_size": ...}}}
+            target_index_engine: {"file": {}}, {"memory": {}} or {"ipfs": {"cache_config": {"cache_size": ...}}}
             merge_policy: describes how to select segments for merging, possible values: {"log": {}}, {"temporal": {}}
             request_id: request id
             session_id: session id

@@ -7,14 +7,16 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Map
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class IndexQuery(_message.Message):
-    __slots__ = ["collectors", "index_alias", "query"]
+    __slots__ = ["collectors", "index_alias", "is_fieldnorms_scoring_enabled", "query"]
     COLLECTORS_FIELD_NUMBER: _ClassVar[int]
     INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    IS_FIELDNORMS_SCORING_ENABLED_FIELD_NUMBER: _ClassVar[int]
     QUERY_FIELD_NUMBER: _ClassVar[int]
     collectors: _containers.RepeatedCompositeFieldContainer[_query_pb2.Collector]
     index_alias: str
+    is_fieldnorms_scoring_enabled: bool
     query: _query_pb2.Query
-    def __init__(self, index_alias: _Optional[str] = ..., query: _Optional[_Union[_query_pb2.Query, _Mapping]] = ..., collectors: _Optional[_Iterable[_Union[_query_pb2.Collector, _Mapping]]] = ...) -> None: ...
+    def __init__(self, index_alias: _Optional[str] = ..., query: _Optional[_Union[_query_pb2.Query, _Mapping]] = ..., collectors: _Optional[_Iterable[_Union[_query_pb2.Collector, _Mapping]]] = ..., is_fieldnorms_scoring_enabled: bool = ...) -> None: ...
 
 class SearchRequest(_message.Message):
     __slots__ = ["index_queries", "tags"]

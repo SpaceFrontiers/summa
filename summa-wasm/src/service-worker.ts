@@ -29,16 +29,17 @@ function set_same_origin_headers(headers: Headers) {
 async function handle_request(event: FetchEvent) {
   const request = event.request
   const response = await fetch_with_retries(
-      request.url,
-      {
-          method: request.method,
-          headers: request.headers,
-      },
-      7
-  )
+    request.url,
+    {
+      method: request.method,
+      headers: request.headers,
+    },
+    7
+  );
+  const headers = set_same_origin_headers(new Headers(response.headers));
   return new Response(response.body, {
-    status: 200,
-    headers: set_same_origin_headers(new Headers(response.headers)),
+    status: response.status,
+    headers: headers,
   });
 }
 

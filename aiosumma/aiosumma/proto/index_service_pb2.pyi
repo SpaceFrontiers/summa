@@ -8,8 +8,12 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Map
 
 Brotli: Compression
 DESCRIPTOR: _descriptor.FileDescriptor
+DO_NOTHING: ConflictStrategy
 Lz4: Compression
+MERGE: ConflictStrategy
 None: Compression
+OVERWRITE: ConflictStrategy
+OVERWRITE_ALWAYS: ConflictStrategy
 Snappy: Compression
 Zstd: Compression
 Zstd14: Compression
@@ -43,26 +47,24 @@ class AttachIndexResponse(_message.Message):
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class AttachIpfsEngineRequest(_message.Message):
-    __slots__ = ["chunked_cache_config", "cid"]
-    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["cache_config", "cid"]
+    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
     CID_FIELD_NUMBER: _ClassVar[int]
-    chunked_cache_config: ChunkedCacheConfig
+    cache_config: CacheConfig
     cid: str
-    def __init__(self, cid: _Optional[str] = ..., chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
+    def __init__(self, cid: _Optional[str] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
 class AttachRemoteEngineRequest(_message.Message):
-    __slots__ = ["chunked_cache_config"]
-    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    chunked_cache_config: ChunkedCacheConfig
-    def __init__(self, chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
+    __slots__ = ["cache_config"]
+    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    cache_config: CacheConfig
+    def __init__(self, cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
-class ChunkedCacheConfig(_message.Message):
-    __slots__ = ["cache_size", "chunk_size"]
+class CacheConfig(_message.Message):
+    __slots__ = ["cache_size"]
     CACHE_SIZE_FIELD_NUMBER: _ClassVar[int]
-    CHUNK_SIZE_FIELD_NUMBER: _ClassVar[int]
     cache_size: int
-    chunk_size: int
-    def __init__(self, chunk_size: _Optional[int] = ..., cache_size: _Optional[int] = ...) -> None: ...
+    def __init__(self, cache_size: _Optional[int] = ...) -> None: ...
 
 class CommitIndexRequest(_message.Message):
     __slots__ = ["index_name"]
@@ -149,10 +151,10 @@ class CreateIndexResponse(_message.Message):
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class CreateIpfsEngineRequest(_message.Message):
-    __slots__ = ["chunked_cache_config"]
-    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    chunked_cache_config: ChunkedCacheConfig
-    def __init__(self, chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
+    __slots__ = ["cache_config"]
+    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    cache_config: CacheConfig
+    def __init__(self, cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
 class CreateMemoryEngineRequest(_message.Message):
     __slots__ = []
@@ -242,7 +244,8 @@ class GetIndicesResponse(_message.Message):
     def __init__(self, index_names: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexAttributes(_message.Message):
-    __slots__ = ["created_at", "default_fields", "default_index_name", "default_snippets", "description", "multi_fields", "unique_fields"]
+    __slots__ = ["conflict_strategy", "created_at", "default_fields", "default_index_name", "default_snippets", "description", "multi_fields", "unique_fields"]
+    CONFLICT_STRATEGY_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
@@ -250,6 +253,7 @@ class IndexAttributes(_message.Message):
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
     MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
     UNIQUE_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    conflict_strategy: ConflictStrategy
     created_at: int
     default_fields: _containers.RepeatedScalarFieldContainer[str]
     default_index_name: str
@@ -257,7 +261,7 @@ class IndexAttributes(_message.Message):
     description: str
     multi_fields: _containers.RepeatedScalarFieldContainer[str]
     unique_fields: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ["compression", "index_aliases", "index_attributes", "index_engine", "index_name", "num_docs"]
@@ -332,12 +336,12 @@ class IndexOperation(_message.Message):
     def __init__(self, index_document: _Optional[_Union[IndexDocumentOperation, _Mapping]] = ...) -> None: ...
 
 class IpfsEngineConfig(_message.Message):
-    __slots__ = ["chunked_cache_config", "cid"]
-    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["cache_config", "cid"]
+    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
     CID_FIELD_NUMBER: _ClassVar[int]
-    chunked_cache_config: ChunkedCacheConfig
+    cache_config: CacheConfig
     cid: str
-    def __init__(self, cid: _Optional[str] = ..., chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
+    def __init__(self, cid: _Optional[str] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
 class LogMergePolicy(_message.Message):
     __slots__ = ["is_frozen"]
@@ -382,7 +386,7 @@ class PrimaryKey(_message.Message):
     def __init__(self, str: _Optional[str] = ..., i64: _Optional[int] = ...) -> None: ...
 
 class RemoteEngineConfig(_message.Message):
-    __slots__ = ["chunked_cache_config", "headers_template", "method", "url_template"]
+    __slots__ = ["cache_config", "headers_template", "method", "url_template"]
     class HeadersTemplateEntry(_message.Message):
         __slots__ = ["key", "value"]
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -390,15 +394,15 @@ class RemoteEngineConfig(_message.Message):
         key: str
         value: str
         def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
-    CHUNKED_CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
     HEADERS_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
     METHOD_FIELD_NUMBER: _ClassVar[int]
     URL_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
-    chunked_cache_config: ChunkedCacheConfig
+    cache_config: CacheConfig
     headers_template: _containers.ScalarMap[str, str]
     method: str
     url_template: str
-    def __init__(self, method: _Optional[str] = ..., url_template: _Optional[str] = ..., headers_template: _Optional[_Mapping[str, str]] = ..., chunked_cache_config: _Optional[_Union[ChunkedCacheConfig, _Mapping]] = ...) -> None: ...
+    def __init__(self, method: _Optional[str] = ..., url_template: _Optional[str] = ..., headers_template: _Optional[_Mapping[str, str]] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
 class SetIndexAliasRequest(_message.Message):
     __slots__ = ["index_alias", "index_name"]
@@ -451,6 +455,9 @@ class WarmupIndexResponse(_message.Message):
     ELAPSED_SECS_FIELD_NUMBER: _ClassVar[int]
     elapsed_secs: float
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
+
+class ConflictStrategy(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = []
 
 class Compression(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []

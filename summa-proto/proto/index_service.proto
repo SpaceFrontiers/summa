@@ -63,14 +63,14 @@ message AttachFileEngineRequest {}
 
 // Attach remote engine request
 message AttachRemoteEngineRequest {
-  ChunkedCacheConfig chunked_cache_config = 1;
+  CacheConfig cache_config = 1;
 }
 
 // Attach file engine request
 message AttachIpfsEngineRequest {
   // [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/)
   string cid = 1;
-  ChunkedCacheConfig chunked_cache_config = 2;
+  CacheConfig cache_config = 2;
 }
 
 // Attach index request
@@ -144,7 +144,7 @@ message SortByField {
 message CreateFileEngineRequest {}
 message CreateMemoryEngineRequest {}
 message CreateIpfsEngineRequest {
-  ChunkedCacheConfig chunked_cache_config = 1;
+  CacheConfig cache_config = 1;
 }
 
 enum ConflictStrategy {
@@ -324,11 +324,9 @@ message MemoryEngineConfig {
   string schema = 1;
 }
 
-message ChunkedCacheConfig {
-  // Chunk size in bytes
-  uint64 chunk_size = 1;
+message CacheConfig {
   // Total cache size in bytes
-  optional uint64 cache_size = 2;
+  uint64 cache_size = 1;
 }
 
 // Remote HTTP engine config
@@ -340,7 +338,7 @@ message RemoteEngineConfig {
   // Headers template which will be used to generate real URL by variables substitution
   map<string, string> headers_template = 3;
   // Description of the cache for the engine
-  ChunkedCacheConfig chunked_cache_config = 4;
+  CacheConfig cache_config = 4;
 }
 
 // IPFS index engine
@@ -348,7 +346,7 @@ message IpfsEngineConfig {
   // [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/)
   string cid = 1;
   // Description of the cache for the engine
-  ChunkedCacheConfig chunked_cache_config = 2;
+  CacheConfig cache_config = 2;
 }
 
 // Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/tantivy/merge_policy/struct.LogMergePolicy.html)

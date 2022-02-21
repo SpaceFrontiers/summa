@@ -247,7 +247,7 @@ mod tests {
             .create_index(tonic::Request::new(proto::CreateIndexRequest {
                 index_name: index_name.to_owned(),
                 index_engine: Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
-                    chunked_cache_config: None,
+                    cache_config: None,
                 })),
                 index_attributes: Some(proto::IndexAttributes {
                     default_fields: vec!["title".to_owned(), "body".to_owned()],

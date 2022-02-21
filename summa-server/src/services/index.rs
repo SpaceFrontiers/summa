@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
-use summa_core::components::{cleanup_index, Driver, HotCacheConfig, IndexHolder, IndexRegistry};
+use summa_core::components::{cleanup_index, Driver, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::IrohDirectory;
@@ -238,10 +238,10 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
-            Some(proto::attach_index_request::IndexEngine::Ipfs(proto::AttachIpfsEngineRequest { cid, chunked_cache_config })) => {
+            Some(proto::attach_index_request::IndexEngine::Ipfs(proto::AttachIpfsEngineRequest { cid, cache_config })) => {
                 let ipfs_index_engine = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
-                    chunked_cache_config,
+                    cache_config,
                 };
                 let index = IndexHolder::open_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 let index_engine_config = proto::IndexEngineConfig {
@@ -295,7 +295,7 @@ impl Index {
             docstore_compression: proto::Compression::from_i32(create_index_request.compression)
                 .map(|c| Wrapper::from(c).into())
                 .unwrap_or(tantivy::store::Compressor::Zstd(ZstdCompressor::default())),
-            docstore_blocksize: create_index_request.blocksize.unwrap_or(16384) as usize,
+            docstore_blocksize: create_index_request.blocksize.unwrap_or(32768) as usize,
             sort_by_field: create_index_request.sort_by_field.map(|s| Wrapper::from(s).into()),
             ..Default::default()
         };
@@ -325,21 +325,18 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
-            Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
+            Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config })) => {
                 let iroh_directory = IrohDirectory::new(
                     self.store_service.content_loader(),
                     self.store_service.store(),
-                    chunked_cache_config
-                        .as_ref()
-                        .map(|chunked_cache_config| chunked_cache_config.chunk_size)
-                        .unwrap_or(DEFAULT_CHUNK_SIZE),
+                    DEFAULT_CHUNK_SIZE,
                     Driver::current_tokio(),
                 );
                 index_builder.open_or_create(iroh_directory.clone())?;
                 let cid = iroh_directory.cid().expect("directory should be created");
                 let ipfs_engine_config = proto::IpfsEngineConfig {
                     cid: cid.to_string(),
-                    chunked_cache_config,
+                    cache_config,
                 };
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config.clone())),
@@ -488,11 +485,8 @@ impl Index {
         let mut index_engine_config = index_holder.index_engine_config().write().await;
         if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
             let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
-            let hot_cache_config = ipfs_engine_config.chunked_cache_config.as_ref().map(|c| HotCacheConfig {
-                chunk_size: Some(c.chunk_size),
-            });
             let span = tracing::Span::current();
-            tokio::task::spawn_blocking(move || span.in_scope(|| index_writer_holder.prepare_index(hot_cache_config))).await??;
+            tokio::task::spawn_blocking(move || span.in_scope(|| index_writer_holder.prepare_index(true))).await??;
             let cid = index_holder
                 .real_directory()
                 .as_any()
@@ -613,24 +607,18 @@ impl Index {
         let prepared_consumption = self.commit(&index_holder).await?;
 
         let index_holder = match copy_index_request.target_index_engine {
-            Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config })) => {
+            Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config })) => {
                 let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
-                let hotcache_config = Some(HotCacheConfig {
-                    chunk_size: chunked_cache_config.as_ref().map(|chunked_cache_config| chunked_cache_config.chunk_size),
-                });
                 let iroh_directory = IrohDirectory::new(
                     self.store_service.content_loader(),
                     self.store_service.store(),
-                    chunked_cache_config
-                        .as_ref()
-                        .map(|chunked_cache_config| chunked_cache_config.chunk_size)
-                        .unwrap_or(DEFAULT_CHUNK_SIZE),
+                    DEFAULT_CHUNK_SIZE,
                     Driver::Tokio(tokio::runtime::Handle::current()),
                 );
                 let span = tracing::Span::current();
                 let cid = tokio::task::spawn_blocking(move || {
                     span.in_scope(|| {
-                        let locked_files = index_writer_holder.lock_files(hotcache_config)?;
+                        let locked_files = index_writer_holder.lock_files(true)?;
                         for file in locked_files {
                             // ToDo: Avoid reading to memory
                             info!(action = "copy_file", file = file);
@@ -642,7 +630,7 @@ impl Index {
                     })
                 })
                 .await??;
-                let ipfs_engine_config = proto::IpfsEngineConfig { cid, chunked_cache_config };
+                let ipfs_engine_config = proto::IpfsEngineConfig { cid, cache_config };
                 let index = IndexHolder::open_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
                 self.insert_index(
                     &copy_index_request.target_index_name,
@@ -980,7 +968,7 @@ pub(crate) mod tests {
         let index_holder = create_test_index_holder(
             &index_service,
             &create_test_schema(),
-            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config: None }),
+            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config: None }),
         )
         .await?;
 
@@ -1092,10 +1080,7 @@ pub(crate) mod tests {
                 target_index_name: "copied_index".to_string(),
                 merge_policy: None,
                 target_index_engine: Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
-                    chunked_cache_config: Some(proto::ChunkedCacheConfig {
-                        chunk_size: 16 * 1024,
-                        cache_size: None,
-                    }),
+                    chunked_cache_config: None,
                 })),
             })
             .await?;
@@ -1135,7 +1120,7 @@ pub(crate) mod tests {
         let index_holder = create_test_index_holder(
             &index_service,
             &schema,
-            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { chunked_cache_config: None }),
+            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config: None }),
         )
         .await?;
 
