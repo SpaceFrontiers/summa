@@ -7,7 +7,7 @@ export class MetaDb extends Dexie {
   constructor(name: string, version: number) {
     super(name);
     this.version(version).stores({
-      index_configs: "index_name,is_enabled",
+      index_configs: "index_name",
     });
     this.index_configs.mapToClass(IndexConfig);
   }
@@ -20,33 +20,33 @@ export class MetaDb extends Dexie {
 }
 
 interface IIndexConfig {
-  is_enabled: boolean;
   index_name: string;
   index_seed: Object;
+  index_properties: Object;
   remote_engine_config: RemoteEngineConfig;
 }
 
 export class IndexConfig implements IIndexConfig {
-  is_enabled: boolean;
   index_name: string;
   description: string;
   created_at: number;
   index_seed: Object;
+  index_properties: Object;
   remote_engine_config: RemoteEngineConfig;
 
   constructor(
-    is_enabled: boolean,
     index_name: string,
     description: string,
     created_at: number,
     index_seed: Object,
+    index_properties: Object,
     remote_engine_config: RemoteEngineConfig
   ) {
-    this.is_enabled = is_enabled;
     this.index_name = index_name;
     this.description = description;
     this.created_at = created_at;
     this.index_seed = index_seed;
+    this.index_properties = index_properties;
     this.remote_engine_config = remote_engine_config;
   }
 }

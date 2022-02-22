@@ -68,7 +68,7 @@ fn default_headers() -> HashMap<String, String> {
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
-    /// Iroh Gateway HTTP endpoint in format: `127.0.0.1:8080`
+    /// Iroh Gateway HTTP endpoint in format: `127.0.0.1:9090`
     pub http_endpoint: String,
     /// Iroh Gateway RPC endpoint in format: `127.0.0.1:4400`
     pub p2p_endpoint: String,
@@ -84,11 +84,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            http_endpoint: "127.0.0.1:8080".to_string(),
+            http_endpoint: "127.0.0.1:9090".to_string(),
             p2p_endpoint: "127.0.0.1:4400".to_string(),
             dns_resolver: iroh_resolver::dns_resolver::Config::default(),
             headers: default_headers(),
-            public_url_base: "http://localhost:8080/".to_string(),
+            public_url_base: "http://localhost:9090/".to_string(),
         }
     }
 }

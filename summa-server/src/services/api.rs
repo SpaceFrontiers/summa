@@ -134,10 +134,10 @@ impl Api {
             let http_router = Server::builder()
                 .accept_http1(true)
                 .layer(GrpcWebLayer::new())
-                .add_service(consumer_service.clone())
-                .add_service(index_service.clone())
-                .add_service(reflection_service.clone())
-                .add_service(search_service.clone());
+                .add_service(consumer_service)
+                .add_service(index_service)
+                .add_service(reflection_service)
+                .add_service(search_service);
             let http_listener = Api::set_listener(&http_endpoint)?;
             let mut http_terminator = terminator.clone();
             futures.push(Box::new(async move {

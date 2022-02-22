@@ -145,14 +145,34 @@ impl IndexHolder {
         index.set_segment_attributes_merger(Arc::new(SegmentAttributesMergerImpl::<SummaSegmentAttributes>::new()));
 
         let metas = index.load_metas()?;
+        let cached_schema = index.schema();
+        let cached_index_attributes: Option<IndexAttributes> = metas.index_attributes()?;
+        let cached_multi_fields = cached_index_attributes
+            .as_ref()
+            .map(|index_attributes| {
+                index_attributes
+                    .multi_fields
+                    .iter()
+                    .map(|field_name| Ok::<_, Error>(cached_schema.get_field(field_name)?))
+                    .collect()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         let index_name = index_name.map(|x| x.to_string()).unwrap_or_else(|| {
-            serde_json::from_value::<IndexAttributes>(metas.index_attributes().expect("no attributes").expect("no attributes"))
-                .expect("wrong json")
+            cached_index_attributes
+                .as_ref()
+                .expect("no attributes")
                 .default_index_name
+                .clone()
                 .expect("no index name")
         });
-        let cached_schema = index.schema();
-        let query_parser = ProtoQueryParser::for_index(&index_name, &index)?;
+
+        let query_parser = ProtoQueryParser::for_index(
+            &index_name,
+            &index,
+            cached_index_attributes.as_ref().map(|a| a.default_fields.clone()).unwrap_or_else(Vec::new),
+        )?;
         let index_reader = index
             .reader_builder()
             .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)
@@ -169,19 +189,6 @@ impl IndexHolder {
                 Wrapper::from(merge_policy).into(),
             )?))),
         };
-
-        let cached_index_attributes: Option<IndexAttributes> = metas.index_attributes()?;
-        let cached_multi_fields = cached_index_attributes
-            .as_ref()
-            .map(|index_attributes| {
-                index_attributes
-                    .multi_fields
-                    .iter()
-                    .map(|field_name| Ok::<_, Error>(cached_schema.get_field(field_name)?))
-                    .collect()
-            })
-            .transpose()?
-            .unwrap_or_default();
 
         Ok(IndexHolder {
             index_engine_config,

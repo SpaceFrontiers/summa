@@ -15,7 +15,7 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::components::query_parser::{QueryParser, QueryParserError};
 use crate::errors::{Error, SummaResult, ValidationError};
@@ -32,6 +32,7 @@ pub struct ProtoQueryParser {
     query_counter: Counter<u64>,
     #[cfg(feature = "metrics")]
     subquery_counter: Counter<u64>,
+    index_default_fields: Vec<String>,
 }
 
 fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> SummaResult<Term> {
@@ -78,7 +79,7 @@ fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, i
 }
 
 impl ProtoQueryParser {
-    pub fn for_index(index_name: &str, index: &Index) -> SummaResult<ProtoQueryParser> {
+    pub fn for_index(index_name: &str, index: &Index, index_default_fields: Vec<String>) -> SummaResult<ProtoQueryParser> {
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
         #[cfg(feature = "metrics")]
@@ -95,6 +96,7 @@ impl ProtoQueryParser {
             query_counter,
             #[cfg(feature = "metrics")]
             subquery_counter,
+            index_default_fields,
         })
     }
 
@@ -144,7 +146,18 @@ impl ProtoQueryParser {
                 },
             )),
             proto::query::Query::Match(match_query_proto) => {
-                let nested_query_parser = QueryParser::for_index(&self.index, match_query_proto.default_fields)?;
+                let default_fields = if !match_query_proto.default_fields.is_empty() {
+                    match_query_proto.default_fields
+                } else {
+                    self.index_default_fields.clone()
+                };
+                if default_fields.is_empty() {
+                    warn!(
+                        action = "missing_default_fields",
+                        hint = "Add `default_fields` to match query, otherwise you match nothing"
+                    )
+                }
+                let nested_query_parser = QueryParser::for_index(&self.index, default_fields)?;
                 match nested_query_parser.parse_query(&match_query_proto.value) {
                     Ok(parsed_query) => {
                         info!(parsed_match_query = ?parsed_query);
