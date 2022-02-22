@@ -54,4 +54,3 @@ thiserror = "1.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
 tokio = { version = "1.25", default_features = false }
 tracing = "0.1"
-zstd = { version = "0.12", default-features = false, features = ["fat-lto"] }
