@@ -2,7 +2,7 @@ use std::error::Error;
 use std::str::FromStr;
 
 use cid::Cid;
-use clap::{arg, command};
+use clap::{arg, command, ArgAction};
 use futures_lite::stream::StreamExt;
 use iroh_rpc_types::store::StoreAddr;
 use iroh_unixfs::unixfs::UnixfsNode;
@@ -67,10 +67,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .default_value("web/dist")
                         .num_args(1),
                 )
-                .arg(arg!(-d <DATA_PATH> "Names and CIDs for mounting under `data` sub-directory in format `<name>:<cid>`"))
+                .arg(
+                    arg!(-d <DATA_PATH> "Names and CIDs for mounting under `data` sub-directory in format `<name>:<cid>`")
+                        .action(ArgAction::Append)
+                        .num_args(0..),
+                )
                 .arg(
                     arg!(-c <CHUNK_SIZE> "Size of a single block published to IPFS")
-                        .default_value("1048576")
+                        .default_value("262144")
                         .num_args(1),
                 ),
         )

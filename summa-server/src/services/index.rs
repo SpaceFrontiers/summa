@@ -12,8 +12,8 @@ use futures_util::future::join_all;
 use summa_core::components::{cleanup_index, Driver, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
+use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::directories::IrohDirectory;
-use summa_core::directories::{DefaultExternalRequestGenerator, DEFAULT_CHUNK_SIZE};
 use summa_core::errors::SummaResult;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
@@ -243,7 +243,14 @@ impl Index {
                     cid: cid.to_string(),
                     cache_config,
                 };
-                let index = IndexHolder::open_ipfs_index(&ipfs_index_engine, self.store_service.content_loader(), self.store_service.store(), false).await?;
+                let index = IndexHolder::open_ipfs_index(
+                    &ipfs_index_engine,
+                    self.store_service.content_loader(),
+                    self.store_service.store(),
+                    self.store_service.default_chunk_size(),
+                    false,
+                )
+                .await?;
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
                     merge_policy: attach_index_request.merge_policy,
@@ -329,7 +336,7 @@ impl Index {
                 let iroh_directory = IrohDirectory::new(
                     self.store_service.content_loader(),
                     self.store_service.store(),
-                    DEFAULT_CHUNK_SIZE,
+                    self.store_service.default_chunk_size(),
                     Driver::current_tokio(),
                 );
                 index_builder.open_or_create(iroh_directory.clone())?;
@@ -342,7 +349,14 @@ impl Index {
                     config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config.clone())),
                     merge_policy: create_index_request.merge_policy,
                 };
-                let index = IndexHolder::open_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
+                let index = IndexHolder::open_ipfs_index(
+                    &ipfs_engine_config,
+                    self.store_service.content_loader(),
+                    self.store_service.store(),
+                    self.store_service.default_chunk_size(),
+                    false,
+                )
+                .await?;
                 (index, index_engine_config)
             }
         };
@@ -593,7 +607,14 @@ impl Index {
                 IndexHolder::open_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, read_only).await?
             }
             Some(proto::index_engine_config::Config::Ipfs(config)) => {
-                IndexHolder::open_ipfs_index(&config, self.store_service.content_loader(), self.store_service.store(), read_only).await?
+                IndexHolder::open_ipfs_index(
+                    &config,
+                    self.store_service.content_loader(),
+                    self.store_service.store(),
+                    self.store_service.default_chunk_size(),
+                    read_only,
+                )
+                .await?
             }
             _ => unimplemented!(),
         };
@@ -612,7 +633,7 @@ impl Index {
                 let iroh_directory = IrohDirectory::new(
                     self.store_service.content_loader(),
                     self.store_service.store(),
-                    DEFAULT_CHUNK_SIZE,
+                    self.store_service.default_chunk_size(),
                     Driver::Tokio(tokio::runtime::Handle::current()),
                 );
                 let span = tracing::Span::current();
@@ -631,7 +652,14 @@ impl Index {
                 })
                 .await??;
                 let ipfs_engine_config = proto::IpfsEngineConfig { cid, cache_config };
-                let index = IndexHolder::open_ipfs_index(&ipfs_engine_config, self.store_service.content_loader(), self.store_service.store(), false).await?;
+                let index = IndexHolder::open_ipfs_index(
+                    &ipfs_engine_config,
+                    self.store_service.content_loader(),
+                    self.store_service.store(),
+                    self.store_service.default_chunk_size(),
+                    false,
+                )
+                .await?;
                 self.insert_index(
                     &copy_index_request.target_index_name,
                     index,

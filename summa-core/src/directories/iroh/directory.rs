@@ -20,7 +20,6 @@ use crate::directories::iroh::file::{IrohFile, IrohFileDescriptor};
 use crate::directories::iroh::writer::IrohWriter;
 use crate::errors::SummaResult;
 
-pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 pub(crate) const DEFAULT_DEGREE: u32 = 174;
 pub(crate) const DEFAULT_CODE: cid::multihash::Code = cid::multihash::Code::Blake3_256;
 

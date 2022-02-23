@@ -3,4 +3,4 @@ pub(crate) mod file;
 pub(crate) mod tantivy_compat;
 pub(crate) mod writer;
 
-pub use directory::{IrohDirectory, DEFAULT_CHUNK_SIZE};
+pub use directory::IrohDirectory;

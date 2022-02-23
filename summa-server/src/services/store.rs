@@ -59,6 +59,10 @@ impl Store {
         &self.store
     }
 
+    pub fn default_chunk_size(&self) -> u64 {
+        self.config.default_chunk_size
+    }
+
     #[instrument("lifecycle", skip_all)]
     pub async fn prepare_serving_future(&self, mut terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         let rpc_addr: StoreAddr = parse_endpoint(&self.config.endpoint)?;

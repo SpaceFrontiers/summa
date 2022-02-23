@@ -278,16 +278,11 @@ impl IndexHolder {
         ipfs_engine_config: &proto::IpfsEngineConfig,
         content_loader: &iroh_unixfs::content_loader::FullLoader,
         store: &iroh_store::Store,
+        default_chunk_size: u64,
         read_only: bool,
     ) -> SummaResult<Index> {
-        let iroh_directory = crate::directories::IrohDirectory::from_cid(
-            content_loader,
-            store,
-            Driver::current_tokio(),
-            &ipfs_engine_config.cid,
-            crate::directories::iroh::directory::DEFAULT_CHUNK_SIZE,
-        )
-        .await?;
+        let iroh_directory =
+            crate::directories::IrohDirectory::from_cid(content_loader, store, Driver::current_tokio(), &ipfs_engine_config.cid, default_chunk_size).await?;
         let cache_config = ipfs_engine_config.cache_config.clone();
         let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
             Ok(hotcache_handle) => {
