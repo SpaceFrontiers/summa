@@ -1108,7 +1108,7 @@ pub(crate) mod tests {
                 target_index_name: "copied_index".to_string(),
                 merge_policy: None,
                 target_index_engine: Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
-                    chunked_cache_config: None,
+                    cache_config: None,
                 })),
             })
             .await?;

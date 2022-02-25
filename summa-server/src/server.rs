@@ -323,6 +323,7 @@ mod tests {
                         query: Some(proto::query::Query::Match(proto::MatchQuery {
                             value: "title3".to_string(),
                             default_fields: vec!["title".to_owned(), "body".to_owned()],
+                            ..Default::default()
                         })),
                     }),
                     collectors: vec![proto::Collector {
@@ -368,6 +369,7 @@ mod tests {
                         query: Some(proto::query::Query::Match(proto::MatchQuery {
                             value: "title3".to_string(),
                             default_fields: vec!["title".to_owned(), "body".to_owned()],
+                            ..Default::default()
                         })),
                     }),
                     collectors: vec![proto::Collector {

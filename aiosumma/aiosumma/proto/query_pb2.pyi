@@ -192,6 +192,14 @@ class EmptyQuery(_message.Message):
     __slots__ = []
     def __init__(self) -> None: ...
 
+class ExactMatchesPromoter(_message.Message):
+    __slots__ = ["boost", "slop"]
+    BOOST_FIELD_NUMBER: _ClassVar[int]
+    SLOP_FIELD_NUMBER: _ClassVar[int]
+    boost: float
+    slop: int
+    def __init__(self, slop: _Optional[int] = ..., boost: _Optional[float] = ...) -> None: ...
+
 class FacetCollector(_message.Message):
     __slots__ = ["facets", "field"]
     FACETS_FIELD_NUMBER: _ClassVar[int]
@@ -259,12 +267,37 @@ class Key(_message.Message):
     def __init__(self, str: _Optional[str] = ..., f64: _Optional[float] = ...) -> None: ...
 
 class MatchQuery(_message.Message):
-    __slots__ = ["default_fields", "value"]
+    __slots__ = ["boolean_should_mode", "default_fields", "disjuction_max_mode", "exact_matches_promoter", "field_boosts", "value"]
+    class FieldBoostsEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: float
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[float] = ...) -> None: ...
+    BOOLEAN_SHOULD_MODE_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    DISJUCTION_MAX_MODE_FIELD_NUMBER: _ClassVar[int]
+    EXACT_MATCHES_PROMOTER_FIELD_NUMBER: _ClassVar[int]
+    FIELD_BOOSTS_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
+    boolean_should_mode: MatchQueryBooleanShouldMode
     default_fields: _containers.RepeatedScalarFieldContainer[str]
+    disjuction_max_mode: MatchQueryDisjuctionMaxMode
+    exact_matches_promoter: ExactMatchesPromoter
+    field_boosts: _containers.ScalarMap[str, float]
     value: str
-    def __init__(self, value: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ...) -> None: ...
+    def __init__(self, value: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ..., boolean_should_mode: _Optional[_Union[MatchQueryBooleanShouldMode, _Mapping]] = ..., disjuction_max_mode: _Optional[_Union[MatchQueryDisjuctionMaxMode, _Mapping]] = ..., field_boosts: _Optional[_Mapping[str, float]] = ..., exact_matches_promoter: _Optional[_Union[ExactMatchesPromoter, _Mapping]] = ...) -> None: ...
+
+class MatchQueryBooleanShouldMode(_message.Message):
+    __slots__ = []
+    def __init__(self) -> None: ...
+
+class MatchQueryDisjuctionMaxMode(_message.Message):
+    __slots__ = ["tie_breaker"]
+    TIE_BREAKER_FIELD_NUMBER: _ClassVar[int]
+    tie_breaker: float
+    def __init__(self, tie_breaker: _Optional[float] = ...) -> None: ...
 
 class MetricAggregation(_message.Message):
     __slots__ = ["average", "stats"]

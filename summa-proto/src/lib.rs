@@ -21,7 +21,11 @@ pub mod proto_traits;
 ///             index_queries: vec![proto::IndexQuery {
 ///                 index_alias: "test_index".to_string(),
 ///                 query: Some(proto::Query {
-///                     query: Some(proto::query::Query::Match(proto::MatchQuery { value: "game of thrones".to_string(), default_fields: vec!["title".to_string()] })),
+///                     query: Some(proto::query::Query::Match(proto::MatchQuery {
+///                         value: "game of thrones".to_string(),
+///                         default_fields: vec!["title".to_string()],
+///                         ..Default::default()
+///                     })),
 ///                 }),
 ///                 collectors: vec![
 ///                     proto::Collector {
