@@ -3,7 +3,11 @@ export function get_ipfs_hostname(ipfs_url?: string) {
   const parsed_url = new URL(ipfs_url);
   let ipfs_hostname = parsed_url.hostname;
   if (parsed_url.port !== "") {
-    ipfs_hostname += ":" + parsed_url.port;
+    if (parsed_url.port !== "5173") {
+      ipfs_hostname += ":" + parsed_url.port;
+    } else {
+      ipfs_hostname += ":8080";
+    }
   }
   return { ipfs_hostname, ipfs_http_protocol: parsed_url.protocol };
 }

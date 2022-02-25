@@ -14,7 +14,7 @@ use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
-use tantivy::{DateTime, Index, Term};
+use tantivy::{DateTime, Index, Score, Term};
 use tracing::{info, warn};
 
 use crate::components::query_parser::{QueryParser, QueryParserError};
@@ -33,6 +33,22 @@ pub struct ProtoQueryParser {
     #[cfg(feature = "metrics")]
     subquery_counter: Counter<u64>,
     index_default_fields: Vec<String>,
+}
+
+pub enum MatchQueryDefaultMode {
+    Boolean,
+    DisjuctionMax { tie_breaker: Score },
+}
+
+impl From<Option<proto::match_query::DefaultMode>> for MatchQueryDefaultMode {
+    fn from(value: Option<proto::match_query::DefaultMode>) -> Self {
+        match value {
+            Some(proto::match_query::DefaultMode::BooleanShouldMode(_)) | None => MatchQueryDefaultMode::Boolean,
+            Some(proto::match_query::DefaultMode::DisjuctionMaxMode(proto::MatchQueryDisjuctionMaxMode { tie_breaker })) => {
+                MatchQueryDefaultMode::DisjuctionMax { tie_breaker }
+            }
+        }
+    }
 }
 
 fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> SummaResult<Term> {
@@ -157,7 +173,17 @@ impl ProtoQueryParser {
                         hint = "Add `default_fields` to match query, otherwise you match nothing"
                     )
                 }
-                let nested_query_parser = QueryParser::for_index(&self.index, default_fields)?;
+                let mut nested_query_parser = QueryParser::for_index(&self.index, default_fields)?;
+                nested_query_parser.set_default_mode(match_query_proto.default_mode.into());
+
+                if !match_query_proto.field_boosts.is_empty() {
+                    nested_query_parser.set_field_boosts(match_query_proto.field_boosts)
+                }
+
+                if let Some(exact_matches_promoter) = match_query_proto.exact_matches_promoter {
+                    nested_query_parser.set_exact_match_promoter(exact_matches_promoter)
+                }
+
                 match nested_query_parser.parse_query(&match_query_proto.value) {
                     Ok(parsed_query) => {
                         info!(parsed_match_query = ?parsed_query);

@@ -63,9 +63,24 @@ message RangeQuery {
   Range value = 2;
 }
 
+message MatchQueryBooleanShouldMode {};
+message MatchQueryDisjuctionMaxMode {
+  float tie_breaker = 1;
+};
+message ExactMatchesPromoter {
+  uint32 slop = 1;
+  optional float boost = 2;
+}
+
 message MatchQuery {
   string value = 1;
   repeated string default_fields = 2;
+  oneof default_mode {
+    MatchQueryBooleanShouldMode boolean_should_mode = 3;
+    MatchQueryDisjuctionMaxMode disjuction_max_mode = 4;
+  }
+  map<string, float> field_boosts = 5;
+  ExactMatchesPromoter exact_matches_promoter = 6;
 }
 
 message BooleanSubquery {

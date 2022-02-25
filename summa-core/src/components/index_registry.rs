@@ -156,6 +156,9 @@ impl IndexRegistry {
 
     /// Merges several `IntermediateExtractionResult`
     pub async fn finalize_extraction(&self, ie_results: Vec<Vec<IntermediateExtractionResult>>) -> SummaResult<Vec<proto::CollectorOutput>> {
+        if ie_results.is_empty() {
+            return Ok(vec![]);
+        }
         let ie_results = transpose(ie_results);
         let mut collector_outputs = vec![];
 

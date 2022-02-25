@@ -5,7 +5,6 @@ use cid::Cid;
 use clap::{arg, command, ArgAction};
 use futures_lite::stream::StreamExt;
 use iroh_rpc_types::store::StoreAddr;
-use iroh_unixfs::unixfs::UnixfsNode;
 
 static DEFAULT_CODE: cid::multihash::Code = cid::multihash::Code::Blake3_256;
 
@@ -23,9 +22,7 @@ async fn publish(store_endpoint: &str, root_path: &str, data_paths: &[String], c
         let items: Vec<_> = data_item.split(':').collect();
         let (name, cid) = (items[0], items[1]);
         let cid = Cid::from_str(cid)?;
-        let block = store_client.get(cid).await?.unwrap_or_else(|| panic!("`{cid}` is not found in Iroh Store"));
-        let node = UnixfsNode::decode(&cid, block)?;
-        data_dir = data_dir.add_raw_block(iroh_unixfs::builder::RawBlock::new(name, node.encode(&cid::multihash::Code::Blake3_256)?));
+        data_dir = data_dir.add_link(name, cid);
     }
     let root_directory = root_directory.add_dir(data_dir.build()?)?.build()?;
 
