@@ -9,7 +9,7 @@ boost = { (DECIMAL_NUMBER | ".")+ }
 range = ${ "[" ~ WHITE_SPACE* ~ boundary_word ~ WHITE_SPACE+ ~ ^"to" ~ WHITE_SPACE+ ~ boundary_word ~ WHITE_SPACE* ~ "]" }
 
 field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
-word = @{ doi | ((LETTER | NUMBER) ~ (LETTER | NUMBER | "_" | "+" | "#" | "-")*) }
+word = @{ doi | ((LETTER | NUMBER) ~ (LETTER | NUMBER | "_" | "+" | "#" | "-" | "–")*) }
 
 boundary_word = _{ star | word }
 phrase_internals = { (!quote ~ ANY)* }

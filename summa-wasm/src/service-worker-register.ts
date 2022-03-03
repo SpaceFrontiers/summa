@@ -13,7 +13,7 @@
   }
 
   // If we're already coi: do nothing. Perhaps it's due to this script doing its job, or COOP/COEP are
-  // already set from the origin server. Also if the browser has no notion of crossOriginIsolated, just give up here.
+  // already set from the origin server. Also, if the browser has no notion of crossOriginIsolated, just give up here.
   if (window.crossOriginIsolated || !coi.shouldRegister()) return;
 
   if (!window.isSecureContext) {

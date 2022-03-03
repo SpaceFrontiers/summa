@@ -339,6 +339,8 @@ message RemoteEngineConfig {
   map<string, string> headers_template = 3;
   // Description of the cache for the engine
   CacheConfig cache_config = 4;
+  // Timeout for the request
+  optional uint32 timeout_ms = 5;
 }
 
 // IPFS index engine

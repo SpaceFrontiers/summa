@@ -18,17 +18,27 @@ function parse_headers(xhr: XMLHttpRequest): Header[] {
     return headers_arr;
 }
 
-export function request(method: string, url: string, headers: {name: string, value: string}[]): { data: Uint8Array, headers: Header[]} | {status: number, status_text: string} {
+export function request(method: string, url: string, headers: {name: string, value: string}[], timeout_ms?: number): { data: Uint8Array, headers: Header[]} | {status: number, status_text: string} {
     var xhr = new XMLHttpRequest();
-    xhr.responseType = "arraybuffer"
+    xhr.responseType = "arraybuffer";
     xhr.withCredentials = true;
-    xhr.open(method, url, false);
-    if (headers !== undefined) {
-        headers.forEach((header) => {
-          xhr.setRequestHeader(header.name, header.value)
-        });
+    if (timeout_ms) {
+        xhr.timeout = timeout_ms;
     }
-    xhr.send(null);
+    try {
+        xhr.open(method, url, false);
+        if (headers !== undefined) {
+            headers.forEach((header) => {
+              xhr.setRequestHeader(header.name, header.value)
+            });
+        }
+        xhr.send(null);
+    } catch (e) {
+        throw {
+            status: 500,
+            status_text: `${e}`,
+        }
+    }
     if (xhr.status >= 200 && xhr.status < 300) {
         return { data: new Uint8Array(xhr.response), headers: parse_headers(xhr) }
     } else {
@@ -40,33 +50,43 @@ export function request(method: string, url: string, headers: {name: string, val
 }
 
 
-export function request_async(method: string, url: string, headers: Array<{name: string, value: string}>) {
+export function request_async(method: string, url: string, headers: Array<{name: string, value: string}>, timeout_ms?: number) {
     return new Promise(function (resolve, reject) {
         let xhr = new XMLHttpRequest();
-        xhr.responseType = "arraybuffer"
+        xhr.responseType = "arraybuffer";
         xhr.withCredentials = true;
-        xhr.open(method, url);
-        if (headers !== undefined) {
-          headers.forEach((header) => {
-            xhr.setRequestHeader(header.name, header.value)
-          });
+        if (timeout_ms) {
+            xhr.timeout = timeout_ms;
         }
-        xhr.onload = function () {
-            if (this.status >= 200 && this.status < 300) {
-                resolve({ data: new Uint8Array(xhr.response), headers: parse_headers(xhr) })
-            } else {
+        try {
+            xhr.open(method, url);
+            if (headers !== undefined) {
+              headers.forEach((header) => {
+                xhr.setRequestHeader(header.name, header.value)
+              });
+            }
+            xhr.onload = function () {
+                if (this.status >= 200 && this.status < 300) {
+                    resolve({ data: new Uint8Array(xhr.response), headers: parse_headers(xhr) })
+                } else {
+                    reject({
+                        status: this.status,
+                        status_text: xhr.statusText
+                    });
+                }
+            };
+            xhr.onerror = function () {
                 reject({
                     status: this.status,
                     status_text: xhr.statusText
                 });
-            }
-        };
-        xhr.onerror = function () {
+            };
+            xhr.send();
+        } catch (e) {
             reject({
-                status: this.status,
-                status_text: xhr.statusText
-            });
-        };
-        xhr.send();
+                status: 500,
+                status_text: `${e}`,
+            })
+        }
     });
 }

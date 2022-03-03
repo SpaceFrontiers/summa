@@ -19,16 +19,19 @@ export class RemoteEngineConfig {
   url_template: string;
   headers_template: Map<string, string> | null;
   cache_config?: CacheConfig;
+  timeout_ms?: number;
   constructor(
     method: string,
     url_template: string,
     headers_template: Map<string, string> | null,
     cache_config?: CacheConfig,
+    timeout_ms?: number,
   ) {
     this.method = method
     this.url_template = url_template
     this.headers_template = headers_template;
     this.cache_config = cache_config;
+    this.timeout_ms = timeout_ms;
   }
 }
 

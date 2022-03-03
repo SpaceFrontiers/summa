@@ -37,7 +37,7 @@ pub struct ExternalResponse {
 
 #[async_trait]
 pub trait ExternalRequest: Debug + Send + Sync {
-    fn new(method: &str, url: &str, headers: &[Header]) -> Self
+    fn new(method: &str, url: &str, headers: &[Header], timeout_ms: Option<u32>) -> Self
     where
         Self: Sized;
     fn request(self) -> SummaResult<ExternalResponse>;
@@ -107,6 +107,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
             &self.remote_engine_config.method,
             &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(Box::new(ValidationError::from(e))))?,
             &headers,
+            self.remote_engine_config.timeout_ms,
         ))
     }
 
@@ -117,6 +118,7 @@ impl<TExternalRequest: ExternalRequest + Clone + 'static> ExternalRequestGenerat
             "HEAD",
             &strfmt(&self.remote_engine_config.url_template, &vars).map_err(|e| Error::Validation(Box::new(ValidationError::from(e))))?,
             &[],
+            self.remote_engine_config.timeout_ms,
         ))
     }
 }

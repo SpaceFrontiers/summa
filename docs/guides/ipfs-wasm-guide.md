@@ -44,8 +44,8 @@ Now we are ready to instantiate `summa-wasm`
 // that supports `Range` queries and used to access index files
 const directory_url = `http://localhost:8080/ipfs/${ipfs_hash}/`;
 
-const worker_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.108.2/dist/root-worker.js";
-const wasm_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.108.2/dist/index_bg.wasm"
+const worker_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.111.5/dist/root-worker.js";
+const wasm_url = "https://cdn.jsdelivr.net/npm/summa-wasm@0.111.5/dist/index_bg.wasm"
 
 // `remote_index_registry` is an object used to spawn threads for searching
 // `setup` initializes WASM-module and pool of Web Workers.

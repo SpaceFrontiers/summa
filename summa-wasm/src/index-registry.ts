@@ -19,7 +19,8 @@ export interface IIndexRegistry {
   warmup(index_name: string): Promise<void>;
   index_document(index_name: string, document: string): Promise<void>;
   commit(index_name: string): Promise<void>;
-  extract_terms(index_name: string, field_name: string, limit: bigint, start_from?: string): Promise<string[]>;
+  extract_terms(index_name: string, field_name: string, limit: number, start_from?: string): Promise<string[]>;
+  get_index_field_names(index_name: string): Promise<string[]>;
 }
 
 export type IndexRegistryOptions = {
@@ -41,7 +42,7 @@ function is_mobile() {
 }
 
 export const default_options: IndexRegistryOptions = {
-  num_threads: navigator.hardwareConcurrency,
+  num_threads: Math.ceil(navigator.hardwareConcurrency / 2),
   logging_level: "info",
   memory_config: is_mobile() ? { initial: 1024, maximum: 8192, shared: true } : { initial: 8192, maximum: 65536, shared: true }
 }
@@ -80,7 +81,10 @@ export class IndexRegistry implements IIndexRegistry {
   async commit(index_name: string) {
     return await this.registry!.commit(index_name)
   }
-  async extract_terms(index_name: string, field_name: string, limit: bigint, start_from?: string): Promise<string[]> {
+  async extract_terms(index_name: string, field_name: string, limit: number, start_from?: string): Promise<string[]> {
     return await this.registry!.extract_terms(index_name, field_name, limit, start_from);
+  }
+  async get_index_field_names(index_name: string): Promise<string[]> {
+    return await this.registry!.get_index_field_names(index_name);
   }
 }

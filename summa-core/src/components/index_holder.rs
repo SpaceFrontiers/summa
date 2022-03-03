@@ -430,7 +430,9 @@ impl IndexHolder {
             (_, false) => EnableScoring::disabled_from_searcher(searcher),
         };
         let segment_readers = searcher.segment_readers();
+        trace!(index_name = ?self.index_name, action = "weight");
         let weight = query.weight_async(enabled_scoring).await?;
+        trace!(index_name = ?self.index_name, action = "collect_segment");
         let fruits = join_all(segment_readers.iter().enumerate().map(|(segment_ord, segment_reader)| {
             let weight_ref = weight.as_ref();
             async move { collector.collect_segment_async(weight_ref, segment_ord as u32, segment_reader).await }
@@ -552,11 +554,11 @@ impl IndexHolder {
         Ok(rx)
     }
 
-    pub fn extract_terms_with_freq(
+    pub async fn extract_terms_with_freq(
         &self,
         searcher: &Searcher,
         field_name: &str,
-        limit: u64,
+        limit: u32,
         start_from: Option<&str>,
         more_frequent_than: Option<u32>,
     ) -> SummaResult<Vec<Term>> {
@@ -576,13 +578,14 @@ impl IndexHolder {
             start_from,
             more_frequent_than,
         )
+        .await
     }
 
-    fn extract_terms_with_freq_from_single_segment(
+    async fn extract_terms_with_freq_from_single_segment(
         &self,
         segment_reader: &SegmentReader,
         field: Field,
-        limit: u64,
+        limit: u32,
         start_from: Option<&str>,
         more_frequent_than: Option<u32>,
     ) -> SummaResult<Vec<Term>> {
@@ -590,33 +593,29 @@ impl IndexHolder {
 
         let inverted_index = segment_reader.inverted_index(field)?;
         let terms = inverted_index.terms();
-        info!(action = "extract_terms", segment_id = ?segment_reader.segment_id(), num_terms = terms.num_terms());
+        info!(action = "extract_terms", segment_id = ?segment_reader.segment_id(), num_terms = terms.num_terms(), limit = limit);
 
         let mut stream_builder = terms.range();
         if let Some(start_from) = start_from {
             stream_builder = stream_builder.gt(start_from);
         }
-        let mut term_stream = stream_builder.limit(limit).into_stream()?;
+        let mut term_stream = stream_builder.limit(limit as u64).into_stream_async().await?;
         while let Some((term, term_info)) = term_stream.next() {
-            let term = Term::from_field_bytes(field, term);
-            if let Some(more_frequent_than) = more_frequent_than {
-                if term_info.doc_freq > more_frequent_than {
-                    collected_terms.push(term);
-                }
-            } else {
+            if term_info.doc_freq > more_frequent_than.unwrap_or(0) {
+                let term = Term::from_field_text(field, unsafe { std::str::from_utf8_unchecked(term) });
                 collected_terms.push(term);
             }
         }
         Ok(collected_terms)
     }
 
-    pub fn extract_terms(&self, searcher: &Searcher, field_name: &str, limit: u64, start_from: Option<&str>) -> SummaResult<Vec<Term>> {
-        self.extract_terms_with_freq(searcher, field_name, limit, start_from, None)
+    pub async fn extract_terms(&self, searcher: &Searcher, field_name: &str, limit: u32, start_from: Option<&str>) -> SummaResult<Vec<Term>> {
+        self.extract_terms_with_freq(searcher, field_name, limit, start_from, None).await
     }
 
     #[cfg(feature = "tokio-rt")]
     pub async fn deduplicate_by_field(&self, field_name: &str) -> SummaResult<()> {
-        const BATCH_SIZE: u64 = 100_000;
+        const BATCH_SIZE: u32 = 100_000;
 
         let searcher = self.index_reader().searcher();
         let index_writer = self.index_writer_holder()?.read().await;

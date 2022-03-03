@@ -19,11 +19,11 @@ function wait_for_msg_type(target: any, type: any): Promise<WorkerData> {
 
 export async function start_worker(module: WebAssembly.Module, memory: WebAssembly.Memory, state: any, opts: WorkerOptions) {
     const workerInit: WorkerData = {
-        type: 'init',
-        module,
-        memory,
-        state,
-      };
+      type: 'init',
+      module,
+      memory,
+      state,
+    };
     const worker = new Worker(self.location.href, opts);
     _workers.push(worker);
     worker.postMessage(workerInit);
