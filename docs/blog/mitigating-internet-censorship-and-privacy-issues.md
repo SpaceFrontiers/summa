@@ -207,13 +207,6 @@ A little over a year ago, I started developing the Summa server, which initially
 - the fasteval2 language for describing ranking functions
 - and some extra search functions
 
-A little later, I've added IPFS implementation named [iroh](https://github.com/n0-computer/iroh) 
-to Summa, and Summa has started to be a complete IPFS node.
-
-`Iroh` allows Summa to seed its search indices into IPFS network without any extra moves and data duplication.
-Also, `iroh` adds HTTP IPFS Gateway to Summa, making it a single tool for indexing and distributing search indices,
-and for viewing web bundles.
-
 At the same time Summa has been made compatible with WASM. 
 All Summa parts, including the network layer for loading index parts with HTTP requests, 
 have been shaped into `summa-wasm` module which now allows you to execute search queries
@@ -260,40 +253,29 @@ Summa provides [an example of news feed site](https://github.com/izihawa/earth-t
 
 ### Bundle your web-site
 
-Now we should bundle all together manually or with `summa-publisher` script.
+Now we should bundle all together.
 
 <figure>
   <img src="/summa/assets/summa-publisher.drawio.png" alt="web-bundle-with-ipfs">
   <figcaption>What summa-publisher does</figcaption>
 </figure>
 
-`summa-publisher` is distributed through Cargo and may be installed if you have configured Rust toolchain.
-
 ```bash
-cargo install summa-publisher
-
 # Endpoint of Summa GRPC API
 summa_api=0.0.0.0:8082
-# Iroh Store RPC
-iroh_store_rpc=0.0.0.0:4402
 # Here should be your index name
 index_name=ipfs_index_name
 # Path to compiled web application with index.html
 web_app_path=web/dist
 
-# Retrieve CID of the index from Summa
-data_cid=$(summa-cli $summa_api get-index $index_name | jq .index.index_engine.ipfs.cid -r)
-# And combine files into a web bundle
-summa-publisher publish -s $iroh_store_rpc -r $web_app_path -d "$index_name:$data_cid"
+web_cid=$(ipfs add --pin -Q -r --hash=blake3 $web_app_path)
+data_cid=$(ipfs add --pin -Q -r --hash=blake3 --nocopy data/bin/$index_name)
+
+ipfs files cp /ipfs/"web_cid" /summa-web
+ipfs files cp -p /ipfs/$data_cid /summa-web/data/$index_name
+
+ipfs files stat --hash /summa-web
 ```
-
-`summa-publisher` will output your a CID of the web bundle. It will be just a IPFS directory
-with `$web_app_path` as a root and index files in `data/$index_name` subdirectory.
-
-### Start seeding
-
-If you used `summa-publisher` for publishing, your web bundle is already put into Iroh Store and seeded by Iroh P2P.
-Otherwise, you should start seeding by `ipfs add`/`iroh add`.
 
 ### Use!
 

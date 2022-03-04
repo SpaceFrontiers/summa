@@ -20,8 +20,6 @@ pub struct Config {
     pub debug: bool,
     /// Summa API configuration
     pub api: crate::configs::api::Config,
-    /// Iroh Store configuration
-    pub store: crate::configs::store::Config,
     /// Path to directory with logs
     #[builder(setter(custom))]
     pub log_path: PathBuf,
@@ -41,7 +39,6 @@ impl Default for Config {
             data_path: PathBuf::new(),
             debug: true,
             api: crate::configs::api::Config::default(),
-            store: crate::configs::store::Config::default(),
             log_path: PathBuf::new(),
             metrics: crate::configs::metrics::Config::default(),
             consumers: HashMap::new(),
@@ -113,13 +110,6 @@ pub mod tests {
                     .endpoint(format!("127.0.0.1:{}", acquire_free_port()))
                     .build()
                     .expect("cannot create metrics config"),
-            )
-            .store(
-                crate::configs::store::ConfigBuilder::default()
-                    .endpoint(format!("127.0.0.1:{}", acquire_free_port()))
-                    .path(data_path.join("ks"))
-                    .build()
-                    .expect("cannot create store config"),
             )
             .build()
             .expect("cannot create server config")

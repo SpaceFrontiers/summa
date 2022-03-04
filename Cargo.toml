@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["examples", "summa-core", "summa-proto", "summa-publisher", "summa-server", "summa-wasm"]
+members = ["examples", "summa-core", "summa-proto", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true
@@ -20,8 +20,6 @@ downcast-rs = "1.2"
 fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
 futures = "0.3"
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
-iroh-store = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
-iroh-unixfs = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
 itertools = "0.10"
 kanal = "0.1.0-pre8"
 lazy_static = "1.4"

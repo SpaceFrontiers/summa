@@ -25,7 +25,6 @@ If you're ready to start, be sure to check out our docs:
 - Server with GRPC API for using the search engine 
 - Python asynchronous client [library and CLI](/summa/apis/python-api) for the API
 - [JS-bindings](/summa/apis/js-api) to launch subset of Summa in browsers
-- Has ready [embedded IPFS implementation](https://github.com/n0-computer/iroh) allowing to seed and replicate index through IPFS network
 - Also, you may use Kafka for indexing
 
 ## Distribution

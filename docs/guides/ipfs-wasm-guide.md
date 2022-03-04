@@ -8,10 +8,10 @@ nav_order: 2
 First, you should set up Summa Server with Iroh Store (enabled by default) and create a test index using our [Quick-Start guide](/summa/quick-start) 
 
 ### Publish the index to IPFS
-To publish the index, we need to change its engine to IPFS. Then, Iroh P2P will automatically make it available to your IPFS peers:
+To publish the index, we need to change its engine to IPFS:
 
 ```bash 
-summa-cli localhost:8082 - copy-index books books_iroh '{"ipfs": {}}'
+data_cid=$(ipfs add --pin -Q -r --hash=blake3 --nocopy data/bin/books)
 ```
 The command will return the CID of the published index that you can use later for replicating or opening it through the browser.
 For example, you can find your index using `kubo`:

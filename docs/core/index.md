@@ -7,7 +7,7 @@ has_toc: true
 
 Summa is composed of multiple parts, the most important of which are
 - [Tantivy](https://github.com/quickwit-oss/tantivy) for creating indices and searching in them
-- [Iroh](https://github.com/n0-computer/iroh) for downloading and distributing indices through [IPFS](https://ipfs.tech) network
+- [IPFS](https://github.com/ipfs/kubo) for downloading and distributing indices through [IPFS](https://ipfs.tech) network
 - [WASM](https://github.com/izihawa/summa/tree/master/summa-wasm) for compiling and launching the subset of Summa in browsers 
 
 Summa Server combines Tantivy and Iroh together. It operates indices and puts them in the Iroh Store, and manages Iroh
