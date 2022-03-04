@@ -13,6 +13,7 @@ async def client_cli(endpoint):
     try:
         client = SummaClient(endpoint=endpoint, connection_timeout=3.0)
         await client.start()
+        print(f"{colored('SERVER_RESPONDED', 'green')}:", file=sys.stderr)
         return client.get_interface()
     except asyncio.exceptions.TimeoutError:
         # ToDo: process exception through fire.core.FireError
