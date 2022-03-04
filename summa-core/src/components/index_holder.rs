@@ -271,44 +271,6 @@ impl IndexHolder {
         Ok(Index::open(directory)?)
     }
 
-    /// Attaches index and sets it up via `setup`
-    #[cfg(feature = "ipfs")]
-    #[instrument(skip_all)]
-    pub async fn open_ipfs_index(
-        ipfs_engine_config: &proto::IpfsEngineConfig,
-        content_loader: &iroh_unixfs::content_loader::FullLoader,
-        store: &iroh_store::Store,
-        default_chunk_size: u64,
-        read_only: bool,
-    ) -> SummaResult<Index> {
-        let iroh_directory =
-            crate::directories::IrohDirectory::from_cid(content_loader, store, Driver::current_tokio(), &ipfs_engine_config.cid, default_chunk_size).await?;
-        let cache_config = ipfs_engine_config.cache_config.clone();
-        let hotcache_bytes = match iroh_directory.get_file_handle("hotcache.bin".as_ref()) {
-            Ok(hotcache_handle) => {
-                if read_only {
-                    let len = hotcache_handle.len();
-                    info!(action = "read_hotcache", len = len);
-                    hotcache_handle.read_bytes_async(0..len).await.ok()
-                } else {
-                    warn!(action = "omit_hotcache");
-                    None
-                }
-            }
-            Err(error) => {
-                warn!(action = "error_hotcache", error = ?error);
-                None
-            }
-        };
-        #[cfg(feature = "tokio-rt")]
-        let index =
-            tokio::task::spawn_blocking(move || Ok::<Index, Error>(Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, cache_config)?)?)).await??;
-        #[cfg(not(feature = "tokio-rt"))]
-        let index = Index::open(wrap_with_caches(iroh_directory, hotcache_bytes, cache_config.as_ref())?);
-        info!(action = "opened", config = ?ipfs_engine_config);
-        Ok(index)
-    }
-
     /// Compression
     pub fn compression(&self) -> proto::Compression {
         Wrapper::from(self.index_reader().searcher().index().settings().docstore_compression).into_inner()
@@ -621,7 +583,9 @@ impl IndexHolder {
         let index_writer = self.index_writer_holder()?.read().await;
         let mut start_from = None;
         loop {
-            let duplicated_terms = self.extract_terms_with_freq(&searcher, field_name, BATCH_SIZE, start_from.as_deref(), Some(1))?;
+            let duplicated_terms = self
+                .extract_terms_with_freq(&searcher, field_name, BATCH_SIZE, start_from.as_deref(), Some(1))
+                .await?;
             let Some(last_term) = duplicated_terms.last() else {
                 break;
             };

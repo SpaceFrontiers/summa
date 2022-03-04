@@ -20,12 +20,8 @@ pub struct Config {
     pub debug: bool,
     /// Summa API configuration
     pub api: crate::configs::api::Config,
-    /// Iroh P2P configuration
-    pub p2p: Option<crate::configs::p2p::Config>,
     /// Iroh Store configuration
     pub store: crate::configs::store::Config,
-    /// Iroh Gateway configuration
-    pub gateway: Option<crate::configs::gateway::Config>,
     /// Path to directory with logs
     #[builder(setter(custom))]
     pub log_path: PathBuf,
@@ -45,9 +41,7 @@ impl Default for Config {
             data_path: PathBuf::new(),
             debug: true,
             api: crate::configs::api::Config::default(),
-            p2p: Some(crate::configs::p2p::Config::default()),
             store: crate::configs::store::Config::default(),
-            gateway: Some(crate::configs::gateway::Config::default()),
             log_path: PathBuf::new(),
             metrics: crate::configs::metrics::Config::default(),
             consumers: HashMap::new(),
@@ -127,8 +121,6 @@ pub mod tests {
                     .build()
                     .expect("cannot create store config"),
             )
-            .p2p(None)
-            .gateway(None)
             .build()
             .expect("cannot create server config")
     }

@@ -66,13 +66,6 @@ message AttachRemoteEngineRequest {
   CacheConfig cache_config = 1;
 }
 
-// Attach file engine request
-message AttachIpfsEngineRequest {
-  // [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/)
-  string cid = 1;
-  CacheConfig cache_config = 2;
-}
-
 // Attach index request
 message AttachIndexRequest {
   // Index name for attaching
@@ -81,7 +74,6 @@ message AttachIndexRequest {
   oneof index_engine {
     AttachFileEngineRequest file = 2;
     AttachRemoteEngineRequest remote = 3;
-    AttachIpfsEngineRequest ipfs = 4;
   }
   MergePolicy merge_policy = 10;
 }
@@ -126,7 +118,6 @@ message CopyIndexRequest {
   oneof target_index_engine {
     CreateFileEngineRequest file = 3;
     CreateMemoryEngineRequest memory = 4;
-    CreateIpfsEngineRequest ipfs = 5;
   }
   MergePolicy merge_policy = 6;
 }
@@ -143,9 +134,6 @@ message SortByField {
 
 message CreateFileEngineRequest {}
 message CreateMemoryEngineRequest {}
-message CreateIpfsEngineRequest {
-  CacheConfig cache_config = 1;
-}
 
 enum ConflictStrategy {
   DO_NOTHING = 0;
@@ -180,7 +168,6 @@ message CreateIndexRequest {
   oneof index_engine {
     CreateFileEngineRequest file = 7;
     CreateMemoryEngineRequest memory = 8;
-    CreateIpfsEngineRequest ipfs = 9;
   }
   // Index schema in Tantivy format
   string schema = 2;
@@ -343,14 +330,6 @@ message RemoteEngineConfig {
   optional uint32 timeout_ms = 5;
 }
 
-// IPFS index engine
-message IpfsEngineConfig {
-  // [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/)
-  string cid = 1;
-  // Description of the cache for the engine
-  CacheConfig cache_config = 2;
-}
-
 // Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/tantivy/merge_policy/struct.LogMergePolicy.html)
 message LogMergePolicy {
   // Set if once merged segment should be left intact
@@ -368,7 +347,6 @@ message IndexEngineConfig {
     FileEngineConfig file = 1;
     MemoryEngineConfig memory = 2;
     RemoteEngineConfig remote = 3;
-    IpfsEngineConfig ipfs = 4;
   }
   // Merge policy
   MergePolicy merge_policy = 10;

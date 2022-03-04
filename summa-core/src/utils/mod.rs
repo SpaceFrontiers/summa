@@ -1,21 +1,5 @@
-use std::str::FromStr;
-
-use crate::errors::SummaResult;
-
 pub mod random;
 pub mod sync;
-
-/// Parse `iroh` endpoints.
-pub fn parse_endpoint<P: FromStr>(endpoint: &str) -> SummaResult<P>
-where
-    crate::errors::Error: From<<P as FromStr>::Err>,
-{
-    if endpoint.starts_with("irpc://") {
-        Ok(endpoint.parse()?)
-    } else {
-        Ok(format!("irpc://{endpoint}").parse()?)
-    }
-}
 
 pub fn current_time() -> u64 {
     (instant::now() / 1000.0) as u64

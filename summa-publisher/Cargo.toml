@@ -16,7 +16,5 @@ doc = false
 cid = "0.9"
 clap = { workspace = true }
 futures-lite = "1.12.0"
-iroh-rpc-client = { workspace = true }
-iroh-rpc-types = { workspace = true }
 iroh-unixfs = { workspace = true }
 tokio = { workspace = true }

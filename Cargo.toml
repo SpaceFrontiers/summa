@@ -20,12 +20,6 @@ downcast-rs = "1.2"
 fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
 futures = "0.3"
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
-iroh-gateway = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
-iroh-metrics = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
-iroh-p2p = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
-iroh-resolver = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
-iroh-rpc-client = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
-iroh-rpc-types = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
 iroh-store = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
 iroh-unixfs = { git = "https://github.com/izihawa/beetle", branch = "feature/summa", version = "0.2.0" }
 itertools = "0.10"

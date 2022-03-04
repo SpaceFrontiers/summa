@@ -3,8 +3,6 @@ mod caching_directory;
 mod debug_proxy_directory;
 mod external_requests;
 mod hot_cache_directory;
-#[cfg(feature = "ipfs")]
-pub(crate) mod iroh;
 mod network_directory;
 
 pub use caching_directory::{CachingDirectory, FileStat, FileStats};
@@ -13,8 +11,6 @@ pub use external_requests::{
     DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, ExternalResponse, Header,
 };
 pub use hot_cache_directory::{create_hotcache, deserialize_cbor, HotDirectory, StaticDirectoryCache};
-#[cfg(feature = "ipfs")]
-pub use iroh::IrohDirectory;
 pub use network_directory::{NetworkDirectory, NetworkFile};
 
 struct Noop {}

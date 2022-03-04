@@ -1,22 +1,17 @@
 use std::future::Future;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use async_broadcast::Receiver;
 use clap::{arg, command};
 use futures_util::future::try_join_all;
-use iroh_unixfs::content_loader::GatewayUrl;
 use summa_core::configs::ConfigProxy;
-use summa_core::utils::parse_endpoint;
 use tracing::{info, info_span, Instrument};
 
 use crate::configs::server::ConfigHolder;
 use crate::errors::{Error, SummaServerResult};
 use crate::logging;
-use crate::services::gateway::Gateway;
-use crate::services::store::Store;
-use crate::services::{Api, Index, Metrics, P2p};
+use crate::services::{Api, Index, Metrics};
 use crate::utils::thread_handler::ControlMessage;
 use crate::utils::{increase_fd_limit, signal_channel};
 
@@ -62,7 +57,6 @@ impl Server {
             Some(("generate-config", submatches)) => {
                 let data_path = PathBuf::from(submatches.try_get_one::<String>("DATA_PATH")?.expect("no value"));
                 let api_grpc_endpoint = submatches.try_get_one::<String>("API_GRPC_ENDPOINT")?.expect("no value");
-                let iroh_gateway_http_endpoint = submatches.try_get_one::<String>("IROH_GATEWAY_HTTP_ENDPOINT")?;
                 let server_config = crate::configs::server::ConfigBuilder::default()
                     .data_path(data_path.join("bin"))
                     .logs_path(data_path.join("logs"))
@@ -71,28 +65,6 @@ impl Server {
                             .grpc_endpoint(api_grpc_endpoint.to_string())
                             .build()
                             .map_err(summa_core::Error::from)?,
-                    )
-                    .p2p(Some(
-                        crate::configs::p2p::ConfigBuilder::default()
-                            .key_store_path(data_path.join("ks"))
-                            .build()
-                            .map_err(summa_core::Error::from)?,
-                    ))
-                    .store(
-                        crate::configs::store::ConfigBuilder::default()
-                            .path(data_path.join("store"))
-                            .build()
-                            .map_err(summa_core::Error::from)?,
-                    )
-                    .gateway(
-                        iroh_gateway_http_endpoint
-                            .map(|http_endpoint| {
-                                crate::configs::gateway::ConfigBuilder::default()
-                                    .http_endpoint(http_endpoint.to_string())
-                                    .build()
-                                    .map_err(summa_core::Error::from)
-                            })
-                            .transpose()?,
                     )
                     .build()
                     .map_err(summa_core::Error::from)?;
@@ -130,47 +102,8 @@ impl Server {
 
         let mut futures: Vec<Box<dyn Future<Output = SummaServerResult<()>> + Send>> = vec![];
         let server_config = self.server_config_holder.read().await.get().clone();
-        let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
 
-        iroh_rpc_config.store_addr = Some(parse_endpoint(&server_config.store.endpoint)?);
-        iroh_rpc_config.p2p_addr = server_config.p2p.as_ref().map(|p2p_config| parse_endpoint(&p2p_config.endpoint)).transpose()?;
-
-        let iroh_rpc_client = iroh_rpc_client::Client::new(iroh_rpc_config.clone()).await?;
-        let content_loader = iroh_unixfs::content_loader::FullLoader::new(
-            iroh_rpc_client,
-            iroh_unixfs::content_loader::FullLoaderConfig {
-                http_gateways: server_config
-                    .p2p
-                    .as_ref()
-                    .map(|p2p| p2p.http_gateways.iter().map(|x| GatewayUrl::from_str(x)).collect::<Result<_, _>>())
-                    .transpose()?
-                    .unwrap_or_default(),
-                indexer: None,
-            },
-        )?;
-
-        let p2p_service = if let Some(p2p_config) = &server_config.p2p {
-            let p2p_service = P2p::new(p2p_config.clone()).await?;
-            let p2p_future = p2p_service.prepare_serving_future(terminator.clone()).await?;
-            futures.push(Box::new(p2p_future));
-            Some(p2p_service)
-        } else {
-            None
-        };
-
-        let store_service = Store::new(server_config.store.clone(), &iroh_rpc_config, content_loader).await?;
-        futures.push(Box::new(store_service.prepare_serving_future(terminator.clone()).await?));
-
-        if let Some(gateway_config) = server_config.gateway.clone() {
-            futures.push(Box::new(
-                Gateway::new(gateway_config, &store_service, p2p_service.as_ref())
-                    .await?
-                    .prepare_serving_future(terminator.clone())
-                    .await?,
-            ));
-        }
-
-        let index_service = Index::new(&self.server_config_holder, store_service)?;
+        let index_service = Index::new(&self.server_config_holder)?;
         futures.push(Box::new(index_service.prepare_serving_future(terminator.clone()).await?));
 
         let metrics_service = Metrics::new(&server_config.metrics)?;

@@ -81,7 +81,7 @@ async function handle_request(event: FetchEvent) {
     );
     response = new Response(response.body, {
       headers: set_same_origin_headers(new Headers(response.headers)),
-      status: 200
+      status: response.status === 206 ? 200 : response.status
     })
     if (caching_enabled && response.ok) {
       cache.put(url, response.clone());

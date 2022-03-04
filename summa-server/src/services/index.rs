@@ -1,8 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::Write;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,20 +11,19 @@ use summa_core::components::{cleanup_index, Driver, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
-use summa_core::directories::IrohDirectory;
 use summa_core::errors::SummaResult;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::validators;
 use summa_proto::proto;
 use tantivy::store::ZstdCompressor;
-use tantivy::{Directory, IndexBuilder, SegmentId};
+use tantivy::{IndexBuilder, SegmentId};
 use tokio::sync::RwLock;
 use tracing::{error, info, info_span, instrument, warn, Instrument};
 
 use crate::components::{ConsumerManager, PreparedConsumption};
+use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
-use crate::errors::{Error, SummaServerResult};
 use crate::hyper_external_request::HyperExternalRequest;
 use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
 
@@ -38,7 +35,6 @@ pub struct Index {
     consumer_manager: Arc<RwLock<ConsumerManager>>,
     should_terminate: Arc<AtomicBool>,
     autocommit_thread: Arc<RwLock<Option<ThreadHandler<SummaServerResult<()>>>>>,
-    store_service: crate::services::Store,
 }
 
 #[derive(Default)]
@@ -88,7 +84,7 @@ impl Index {
     }
 
     /// Creates new `IndexService` with `ConfigHolder`
-    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>, store_service: crate::services::Store) -> SummaServerResult<Index> {
+    pub fn new(server_config_holder: &Arc<dyn ConfigProxy<crate::configs::server::Config>>) -> SummaServerResult<Index> {
         let core_config_holder = Arc::new(PartialProxy::new(
             server_config_holder,
             |server_config| &server_config.core,
@@ -100,7 +96,6 @@ impl Index {
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
             autocommit_thread: Arc::default(),
-            store_service,
         })
     }
 
@@ -238,25 +233,6 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
-            Some(proto::attach_index_request::IndexEngine::Ipfs(proto::AttachIpfsEngineRequest { cid, cache_config })) => {
-                let ipfs_index_engine = proto::IpfsEngineConfig {
-                    cid: cid.to_string(),
-                    cache_config,
-                };
-                let index = IndexHolder::open_ipfs_index(
-                    &ipfs_index_engine,
-                    self.store_service.content_loader(),
-                    self.store_service.store(),
-                    self.store_service.default_chunk_size(),
-                    false,
-                )
-                .await?;
-                let index_engine_config = proto::IndexEngineConfig {
-                    config: Some(proto::index_engine_config::Config::Ipfs(ipfs_index_engine)),
-                    merge_policy: attach_index_request.merge_policy,
-                };
-                (index, index_engine_config)
-            }
             _ => unimplemented!(),
         };
         let index_holder = self.insert_index(&attach_index_request.index_name, index, &index_engine_config).await?;
@@ -330,33 +306,6 @@ impl Index {
                     })),
                     merge_policy: create_index_request.merge_policy,
                 };
-                (index, index_engine_config)
-            }
-            Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config })) => {
-                let iroh_directory = IrohDirectory::new(
-                    self.store_service.content_loader(),
-                    self.store_service.store(),
-                    self.store_service.default_chunk_size(),
-                    Driver::current_tokio(),
-                );
-                index_builder.open_or_create(iroh_directory.clone())?;
-                let cid = iroh_directory.cid().expect("directory should be created");
-                let ipfs_engine_config = proto::IpfsEngineConfig {
-                    cid: cid.to_string(),
-                    cache_config,
-                };
-                let index_engine_config = proto::IndexEngineConfig {
-                    config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config.clone())),
-                    merge_policy: create_index_request.merge_policy,
-                };
-                let index = IndexHolder::open_ipfs_index(
-                    &ipfs_engine_config,
-                    self.store_service.content_loader(),
-                    self.store_service.store(),
-                    self.store_service.default_chunk_size(),
-                    false,
-                )
-                .await?;
                 (index, index_engine_config)
             }
         };
@@ -496,25 +445,6 @@ impl Index {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
         };
-        let mut index_engine_config = index_holder.index_engine_config().write().await;
-        if let Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)) = &mut index_engine_config.get_mut().config {
-            let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
-            let span = tracing::Span::current();
-            tokio::task::spawn_blocking(move || span.in_scope(|| index_writer_holder.prepare_index(true))).await??;
-            let cid = index_holder
-                .real_directory()
-                .as_any()
-                .downcast_ref::<IrohDirectory>()
-                .expect("should be `IrohDirectory`")
-                .cid()
-                .expect("should be `cid`");
-            ipfs_engine_config.cid = cid.to_string();
-            index_engine_config.commit().await?;
-            info!(action = "store_new_cid", cid = ?cid);
-            let index_holder = index_holder.clone();
-            let span = tracing::Span::current();
-            tokio::task::spawn_blocking(move || span.in_scope(|| index_holder.index_reader().reload())).await??;
-        }
         Ok(prepared_consumption)
     }
 
@@ -606,16 +536,6 @@ impl Index {
             Some(proto::index_engine_config::Config::Remote(config)) => {
                 IndexHolder::open_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, read_only).await?
             }
-            Some(proto::index_engine_config::Config::Ipfs(config)) => {
-                IndexHolder::open_ipfs_index(
-                    &config,
-                    self.store_service.content_loader(),
-                    self.store_service.store(),
-                    self.store_service.default_chunk_size(),
-                    read_only,
-                )
-                .await?
-            }
             _ => unimplemented!(),
         };
         Ok(index)
@@ -624,59 +544,7 @@ impl Index {
     /// Copies index with changing engine
     #[instrument(skip(self, copy_index_request), fields(source_index_name = copy_index_request.source_index_name, target_index_name = copy_index_request.target_index_name))]
     pub async fn copy_index(&self, copy_index_request: proto::CopyIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
-        let index_holder = self.index_registry.get_index_holder(&copy_index_request.source_index_name).await?;
-        let prepared_consumption = self.commit(&index_holder).await?;
-
-        let index_holder = match copy_index_request.target_index_engine {
-            Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config })) => {
-                let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
-                let iroh_directory = IrohDirectory::new(
-                    self.store_service.content_loader(),
-                    self.store_service.store(),
-                    self.store_service.default_chunk_size(),
-                    Driver::Tokio(tokio::runtime::Handle::current()),
-                );
-                let span = tracing::Span::current();
-                let cid = tokio::task::spawn_blocking(move || {
-                    span.in_scope(|| {
-                        let locked_files = index_writer_holder.lock_files(true)?;
-                        for file in locked_files {
-                            // ToDo: Avoid reading to memory
-                            info!(action = "copy_file", file = file);
-                            let mut writer = iroh_directory.get_writer(&file);
-                            writer.write_all(&index_holder.index().directory().atomic_read(Path::new(&file)).expect("cannot read"))?;
-                            writer.terminate()?;
-                        }
-                        Ok::<String, Error>(iroh_directory.cid().expect("should be non empty").to_string())
-                    })
-                })
-                .await??;
-                let ipfs_engine_config = proto::IpfsEngineConfig { cid, cache_config };
-                let index = IndexHolder::open_ipfs_index(
-                    &ipfs_engine_config,
-                    self.store_service.content_loader(),
-                    self.store_service.store(),
-                    self.store_service.default_chunk_size(),
-                    false,
-                )
-                .await?;
-                self.insert_index(
-                    &copy_index_request.target_index_name,
-                    index,
-                    &proto::IndexEngineConfig {
-                        config: Some(proto::index_engine_config::Config::Ipfs(ipfs_engine_config)),
-                        merge_policy: copy_index_request.merge_policy,
-                    },
-                )
-                .await?
-            }
-            _ => unimplemented!(),
-        };
-        index_holder.partial_warmup(false).await?;
-        if let Some(prepared_consumption) = prepared_consumption {
-            self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
-        }
-        Ok(index_holder)
+        unimplemented!()
     }
 
     /// Search documents
@@ -745,7 +613,6 @@ pub(crate) mod tests {
     use rand::{Rng, SeedableRng};
     use summa_core::components::SummaDocument;
     use summa_core::configs::DirectProxy;
-    use summa_core::utils::parse_endpoint;
     use summa_proto::proto_traits::collector::shortcuts::{top_docs_collector, top_docs_collector_with_eval_expr};
     use summa_proto::proto_traits::query::shortcuts::match_query;
     use tantivy::doc;
@@ -757,33 +624,8 @@ pub(crate) mod tests {
     use crate::utils::signal_channel;
     use crate::utils::tests::acquire_free_port;
 
-    pub async fn create_test_store_service(data_path: &Path) -> crate::services::Store {
-        let port = acquire_free_port();
-
-        let mut iroh_rpc_config = iroh_rpc_client::Config::default_network();
-        iroh_rpc_config.store_addr = Some(parse_endpoint(&format!("127.0.0.1:{port}")).unwrap());
-        iroh_rpc_config.p2p_addr = None;
-        iroh_rpc_config.gateway_addr = None;
-
-        let iroh_rpc_client = iroh_rpc_client::Client::new(iroh_rpc_config.clone()).await.unwrap();
-        let content_loader = iroh_unixfs::content_loader::FullLoader::new(
-            iroh_rpc_client,
-            iroh_unixfs::content_loader::FullLoaderConfig {
-                http_gateways: vec![],
-                indexer: None,
-            },
-        )
-        .unwrap();
-        let mut config = crate::configs::store::Config::default();
-        config.path = data_path.join("store").to_path_buf();
-        config.endpoint = format!("127.0.0.1:{}", port);
-        let store = crate::services::Store::new(config, &iroh_rpc_config, content_loader).await.unwrap();
-        tokio::spawn(store.prepare_serving_future(signal_channel().unwrap()).await.unwrap());
-        store
-    }
-
     pub async fn create_test_index_service(data_path: &Path) -> Index {
-        Index::new(&create_test_server_config_holder(&data_path), create_test_store_service(data_path).await).unwrap()
+        Index::new(&create_test_server_config_holder(&data_path)).unwrap()
     }
 
     pub async fn create_test_index_holder(
@@ -910,10 +752,7 @@ pub(crate) mod tests {
         logging::tests::initialize_default_once();
         let root_path = tempdir::TempDir::new("summa_test").unwrap();
         let data_path = root_path.path().join("data");
-        let index_service = Index::new(
-            &(Arc::new(DirectProxy::default()) as Arc<dyn ConfigProxy<_>>),
-            create_test_store_service(&data_path).await,
-        )?;
+        let index_service = Index::new(&(Arc::new(DirectProxy::default()) as Arc<dyn ConfigProxy<_>>))?;
         assert!(index_service
             .create_index(proto::CreateIndexRequest {
                 index_name: "test_index".to_owned(),
@@ -951,7 +790,7 @@ pub(crate) mod tests {
 
         let server_config_holder = create_test_server_config_holder(&data_path);
 
-        let index_service = Index::new(&server_config_holder, create_test_store_service(&data_path).await)?;
+        let index_service = Index::new(&server_config_holder)?;
         index_service
             .create_index(proto::CreateIndexRequest {
                 index_name: "test_index".to_owned(),
@@ -983,55 +822,6 @@ pub(crate) mod tests {
             },)
             .await
             .is_ok());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_ipfs_index() -> SummaServerResult<()> {
-        logging::tests::initialize_default_once();
-        let root_path = tempdir::TempDir::new("summa_test").unwrap();
-        let data_path = root_path.path().join("data");
-
-        let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(
-            &index_service,
-            &create_test_schema(),
-            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config: None }),
-        )
-        .await?;
-
-        for d in generate_documents(index_holder.schema(), 1000) {
-            index_holder.index_document(d).await?;
-        }
-        index_service.commit(&index_holder).await?;
-        index_holder
-            .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
-            .await?;
-        index_service.commit(&index_holder).await?;
-        for d in generate_documents(index_holder.schema(), 1000) {
-            index_holder.index_document(d).await?;
-        }
-        index_service.rollback(&index_holder).await?;
-        for d in generate_documents(index_holder.schema(), 1000) {
-            index_holder.index_document(d).await?;
-        }
-        index_service.commit(&index_holder).await?;
-
-        let search_response = index_holder
-            .search(
-                "index",
-                match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
-                vec![top_docs_collector(10)],
-                None,
-            )
-            .await?;
-        assert_eq!(search_response.len(), 1);
-        drop(index_holder);
-        index_service
-            .delete_index(proto::DeleteIndexRequest {
-                index_name: "test_index".to_string(),
-            })
-            .await?;
         Ok(())
     }
 
@@ -1079,64 +869,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_index() -> SummaServerResult<()> {
-        logging::tests::initialize_default_once();
-        let schema = create_test_schema();
-
-        let root_path = tempdir::TempDir::new("summa_test").unwrap();
-        let data_path = root_path.path().join("data");
-
-        let index_service = create_test_index_service(&data_path).await;
-        let index_holder = create_test_index_holder(
-            &index_service,
-            &schema,
-            proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {}),
-        )
-        .await?;
-
-        for d in generate_documents(index_holder.schema(), 1000) {
-            index_holder.index_document(d).await?;
-        }
-        index_holder
-            .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
-            .await?;
-        index_service.commit(&index_holder).await?;
-
-        index_service
-            .copy_index(proto::CopyIndexRequest {
-                source_index_name: "test_index".to_string(),
-                target_index_name: "copied_index".to_string(),
-                merge_policy: None,
-                target_index_engine: Some(proto::copy_index_request::TargetIndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
-                    cache_config: None,
-                })),
-            })
-            .await?;
-
-        let search_response = index_holder
-            .search(
-                "copied_index",
-                match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
-                vec![top_docs_collector(10)],
-                None,
-            )
-            .await?;
-        assert_eq!(search_response.len(), 1);
-
-        let search_response = index_holder
-            .search(
-                "test_index",
-                match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
-                vec![top_docs_collector(10)],
-                None,
-            )
-            .await?;
-        assert_eq!(search_response.len(), 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_custom_ranking() -> SummaServerResult<()> {
         logging::tests::initialize_default_once();
         let schema = create_test_schema();
@@ -1148,7 +880,7 @@ pub(crate) mod tests {
         let index_holder = create_test_index_holder(
             &index_service,
             &schema,
-            proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest { cache_config: None }),
+            proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {}),
         )
         .await?;
 
