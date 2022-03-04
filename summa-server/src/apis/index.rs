@@ -249,8 +249,8 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn vacuum_index(&self, proto_request: Request<proto::VacuumIndexRequest>) -> Result<Response<proto::VacuumIndexResponse>, Status> {
         let vacuum_index_request = proto_request.into_inner();
-        self.index_service.vacuum_index(vacuum_index_request).await?;
-        let response = proto::VacuumIndexResponse {};
+        let freed_space_bytes = self.index_service.vacuum_index(vacuum_index_request).await?;
+        let response = proto::VacuumIndexResponse { freed_space_bytes };
         Ok(Response::new(response))
     }
 

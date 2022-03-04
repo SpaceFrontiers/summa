@@ -27,32 +27,22 @@ class AttachFileEngineRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class AttachIndexRequest(_message.Message):
-    __slots__ = ["file", "index_name", "ipfs", "merge_policy", "remote"]
+    __slots__ = ["file", "index_name", "merge_policy", "remote"]
     FILE_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    IPFS_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     REMOTE_FIELD_NUMBER: _ClassVar[int]
     file: AttachFileEngineRequest
     index_name: str
-    ipfs: AttachIpfsEngineRequest
     merge_policy: MergePolicy
     remote: AttachRemoteEngineRequest
-    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., remote: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[AttachIpfsEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., remote: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
 
 class AttachIndexResponse(_message.Message):
     __slots__ = ["index"]
     INDEX_FIELD_NUMBER: _ClassVar[int]
     index: IndexDescription
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
-
-class AttachIpfsEngineRequest(_message.Message):
-    __slots__ = ["cache_config", "cid"]
-    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    CID_FIELD_NUMBER: _ClassVar[int]
-    cache_config: CacheConfig
-    cid: str
-    def __init__(self, cid: _Optional[str] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
 class AttachRemoteEngineRequest(_message.Message):
     __slots__ = ["cache_config"]
@@ -95,20 +85,18 @@ class CopyDocumentsResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ..., copied_documents: _Optional[int] = ...) -> None: ...
 
 class CopyIndexRequest(_message.Message):
-    __slots__ = ["file", "ipfs", "memory", "merge_policy", "source_index_name", "target_index_name"]
+    __slots__ = ["file", "memory", "merge_policy", "source_index_name", "target_index_name"]
     FILE_FIELD_NUMBER: _ClassVar[int]
-    IPFS_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     SOURCE_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     TARGET_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     file: CreateFileEngineRequest
-    ipfs: CreateIpfsEngineRequest
     memory: CreateMemoryEngineRequest
     merge_policy: MergePolicy
     source_index_name: str
     target_index_name: str
-    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[CreateIpfsEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
 
 class CopyIndexResponse(_message.Message):
     __slots__ = ["index"]
@@ -121,13 +109,12 @@ class CreateFileEngineRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class CreateIndexRequest(_message.Message):
-    __slots__ = ["blocksize", "compression", "file", "index_attributes", "index_name", "ipfs", "memory", "merge_policy", "schema", "sort_by_field"]
+    __slots__ = ["blocksize", "compression", "file", "index_attributes", "index_name", "memory", "merge_policy", "schema", "sort_by_field"]
     BLOCKSIZE_FIELD_NUMBER: _ClassVar[int]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
     FILE_FIELD_NUMBER: _ClassVar[int]
     INDEX_ATTRIBUTES_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    IPFS_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     SCHEMA_FIELD_NUMBER: _ClassVar[int]
@@ -137,24 +124,17 @@ class CreateIndexRequest(_message.Message):
     file: CreateFileEngineRequest
     index_attributes: IndexAttributes
     index_name: str
-    ipfs: CreateIpfsEngineRequest
     memory: CreateMemoryEngineRequest
     merge_policy: MergePolicy
     schema: str
     sort_by_field: SortByField
-    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., ipfs: _Optional[_Union[CreateIpfsEngineRequest, _Mapping]] = ..., schema: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., schema: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
 
 class CreateIndexResponse(_message.Message):
     __slots__ = ["index"]
     INDEX_FIELD_NUMBER: _ClassVar[int]
     index: IndexDescription
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
-
-class CreateIpfsEngineRequest(_message.Message):
-    __slots__ = ["cache_config"]
-    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    cache_config: CacheConfig
-    def __init__(self, cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
 class CreateMemoryEngineRequest(_message.Message):
     __slots__ = []
@@ -316,32 +296,22 @@ class IndexDocumentStreamResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ..., success_docs: _Optional[int] = ..., failed_docs: _Optional[int] = ...) -> None: ...
 
 class IndexEngineConfig(_message.Message):
-    __slots__ = ["file", "ipfs", "memory", "merge_policy", "remote"]
+    __slots__ = ["file", "memory", "merge_policy", "remote"]
     FILE_FIELD_NUMBER: _ClassVar[int]
-    IPFS_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     REMOTE_FIELD_NUMBER: _ClassVar[int]
     file: FileEngineConfig
-    ipfs: IpfsEngineConfig
     memory: MemoryEngineConfig
     merge_policy: MergePolicy
     remote: RemoteEngineConfig
-    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., ipfs: _Optional[_Union[IpfsEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
 
 class IndexOperation(_message.Message):
     __slots__ = ["index_document"]
     INDEX_DOCUMENT_FIELD_NUMBER: _ClassVar[int]
     index_document: IndexDocumentOperation
     def __init__(self, index_document: _Optional[_Union[IndexDocumentOperation, _Mapping]] = ...) -> None: ...
-
-class IpfsEngineConfig(_message.Message):
-    __slots__ = ["cache_config", "cid"]
-    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    CID_FIELD_NUMBER: _ClassVar[int]
-    cache_config: CacheConfig
-    cid: str
-    def __init__(self, cid: _Optional[str] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
 
 class LogMergePolicy(_message.Message):
     __slots__ = ["is_frozen"]
@@ -386,7 +356,7 @@ class PrimaryKey(_message.Message):
     def __init__(self, str: _Optional[str] = ..., i64: _Optional[int] = ...) -> None: ...
 
 class RemoteEngineConfig(_message.Message):
-    __slots__ = ["cache_config", "headers_template", "method", "url_template"]
+    __slots__ = ["cache_config", "headers_template", "method", "timeout_ms", "url_template"]
     class HeadersTemplateEntry(_message.Message):
         __slots__ = ["key", "value"]
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -397,12 +367,14 @@ class RemoteEngineConfig(_message.Message):
     CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
     HEADERS_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
     METHOD_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_MS_FIELD_NUMBER: _ClassVar[int]
     URL_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
     cache_config: CacheConfig
     headers_template: _containers.ScalarMap[str, str]
     method: str
+    timeout_ms: int
     url_template: str
-    def __init__(self, method: _Optional[str] = ..., url_template: _Optional[str] = ..., headers_template: _Optional[_Mapping[str, str]] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
+    def __init__(self, method: _Optional[str] = ..., url_template: _Optional[str] = ..., headers_template: _Optional[_Mapping[str, str]] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ..., timeout_ms: _Optional[int] = ...) -> None: ...
 
 class SetIndexAliasRequest(_message.Message):
     __slots__ = ["index_alias", "index_name"]
@@ -439,8 +411,10 @@ class VacuumIndexRequest(_message.Message):
     def __init__(self, index_name: _Optional[str] = ...) -> None: ...
 
 class VacuumIndexResponse(_message.Message):
-    __slots__ = []
-    def __init__(self) -> None: ...
+    __slots__ = ["freed_space_bytes"]
+    FREED_SPACE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    freed_space_bytes: int
+    def __init__(self, freed_space_bytes: _Optional[int] = ...) -> None: ...
 
 class WarmupIndexRequest(_message.Message):
     __slots__ = ["index_name", "is_full"]

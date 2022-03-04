@@ -18,6 +18,7 @@ use tantivy::collector::{Collector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
+use tantivy::space_usage::SearcherSpaceUsage;
 use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher, SegmentReader, Term};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -612,5 +613,9 @@ impl IndexHolder {
             start_from = Some(last_term);
         }
         Ok(())
+    }
+
+    pub fn space_usage(&self) -> SummaResult<SearcherSpaceUsage> {
+        Ok(self.index_reader().searcher().space_usage()?)
     }
 }

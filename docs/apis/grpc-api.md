@@ -23,9 +23,8 @@ parent: APIs
     - [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest)
     - [AttachIndexRequest](#summa-proto-AttachIndexRequest)
     - [AttachIndexResponse](#summa-proto-AttachIndexResponse)
-    - [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest)
     - [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest)
-    - [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig)
+    - [CacheConfig](#summa-proto-CacheConfig)
     - [CommitIndexRequest](#summa-proto-CommitIndexRequest)
     - [CommitIndexResponse](#summa-proto-CommitIndexResponse)
     - [CopyDocumentsRequest](#summa-proto-CopyDocumentsRequest)
@@ -35,7 +34,6 @@ parent: APIs
     - [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest)
     - [CreateIndexRequest](#summa-proto-CreateIndexRequest)
     - [CreateIndexResponse](#summa-proto-CreateIndexResponse)
-    - [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest)
     - [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest)
     - [DeleteDocumentsRequest](#summa-proto-DeleteDocumentsRequest)
     - [DeleteDocumentsResponse](#summa-proto-DeleteDocumentsResponse)
@@ -60,7 +58,6 @@ parent: APIs
     - [IndexDocumentStreamResponse](#summa-proto-IndexDocumentStreamResponse)
     - [IndexEngineConfig](#summa-proto-IndexEngineConfig)
     - [IndexOperation](#summa-proto-IndexOperation)
-    - [IpfsEngineConfig](#summa-proto-IpfsEngineConfig)
     - [LogMergePolicy](#summa-proto-LogMergePolicy)
     - [MemoryEngineConfig](#summa-proto-MemoryEngineConfig)
     - [MergePolicy](#summa-proto-MergePolicy)
@@ -79,6 +76,7 @@ parent: APIs
     - [WarmupIndexResponse](#summa-proto-WarmupIndexResponse)
   
     - [Compression](#summa-proto-Compression)
+    - [ConflictStrategy](#summa-proto-ConflictStrategy)
   
 - [query.proto](#query-proto)
     - [Aggregation](#summa-proto-Aggregation)
@@ -104,6 +102,7 @@ parent: APIs
     - [CustomOrder](#summa-proto-CustomOrder)
     - [DisjunctionMaxQuery](#summa-proto-DisjunctionMaxQuery)
     - [EmptyQuery](#summa-proto-EmptyQuery)
+    - [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter)
     - [FacetCollector](#summa-proto-FacetCollector)
     - [FacetCollectorOutput](#summa-proto-FacetCollectorOutput)
     - [FacetCollectorOutput.FacetCountsEntry](#summa-proto-FacetCollectorOutput-FacetCountsEntry)
@@ -113,6 +112,9 @@ parent: APIs
     - [HistogramResult](#summa-proto-HistogramResult)
     - [Key](#summa-proto-Key)
     - [MatchQuery](#summa-proto-MatchQuery)
+    - [MatchQuery.FieldBoostsEntry](#summa-proto-MatchQuery-FieldBoostsEntry)
+    - [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode)
+    - [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode)
     - [MetricAggregation](#summa-proto-MetricAggregation)
     - [MetricResult](#summa-proto-MetricResult)
     - [MoreLikeThisQuery](#summa-proto-MoreLikeThisQuery)
@@ -362,7 +364,6 @@ Attach index request
 | index_name | [string](#string) |  | Index name for attaching |
 | file | [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest) |  |  |
 | remote | [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest) |  |  |
-| ipfs | [AttachIpfsEngineRequest](#summa-proto-AttachIpfsEngineRequest) |  |  |
 | merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  |  |
 
 
@@ -385,22 +386,6 @@ Description of the attached index
 
 
 
-<a name="summa-proto-AttachIpfsEngineRequest"></a>
-
-### AttachIpfsEngineRequest
-Attach file engine request
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| cid | [string](#string) |  | [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/) |
-| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
-
-
-
-
-
-
 <a name="summa-proto-AttachRemoteEngineRequest"></a>
 
 ### AttachRemoteEngineRequest
@@ -409,23 +394,22 @@ Attach remote engine request
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
+| cache_config | [CacheConfig](#summa-proto-CacheConfig) |  |  |
 
 
 
 
 
 
-<a name="summa-proto-ChunkedCacheConfig"></a>
+<a name="summa-proto-CacheConfig"></a>
 
-### ChunkedCacheConfig
+### CacheConfig
 
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| chunk_size | [uint64](#uint64) |  | Chunk size in bytes |
-| cache_size | [uint64](#uint64) | optional | Total cache size in bytes |
+| cache_size | [uint64](#uint64) |  | Total cache size in bytes |
 
 
 
@@ -506,7 +490,6 @@ Request that changes index engine. Currently possible to convert File to IPFS
 | target_index_name | [string](#string) |  | Name of index that will be created |
 | file | [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest) |  |  |
 | memory | [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest) |  |  |
-| ipfs | [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest) |  |  |
 | merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  |  |
 
 
@@ -550,7 +533,6 @@ Request for index creation
 | index_name | [string](#string) |  | Index name |
 | file | [CreateFileEngineRequest](#summa-proto-CreateFileEngineRequest) |  |  |
 | memory | [CreateMemoryEngineRequest](#summa-proto-CreateMemoryEngineRequest) |  |  |
-| ipfs | [CreateIpfsEngineRequest](#summa-proto-CreateIpfsEngineRequest) |  |  |
 | schema | [string](#string) |  | Index schema in Tantivy format |
 | compression | [Compression](#summa-proto-Compression) |  | Compression for store |
 | blocksize | [uint32](#uint32) | optional | Size of store blocks |
@@ -572,21 +554,6 @@ Request for index creation
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index | [IndexDescription](#summa-proto-IndexDescription) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-CreateIpfsEngineRequest"></a>
-
-### CreateIpfsEngineRequest
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  |  |
 
 
 
@@ -820,6 +787,7 @@ Single document from the index
 | default_index_name | [string](#string) | optional | Descriptive field that may be used as name for index when indices are replicating over wire |
 | description | [string](#string) | optional | Text index description |
 | default_snippets | [string](#string) | repeated | (Not-used) |
+| conflict_strategy | [ConflictStrategy](#summa-proto-ConflictStrategy) |  |  |
 
 
 
@@ -931,7 +899,6 @@ Description of the `IndexEngine` responsible for managing files in the persisten
 | file | [FileEngineConfig](#summa-proto-FileEngineConfig) |  |  |
 | memory | [MemoryEngineConfig](#summa-proto-MemoryEngineConfig) |  |  |
 | remote | [RemoteEngineConfig](#summa-proto-RemoteEngineConfig) |  |  |
-| ipfs | [IpfsEngineConfig](#summa-proto-IpfsEngineConfig) |  |  |
 | merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  | Merge policy |
 
 
@@ -948,22 +915,6 @@ Message that should be put in Kafka for ingesting by Summa consumers
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_document | [IndexDocumentOperation](#summa-proto-IndexDocumentOperation) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-IpfsEngineConfig"></a>
-
-### IpfsEngineConfig
-IPFS index engine
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| cid | [string](#string) |  | [IPFS CID](https://docs.ipfs.tech/concepts/content-addressing/) |
-| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  | Description of the cache for the engine |
 
 
 
@@ -1074,7 +1025,8 @@ Remote HTTP engine config
 | method | [string](#string) |  | Which method should be used to request remote endpoint |
 | url_template | [string](#string) |  | URL template which will be used to generate real URL by variables substitution |
 | headers_template | [RemoteEngineConfig.HeadersTemplateEntry](#summa-proto-RemoteEngineConfig-HeadersTemplateEntry) | repeated | Headers template which will be used to generate real URL by variables substitution |
-| chunked_cache_config | [ChunkedCacheConfig](#summa-proto-ChunkedCacheConfig) |  | Description of the cache for the engine |
+| cache_config | [CacheConfig](#summa-proto-CacheConfig) |  | Description of the cache for the engine |
+| timeout_ms | [uint32](#uint32) | optional | Timeout for the request |
 
 
 
@@ -1180,6 +1132,11 @@ Merge policy for compressing old segments
 
 
 
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| freed_space_bytes | [uint64](#uint64) |  |  |
+
+
 
 
 
@@ -1234,6 +1191,20 @@ Compression library for store, implies on both performance and occupied disk spa
 | Zstd14 | 7 |  |
 | Zstd19 | 8 |  |
 | Zstd22 | 9 |  |
+
+
+
+<a name="summa-proto-ConflictStrategy"></a>
+
+### ConflictStrategy
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| DO_NOTHING | 0 |  |
+| OVERWRITE_ALWAYS | 1 |  |
+| OVERWRITE | 2 |  |
+| MERGE | 3 |  |
 
 
  <!-- end enums -->
@@ -1633,6 +1604,22 @@ Collectors and CollectorOutputs
 
 
 
+<a name="summa-proto-ExactMatchesPromoter"></a>
+
+### ExactMatchesPromoter
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| slop | [uint32](#uint32) |  |  |
+| boost | [float](#float) | optional |  |
+
+
+
+
+
+
 <a name="summa-proto-FacetCollector"></a>
 
 ### FacetCollector
@@ -1773,6 +1760,51 @@ Collectors and CollectorOutputs
 | ----- | ---- | ----- | ----------- |
 | value | [string](#string) |  |  |
 | default_fields | [string](#string) | repeated |  |
+| boolean_should_mode | [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode) |  |  |
+| disjuction_max_mode | [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode) |  |  |
+| field_boosts | [MatchQuery.FieldBoostsEntry](#summa-proto-MatchQuery-FieldBoostsEntry) | repeated |  |
+| exact_matches_promoter | [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-MatchQuery-FieldBoostsEntry"></a>
+
+### MatchQuery.FieldBoostsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [float](#float) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-MatchQueryBooleanShouldMode"></a>
+
+### MatchQueryBooleanShouldMode
+
+
+
+
+
+
+
+<a name="summa-proto-MatchQueryDisjuctionMaxMode"></a>
+
+### MatchQueryDisjuctionMaxMode
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| tie_breaker | [float](#float) |  |  |
 
 
 
@@ -2455,6 +2487,7 @@ Analyzes indices
 | index_alias | [string](#string) |  | The index name or alias |
 | query | [Query](#summa-proto-Query) |  | Query DSL. Use `MatchQuery` to pass a free-form query |
 | collectors | [Collector](#summa-proto-Collector) | repeated | Every collector is responsible of processing and storing documents and/or their derivatives (like counters) to return them to the caller |
+| is_fieldnorms_scoring_enabled | [bool](#bool) | optional | Is requiring fieldnorms needed for the query? |
 
 
 

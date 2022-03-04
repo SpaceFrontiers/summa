@@ -33,6 +33,9 @@ export class RemoteEngineConfig {
     this.cache_config = cache_config;
     this.timeout_ms = timeout_ms;
   }
+  get_file_url(file_name: string) {
+    return this.url_template.replace("{file_name}", file_name);
+  }
 }
 
 export class CacheConfig {

@@ -580,7 +580,7 @@ impl Index {
 
     /// Merges segments and removes tombstones
     #[instrument(skip(self, vacuum_index_request), fields(index_name = vacuum_index_request.index_name))]
-    pub async fn vacuum_index(&self, vacuum_index_request: proto::VacuumIndexRequest) -> SummaServerResult<()> {
+    pub async fn vacuum_index(&self, vacuum_index_request: proto::VacuumIndexRequest) -> SummaServerResult<u64> {
         let index_holder = self.get_index_holder(&vacuum_index_request.index_name).await?;
         let mut index_writer_holder = index_holder
             .index_writer_holder()
@@ -588,6 +588,7 @@ impl Index {
             .clone()
             .write_owned()
             .await;
+        let before_size = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
@@ -598,7 +599,8 @@ impl Index {
             });
         })
         .await?;
-        Ok(())
+        let after_size = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
+        Ok(after_size - before_size)
     }
 }
 
