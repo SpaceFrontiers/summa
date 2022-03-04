@@ -9,7 +9,7 @@ from termcolor import colored
 from aiosumma import SummaClient
 
 
-async def client_cli(endpoint):
+async def client_cli(endpoint: str = '127.0.0.1:8082'):
     try:
         client = SummaClient(endpoint=endpoint, connection_timeout=3.0)
         await client.start()

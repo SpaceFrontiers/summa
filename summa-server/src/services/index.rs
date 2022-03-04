@@ -437,9 +437,17 @@ impl Index {
     pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         let mut index_writer = index_holder.index_writer_holder()?.clone().write_owned().await;
+        let index_holder = index_holder.clone();
 
         let span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit())).await??;
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                index_writer.commit()?;
+                index_holder.index_reader().reload()?;
+                Ok::<_, crate::errors::Error>(())
+            })
+        })
+        .await??;
 
         let prepared_consumption = match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
@@ -588,7 +596,7 @@ impl Index {
             .clone()
             .write_owned()
             .await;
-        let before_size = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
+        let before_size: u64 = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
@@ -599,7 +607,7 @@ impl Index {
             });
         })
         .await?;
-        let after_size = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
+        let after_size: u64 = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
         Ok(after_size - before_size)
     }
 }
@@ -623,8 +631,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::configs::server::tests::create_test_server_config_holder;
     use crate::logging;
-    use crate::utils::signal_channel;
-    use crate::utils::tests::acquire_free_port;
 
     pub async fn create_test_index_service(data_path: &Path) -> Index {
         Index::new(&create_test_server_config_holder(&data_path)).unwrap()
@@ -752,8 +758,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_same_name_index() -> SummaServerResult<()> {
         logging::tests::initialize_default_once();
-        let root_path = tempdir::TempDir::new("summa_test").unwrap();
-        let data_path = root_path.path().join("data");
         let index_service = Index::new(&(Arc::new(DirectProxy::default()) as Arc<dyn ConfigProxy<_>>))?;
         assert!(index_service
             .create_index(proto::CreateIndexRequest {
@@ -898,7 +902,7 @@ pub(crate) mod tests {
         tokio::task::spawn_blocking(move || {
             index_writer.vacuum(None)?;
             index_holder_clone.index_reader().reload()?;
-            Ok::<_, Error>(())
+            Ok::<_, crate::errors::Error>(())
         })
         .await??;
         assert!(index_holder

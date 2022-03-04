@@ -822,17 +822,17 @@ mod tests {
         let query = query_parser.parse_query("body:[aaa TO ccc]");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(RangeQuery { field: \"body\", value_type: Str, left_bound: Included([97, 97, 97]), right_bound: Included([99, 99, 99]) })"
+            "Ok(RangeQuery { field: \"body\", value_type: Str, left_bound: Included([97, 97, 97]), right_bound: Included([99, 99, 99]), limit: None })"
         );
         let query = query_parser.parse_query("body:[ a to  * ]");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(RangeQuery { field: \"body\", value_type: Str, left_bound: Included([97]), right_bound: Unbounded })"
+            "Ok(RangeQuery { field: \"body\", value_type: Str, left_bound: Included([97]), right_bound: Unbounded, limit: None })"
         );
         let query = query_parser.parse_query("timestamp:[ 1000 to 2000 ]");
-        assert_eq!(format!("{:?}", query), "Ok(RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]) })");
+        assert_eq!(format!("{:?}", query), "Ok(RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]), limit: None })");
         let query = query_parser.parse_query("timestamp:(-[1100 to 1200] [ 1000 to 2000 ] -1500 +3000)");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(MustNot, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 4, 76]), right_bound: Included([128, 0, 0, 0, 0, 0, 4, 176]) }), (Should, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]) }), (MustNot, TermQuery(Term(type=I64, field=2, 1500))), (Must, TermQuery(Term(type=I64, field=2, 3000)))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(MustNot, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 4, 76]), right_bound: Included([128, 0, 0, 0, 0, 0, 4, 176]), limit: None }), (Should, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]), limit: None }), (MustNot, TermQuery(Term(type=I64, field=2, 1500))), (Must, TermQuery(Term(type=I64, field=2, 3000)))] })");
     }
 
     #[test]

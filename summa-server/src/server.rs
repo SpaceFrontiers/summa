@@ -179,9 +179,7 @@ mod tests {
         let r = index_api_client
             .create_index(tonic::Request::new(proto::CreateIndexRequest {
                 index_name: index_name.to_owned(),
-                index_engine: Some(proto::create_index_request::IndexEngine::Ipfs(proto::CreateIpfsEngineRequest {
-                    cache_config: None,
-                })),
+                index_engine: Some(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {})),
                 index_attributes: Some(proto::IndexAttributes {
                     default_fields: vec!["title".to_owned(), "body".to_owned()],
                     ..Default::default()
@@ -309,10 +307,7 @@ mod tests {
                         collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
                             limit: 1,
                             offset: 0,
-                            scorer: None,
-                            snippet_configs: Default::default(),
-                            explain: false,
-                            fields: vec![],
+                            ..Default::default()
                         })),
                     }],
                     is_fieldnorms_scoring_enabled: None,

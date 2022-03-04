@@ -1,5 +1,4 @@
 import sys
-import typing
 from typing import (
     AsyncIterator,
     Dict,
