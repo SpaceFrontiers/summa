@@ -620,7 +620,10 @@ mod tests {
         let tokenizer_manager = TokenizerManager::default();
         tokenizer_manager.register(
             "summa",
-            TextAnalyzer::from(SummaTokenizer).filter(RemoveLongFilter::limit(100)).filter(LowerCaser),
+            TextAnalyzer::builder(SummaTokenizer)
+                .filter(RemoveLongFilter::limit(100))
+                .filter(LowerCaser)
+                .build(),
         );
         let mut schema_builder = Schema::builder();
         let text_options = TextOptions::default().set_indexing_options(

@@ -619,3 +619,65 @@ impl IndexHolder {
         Ok(self.index_reader().searcher().space_usage()?)
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use std::error::Error;
+
+    use summa_proto::proto;
+    use summa_proto::proto::ConflictStrategy;
+    use tantivy::collector::Count;
+    use tantivy::query::TermQuery;
+    use tantivy::schema::IndexRecordOption;
+    use tantivy::{doc, Document, IndexBuilder, Term};
+
+    use crate::components::test_utils::{create_test_schema, generate_documents};
+    use crate::components::IndexWriterHolder;
+    use crate::configs::core::WriterThreads;
+
+    #[test]
+    fn test_deletes() -> Result<(), Box<dyn Error>> {
+        let schema = create_test_schema();
+        let index = IndexBuilder::new()
+            .schema(schema.clone())
+            .index_attributes(proto::IndexAttributes {
+                unique_fields: vec!["id".to_string()],
+                ..Default::default()
+            })
+            .create_in_ram()?;
+        let mut index_writer_holder = IndexWriterHolder::create(
+            &index,
+            WriterThreads::N(12),
+            1024 * 1024 * 1024,
+            Box::new(tantivy::merge_policy::LogMergePolicy::default()),
+        )?;
+        let mut last_document = None;
+        for document in generate_documents(&schema, 10000) {
+            let document: Document = document.bound_with(&schema).try_into()?;
+            last_document = Some(document.clone());
+            index_writer_holder.index_document(document, ConflictStrategy::Merge)?;
+        }
+        let last_document = last_document.clone().unwrap();
+        let id = last_document.get_first(schema.get_field("id").unwrap()).unwrap().as_i64().unwrap();
+        let modified_last_document = doc!(
+            schema.get_field("id").unwrap() => id,
+            schema.get_field("issued_at").unwrap() => 100i64
+        );
+        index_writer_holder.commit()?;
+        for document in generate_documents(&schema, 1000) {
+            let document = document.bound_with(&schema).try_into()?;
+            index_writer_holder.index_document(modified_last_document.clone(), ConflictStrategy::Merge)?;
+            index_writer_holder.index_document(document, ConflictStrategy::Merge)?;
+        }
+        index_writer_holder.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let counter = searcher.search(
+            &TermQuery::new(Term::from_field_i64(schema.get_field("id").unwrap(), id), IndexRecordOption::WithFreqs),
+            &Count,
+        )?;
+        assert_eq!(counter, 1);
+        Ok(())
+    }
+}

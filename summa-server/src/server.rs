@@ -133,6 +133,7 @@ mod tests {
 
     use async_broadcast::broadcast;
     use serde_json::json;
+    use summa_core::components::test_utils::create_test_schema;
     use summa_proto::proto;
     use summa_proto::proto::index_api_client::IndexApiClient;
     use summa_proto::proto::score::Score::F64Score;
@@ -141,7 +142,6 @@ mod tests {
 
     use super::*;
     use crate::configs::server::tests::create_test_server_config;
-    use crate::services::index::tests::create_test_schema;
     use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
 
     async fn create_index_api_client(endpoint: &str) -> IndexApiClient<Channel> {

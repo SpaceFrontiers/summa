@@ -24,7 +24,7 @@ impl TryFrom<Wrapper<proto::aggregation::Aggregation>> for Aggregation {
 
     fn try_from(aggregation: Wrapper<proto::aggregation::Aggregation>) -> Result<Self, Error> {
         Ok(match aggregation.into_inner() {
-            proto::aggregation::Aggregation::Bucket(bucket_aggregation) => Aggregation::Bucket(BucketAggregation {
+            proto::aggregation::Aggregation::Bucket(bucket_aggregation) => Aggregation::Bucket(Box::new(BucketAggregation {
                 bucket_agg: match bucket_aggregation.bucket_agg {
                     Some(proto::bucket_aggregation::BucketAgg::Histogram(histogram_aggregation)) => BucketAggregationType::Histogram(HistogramAggregation {
                         field: histogram_aggregation.field,
@@ -77,7 +77,7 @@ impl TryFrom<Wrapper<proto::aggregation::Aggregation>> for Aggregation {
                     .into_iter()
                     .map(|(name, aggregation)| Ok((name, Wrapper::from(aggregation).try_into()?)))
                     .collect::<Result<_, Error>>()?,
-            }),
+            })),
             proto::aggregation::Aggregation::Metric(metric_aggregation) => match metric_aggregation.metric_aggregation {
                 Some(proto::metric_aggregation::MetricAggregation::Average(average_aggregation)) => {
                     Aggregation::Metric(MetricAggregation::Average(AverageAggregation::from_field_name(average_aggregation.field)))
