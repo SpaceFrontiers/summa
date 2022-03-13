@@ -1,3 +1,5 @@
+use std::collections::hash_map::RandomState;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -5,7 +7,7 @@ use summa_proto::proto;
 use tantivy::merge_policy::MergePolicy;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Value};
-use tantivy::{Directory, Document, Index, IndexWriter, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
+use tantivy::{Directory, Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
 use tracing::info;
 
 use super::SummaSegmentAttributes;
@@ -85,7 +87,7 @@ impl IndexWriterImpl {
             }
         }
     }
-    pub fn commit(&mut self) -> SummaResult<()> {
+    pub fn commit(&mut self) -> SummaResult<Opstamp> {
         match self {
             IndexWriterImpl::SameThread(writer) => {
                 let index = writer.index.clone();
@@ -95,13 +97,13 @@ impl IndexWriterImpl {
                     writer.finalize().expect("cannot finalize");
                     SingleSegmentIndexWriter::new(index.clone(), writer_heap_size_bytes).expect("cannot recreate writer")
                 });
-                Ok(())
+                Ok(0)
             }
             IndexWriterImpl::Threaded(writer) => {
                 info!(action = "commit_files");
                 let opstamp = writer.prepare_commit()?.commit()?;
                 info!(action = "committed", opstamp = ?opstamp);
-                Ok(())
+                Ok(opstamp)
             }
         }
     }
@@ -244,7 +246,7 @@ impl IndexWriterHolder {
     ///
     /// Committing makes indexed documents visible
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub fn commit(&mut self) -> SummaResult<()> {
+    pub fn commit(&mut self) -> SummaResult<Opstamp> {
         self.index_writer.commit()
     }
 
@@ -252,9 +254,15 @@ impl IndexWriterHolder {
         self.index_writer.rollback()
     }
 
-    pub fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<()> {
+    pub fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>, excluded_segments: Vec<String>) -> SummaResult<()> {
         let mut segments = self.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
+
+        let excluded_segments: HashSet<SegmentId, RandomState> = excluded_segments
+            .into_iter()
+            .map(|s| SegmentId::from_uuid_string(&s))
+            .collect::<Result<_, _>>()
+            .map_err(|e| Error::InvalidSegmentId(e.to_string()))?;
 
         let segments = segments
             .into_iter()
@@ -268,7 +276,8 @@ impl IndexWriterHolder {
                         parsed_attributes.map(|v| v.is_frozen).unwrap_or(false)
                     })
                     .unwrap_or(false);
-                !is_frozen
+                let is_excluded = excluded_segments.contains(&segment.id());
+                !is_frozen && !is_excluded
             })
             .collect::<Vec<_>>();
         if !segments.is_empty() {
@@ -293,7 +302,7 @@ impl IndexWriterHolder {
     }
 
     /// Locking index files for executing operation on them
-    pub fn prepare_index(&mut self, with_hotcache: bool) -> SummaResult<()> {
+    pub fn commit_and_prepare(&mut self, with_hotcache: bool) -> SummaResult<()> {
         self.commit()?;
         self.wait_merging_threads();
 
@@ -312,7 +321,7 @@ impl IndexWriterHolder {
 
     pub fn lock_files(&mut self, with_hotcache: bool) -> SummaResult<Vec<String>> {
         let mut segment_files = vec![".managed.json".to_string(), "meta.json".to_string()];
-        self.prepare_index(with_hotcache)?;
+        self.commit_and_prepare(with_hotcache)?;
         if with_hotcache {
             segment_files.push("hotcache.bin".to_string())
         }

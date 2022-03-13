@@ -29,7 +29,6 @@ use crate::metrics::CacheMetrics;
 /// Static `CacheMetrics` shared by all instances of `crate::directories::ChunkedCachingDirectory`
 pub static CACHE_METRICS: Lazy<CacheMetrics> = Lazy::new(CacheMetrics::default);
 
-#[cfg(feature = "test-utils")]
 pub mod test_utils {
     use std::default::Default;
     use std::sync::atomic::{AtomicI64, Ordering};

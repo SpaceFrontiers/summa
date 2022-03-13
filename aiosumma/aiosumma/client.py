@@ -593,6 +593,7 @@ class SummaClient(BaseGrpcClient):
     async def vacuum_index(
         self,
         index_name: str,
+        excluded_segments: Optional[List[str]] = None,
         request_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> index_service_pb.VacuumIndexResponse:
@@ -601,11 +602,12 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
+            excluded_segments: segments that must not be merged
             request_id: request id
             session_id: session id
         """
         return await self.stubs['index_api'].vacuum_index(
-            index_service_pb.VacuumIndexRequest(index_name=index_name),
+            index_service_pb.VacuumIndexRequest(index_name=index_name, excluded_segments=excluded_segments),
             metadata=setup_metadata(session_id, request_id),
         )
 

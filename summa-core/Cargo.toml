@@ -14,7 +14,6 @@ doc = true
 [features]
 fs = ["tantivy/mmap", "tokio/fs"]
 metrics = ["opentelemetry"]
-test-utils = []
 tokio-rt = ["tokio/rt"]
 
 [dev-dependencies]

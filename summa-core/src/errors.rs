@@ -75,6 +75,8 @@ pub enum Error {
     #[error("{0:?} for {1:?}")]
     InvalidQuerySyntax(Box<crate::components::QueryParserError>, String),
     #[error("{0:?}")]
+    InvalidSegmentId(String),
+    #[error("{0:?}")]
     InvalidSyntax(String),
     #[error("{0:?}")]
     IO((std::io::Error, Option<PathBuf>)),

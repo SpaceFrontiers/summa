@@ -442,7 +442,7 @@ impl Index {
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                index_writer.commit()?;
+                index_writer.commit_and_prepare(true)?;
                 index_holder.index_reader().reload()?;
                 Ok::<_, crate::errors::Error>(())
             })
@@ -472,7 +472,7 @@ impl Index {
         let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         let span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit())).await??;
+        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit_and_prepare(true))).await??;
         Ok(match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
@@ -600,7 +600,7 @@ impl Index {
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                let result = index_writer_holder.vacuum(None);
+                let result = index_writer_holder.vacuum(None, vacuum_index_request.excluded_segments);
                 if let Err(error) = result {
                     error!(error = ?error)
                 }

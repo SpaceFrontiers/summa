@@ -55,7 +55,7 @@ async function handle_request(event: FetchEvent) {
       filename.endsWith(".del") ||
       filename.endsWith(".wasm") ||
       filename.endsWith(".bin") ||
-      filename.endsWith(".json") ||
+      (filename.endsWith(".json") && !filename.endsWith("meta.json")) ||
       event.request.destination === "image" ||
       event.request.destination === "font" ||
       event.request.destination === "style" ||
@@ -63,7 +63,7 @@ async function handle_request(event: FetchEvent) {
 
   let caching_enabled = is_immutable_file && request.method === "GET";
 
-  const cache = await caches.open("cache_v1");
+  const cache = await caches.open("cache_v2");
   let response = undefined;
   if (caching_enabled) {
       response = await cache.match(url);

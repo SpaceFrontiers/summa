@@ -273,6 +273,7 @@ message DocumentsResponse {
 
 message VacuumIndexRequest {
   string index_name = 1;
+  repeated string excluded_segments = 2;
 }
 
 message VacuumIndexResponse {

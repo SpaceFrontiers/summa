@@ -405,10 +405,12 @@ class TemporalMergePolicy(_message.Message):
     def __init__(self, merge_older_then_secs: _Optional[int] = ...) -> None: ...
 
 class VacuumIndexRequest(_message.Message):
-    __slots__ = ["index_name"]
+    __slots__ = ["excluded_segments", "index_name"]
+    EXCLUDED_SEGMENTS_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    excluded_segments: _containers.RepeatedScalarFieldContainer[str]
     index_name: str
-    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., excluded_segments: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class VacuumIndexResponse(_message.Message):
     __slots__ = ["freed_space_bytes"]

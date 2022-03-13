@@ -29,7 +29,7 @@ maintenance = { status = "actively-developed" }
 tonic-build = { version = "0.8.0", default-features = false, features = ["prost", "transport"] }
 
 [dev-dependencies]
-summa-core = { version = "0.11.0", path = "../summa-core", features = ["fs", "test-utils", "tokio-rt"] }
+summa-core = { version = "0.11.0", path = "../summa-core", features = ["fs", "tokio-rt"] }
 tempdir = "0.3.7"
 
 [dependencies]

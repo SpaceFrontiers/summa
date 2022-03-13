@@ -403,7 +403,7 @@ impl QueryParser {
         }
     }
 
-    fn parse_term(&self, field: &Field, term: Pair<Rule>, boost: Option<f32>) -> Result<Box<dyn Query>, QueryParserError> {
+    fn parse_term(&self, term: Pair<Rule>, field: &Field, boost: Option<f32>) -> Result<Box<dyn Query>, QueryParserError> {
         let term = term.into_inner().next().expect("grammar_failure");
         let occur = self.parse_occur(&term);
         let pre_term = term.into_inner().next().expect("grammar failure");
@@ -498,11 +498,11 @@ impl QueryParser {
 
     fn parse_statement(&self, pair: Pair<Rule>) -> Result<Box<dyn Query>, QueryParserError> {
         let mut statement_pairs = pair.into_inner();
-        let search_group_or_term = statement_pairs.next().expect("grammar failure");
+        let doi_or_search_group_or_term = statement_pairs.next().expect("grammar failure");
         let statement_boost = statement_pairs.next().map(|boost| f32::from_str(boost.as_str()).expect("grammar failure"));
-        let statement_result = match search_group_or_term.as_rule() {
+        let statement_result = match doi_or_search_group_or_term.as_rule() {
             Rule::search_group => {
-                let mut search_group = search_group_or_term.into_inner();
+                let mut search_group = doi_or_search_group_or_term.into_inner();
                 let field_name = search_group.next().expect("grammar failure");
                 let grouping_or_term = search_group.next().expect("grammar failure");
                 match grouping_or_term.as_rule() {
@@ -511,7 +511,7 @@ impl QueryParser {
                         match self.schema.get_field(field_name.as_str()) {
                             Ok(field) => {
                                 for term in grouping_or_term.into_inner() {
-                                    intermediate_results.push(self.parse_term(&field, term, statement_boost)?);
+                                    intermediate_results.push(self.parse_term(term, &field, statement_boost)?);
                                 }
                             }
                             Err(tantivy::TantivyError::FieldNotFound(_)) => match self.missing_field_policy {
@@ -529,7 +529,7 @@ impl QueryParser {
                         Ok(Box::new(BooleanQuery::new(intermediate_results.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>)
                     }
                     Rule::term => match self.schema.get_field(field_name.as_str()) {
-                        Ok(field) => self.parse_term(&field, grouping_or_term, statement_boost),
+                        Ok(field) => self.parse_term(grouping_or_term, &field, statement_boost),
                         Err(tantivy::TantivyError::FieldNotFound(_)) => match self.missing_field_policy {
                             MissingFieldPolicy::AsUsualTerms => Ok(Box::new(BooleanQuery::new(vec![
                                 (Occur::Should, self.default_fields_term(field_name, statement_boost)?),
@@ -543,7 +543,18 @@ impl QueryParser {
                     _ => unreachable!(),
                 }
             }
-            Rule::term => self.default_fields_term(search_group_or_term, statement_boost),
+            Rule::doi => {
+                if let Ok(doi_field) = self.schema.get_field("doi") {
+                    // ToDo: use more general approach, i.e. use doi tokenizer
+                    Ok(Box::new(TermQuery::new(
+                        Term::from_field_text(doi_field, &doi_or_search_group_or_term.as_str().to_lowercase()),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>)
+                } else {
+                    Ok(Box::new(EmptyQuery) as Box<dyn Query>)
+                }
+            }
+            Rule::term => self.default_fields_term(doi_or_search_group_or_term, statement_boost),
             e => panic!("{e:?}"),
         }?;
         Ok(statement_result)
@@ -685,6 +696,26 @@ mod tests {
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi:10.0000/abcd.0123 ")),
+            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("doi:https://doi.org/10.0000/abcd.0123")),
+            "Ok(TermQuery(Term(type=Str, field=3, \"https://doi.org/10.0000/abcd.0123\")))"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("doi:doi.org/10.0000/abcd.0123")),
+            "Ok(TermQuery(Term(type=Str, field=3, \"doi.org/10.0000/abcd.0123\")))"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("doi.org/10.0000/abcd.0123")),
+            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("10.0000/abcd.0123")),
+            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("https://doi.org/10.0000/abcd.0123")),
             "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
         );
     }
