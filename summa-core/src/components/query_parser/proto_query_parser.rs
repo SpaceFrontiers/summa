@@ -277,8 +277,8 @@ impl ProtoQueryParser {
                 query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words);
                 Box::new(query_builder.with_document_fields(field_values))
             }
-            proto::query::Query::Exist(exist_query_proto) => {
-                let (field, _) = self.field_and_field_entry(&exist_query_proto.field)?;
+            proto::query::Query::Exists(exists_query_proto) => {
+                let (field, _) = self.field_and_field_entry(&exists_query_proto.field)?;
                 Box::new(ExistsQuery::new(field))
             }
         })

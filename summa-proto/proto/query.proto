@@ -24,7 +24,7 @@ message Query {
     BoostQuery boost = 9;
     DisjunctionMaxQuery disjunction_max = 10;
     EmptyQuery empty = 11;
-    ExistQuery exist = 12;
+    ExistsQuery exists = 12;
   }
 }
 
@@ -103,7 +103,7 @@ message TermQuery {
   string value = 2;
 }
 
-message ExistQuery {
+message ExistsQuery {
   string field = 1;
 }
 

@@ -103,6 +103,7 @@ parent: APIs
     - [DisjunctionMaxQuery](#summa-proto-DisjunctionMaxQuery)
     - [EmptyQuery](#summa-proto-EmptyQuery)
     - [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter)
+    - [ExistsQuery](#summa-proto-ExistsQuery)
     - [FacetCollector](#summa-proto-FacetCollector)
     - [FacetCollectorOutput](#summa-proto-FacetCollectorOutput)
     - [FacetCollectorOutput.FacetCountsEntry](#summa-proto-FacetCollectorOutput-FacetCountsEntry)
@@ -1120,6 +1121,7 @@ Merge policy for compressing old segments
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
+| excluded_segments | [string](#string) | repeated |  |
 
 
 
@@ -1620,6 +1622,21 @@ Collectors and CollectorOutputs
 
 
 
+<a name="summa-proto-ExistsQuery"></a>
+
+### ExistsQuery
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| field | [string](#string) |  |  |
+
+
+
+
+
+
 <a name="summa-proto-FacetCollector"></a>
 
 ### FacetCollector
@@ -1902,6 +1919,7 @@ Recursive query DSL
 | boost | [BoostQuery](#summa-proto-BoostQuery) |  |  |
 | disjunction_max | [DisjunctionMaxQuery](#summa-proto-DisjunctionMaxQuery) |  |  |
 | empty | [EmptyQuery](#summa-proto-EmptyQuery) |  |  |
+| exists | [ExistsQuery](#summa-proto-ExistsQuery) |  |  |
 
 
 

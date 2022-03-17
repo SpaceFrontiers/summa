@@ -200,6 +200,12 @@ class ExactMatchesPromoter(_message.Message):
     slop: int
     def __init__(self, slop: _Optional[int] = ..., boost: _Optional[float] = ...) -> None: ...
 
+class ExistsQuery(_message.Message):
+    __slots__ = ["field"]
+    FIELD_FIELD_NUMBER: _ClassVar[int]
+    field: str
+    def __init__(self, field: _Optional[str] = ...) -> None: ...
+
 class FacetCollector(_message.Message):
     __slots__ = ["facets", "field"]
     FACETS_FIELD_NUMBER: _ClassVar[int]
@@ -348,12 +354,13 @@ class PhraseQuery(_message.Message):
     def __init__(self, field: _Optional[str] = ..., value: _Optional[str] = ..., slop: _Optional[int] = ...) -> None: ...
 
 class Query(_message.Message):
-    __slots__ = ["all", "boolean", "boost", "disjunction_max", "empty", "match", "more_like_this", "phrase", "range", "regex", "term"]
+    __slots__ = ["all", "boolean", "boost", "disjunction_max", "empty", "exists", "match", "more_like_this", "phrase", "range", "regex", "term"]
     ALL_FIELD_NUMBER: _ClassVar[int]
     BOOLEAN_FIELD_NUMBER: _ClassVar[int]
     BOOST_FIELD_NUMBER: _ClassVar[int]
     DISJUNCTION_MAX_FIELD_NUMBER: _ClassVar[int]
     EMPTY_FIELD_NUMBER: _ClassVar[int]
+    EXISTS_FIELD_NUMBER: _ClassVar[int]
     MATCH_FIELD_NUMBER: _ClassVar[int]
     MORE_LIKE_THIS_FIELD_NUMBER: _ClassVar[int]
     PHRASE_FIELD_NUMBER: _ClassVar[int]
@@ -365,13 +372,14 @@ class Query(_message.Message):
     boost: BoostQuery
     disjunction_max: DisjunctionMaxQuery
     empty: EmptyQuery
+    exists: ExistsQuery
     match: MatchQuery
     more_like_this: MoreLikeThisQuery
     phrase: PhraseQuery
     range: RangeQuery
     regex: RegexQuery
     term: TermQuery
-    def __init__(self, boolean: _Optional[_Union[BooleanQuery, _Mapping]] = ..., match: _Optional[_Union[MatchQuery, _Mapping]] = ..., regex: _Optional[_Union[RegexQuery, _Mapping]] = ..., term: _Optional[_Union[TermQuery, _Mapping]] = ..., phrase: _Optional[_Union[PhraseQuery, _Mapping]] = ..., range: _Optional[_Union[RangeQuery, _Mapping]] = ..., all: _Optional[_Union[AllQuery, _Mapping]] = ..., more_like_this: _Optional[_Union[MoreLikeThisQuery, _Mapping]] = ..., boost: _Optional[_Union[BoostQuery, _Mapping]] = ..., disjunction_max: _Optional[_Union[DisjunctionMaxQuery, _Mapping]] = ..., empty: _Optional[_Union[EmptyQuery, _Mapping]] = ...) -> None: ...
+    def __init__(self, boolean: _Optional[_Union[BooleanQuery, _Mapping]] = ..., match: _Optional[_Union[MatchQuery, _Mapping]] = ..., regex: _Optional[_Union[RegexQuery, _Mapping]] = ..., term: _Optional[_Union[TermQuery, _Mapping]] = ..., phrase: _Optional[_Union[PhraseQuery, _Mapping]] = ..., range: _Optional[_Union[RangeQuery, _Mapping]] = ..., all: _Optional[_Union[AllQuery, _Mapping]] = ..., more_like_this: _Optional[_Union[MoreLikeThisQuery, _Mapping]] = ..., boost: _Optional[_Union[BoostQuery, _Mapping]] = ..., disjunction_max: _Optional[_Union[DisjunctionMaxQuery, _Mapping]] = ..., empty: _Optional[_Union[EmptyQuery, _Mapping]] = ..., exists: _Optional[_Union[ExistsQuery, _Mapping]] = ...) -> None: ...
 
 class RandomDocument(_message.Message):
     __slots__ = ["document", "index_alias", "score"]
