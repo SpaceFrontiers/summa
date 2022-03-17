@@ -16,8 +16,10 @@ word = @{ wrapped_doi | ((LETTER | NUMBER) ~ (LETTER | NUMBER | "_" | "+" | "#" 
 boundary_word = _{ star | word }
 phrase_internals = { (!quote ~ ANY)* }
 phrase = ${ quote ~ phrase_internals? ~ (quote | EOI) ~ ("~" ~ slop)? }
+regex_internals = ${ (!PEEK ~ ANY)* }
+regex = ${ PUSH("/"+) ~ regex_internals ~ POP }
 
-pre_term = _{ phrase | range | word }
+pre_term = _{ phrase | regex | range | word }
 
 positive_term = ${ "+" ~ pre_term }
 negative_term = ${ "-" ~ pre_term }

@@ -558,7 +558,7 @@ impl Index {
     /// Search documents
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
         let futures = self.index_registry.search_futures(search_request.index_queries).await?;
-        let collector_outputs = join_all(futures.into_iter().map(|t| tokio::spawn(async move { t.await })))
+        let collector_outputs = join_all(futures.into_iter().map(tokio::spawn))
             .await
             .into_iter()
             .collect::<Result<SummaResult<Vec<_>>, _>>()??;
@@ -596,7 +596,7 @@ impl Index {
             .clone()
             .write_owned()
             .await;
-        let before_size: u64 = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
+        let before_size: u64 = index_holder.space_usage()?.segments().iter().map(|s| s.total().get_bytes()).sum();
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
@@ -607,7 +607,7 @@ impl Index {
             });
         })
         .await?;
-        let after_size: u64 = index_holder.space_usage()?.segments().into_iter().map(|s| s.total()).sum();
+        let after_size: u64 = index_holder.space_usage()?.segments().iter().map(|s| s.total().get_bytes()).sum();
         Ok(after_size - before_size)
     }
 }
@@ -802,7 +802,7 @@ pub(crate) mod tests {
         let index_holder_clone = index_holder.clone();
         let mut index_writer = index_holder.index_writer_holder().unwrap().clone().write_owned().await;
         tokio::task::spawn_blocking(move || {
-            index_writer.vacuum(None)?;
+            index_writer.vacuum(None, vec![])?;
             index_holder_clone.index_reader().reload()?;
             Ok::<_, crate::errors::Error>(())
         })

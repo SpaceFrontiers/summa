@@ -12,7 +12,6 @@ async-broadcast = "0.5"
 async-trait = "0.1"
 base64 = "0.21"
 bytes = "1.3"
-cid = "0.9"
 clap = { version = "4.0", features = ["cargo"] }
 config = "0.13"
 derive_builder = "0.12"
@@ -23,7 +22,7 @@ instant = { version = "0.1", default_features = false, features = [ "inaccurate"
 itertools = "0.10"
 kanal = "0.1.0-pre8"
 lazy_static = "1.4"
-lru = "0.9"
+lru = "0.10.0"
 once_cell = "1.16"
 oneshot = "0.1"
 parking_lot = { version = "0.12", features = ["send_guard"] }
@@ -38,9 +37,10 @@ serde_cbor = "0.11"
 serde_json = { version = "1.0" }
 serde_yaml = { version = "0.8" }
 strfmt = "0.2"
-summa-proto = { version = "0.22.0", path = "./summa-proto", default_features = false }
+summa-proto = { version = "0.23.0", path = "./summa-proto", default_features = false }
 take_mut = "0.2"
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa", default_features = false, features = ["quickwit", "zstd-compression"] }
+tantivy-common = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa" }
 tantivy-query-grammar = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa" }
 thiserror = "1.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }

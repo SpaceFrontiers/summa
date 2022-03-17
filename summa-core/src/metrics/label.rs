@@ -19,6 +19,7 @@ impl ToLabel for proto::query::Query {
             proto::query::Query::Term(_) => "term",
             proto::query::Query::MoreLikeThis(_) => "more_like_this",
             proto::query::Query::DisjunctionMax(_) => "disjunction_max",
+            proto::query::Query::Exist(_) => "exist",
         }
         .to_owned()
     }

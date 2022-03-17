@@ -17,6 +17,7 @@ use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Score, Term};
 use tracing::{info, warn};
 
+use crate::components::queries::ExistsQuery;
 use crate::components::query_parser::{QueryParser, QueryParserError};
 use crate::errors::{Error, SummaResult, ValidationError};
 #[cfg(feature = "metrics")]
@@ -275,6 +276,10 @@ impl ProtoQueryParser {
                 }
                 query_builder = query_builder.with_stop_words(more_like_this_query_proto.stop_words);
                 Box::new(query_builder.with_document_fields(field_values))
+            }
+            proto::query::Query::Exist(exist_query_proto) => {
+                let (field, _) = self.field_and_field_entry(&exist_query_proto.field)?;
+                Box::new(ExistsQuery::new(field))
             }
         })
     }

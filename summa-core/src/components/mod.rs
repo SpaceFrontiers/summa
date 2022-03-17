@@ -6,6 +6,7 @@ mod index_holder;
 mod index_registry;
 mod index_writer_holder;
 pub mod merge_policies;
+pub mod queries;
 mod query_parser;
 mod segment_attributes;
 mod snippet_generator;
@@ -101,11 +102,11 @@ pub mod test_utils {
         let issued_at = 1674041452i64 - rng.gen_range(100..1000);
 
         SummaDocument::TantivyDocument(doc!(
-            schema.get_field("id").unwrap() => doc_id.unwrap_or_else(|| DOC_ID.fetch_add(1, Ordering::SeqCst)),
-            schema.get_field("title").unwrap() => generate_sentence(rng, title_prefix, title_power, 3),
-            schema.get_field("body").unwrap() => generate_sentence(rng, body_prefix, body_power, 50),
-            schema.get_field("tags").unwrap() => generate_sentence(rng, tag_prefix, tag_power, 5),
-            schema.get_field("issued_at").unwrap() => issued_at
+            schema.get_field("id").expect("no expected field") => doc_id.unwrap_or_else(|| DOC_ID.fetch_add(1, Ordering::SeqCst)),
+            schema.get_field("title").expect("no expected field") => generate_sentence(rng, title_prefix, title_power, 3),
+            schema.get_field("body").expect("no expected field") => generate_sentence(rng, body_prefix, body_power, 50),
+            schema.get_field("tags").expect("no expected field") => generate_sentence(rng, tag_prefix, tag_power, 5),
+            schema.get_field("issued_at").expect("no expected field") => issued_at
         ))
     }
 

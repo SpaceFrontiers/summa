@@ -1,6 +1,6 @@
 [package]
 name = "summa-core"
-version = "0.11.0"
+version = "0.14.1"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -24,7 +24,6 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-cid = { workspace = true }
 config = { workspace = true }
 derive_builder = { workspace = true }
 downcast-rs = { workspace = true }
@@ -53,6 +52,7 @@ strfmt = { workspace = true }
 summa-proto = { workspace = true }
 take_mut = { workspace = true }
 tantivy = { workspace = true }
+tantivy-common = { workspace = true }
 tantivy-query-grammar = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

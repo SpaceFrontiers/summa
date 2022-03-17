@@ -24,6 +24,7 @@ message Query {
     BoostQuery boost = 9;
     DisjunctionMaxQuery disjunction_max = 10;
     EmptyQuery empty = 11;
+    ExistQuery exist = 12;
   }
 }
 
@@ -100,6 +101,10 @@ message RegexQuery {
 message TermQuery {
   string field = 1;
   string value = 2;
+}
+
+message ExistQuery {
+  string field = 1;
 }
 
 // Aggregation

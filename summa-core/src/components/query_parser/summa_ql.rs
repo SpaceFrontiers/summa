@@ -7,7 +7,7 @@ use pest::iterators::{Pair, Pairs};
 use pest::Parser;
 use pest_derive::Parser;
 use summa_proto::proto;
-use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 use tantivy::{Index, Term};
@@ -121,7 +121,7 @@ fn boost_query(query: Box<dyn Query>, boost: Option<f32>) -> Box<dyn Query> {
     if let Some(boost) = boost {
         return Box::new(BoostQuery::new(query, boost)) as Box<dyn Query>;
     }
-    return query;
+    query
 }
 
 fn multiply_boosts(a: Option<f32>, b: Option<f32>) -> Option<f32> {
@@ -387,6 +387,13 @@ impl QueryParser {
                         return Ok(vec![boost_query(query, boost)]);
                     }
                     Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
+                    Rule::regex => {
+                        let query = Box::new(
+                            RegexQuery::from_pattern(pre_term.clone().into_inner().next().expect("grammar failure").as_str(), *field)
+                                .map_err(|_| QueryParserError::Syntax(pre_term.as_str().to_string()))?,
+                        ) as Box<dyn Query>;
+                        return Ok(vec![boost_query(query, boost)]);
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -797,6 +804,14 @@ mod tests {
             format!("{:?}", query_parser.parse_query("healthcare cyber–physical system")),
             "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"healthcare\"))), (Should, TermQuery(Term(type=Str, field=0, \"cyber\"))), (Should, TermQuery(Term(type=Str, field=0, \"physical\"))), (Should, TermQuery(Term(type=Str, field=0, \"system\")))] })"
         );
+    }
+
+    #[test]
+    pub fn test_regex() {
+        let query_parser = create_query_parser();
+        assert!(format!("{:?}", query_parser.parse_query("body:/поисковые/")).contains("Regex(\"поисковые\")"));
+        assert!(format!("{:?}", query_parser.parse_query("body://поиск/овые//")).contains("Regex(\"поиск/овые\")"));
+        assert!(format!("{:?}", query_parser.parse_query("body:/поисковые.*/")).contains("Regex(\"поисковые.*\")"));
     }
 
     #[test]

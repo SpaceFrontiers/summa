@@ -398,7 +398,7 @@ impl IndexHolder {
         trace!(index_name = ?self.index_name, action = "collect_segment");
         let fruits = join_all(segment_readers.iter().enumerate().map(|(segment_ord, segment_reader)| {
             let weight_ref = weight.as_ref();
-            async move { collector.collect_segment_async(weight_ref, segment_ord as u32, segment_reader).await }
+            collector.collect_segment_async(weight_ref, segment_ord as u32, segment_reader)
         }))
         .await
         .into_iter()

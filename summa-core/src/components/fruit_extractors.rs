@@ -201,7 +201,7 @@ pub fn build_fruit_extractor(
         }
         Some(proto::collector::Collector::Aggregation(aggregation_collector_proto)) => {
             let aggregation_collector =
-                tantivy::aggregation::AggregationCollector::from_aggs(parse_aggregations(aggregation_collector_proto.aggregations)?, None);
+                tantivy::aggregation::AggregationCollector::from_aggs(parse_aggregations(aggregation_collector_proto.aggregations)?, Default::default());
             Ok(Box::new(Aggregation(multi_collector.add_collector(aggregation_collector))) as Box<dyn FruitExtractor>)
         }
         None => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
