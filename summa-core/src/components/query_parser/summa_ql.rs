@@ -809,9 +809,18 @@ mod tests {
     #[test]
     pub fn test_regex() {
         let query_parser = create_query_parser();
-        assert!(format!("{:?}", query_parser.parse_query("body:/поисковые/")).contains("Regex(\"поисковые\")"));
-        assert!(format!("{:?}", query_parser.parse_query("body://поиск/овые//")).contains("Regex(\"поиск/овые\")"));
-        assert!(format!("{:?}", query_parser.parse_query("body:/поисковые.*/")).contains("Regex(\"поисковые.*\")"));
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("body:/поисковые/")),
+            "Ok(RegexQuery { regex: Regex(\"поисковые\")\n, field: Field(1) })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("body://поиск/овые//")),
+            "Ok(RegexQuery { regex: Regex(\"поиск/овые\")\n, field: Field(1) })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("body:/поисковые.*/")),
+            "Ok(RegexQuery { regex: Regex(\"поисковые.*\")\n, field: Field(1) })"
+        );
     }
 
     #[test]
