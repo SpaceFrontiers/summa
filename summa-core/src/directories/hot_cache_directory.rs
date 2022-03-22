@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tantivy::directory::error::{LockError, OpenReadError};
 use tantivy::directory::{DirectoryLock, FileHandle, FileSlice, Lock, OwnedBytes, WatchCallback, WatchHandle};
 use tantivy::error::DataCorruption;
-use tantivy::{Directory, HasLen, Index, IndexReader, ReloadPolicy};
+use tantivy::{Directory, HasLen, Index, IndexReader, Opstamp, ReloadPolicy};
 
 use super::debug_proxy_directory::DebugProxyDirectory;
 
@@ -126,7 +126,7 @@ impl Debug for StaticDirectoryCache {
 }
 
 impl StaticDirectoryCache {
-    pub fn open(mut bytes: OwnedBytes) -> tantivy::Result<StaticDirectoryCache> {
+    pub fn open(mut bytes: OwnedBytes, opstamp: Opstamp) -> tantivy::Result<StaticDirectoryCache> {
         let format_version = bytes.read_u8();
         let bytes_len = bytes.len();
 
@@ -137,7 +137,7 @@ impl StaticDirectoryCache {
         }
 
         let mut file_lengths: HashMap<PathBuf, u64> = deserialize_cbor(&mut bytes).expect("CBOR failed");
-        file_lengths.insert(PathBuf::from("hotcache.bin"), bytes_len as u64);
+        file_lengths.insert(PathBuf::from(format!("hotcache.{}.bin", opstamp)), bytes_len as u64);
 
         let mut slice_offsets: Vec<(PathBuf, u64)> = deserialize_cbor(&mut bytes).expect("CBOR failed");
         slice_offsets.push((PathBuf::default(), bytes.len() as u64));

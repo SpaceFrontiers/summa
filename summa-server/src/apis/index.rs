@@ -2,14 +2,16 @@
 //!
 //! Index GRPC API is using for managing indices
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Instant;
 
-use summa_core::components::{IndexHolder, SummaDocument};
+use summa_core::components::{IndexHolder, NamedFieldDocument, SummaDocument};
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::sync::Handler;
+use summa_core::validators;
 use summa_proto::proto;
 use summa_proto::proto::DocumentsResponse;
 use tokio_stream::wrappers::ReceiverStream;
@@ -145,8 +147,16 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
         let searcher = index_holder.index_reader().searcher();
         let schema = index_holder.schema().clone();
+        let multi_fields = index_holder.multi_fields().clone();
+
+        let query_fields = validators::parse_fields(searcher.schema(), &proto_request.fields).map_err(crate::errors::Error::from)?;
+        let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter()));
+
         let documents_receiver = index_holder
-            .documents(&searcher, move |d| Some(Ok(DocumentsResponse { document: schema.to_json(&d) })))
+            .documents(&searcher, move |document| {
+                let document = NamedFieldDocument::from_document(&schema, &query_fields, &multi_fields, &document).to_json_string();
+                Some(Ok(DocumentsResponse { document }))
+            })
             .map_err(crate::errors::Error::from)?;
         Ok(Response::new(ReceiverStream::new(documents_receiver)))
     }

@@ -233,6 +233,20 @@ impl Index {
                 };
                 (index, index_engine_config)
             }
+            Some(proto::attach_index_request::IndexEngine::Remote(proto::AttachRemoteEngineRequest {
+                remote_engine_config: Some(remote_engine_config),
+            })) => {
+                let index = IndexHolder::open_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
+                    remote_engine_config.clone(),
+                    true,
+                )
+                .await?;
+                let index_engine_config = proto::IndexEngineConfig {
+                    config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
+                    merge_policy: attach_index_request.merge_policy,
+                };
+                (index, index_engine_config)
+            }
             _ => unimplemented!(),
         };
         let index_holder = self.insert_index(&attach_index_request.index_name, index, &index_engine_config).await?;
@@ -608,7 +622,7 @@ impl Index {
         })
         .await?;
         let after_size: u64 = index_holder.space_usage()?.segments().iter().map(|s| s.total().get_bytes()).sum();
-        Ok(after_size - before_size)
+        Ok(before_size - after_size)
     }
 }
 

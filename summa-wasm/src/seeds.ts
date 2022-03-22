@@ -9,15 +9,13 @@ export interface IIndexSeed {
 export class LocalDatabaseSeed implements IIndexSeed {
   ipfs_path: string;
   cache_config?: CacheConfig;
-  timeout_ms?: number;
 
-  constructor(ipfs_path: string, cache_config?: CacheConfig, timeout_ms?: number) {
+  constructor(ipfs_path: string, cache_config?: CacheConfig) {
     if (!ipfs_path.endsWith("/")) {
       ipfs_path += "/";
     }
     this.ipfs_path = ipfs_path;
     this.cache_config = cache_config;
-    this.timeout_ms = timeout_ms;
   }
 
   async retrieve_remote_engine_config(): Promise<RemoteEngineConfig> {
@@ -26,7 +24,6 @@ export class LocalDatabaseSeed implements IIndexSeed {
       `${this.ipfs_path}{file_name}`,
       new Map([["range", "bytes={start}-{end}"]]),
       this.cache_config,
-      this.timeout_ms,
     );
   }
 }
@@ -35,13 +32,11 @@ export class IpfsDatabaseSeed implements IIndexSeed {
   ipfs_path: string;
   cache_config: CacheConfig;
   ipfs_url?: string;
-  timeout_ms?: number;
 
-  constructor(ipfs_path: string, cache_config: CacheConfig, ipfs_url?: string, timeout_ms?: number) {
+  constructor(ipfs_path: string, cache_config: CacheConfig, ipfs_url?: string) {
     this.ipfs_path = ipfs_path;
     this.cache_config = cache_config;
     this.ipfs_url = ipfs_url;
-    this.timeout_ms = timeout_ms;
   }
 
   async retrieve_remote_engine_config(): Promise<RemoteEngineConfig> {
@@ -81,7 +76,6 @@ export class IpfsDatabaseSeed implements IIndexSeed {
         `${ipfs_http_protocol}//${ipfs_hash}.ipfs.${ipfs_hostname}/{file_name}`,
         new Map([["range", "bytes={start}-{end}"]]),
         this.cache_config,
-        this.timeout_ms,
       );
     } catch {
       return new RemoteEngineConfig(
@@ -89,7 +83,6 @@ export class IpfsDatabaseSeed implements IIndexSeed {
         `${ipfs_http_protocol}//${ipfs_hostname}/ipfs/${ipfs_hash}/{file_name}`,
         new Map([["range", "bytes={start}-{end}"]]),
         this.cache_config,
-        this.timeout_ms,
       );
     }
   }

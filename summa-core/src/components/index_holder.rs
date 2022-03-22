@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::Arc;
 
 use futures::future::{join_all, try_join_all};
@@ -12,6 +13,7 @@ use opentelemetry::{
     metrics::{Histogram, Unit},
     Context, KeyValue,
 };
+use serde::Deserialize;
 use summa_proto::proto;
 use summa_proto::proto::IndexAttributes;
 use tantivy::collector::{Collector, MultiCollector, MultiFruit};
@@ -19,7 +21,7 @@ use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
 use tantivy::space_usage::SearcherSpaceUsage;
-use tantivy::{Directory, Index, IndexBuilder, IndexReader, ReloadPolicy, Searcher, SegmentReader, Term};
+use tantivy::{Directory, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing::{instrument, trace};
@@ -31,7 +33,7 @@ use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{Driver, IndexWriterHolder, SummaDocument};
 use crate::configs::ConfigProxy;
 use crate::directories::{CachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
-use crate::errors::{SummaResult, ValidationError};
+use crate::errors::SummaResult;
 use crate::proto_traits::Wrapper;
 use crate::Error;
 
@@ -61,6 +63,18 @@ impl PartialEq<Self> for IndexHolder {
     fn eq(&self, other: &Self) -> bool {
         self.index_name.eq(&other.index_name)
     }
+}
+
+#[derive(Deserialize)]
+struct LightMeta {
+    pub opstamp: Opstamp,
+}
+
+pub async fn read_opstamp<D: Directory>(directory: &D) -> SummaResult<Opstamp> {
+    let meta = directory.atomic_read_async(Path::new("meta.json")).await.unwrap();
+    let meta_string = String::from_utf8(meta).unwrap();
+    let meta_json: LightMeta = serde_json::from_str(&meta_string).unwrap();
+    Ok(meta_json.opstamp)
 }
 
 impl Debug for IndexHolder {
@@ -103,8 +117,11 @@ fn wrap_with_caches<D: Directory>(
     directory: D,
     hotcache_bytes: Option<OwnedBytes>,
     cache_config: Option<proto::CacheConfig>,
+    opstamp: Opstamp,
 ) -> SummaResult<Box<dyn Directory>> {
-    let static_cache = hotcache_bytes.map(StaticDirectoryCache::open).transpose()?;
+    let static_cache = hotcache_bytes
+        .map(|hotcache_bytes| StaticDirectoryCache::open(hotcache_bytes, opstamp))
+        .transpose()?;
     info!(action = "opened_static_cache");
     let file_lengths = static_cache
         .as_ref()
@@ -222,9 +239,9 @@ impl IndexHolder {
     /// Creates index and sets it up via `setup`
     #[instrument(skip_all)]
     #[cfg(feature = "fs")]
-    pub async fn create_file_index(index_path: &std::path::Path, index_builder: IndexBuilder) -> SummaResult<Index> {
+    pub async fn create_file_index(index_path: &Path, index_builder: IndexBuilder) -> SummaResult<Index> {
         if index_path.exists() {
-            return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
+            return Err(crate::errors::ValidationError::ExistingPath(index_path.to_owned()).into());
         }
         tokio::fs::create_dir_all(index_path).await?;
         let index = index_builder.create_in_dir(index_path)?;
@@ -249,8 +266,9 @@ impl IndexHolder {
         read_only: bool,
     ) -> SummaResult<Index> {
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
+        let opstamp = read_opstamp(&network_directory).await?;
         let hotcache_bytes = match network_directory
-            .get_network_file_handle("hotcache.bin".as_ref())
+            .get_network_file_handle(format!("hotcache.{}.bin", opstamp).as_ref())
             .do_read_bytes_async(None)
             .await
         {
@@ -268,7 +286,7 @@ impl IndexHolder {
                 None
             }
         };
-        let directory = wrap_with_caches(network_directory, hotcache_bytes, remote_engine_config.cache_config)?;
+        let directory = wrap_with_caches(network_directory, hotcache_bytes, remote_engine_config.cache_config, opstamp)?;
         Ok(Index::open(directory)?)
     }
 
@@ -515,104 +533,6 @@ impl IndexHolder {
             });
         }
         Ok(rx)
-    }
-
-    pub async fn extract_terms_with_freq(
-        &self,
-        searcher: &Searcher,
-        field_name: &str,
-        limit: u32,
-        start_from: Option<&str>,
-        more_frequent_than: Option<u32>,
-    ) -> SummaResult<Vec<Term>> {
-        if searcher.segment_readers().len() > 1 {
-            return Err(Error::Validation(Box::new(ValidationError::InvalidSegmentsNumber(
-                searcher.segment_readers().len() as u32,
-            ))));
-        }
-        let Some(single_segment_reader) = searcher.segment_readers().first()
-        else {
-            return Err(Error::Validation(Box::new(ValidationError::InvalidSegmentsNumber(0))))
-        };
-        self.extract_terms_with_freq_from_single_segment(
-            single_segment_reader,
-            searcher.schema().get_field(field_name)?,
-            limit,
-            start_from,
-            more_frequent_than,
-        )
-        .await
-    }
-
-    async fn extract_terms_with_freq_from_single_segment(
-        &self,
-        segment_reader: &SegmentReader,
-        field: Field,
-        limit: u32,
-        start_from: Option<&str>,
-        more_frequent_than: Option<u32>,
-    ) -> SummaResult<Vec<Term>> {
-        let mut collected_terms = vec![];
-
-        let inverted_index = segment_reader.inverted_index(field)?;
-        let terms = inverted_index.terms();
-        info!(action = "extract_terms", segment_id = ?segment_reader.segment_id(), num_terms = terms.num_terms(), limit = limit);
-
-        let mut stream_builder = terms.range();
-        if let Some(start_from) = start_from {
-            stream_builder = stream_builder.gt(start_from);
-        }
-        let mut term_stream = stream_builder.limit(limit as u64).into_stream_async().await?;
-        while let Some((term, term_info)) = term_stream.next() {
-            if term_info.doc_freq > more_frequent_than.unwrap_or(0) {
-                let term = Term::from_field_text(field, unsafe { std::str::from_utf8_unchecked(term) });
-                collected_terms.push(term);
-            }
-        }
-        Ok(collected_terms)
-    }
-
-    pub async fn extract_terms(&self, searcher: &Searcher, field_name: &str, limit: u32, start_from: Option<&str>) -> SummaResult<Vec<Term>> {
-        self.extract_terms_with_freq(searcher, field_name, limit, start_from, None).await
-    }
-
-    #[cfg(feature = "tokio-rt")]
-    pub async fn deduplicate_by_field(&self, field_name: &str) -> SummaResult<()> {
-        const BATCH_SIZE: u32 = 100_000;
-
-        let searcher = self.index_reader().searcher();
-        let index_writer = self.index_writer_holder()?.read().await;
-        let mut start_from = None;
-        loop {
-            let duplicated_terms = self
-                .extract_terms_with_freq(&searcher, field_name, BATCH_SIZE, start_from.as_deref(), Some(1))
-                .await?;
-            let Some(last_term) = duplicated_terms.last() else {
-                break;
-            };
-            let last_term = last_term.as_str().expect("supported only text fields").to_string();
-            info!(
-                action = "deduplicate_by_field",
-                terms_batch_start_from = start_from,
-                terms_batch_last_term = last_term,
-                duplicated_terms = duplicated_terms.len()
-            );
-            for duplicate_term in duplicated_terms {
-                let collector = tantivy::collector::TopDocs::with_limit(2);
-                let duplicated_documents = searcher.search(
-                    &tantivy::query::TermQuery::new(duplicate_term.clone(), tantivy::schema::IndexRecordOption::Basic),
-                    &collector,
-                )?;
-                // Check again because `extract_terms_with_freq` does not account deleted documents
-                if duplicated_documents.len() > 1 {
-                    let document = searcher.doc(duplicated_documents.first().expect("no documents").1)?;
-                    index_writer.delete_by_term(duplicate_term);
-                    index_writer.index_document(document, proto::ConflictStrategy::DoNothing)?;
-                }
-            }
-            start_from = Some(last_term);
-        }
-        Ok(())
     }
 
     pub fn space_usage(&self) -> SummaResult<SearcherSpaceUsage> {

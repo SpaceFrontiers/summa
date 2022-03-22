@@ -1,5 +1,5 @@
 import {IndexAttributes, IndexEngineConfig} from "./configs";
-import init, {reserve_heap, setup_logging, WrappedIndexRegistry} from "../pkg";
+import init, {setup_logging, WrappedIndexRegistry} from "../pkg";
 
 export class IndexQuery {
   index_alias: string
@@ -19,7 +19,6 @@ export interface IIndexRegistry {
   warmup(index_name: string): Promise<void>;
   index_document(index_name: string, document: string): Promise<void>;
   commit(index_name: string): Promise<void>;
-  extract_terms(index_name: string, field_name: string, limit: number, start_from?: string): Promise<string[]>;
   get_index_field_names(index_name: string): Promise<string[]>;
 }
 
@@ -80,9 +79,6 @@ export class IndexRegistry implements IIndexRegistry {
   }
   async commit(index_name: string) {
     return await this.registry!.commit(index_name)
-  }
-  async extract_terms(index_name: string, field_name: string, limit: number, start_from?: string): Promise<string[]> {
-    return await this.registry!.extract_terms(index_name, field_name, limit, start_from);
   }
   async get_index_field_names(index_name: string): Promise<string[]> {
     return await this.registry!.get_index_field_names(index_name);

@@ -302,8 +302,8 @@ impl IndexWriterHolder {
     }
 
     /// Locking index files for executing operation on them
-    pub fn commit_and_prepare(&mut self, with_hotcache: bool) -> SummaResult<()> {
-        self.commit()?;
+    pub fn commit_and_prepare(&mut self, with_hotcache: bool) -> SummaResult<Opstamp> {
+        let opstamp = self.commit()?;
         self.wait_merging_threads();
 
         if with_hotcache {
@@ -314,16 +314,16 @@ impl IndexWriterHolder {
                     .expect("managed directory should contain nested directory")
                     .box_clone(),
             )?;
-            directory.atomic_write(Path::new("hotcache.bin"), &hotcache_bytes)?;
+            directory.atomic_write(Path::new(&format!("hotcache.{}.bin", opstamp)), &hotcache_bytes)?;
         }
-        Ok(())
+        Ok(opstamp)
     }
 
     pub fn lock_files(&mut self, with_hotcache: bool) -> SummaResult<Vec<String>> {
         let mut segment_files = vec![".managed.json".to_string(), "meta.json".to_string()];
-        self.commit_and_prepare(with_hotcache)?;
+        let opstamp = self.commit_and_prepare(with_hotcache)?;
         if with_hotcache {
-            segment_files.push("hotcache.bin".to_string())
+            segment_files.push(format!("hotcache.{}.bin", opstamp))
         }
         segment_files.extend(self.get_index_files()?);
         Ok(segment_files)

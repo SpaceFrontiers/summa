@@ -63,7 +63,7 @@ message AttachFileEngineRequest {}
 
 // Attach remote engine request
 message AttachRemoteEngineRequest {
-  CacheConfig cache_config = 1;
+  RemoteEngineConfig remote_engine_config = 1;
 }
 
 // Attach index request
@@ -264,6 +264,7 @@ message SetIndexAliasResponse {
 // Request a stream of all documents from the index
 message DocumentsRequest {
   string index_name = 1;
+  repeated string fields = 2;
 }
 
 // Single document from the index

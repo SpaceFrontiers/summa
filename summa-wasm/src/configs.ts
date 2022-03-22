@@ -19,19 +19,16 @@ export class RemoteEngineConfig {
   url_template: string;
   headers_template: Map<string, string> | null;
   cache_config?: CacheConfig;
-  timeout_ms?: number;
   constructor(
     method: string,
     url_template: string,
     headers_template: Map<string, string> | null,
     cache_config?: CacheConfig,
-    timeout_ms?: number,
   ) {
     this.method = method
     this.url_template = url_template
     this.headers_template = headers_template;
     this.cache_config = cache_config;
-    this.timeout_ms = timeout_ms;
   }
   get_file_url(file_name: string) {
     return this.url_template.replace("{file_name}", file_name);

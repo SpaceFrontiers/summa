@@ -16,7 +16,7 @@ function fetch_with_retries(url: string, options: any, retries: number, sleep: n
       if (!retries_left) {
         throw error;
       }
-      if (error.status == 502) {
+      if (error.status == 502 || error.name == 'AbortError') {
         return setTimeout(() => fetch_with_retries(url, options, retries_left, sleep * 1.5), sleep * 1000)
       } else {
         return fetch_with_retries(url, options, retries_left, sleep);
@@ -45,7 +45,6 @@ async function handle_request(event: FetchEvent) {
     url += "?r=" + range_start + "-" + range_end;
   }
 
-  let priority = (filename.endsWith(".term") || filename.endsWith(".store") || filename.endsWith(".idx")) ? "high" : "auto";
   let is_immutable_file = filename.endsWith(".fast") ||
       filename.endsWith(".term") ||
       filename.endsWith(".pos") ||
@@ -74,7 +73,6 @@ async function handle_request(event: FetchEvent) {
       {
         method: request.method,
         headers: request.headers,
-        priority,
       },
       3,
         1.0,

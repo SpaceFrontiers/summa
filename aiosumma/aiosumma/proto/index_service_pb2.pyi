@@ -45,10 +45,10 @@ class AttachIndexResponse(_message.Message):
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class AttachRemoteEngineRequest(_message.Message):
-    __slots__ = ["cache_config"]
-    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    cache_config: CacheConfig
-    def __init__(self, cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ...) -> None: ...
+    __slots__ = ["remote_engine_config"]
+    REMOTE_ENGINE_CONFIG_FIELD_NUMBER: _ClassVar[int]
+    remote_engine_config: RemoteEngineConfig
+    def __init__(self, remote_engine_config: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ...) -> None: ...
 
 class CacheConfig(_message.Message):
     __slots__ = ["cache_size"]

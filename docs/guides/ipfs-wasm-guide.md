@@ -1,7 +1,7 @@
 ---
 title: IPFS Publish + WASM Browsing
 parent: Guides
-nav_order: 2
+nav_order: 1
 ---
 
 ### Configuring Summa and the index

@@ -40,10 +40,6 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         return this.index_registry.commit(index_name);
     }
 
-    extract_terms(index_name: string, field_name: string, limit: number, start_from?: string): Promise<string[]> {
-        return this.index_registry.extract_terms(index_name, field_name, limit, start_from);
-    }
-
     get_index_field_names(index_name: string): Promise<string[]> {
         return this.index_registry.get_index_field_names(index_name);
     }

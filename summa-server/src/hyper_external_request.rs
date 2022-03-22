@@ -16,7 +16,7 @@ pub struct HyperExternalRequest {
 
 #[async_trait]
 impl ExternalRequest for HyperExternalRequest {
-    fn new(method: &str, url: &str, headers: &[Header], timeout_ms: Option<u32>) -> Self
+    fn new(method: &str, url: &str, headers: &[Header]) -> Self
     where
         Self: Sized,
     {

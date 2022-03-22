@@ -148,27 +148,6 @@ impl WrappedIndexRegistry {
         Ok(self.commit_internal(index_name).await.map_err(Error::from)?)
     }
 
-    #[wasm_bindgen]
-    pub async fn extract_terms(&self, index_name: &str, field_name: &str, limit: u32, start_from: Option<String>) -> Result<JsValue, JsValue> {
-        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
-        let searcher = index_holder.index_reader().searcher();
-        Ok(serde_wasm_bindgen::to_value(
-            &index_holder
-                .extract_terms(&searcher, field_name, limit, start_from.as_deref())
-                .await
-                .map_err(Error::from)?
-                .into_iter()
-                .map(|term| {
-                    match term.as_str() {
-                        Some(term) => term,
-                        None => panic!("{:?} is not a string term", term),
-                    }
-                    .to_string()
-                })
-                .collect::<Vec<_>>(),
-        )?)
-    }
-
     pub(crate) fn thread_pool(&self) -> &ThreadPool {
         self.thread_pool
             .as_ref()

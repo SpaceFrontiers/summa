@@ -18,13 +18,10 @@ function parse_headers(xhr: XMLHttpRequest): Header[] {
     return headers_arr;
 }
 
-export function request(method: string, url: string, headers: {name: string, value: string}[], timeout_ms?: number): { data: Uint8Array, headers: Header[]} | {status: number, status_text: string} {
+export function request(method: string, url: string, headers: {name: string, value: string}[]): { data: Uint8Array, headers: Header[]} | {status: number, status_text: string} {
     var xhr = new XMLHttpRequest();
     xhr.responseType = "arraybuffer";
     xhr.withCredentials = true;
-    if (timeout_ms) {
-        xhr.timeout = timeout_ms;
-    }
     try {
         xhr.open(method, url, false);
         if (headers !== undefined) {
@@ -50,14 +47,11 @@ export function request(method: string, url: string, headers: {name: string, val
 }
 
 
-export function request_async(method: string, url: string, headers: Array<{name: string, value: string}>, timeout_ms?: number) {
+export function request_async(method: string, url: string, headers: Array<{name: string, value: string}>) {
     return new Promise(function (resolve, reject) {
         let xhr = new XMLHttpRequest();
         xhr.responseType = "arraybuffer";
         xhr.withCredentials = true;
-        if (timeout_ms) {
-            xhr.timeout = timeout_ms;
-        }
         try {
             xhr.open(method, url);
             if (headers !== undefined) {

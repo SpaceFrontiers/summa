@@ -13,6 +13,7 @@ mod snippet_generator;
 mod summa_document;
 mod summa_tokenizer;
 
+pub use custom_serializer::NamedFieldDocument;
 pub use default_tokenizers::default_tokenizers;
 pub use driver::Driver;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor, IntermediateExtractionResult};
