@@ -2,19 +2,20 @@ use std::sync::Arc;
 
 use futures::future::join_all;
 use serde::Serialize;
+use serde_wasm_bindgen::Serializer;
 use summa_core::components::{Driver, IndexHolder, IndexRegistry, SummaDocument};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
 use summa_proto::proto;
 use tantivy::IndexBuilder;
-use tracing::info;
+use tracing::{info, trace};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 
 use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;
-use crate::{ThreadPool, SERIALIZER};
+use crate::ThreadPool;
 
 /// Hold `IndexRegistry` and wrap it for making WASM-compatible
 #[wasm_bindgen]
@@ -54,17 +55,19 @@ impl WrappedIndexRegistry {
     #[wasm_bindgen]
     pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
         let index_queries: Vec<proto::IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
-        Ok(self.search_internal(index_queries).await.map_err(Error::from)?.serialize(&*SERIALIZER)?)
+        let serializer = Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true);
+        Ok(self.search_internal(index_queries).await.map_err(Error::from)?.serialize(&serializer)?)
     }
 
     async fn search_internal(&self, index_queries: Vec<proto::IndexQuery>) -> SummaResult<Vec<proto::CollectorOutput>> {
         info!(action = "search", index_queries = ?index_queries);
-        let futures = self.index_registry.search_futures(index_queries).await?;
+        let futures = self.index_registry.search_futures(index_queries)?;
         let extraction_results = join_all(futures.into_iter().map(|f| self.thread_pool().spawn(f)))
             .await
             .into_iter()
             .map(|r| r.expect("cannot receive"))
             .collect::<SummaResult<Vec<_>>>()?;
+        trace!(action = "searched");
         self.index_registry.finalize_extraction(extraction_results).await
     }
 
@@ -72,11 +75,12 @@ impl WrappedIndexRegistry {
     #[wasm_bindgen]
     pub async fn add(&self, index_engine_config: JsValue, index_name: Option<String>) -> Result<JsValue, JsValue> {
         let index_engine_config: proto::IndexEngineConfig = serde_wasm_bindgen::from_value(index_engine_config)?;
+        let serializer = Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true);
         Ok(self
             .add_internal(index_engine_config, index_name)
             .await
             .map_err(Error::from)?
-            .serialize(&*SERIALIZER)?)
+            .serialize(&serializer)?)
     }
 
     async fn add_internal(&self, index_engine_config: proto::IndexEngineConfig, index_name: Option<String>) -> SummaWasmResult<Option<proto::IndexAttributes>> {

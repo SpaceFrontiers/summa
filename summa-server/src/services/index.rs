@@ -571,7 +571,7 @@ impl Index {
 
     /// Search documents
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
-        let futures = self.index_registry.search_futures(search_request.index_queries).await?;
+        let futures = self.index_registry.search_futures(search_request.index_queries)?;
         let collector_outputs = join_all(futures.into_iter().map(tokio::spawn))
             .await
             .into_iter()

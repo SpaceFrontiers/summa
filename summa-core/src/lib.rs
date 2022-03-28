@@ -24,6 +24,7 @@ pub mod configs;
 pub mod directories;
 pub mod errors;
 pub mod metrics;
+pub mod page_rank;
 pub mod proto_traits;
 pub mod scorers;
 pub mod utils;
@@ -33,5 +34,3 @@ pub use errors::Error;
 
 #[macro_use]
 extern crate derive_builder;
-#[macro_use]
-extern crate lazy_static;

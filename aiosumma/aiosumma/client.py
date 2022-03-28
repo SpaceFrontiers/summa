@@ -42,6 +42,22 @@ def setup_metadata(session_id, request_id):
     return metadata
 
 
+def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int):
+    documents_portion = []
+    for document in documents:
+        documents_portion.append(document)
+        if len(documents_portion) > bulk_size:
+            yield index_service_pb.IndexDocumentStreamRequest(
+                index_name=index_name,
+                documents=documents_portion,
+            )
+            documents_portion = []
+    if documents_portion:
+        yield index_service_pb.IndexDocumentStreamRequest(
+            index_name=index_name,
+            documents=documents_portion,
+        )
+
 class SummaClient(BaseGrpcClient):
     stub_clses = {
         'consumer_api': ConsumerApiStub,
@@ -52,12 +68,12 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def attach_index(
-        self,
-        index_name: str,
-        index_engine: dict,
-        merge_policy: Optional[Dict] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            index_engine: dict,
+            merge_policy: Optional[Dict] = None,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.AttachIndexResponse:
         """
         Attach index to Summa. It must be placed under data directory named as `index_name`
@@ -80,10 +96,10 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def commit_index(
-        self,
-        index_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.CommitIndexResponse:
         """
         Commit index asynchronously. A commit will be scheduled and be done eventually.
@@ -106,11 +122,11 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def copy_documents(
-        self,
-        source_index_name: str,
-        target_index_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            source_index_name: str,
+            target_index_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.CopyDocumentsResponse:
         """
         Copies all documents from `source` to `target` index
@@ -133,14 +149,14 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def create_consumer(
-        self,
-        index_name: str,
-        consumer_name: str,
-        bootstrap_servers: List[str],
-        group_id: str,
-        topics: List[str],
-        request_id: str = None,
-        session_id: str = None,
+            self,
+            index_name: str,
+            consumer_name: str,
+            bootstrap_servers: List[str],
+            group_id: str,
+            topics: List[str],
+            request_id: str = None,
+            session_id: str = None,
     ) -> consumer_service_pb.CreateConsumerResponse:
         """
         Create consumer and corresponding topics in Kafka.
@@ -168,17 +184,17 @@ class SummaClient(BaseGrpcClient):
 
     @expose(with_from_file=True)
     async def create_index(
-        self,
-        index_name: str,
-        schema: Union[str, list],
-        index_engine: dict,
-        compression: Optional[Union[str, int]] = None,
-        blocksize: Optional[int] = None,
-        sort_by_field: Optional[Tuple] = None,
-        index_attributes: Optional[Dict] = None,
-        merge_policy: Optional[Dict] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            schema: Union[str, list],
+            index_engine: dict,
+            compression: Optional[Union[str, int]] = None,
+            blocksize: Optional[int] = None,
+            sort_by_field: Optional[Tuple] = None,
+            index_attributes: Optional[Dict] = None,
+            merge_policy: Optional[Dict] = None,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
         """
         Create index
@@ -220,13 +236,13 @@ class SummaClient(BaseGrpcClient):
 
     @expose(with_from_file=True)
     async def copy_index(
-        self,
-        source_index_name: str,
-        target_index_name: str,
-        target_index_engine: dict,
-        merge_policy: Optional[Dict] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            source_index_name: str,
+            target_index_name: str,
+            target_index_engine: dict,
+            merge_policy: Optional[Dict] = None,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
         """
         Copies existing index to new engine
@@ -251,10 +267,10 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def delete_consumer(
-        self,
-        consumer_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            consumer_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> consumer_service_pb.DeleteConsumerResponse:
         """
         Delete consumer by index and consumer names
@@ -271,11 +287,11 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def delete_documents(
-        self,
-        index_name: str,
-        query: query_pb.Query,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            query: query_pb.Query,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentResponse:
         """
         Delete document with primary key
@@ -296,10 +312,10 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def delete_index(
-        self,
-        index_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.DeleteIndexResponse:
         """
         Delete index
@@ -316,10 +332,10 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def get_consumer(
-        self,
-        consumer_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            consumer_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> consumer_service_pb.GetConsumerResponse:
         """
         Consumer metadata
@@ -338,9 +354,9 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def get_consumers(
-        self,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> consumer_service_pb.GetConsumersResponse:
         """
         All active consumers
@@ -358,10 +374,10 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def get_index(
-        self,
-        index_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.GetIndexResponse:
         """
         Index metadata
@@ -380,9 +396,9 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def get_indices(
-        self,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.GetIndicesResponse:
         """
         All indices metadata
@@ -400,9 +416,9 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def get_indices_aliases(
-        self,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.GetIndicesAliasesResponse:
         """
         Get all aliases for all indices
@@ -420,10 +436,10 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def documents(
-        self,
-        index_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         Retrieve all documents from the index
@@ -434,19 +450,19 @@ class SummaClient(BaseGrpcClient):
             session_id: session id
         """
         async for document in self.stubs['index_api'].documents(
-            index_service_pb.DocumentsRequest(index_name=index_name),
-            metadata=setup_metadata(session_id, request_id),
+                index_service_pb.DocumentsRequest(index_name=index_name),
+                metadata=setup_metadata(session_id, request_id),
         ):
             yield document.document
 
     @expose
     async def index_document_stream(
-        self,
-        index_name: str,
-        documents: Union[Iterable[str], str] = None,
-        bulk_size: int = 100,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            documents: Union[Iterable[str], str] = None,
+            bulk_size: int = 100,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentStreamResponse:
         """
         Index documents bulky
@@ -462,36 +478,21 @@ class SummaClient(BaseGrpcClient):
             def documents_iter():
                 for line in sys.stdin:
                     yield line.strip().encode()
+
             documents = documents_iter()
 
-        def documents_portion_iter():
-            documents_portion = []
-            for document in documents:
-                documents_portion.append(document)
-                if len(documents_portion) > bulk_size:
-                    yield index_service_pb.IndexDocumentStreamRequest(
-                        index_name=index_name,
-                        documents=documents_portion,
-                    )
-                    documents_portion = []
-            if documents_portion:
-                yield index_service_pb.IndexDocumentStreamRequest(
-                    index_name=index_name,
-                    documents=documents_portion,
-                )
-
         return await self.stubs['index_api'].index_document_stream(
-            documents_portion_iter(),
+            documents_portion_iter(index_name, documents, bulk_size),
             metadata=setup_metadata(session_id, request_id),
         )
 
     @expose
     async def index_document(
-        self,
-        index_name: str,
-        document: Union[dict, bytes, str],
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            document: Union[dict, bytes, str],
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentResponse:
         """
         Index document
@@ -512,12 +513,12 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def search(
-        self,
-        index_queries: List[dict],
-        tags: Optional[Dict[str, str]] = None,
-        ignore_not_found: bool = False,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_queries: List[dict],
+            tags: Optional[Dict[str, str]] = None,
+            ignore_not_found: bool = False,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> query_pb.SearchResponse:
         """Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
 
@@ -547,11 +548,11 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def merge_segments(
-        self,
-        index_name: str,
-        segment_ids: List[str],
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            segment_ids: List[str],
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.MergeSegmentsResponse:
         """
         Merge a list of segments into a single one
@@ -569,11 +570,11 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def set_index_alias(
-        self,
-        index_alias: str,
-        index_name: str,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_alias: str,
+            index_name: str,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.SetIndexAliasResponse:
         """
         Set or reassign the alias for an index
@@ -591,11 +592,11 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def vacuum_index(
-        self,
-        index_name: str,
-        excluded_segments: Optional[List[str]] = None,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            excluded_segments: Optional[List[str]] = None,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.VacuumIndexResponse:
         """
         Vacuuming index. It cleans every segment from deleted documents, one by one.
@@ -613,11 +614,11 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def warmup_index(
-        self,
-        index_name: str,
-        is_full: bool = False,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            is_full: bool = False,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.VacuumIndexResponse:
         """
         Warm index up. It loads all hot parts or index into memory and makes further first queries to the index faster.
@@ -635,12 +636,12 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def get_top_terms(
-        self,
-        index_name: str,
-        field_name: str,
-        top_k: int,
-        request_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+            self,
+            index_name: str,
+            field_name: str,
+            top_k: int,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
     ) -> index_service_pb.VacuumIndexResponse:
         """
         Get top terms by the number for the index

@@ -1,7 +1,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use summa_proto::proto;
 use tantivy::merge_policy::MergePolicy;
@@ -29,7 +29,7 @@ pub enum IndexWriterImpl {
 }
 
 impl IndexWriterImpl {
-    pub fn new(index: &Index, writer_threads: WriterThreads, writer_heap_size_bytes: usize, merge_policy: Box<dyn MergePolicy>) -> SummaResult<Self> {
+    pub fn new(index: &Index, writer_threads: WriterThreads, writer_heap_size_bytes: usize, merge_policy: Arc<dyn MergePolicy>) -> SummaResult<Self> {
         Ok(match writer_threads {
             WriterThreads::SameThread => IndexWriterImpl::SameThread(SingleIndexWriter {
                 index: index.clone(),
@@ -123,6 +123,7 @@ impl IndexWriterImpl {
 /// Managing write operations to index
 pub struct IndexWriterHolder {
     index_writer: IndexWriterImpl,
+    merge_policy: Arc<dyn MergePolicy>,
     unique_fields: Vec<Field>,
     writer_threads: WriterThreads,
     writer_heap_size_bytes: usize,
@@ -136,12 +137,14 @@ impl IndexWriterHolder {
     /// The type of primary key is restricted to I64 but it is subjected to be changed in the future.
     pub(super) fn new(
         index_writer: IndexWriterImpl,
+        merge_policy: Arc<dyn MergePolicy>,
         unique_fields: Vec<Field>,
         writer_threads: WriterThreads,
         writer_heap_size_bytes: usize,
     ) -> SummaResult<IndexWriterHolder> {
         Ok(IndexWriterHolder {
             index_writer,
+            merge_policy,
             unique_fields,
             writer_threads,
             writer_heap_size_bytes,
@@ -153,9 +156,9 @@ impl IndexWriterHolder {
         index: &Index,
         writer_threads: WriterThreads,
         writer_heap_size_bytes: usize,
-        merge_policy: Box<dyn MergePolicy>,
+        merge_policy: Arc<dyn MergePolicy>,
     ) -> SummaResult<IndexWriterHolder> {
-        let index_writer = IndexWriterImpl::new(index, writer_threads.clone(), writer_heap_size_bytes, merge_policy)?;
+        let index_writer = IndexWriterImpl::new(index, writer_threads.clone(), writer_heap_size_bytes, merge_policy.clone())?;
         let unique_fields = index
             .load_metas()?
             .index_attributes()?
@@ -168,7 +171,7 @@ impl IndexWriterHolder {
             })
             .transpose()?
             .unwrap_or_default();
-        IndexWriterHolder::new(index_writer, unique_fields, writer_threads, writer_heap_size_bytes)
+        IndexWriterHolder::new(index_writer, merge_policy, unique_fields, writer_threads, writer_heap_size_bytes)
     }
 
     /// Delete index by its unique fields
@@ -294,9 +297,11 @@ impl IndexWriterHolder {
                 info!(action = "wait_merging_threads", mode = "threaded");
                 index_writer.wait_merging_threads().expect("cannot wait merging threads");
                 info!(action = "merging_threads_finished", mode = "threaded");
-                index
+                let index_writer = index
                     .writer_with_num_threads(self.writer_threads.threads() as usize, self.writer_heap_size_bytes)
-                    .expect("cannot create index writer_holder")
+                    .expect("cannot create index writer_holder");
+                index_writer.set_merge_policy(self.merge_policy.clone());
+                index_writer
             }),
         };
     }

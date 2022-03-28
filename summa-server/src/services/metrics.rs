@@ -11,6 +11,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
+use once_cell::sync::Lazy;
 use opentelemetry::sdk::export::metrics::{aggregation, AggregatorSelector};
 use opentelemetry::sdk::metrics::aggregators::Aggregator;
 use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
@@ -24,10 +25,6 @@ use crate::components::IndexMeter;
 use crate::errors::{Error, SummaServerResult};
 use crate::services::Index;
 use crate::utils::thread_handler::ControlMessage;
-
-lazy_static! {
-    static ref EMPTY_HEADER_VALUE: HeaderValue = HeaderValue::from_static("");
-}
 
 #[derive(Clone)]
 pub struct Metrics {
@@ -70,10 +67,11 @@ impl Metrics {
     }
 
     async fn serve_request(request: Request<Body>, state: Arc<AppState>) -> Result<Response<Body>, hyper::Error> {
+        let empty_header_value = HeaderValue::from_static("");
         let _span = info_span!(
             "request",
-            request_id = ?request.headers().get("request-id").unwrap_or(&EMPTY_HEADER_VALUE),
-            session_id = ?request.headers().get("session-id").unwrap_or(&EMPTY_HEADER_VALUE),
+            request_id = ?request.headers().get("request-id").unwrap_or(&empty_header_value),
+            session_id = ?request.headers().get("session-id").unwrap_or(&empty_header_value),
         );
         info!(path = ?request.uri().path());
         let response = match request.method() {

@@ -34,8 +34,6 @@
 
 #[macro_use]
 extern crate derive_builder;
-#[macro_use]
-extern crate lazy_static;
 
 pub mod apis;
 pub mod components;

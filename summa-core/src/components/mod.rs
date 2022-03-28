@@ -20,16 +20,10 @@ pub use fruit_extractors::{build_fruit_extractor, FruitExtractor, IntermediateEx
 pub use index_holder::{cleanup_index, IndexHolder};
 pub use index_registry::IndexRegistry;
 pub use index_writer_holder::IndexWriterHolder;
-use once_cell::sync::Lazy;
 pub use query_parser::{ProtoQueryParser, QueryParser, QueryParserError};
 pub use segment_attributes::SummaSegmentAttributes;
 pub use summa_document::{DocumentParsingError, SummaDocument};
 pub use summa_tokenizer::SummaTokenizer;
-
-use crate::metrics::CacheMetrics;
-
-/// Static `CacheMetrics` shared by all instances of `crate::directories::ChunkedCachingDirectory`
-pub static CACHE_METRICS: Lazy<CacheMetrics> = Lazy::new(CacheMetrics::default);
 
 pub mod test_utils {
     use std::default::Default;

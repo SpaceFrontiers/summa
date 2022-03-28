@@ -4,6 +4,7 @@ use tantivy::{DocId, SegmentReader};
 
 use super::fast_field_iterator::{FastFieldIterator, FastFieldIteratorImpl};
 use crate::errors::{Error, SummaResult, ValidationError};
+use crate::page_rank::inverse_quantized_page_rank;
 
 /// Responsible for evaluation `fasteval` formula against documents and fastfields to receive document score
 pub(crate) struct SegmentEvalScorer {
@@ -84,6 +85,10 @@ impl SegmentEvalScorer {
                     let a = args.get(1).unwrap_or(&1f64);
                     Some(x / (*a + x))
                 }
+                "iqpr" => {
+                    let x = args[0].abs() as u64;
+                    Some(inverse_quantized_page_rank(x))
+                }
                 _ => None,
             }
         };
@@ -138,6 +143,10 @@ impl SegmentEvalScorer {
                     let x = args[0].abs();
                     let a = args.get(1).unwrap_or(&1f64);
                     Some(x / (*a + x))
+                }
+                "iqpr" => {
+                    let x = args[0].abs() as u64;
+                    Some(inverse_quantized_page_rank(x))
                 }
                 _ => None,
             }

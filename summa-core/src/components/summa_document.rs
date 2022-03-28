@@ -10,6 +10,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::errors::{Error, SummaResult, ValidationError};
+use crate::page_rank::quantize_page_rank;
 
 /// Wrapper for carrying `tantivy::Document` from various sources
 pub enum SummaDocument<'a> {
@@ -44,6 +45,18 @@ pub enum DocumentParsingError {
     /// One of the value node could not be parsed.
     #[error("The field '{0:?}' could not be parsed: {1:?}")]
     ValueError(String, ValueParsingError),
+}
+
+pub fn process_dynamic_fields(schema: &Schema, document: &mut Document) {
+    if let Ok(page_rank_field) = schema.get_field("page_rank") {
+        if let Ok(quantized_page_rank_field) = schema.get_field("quantized_page_rank") {
+            if let Some(page_rank_value) = document.get_first(page_rank_field) {
+                if let Some(page_rank_value) = page_rank_value.as_f64() {
+                    document.add_u64(quantized_page_rank_field, quantize_page_rank(page_rank_value))
+                }
+            }
+        }
+    }
 }
 
 impl<'a> SummaDocument<'a> {
@@ -216,7 +229,9 @@ impl<'a> TryInto<Document> for SummaDocument<'a> {
         match self {
             SummaDocument::BoundJsonBytes((schema, json_bytes)) => {
                 let text_document = from_utf8(json_bytes).map_err(ValidationError::Utf8)?;
-                Ok(self.parse_document(schema, text_document)?)
+                let mut parsed_document = self.parse_document(schema, text_document)?;
+                process_dynamic_fields(schema, &mut parsed_document);
+                Ok(parsed_document)
             }
             SummaDocument::UnboundJsonBytes(_) => Err(Error::UnboundDocument),
             SummaDocument::TantivyDocument(document) => Ok(document),

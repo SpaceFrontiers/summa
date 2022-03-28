@@ -71,9 +71,9 @@ struct LightMeta {
 }
 
 pub async fn read_opstamp<D: Directory>(directory: &D) -> SummaResult<Opstamp> {
-    let meta = directory.atomic_read_async(Path::new("meta.json")).await.unwrap();
-    let meta_string = String::from_utf8(meta).unwrap();
-    let meta_json: LightMeta = serde_json::from_str(&meta_string).unwrap();
+    let meta = directory.atomic_read_async(Path::new("meta.json")).await.map_err(|e| Error::Internal)?;
+    let meta_string = String::from_utf8(meta).map_err(|e| Error::Internal)?;
+    let meta_json: LightMeta = serde_json::from_str(&meta_string)?;
     Ok(meta_json.opstamp)
 }
 
@@ -200,12 +200,16 @@ impl IndexHolder {
 
         let index_writer_holder = match (read_only, &core_config.writer_threads) {
             (true, _) | (_, None) => None,
-            (_, Some(writer_threads)) => Some(Arc::new(RwLock::new(IndexWriterHolder::create(
-                &index,
-                writer_threads.clone(),
-                core_config.writer_heap_size_bytes as usize,
-                Wrapper::from(merge_policy).into(),
-            )?))),
+            (_, Some(writer_threads)) => {
+                let merge_policy = Wrapper::from(merge_policy).into();
+                info!(action = "create_index_writer", merge_policy = ?merge_policy, writer_threads = ?writer_threads, writer_heap_size_bytes = core_config.writer_heap_size_bytes);
+                Some(Arc::new(RwLock::new(IndexWriterHolder::create(
+                    &index,
+                    writer_threads.clone(),
+                    core_config.writer_heap_size_bytes as usize,
+                    merge_policy,
+                )?)))
+            }
         };
 
         Ok(IndexHolder {
@@ -433,8 +437,10 @@ impl IndexHolder {
         is_fieldnorms_scoring_enabled: Option<bool>,
     ) -> SummaResult<Vec<IntermediateExtractionResult>> {
         let searcher = self.index_reader().searcher();
+        trace!(action = "parse_query", index_name = ?self.index_name);
         let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
+        trace!(action = "build_extractors", index_name = ?self.index_name);
         let extractors: Vec<Box<dyn FruitExtractor>> = collectors
             .into_iter()
             .map(|collector_proto| build_fruit_extractor(self, index_alias, searcher.clone(), collector_proto, &parsed_query, &mut multi_collector))
@@ -461,6 +467,7 @@ impl IndexHolder {
         for extractor in extractors.into_iter() {
             collector_outputs.push(extractor.extract(&mut multi_fruit)?)
         }
+        trace!(action = "extracted");
         Ok(collector_outputs)
     }
 
@@ -536,13 +543,16 @@ impl IndexHolder {
     }
 
     pub fn space_usage(&self) -> SummaResult<SearcherSpaceUsage> {
-        Ok(self.index_reader().searcher().space_usage()?)
+        let index_reader = self.index_reader();
+        index_reader.reload()?;
+        Ok(index_reader.searcher().space_usage()?)
     }
 }
 
 #[cfg(test)]
 pub mod tests {
     use std::error::Error;
+    use std::sync::Arc;
 
     use summa_proto::proto;
     use summa_proto::proto::ConflictStrategy;
@@ -569,7 +579,7 @@ pub mod tests {
             &index,
             WriterThreads::N(12),
             1024 * 1024 * 1024,
-            Box::new(tantivy::merge_policy::LogMergePolicy::default()),
+            Arc::new(tantivy::merge_policy::LogMergePolicy::default()),
         )?;
         let mut last_document = None;
         for document in generate_documents(&schema, 10000) {

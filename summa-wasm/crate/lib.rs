@@ -18,9 +18,7 @@
 #[macro_use]
 extern crate async_trait;
 
-use once_cell::sync::Lazy;
 use parking_lot::Once;
-use serde_wasm_bindgen::Serializer;
 use tracing_wasm::{ConsoleConfig, WASMLayerConfigBuilder};
 use wasm_bindgen::prelude::*;
 
@@ -30,7 +28,6 @@ mod web_index_registry;
 mod worker_helper;
 
 pub use worker_helper::{worker_entry_point, ThreadPool};
-pub static SERIALIZER: Lazy<Serializer> = Lazy::new(|| Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true));
 
 #[wasm_bindgen]
 pub fn setup_logging(max_level: String) {

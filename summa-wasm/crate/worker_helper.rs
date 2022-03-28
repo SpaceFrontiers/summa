@@ -8,6 +8,7 @@ use js_sys::Promise;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
+use tracing::trace;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{DedicatedWorkerGlobalScope, WorkerOptions, WorkerType};
@@ -89,6 +90,7 @@ impl ThreadPool {
     where
         Fut: Future<Output = ()> + Send + 'static,
     {
+        trace!(action = "spawning_thread");
         self.state.send(Message::Run(Box::pin(future)));
     }
 
@@ -104,9 +106,9 @@ impl ThreadPool {
         let (tx, rx) = oneshot::channel();
         let f = async move {
             let res = future.await;
+            trace!(action = "receiving_future_result");
             let _ = tx.send(res);
         };
-
         self.spawn_ok(f);
         rx
     }

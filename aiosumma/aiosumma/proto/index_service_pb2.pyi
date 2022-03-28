@@ -167,10 +167,12 @@ class DeleteIndexResponse(_message.Message):
     def __init__(self, deleted_index_name: _Optional[str] = ...) -> None: ...
 
 class DocumentsRequest(_message.Message):
-    __slots__ = ["index_name"]
+    __slots__ = ["fields", "index_name"]
+    FIELDS_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    fields: _containers.RepeatedScalarFieldContainer[str]
     index_name: str
-    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class DocumentsResponse(_message.Message):
     __slots__ = ["document"]

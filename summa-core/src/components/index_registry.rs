@@ -10,7 +10,7 @@ use summa_proto::proto::collector_output::CollectorOutput;
 use summa_proto::proto::Score;
 use tantivy::{DocAddress, SnippetGenerator};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, trace};
 
 use super::IndexHolder;
 use crate::components::custom_serializer::NamedFieldDocument;
@@ -128,7 +128,7 @@ impl IndexRegistry {
     }
 
     /// Searches in several indices simultaneously and merges results
-    pub async fn search_futures(
+    pub fn search_futures(
         &self,
         index_queries: Vec<proto::IndexQuery>,
     ) -> SummaResult<Vec<impl Future<Output = SummaResult<Vec<IntermediateExtractionResult>>>>> {
@@ -174,6 +174,7 @@ impl IndexRegistry {
                         }
                     }
                     Some(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Count(_))) => {
+                        trace!(action = "count_collector_finalization");
                         let counts = ie_result
                             .into_iter()
                             .map(|ie_result| ie_result.as_count().expect("expected count collector").count);
@@ -187,6 +188,8 @@ impl IndexRegistry {
                         }
                     }
                     Some(IntermediateExtractionResult::PreparedDocumentReferences(first_prepared_document_references)) => {
+                        trace!(action = "prepared_documents_finalization");
+
                         let offset = first_prepared_document_references.offset as usize;
                         let limit = first_prepared_document_references.limit as usize;
 
@@ -209,6 +212,7 @@ impl IndexRegistry {
                             }
                         }
 
+                        trace!(action = "generate_snippets");
                         let snippet_generators: HashMap<&str, Vec<(String, SnippetGenerator)>> =
                             join_all(snippet_generators_futures).await.into_iter().collect();
 
