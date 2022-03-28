@@ -1,6 +1,6 @@
 [package]
 name = "summa-proto"
-version = "0.23.1"
+version = "0.23.2"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"

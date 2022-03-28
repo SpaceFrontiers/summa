@@ -11,7 +11,6 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
-use once_cell::sync::Lazy;
 use opentelemetry::sdk::export::metrics::{aggregation, AggregatorSelector};
 use opentelemetry::sdk::metrics::aggregators::Aggregator;
 use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
