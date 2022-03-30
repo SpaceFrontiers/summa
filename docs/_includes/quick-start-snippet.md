@@ -25,9 +25,8 @@ mkdir data
 
 # Generate config for `summa-server`
 # -a flag is for setting listen address of GRPC API
-# -i flag is for setting listen address of Iroh Gateway HTTP
 docker run izihawa/summa-server:testing generate-config -d /data \
--a 0.0.0.0:8082 -i 0.0.0.0:8080 > summa.yaml
+-a 0.0.0.0:8082 > summa.yaml
 
 # Launch `summa-server`
 docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data \

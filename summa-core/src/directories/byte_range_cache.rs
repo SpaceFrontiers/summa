@@ -43,7 +43,10 @@ struct NeedMutByteRangeCache<T: 'static + ToOwned + ?Sized> {
     num_bytes: u64,
 }
 
-impl<T: 'static + ToOwned + ?Sized + Ord> NeedMutByteRangeCache<T> {
+impl<T: 'static + ToOwned + ?Sized + Ord> NeedMutByteRangeCache<T>
+where
+    T::Owned: std::fmt::Debug,
+{
     fn with_infinite_capacity() -> Self {
         NeedMutByteRangeCache {
             cache: BTreeMap::new(),
@@ -72,7 +75,14 @@ impl<T: 'static + ToOwned + ?Sized + Ord> NeedMutByteRangeCache<T> {
 
     fn put_slice(&mut self, tag: T::Owned, byte_range: Range<u64>, bytes: OwnedBytes) {
         let len = (byte_range.end - byte_range.start) as usize;
-        assert_eq!(len, bytes.len());
+        assert_eq!(
+            len,
+            bytes.len(),
+            "declared byte_range {:?} length is not equal to data length {} for tag {:?}",
+            byte_range,
+            bytes.len(),
+            tag
+        );
         if len == 0 {
             return;
         }

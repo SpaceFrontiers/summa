@@ -5,7 +5,7 @@ nav_order: 1
 ---
 
 ### Configuring Summa and the index
-First, you should set up Summa Server with Iroh Store (enabled by default) and create a test index using our [Quick-Start guide](/summa/quick-start) 
+First, you should set up Summa Server and create a test index using our [Quick-Start guide](/summa/quick-start) 
 
 ### Publish the index to IPFS
 To publish the index, we need to change its engine to IPFS:

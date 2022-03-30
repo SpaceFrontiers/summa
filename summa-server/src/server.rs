@@ -43,8 +43,7 @@ impl Server {
                 command!("generate-config")
                     .about("Generate default config file")
                     .arg(arg!(-d <DATA_PATH> "Path for storing configs and data").default_value("data").num_args(1))
-                    .arg(arg!(-a <API_GRPC_ENDPOINT> "API GRPC endpoint").default_value("127.0.0.1:8082").num_args(1))
-                    .arg(arg!(-i <IROH_GATEWAY_HTTP_ENDPOINT> "Iroh Gateway HTTP endpoint")),
+                    .arg(arg!(-a <API_GRPC_ENDPOINT> "API GRPC endpoint").default_value("127.0.0.1:8082").num_args(1)),
             )
             .subcommand(
                 command!("serve")

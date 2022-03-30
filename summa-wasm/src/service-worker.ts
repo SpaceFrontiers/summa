@@ -2,26 +2,29 @@
 export default null
 declare let self: ServiceWorkerGlobalScope
 
-function fetch_with_retries(url: string, options: any, retries: number, sleep: number): any {
-  return fetch(url, options)
-    .then((res) => {
-      if (!res.ok && retries > 0) {
-        throw res;
-      }
-      return res;
-    })
-    .catch((error) => {
-      console.debug("retry failed", error);
-      let retries_left = retries - 1;
-      if (!retries_left) {
-        throw error;
-      }
-      if (error.status == 502 || error.name == 'AbortError') {
-        return setTimeout(() => fetch_with_retries(url, options, retries_left, sleep * 1.5), sleep * 1000)
-      } else {
-        return fetch_with_retries(url, options, retries_left, sleep);
-      }
-    });
+function delay(t: any) {
+    return new Promise(resolve => setTimeout(resolve, t));
+}
+
+async function fetch_with_retries(url: string, options: any, retries: number = 5, delay: number = 1000): Promise<Response> {
+  try {
+    const res = await fetch(url, options);
+    if (!res.ok && retries > 0) {
+      throw res;
+    }
+    return res;
+  } catch (error: any) {
+    console.debug("retry failed", error);
+    if (retries === 0) {
+      throw error;
+    }
+    if (error.status == 503 || error.status == 502 || error.name == 'AbortError') {
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return fetch_with_retries(url, options, retries - 1, delay * 2);
+    } else {
+      return fetch_with_retries(url, options, retries - 1, delay);
+    }
+  }
 }
 
 function set_same_origin_headers(headers: Headers) {
@@ -74,8 +77,8 @@ async function handle_request(event: FetchEvent) {
         method: request.method,
         headers: request.headers,
       },
-      3,
-        1.0,
+      5,
+        1000,
     );
     response = new Response(response.body, {
       headers: set_same_origin_headers(new Headers(response.headers)),

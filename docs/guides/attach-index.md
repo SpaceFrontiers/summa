@@ -5,7 +5,7 @@ nav_order: 2
 ---
 
 You can not just create indices but install downloaded indices or even access remote indices through network.
-First, you should set up Summa Server with Iroh Store (enabled by default) and create a test index using our [Quick-Start guide](/summa/quick-start)
+First, you should set up Summa Server and create a test index using our [Quick-Start guide](/summa/quick-start)
 
 ### Local File Indices
 
