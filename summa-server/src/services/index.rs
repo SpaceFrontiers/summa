@@ -234,7 +234,7 @@ impl Index {
                 (index, index_engine_config)
             }
             Some(proto::attach_index_request::IndexEngine::Remote(proto::AttachRemoteEngineRequest {
-                remote_engine_config: Some(remote_engine_config),
+                config: Some(remote_engine_config),
             })) => {
                 let index = IndexHolder::open_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(
                     remote_engine_config.clone(),

@@ -269,6 +269,7 @@ impl IndexHolder {
         remote_engine_config: proto::RemoteEngineConfig,
         read_only: bool,
     ) -> SummaResult<Index> {
+        info!(action = "opening_network_directory", config = ?remote_engine_config);
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
         let opstamp = read_opstamp(&network_directory).await?;
         let hotcache_bytes = match network_directory

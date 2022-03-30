@@ -63,7 +63,7 @@ message AttachFileEngineRequest {}
 
 // Attach remote engine request
 message AttachRemoteEngineRequest {
-  RemoteEngineConfig remote_engine_config = 1;
+  RemoteEngineConfig config = 1;
 }
 
 // Attach index request
