@@ -71,8 +71,8 @@ struct LightMeta {
 }
 
 pub async fn read_opstamp<D: Directory>(directory: &D) -> SummaResult<Opstamp> {
-    let meta = directory.atomic_read_async(Path::new("meta.json")).await.map_err(|e| Error::Internal)?;
-    let meta_string = String::from_utf8(meta).map_err(|e| Error::Internal)?;
+    let meta = directory.atomic_read_async(Path::new("meta.json")).await.map_err(|e| Error::Anyhow(e.into()))?;
+    let meta_string = String::from_utf8(meta).map_err(|e| Error::Anyhow(e.into()))?;
     let meta_json: LightMeta = serde_json::from_str(&meta_string)?;
     Ok(meta_json.opstamp)
 }
@@ -122,7 +122,7 @@ fn wrap_with_caches<D: Directory>(
     let static_cache = hotcache_bytes
         .map(|hotcache_bytes| StaticDirectoryCache::open(hotcache_bytes, opstamp))
         .transpose()?;
-    info!(action = "opened_static_cache");
+    info!(action = "opened_static_cache", static_cache = ?static_cache);
     let file_lengths = static_cache
         .as_ref()
         .map(|static_cache| static_cache.file_lengths().clone())
@@ -292,7 +292,7 @@ impl IndexHolder {
             }
         };
         let directory = wrap_with_caches(network_directory, hotcache_bytes, remote_engine_config.cache_config, opstamp)?;
-        Ok(Index::open(directory)?)
+        Ok(Index::open_async(directory).await?)
     }
 
     /// Compression

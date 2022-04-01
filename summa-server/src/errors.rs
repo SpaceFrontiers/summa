@@ -81,12 +81,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<Error> for summa_core::Error {
-    fn from(error: Error) -> Self {
-        summa_core::Error::External(format!("{error:?}"))
-    }
-}
-
 impl From<tokio::task::JoinError> for Error {
     fn from(_error: tokio::task::JoinError) -> Self {
         Error::Internal

@@ -119,7 +119,7 @@ impl Index {
         for (index_name, index_engine_config) in self.server_config.read().await.get().core.indices.clone().into_iter() {
             info!(action = "from_config", index = ?index_name);
             let index = self
-                .open_index_from_config(index_engine_config, false)
+                .open_index_from_config(index_engine_config)
                 .instrument(info_span!("open_index_from_config", index_name = ?index_name))
                 .await?;
             let core_config = self.server_config.read().await.get().core.clone();
@@ -551,12 +551,12 @@ impl Index {
     }
 
     /// Opens index and sets it up via `setup`
-    pub async fn open_index_from_config(&self, index_engine_config: proto::IndexEngineConfig, read_only: bool) -> SummaServerResult<tantivy::Index> {
+    pub async fn open_index_from_config(&self, index_engine_config: proto::IndexEngineConfig) -> SummaServerResult<tantivy::Index> {
         let index = match index_engine_config.config {
             Some(proto::index_engine_config::Config::File(config)) => tantivy::Index::open_in_dir(config.path)?,
             Some(proto::index_engine_config::Config::Memory(config)) => IndexBuilder::new().schema(serde_yaml::from_str(&config.schema)?).create_in_ram()?,
             Some(proto::index_engine_config::Config::Remote(config)) => {
-                IndexHolder::open_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, read_only).await?
+                IndexHolder::open_remote_index::<HyperExternalRequest, DefaultExternalRequestGenerator<HyperExternalRequest>>(config, false).await?
             }
             _ => unimplemented!(),
         };

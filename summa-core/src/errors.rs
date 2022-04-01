@@ -16,8 +16,6 @@ pub enum ValidationError {
     },
     #[error("invalid_http_header: <{0}: {1}>")]
     InvalidHttpHeader(String, String),
-    #[error("invalid_http_method: {0}")]
-    InvalidHttpMethod(String),
     #[error("invalid_segments_number: {0}")]
     InvalidSegmentsNumber(u32),
     #[error("invalid_schema_error: {0}")]
@@ -60,8 +58,6 @@ pub enum Error {
     DocumentParsing(#[from] crate::components::DocumentParsingError),
     #[error("empty_query_error")]
     EmptyQuery,
-    #[error("external: {0}")]
-    External(String),
     #[error("fast_eval_error: {0:?}")]
     FastEval(#[from] fasteval2::Error),
     #[error("infallible")]

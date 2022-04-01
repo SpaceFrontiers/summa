@@ -8,7 +8,7 @@ mod network_directory;
 pub use caching_directory::{CachingDirectory, FileStat, FileStats};
 pub use debug_proxy_directory::DebugProxyDirectory;
 pub use external_requests::{
-    DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, ExternalResponse, Header,
+    DefaultExternalRequestGenerator, ExternalRequest, ExternalRequestGenerator, ExternalRequestGeneratorClone, ExternalResponse, Header, RequestError,
 };
 pub use hot_cache_directory::{create_hotcache, deserialize_cbor, HotDirectory, StaticDirectoryCache};
 pub use network_directory::{NetworkDirectory, NetworkFile};

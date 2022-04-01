@@ -1,8 +1,10 @@
+use std::path::PathBuf;
+
 use hyper::client::HttpConnector;
 use hyper::{Client, Method, Request};
-use summa_core::directories::{ExternalRequest, ExternalResponse, Header};
-use summa_core::errors::{SummaResult, ValidationError};
+use summa_core::directories::{ExternalRequest, ExternalResponse, Header, RequestError};
 use tonic::async_trait;
+use tracing::info;
 
 use crate::errors::Error;
 
@@ -28,25 +30,22 @@ impl ExternalRequest for HyperExternalRequest {
         }
     }
 
-    fn request(self) -> SummaResult<ExternalResponse> {
+    fn request(self) -> Result<ExternalResponse, RequestError> {
         let (s, r) = tokio::sync::oneshot::channel();
         tokio::spawn(async move { s.send(self.request_async().await) });
         r.blocking_recv().expect("channel failed")
     }
 
-    async fn request_async(self) -> SummaResult<ExternalResponse> {
-        let mut request = Request::builder().uri(&self.url).method(
-            Method::from_bytes(self.method.as_bytes())
-                .map_err(|_| summa_core::Error::Validation(Box::new(ValidationError::InvalidHttpMethod(self.method.to_string()))))?,
-        );
+    async fn request_async(self) -> Result<ExternalResponse, RequestError> {
+        let mut request = Request::builder().uri(&self.url).method(Method::from_bytes(self.method.as_bytes()).unwrap());
         for header in self.headers.iter() {
             request = request.header(&header.name, &header.value);
         }
-        let response = self
-            .client
-            .request(request.body(hyper::Body::empty()).map_err(Error::from)?)
-            .await
-            .map_err(Error::from)?;
+        info!(action = "network_request", request = ?request);
+        let response = self.client.request(request.body(hyper::Body::empty()).unwrap()).await.unwrap();
+        if response.status() == 404 {
+            return Err(RequestError::NotFound(PathBuf::from(self.url)));
+        }
         let headers = response
             .headers()
             .iter()
@@ -56,7 +55,7 @@ impl ExternalRequest for HyperExternalRequest {
             })
             .collect();
         Ok(ExternalResponse {
-            data: hyper::body::to_bytes(response).await.map_err(Error::from)?.to_vec(),
+            data: hyper::body::to_bytes(response).await.map_err(Error::from).unwrap().to_vec(),
             headers,
         })
     }

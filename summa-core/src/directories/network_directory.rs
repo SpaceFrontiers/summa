@@ -11,7 +11,7 @@ use tantivy::{
 use tracing::trace;
 
 use super::ExternalRequestGenerator;
-use crate::directories::ExternalRequest;
+use crate::directories::{ExternalRequest, RequestError};
 use crate::errors::ValidationError::InvalidHttpHeader;
 use crate::errors::{SummaResult, ValidationError};
 
@@ -59,19 +59,22 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file_handle = self.get_network_file_handle(path);
-        Ok(file_handle
-            .do_read_bytes(None)
-            .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?
-            .to_vec())
+        match file_handle.do_read_bytes(None) {
+            Ok(bytes) => Ok(bytes.to_vec()),
+            Err(RequestError::NotFound(p)) => Err(OpenReadError::FileDoesNotExist(p)),
+            Err(RequestError::IoError(e, p)) => Err(OpenReadError::wrap_io_error(e, p)),
+            Err(e) => panic!("{:?}", e),
+        }
     }
 
     async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file_handle = self.get_network_file_handle(path);
-        Ok(file_handle
-            .do_read_bytes_async(None)
-            .await
-            .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?
-            .to_vec())
+        match file_handle.do_read_bytes_async(None).await {
+            Ok(bytes) => Ok(bytes.to_vec()),
+            Err(RequestError::NotFound(p)) => Err(OpenReadError::FileDoesNotExist(p)),
+            Err(RequestError::IoError(e, p)) => Err(OpenReadError::wrap_io_error(e, p)),
+            Err(e) => panic!("{:?}", e),
+        }
     }
 
     fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
@@ -107,26 +110,28 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
         &self.file_name
     }
 
-    pub fn url(&self) -> io::Result<String> {
-        Ok(self.request_generator.generate_length_request(&self.file_name)?.url().to_string())
+    pub fn url(&self) -> String {
+        self.request_generator.generate_length_request(&self.file_name).url().to_string()
     }
 
-    fn do_read_bytes(&self, byte_range: Option<Range<u64>>) -> io::Result<OwnedBytes> {
-        let request_response = self.request_generator.generate_range_request(&self.file_name, byte_range)?.request()?;
-        Ok(OwnedBytes::new(request_response.data))
+    fn do_read_bytes(&self, byte_range: Option<Range<u64>>) -> Result<OwnedBytes, RequestError> {
+        self.request_generator
+            .generate_range_request(&self.file_name, byte_range)
+            .request()
+            .map(|r| OwnedBytes::new(r.data))
     }
 
-    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<u64>>) -> io::Result<OwnedBytes> {
-        let request = self.request_generator.generate_range_request(&self.file_name, byte_range)?;
+    pub async fn do_read_bytes_async(&self, byte_range: Option<Range<u64>>) -> Result<OwnedBytes, RequestError> {
+        let request = self.request_generator.generate_range_request(&self.file_name, byte_range);
         let url = request.url().to_string();
         trace!(action = "start_reading_file", url = ?url);
         let request_fut = request.request_async();
         trace!(action = "finish_reading_file", url = ?url);
-        Ok(OwnedBytes::new(request_fut.await?.data))
+        request_fut.await.map(|r| OwnedBytes::new(r.data))
     }
 
     pub fn internal_length(&self) -> SummaResult<u64> {
-        let external_response = self.request_generator.generate_length_request(&self.file_name)?.request()?;
+        let external_response = self.request_generator.generate_length_request(&self.file_name).request().unwrap();
         Ok(external_response
             .headers
             .iter()
@@ -149,11 +154,11 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
 #[async_trait]
 impl<TExternalRequest: ExternalRequest + Debug + 'static> FileHandle for NetworkFile<TExternalRequest> {
     fn read_bytes(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
-        self.do_read_bytes(Some(byte_range))
+        Ok(self.do_read_bytes(Some(byte_range)).unwrap())
     }
 
     async fn read_bytes_async(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
-        self.do_read_bytes_async(Some(byte_range)).await
+        Ok(self.do_read_bytes_async(Some(byte_range)).await.unwrap())
     }
 }
 
