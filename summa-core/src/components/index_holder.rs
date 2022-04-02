@@ -23,7 +23,7 @@ use tantivy::schema::{Field, Schema};
 use tantivy::space_usage::SearcherSpaceUsage;
 use tantivy::{Directory, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing::{instrument, trace};
 
 use super::SummaSegmentAttributes;
@@ -73,7 +73,13 @@ struct LightMeta {
 pub async fn read_opstamp<D: Directory>(directory: &D) -> SummaResult<Opstamp> {
     let meta = directory.atomic_read_async(Path::new("meta.json")).await.map_err(|e| Error::Anyhow(e.into()))?;
     let meta_string = String::from_utf8(meta).map_err(|e| Error::Anyhow(e.into()))?;
-    let meta_json: LightMeta = serde_json::from_str(&meta_string)?;
+    let meta_json: LightMeta = match serde_json::from_str(&meta_string) {
+        Ok(meta_json) => meta_json,
+        Err(e) => {
+            error!(action = "invalid_json", json = meta_string);
+            Err(e)?
+        }
+    };
     Ok(meta_json.opstamp)
 }
 
@@ -269,7 +275,7 @@ impl IndexHolder {
         remote_engine_config: proto::RemoteEngineConfig,
         read_only: bool,
     ) -> SummaResult<Index> {
-        info!(action = "opening_network_directory", config = ?remote_engine_config);
+        info!(action = "opening_network_directory", config = ?remote_engine_config, read_only = read_only);
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
         let opstamp = read_opstamp(&network_directory).await?;
         let hotcache_bytes = match network_directory

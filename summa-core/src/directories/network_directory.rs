@@ -8,7 +8,7 @@ use tantivy::{
     directory::{error::OpenReadError, FileHandle, OwnedBytes},
     Directory, HasLen,
 };
-use tracing::trace;
+use tracing::{info, trace};
 
 use super::ExternalRequestGenerator;
 use crate::directories::{ExternalRequest, RequestError};
@@ -59,6 +59,7 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file_handle = self.get_network_file_handle(path);
+        info!(action = "atomic_read", path = ?path);
         match file_handle.do_read_bytes(None) {
             Ok(bytes) => Ok(bytes.to_vec()),
             Err(RequestError::NotFound(p)) => Err(OpenReadError::FileDoesNotExist(p)),
@@ -69,6 +70,7 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
 
     async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file_handle = self.get_network_file_handle(path);
+        info!(action = "atomic_read_async", path = ?path);
         match file_handle.do_read_bytes_async(None).await {
             Ok(bytes) => Ok(bytes.to_vec()),
             Err(RequestError::NotFound(p)) => Err(OpenReadError::FileDoesNotExist(p)),

@@ -72,12 +72,42 @@ pub struct ExistsWeight {
     field: Field,
 }
 
+#[async_trait]
 impl Weight for ExistsWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);
 
         let inverted_index = reader.inverted_index(self.field)?;
+        let mut term_stream = inverted_index.terms().stream()?;
+
+        while term_stream.advance() {
+            let term_info = term_stream.value();
+
+            let mut block_segment_postings = inverted_index.read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+
+            loop {
+                let docs = block_segment_postings.docs();
+
+                if docs.is_empty() {
+                    break;
+                }
+                for &doc in block_segment_postings.docs() {
+                    doc_bitset.insert(doc);
+                }
+                block_segment_postings.advance();
+            }
+        }
+
+        let doc_bitset = BitSetDocSet::from(doc_bitset);
+        Ok(Box::new(ConstScorer::new(doc_bitset, boost)))
+    }
+
+    async fn scorer_async(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
+        let max_doc = reader.max_doc();
+        let mut doc_bitset = BitSet::with_max_value(max_doc);
+
+        let inverted_index = reader.inverted_index_async(self.field).await?;
         let mut term_stream = inverted_index.terms().stream()?;
 
         while term_stream.advance() {
