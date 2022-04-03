@@ -212,11 +212,6 @@ All Summa parts, including the network layer for loading index parts with HTTP r
 have been shaped into `summa-wasm` module which now allows you to execute search queries
 over Summa indices directly in browser.
 
-<figure>
-  <img src="/summa/assets/arch.drawio.png" alt="architecture">
-  <figcaption>Summa architecture</figcaption>
-</figure>
-
 ### Why It Is So Special?
 
 With the integration of `summa-wasm` into your web application, you will have the ability to

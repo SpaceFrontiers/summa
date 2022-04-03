@@ -10,12 +10,7 @@ Summa is composed of multiple parts, the most important of which are
 - [IPFS](https://github.com/ipfs/kubo) for downloading and distributing indices through [IPFS](https://ipfs.tech) network
 - [WASM](https://github.com/izihawa/summa/tree/master/summa-wasm) for compiling and launching the subset of Summa in browsers 
 
-Summa Server operates indices and puts them in the Iroh Store, and manages Iroh
-P2P for making indices available through the IPFS network.
-
-![architecture](/summa/assets/arch.drawio.png)
-
-The main object in Summa is `Index` that represents a set of data with common [schema](/summa/core/schema) and backed with one of available `IndexEngine`.
+Summa Server operates indices. The main object in Summa is `Index` that represents a set of data with common [schema](/summa/core/schema) and backed with one of available `IndexEngine`.
 `IndexEngine` encapsulates all I/O operations. There are ready implementations for `Memory`, `File`, `IPFS` and `Remote`-backed indices.
 
 ### Index Engines

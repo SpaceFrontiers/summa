@@ -95,7 +95,7 @@ async function handle_request(event: FetchEvent) {
     number_range_start = Number.parseInt(start);
     if (end) {
       range_end = end;
-      number_range_end = Number.parseInt(end) + 1;
+      number_range_end = Number.parseInt(end);
     }
     if (!crop_after) {
       url += "?r=" + range_start + "-" + range_end;
