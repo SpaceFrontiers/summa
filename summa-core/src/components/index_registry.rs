@@ -286,7 +286,7 @@ impl IndexRegistry {
                         .await
                         .into_iter()
                         .collect::<SummaResult<Vec<_>>>()?;
-                        CollectorOutput::TopDocs(proto::TopDocsCollectorOutput { has_next, scored_documents })
+                        CollectorOutput::Documents(proto::DocumentsCollectorOutput { has_next, scored_documents })
                     }
                 }),
             });

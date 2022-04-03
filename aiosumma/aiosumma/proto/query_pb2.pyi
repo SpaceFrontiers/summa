@@ -145,18 +145,16 @@ class Collector(_message.Message):
     def __init__(self, top_docs: _Optional[_Union[TopDocsCollector, _Mapping]] = ..., reservoir_sampling: _Optional[_Union[ReservoirSamplingCollector, _Mapping]] = ..., count: _Optional[_Union[CountCollector, _Mapping]] = ..., facet: _Optional[_Union[FacetCollector, _Mapping]] = ..., aggregation: _Optional[_Union[AggregationCollector, _Mapping]] = ...) -> None: ...
 
 class CollectorOutput(_message.Message):
-    __slots__ = ["aggregation", "count", "facet", "reservoir_sampling", "top_docs"]
+    __slots__ = ["aggregation", "count", "documents", "facet"]
     AGGREGATION_FIELD_NUMBER: _ClassVar[int]
     COUNT_FIELD_NUMBER: _ClassVar[int]
+    DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
     FACET_FIELD_NUMBER: _ClassVar[int]
-    RESERVOIR_SAMPLING_FIELD_NUMBER: _ClassVar[int]
-    TOP_DOCS_FIELD_NUMBER: _ClassVar[int]
     aggregation: AggregationCollectorOutput
     count: CountCollectorOutput
+    documents: DocumentsCollectorOutput
     facet: FacetCollectorOutput
-    reservoir_sampling: ReservoirSamplingCollectorOutput
-    top_docs: TopDocsCollectorOutput
-    def __init__(self, top_docs: _Optional[_Union[TopDocsCollectorOutput, _Mapping]] = ..., reservoir_sampling: _Optional[_Union[ReservoirSamplingCollectorOutput, _Mapping]] = ..., count: _Optional[_Union[CountCollectorOutput, _Mapping]] = ..., facet: _Optional[_Union[FacetCollectorOutput, _Mapping]] = ..., aggregation: _Optional[_Union[AggregationCollectorOutput, _Mapping]] = ...) -> None: ...
+    def __init__(self, documents: _Optional[_Union[DocumentsCollectorOutput, _Mapping]] = ..., count: _Optional[_Union[CountCollectorOutput, _Mapping]] = ..., facet: _Optional[_Union[FacetCollectorOutput, _Mapping]] = ..., aggregation: _Optional[_Union[AggregationCollectorOutput, _Mapping]] = ...) -> None: ...
 
 class CountCollector(_message.Message):
     __slots__ = []
@@ -187,6 +185,14 @@ class DisjunctionMaxQuery(_message.Message):
     disjuncts: _containers.RepeatedCompositeFieldContainer[Query]
     tie_breaker: str
     def __init__(self, disjuncts: _Optional[_Iterable[_Union[Query, _Mapping]]] = ..., tie_breaker: _Optional[str] = ...) -> None: ...
+
+class DocumentsCollectorOutput(_message.Message):
+    __slots__ = ["has_next", "scored_documents"]
+    HAS_NEXT_FIELD_NUMBER: _ClassVar[int]
+    SCORED_DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
+    has_next: bool
+    scored_documents: _containers.RepeatedCompositeFieldContainer[ScoredDocument]
+    def __init__(self, scored_documents: _Optional[_Iterable[_Union[ScoredDocument, _Mapping]]] = ..., has_next: bool = ...) -> None: ...
 
 class EmptyQuery(_message.Message):
     __slots__ = []
@@ -615,14 +621,6 @@ class TopDocsCollector(_message.Message):
     scorer: Scorer
     snippet_configs: _containers.ScalarMap[str, int]
     def __init__(self, limit: _Optional[int] = ..., offset: _Optional[int] = ..., scorer: _Optional[_Union[Scorer, _Mapping]] = ..., snippet_configs: _Optional[_Mapping[str, int]] = ..., explain: bool = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
-
-class TopDocsCollectorOutput(_message.Message):
-    __slots__ = ["has_next", "scored_documents"]
-    HAS_NEXT_FIELD_NUMBER: _ClassVar[int]
-    SCORED_DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
-    has_next: bool
-    scored_documents: _containers.RepeatedCompositeFieldContainer[ScoredDocument]
-    def __init__(self, scored_documents: _Optional[_Iterable[_Union[ScoredDocument, _Mapping]]] = ..., has_next: bool = ...) -> None: ...
 
 class Occur(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []

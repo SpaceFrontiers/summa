@@ -2,8 +2,37 @@
 export default null
 declare let self: ServiceWorkerGlobalScope
 
-function delay(t: any) {
-    return new Promise(resolve => setTimeout(resolve, t));
+class ByteSliceStream extends TransformStream<Uint8Array, Uint8Array> {
+  #offsetStart = 0;
+  #offsetEnd = 0;
+  #counter = 0;
+
+  constructor(start = 0, end = Infinity) {
+    super({
+      start: () => {
+        end += 1;
+      },
+      transform: (chunk, controller) => {
+        this.#offsetStart = this.#offsetEnd;
+        this.#offsetEnd += chunk.byteLength;
+        if (this.#offsetEnd > start) {
+          if (this.#offsetStart < start) {
+            chunk = chunk.slice(start - this.#offsetStart);
+          }
+          if (this.#offsetEnd >= end) {
+            chunk = chunk.slice(0, chunk.byteLength - this.#offsetEnd + end);
+            this.#counter += chunk.byteLength;
+            controller.enqueue(chunk);
+            console.log("Counter: ", this.#counter)
+            controller.terminate();
+          } else {
+            this.#counter += chunk.byteLength;
+            controller.enqueue(chunk);
+          }
+        }
+      },
+    });
+  }
 }
 
 async function fetch_with_retries(url: string, options: any, retries: number = 5, delay: number = 1000): Promise<Response> {
@@ -37,16 +66,6 @@ async function handle_request(event: FetchEvent) {
   const request = event.request
   let filename = request.url;
   let url = request.url;
-  const range_header = request.headers.get("range");
-  if (range_header !== null) {
-    let range_end = '';
-    // @ts-ignore
-    const [_, range_start, end] = /^bytes=(\d+)-(\d+)?$/g.exec(range_header);
-    if (end) {
-      range_end = end;
-    }
-    url += "?r=" + range_start + "-" + range_end;
-  }
 
   let is_immutable_file = filename.endsWith(".fast") ||
       filename.endsWith(".term") ||
@@ -62,6 +81,26 @@ async function handle_request(event: FetchEvent) {
       event.request.destination === "font" ||
       event.request.destination === "style" ||
       (event.request.destination === "script" && !request.url.startsWith("chrome-extension"));
+
+  let crop_after: boolean = filename.endsWith(".del");
+  let range_start = '0'
+  let range_end = '';
+  let number_range_start = 0;
+  let number_range_end = undefined;
+  const range_header = request.headers.get("range");
+  if (range_header !== null) {
+    // @ts-ignore
+    let [_, start, end] = /^bytes=(\d+)-(\d+)?$/g.exec(range_header);
+    range_start = start;
+    number_range_start = Number.parseInt(start);
+    if (end) {
+      range_end = end;
+      number_range_end = Number.parseInt(end) + 1;
+    }
+    if (!crop_after) {
+      url += "?r=" + range_start + "-" + range_end;
+    }
+  }
 
   let caching_enabled = is_immutable_file && request.method === "GET";
 
@@ -87,6 +126,12 @@ async function handle_request(event: FetchEvent) {
     if (caching_enabled && response.ok) {
       cache.put(url, response.clone());
     }
+  }
+  if (range_header && crop_after && response.body) {
+    response = new Response(response.body.pipeThrough(new ByteSliceStream(number_range_start, number_range_end)), {
+      headers: response.headers,
+      status: response.status
+    })
   }
   return response;
 }

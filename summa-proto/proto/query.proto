@@ -264,8 +264,7 @@ message Collector {
 
 message CollectorOutput {
   oneof collector_output {
-    TopDocsCollectorOutput top_docs = 1;
-    ReservoirSamplingCollectorOutput reservoir_sampling = 2;
+    DocumentsCollectorOutput documents = 1;
     CountCollectorOutput count = 3;
     FacetCollectorOutput facet = 4;
     AggregationCollectorOutput aggregation = 5;
@@ -309,7 +308,7 @@ message TopDocsCollector {
   repeated string fields = 6;
 }
 
-message TopDocsCollectorOutput {
+message DocumentsCollectorOutput {
   repeated ScoredDocument scored_documents = 1;
   bool has_next = 2;
 }

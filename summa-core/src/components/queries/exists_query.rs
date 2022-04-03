@@ -108,12 +108,14 @@ impl Weight for ExistsWeight {
         let mut doc_bitset = BitSet::with_max_value(max_doc);
 
         let inverted_index = reader.inverted_index_async(self.field).await?;
-        let mut term_stream = inverted_index.terms().stream()?;
+        let mut term_stream = inverted_index.terms().range().into_stream_async().await?;
 
         while term_stream.advance() {
             let term_info = term_stream.value();
 
-            let mut block_segment_postings = inverted_index.read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+            let mut block_segment_postings = inverted_index
+                .read_block_postings_from_terminfo_async(term_info, IndexRecordOption::Basic)
+                .await?;
 
             loop {
                 let docs = block_segment_postings.docs();

@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(
             search_response.collector_outputs[0],
             proto::CollectorOutput {
-                collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+                collector_output: Some(proto::collector_output::CollectorOutput::Documents(proto::DocumentsCollectorOutput {
                     scored_documents: vec![proto::ScoredDocument {
                         document: "{\"body\":\"body3\",\"title\":\"title3\"}".to_string(),
                         score: Some(proto::Score {
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(
             search_response.collector_outputs[0],
             proto::CollectorOutput {
-                collector_output: Some(proto::collector_output::CollectorOutput::TopDocs(proto::TopDocsCollectorOutput {
+                collector_output: Some(proto::collector_output::CollectorOutput::Documents(proto::DocumentsCollectorOutput {
                     scored_documents: vec![proto::ScoredDocument {
                         document: "{\"body\":\"body3\",\"title\":\"title3\"}".to_string(),
                         score: Some(proto::Score {

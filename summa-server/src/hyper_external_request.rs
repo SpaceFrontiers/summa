@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use hyper::client::HttpConnector;
 use hyper::{Client, Method, Request};
+use hyper_tls::HttpsConnector;
 use summa_core::directories::{ExternalRequest, ExternalResponse, Header, RequestError};
 use tonic::async_trait;
 use tracing::info;
@@ -10,7 +11,7 @@ use crate::errors::Error;
 
 #[derive(Clone, Debug)]
 pub struct HyperExternalRequest {
-    pub client: Client<HttpConnector>,
+    pub client: Client<HttpsConnector<HttpConnector>>,
     pub method: String,
     pub url: String,
     pub headers: Vec<Header>,
@@ -22,8 +23,10 @@ impl ExternalRequest for HyperExternalRequest {
     where
         Self: Sized,
     {
+        let https = HttpsConnector::new();
+        let client = Client::builder().build::<_, hyper::Body>(https);
         HyperExternalRequest {
-            client: Client::new(),
+            client,
             method: method.to_string(),
             url: url.to_string(),
             headers: Vec::from_iter(headers.iter().cloned()),
@@ -45,6 +48,9 @@ impl ExternalRequest for HyperExternalRequest {
         let response = self.client.request(request.body(hyper::Body::empty()).unwrap()).await.unwrap();
         if response.status() == 404 {
             return Err(RequestError::NotFound(PathBuf::from(self.url)));
+        }
+        if response.status().as_u16() < 200 || response.status().as_u16() >= 300 {
+            return Err(RequestError::External(format!("status: {} for {}", response.status(), self.url)));
         }
         let headers = response
             .headers()

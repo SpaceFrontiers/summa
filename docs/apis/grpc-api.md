@@ -101,6 +101,7 @@ parent: APIs
     - [CountCollectorOutput](#summa-proto-CountCollectorOutput)
     - [CustomOrder](#summa-proto-CustomOrder)
     - [DisjunctionMaxQuery](#summa-proto-DisjunctionMaxQuery)
+    - [DocumentsCollectorOutput](#summa-proto-DocumentsCollectorOutput)
     - [EmptyQuery](#summa-proto-EmptyQuery)
     - [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter)
     - [ExistsQuery](#summa-proto-ExistsQuery)
@@ -146,7 +147,6 @@ parent: APIs
     - [TermsResult](#summa-proto-TermsResult)
     - [TopDocsCollector](#summa-proto-TopDocsCollector)
     - [TopDocsCollector.SnippetConfigsEntry](#summa-proto-TopDocsCollector-SnippetConfigsEntry)
-    - [TopDocsCollectorOutput](#summa-proto-TopDocsCollectorOutput)
   
     - [Occur](#summa-proto-Occur)
   
@@ -395,7 +395,7 @@ Attach remote engine request
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| cache_config | [CacheConfig](#summa-proto-CacheConfig) |  |  |
+| config | [RemoteEngineConfig](#summa-proto-RemoteEngineConfig) |  |  |
 
 
 
@@ -641,6 +641,7 @@ Request a stream of all documents from the index
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
+| fields | [string](#string) | repeated |  |
 
 
 
@@ -1526,8 +1527,7 @@ Collectors and CollectorOutputs
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| top_docs | [TopDocsCollectorOutput](#summa-proto-TopDocsCollectorOutput) |  |  |
-| reservoir_sampling | [ReservoirSamplingCollectorOutput](#summa-proto-ReservoirSamplingCollectorOutput) |  |  |
+| documents | [DocumentsCollectorOutput](#summa-proto-DocumentsCollectorOutput) |  |  |
 | count | [CountCollectorOutput](#summa-proto-CountCollectorOutput) |  |  |
 | facet | [FacetCollectorOutput](#summa-proto-FacetCollectorOutput) |  |  |
 | aggregation | [AggregationCollectorOutput](#summa-proto-AggregationCollectorOutput) |  |  |
@@ -1590,6 +1590,22 @@ Collectors and CollectorOutputs
 | ----- | ---- | ----- | ----------- |
 | disjuncts | [Query](#summa-proto-Query) | repeated |  |
 | tie_breaker | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-DocumentsCollectorOutput"></a>
+
+### DocumentsCollectorOutput
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| scored_documents | [ScoredDocument](#summa-proto-ScoredDocument) | repeated |  |
+| has_next | [bool](#bool) |  |  |
 
 
 
@@ -2340,22 +2356,6 @@ Recursive query DSL
 | ----- | ---- | ----- | ----------- |
 | key | [string](#string) |  |  |
 | value | [uint32](#uint32) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-TopDocsCollectorOutput"></a>
-
-### TopDocsCollectorOutput
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| scored_documents | [ScoredDocument](#summa-proto-ScoredDocument) | repeated |  |
-| has_next | [bool](#bool) |  |  |
 
 
 
