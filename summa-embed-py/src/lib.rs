@@ -103,7 +103,7 @@ impl IndexRegistry {
 /// A Python module implemented in Rust.
 #[pymodule]
 #[pyo3(name = "summa_embed")]
-fn summa_py(_py: Python, m: &PyModule) -> PyResult<()> {
+fn summa_embed(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<IndexRegistry>()?;
     Ok(())
 }
