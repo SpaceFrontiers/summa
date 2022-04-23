@@ -39,7 +39,6 @@ pub mod apis;
 pub mod components;
 pub mod configs;
 pub mod errors;
-pub(crate) mod hyper_external_request;
 pub(crate) mod logging;
 pub mod server;
 pub mod services;

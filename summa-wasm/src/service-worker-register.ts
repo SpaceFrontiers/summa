@@ -36,6 +36,7 @@
         },
         (err) => {
           console.error("COOP/COEP Service Worker failed to register:", err);
+          setTimeout(() => { coi.doReload() }, 2000);
         }
       );
   }

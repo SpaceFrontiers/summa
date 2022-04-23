@@ -3,10 +3,9 @@ use std::path::PathBuf;
 use hyper::client::HttpConnector;
 use hyper::{Client, Method, Request};
 use hyper_tls::HttpsConnector;
-use summa_core::directories::{ExternalRequest, ExternalResponse, Header, RequestError};
-use tonic::async_trait;
 use tracing::info;
 
+use crate::directories::{ExternalRequest, ExternalResponse, Header, RequestError};
 use crate::errors::Error;
 
 #[derive(Clone, Debug)]
@@ -40,12 +39,12 @@ impl ExternalRequest for HyperExternalRequest {
     }
 
     async fn request_async(self) -> Result<ExternalResponse, RequestError> {
-        let mut request = Request::builder().uri(&self.url).method(Method::from_bytes(self.method.as_bytes()).unwrap());
+        let mut request = Request::builder().uri(&self.url).method(Method::from_bytes(self.method.as_bytes())?);
         for header in self.headers.iter() {
             request = request.header(&header.name, &header.value);
         }
         info!(action = "network_request", request = ?request);
-        let response = self.client.request(request.body(hyper::Body::empty()).unwrap()).await.unwrap();
+        let response = self.client.request(request.body(hyper::Body::empty())?).await?;
         if response.status() == 404 {
             return Err(RequestError::NotFound(PathBuf::from(self.url)));
         }
@@ -61,7 +60,7 @@ impl ExternalRequest for HyperExternalRequest {
             })
             .collect();
         Ok(ExternalResponse {
-            data: hyper::body::to_bytes(response).await.map_err(Error::from).unwrap().to_vec(),
+            data: hyper::body::to_bytes(response).await?.to_vec(),
             headers,
         })
     }

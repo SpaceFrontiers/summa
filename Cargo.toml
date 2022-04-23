@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["examples", "summa-core", "summa-proto", "summa-server", "summa-wasm"]
+members = ["examples", "summa-core", "summa-proto", "summa-embed-py", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true
@@ -18,6 +18,8 @@ derive_builder = "0.12"
 downcast-rs = "1.2"
 fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
 futures = "0.3"
+hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
+hyper-tls = { version = "0.5.0", features = ["vendored"] }
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
 itertools = "0.10"
 kanal = "0.1.0-pre8"
@@ -30,13 +32,14 @@ pest_derive = "2.5"
 prost = "0.11"
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.6.1"
+safe-regex = "0.2.5"
 serde = { version = "1.0", default_features = false, features = ["derive", "std"] }
 serde_bytes = "0.11"
 serde_cbor = "0.11"
 serde_json = { version = "1.0" }
 serde_yaml = { version = "0.8" }
 strfmt = "0.2"
-summa-proto = { version = "0.24.0", path = "./summa-proto", default_features = false }
+summa-proto = { version = "0.25.0", path = "./summa-proto", default_features = false }
 take_mut = "0.2"
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa", default_features = false, features = ["quickwit", "zstd-compression"] }
 tantivy-common = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa" }

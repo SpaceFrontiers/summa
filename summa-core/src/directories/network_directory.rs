@@ -133,7 +133,7 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
     }
 
     pub fn internal_length(&self) -> SummaResult<u64> {
-        let external_response = self.request_generator.generate_length_request(&self.file_name).request().unwrap();
+        let external_response = self.request_generator.generate_length_request(&self.file_name).request()?;
         Ok(external_response
             .headers
             .iter()
@@ -156,11 +156,14 @@ impl<TExternalRequest: ExternalRequest> NetworkFile<TExternalRequest> {
 #[async_trait]
 impl<TExternalRequest: ExternalRequest + Debug + 'static> FileHandle for NetworkFile<TExternalRequest> {
     fn read_bytes(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
-        Ok(self.do_read_bytes(Some(byte_range)).unwrap())
+        self.do_read_bytes(Some(byte_range))
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))
     }
 
     async fn read_bytes_async(&self, byte_range: Range<u64>) -> io::Result<OwnedBytes> {
-        Ok(self.do_read_bytes_async(Some(byte_range)).await.unwrap())
+        self.do_read_bytes_async(Some(byte_range))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))
     }
 }
 

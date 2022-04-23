@@ -23,7 +23,6 @@ class ByteSliceStream extends TransformStream<Uint8Array, Uint8Array> {
             chunk = chunk.slice(0, chunk.byteLength - this.#offsetEnd + end);
             this.#counter += chunk.byteLength;
             controller.enqueue(chunk);
-            console.log("Counter: ", this.#counter)
             controller.terminate();
           } else {
             this.#counter += chunk.byteLength;

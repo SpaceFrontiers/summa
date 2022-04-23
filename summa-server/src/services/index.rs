@@ -12,6 +12,7 @@ use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
+use summa_core::hyper_external_request::HyperExternalRequest;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
 use summa_core::validators;
@@ -24,7 +25,6 @@ use tracing::{error, info, info_span, instrument, warn, Instrument};
 use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::errors::SummaServerResult;
 use crate::errors::ValidationError;
-use crate::hyper_external_request::HyperExternalRequest;
 use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
 
 /// `services::Index` is responsible for indices lifecycle. Here lives indices creation and deletion as well as committing and indexing new documents.

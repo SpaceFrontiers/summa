@@ -39,10 +39,6 @@ pub enum Error {
     ClapMatches(#[from] clap::parser::MatchesError),
     #[error("{0}")]
     Core(#[from] summa_core::Error),
-    #[error("hyper_error: {0}")]
-    Hyper(#[from] hyper::Error),
-    #[error("hyper_http_error: {0}")]
-    HyperHttp(#[from] hyper::http::Error),
     #[error("internal_error")]
     Internal,
     #[error("{0:?}")]

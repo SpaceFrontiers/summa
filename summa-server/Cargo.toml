@@ -29,7 +29,7 @@ maintenance = { status = "actively-developed" }
 tonic-build = { version = "0.8.0", default-features = false, features = ["prost", "transport"] }
 
 [dev-dependencies]
-summa-core = { version = "0.14.3", path = "../summa-core", features = ["fs", "tokio-rt"] }
+summa-core = { version = "0.14.3", path = "../summa-core", features = ["fs", "hyper-external-request", "tokio-rt"] }
 tempdir = "0.3.7"
 
 [dependencies]
@@ -42,8 +42,7 @@ derive_builder = { workspace = true }
 futures = { workspace = true }
 futures-util = "0.3"
 headers = "0.3"
-hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
-hyper-tls = "0.5.0"
+hyper = { workspace = true }
 itertools = { workspace = true }
 opentelemetry = { version = "0.18", features = ["rt-tokio"], optional = true }
 opentelemetry-prometheus = { version = "0.11", optional = true }

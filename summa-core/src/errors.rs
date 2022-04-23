@@ -60,6 +60,12 @@ pub enum Error {
     EmptyQuery,
     #[error("fast_eval_error: {0:?}")]
     FastEval(#[from] fasteval2::Error),
+    #[cfg(feature = "hyper-external-request")]
+    #[error("hyper_error: {0}")]
+    Hyper(#[from] hyper::Error),
+    #[cfg(feature = "hyper-external-request")]
+    #[error("hyper_http_error: {0}")]
+    HyperHttp(#[from] hyper::http::Error),
     #[error("infallible")]
     Infallible,
     #[error("internal_error")]
@@ -84,6 +90,8 @@ pub enum Error {
     Tantivy(#[from] tantivy::TantivyError),
     #[error("read_only_index: {0}")]
     ReadOnlyIndex(String),
+    #[error("request_error: {0}")]
+    RequestError(#[from] crate::directories::RequestError),
     #[error("unbound_document_error")]
     UnboundDocument,
     #[error("unknown_directory_error: {0}")]

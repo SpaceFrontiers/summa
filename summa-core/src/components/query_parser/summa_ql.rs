@@ -6,11 +6,13 @@ use std::str::FromStr;
 use pest::iterators::{Pair, Pairs};
 use pest::Parser;
 use pest_derive::Parser;
+use safe_regex::{regex, Matcher3};
 use summa_proto::proto;
 use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 use tantivy::{Index, Term};
+use tantivy_common::HasLen;
 use tantivy_query_grammar::Occur;
 
 use crate::components::query_parser::proto_query_parser::MatchQueryDefaultMode;
@@ -503,13 +505,74 @@ impl QueryParser {
         (!terms.is_empty()).then(|| terms.join(" "))
     }
 
+    fn parse_isbn(&self, isbn: &str) -> Result<Box<dyn Query>, QueryParserError> {
+        if let Ok(isbns_fields) = self.schema.get_field("isbns") {
+            Ok(Box::new(TermQuery::new(
+                Term::from_field_text(isbns_fields, &isbn.replace('-', "")),
+                IndexRecordOption::Basic,
+            )) as Box<dyn Query>)
+        } else {
+            Ok(Box::new(EmptyQuery) as Box<dyn Query>)
+        }
+    }
+
+    fn parse_doi(&self, doi: &str) -> Result<Box<dyn Query>, QueryParserError> {
+        if let Ok(doi_field) = self.schema.get_field("doi") {
+            // ToDo: use more general approach, i.e. use doi tokenizer
+            let mut term_queries = vec![];
+            let mut boost_original_match = None;
+            let lowercased_doi = doi.to_lowercase();
+            // ToDo: compile statically
+            let matcher: Matcher3<_> = regex!(br"(10.[0-9]+)/((?:cbo)?(?:(?:978[0-9]{10})|(?:978[0-9]{13})|(?:978[-0-9]+)))(.*)");
+            if let Some((prefix, isbn, tail)) = matcher.match_slices(lowercased_doi.as_ref()) {
+                let isbn = unsafe { std::str::from_utf8_unchecked(isbn) };
+                let corrected_isbn = isbn.replace('-', "").replace("cbo", "");
+                if (corrected_isbn.len() == 10 || corrected_isbn.len() == 13) && !prefix.is_empty() {
+                    if !tail.is_empty() {
+                        term_queries.push((
+                            Occur::Should,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(doi_field, &format!("{}/{}", unsafe { std::str::from_utf8_unchecked(prefix) }, isbn)),
+                                IndexRecordOption::Basic,
+                            )) as Box<dyn Query>,
+                        ));
+                    }
+                    if let Ok(isbns_field) = self.schema.get_field("isbns") {
+                        term_queries.push((
+                            Occur::Should,
+                            Box::new(TermQuery::new(Term::from_field_text(isbns_field, &corrected_isbn), IndexRecordOption::Basic)) as Box<dyn Query>,
+                        ));
+                        boost_original_match = Some(3.0);
+                    }
+                }
+            }
+            if let Some(boost) = boost_original_match {
+                term_queries.push((
+                    Occur::Should,
+                    Box::new(BoostQuery::new(
+                        Box::new(TermQuery::new(Term::from_field_text(doi_field, &lowercased_doi), IndexRecordOption::Basic)) as Box<dyn Query>,
+                        boost,
+                    )) as Box<dyn Query>,
+                ))
+            } else {
+                term_queries.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(Term::from_field_text(doi_field, &lowercased_doi), IndexRecordOption::Basic)) as Box<dyn Query>,
+                ));
+            }
+            Ok(Box::new(BooleanQuery::new(term_queries)) as Box<dyn Query>)
+        } else {
+            Ok(Box::new(EmptyQuery) as Box<dyn Query>)
+        }
+    }
+
     fn parse_statement(&self, pair: Pair<Rule>) -> Result<Box<dyn Query>, QueryParserError> {
         let mut statement_pairs = pair.into_inner();
-        let doi_or_search_group_or_term = statement_pairs.next().expect("grammar failure");
+        let isbn_doi_or_search_group_or_term = statement_pairs.next().expect("grammar failure");
         let statement_boost = statement_pairs.next().map(|boost| f32::from_str(boost.as_str()).expect("grammar failure"));
-        let statement_result = match doi_or_search_group_or_term.as_rule() {
+        let statement_result = match isbn_doi_or_search_group_or_term.as_rule() {
             Rule::search_group => {
-                let mut search_group = doi_or_search_group_or_term.into_inner();
+                let mut search_group = isbn_doi_or_search_group_or_term.into_inner();
                 let field_name = search_group.next().expect("grammar failure");
                 let grouping_or_term = search_group.next().expect("grammar failure");
                 match grouping_or_term.as_rule() {
@@ -550,18 +613,9 @@ impl QueryParser {
                     _ => unreachable!(),
                 }
             }
-            Rule::doi => {
-                if let Ok(doi_field) = self.schema.get_field("doi") {
-                    // ToDo: use more general approach, i.e. use doi tokenizer
-                    Ok(Box::new(TermQuery::new(
-                        Term::from_field_text(doi_field, &doi_or_search_group_or_term.as_str().to_lowercase()),
-                        IndexRecordOption::Basic,
-                    )) as Box<dyn Query>)
-                } else {
-                    Ok(Box::new(EmptyQuery) as Box<dyn Query>)
-                }
-            }
-            Rule::term => self.default_fields_term(doi_or_search_group_or_term, statement_boost),
+            Rule::doi => self.parse_doi(isbn_doi_or_search_group_or_term.as_str()),
+            Rule::isbn => self.parse_isbn(isbn_doi_or_search_group_or_term.as_str()),
+            Rule::term => self.default_fields_term(isbn_doi_or_search_group_or_term, statement_boost),
             e => panic!("{e:?}"),
         }?;
         Ok(statement_result)
@@ -629,6 +683,7 @@ mod tests {
         schema_builder.add_text_field("body", TEXT);
         schema_builder.add_i64_field("timestamp", INDEXED);
         schema_builder.add_text_field("doi", STRING);
+        schema_builder.add_text_field("isbns", STRING);
         let schema = schema_builder.build();
         let default_fields = vec!["title".to_string()];
         QueryParser::new(schema, default_fields, &tokenizer_manager).expect("cannot create parser")
@@ -655,6 +710,7 @@ mod tests {
         schema_builder.add_text_field("language", TEXT);
         schema_builder.add_i64_field("timestamp", INDEXED);
         schema_builder.add_text_field("doi", STRING);
+        schema_builder.add_text_field("isbns", STRING);
         let schema = schema_builder.build();
         let default_fields = vec!["title".to_string(), "body".to_string()];
         QueryParser::new(schema, default_fields, &tokenizer_manager).expect("cannot create parser")
@@ -712,6 +768,32 @@ mod tests {
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi:doi.org/10.0000/abcd.0123")),
             "Ok(TermQuery(Term(type=Str, field=3, \"doi.org/10.0000/abcd.0123\")))"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("10.0000/978123")),
+            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/978123\")))"
+        );
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/9781234567890")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/9781234567890\")), boost=3))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/978-12345-6789-0")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/978-12345-6789-0\")), boost=3))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/978-12345-6789-0.ch11")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=3, \"10.0000/978-12345-6789-0\"))), (Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/978-12345-6789-0.ch11\")), boost=3))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/cbo978-12345-6789-0.ch11")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=3, \"10.0000/cbo978-12345-6789-0\"))), (Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/cbo978-12345-6789-0.ch11\")), boost=3))] })");
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("978-12345-6789-0")),
+            "Ok(TermQuery(Term(type=Str, field=4, \"9781234567890\")))"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("9781234567890")),
+            "Ok(TermQuery(Term(type=Str, field=4, \"9781234567890\")))"
+        );
+        assert_eq!(format!("{:?}", query_parser.parse_query("97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"97812\"))), (Should, TermQuery(Term(type=Str, field=0, \"34\"))), (Should, TermQuery(Term(type=Str, field=0, \"5678\"))), (Should, TermQuery(Term(type=Str, field=0, \"909\")))] })");
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("isbns:97812-34-5678-90")),
+            "Ok(TermQuery(Term(type=Str, field=4, \"97812-34-5678-90\")))"
+        );
+        assert_eq!(format!("{:?}", query_parser.parse_query("123 97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"123\"))), (Should, TermQuery(Term(type=Str, field=0, \"97812\"))), (Should, TermQuery(Term(type=Str, field=0, \"34\"))), (Should, TermQuery(Term(type=Str, field=0, \"5678\"))), (Should, TermQuery(Term(type=Str, field=0, \"909\")))] })");
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("10.0000/cbo123")),
+            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/cbo123\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi.org/10.0000/abcd.0123")),

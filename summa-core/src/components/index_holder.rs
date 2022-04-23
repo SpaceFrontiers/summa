@@ -444,7 +444,7 @@ impl IndexHolder {
         is_fieldnorms_scoring_enabled: Option<bool>,
     ) -> SummaResult<Vec<IntermediateExtractionResult>> {
         let searcher = self.index_reader().searcher();
-        trace!(action = "parse_query", index_name = ?self.index_name);
+        trace!(action = "parse_query", index_name = ?self.index_name, query = ?query);
         let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         trace!(action = "build_extractors", index_name = ?self.index_name);

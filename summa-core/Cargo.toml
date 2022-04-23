@@ -13,6 +13,7 @@ doc = true
 
 [features]
 fs = ["tantivy/mmap", "tokio/fs"]
+hyper-external-request = ["hyper", "hyper-tls"]
 metrics = ["opentelemetry"]
 tokio-rt = ["tokio/rt"]
 
@@ -29,6 +30,8 @@ derive_builder = { workspace = true }
 downcast-rs = { workspace = true }
 fasteval2 = { workspace = true }
 futures = { workspace = true }
+hyper = { workspace = true, optional = true }
+hyper-tls = { workspace = true, optional = true }
 instant = { workspace = true }
 itertools = { workspace = true }
 lru = { workspace = true }
@@ -40,6 +43,7 @@ pest_derive = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
+safe-regex = { workspace = true }
 rustc-hash = "1.1.0"
 serde = { workspace = true }
 serde_bytes = { workspace = true }
