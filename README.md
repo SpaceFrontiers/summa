@@ -41,11 +41,12 @@ If you're ready to start, be sure to check out our docs:
 is `testing`*
 
 - [Docker (testing)](https://hub.docker.com/r/izihawa/summa-server/testing)
-- [Docker (v0.11.0)](https://hub.docker.com/r/izihawa/summa-server/0.11.0)
+- [Docker (v0.14.3)](https://hub.docker.com/r/izihawa/summa-server/0.14.3)
 
 ### Clients
 
-- [Python](https://pypi.org/project/aiosumma/)
+- [Async Python client to Summa](https://pypi.org/project/aiosumma/)
+- [Python bindings to Summa](https://pypi.org/project/summa_embed/)
 - [Rust (proto)](https://lib.rs/crates/summa-proto)
 
 ## Donate
