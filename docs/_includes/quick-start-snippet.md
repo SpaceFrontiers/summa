@@ -70,6 +70,11 @@ cat << EOF > schema.yaml
 EOF
 ```
 
+```bash
+# Create index
+summa-cli localhost:8082 - create-index-from-file schema.yaml
+```
+
 ### Add Documents <a name="fill"></a>
 WikiBooks provides weekly dumps of their books' database. 
 Let's download their dump and index it in Summa:

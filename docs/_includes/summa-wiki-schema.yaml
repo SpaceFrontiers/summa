@@ -67,35 +67,35 @@ schema: >
   - name: timestamp
     type: date
     options:
-      fast: single
+      fast: true
       fieldnorms: false
       indexed: true
       stored: true
   - name: create_timestamp
     type: date
     options:
-      fast: single
+      fast: true
       fieldnorms: false
       indexed: true
       stored: true
   - name: popularity_score
     type: f64
     options:
-      fast: single
+      fast: true
       fieldnorms: false
       indexed: true
       stored: true
   - name: incoming_links
     type: u64
     options:
-      fast: single
+      fast: true
       fieldnorms: false
       indexed: true
       stored: true
   - name: namespace
     type: u64
     options:
-      fast: single
+      fast: true
       fieldnorms: false
       indexed: true
       stored: true

@@ -41,10 +41,13 @@ pub struct ExternalResponse {
 pub enum RequestError {
     #[error("external: {0}")]
     External(String),
+    #[cfg(feature = "hyper-external-request")]
     #[error("http_error: {0}")]
     HttpError(#[from] hyper::http::Error),
+    #[cfg(feature = "hyper-external-request")]
     #[error("hyper_error: {0}")]
     HyperError(#[from] hyper::Error),
+    #[cfg(feature = "hyper-external-request")]
     #[error("invalid_method: {0}")]
     InvalidMethod(#[from] hyper::http::method::InvalidMethod),
     #[error("io_error: {0} {1}")]
