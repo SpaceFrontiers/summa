@@ -15,11 +15,11 @@ jobs:
         uses: arduino/setup-protoc@v1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions-rs/toolchain@v1.0.7
+      - uses: actions-rs/toolchain@v1
         with:
           override: true
           toolchain: stable
-      - uses: actions/cache@v2.1.6
+      - uses: actions/cache@v2
         with:
           path: |
             ~/.cargo/bin/
@@ -42,7 +42,7 @@ jobs:
       - uses: actions-rs/toolchain@v1.0.7
         with:
           toolchain: stable
-      - uses: actions/cache@v2.1.6
+      - uses: actions/cache@v2
         with:
           path: |
             target/

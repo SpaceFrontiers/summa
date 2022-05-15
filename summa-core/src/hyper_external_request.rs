@@ -6,7 +6,6 @@ use hyper_tls::HttpsConnector;
 use tracing::info;
 
 use crate::directories::{ExternalRequest, ExternalResponse, Header, RequestError};
-use crate::errors::Error;
 
 #[derive(Clone, Debug)]
 pub struct HyperExternalRequest {
