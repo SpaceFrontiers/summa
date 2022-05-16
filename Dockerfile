@@ -15,13 +15,13 @@ ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
     CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
-    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=armv7-linux-gnueabihf-gcc \
-    CC_armv7_unknown_linux_gnueabihf=armv7-linux-gnueabihf-gcc \
-    CXX_armv7_unknown_linux_gnueabihf=armv7-linux-gnueabihf-g++ \
+    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
+    CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
+    CXX_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-g++ \
     CARGO_INCREMENTAL=0
 
-# amd64 build ----------------------------
-FROM --platform=$BUILDPLATFORM builder AS build-amd64
+# base dir
+FROM --platform=$BUILDPLATFORM builder AS base-dir
 WORKDIR /app
 COPY .cargo .cargo
 COPY examples examples
@@ -32,37 +32,20 @@ COPY summa-server summa-server
 COPY summa-wasm summa-wasm
 COPY Cargo.toml Cargo.toml
 COPY rustfmt.toml rustfmt.toml
+
+# amd64 build ----------------------------
+FROM --platform=$BUILDPLATFORM base-dir AS build-amd64
 RUN cargo build --profile release -p summa-server --target x86_64-unknown-linux-gnu
 RUN mv target/x86_64-unknown-linux-gnu/release/summa-server-bin /bin/summa-server
 
 # arm64 build ----------------------------
-FROM --platform=$BUILDPLATFORM builder AS build-arm64
-WORKDIR /app
-COPY .cargo .cargo
-COPY examples examples
-COPY summa-core summa-core
-COPY summa-embed-py summa-embed-py
-COPY summa-proto summa-proto
-COPY summa-server summa-server
-COPY summa-wasm summa-wasm
-COPY Cargo.toml Cargo.toml
-COPY rustfmt.toml rustfmt.toml
+FROM --platform=$BUILDPLATFORM base-dir AS build-arm64
 RUN CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ cargo build --profile release -p summa-server --target aarch64-unknown-linux-gnu
 RUN mv target/aarch64-unknown-linux-gnu/release/summa-server-bin /bin/summa-server
 
 # armv7 build ----------------------------
-FROM --platform=$BUILDPLATFORM builder AS build-armv7
-WORKDIR /app
-COPY .cargo .cargo
-COPY examples examples
-COPY summa-core summa-core
-COPY summa-embed-py summa-embed-py
-COPY summa-proto summa-proto
-COPY summa-server summa-server
-COPY summa-wasm summa-wasm
-COPY Cargo.toml Cargo.toml
-COPY rustfmt.toml rustfmt.toml
-RUN CC=armv7-linux-gnueabihf-gcc CXX=armv7-linux-gnueabihf-g++ cargo build --profile release -p summa-server --target armv7-unknown-linux-gnueabihf
+FROM --platform=$BUILDPLATFORM base-dir AS build-arm
+RUN CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++ cargo build --profile release -p summa-server --target armv7-unknown-linux-gnueabihf
 RUN mv target/armv7-unknown-linux-gnueabihf/release/summa-server-bin /bin/summa-server
 
 # Final arch images ----------------------
@@ -71,7 +54,7 @@ COPY --from=build-amd64 /bin/summa-server /bin/summa-server
 FROM --platform=arm64 gcr.io/distroless/cc:latest-arm64 AS final-arm64
 COPY --from=build-arm64 /bin/summa-server /bin/summa-server
 FROM --platform=arm/v7 gcr.io/distroless/cc:latest-arm AS final-arm
-COPY --from=build-armv7 /bin/summa-server /bin/summa-server
+COPY --from=build-arm /bin/summa-server /bin/summa-server
 
 # Final image ----------------------------
 FROM final-${TARGETARCH}
