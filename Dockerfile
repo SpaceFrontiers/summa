@@ -1,14 +1,6 @@
 FROM rust as builder
 WORKDIR app
-COPY .cargo .cargo
-COPY examples examples
-COPY summa-core summa-core
-COPY summa-embed-py summa-embed-py
-COPY summa-proto summa-proto
-COPY summa-server summa-server
-COPY summa-wasm summa-wasm
-COPY Cargo.toml Cargo.toml
-COPY rustfmt.toml rustfmt.toml
+COPY . .
 RUN cargo build --profile release -p summa-server
 
 FROM gcr.io/distroless/cc
