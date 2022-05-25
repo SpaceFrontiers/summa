@@ -15,11 +15,11 @@ jobs:
         uses: arduino/setup-protoc@v1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions-rs/toolchain@v1.0.7
+      - uses: actions-rs/toolchain@v1
         with:
           override: true
           toolchain: stable
-      - uses: actions/cache@v2.1.6
+      - uses: actions/cache@v2
         with:
           path: |
             ~/.cargo/bin/
@@ -46,14 +46,3 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: summa-wasm
-  twine-upload:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      - run: bash build.sh
-        working-directory: aiosumma
-      - run: twine upload dist/*
-        working-directory: aiosumma

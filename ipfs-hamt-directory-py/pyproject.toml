@@ -3,7 +3,7 @@ requires = ["maturin>=0.14,<0.15"]
 build-backend = "maturin"
 
 [project]
-name = "ipfs_hamt_directory"
+name = "ipfs_hamt_directory_py"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
