@@ -2,13 +2,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
     let files = &[
         "proto/consumer_service.proto",
+        "proto/dag_pb.proto",
         "proto/index_service.proto",
         "proto/query.proto",
         "proto/reflection_service.proto",
         "proto/search_service.proto",
+        "proto/unixfs.proto",
         "proto/utils.proto",
     ];
     let serde_default_structs = &[
+        "dag_pb.PBNode",
+        "dag_pb.PBLink",
         "summa.proto.HistogramAggregation",
         "summa.proto.IndexAttributes",
         "summa.proto.MoreLikeThisQuery",
@@ -16,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "summa.proto.ReservoirSamplingCollector",
         "summa.proto.TermsAggregation",
         "summa.proto.TopDocsCollector",
+        "unixfs.Data",
     ];
     #[cfg(feature = "grpc")]
     build_tonic(files, serde_default_structs)?;

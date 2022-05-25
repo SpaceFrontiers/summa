@@ -1,8 +1,6 @@
+use tantivy::aggregation::agg_req::Aggregation;
 use summa_proto::proto;
-use tantivy::aggregation::agg_req::{Aggregation, BucketAggregation, BucketAggregationType, MetricAggregation, RangeAggregation};
 use tantivy::aggregation::agg_result::{AggregationResult, BucketEntries, BucketEntry, BucketResult, MetricResult, RangeBucketEntry};
-use tantivy::aggregation::bucket::{CustomOrder, HistogramAggregation, HistogramBounds, OrderTarget, RangeAggregationRange, TermsAggregation};
-use tantivy::aggregation::metric::{AverageAggregation, StatsAggregation};
 use tantivy::aggregation::Key;
 
 use crate::errors::Error;
@@ -23,71 +21,7 @@ impl TryFrom<Wrapper<proto::aggregation::Aggregation>> for Aggregation {
     type Error = Error;
 
     fn try_from(aggregation: Wrapper<proto::aggregation::Aggregation>) -> Result<Self, Error> {
-        Ok(match aggregation.into_inner() {
-            proto::aggregation::Aggregation::Bucket(bucket_aggregation) => Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: match bucket_aggregation.bucket_agg {
-                    Some(proto::bucket_aggregation::BucketAgg::Histogram(histogram_aggregation)) => BucketAggregationType::Histogram(HistogramAggregation {
-                        field: histogram_aggregation.field,
-                        interval: histogram_aggregation.interval,
-                        offset: histogram_aggregation.offset,
-                        min_doc_count: histogram_aggregation.min_doc_count,
-                        hard_bounds: histogram_aggregation.hard_bounds.map(|hard_bounds| HistogramBounds {
-                            min: hard_bounds.min,
-                            max: hard_bounds.max,
-                        }),
-                        extended_bounds: histogram_aggregation.extended_bounds.map(|extended_bounds| HistogramBounds {
-                            min: extended_bounds.min,
-                            max: extended_bounds.max,
-                        }),
-                        keyed: false,
-                    }),
-                    Some(proto::bucket_aggregation::BucketAgg::Range(range_aggregation)) => BucketAggregationType::Range(RangeAggregation {
-                        field: range_aggregation.field,
-                        ranges: range_aggregation
-                            .ranges
-                            .into_iter()
-                            .map(|range| RangeAggregationRange {
-                                key: range.key,
-                                from: range.from,
-                                to: range.to,
-                            })
-                            .collect(),
-                        keyed: false,
-                    }),
-                    Some(proto::bucket_aggregation::BucketAgg::Terms(terms_aggregation)) => BucketAggregationType::Terms(TermsAggregation {
-                        field: terms_aggregation.field,
-                        size: terms_aggregation.size,
-                        split_size: terms_aggregation.split_size,
-                        segment_size: terms_aggregation.segment_size,
-                        show_term_doc_count_error: terms_aggregation.show_term_doc_count_error,
-                        min_doc_count: terms_aggregation.min_doc_count,
-                        order: terms_aggregation.order.map(|order| CustomOrder {
-                            order: Wrapper::from(order.order()).into(),
-                            target: match order.order_target {
-                                None | Some(proto::custom_order::OrderTarget::Key(_)) => OrderTarget::Key,
-                                Some(proto::custom_order::OrderTarget::Count(_)) => OrderTarget::Count,
-                                Some(proto::custom_order::OrderTarget::SubAggregation(sub_aggregation)) => OrderTarget::SubAggregation(sub_aggregation),
-                            },
-                        }),
-                    }),
-                    None => return Err(Error::InvalidAggregation),
-                },
-                sub_aggregation: bucket_aggregation
-                    .sub_aggregation
-                    .into_iter()
-                    .map(|(name, aggregation)| Ok((name, Wrapper::from(aggregation).try_into()?)))
-                    .collect::<Result<_, Error>>()?,
-            })),
-            proto::aggregation::Aggregation::Metric(metric_aggregation) => match metric_aggregation.metric_aggregation {
-                Some(proto::metric_aggregation::MetricAggregation::Average(average_aggregation)) => {
-                    Aggregation::Metric(MetricAggregation::Average(AverageAggregation::from_field_name(average_aggregation.field)))
-                }
-                Some(proto::metric_aggregation::MetricAggregation::Stats(stats_aggregation)) => {
-                    Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(stats_aggregation.field)))
-                }
-                None => return Err(Error::InvalidAggregation),
-            },
-        })
+        Ok(serde_json::from_str(&serde_json::to_string(&aggregation.into_inner()).unwrap()).unwrap())
     }
 }
 

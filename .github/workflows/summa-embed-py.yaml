@@ -8,14 +8,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  PACKAGE_NAME: summa_embed
-
 jobs:
   macos:
     runs-on: macos-latest
     strategy:
       matrix:
+        package: ["summa-embed-py", "ipfs-hamt-directory-py"]
         python-version: [ '3.8', '3.9', '3.10', '3.11' ]
     steps:
       - uses: actions/checkout@v3
@@ -28,11 +26,11 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          args: --release --out dist --sdist -m summa-embed-py/Cargo.toml
+          args: --release --out dist --sdist -m ${{ matrix.package }}/Cargo.toml
       - name: Build wheels - universal2
         uses: PyO3/maturin-action@v1
         with:
-          args: --release --universal2 --out dist -m summa-embed-py/Cargo.toml
+          args: --release --universal2 --out dist -m ${{ matrix.package }}/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -43,6 +41,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
+        package: ["summa-embed-py", "ipfs-hamt-directory-py"]
         python-version: ['3.8', '3.9', '3.10', '3.11']
         target: [x64, x86]
     steps:
@@ -56,7 +55,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m summa-embed-py/Cargo.toml
+          args: --release --out dist -m ${{ matrix.package }}/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -67,6 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        package: ["summa-embed-py", "ipfs-hamt-directory-py"]
         python-version: ['3.8', '3.9', '3.10', '3.11']
         target: [ x64 ]
     steps:
@@ -80,7 +80,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: auto
-          args: -i ${{ matrix.python-version }} --release --out dist -m summa-embed-py/Cargo.toml
+          args: -i ${{ matrix.python-version }} --release --out dist -m ${{ matrix.package }}/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -91,6 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        package: ["summa-embed-py", "ipfs-hamt-directory-py"]
         python-version: ['3.8', '3.9', '3.10', '3.11']
         target: [aarch64, armv7]
     steps:
@@ -103,7 +104,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: auto
-          args: -i ${{ matrix.python-version }} --release --out dist -m summa-embed-py/Cargo.toml
+          args: -i ${{ matrix.python-version }} --release --out dist -m ${{ matrix.package }}/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:

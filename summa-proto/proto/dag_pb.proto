@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package dag_pb;
+
+message PBLink {
+  // binary CID (with no multibase prefix) of the target object
+  optional bytes hash = 1;
+
+  // UTF-8 string name
+  optional string name = 2;
+
+  // cumulative size of target object
+  optional uint64 t_size = 3;
+}
+
+message PBNode {
+  // refs to other objects
+  repeated PBLink links = 2;
+
+  // opaque user data
+  optional bytes data = 1;
+}

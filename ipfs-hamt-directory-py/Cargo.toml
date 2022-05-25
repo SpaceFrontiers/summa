@@ -1,0 +1,15 @@
+[package]
+name = "ipfs-hamt-directory-py"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "ipfs_hamt_directory_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+cid = "0.10"
+ipfs-hamt-directory = { path = "../ipfs-hamt-directory" }
+multihash = "0.18"
+pyo3 = { version = "0.18", features = ["serde"] }

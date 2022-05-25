@@ -720,11 +720,11 @@ mod tests {
     pub fn test_parser_base() {
         let query_parser = create_query_parser();
         let query = query_parser.parse_query("search engine");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=0, \"engine\")))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=0, type=Str, \"engine\")))] })");
         let query = query_parser.parse_query("'search engine'");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"search\")), (1, Term(type=Str, field=0, \"engine\"))], slop: 0 })"
+            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"search\")), (1, Term(field=0, type=Str, \"engine\"))], slop: 0 })"
         );
     }
 
@@ -734,7 +734,7 @@ mod tests {
         let query = query_parser.parse_query("body:'search engine'~4");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engine\"))], slop: 4 })"
+            "Ok(PhraseQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"search\")), (1, Term(field=1, type=Str, \"engine\"))], slop: 4 })"
         );
     }
 
@@ -743,69 +743,69 @@ mod tests {
         let query_parser = create_query_parser();
         assert_eq!(
             format!("{:?}", query_parser.parse_query("body:'search engine'")),
-            "Ok(PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engine\"))], slop: 0 })"
+            "Ok(PhraseQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"search\")), (1, Term(field=1, type=Str, \"engine\"))], slop: 0 })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("timestamp:10")),
-            "Ok(TermQuery(Term(type=I64, field=2, 10)))"
+            "Ok(TermQuery(Term(field=2, type=I64, 10)))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("title:search engine")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=0, type=Str, \"engine\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("not_field:search engine")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"engine\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi:10.0000/abcd.0123 ")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/abcd.0123\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi:https://doi.org/10.0000/abcd.0123")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"https://doi.org/10.0000/abcd.0123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"https://doi.org/10.0000/abcd.0123\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi:doi.org/10.0000/abcd.0123")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"doi.org/10.0000/abcd.0123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"doi.org/10.0000/abcd.0123\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("10.0000/978123")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/978123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/978123\")))"
         );
-        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/9781234567890")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/9781234567890\")), boost=3))] })");
-        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/978-12345-6789-0")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/978-12345-6789-0\")), boost=3))] })");
-        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/978-12345-6789-0.ch11")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=3, \"10.0000/978-12345-6789-0\"))), (Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/978-12345-6789-0.ch11\")), boost=3))] })");
-        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/cbo978-12345-6789-0.ch11")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=3, \"10.0000/cbo978-12345-6789-0\"))), (Should, TermQuery(Term(type=Str, field=4, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=3, \"10.0000/cbo978-12345-6789-0.ch11\")), boost=3))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/9781234567890")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=4, type=Str, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(field=3, type=Str, \"10.0000/9781234567890\")), boost=3))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/978-12345-6789-0")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=4, type=Str, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(field=3, type=Str, \"10.0000/978-12345-6789-0\")), boost=3))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/978-12345-6789-0.ch11")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=3, type=Str, \"10.0000/978-12345-6789-0\"))), (Should, TermQuery(Term(field=4, type=Str, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(field=3, type=Str, \"10.0000/978-12345-6789-0.ch11\")), boost=3))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("10.0000/cbo978-12345-6789-0.ch11")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=3, type=Str, \"10.0000/cbo978-12345-6789-0\"))), (Should, TermQuery(Term(field=4, type=Str, \"9781234567890\"))), (Should, Boost(query=TermQuery(Term(field=3, type=Str, \"10.0000/cbo978-12345-6789-0.ch11\")), boost=3))] })");
         assert_eq!(
             format!("{:?}", query_parser.parse_query("978-12345-6789-0")),
-            "Ok(TermQuery(Term(type=Str, field=4, \"9781234567890\")))"
+            "Ok(TermQuery(Term(field=4, type=Str, \"9781234567890\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("9781234567890")),
-            "Ok(TermQuery(Term(type=Str, field=4, \"9781234567890\")))"
+            "Ok(TermQuery(Term(field=4, type=Str, \"9781234567890\")))"
         );
-        assert_eq!(format!("{:?}", query_parser.parse_query("97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"97812\"))), (Should, TermQuery(Term(type=Str, field=0, \"34\"))), (Should, TermQuery(Term(type=Str, field=0, \"5678\"))), (Should, TermQuery(Term(type=Str, field=0, \"909\")))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"97812\"))), (Should, TermQuery(Term(field=0, type=Str, \"34\"))), (Should, TermQuery(Term(field=0, type=Str, \"5678\"))), (Should, TermQuery(Term(field=0, type=Str, \"909\")))] })");
         assert_eq!(
             format!("{:?}", query_parser.parse_query("isbns:97812-34-5678-90")),
-            "Ok(TermQuery(Term(type=Str, field=4, \"97812-34-5678-90\")))"
+            "Ok(TermQuery(Term(field=4, type=Str, \"97812-34-5678-90\")))"
         );
-        assert_eq!(format!("{:?}", query_parser.parse_query("123 97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"123\"))), (Should, TermQuery(Term(type=Str, field=0, \"97812\"))), (Should, TermQuery(Term(type=Str, field=0, \"34\"))), (Should, TermQuery(Term(type=Str, field=0, \"5678\"))), (Should, TermQuery(Term(type=Str, field=0, \"909\")))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("123 97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"123\"))), (Should, TermQuery(Term(field=0, type=Str, \"97812\"))), (Should, TermQuery(Term(field=0, type=Str, \"34\"))), (Should, TermQuery(Term(field=0, type=Str, \"5678\"))), (Should, TermQuery(Term(field=0, type=Str, \"909\")))] })");
         assert_eq!(
             format!("{:?}", query_parser.parse_query("10.0000/cbo123")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/cbo123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/cbo123\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi.org/10.0000/abcd.0123")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/abcd.0123\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("10.0000/abcd.0123")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/abcd.0123\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("https://doi.org/10.0000/abcd.0123")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.0000/abcd.0123\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/abcd.0123\")))"
         );
     }
 
@@ -814,57 +814,57 @@ mod tests {
         let query_parser = create_query_parser();
         assert_eq!(
             format!("{:?}", query_parser.parse_query("Search Engines: The Ultimate, Only Guide!")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=0, \"engines\"))), (Should, TermQuery(Term(type=Str, field=0, \"the\"))), (Should, TermQuery(Term(type=Str, field=0, \"ultimate\"))), (Should, TermQuery(Term(type=Str, field=0, \"only\"))), (Should, TermQuery(Term(type=Str, field=0, \"guide\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=0, type=Str, \"engines\"))), (Should, TermQuery(Term(field=0, type=Str, \"the\"))), (Should, TermQuery(Term(field=0, type=Str, \"ultimate\"))), (Should, TermQuery(Term(field=0, type=Str, \"only\"))), (Should, TermQuery(Term(field=0, type=Str, \"guide\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("!! HI !! (SEARCH! ENGINES!")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"hi\"))), (Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=0, \"engines\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"hi\"))), (Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=0, type=Str, \"engines\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("`non closed")),
-            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"non\")), (1, Term(type=Str, field=0, \"closed\"))], slop: 0 })"
+            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"non\")), (1, Term(field=0, type=Str, \"closed\"))], slop: 0 })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("\"non closed")),
-            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"non\")), (1, Term(type=Str, field=0, \"closed\"))], slop: 0 })"
+            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"non\")), (1, Term(field=0, type=Str, \"closed\"))], slop: 0 })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("non closed`")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"non\"))), (Should, TermQuery(Term(type=Str, field=0, \"closed\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"non\"))), (Should, TermQuery(Term(field=0, type=Str, \"closed\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("non closed\"")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"non\"))), (Should, TermQuery(Term(type=Str, field=0, \"closed\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"non\"))), (Should, TermQuery(Term(field=0, type=Str, \"closed\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("title:(search ")),
-            "Ok(TermQuery(Term(type=Str, field=0, \"title\")))"
+            "Ok(TermQuery(Term(field=0, type=Str, \"title\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("title:(search -")),
-            "Ok(TermQuery(Term(type=Str, field=0, \"title\")))"
+            "Ok(TermQuery(Term(field=0, type=Str, \"title\")))"
         );
         assert_eq!(format!("{:?}", query_parser.parse_query("``")), "Ok(EmptyQuery)");
         assert_eq!(format!("{:?}", query_parser.parse_query("```")), "Ok(EmptyQuery)");
         assert_eq!(format!("{:?}", query_parser.parse_query(")(")), "Ok(EmptyQuery)");
         assert_eq!(
             format!("{:?}", query_parser.parse_query("(a)(b)`")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"a\"))), (Should, TermQuery(Term(type=Str, field=0, \"b\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"a\"))), (Should, TermQuery(Term(field=0, type=Str, \"b\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi:'10.1182/blood.v53.1.19.bloodjournal53119'")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.1182/blood.v53.1.19.bloodjournal53119\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.1182/blood.v53.1.19.bloodjournal53119\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("doi:10.1182/blood.v53.1.19.bloodjournal53119")),
-            "Ok(TermQuery(Term(type=Str, field=3, \"10.1182/blood.v53.1.19.bloodjournal53119\")))"
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.1182/blood.v53.1.19.bloodjournal53119\")))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("10.10 10/10")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\"))), (Should, TermQuery(Term(type=Str, field=0, \"10\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"10\"))), (Should, TermQuery(Term(field=0, type=Str, \"10\"))), (Should, TermQuery(Term(field=0, type=Str, \"10\"))), (Should, TermQuery(Term(field=0, type=Str, \"10\")))] })"
         );
         let query_parser = create_complex_query_parser();
-        assert_eq!(format!("{:?}", query_parser.parse_query("\"search engines\"")), "Ok(BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"search\")), (1, Term(type=Str, field=0, \"engines\"))], slop: 0 }), (Should, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engines\"))], slop: 0 })] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("\"search engines\"")), "Ok(BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"search\")), (1, Term(field=0, type=Str, \"engines\"))], slop: 0 }), (Should, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"search\")), (1, Term(field=1, type=Str, \"engines\"))], slop: 0 })] })");
     }
 
     #[test]
@@ -872,19 +872,19 @@ mod tests {
         let query_parser = create_query_parser();
         assert_eq!(
             format!("{:?}", query_parser.parse_query("body:поисковые системы")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=1, \"поисковые\"))), (Should, TermQuery(Term(type=Str, field=0, \"системы\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=1, type=Str, \"поисковые\"))), (Should, TermQuery(Term(field=0, type=Str, \"системы\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("(поисковые системы)")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"поисковые\"))), (Should, TermQuery(Term(type=Str, field=0, \"системы\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"поисковые\"))), (Should, TermQuery(Term(field=0, type=Str, \"системы\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("поисковые: системы")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"поисковые\"))), (Should, TermQuery(Term(type=Str, field=0, \"системы\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"поисковые\"))), (Should, TermQuery(Term(field=0, type=Str, \"системы\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("healthcare cyber–physical system")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"healthcare\"))), (Should, TermQuery(Term(type=Str, field=0, \"cyber\"))), (Should, TermQuery(Term(type=Str, field=0, \"physical\"))), (Should, TermQuery(Term(type=Str, field=0, \"system\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"healthcare\"))), (Should, TermQuery(Term(field=0, type=Str, \"cyber\"))), (Should, TermQuery(Term(field=0, type=Str, \"physical\"))), (Should, TermQuery(Term(field=0, type=Str, \"system\")))] })"
         );
     }
 
@@ -910,20 +910,20 @@ mod tests {
         let query_parser = create_query_parser();
         assert_eq!(
             format!("{:?}", query_parser.parse_query("body:+search -engine")),
-            "Ok(BooleanQuery { subqueries: [(Must, TermQuery(Term(type=Str, field=1, \"search\"))), (MustNot, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Must, TermQuery(Term(field=1, type=Str, \"search\"))), (MustNot, TermQuery(Term(field=0, type=Str, \"engine\")))] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("body:+'search engine'")),
-            "Ok(BooleanQuery { subqueries: [(Must, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(type=Str, field=1, \"search\")), (1, Term(type=Str, field=1, \"engine\"))], slop: 0 })] })"
+            "Ok(BooleanQuery { subqueries: [(Must, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"search\")), (1, Term(field=1, type=Str, \"engine\"))], slop: 0 })] })"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("+search +engine")),
-            "Ok(BooleanQuery { subqueries: [(Must, TermQuery(Term(type=Str, field=0, \"search\"))), (Must, TermQuery(Term(type=Str, field=0, \"engine\")))] })"
+            "Ok(BooleanQuery { subqueries: [(Must, TermQuery(Term(field=0, type=Str, \"search\"))), (Must, TermQuery(Term(field=0, type=Str, \"engine\")))] })"
         );
         let query_parser = create_complex_query_parser();
-        assert_eq!(format!("{:?}", query_parser.parse_query("+search +engine")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=1, \"search\")))] }), (Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"engine\"))), (Should, TermQuery(Term(type=Str, field=1, \"engine\")))] })] })");
-        assert_eq!(format!("{:?}", query_parser.parse_query("+search language:+ru")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, TermQuery(Term(type=Str, field=1, \"search\")))] }), (Must, TermQuery(Term(type=Str, field=3, \"ru\")))] })");
-        assert_eq!(format!("{:?}", query_parser.parse_query("+c++ language:+ru")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"c++\"))), (Should, TermQuery(Term(type=Str, field=1, \"c\")))] }), (Must, TermQuery(Term(type=Str, field=3, \"ru\")))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("+search +engine")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=1, type=Str, \"search\")))] }), (Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"engine\"))), (Should, TermQuery(Term(field=1, type=Str, \"engine\")))] })] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("+search language:+ru")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=1, type=Str, \"search\")))] }), (Must, TermQuery(Term(field=3, type=Str, \"ru\")))] })");
+        assert_eq!(format!("{:?}", query_parser.parse_query("+c++ language:+ru")), "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"c++\"))), (Should, TermQuery(Term(field=1, type=Str, \"c\")))] }), (Must, TermQuery(Term(field=3, type=Str, \"ru\")))] })");
     }
 
     #[test]
@@ -932,27 +932,27 @@ mod tests {
         let query = query_parser.parse_query("search^2.0");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(Boost(query=TermQuery(Term(type=Str, field=0, \"search\")), boost=2))"
+            "Ok(Boost(query=TermQuery(Term(field=0, type=Str, \"search\")), boost=2))"
         );
         let query = query_parser.parse_query("'search engine'~3^2.0");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"search\")), (1, Term(type=Str, field=0, \"engine\"))], slop: 3 }, boost=2))"
+            "Ok(Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"search\")), (1, Term(field=0, type=Str, \"engine\"))], slop: 3 }, boost=2))"
         );
         let query = query_parser.parse_query("search engine^2.0");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"search\"))), (Should, Boost(query=TermQuery(Term(type=Str, field=0, \"engine\")), boost=2))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, Boost(query=TermQuery(Term(field=0, type=Str, \"engine\")), boost=2))] })"
         );
         let query = query_parser.parse_query("body:title^2.0");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(Boost(query=TermQuery(Term(type=Str, field=1, \"title\")), boost=2))"
+            "Ok(Boost(query=TermQuery(Term(field=1, type=Str, \"title\")), boost=2))"
         );
         let query = query_parser.parse_query("body:'title'^2.0");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(Boost(query=TermQuery(Term(type=Str, field=1, \"title\")), boost=2))"
+            "Ok(Boost(query=TermQuery(Term(field=1, type=Str, \"title\")), boost=2))"
         );
     }
 
@@ -962,17 +962,17 @@ mod tests {
         let query = query_parser.parse_query("body:[aaa TO ccc]");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(RangeQuery { field: \"body\", value_type: Str, left_bound: Included([97, 97, 97]), right_bound: Included([99, 99, 99]), limit: None })"
+            "Ok(RangeQuery { field: \"body\", value_type: Str, lower_bound: Included([97, 97, 97]), upper_bound: Included([99, 99, 99]), limit: None })"
         );
         let query = query_parser.parse_query("body:[ a to  * ]");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(RangeQuery { field: \"body\", value_type: Str, left_bound: Included([97]), right_bound: Unbounded, limit: None })"
+            "Ok(RangeQuery { field: \"body\", value_type: Str, lower_bound: Included([97]), upper_bound: Unbounded, limit: None })"
         );
         let query = query_parser.parse_query("timestamp:[ 1000 to 2000 ]");
-        assert_eq!(format!("{:?}", query), "Ok(RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]), limit: None })");
+        assert_eq!(format!("{:?}", query), "Ok(RangeQuery { field: \"timestamp\", value_type: I64, lower_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), upper_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]), limit: None })");
         let query = query_parser.parse_query("timestamp:(-[1100 to 1200] [ 1000 to 2000 ] -1500 +3000)");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(MustNot, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 4, 76]), right_bound: Included([128, 0, 0, 0, 0, 0, 4, 176]), limit: None }), (Should, RangeQuery { field: \"timestamp\", value_type: I64, left_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), right_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]), limit: None }), (MustNot, TermQuery(Term(type=I64, field=2, 1500))), (Must, TermQuery(Term(type=I64, field=2, 3000)))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(MustNot, RangeQuery { field: \"timestamp\", value_type: I64, lower_bound: Included([128, 0, 0, 0, 0, 0, 4, 76]), upper_bound: Included([128, 0, 0, 0, 0, 0, 4, 176]), limit: None }), (Should, RangeQuery { field: \"timestamp\", value_type: I64, lower_bound: Included([128, 0, 0, 0, 0, 0, 3, 232]), upper_bound: Included([128, 0, 0, 0, 0, 0, 7, 208]), limit: None }), (MustNot, TermQuery(Term(field=2, type=I64, 1500))), (Must, TermQuery(Term(field=2, type=I64, 3000)))] })");
     }
 
     #[test]
@@ -980,11 +980,11 @@ mod tests {
         let mut query_parser = create_query_parser();
         query_parser.set_exact_match_promoter(proto::ExactMatchesPromoter { slop: 3, boost: Some(2.0) });
         let query = query_parser.parse_query("old school holy-wood");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(type=Str, field=0, \"old\"))), (Should, TermQuery(Term(type=Str, field=0, \"school\"))), (Should, TermQuery(Term(type=Str, field=0, \"holy\"))), (Should, TermQuery(Term(type=Str, field=0, \"wood\"))), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"old\")), (1, Term(type=Str, field=0, \"school\")), (2, Term(type=Str, field=0, \"holy\")), (3, Term(type=Str, field=0, \"wood\"))], slop: 3 }, boost=2))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"old\"))), (Should, TermQuery(Term(field=0, type=Str, \"school\"))), (Should, TermQuery(Term(field=0, type=Str, \"holy\"))), (Should, TermQuery(Term(field=0, type=Str, \"wood\"))), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"old\")), (1, Term(field=0, type=Str, \"school\")), (2, Term(field=0, type=Str, \"holy\")), (3, Term(field=0, type=Str, \"wood\"))], slop: 3 }, boost=2))] })");
         let query = query_parser.parse_query("old^2.0 school");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, Boost(query=TermQuery(Term(type=Str, field=0, \"old\")), boost=2)), (Should, TermQuery(Term(type=Str, field=0, \"school\")))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, Boost(query=TermQuery(Term(field=0, type=Str, \"old\")), boost=2)), (Should, TermQuery(Term(field=0, type=Str, \"school\")))] })");
         query_parser.set_field_boosts(HashMap::from_iter(vec![("title".to_string(), 3.0)].into_iter()));
         let query = query_parser.parse_query("old school");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, Boost(query=TermQuery(Term(type=Str, field=0, \"old\")), boost=3)), (Should, Boost(query=TermQuery(Term(type=Str, field=0, \"school\")), boost=3)), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(type=Str, field=0, \"old\")), (1, Term(type=Str, field=0, \"school\"))], slop: 3 }, boost=6))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, Boost(query=TermQuery(Term(field=0, type=Str, \"old\")), boost=3)), (Should, Boost(query=TermQuery(Term(field=0, type=Str, \"school\")), boost=3)), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"old\")), (1, Term(field=0, type=Str, \"school\"))], slop: 3 }, boost=6))] })");
     }
 }

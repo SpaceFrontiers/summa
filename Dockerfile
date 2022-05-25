@@ -8,7 +8,6 @@ COPY summa-proto summa-proto
 COPY summa-server summa-server
 COPY summa-wasm summa-wasm
 COPY Cargo.toml Cargo.toml
-COPY Cargo.lock Cargo.lock
 COPY rustfmt.toml rustfmt.toml
 RUN cargo build --profile release -p summa-server
 

@@ -49,6 +49,12 @@ pub mod proto_traits;
 pub mod proto {
     #[cfg(feature = "grpc")]
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("summa");
+    pub mod dag_pb {
+        include!(concat!(env!("OUT_DIR"), "/dag_pb.rs"));
+    }
+    pub mod unixfs {
+        include!(concat!(env!("OUT_DIR"), "/unixfs.rs"));
+    }
     #[cfg(feature = "grpc")]
     tonic::include_proto!("summa.proto");
     #[cfg(not(feature = "grpc"))]
