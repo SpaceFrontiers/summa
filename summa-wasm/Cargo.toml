@@ -23,9 +23,9 @@ instant = { workspace = true }
 js-sys = "0.3"
 parking_lot = { workspace = true }
 serde = { workspace = true }
-serde-wasm-bindgen = "0.4"
+serde-wasm-bindgen = "0.5"
 strfmt = { workspace = true }
-summa-core = { version = "0.15.2", path = "../summa-core", default_features = false }
+summa-core = { version = "0.15.3", path = "../summa-core", default_features = false }
 summa-proto = { workspace = true }
 tantivy = { workspace = true, features = ["wasm"] }
 thiserror = { workspace = true }
