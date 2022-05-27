@@ -8,7 +8,7 @@ use pest::Parser;
 use pest_derive::Parser;
 use safe_regex::{regex, Matcher3};
 use summa_proto::proto;
-use tantivy::json_utils::JsonTermWriter;
+use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
@@ -386,8 +386,10 @@ impl QueryParser {
                                     let mut term = Term::with_capacity(128);
                                     let mut json_term_writer =
                                         JsonTermWriter::from_field_and_json_path(*field, full_path, json_options.is_expand_dots_enabled(), &mut term);
-                                    json_term_writer.set_str(&token.text);
-                                    json_term_writer.term().clone()
+                                    convert_to_fast_value_and_get_term(&mut json_term_writer, &token.text).unwrap_or_else(|| {
+                                        json_term_writer.set_str(&token.text);
+                                        json_term_writer.term().clone()
+                                    })
                                 }
                                 _ => unreachable!(),
                             };

@@ -10,7 +10,7 @@ use opentelemetry::Context;
 #[cfg(feature = "metrics")]
 use opentelemetry::{global, KeyValue};
 use summa_proto::proto;
-use tantivy::json_utils::JsonTermWriter;
+use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
@@ -59,8 +59,10 @@ fn cast_value_to_term(field: Field, full_path: &str, field_type: &FieldType, val
         FieldType::JsonObject(json_options) => {
             let mut term = Term::with_capacity(128);
             let mut json_term_writer = JsonTermWriter::from_field_and_json_path(field, full_path, json_options.is_expand_dots_enabled(), &mut term);
-            json_term_writer.set_str(value);
-            json_term_writer.term().clone()
+            convert_to_fast_value_and_get_term(&mut json_term_writer, value).unwrap_or_else(|| {
+                json_term_writer.set_str(&value);
+                json_term_writer.term().clone()
+            })
         }
         FieldType::I64(_) => Term::from_field_i64(
             field,
