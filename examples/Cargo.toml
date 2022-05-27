@@ -9,7 +9,7 @@ publish = false
 serde_json = "1.0"
 summa-proto = { workspace = true, features = ["grpc"] }
 tokio = "1.24"
-tonic = { version = "0.8", features = ["channel"] }
+tonic = { version = "0.9", features = ["channel"] }
 
 [[example]]
 name = "proto_client"

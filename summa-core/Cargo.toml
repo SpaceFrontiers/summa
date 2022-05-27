@@ -1,6 +1,6 @@
 [package]
 name = "summa-core"
-version = "0.15.0"
+version = "0.15.1"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -36,7 +36,7 @@ instant = { workspace = true }
 itertools = { workspace = true }
 lru = { workspace = true }
 oneshot = { workspace = true }
-opentelemetry = { version = "0.18", features = ["rt-tokio"], optional = true }
+opentelemetry = { version = "0.19", features = ["metrics", "rt-tokio"], optional = true }
 parking_lot = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }

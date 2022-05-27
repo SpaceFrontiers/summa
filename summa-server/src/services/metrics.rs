@@ -57,7 +57,7 @@ impl AggregatorSelector for CustomAgg {
 
 impl Metrics {
     pub fn new(config: &crate::configs::metrics::Config) -> SummaServerResult<Metrics> {
-        let controller = controllers::basic(processors::factory(CustomAgg, aggregation::cumulative_temporality_selector()).with_memory(true)).build();
+        let controller = controllers::basic(processors::factory(CustomAgg, aggregation::cumulative_temporality_selector())).build();
         let exporter = opentelemetry_prometheus::exporter(controller).init();
         Ok(Metrics {
             config: config.clone(),
