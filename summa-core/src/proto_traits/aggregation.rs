@@ -1,5 +1,5 @@
-use tantivy::aggregation::agg_req::Aggregation;
 use summa_proto::proto;
+use tantivy::aggregation::agg_req::Aggregation;
 use tantivy::aggregation::agg_result::{AggregationResult, BucketEntries, BucketEntry, BucketResult, MetricResult, RangeBucketEntry};
 use tantivy::aggregation::Key;
 

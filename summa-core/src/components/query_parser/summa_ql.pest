@@ -11,7 +11,7 @@ slop = @{ DECIMAL_NUMBER+ }
 boost = { (DECIMAL_NUMBER | ".")+ }
 range = ${ "[" ~ WHITE_SPACE* ~ boundary_word ~ WHITE_SPACE+ ~ ^"to" ~ WHITE_SPACE+ ~ boundary_word ~ WHITE_SPACE* ~ "]" }
 
-field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_" | ".")* }
 word = @{ wrapped_doi | ((LETTER | NUMBER) ~ (LETTER | NUMBER | "_" | "+" | "#" | "-" | "–")*) }
 
 boundary_word = _{ star | word }

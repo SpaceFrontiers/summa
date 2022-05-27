@@ -8,6 +8,7 @@ use pest::Parser;
 use pest_derive::Parser;
 use safe_regex::{regex, Matcher3};
 use summa_proto::proto;
+use tantivy::json_utils::JsonTermWriter;
 use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
@@ -80,6 +81,12 @@ pub enum QueryParserError {
     /// as indexed in the schema.
     #[error("field_not_indexed_error: {0}")]
     FieldNotIndexed(String),
+    /// The field is declated as JSON but the query does not contain object path
+    #[error("json_field_without_path_error: {0}")]
+    JsonFieldWithoutPath(String),
+    /// The field is not declated as JSON but the query does contain object path
+    #[error("non_json_field_with_path_error: {0}")]
+    NonJsonFieldWithPath(String),
     /// A phrase query was requested for a field that does not
     /// have any positions indexed.
     #[error("field_does_not_have_positions_indexed_error: {0}")]
@@ -233,7 +240,7 @@ impl QueryParser {
         let default_field_queries = self
             .default_fields
             .iter()
-            .map(|field| self.parse_pre_term(field, pre_term.clone(), boost))
+            .map(|field| self.parse_pre_term(field, "", pre_term.clone(), boost))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(match occur {
@@ -295,12 +302,24 @@ impl QueryParser {
         Ok(terms)
     }
 
-    fn parse_pre_term(&self, field: &Field, pre_term: Pair<Rule>, boost: Option<f32>) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
+    fn parse_pre_term(&self, field: &Field, full_path: &str, pre_term: Pair<Rule>, boost: Option<f32>) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(*field);
         let field_type = field_entry.field_type();
 
         if !field_type.is_indexed() {
             return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+        }
+
+        if field_type.value_type() == Type::Json && full_path.is_empty() {
+            return Err(QueryParserError::JsonFieldWithoutPath(field_entry.name().to_string()));
+        }
+
+        if field_type.value_type() != Type::Json && !full_path.is_empty() {
+            return Err(QueryParserError::NonJsonFieldWithPath(format!(
+                "{}.{}",
+                field_entry.name().to_string(),
+                full_path
+            )));
         }
 
         let boost = multiply_boosts(self.field_boosts.as_ref().and_then(|boosts| boosts.get(field_entry.name()).cloned()), boost);
@@ -346,17 +365,36 @@ impl QueryParser {
                 }
                 _ => unreachable!(),
             },
-            FieldType::Str(ref str_options) => {
-                let option = str_options.get_indexing_options().expect("unreachable");
+            FieldType::Str(_) | FieldType::JsonObject(_) => {
+                let indexing = if let FieldType::Str(ref text_options) = field_type {
+                    text_options.get_indexing_options().expect("unreachable")
+                } else if let FieldType::JsonObject(ref json_options) = field_type {
+                    json_options.get_text_indexing_options().expect("unreachable")
+                } else {
+                    unreachable!()
+                };
+
                 match pre_term.as_rule() {
                     Rule::word | Rule::field_name => {
-                        let mut token_stream = self.get_text_analyzer(field_entry, option)?.token_stream(pre_term.as_str());
+                        let mut token_stream = self.get_text_analyzer(field_entry, indexing)?.token_stream(pre_term.as_str());
                         let mut queries = Vec::new();
 
                         token_stream.process(&mut |token| {
-                            let query = Box::new(TermQuery::new(Term::from_field_text(*field, &token.text), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
+                            let term = match field_type {
+                                FieldType::Str(_) => Term::from_field_text(*field, &token.text),
+                                FieldType::JsonObject(ref json_options) => {
+                                    let mut term = Term::with_capacity(128);
+                                    let mut json_term_writer =
+                                        JsonTermWriter::from_field_and_json_path(*field, full_path, json_options.is_expand_dots_enabled(), &mut term);
+                                    json_term_writer.set_str(&token.text);
+                                    json_term_writer.term().clone()
+                                }
+                                _ => unreachable!(),
+                            };
+                            let query = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
                             queries.push(boost_query(query, boost));
                         });
+
                         Ok(queries)
                     }
                     Rule::phrase => {
@@ -372,7 +410,7 @@ impl QueryParser {
                                 _ => u32::from_str(v.as_str()).expect("cannot parse"),
                             })
                             .unwrap_or(0);
-                        let terms = self.parse_words(*field, option, words.as_str())?;
+                        let terms = self.parse_words(*field, indexing, words.as_str())?;
                         if terms.len() <= 1 {
                             return Ok(terms
                                 .into_iter()
@@ -382,7 +420,7 @@ impl QueryParser {
                                 })
                                 .collect());
                         }
-                        if !option.index_option().has_positions() {
+                        if !indexing.index_option().has_positions() {
                             return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
                         }
                         let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>;
@@ -412,12 +450,15 @@ impl QueryParser {
         }
     }
 
-    fn parse_term(&self, term: Pair<Rule>, field: &Field, boost: Option<f32>) -> Result<Box<dyn Query>, QueryParserError> {
+    fn parse_term(&self, term: Pair<Rule>, field: &Field, full_path: &str, boost: Option<f32>) -> Result<Box<dyn Query>, QueryParserError> {
         let term = term.into_inner().next().expect("grammar_failure");
         let occur = self.parse_occur(&term);
         let pre_term = term.into_inner().next().expect("grammar failure");
         Ok(Box::new(BooleanQuery::new(
-            self.parse_pre_term(field, pre_term, boost)?.into_iter().map(|q| (occur, q)).collect(),
+            self.parse_pre_term(field, full_path, pre_term, boost)?
+                .into_iter()
+                .map(|q| (occur, q))
+                .collect(),
         )))
     }
 
@@ -581,7 +622,7 @@ impl QueryParser {
                         match self.schema.get_field(field_name.as_str()) {
                             Ok(field) => {
                                 for term in grouping_or_term.into_inner() {
-                                    intermediate_results.push(self.parse_term(term, &field, statement_boost)?);
+                                    intermediate_results.push(self.parse_term(term, &field, "", statement_boost)?);
                                 }
                             }
                             Err(tantivy::TantivyError::FieldNotFound(_)) => match self.missing_field_policy {
@@ -598,9 +639,9 @@ impl QueryParser {
                         }
                         Ok(Box::new(BooleanQuery::new(intermediate_results.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>)
                     }
-                    Rule::term => match self.schema.get_field(field_name.as_str()) {
-                        Ok(field) => self.parse_term(grouping_or_term, &field, statement_boost),
-                        Err(tantivy::TantivyError::FieldNotFound(_)) => match self.missing_field_policy {
+                    Rule::term => match self.schema.find_field(field_name.as_str()) {
+                        Some((field, full_path)) => self.parse_term(grouping_or_term, &field, full_path, statement_boost),
+                        None => match self.missing_field_policy {
                             MissingFieldPolicy::AsUsualTerms => Ok(Box::new(BooleanQuery::new(vec![
                                 (Occur::Should, self.default_fields_term(field_name, statement_boost)?),
                                 (Occur::Should, self.default_fields_term(grouping_or_term, statement_boost)?),
@@ -608,7 +649,6 @@ impl QueryParser {
                             MissingFieldPolicy::Remove => Ok(Box::new(EmptyQuery {}) as Box<dyn Query>),
                             MissingFieldPolicy::Fail => Err(QueryParserError::FieldDoesNotExist(field_name.as_str().to_string())),
                         },
-                        _ => unreachable!(),
                     },
                     _ => unreachable!(),
                 }

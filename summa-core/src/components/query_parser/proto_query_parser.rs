@@ -10,6 +10,7 @@ use opentelemetry::Context;
 #[cfg(feature = "metrics")]
 use opentelemetry::{global, KeyValue};
 use summa_proto::proto;
+use tantivy::json_utils::JsonTermWriter;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
@@ -52,9 +53,15 @@ impl From<Option<proto::match_query::DefaultMode>> for MatchQueryDefaultMode {
     }
 }
 
-fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> SummaResult<Term> {
+fn cast_value_to_term(field: Field, full_path: &str, field_type: &FieldType, value: &str) -> SummaResult<Term> {
     Ok(match field_type {
         FieldType::Str(_) => Term::from_field_text(field, value),
+        FieldType::JsonObject(json_options) => {
+            let mut term = Term::with_capacity(128);
+            let mut json_term_writer = JsonTermWriter::from_field_and_json_path(field, full_path, json_options.is_expand_dots_enabled(), &mut term);
+            json_term_writer.set_str(value);
+            json_term_writer.term().clone()
+        }
         FieldType::I64(_) => Term::from_field_i64(
             field,
             i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as i64")))?,
@@ -81,11 +88,11 @@ fn cast_value_to_term(field: Field, field_type: &FieldType, value: &str) -> Summ
     })
 }
 
-fn cast_value_to_bound_term(field: Field, field_type: &FieldType, value: &str, including: bool) -> SummaResult<Bound<Term>> {
+fn cast_value_to_bound_term(field: Field, full_path: &str, field_type: &FieldType, value: &str, including: bool) -> SummaResult<Bound<Term>> {
     Ok(match value {
         "*" => Unbounded,
         value => {
-            let casted_value = cast_value_to_term(field, field_type, value)?;
+            let casted_value = cast_value_to_term(field, full_path, field_type, value)?;
             if including {
                 Bound::Included(casted_value)
             } else {
@@ -118,10 +125,14 @@ impl ProtoQueryParser {
     }
 
     #[inline]
-    pub(crate) fn field_and_field_entry(&self, field_name: &str) -> SummaResult<(Field, &FieldEntry)> {
-        let field = self.cached_schema.get_field(field_name)?;
-        let field_entry = self.cached_schema.get_field_entry(field);
-        Ok((field, field_entry))
+    pub(crate) fn field_and_field_entry<'a>(&'a self, field_name: &'a str) -> SummaResult<(Field, &str, &FieldEntry)> {
+        match self.cached_schema.find_field(field_name) {
+            Some((field, full_path)) => {
+                let field_entry = self.cached_schema.get_field_entry(field);
+                Ok((field, full_path, field_entry))
+            }
+            None => Err(ValidationError::MissingField(field_name.to_string()).into()),
+        }
     }
 
     fn parse_subquery(&self, query: proto::query::Query) -> SummaResult<Box<dyn Query>> {
@@ -195,10 +206,10 @@ impl ProtoQueryParser {
                 }?
             }
             proto::query::Query::Range(range_query_proto) => {
-                let (field, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
+                let (field, full_path, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
                 let value = range_query_proto.value.as_ref().ok_or(ValidationError::MissingRange)?;
-                let left = cast_value_to_bound_term(field, field_entry.field_type(), &value.left, value.including_left)?;
-                let right = cast_value_to_bound_term(field, field_entry.field_type(), &value.right, value.including_right)?;
+                let left = cast_value_to_bound_term(field, full_path, field_entry.field_type(), &value.left, value.including_left)?;
+                let right = cast_value_to_bound_term(field, full_path, field_entry.field_type(), &value.right, value.including_right)?;
                 Box::new(RangeQuery::new_term_bounds(
                     range_query_proto.field.clone(),
                     field_entry.field_type().value_type(),
@@ -211,17 +222,17 @@ impl ProtoQueryParser {
                 f32::from_str(&boost_query_proto.score).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {} as f32", boost_query_proto.score)))?,
             )),
             proto::query::Query::Regex(regex_query_proto) => {
-                let (field, _) = self.field_and_field_entry(&regex_query_proto.field)?;
+                let (field, _, _) = self.field_and_field_entry(&regex_query_proto.field)?;
                 Box::new(RegexQuery::from_pattern(&regex_query_proto.value, field)?)
             }
             proto::query::Query::Phrase(phrase_query_proto) => {
-                let (field, field_entry) = self.field_and_field_entry(&phrase_query_proto.field)?;
+                let (field, full_path, field_entry) = self.field_and_field_entry(&phrase_query_proto.field)?;
                 let tokenizer = self.index.tokenizer_for_field(field)?;
 
                 let mut token_stream = tokenizer.token_stream(&phrase_query_proto.value);
                 let mut terms: Vec<(usize, Term)> = vec![];
                 while let Some(token) = token_stream.next() {
-                    terms.push((token.position, cast_value_to_term(field, field_entry.field_type(), &token.text)?))
+                    terms.push((token.position, cast_value_to_term(field, full_path, field_entry.field_type(), &token.text)?))
                 }
                 if terms.is_empty() {
                     Box::new(EmptyQuery)
@@ -235,9 +246,9 @@ impl ProtoQueryParser {
                 }
             }
             proto::query::Query::Term(term_query_proto) => {
-                let (field, field_entry) = self.field_and_field_entry(&term_query_proto.field)?;
+                let (field, full_path, field_entry) = self.field_and_field_entry(&term_query_proto.field)?;
                 Box::new(TermQuery::new(
-                    cast_value_to_term(field, field_entry.field_type(), &term_query_proto.value)?,
+                    cast_value_to_term(field, full_path, field_entry.field_type(), &term_query_proto.value)?,
                     field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
                 ))
             }
@@ -278,7 +289,7 @@ impl ProtoQueryParser {
                 Box::new(query_builder.with_document_fields(field_values))
             }
             proto::query::Query::Exists(exists_query_proto) => {
-                let (field, _) = self.field_and_field_entry(&exists_query_proto.field)?;
+                let (field, full_path, _) = self.field_and_field_entry(&exists_query_proto.field)?;
                 Box::new(ExistsQuery::new(field))
             }
         })
