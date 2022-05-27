@@ -291,8 +291,15 @@ impl ProtoQueryParser {
                 Box::new(query_builder.with_document_fields(field_values))
             }
             proto::query::Query::Exists(exists_query_proto) => {
-                let (field, full_path, _) = self.field_and_field_entry(&exists_query_proto.field)?;
-                Box::new(ExistsQuery::new(field))
+                let (field, full_path, field_entry) = self.field_and_field_entry(&exists_query_proto.field)?;
+                if full_path == "" {
+                    Box::new(ExistsQuery::new(field))
+                } else {
+                    Box::new(TermQuery::new(
+                        cast_value_to_term(field, full_path, field_entry.field_type(), "")?,
+                        field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
+                    ))
+                }
             }
         })
     }

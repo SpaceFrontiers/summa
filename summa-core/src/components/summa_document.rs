@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::str::{from_utf8, FromStr};
 
 use base64::Engine;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 use tantivy::schema::{Facet, FieldType, IntoIpv6Addr, Schema, Value};
 use tantivy::tokenizer::PreTokenizedString;
 use tantivy::{DateTime, Document};
@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 use crate::errors::{Error, SummaResult, ValidationError};
 use crate::page_rank::quantize_page_rank;
+use crate::utils::current_time;
 
 /// Wrapper for carrying `tantivy::Document` from various sources
 pub enum SummaDocument<'a> {
@@ -47,15 +48,16 @@ pub enum DocumentParsingError {
     ValueError(String, ValueParsingError),
 }
 
-pub fn process_dynamic_fields(schema: &Schema, document: &mut Document) {
-    if let Ok(page_rank_field) = schema.get_field("page_rank") {
-        if let Ok(quantized_page_rank_field) = schema.get_field("quantized_page_rank") {
-            if let Some(page_rank_value) = document.get_first(page_rank_field) {
-                if let Some(page_rank_value) = page_rank_value.as_f64() {
-                    document.add_u64(quantized_page_rank_field, quantize_page_rank(page_rank_value))
-                }
+pub fn process_dynamic_fields(schema: &Schema, json_object: &mut serde_json::Map<String, JsonValue>) {
+    if schema.get_field("page_rank").is_ok() && schema.get_field("quantized_page_rank").is_ok() {
+        if let Some(page_rank_value) = json_object.get_mut("page_rank") {
+            if let Some(v) = page_rank_value.as_f64() {
+                json_object.insert("quantized_page_rank".to_string(), json!(quantize_page_rank(v)));
             }
         }
+    }
+    if schema.get_field("updated_at").is_ok() {
+        json_object.insert("updated_at".to_string(), json!(current_time()));
     }
 }
 
@@ -187,9 +189,10 @@ impl<'a> SummaDocument<'a> {
     }
 
     /// Build a document object from a json-object.
-    pub fn parse_document(&self, schema: &Schema, doc_json: &str) -> SummaResult<Document> {
-        let json_obj: serde_json::Map<String, JsonValue> =
+    pub fn parse_and_setup_document(&self, schema: &Schema, doc_json: &str) -> SummaResult<Document> {
+        let mut json_obj: serde_json::Map<String, JsonValue> =
             serde_json::from_str(doc_json).map_err(|_| DocumentParsingError::InvalidJson(doc_json.to_owned()))?;
+        process_dynamic_fields(schema, &mut json_obj);
         self.json_object_to_doc(schema, json_obj)
     }
 
@@ -229,8 +232,7 @@ impl<'a> TryInto<Document> for SummaDocument<'a> {
         match self {
             SummaDocument::BoundJsonBytes((schema, json_bytes)) => {
                 let text_document = from_utf8(json_bytes).map_err(ValidationError::Utf8)?;
-                let mut parsed_document = self.parse_document(schema, text_document)?;
-                process_dynamic_fields(schema, &mut parsed_document);
+                let parsed_document = self.parse_and_setup_document(schema, text_document)?;
                 Ok(parsed_document)
             }
             SummaDocument::UnboundJsonBytes(_) => Err(Error::UnboundDocument),
