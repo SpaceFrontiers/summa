@@ -29,7 +29,7 @@ maintenance = { status = "actively-developed" }
 tonic-build = { version = "0.9.1", default-features = false, features = ["prost", "transport"] }
 
 [dev-dependencies]
-summa-core = { version = "0.15.1", path = "../summa-core", features = ["fs", "hyper-external-request", "tokio-rt"] }
+summa-core = { version = "0.15.2", path = "../summa-core", features = ["fs", "hyper-external-request", "tokio-rt"] }
 tempdir = "0.3.7"
 
 [dependencies]
@@ -58,7 +58,7 @@ serde = { workspace = true }
 serde_derive = "1.0"
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-summa-core = { version = "0.15.1", path = "../summa-core", features = ["fs", "hyper-external-request", "tokio-rt"] }
+summa-core = { version = "0.15.2", path = "../summa-core", features = ["fs", "hyper-external-request", "tokio-rt"] }
 summa-proto = { workspace = true, features = ["grpc"] }
 take_mut = { workspace = true }
 tantivy = { workspace = true }
@@ -70,7 +70,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tonic = { version = "0.9", features = ["gzip"] }
 tonic-reflection = "0.9"
-tonic-web = "0.9"
+tonic-web = { version = "0.9" }
 tower = "0.4"
 tower-http = { version = "0.4", features = ["set-header", "trace"] }
 tracing = { workspace = true }
