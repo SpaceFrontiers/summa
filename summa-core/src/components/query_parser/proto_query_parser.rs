@@ -60,7 +60,7 @@ fn cast_value_to_term(field: Field, full_path: &str, field_type: &FieldType, val
             let mut term = Term::with_capacity(128);
             let mut json_term_writer = JsonTermWriter::from_field_and_json_path(field, full_path, json_options.is_expand_dots_enabled(), &mut term);
             convert_to_fast_value_and_get_term(&mut json_term_writer, value).unwrap_or_else(|| {
-                json_term_writer.set_str(&value);
+                json_term_writer.set_str(value.trim_matches(|c| c == '\'' || c == '\"'));
                 json_term_writer.term().clone()
             })
         }
@@ -292,6 +292,10 @@ impl ProtoQueryParser {
             }
             proto::query::Query::Exists(exists_query_proto) => {
                 let (field, full_path, field_entry) = self.field_and_field_entry(&exists_query_proto.field)?;
+                if !field_entry.field_type().is_indexed() {
+                    let fni = QueryParserError::FieldNotIndexed(field_entry.name().to_string());
+                    return Err(Error::InvalidQuerySyntax(Box::new(fni), exists_query_proto.field.to_string()));
+                }
                 if full_path == "" {
                     Box::new(ExistsQuery::new(field))
                 } else {
