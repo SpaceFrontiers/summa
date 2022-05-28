@@ -1,9 +1,9 @@
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 from izihawa_utils.pb_to_json import ParseDict
 
-from .summa_embed_bin import IndexRegistry
 from .proto import search_service_pb2 as search_service_pb
+from .summa_embed_bin import IndexRegistry
 
 
 class SummaEmbed:

@@ -1,10 +1,15 @@
+from typing import ClassVar as _ClassVar
+from typing import Iterable as _Iterable
+from typing import Mapping as _Mapping
+from typing import Optional as _Optional
+from typing import Union as _Union
+
 import query_pb2 as _query_pb2
 import utils_pb2 as _utils_pb2
-from google.protobuf.internal import containers as _containers
-from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
+from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 
 Brotli: Compression
 DESCRIPTOR: _descriptor.FileDescriptor
@@ -298,16 +303,25 @@ class IndexDocumentStreamResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ..., success_docs: _Optional[int] = ..., failed_docs: _Optional[int] = ...) -> None: ...
 
 class IndexEngineConfig(_message.Message):
-    __slots__ = ["file", "memory", "merge_policy", "remote"]
+    __slots__ = ["field_aliases", "file", "memory", "merge_policy", "remote"]
+    class FieldAliasesEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    FIELD_ALIASES_FIELD_NUMBER: _ClassVar[int]
     FILE_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     REMOTE_FIELD_NUMBER: _ClassVar[int]
+    field_aliases: _containers.ScalarMap[str, str]
     file: FileEngineConfig
     memory: MemoryEngineConfig
     merge_policy: MergePolicy
     remote: RemoteEngineConfig
-    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., field_aliases: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class IndexOperation(_message.Message):
     __slots__ = ["index_document"]

@@ -423,6 +423,9 @@ impl Index {
         self.should_terminate.store(true, Ordering::Relaxed);
         if !force {
             self.consumer_manager.write().await.stop().await?;
+            for index_holder in self.index_registry.index_holders_cloned().await.values() {
+                self.commit(index_holder).await?;
+            }
         }
         Ok(())
     }

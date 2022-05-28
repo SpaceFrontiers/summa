@@ -5,7 +5,7 @@ use prost::Message;
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pythonize::{pythonize};
+use pythonize::pythonize;
 use summa_core::components::{Driver, IndexHolder};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
