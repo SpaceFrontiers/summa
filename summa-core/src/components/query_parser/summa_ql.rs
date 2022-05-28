@@ -37,6 +37,7 @@ pub struct QueryParser {
     tokenizer_manager: TokenizerManager,
     missing_field_policy: MissingFieldPolicy,
     limit: usize,
+    field_aliases: HashMap<String, String>,
     field_boosts: Option<HashMap<String, f32>>,
     default_mode: MatchQueryDefaultMode,
     exact_matches_promoter: Option<proto::ExactMatchesPromoter>,
@@ -198,6 +199,7 @@ impl QueryParser {
             tokenizer_manager: tokenizer_manager.clone(),
             missing_field_policy: MissingFieldPolicy::Remove,
             limit: 16,
+            field_aliases: HashMap::new(),
             field_boosts: None,
             default_mode: MatchQueryDefaultMode::Boolean,
             exact_matches_promoter: None,
@@ -206,6 +208,10 @@ impl QueryParser {
 
     pub fn for_index(index: &Index, default_fields: Vec<String>) -> SummaResult<QueryParser> {
         QueryParser::new(index.schema(), default_fields, index.tokenizers())
+    }
+
+    pub fn set_field_aliases(&mut self, field_aliases: HashMap<String, String>) {
+        self.field_aliases = field_aliases;
     }
 
     pub fn set_field_boosts(&mut self, field_boosts: HashMap<String, f32>) {
@@ -222,6 +228,10 @@ impl QueryParser {
 
     pub fn set_exact_match_promoter(&mut self, exact_matches_promoter: proto::ExactMatchesPromoter) {
         self.exact_matches_promoter = Some(exact_matches_promoter);
+    }
+
+    pub fn resolve_field_name<'a>(&'a self, field_name: &'a str) -> &str {
+        self.field_aliases.get(field_name).map(|s| s.as_str()).unwrap_or(field_name)
     }
 
     fn get_text_analyzer(&self, field_entry: &FieldEntry, option: &TextFieldIndexing) -> Result<TextAnalyzer, QueryParserError> {
@@ -621,7 +631,7 @@ impl QueryParser {
                 match grouping_or_term.as_rule() {
                     Rule::grouping => {
                         let mut intermediate_results = vec![];
-                        match self.schema.get_field(field_name.as_str()) {
+                        match self.schema.get_field(self.resolve_field_name(field_name.as_str())) {
                             Ok(field) => {
                                 for term in grouping_or_term.into_inner() {
                                     intermediate_results.push(self.parse_term(term, &field, "", statement_boost)?);
@@ -641,7 +651,7 @@ impl QueryParser {
                         }
                         Ok(Box::new(BooleanQuery::new(intermediate_results.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>)
                     }
-                    Rule::term => match self.schema.find_field(field_name.as_str()) {
+                    Rule::term => match self.schema.find_field(self.resolve_field_name(field_name.as_str())) {
                         Some((field, full_path)) => self.parse_term(grouping_or_term, &field, full_path, statement_boost),
                         None => match self.missing_field_policy {
                             MissingFieldPolicy::AsUsualTerms => Ok(Box::new(BooleanQuery::new(vec![

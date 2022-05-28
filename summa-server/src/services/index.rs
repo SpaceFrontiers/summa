@@ -230,6 +230,7 @@ impl Index {
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::File(file_engine_config)),
                     merge_policy: attach_index_request.merge_policy,
+                    field_aliases: HashMap::new(),
                 };
                 (index, index_engine_config)
             }
@@ -244,6 +245,7 @@ impl Index {
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
                     merge_policy: attach_index_request.merge_policy,
+                    field_aliases: HashMap::new(),
                 };
                 (index, index_engine_config)
             }
@@ -309,6 +311,7 @@ impl Index {
                         path: index_path.to_string_lossy().to_string(),
                     })),
                     merge_policy: create_index_request.merge_policy,
+                    field_aliases: HashMap::new(),
                 };
                 (index, index_engine_config)
             }
@@ -319,6 +322,7 @@ impl Index {
                         schema: serde_yaml::to_string(&index.schema()).expect("cannot serialize"),
                     })),
                     merge_policy: create_index_request.merge_policy,
+                    field_aliases: HashMap::new(),
                 };
                 (index, index_engine_config)
             }
