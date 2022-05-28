@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use futures::future::join_all;
+use prost::Message;
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
-use pythonize::{depythonize, pythonize};
+use pyo3::types::PyBytes;
+use pythonize::{pythonize};
 use summa_core::components::{Driver, IndexHolder};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::hyper_external_request::HyperExternalRequest;
 use summa_proto::proto;
-use summa_proto::proto::IndexEngineConfig;
 use tantivy::IndexBuilder;
 
 struct SummaPyError(String);
@@ -49,8 +50,8 @@ impl IndexRegistry {
         }
     }
 
-    fn add<'a>(&'a self, py: Python<'a>, index_engine_config: PyObject, index_name: Option<String>) -> PyResult<&'a PyAny> {
-        let index_engine_config: IndexEngineConfig = depythonize(index_engine_config.as_ref(py)).unwrap();
+    fn add<'a>(&'a self, py: Python<'a>, index_engine_config: &PyBytes, index_name: Option<String>) -> PyResult<&'a PyAny> {
+        let index_engine_config = proto::IndexEngineConfig::decode(index_engine_config.as_bytes()).unwrap();
         let this = self.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let index = match &index_engine_config.config {
@@ -88,11 +89,11 @@ impl IndexRegistry {
         })
     }
 
-    fn search<'a>(&'a self, py: Python<'a>, index_queries: PyObject) -> PyResult<&'a PyAny> {
-        let index_queries: Vec<proto::IndexQuery> = depythonize(index_queries.as_ref(py)).unwrap();
+    fn search<'a>(&'a self, py: Python<'a>, index_queries: &PyBytes) -> PyResult<&'a PyAny> {
+        let search_request = proto::SearchRequest::decode(index_queries.as_bytes()).unwrap();
         let this = self.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
-            let futures = this.index_registry.search_futures(index_queries).unwrap();
+            let futures = this.index_registry.search_futures(search_request.index_queries).unwrap();
             let extraction_results = join_all(futures).await.into_iter().map(|r| r.expect("cannot receive")).collect::<Vec<_>>();
             let result = this.index_registry.finalize_extraction(extraction_results).await.unwrap();
             Ok(Python::with_gil(|py| pythonize(py, &result).unwrap()))
@@ -102,8 +103,8 @@ impl IndexRegistry {
 
 /// A Python module implemented in Rust.
 #[pymodule]
-#[pyo3(name = "summa_embed")]
-fn summa_embed(_py: Python, m: &PyModule) -> PyResult<()> {
+#[pyo3(name = "summa_embed_bin")]
+fn summa_embed_bin(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<IndexRegistry>()?;
     Ok(())
 }
