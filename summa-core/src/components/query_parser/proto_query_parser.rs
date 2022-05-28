@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
@@ -35,6 +36,7 @@ pub struct ProtoQueryParser {
     #[cfg(feature = "metrics")]
     subquery_counter: Counter<u64>,
     index_default_fields: Vec<String>,
+    field_aliases: HashMap<String, String>,
 }
 
 pub enum MatchQueryDefaultMode {
@@ -105,7 +107,12 @@ fn cast_value_to_bound_term(field: Field, full_path: &str, field_type: &FieldTyp
 }
 
 impl ProtoQueryParser {
-    pub fn for_index(index_name: &str, index: &Index, index_default_fields: Vec<String>) -> SummaResult<ProtoQueryParser> {
+    pub fn for_index(
+        index_name: &str,
+        index: &Index,
+        index_default_fields: Vec<String>,
+        field_aliases: HashMap<String, String>,
+    ) -> SummaResult<ProtoQueryParser> {
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
         #[cfg(feature = "metrics")]
@@ -123,12 +130,17 @@ impl ProtoQueryParser {
             #[cfg(feature = "metrics")]
             subquery_counter,
             index_default_fields,
+            field_aliases,
         })
+    }
+
+    pub fn resolve_field_name<'a>(&'a self, field_name: &'a str) -> &str {
+        self.field_aliases.get(field_name).map(|s| s.as_str()).unwrap_or(field_name)
     }
 
     #[inline]
     pub(crate) fn field_and_field_entry<'a>(&'a self, field_name: &'a str) -> SummaResult<(Field, &str, &FieldEntry)> {
-        match self.cached_schema.find_field(field_name) {
+        match self.cached_schema.find_field(self.resolve_field_name(field_name)) {
             Some((field, full_path)) => {
                 let field_entry = self.cached_schema.get_field_entry(field);
                 Ok((field, full_path, field_entry))
@@ -196,6 +208,10 @@ impl ProtoQueryParser {
 
                 if let Some(exact_matches_promoter) = match_query_proto.exact_matches_promoter {
                     nested_query_parser.set_exact_match_promoter(exact_matches_promoter)
+                }
+
+                if !self.field_aliases.is_empty() {
+                    nested_query_parser.set_field_aliases(self.field_aliases.clone())
                 }
 
                 match nested_query_parser.parse_query(&match_query_proto.value) {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -102,6 +103,7 @@ impl WrappedIndexRegistry {
             index_name.as_deref(),
             Arc::new(DirectProxy::new(index_engine_config)),
             None,
+            HashMap::new(),
             true,
             Driver::Native,
         )?;

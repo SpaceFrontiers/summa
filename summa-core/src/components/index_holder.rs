@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -160,6 +160,7 @@ impl IndexHolder {
         index_name: Option<&str>,
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
         merge_policy: Option<proto::MergePolicy>,
+        field_aliases: HashMap<String, String>,
         read_only: bool,
         driver: Driver,
     ) -> SummaResult<IndexHolder> {
@@ -196,6 +197,7 @@ impl IndexHolder {
             &index_name,
             &index,
             cached_index_attributes.as_ref().map(|a| a.default_fields.clone()).unwrap_or_else(Vec::new),
+            field_aliases,
         )?;
         let index_reader = index
             .reader_builder()
