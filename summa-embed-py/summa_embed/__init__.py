@@ -2,26 +2,25 @@ from typing import Dict, Optional
 
 from izihawa_utils.pb_to_json import ParseDict
 
-from .proto import search_service_pb2 as search_service_pb
-from .summa_embed_bin import IndexRegistry
+from .proto import index_service_pb2, search_service_pb2
+from .summa_embed_bin import IndexRegistry as IndexRegistryBin
 
 
-class SummaEmbed:
+class IndexRegistry:
     def __init__(self):
-        self.index_registry = IndexRegistry()
+        self.index_registry = IndexRegistryBin()
 
     def add(self, index_config, index_name: Optional[str] = None):
-        parsed_index_config = search_service_pb.IndexQuery()
+        parsed_index_config = index_service_pb2.IndexEngineConfig()
         ParseDict(index_config, parsed_index_config)
         return self.index_registry.add(parsed_index_config.SerializeToString(), index_name=index_name)
 
     def search(self, index_queries):
-        search_request = search_service_pb.SearchRequest()
+        search_request = search_service_pb2.SearchRequest()
         for index_query in index_queries:
             if isinstance(index_query, Dict):
                 dict_index_query = index_query
-                index_query = search_service_pb.IndexQuery()
+                index_query = search_service_pb2.IndexQuery()
                 ParseDict(dict_index_query, index_query)
             search_request.index_queries.append(index_query)
         return self.index_registry.search(search_request.SerializeToString())
-
