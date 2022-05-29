@@ -75,7 +75,7 @@ impl IndexWriterImpl {
             IndexWriterImpl::Threaded(writer) => writer.index(),
         }
     }
-    pub fn merge_with_attributes(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<serde_json::Value>) -> SummaResult<Option<SegmentMeta>> {
+    pub fn merge_with_attributes(&self, segment_ids: &[SegmentId], segment_attributes: Option<serde_json::Value>) -> SummaResult<Option<SegmentMeta>> {
         match self {
             IndexWriterImpl::SameThread(_) => {
                 unimplemented!()
@@ -235,7 +235,7 @@ impl IndexWriterHolder {
     ///
     /// Also cleans deleted documents and do recompression. Possible to pass the only segment in `segment_ids` to do recompression or clean up.
     /// It is heavy operation that also blocks on `.await` so should be spawned if non-blocking behaviour is required
-    pub fn merge(&mut self, segment_ids: &[SegmentId], segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
+    pub fn merge(&self, segment_ids: &[SegmentId], segment_attributes: Option<SummaSegmentAttributes>) -> SummaResult<Option<SegmentMeta>> {
         info!(action = "merge_segments", segment_ids = ?segment_ids);
         let segment_meta = self.index_writer.merge_with_attributes(
             segment_ids,
@@ -257,7 +257,7 @@ impl IndexWriterHolder {
         self.index_writer.rollback()
     }
 
-    pub fn vacuum(&mut self, segment_attributes: Option<SummaSegmentAttributes>, excluded_segments: Vec<String>) -> SummaResult<()> {
+    pub fn vacuum(&self, segment_attributes: Option<SummaSegmentAttributes>, excluded_segments: Vec<String>) -> SummaResult<()> {
         let mut segments = self.index().searchable_segments()?;
         segments.sort_by_key(|segment| segment.meta().num_deleted_docs());
 

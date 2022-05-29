@@ -594,11 +594,11 @@ impl Index {
     #[instrument(skip(self, merge_segments_request), fields(index_name = merge_segments_request.index_name))]
     pub async fn merge_segments(&self, merge_segments_request: proto::MergeSegmentsRequest) -> SummaServerResult<Option<SegmentId>> {
         let index_holder = self.get_index_holder(&merge_segments_request.index_name).await?;
-        let mut index_writer_holder = index_holder
+        let index_writer_holder = index_holder
             .index_writer_holder()
             .map_err(crate::errors::Error::from)?
             .clone()
-            .write_owned()
+            .read_owned()
             .await;
         let span = tracing::Span::current();
         let segment_ids: Vec<_> = merge_segments_request
@@ -615,11 +615,11 @@ impl Index {
     #[instrument(skip(self, vacuum_index_request), fields(index_name = vacuum_index_request.index_name))]
     pub async fn vacuum_index(&self, vacuum_index_request: proto::VacuumIndexRequest) -> SummaServerResult<u64> {
         let index_holder = self.get_index_holder(&vacuum_index_request.index_name).await?;
-        let mut index_writer_holder = index_holder
+        let index_writer_holder = index_holder
             .index_writer_holder()
             .map_err(crate::errors::Error::from)?
             .clone()
-            .write_owned()
+            .read_owned()
             .await;
         let before_size: u64 = index_holder.space_usage()?.segments().iter().map(|s| s.total().get_bytes()).sum();
         let span = tracing::Span::current();
@@ -825,7 +825,7 @@ pub(crate) mod tests {
             index_service.commit(&index_holder).await?;
         }
         let index_holder_clone = index_holder.clone();
-        let mut index_writer = index_holder.index_writer_holder().unwrap().clone().write_owned().await;
+        let index_writer = index_holder.index_writer_holder().unwrap().clone().write_owned().await;
         tokio::task::spawn_blocking(move || {
             index_writer.vacuum(None, vec![])?;
             index_holder_clone.index_reader().reload()?;

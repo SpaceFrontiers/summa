@@ -129,25 +129,23 @@ impl Shard {
             .into_iter()
             .enumerate()
             .map(|(index, child)| {
-                child.map(|child| {
-                    match child {
-                        ShardOrLink::Shard(shard) => {
-                            let (cid, t_size) = shard.collapse(tree);
-                            t_size_sum += t_size;
-                            summa_proto::proto::dag_pb::PbLink {
-                                name: Some(format!("{:02X}", index)),
-                                hash: Some(cid.to_bytes()),
-                                t_size: Some(t_size),
-                            }
+                child.map(|child| match child {
+                    ShardOrLink::Shard(shard) => {
+                        let (cid, t_size) = shard.collapse(tree);
+                        t_size_sum += t_size;
+                        summa_proto::proto::dag_pb::PbLink {
+                            name: Some(format!("{:02X}", index)),
+                            hash: Some(cid.to_bytes()),
+                            t_size: Some(t_size),
                         }
-                        ShardOrLink::HamtLink(link) => {
-                            t_size_sum += link.pb_link.t_size.unwrap();
-                            summa_proto::proto::dag_pb::PbLink {
-                                name: link.pb_link.name.map(|name| format!("{:02X}{}", index, name)),
-                                hash: link.pb_link.hash,
-                                t_size: link.pb_link.t_size,
-                            }
-                        },
+                    }
+                    ShardOrLink::HamtLink(link) => {
+                        t_size_sum += link.pb_link.t_size.unwrap();
+                        summa_proto::proto::dag_pb::PbLink {
+                            name: link.pb_link.name.map(|name| format!("{:02X}{}", index, name)),
+                            hash: link.pb_link.hash,
+                            t_size: link.pb_link.t_size,
+                        }
                     }
                 })
             })
