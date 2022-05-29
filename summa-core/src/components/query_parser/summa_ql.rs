@@ -290,8 +290,12 @@ impl QueryParser {
     fn parse_range(&self, pre_term: Pair<Rule>, field: &Field) -> Result<RangeQuery, QueryParserError> {
         let mut range_pairs = pre_term.into_inner();
         let field_entry = self.schema.get_field_entry(*field);
+        if !field_entry.field_type().is_indexed() && !field_entry.field_type().is_fast() {
+            return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+        }
         let left = self.parse_boundary_word(*field, range_pairs.next().expect("grammar failure"))?;
         let right = self.parse_boundary_word(*field, range_pairs.next().expect("grammar failure"))?;
+
         Ok(RangeQuery::new_term_bounds(
             field_entry.name().to_string(),
             field_entry.field_type().value_type(),
@@ -316,10 +320,6 @@ impl QueryParser {
         let field_entry = self.schema.get_field_entry(*field);
         let field_type = field_entry.field_type();
 
-        if !field_type.is_indexed() {
-            return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
-        }
-
         if field_type.value_type() == Type::Json && full_path.is_empty() {
             return Err(QueryParserError::JsonFieldWithoutPath(field_entry.name().to_string()));
         }
@@ -342,6 +342,9 @@ impl QueryParser {
             FieldType::U64(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
+                    if !field_type.is_indexed() {
+                        return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+                    }
                     let val: u64 = u64::from_str(pre_term.as_str())?;
                     let query = Box::new(TermQuery::new(Term::from_field_u64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
                     Ok(vec![boost_query(query, boost)])
@@ -351,6 +354,9 @@ impl QueryParser {
             FieldType::I64(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
+                    if !field_type.is_indexed() {
+                        return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+                    }
                     let val: i64 = i64::from_str(pre_term.as_str())?;
                     let query = Box::new(TermQuery::new(Term::from_field_i64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
                     Ok(vec![boost_query(query, boost)])
@@ -360,6 +366,9 @@ impl QueryParser {
             FieldType::F64(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
+                    if !field_type.is_indexed() {
+                        return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+                    }
                     let val: f64 = f64::from_str(pre_term.as_str())?;
                     let query = Box::new(TermQuery::new(Term::from_field_f64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
                     Ok(vec![boost_query(query, boost)])
@@ -369,6 +378,9 @@ impl QueryParser {
             FieldType::Bool(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
+                    if !field_type.is_indexed() {
+                        return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+                    }
                     let val: bool = bool::from_str(pre_term.as_str())?;
                     let query = Box::new(TermQuery::new(Term::from_field_bool(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
                     Ok(vec![boost_query(query, boost)])
@@ -386,6 +398,10 @@ impl QueryParser {
 
                 match pre_term.as_rule() {
                     Rule::word | Rule::field_name => {
+                        if !field_type.is_indexed() {
+                            return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+                        }
+
                         let mut token_stream = self.get_text_analyzer(field_entry, indexing)?.token_stream(pre_term.as_str());
                         let mut queries = Vec::new();
 
@@ -410,6 +426,10 @@ impl QueryParser {
                         Ok(queries)
                     }
                     Rule::phrase => {
+                        if !field_type.is_indexed() {
+                            return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+                        }
+
                         let mut phrase_pairs = pre_term.into_inner();
                         let words = match phrase_pairs.next() {
                             None => return Ok(vec![]),
@@ -440,6 +460,9 @@ impl QueryParser {
                     }
                     Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                     Rule::regex => {
+                        if !field_type.is_indexed() {
+                            return Err(QueryParserError::FieldNotIndexed(field_entry.name().to_string()));
+                        }
                         let query = Box::new(
                             RegexQuery::from_pattern(pre_term.clone().into_inner().next().expect("grammar failure").as_str(), *field)
                                 .map_err(|_| QueryParserError::Syntax(pre_term.as_str().to_string()))?,
