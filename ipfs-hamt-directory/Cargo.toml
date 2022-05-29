@@ -1,7 +1,7 @@
 [package]
 edition = "2021"
 name = "ipfs-hamt-directory"
-version = "0.1.0"
+version = "0.1.1"
 license-file = "LICENSE"
 description = "Creation of large HAMT-sharded directories"
 homepage = "https://github.com/izihawa/summa/tree/master/ipfs-hamt-directory"
