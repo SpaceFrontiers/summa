@@ -41,7 +41,7 @@ pub struct Config {
     pub autocommit_interval_ms: Option<u64>,
     #[builder(default = "1")]
     #[serde(default = "return_1")]
-    pub docstore_compress_threads: usize,
+    pub doc_store_compress_threads: usize,
     #[builder(default = "100")]
     #[serde(default = "return_100")]
     pub doc_store_cache_num_blocks: usize,
@@ -58,7 +58,7 @@ impl Default for Config {
         Config {
             aliases: HashMap::new(),
             autocommit_interval_ms: None,
-            docstore_compress_threads: 1,
+            doc_store_compress_threads: 1,
             indices: HashMap::new(),
             writer_heap_size_bytes: 1024 * 1024 * 1024,
             writer_threads: Some(WriterThreads::N(1)),

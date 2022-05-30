@@ -33,7 +33,7 @@ impl WrappedIndexRegistry {
     #[wasm_bindgen(constructor)]
     pub fn new() -> WrappedIndexRegistry {
         let core_config = summa_core::configs::core::ConfigBuilder::default()
-            .docstore_compress_threads(0)
+            .doc_store_compress_threads(0)
             .writer_threads(None)
             .build()
             .expect("cannot build");

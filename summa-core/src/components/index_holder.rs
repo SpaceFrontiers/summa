@@ -166,7 +166,7 @@ impl IndexHolder {
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
 
-        index.settings_mut().docstore_compress_threads = core_config.docstore_compress_threads;
+        index.settings_mut().docstore_compress_threads = core_config.doc_store_compress_threads;
         index.set_segment_attributes_merger(Arc::new(SegmentAttributesMergerImpl::<SummaSegmentAttributes>::new()));
 
         let metas = index.load_metas()?;
