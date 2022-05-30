@@ -40,7 +40,7 @@ impl IndexRegistry {
     #[new]
     pub fn new() -> Self {
         let core_config = summa_core::configs::core::ConfigBuilder::default()
-            .dedicated_compression_thread(false)
+            .docstore_compress_threads(1)
             .writer_threads(None)
             .build()
             .expect("cannot build");
