@@ -1,8 +1,13 @@
 {
   "name": "summa-wasm",
   "description": "WASM-bindings for Summa",
-  "version": "0.123.0",
-  "keywords": ["search", "database", "rust", "wasm"],
+  "version": "0.123.8",
+  "keywords": [
+    "search",
+    "database",
+    "rust",
+    "wasm"
+  ],
   "homepage": "https://github.com/izihawa/summa",
   "main": "./dist/main.js",
   "types": "./dist/index.d.ts",
@@ -15,11 +20,14 @@
   "dependencies": {
     "axios": "^1.3.2",
     "comlink": "^4.3.1",
-    "dexie": "^3.2.3"
+    "dexie": "^3.2.3",
+    "protobufjs": "^7.2.3"
   },
   "devDependencies": {
     "@wasm-tool/wasm-pack-plugin": "^1.6.0",
+    "protobufjs-cli": "^1.1.1",
     "ts-loader": "^9.4.1",
+    "ts-protoc-gen": "^0.15.0",
     "typescript": "^4.9.2-rc",
     "webpack": "^5.75.0",
     "webpack-cli": "^4.10.0"

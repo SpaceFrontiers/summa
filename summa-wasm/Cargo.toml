@@ -1,6 +1,6 @@
 [package]
 name = "summa-wasm"
-version = "0.123.0"
+version = "0.123.8"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -22,6 +22,7 @@ getrandom = { version = "0.2", features = ["js"] }
 instant = { workspace = true }
 js-sys = "0.3"
 parking_lot = { workspace = true }
+prost = { workspace = true }
 serde = { workspace = true }
 serde-wasm-bindgen = "0.5"
 strfmt = { workspace = true }

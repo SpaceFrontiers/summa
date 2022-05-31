@@ -13,7 +13,10 @@ class IndexRegistry:
     def add(self, index_config, index_name: Optional[str] = None):
         parsed_index_config = index_service_pb2.IndexEngineConfig()
         ParseDict(index_config, parsed_index_config)
-        return self.index_registry.add(parsed_index_config.SerializeToString(), index_name=index_name)
+        index_attributes_bytes = self.index_registry.add(parsed_index_config.SerializeToString(), index_name=index_name)
+        index_attributes = index_service_pb2.IndexAttributes()
+        index_attributes.ParseFromString(index_attributes_bytes)
+        return index_attributes
 
     def search(self, index_queries):
         search_request = search_service_pb2.SearchRequest()
@@ -23,4 +26,7 @@ class IndexRegistry:
                 index_query = search_service_pb2.IndexQuery()
                 ParseDict(dict_index_query, index_query)
             search_request.index_queries.append(index_query)
-        return self.index_registry.search(search_request.SerializeToString())
+        search_response_bytes = self.index_registry.search(search_request.SerializeToString())
+        search_response = search_service_pb2.SearchRequest()
+        search_response.ParseFromString(search_response_bytes)
+        return search_response

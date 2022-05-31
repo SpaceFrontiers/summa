@@ -435,28 +435,49 @@ impl QueryParser {
                             None => return Ok(vec![]),
                             Some(words) => words,
                         };
-                        let slop = phrase_pairs
-                            .next()
-                            .map(|v| match v.as_str() {
-                                "" => 0,
-                                _ => u32::from_str(v.as_str()).expect("cannot parse"),
-                            })
-                            .unwrap_or(0);
-                        let terms = self.parse_words(*field, indexing, words.as_str())?;
-                        if terms.len() <= 1 {
-                            return Ok(terms
-                                .into_iter()
-                                .map(|(_, term)| {
+
+                        match field_type {
+                            FieldType::JsonObject(ref json_options) => {
+                                let mut token_stream = self.get_text_analyzer(field_entry, indexing)?.token_stream(words.as_str());
+                                let mut queries = Vec::new();
+
+                                token_stream.process(&mut |token| {
+                                    let mut term = Term::with_capacity(128);
+                                    let mut json_term_writer =
+                                        JsonTermWriter::from_field_and_json_path(*field, full_path, json_options.is_expand_dots_enabled(), &mut term);
+                                    json_term_writer.set_str(&token.text);
+                                    let term = json_term_writer.term().clone();
                                     let query = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
-                                    boost_query(query, boost)
-                                })
-                                .collect());
+                                    queries.push(boost_query(query, boost));
+                                });
+
+                                Ok(queries)
+                            }
+                            _ => {
+                                let slop = phrase_pairs
+                                    .next()
+                                    .map(|v| match v.as_str() {
+                                        "" => 0,
+                                        _ => u32::from_str(v.as_str()).expect("cannot parse"),
+                                    })
+                                    .unwrap_or(0);
+                                let terms = self.parse_words(*field, indexing, words.as_str())?;
+                                if terms.len() <= 1 {
+                                    return Ok(terms
+                                        .into_iter()
+                                        .map(|(_, term)| {
+                                            let query = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
+                                            boost_query(query, boost)
+                                        })
+                                        .collect());
+                                }
+                                if !indexing.index_option().has_positions() {
+                                    return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
+                                }
+                                let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>;
+                                return Ok(vec![boost_query(query, boost)]);
+                            }
                         }
-                        if !indexing.index_option().has_positions() {
-                            return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
-                        }
-                        let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>;
-                        return Ok(vec![boost_query(query, boost)]);
                     }
                     Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                     Rule::regex => {

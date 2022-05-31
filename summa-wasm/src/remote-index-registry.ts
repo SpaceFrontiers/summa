@@ -1,6 +1,6 @@
 import * as Comlink from "comlink";
-import {IndexRegistry, IIndexRegistry, IndexQuery, IndexRegistryOptions} from "./index-registry";
-import {IndexAttributes, IndexEngineConfig} from "./configs";
+import { IndexRegistry, IIndexRegistry, IndexRegistryOptions } from "./index-registry";
+import { summa } from "./proto"
 
 export class RemoteIndexRegistry implements IIndexRegistry {
     init_guard: Promise<void>;
@@ -16,7 +16,7 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         this.init_guard = this.setup(wasm_url, options);
     }
 
-    add(index_engine_config: IndexEngineConfig, index_name?: string | undefined): Promise<IndexAttributes> {
+    add(index_engine_config: summa.proto.IndexEngineConfig, index_name?: string | undefined): Promise<summa.proto.IndexAttributes> {
         return this.index_registry.add(index_engine_config, index_name);
     }
 
@@ -24,8 +24,8 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         return this.index_registry.delete(index_name);
     }
 
-    search(index_queries: IndexQuery[]): Promise<object[]> {
-        return this.index_registry.search(index_queries)
+    search(search_request: summa.proto.SearchRequest): Promise<object[]> {
+        return this.index_registry.search(search_request)
     }
 
     warmup(index_name: string): Promise<void> {

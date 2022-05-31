@@ -85,9 +85,9 @@ impl IndexRegistry {
             .await
             .unwrap()
             .unwrap();
-            let index_attributes = index_holder.index_attributes().cloned();
+            let index_attributes = index_holder.index_attributes().cloned().unwrap();
             this.index_registry.add(index_holder).await.unwrap();
-            Ok(Python::with_gil(|py| pythonize(py, &index_attributes).unwrap()))
+            Ok(Python::with_gil(|py| PyBytes::new(py, &index_attributes.encode_to_vec())))
         })
     }
 
@@ -98,7 +98,11 @@ impl IndexRegistry {
             let futures = this.index_registry.search_futures(search_request.index_queries).unwrap();
             let extraction_results = join_all(futures).await.into_iter().map(|r| r.expect("cannot receive")).collect::<Vec<_>>();
             let result = this.index_registry.finalize_extraction(extraction_results).await.unwrap();
-            Ok(Python::with_gil(|py| pythonize(py, &result).unwrap()))
+            let search_response = proto::SearchResponse {
+                elapsed_secs: 0.0,
+                collector_outputs: result,
+            };
+            Ok(Python::with_gil(|py| PyBytes::new(py, &search_response.encode_to_vec())))
         })
     }
 }

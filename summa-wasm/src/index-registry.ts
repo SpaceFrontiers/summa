@@ -1,21 +1,10 @@
-import {IndexAttributes, IndexEngineConfig} from "./configs";
 import init, {setup_logging, WrappedIndexRegistry} from "../pkg";
-
-export class IndexQuery {
-  index_alias: string
-  query: Object;
-  collectors: Object[];
-  constructor(index_alias: string, query: Object, collectors: Object[]) {
-    this.index_alias = index_alias;
-    this.query = query;
-    this.collectors = collectors
-  }
-}
+import { summa } from "./proto"
 
 export interface IIndexRegistry {
-  add(index_engine_config: IndexEngineConfig, index_name?: string): Promise<IndexAttributes>;
+  add(index_engine_config: summa.proto.IndexEngineConfig, index_name?: string): Promise<summa.proto.IndexAttributes>;
   delete(index_name: string): Promise<void>;
-  search(index_queries: IndexQuery[]): Promise<object[]>;
+  search(search_request: summa.proto.SearchRequest): Promise<object[]>;
   warmup(index_name: string): Promise<void>;
   index_document(index_name: string, document: string): Promise<void>;
   commit(index_name: string): Promise<void>;
@@ -62,14 +51,14 @@ export class IndexRegistry implements IIndexRegistry {
     await this.registry.setup(actual_options.num_threads!);
   }
 
-  async add(index_engine_config: IndexEngineConfig, index_name?: string): Promise<IndexAttributes> {
+  async add(index_engine_config: summa.proto.IndexEngineConfig, index_name?: string): Promise<summa.proto.IndexAttributes> {
     return await this.registry!.add(index_engine_config, index_name);
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
   }
-  async search(index_queries: IndexQuery[]): Promise<object[]> {
-    return await this.registry!.search(index_queries);
+  async search(search_request: summa.proto.SearchRequest): Promise<object[]> {
+    return await this.registry!.search(search_request);
   }
   async warmup(index_name: string) {
     return await this.registry!.warmup(index_name);

@@ -1,4 +1,4 @@
-import type { RemoteEngineConfig } from "./configs";
+import { summa } from "./proto";
 import Dexie from "dexie";
 
 export class MetaDb extends Dexie {
@@ -23,7 +23,7 @@ interface IIndexConfig {
   index_name: string;
   index_seed: Object;
   index_properties: Object;
-  remote_engine_config: RemoteEngineConfig;
+  remote_engine_config: summa.proto.RemoteEngineConfig;
 }
 
 export class IndexConfig implements IIndexConfig {
@@ -32,7 +32,7 @@ export class IndexConfig implements IIndexConfig {
   created_at: number;
   index_seed: Object;
   index_properties: Object;
-  remote_engine_config: RemoteEngineConfig;
+  remote_engine_config: summa.proto.RemoteEngineConfig;
 
   constructor(
     index_name: string,
@@ -40,7 +40,7 @@ export class IndexConfig implements IIndexConfig {
     created_at: number,
     index_seed: Object,
     index_properties: Object,
-    remote_engine_config: RemoteEngineConfig
+    remote_engine_config: summa.proto.RemoteEngineConfig
   ) {
     this.index_name = index_name;
     this.description = description;
