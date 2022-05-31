@@ -6,7 +6,6 @@ use prost::Message;
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pythonize::pythonize;
 use summa_core::components::{Driver, IndexHolder};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
@@ -70,24 +69,19 @@ impl IndexRegistry {
                 _ => unimplemented!(),
             };
             let core_config = this.core_config.read().await.get().clone();
-            let index_holder = tokio::task::spawn_blocking(move || {
-                IndexHolder::create_holder(
-                    &core_config,
-                    index,
-                    index_name.as_deref(),
-                    Arc::new(DirectProxy::new(index_engine_config)),
-                    None,
-                    HashMap::new(),
-                    true,
-                    Driver::current_tokio(),
-                )
-            })
-            .await
-            .unwrap()
+            let index_holder = IndexHolder::create_holder(
+                &core_config,
+                index,
+                index_name.as_deref(),
+                Arc::new(DirectProxy::new(index_engine_config)),
+                None,
+                HashMap::new(),
+                Driver::current_tokio(),
+            )
             .unwrap();
             let index_attributes = index_holder.index_attributes().cloned().unwrap();
             this.index_registry.add(index_holder).await.unwrap();
-            Ok(Python::with_gil(|py| PyBytes::new(py, &index_attributes.encode_to_vec())))
+            Ok(Python::with_gil(|py| index_attributes.encode_to_vec().into_py(py)))
         })
     }
 
@@ -102,7 +96,7 @@ impl IndexRegistry {
                 elapsed_secs: 0.0,
                 collector_outputs: result,
             };
-            Ok(Python::with_gil(|py| PyBytes::new(py, &search_response.encode_to_vec())))
+            Ok(Python::with_gil(|py| search_response.encode_to_vec().into_py(py)))
         })
     }
 }

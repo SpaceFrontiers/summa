@@ -161,7 +161,6 @@ impl IndexHolder {
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
         merge_policy: Option<proto::MergePolicy>,
         field_aliases: HashMap<String, String>,
-        read_only: bool,
         driver: Driver,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
@@ -206,18 +205,17 @@ impl IndexHolder {
             .try_into()?;
         index_reader.reload()?;
 
-        let index_writer_holder = match (read_only, &core_config.writer_threads) {
-            (true, _) | (_, None) => None,
-            (_, Some(writer_threads)) => {
-                let merge_policy = Wrapper::from(merge_policy).into();
-                info!(action = "create_index_writer", merge_policy = ?merge_policy, writer_threads = ?writer_threads, writer_heap_size_bytes = core_config.writer_heap_size_bytes);
-                Some(Arc::new(RwLock::new(IndexWriterHolder::create(
-                    &index,
-                    writer_threads.clone(),
-                    core_config.writer_heap_size_bytes as usize,
-                    merge_policy,
-                )?)))
-            }
+        let index_writer_holder = if let Some(writer_threads) = &core_config.writer_threads {
+            let merge_policy = Wrapper::from(merge_policy).into();
+            info!(action = "create_index_writer", merge_policy = ?merge_policy, writer_threads = ?writer_threads, writer_heap_size_bytes = core_config.writer_heap_size_bytes);
+            Some(Arc::new(RwLock::new(IndexWriterHolder::create(
+                &index,
+                writer_threads.clone(),
+                core_config.writer_heap_size_bytes as usize,
+                merge_policy,
+            )?)))
+        } else {
+            None
         };
 
         Ok(IndexHolder {
@@ -275,9 +273,9 @@ impl IndexHolder {
         TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
     >(
         remote_engine_config: proto::RemoteEngineConfig,
-        read_only: bool,
+        read_hotcache: bool,
     ) -> SummaResult<Index> {
-        info!(action = "opening_network_directory", config = ?remote_engine_config, read_only = read_only);
+        info!(action = "opening_network_directory", config = ?remote_engine_config, read_hotcache = read_hotcache);
         let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
         let opstamp = read_opstamp(&network_directory).await?;
         let hotcache_bytes = match network_directory
@@ -286,7 +284,7 @@ impl IndexHolder {
             .await
         {
             Ok(hotcache_bytes) => {
-                if read_only {
+                if read_hotcache {
                     info!(action = "read_hotcache", len = hotcache_bytes.len());
                     Some(hotcache_bytes)
                 } else {

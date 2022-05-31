@@ -134,7 +134,6 @@ impl Index {
                     index_engine_config_holder,
                     merge_policy,
                     field_aliases,
-                    false,
                     Driver::current_tokio(),
                 )
             })
@@ -209,7 +208,6 @@ impl Index {
                         index_engine_config_holder,
                         merge_policy,
                         field_aliases,
-                        false,
                         Driver::current_tokio(),
                     )
                 })

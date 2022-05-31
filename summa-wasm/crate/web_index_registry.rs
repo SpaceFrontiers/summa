@@ -104,7 +104,6 @@ impl WrappedIndexRegistry {
             Arc::new(DirectProxy::new(index_engine_config)),
             None,
             HashMap::new(),
-            true,
             Driver::Native,
         )?;
         let index_attributes = index_holder.index_attributes().cloned();
