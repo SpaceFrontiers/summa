@@ -13,7 +13,6 @@ use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, 
 use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 use tantivy::{Index, Term};
-use tantivy_common::HasLen;
 use tantivy_query_grammar::Occur;
 
 use crate::components::query_parser::proto_query_parser::MatchQueryDefaultMode;

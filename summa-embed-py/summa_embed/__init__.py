@@ -1,15 +1,8 @@
-from typing import (
-    Dict,
-    Optional,
-)
+from typing import Dict, Optional
 
 from izihawa_utils.pb_to_json import ParseDict
 
-from .proto import (
-    index_service_pb2,
-    query_pb2,
-    search_service_pb2,
-)
+from .proto import index_service_pb2, query_pb2, search_service_pb2
 from .summa_embed_bin import IndexRegistry as IndexRegistryBin
 
 

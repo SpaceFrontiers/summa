@@ -14,12 +14,12 @@ pub struct HamtLink {
 impl HamtLink {
     pub fn new(hash: &[u8], pb_link: summa_proto::proto::dag_pb::PbLink) -> Self {
         HamtLink {
-            hash_bits: BitVec::<u8, Msb0>::from_slice(&hash),
+            hash_bits: BitVec::<u8, Msb0>::from_slice(hash),
             pb_link,
         }
     }
     pub fn get_bits(&self, depth: usize, width: usize) -> usize {
-        let offset = (depth * width) as usize;
+        let offset = depth * width;
         let index = &self.hash_bits[offset..(offset + width)];
         to_int(index)
     }
@@ -87,7 +87,7 @@ impl CollapsedShard {
         };
         let block = node_pb.encode_to_vec();
         let cid = Cid::new_v1(0x70, self.hasher.digest(&block));
-        return (cid, block);
+        (cid, block)
     }
 }
 

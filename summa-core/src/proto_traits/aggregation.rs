@@ -21,7 +21,7 @@ impl TryFrom<Wrapper<proto::aggregation::Aggregation>> for Aggregation {
     type Error = Error;
 
     fn try_from(aggregation: Wrapper<proto::aggregation::Aggregation>) -> Result<Self, Error> {
-        Ok(serde_json::from_str(&serde_json::to_string(&aggregation.into_inner()).unwrap()).unwrap())
+        Ok(serde_json::from_str(&serde_json::to_string(&aggregation.into_inner())?)?)
     }
 }
 

@@ -83,10 +83,10 @@ impl DirectoryBuilder {
             .par_iter()
             .map(|bucket| {
                 let hash_db = self.hash_db.clone();
-                let mut tree = IpldHamt::new(self.hasher, self.bucket_size.into());
+                let mut tree = IpldHamt::new(self.hasher, self.bucket_size);
                 tree.set_depth(1);
 
-                for hash_keycid in hash_db.scan_prefix(&[*bucket as u8]) {
+                for hash_keycid in hash_db.scan_prefix([*bucket as u8]) {
                     let hash_keycid = hash_keycid.unwrap();
                     let hash = hash_keycid.0;
                     let keycid = hash_keycid.1;

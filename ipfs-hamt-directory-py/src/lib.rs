@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 
 #[pymodule]
 #[pyo3(name = "ipfs_hamt_directory_py")]
-fn ipfs_hamt_directory_py(py: Python, m: &PyModule) -> PyResult<()> {
+fn ipfs_hamt_directory_py(_py: Python, m: &PyModule) -> PyResult<()> {
     #[pyfn(m)]
     fn from_file(_py: Python, file_path: &str, output_file_path: &str, temporary_data_path: &str) -> PyResult<String> {
         let mut directory_builder = ipfs_hamt_directory::DirectoryBuilder::new(temporary_data_path, multihash::Code::Blake3_256);

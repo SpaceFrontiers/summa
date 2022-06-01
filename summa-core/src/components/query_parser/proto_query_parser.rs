@@ -312,7 +312,7 @@ impl ProtoQueryParser {
                     let fni = QueryParserError::FieldNotIndexed(field_entry.name().to_string());
                     return Err(Error::InvalidQuerySyntax(Box::new(fni), exists_query_proto.field.to_string()));
                 }
-                if full_path == "" {
+                if full_path.is_empty() {
                     Box::new(ExistsQuery::new(field))
                 } else {
                     Box::new(TermQuery::new(

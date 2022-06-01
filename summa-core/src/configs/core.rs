@@ -6,9 +6,6 @@ use summa_proto::proto::IndexEngineConfig;
 
 use crate::errors::{BuilderError, SummaResult, ValidationError};
 
-fn return_true() -> bool {
-    true
-}
 fn return_1() -> usize {
     1
 }

@@ -1,3 +1,5 @@
+extern crate core;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,6 +34,12 @@ impl From<SummaPyError> for PyErr {
 struct IndexRegistry {
     index_registry: summa_core::components::IndexRegistry,
     core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
+}
+
+impl Default for IndexRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pymethods]
@@ -81,7 +89,7 @@ impl IndexRegistry {
             .unwrap();
             let index_attributes = index_holder.index_attributes().cloned().unwrap();
             this.index_registry.add(index_holder).await.unwrap();
-            Ok(Python::with_gil(|py| index_attributes.encode_to_vec().into_py(py)))
+            Ok(Python::with_gil(|py| index_attributes.encode_to_vec().as_slice().into_py(py)))
         })
     }
 
@@ -96,7 +104,7 @@ impl IndexRegistry {
                 elapsed_secs: 0.0,
                 collector_outputs: result,
             };
-            Ok(Python::with_gil(|py| search_response.encode_to_vec().into_py(py)))
+            Ok(Python::with_gil(|py| search_response.encode_to_vec().as_slice().into_py(py)))
         })
     }
 }
