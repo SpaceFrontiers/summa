@@ -113,6 +113,7 @@ impl IndexRegistry {
 #[pymodule]
 #[pyo3(name = "summa_embed_bin")]
 fn summa_embed_bin(_py: Python, m: &PyModule) -> PyResult<()> {
+    pyo3_log::init();
     m.add_class::<IndexRegistry>()?;
     Ok(())
 }
