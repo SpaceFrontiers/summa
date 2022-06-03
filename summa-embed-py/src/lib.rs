@@ -1,6 +1,5 @@
 extern crate core;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -77,13 +76,14 @@ impl IndexRegistry {
                 _ => unimplemented!(),
             };
             let core_config = this.core_config.read().await.get().clone();
+            let field_aliases = index_engine_config.field_aliases.clone();
             let index_holder = IndexHolder::create_holder(
                 &core_config,
                 index,
                 index_name.as_deref(),
                 Arc::new(DirectProxy::new(index_engine_config)),
                 None,
-                HashMap::new(),
+                field_aliases,
                 Driver::current_tokio(),
             )
             .unwrap();

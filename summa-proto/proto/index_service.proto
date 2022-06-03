@@ -355,6 +355,7 @@ message IndexEngineConfig {
   // Merge policy
   MergePolicy merge_policy = 10;
   map<string, string> field_aliases = 11;
+  // map<string, string> field_triggers = 12;
 }
 
 // Description containing `Index` metadata fields
