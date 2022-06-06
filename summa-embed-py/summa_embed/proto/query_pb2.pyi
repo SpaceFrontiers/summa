@@ -10,7 +10,10 @@ from google.protobuf import message as _message
 from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 
+AsUsualTerms: MissingFieldPolicy
 DESCRIPTOR: _descriptor.FileDescriptor
+Fail: MissingFieldPolicy
+Remove: MissingFieldPolicy
 must: Occur
 must_not: Occur
 should: Occur
@@ -238,6 +241,14 @@ class FacetCollectorOutput(_message.Message):
     facet_counts: _containers.ScalarMap[str, int]
     def __init__(self, facet_counts: _Optional[_Mapping[str, int]] = ...) -> None: ...
 
+class FieldMapper(_message.Message):
+    __slots__ = ["fields", "mapper_name"]
+    FIELDS_FIELD_NUMBER: _ClassVar[int]
+    MAPPER_NAME_FIELD_NUMBER: _ClassVar[int]
+    fields: _containers.RepeatedScalarFieldContainer[str]
+    mapper_name: str
+    def __init__(self, mapper_name: _Optional[str] = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
+
 class Highlight(_message.Message):
     __slots__ = ["to"]
     FROM_FIELD_NUMBER: _ClassVar[int]
@@ -275,6 +286,12 @@ class HistogramResult(_message.Message):
     buckets: _containers.RepeatedCompositeFieldContainer[BucketEntry]
     def __init__(self, buckets: _Optional[_Iterable[_Union[BucketEntry, _Mapping]]] = ...) -> None: ...
 
+class InflectionConfig(_message.Message):
+    __slots__ = ["derive_plural"]
+    DERIVE_PLURAL_FIELD_NUMBER: _ClassVar[int]
+    derive_plural: bool
+    def __init__(self, derive_plural: bool = ...) -> None: ...
+
 class Key(_message.Message):
     __slots__ = ["f64", "str"]
     F64_FIELD_NUMBER: _ClassVar[int]
@@ -284,27 +301,12 @@ class Key(_message.Message):
     def __init__(self, str: _Optional[str] = ..., f64: _Optional[float] = ...) -> None: ...
 
 class MatchQuery(_message.Message):
-    __slots__ = ["boolean_should_mode", "default_fields", "disjuction_max_mode", "exact_matches_promoter", "field_boosts", "value"]
-    class FieldBoostsEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: float
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[float] = ...) -> None: ...
-    BOOLEAN_SHOULD_MODE_FIELD_NUMBER: _ClassVar[int]
-    DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
-    DISJUCTION_MAX_MODE_FIELD_NUMBER: _ClassVar[int]
-    EXACT_MATCHES_PROMOTER_FIELD_NUMBER: _ClassVar[int]
-    FIELD_BOOSTS_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["query_parser_config", "value"]
+    QUERY_PARSER_CONFIG_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
-    boolean_should_mode: MatchQueryBooleanShouldMode
-    default_fields: _containers.RepeatedScalarFieldContainer[str]
-    disjuction_max_mode: MatchQueryDisjuctionMaxMode
-    exact_matches_promoter: ExactMatchesPromoter
-    field_boosts: _containers.ScalarMap[str, float]
+    query_parser_config: QueryParserConfig
     value: str
-    def __init__(self, value: _Optional[str] = ..., default_fields: _Optional[_Iterable[str]] = ..., boolean_should_mode: _Optional[_Union[MatchQueryBooleanShouldMode, _Mapping]] = ..., disjuction_max_mode: _Optional[_Union[MatchQueryDisjuctionMaxMode, _Mapping]] = ..., field_boosts: _Optional[_Mapping[str, float]] = ..., exact_matches_promoter: _Optional[_Union[ExactMatchesPromoter, _Mapping]] = ...) -> None: ...
+    def __init__(self, value: _Optional[str] = ..., query_parser_config: _Optional[_Union[QueryParserConfig, _Mapping]] = ...) -> None: ...
 
 class MatchQueryBooleanShouldMode(_message.Message):
     __slots__ = []
@@ -391,6 +393,58 @@ class Query(_message.Message):
     regex: RegexQuery
     term: TermQuery
     def __init__(self, boolean: _Optional[_Union[BooleanQuery, _Mapping]] = ..., match: _Optional[_Union[MatchQuery, _Mapping]] = ..., regex: _Optional[_Union[RegexQuery, _Mapping]] = ..., term: _Optional[_Union[TermQuery, _Mapping]] = ..., phrase: _Optional[_Union[PhraseQuery, _Mapping]] = ..., range: _Optional[_Union[RangeQuery, _Mapping]] = ..., all: _Optional[_Union[AllQuery, _Mapping]] = ..., more_like_this: _Optional[_Union[MoreLikeThisQuery, _Mapping]] = ..., boost: _Optional[_Union[BoostQuery, _Mapping]] = ..., disjunction_max: _Optional[_Union[DisjunctionMaxQuery, _Mapping]] = ..., empty: _Optional[_Union[EmptyQuery, _Mapping]] = ..., exists: _Optional[_Union[ExistsQuery, _Mapping]] = ...) -> None: ...
+
+class QueryParserConfig(_message.Message):
+    __slots__ = ["boolean_should_mode", "default_fields", "disjuction_max_mode", "exact_matches_promoter", "field_aliases", "field_boosts", "field_mappings", "inflection_configs", "missing_field_policy", "term_limit"]
+    class FieldAliasesEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    class FieldBoostsEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: float
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[float] = ...) -> None: ...
+    class FieldMappingsEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: FieldMapper
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[FieldMapper, _Mapping]] = ...) -> None: ...
+    class InflectionConfigsEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: InflectionConfig
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[InflectionConfig, _Mapping]] = ...) -> None: ...
+    BOOLEAN_SHOULD_MODE_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
+    DISJUCTION_MAX_MODE_FIELD_NUMBER: _ClassVar[int]
+    EXACT_MATCHES_PROMOTER_FIELD_NUMBER: _ClassVar[int]
+    FIELD_ALIASES_FIELD_NUMBER: _ClassVar[int]
+    FIELD_BOOSTS_FIELD_NUMBER: _ClassVar[int]
+    FIELD_MAPPINGS_FIELD_NUMBER: _ClassVar[int]
+    INFLECTION_CONFIGS_FIELD_NUMBER: _ClassVar[int]
+    MISSING_FIELD_POLICY_FIELD_NUMBER: _ClassVar[int]
+    TERM_LIMIT_FIELD_NUMBER: _ClassVar[int]
+    boolean_should_mode: MatchQueryBooleanShouldMode
+    default_fields: _containers.RepeatedScalarFieldContainer[str]
+    disjuction_max_mode: MatchQueryDisjuctionMaxMode
+    exact_matches_promoter: ExactMatchesPromoter
+    field_aliases: _containers.ScalarMap[str, str]
+    field_boosts: _containers.ScalarMap[str, float]
+    field_mappings: _containers.MessageMap[str, FieldMapper]
+    inflection_configs: _containers.MessageMap[str, InflectionConfig]
+    missing_field_policy: MissingFieldPolicy
+    term_limit: int
+    def __init__(self, field_aliases: _Optional[_Mapping[str, str]] = ..., field_boosts: _Optional[_Mapping[str, float]] = ..., field_mappings: _Optional[_Mapping[str, FieldMapper]] = ..., term_limit: _Optional[int] = ..., default_fields: _Optional[_Iterable[str]] = ..., boolean_should_mode: _Optional[_Union[MatchQueryBooleanShouldMode, _Mapping]] = ..., disjuction_max_mode: _Optional[_Union[MatchQueryDisjuctionMaxMode, _Mapping]] = ..., exact_matches_promoter: _Optional[_Union[ExactMatchesPromoter, _Mapping]] = ..., missing_field_policy: _Optional[_Union[MissingFieldPolicy, str]] = ..., inflection_configs: _Optional[_Mapping[str, InflectionConfig]] = ...) -> None: ...
 
 class RandomDocument(_message.Message):
     __slots__ = ["document", "index_alias", "score"]
@@ -626,6 +680,9 @@ class TopDocsCollector(_message.Message):
     scorer: Scorer
     snippet_configs: _containers.ScalarMap[str, int]
     def __init__(self, limit: _Optional[int] = ..., offset: _Optional[int] = ..., scorer: _Optional[_Union[Scorer, _Mapping]] = ..., snippet_configs: _Optional[_Mapping[str, int]] = ..., explain: bool = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class MissingFieldPolicy(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = []
 
 class Occur(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []

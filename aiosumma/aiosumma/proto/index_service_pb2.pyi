@@ -32,16 +32,18 @@ class AttachFileEngineRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class AttachIndexRequest(_message.Message):
-    __slots__ = ["file", "index_name", "merge_policy", "remote"]
+    __slots__ = ["file", "index_name", "merge_policy", "query_parser_config", "remote"]
     FILE_FIELD_NUMBER: _ClassVar[int]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
+    QUERY_PARSER_CONFIG_FIELD_NUMBER: _ClassVar[int]
     REMOTE_FIELD_NUMBER: _ClassVar[int]
     file: AttachFileEngineRequest
     index_name: str
     merge_policy: MergePolicy
+    query_parser_config: _query_pb2.QueryParserConfig
     remote: AttachRemoteEngineRequest
-    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., remote: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., remote: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ...) -> None: ...
 
 class AttachIndexResponse(_message.Message):
     __slots__ = ["index"]
@@ -114,7 +116,7 @@ class CreateFileEngineRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class CreateIndexRequest(_message.Message):
-    __slots__ = ["blocksize", "compression", "file", "index_attributes", "index_name", "memory", "merge_policy", "schema", "sort_by_field"]
+    __slots__ = ["blocksize", "compression", "file", "index_attributes", "index_name", "memory", "merge_policy", "query_parser_config", "schema", "sort_by_field"]
     BLOCKSIZE_FIELD_NUMBER: _ClassVar[int]
     COMPRESSION_FIELD_NUMBER: _ClassVar[int]
     FILE_FIELD_NUMBER: _ClassVar[int]
@@ -122,6 +124,7 @@ class CreateIndexRequest(_message.Message):
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
+    QUERY_PARSER_CONFIG_FIELD_NUMBER: _ClassVar[int]
     SCHEMA_FIELD_NUMBER: _ClassVar[int]
     SORT_BY_FIELD_FIELD_NUMBER: _ClassVar[int]
     blocksize: int
@@ -131,9 +134,10 @@ class CreateIndexRequest(_message.Message):
     index_name: str
     memory: CreateMemoryEngineRequest
     merge_policy: MergePolicy
+    query_parser_config: _query_pb2.QueryParserConfig
     schema: str
     sort_by_field: SortByField
-    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., schema: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[CreateFileEngineRequest, _Mapping]] = ..., memory: _Optional[_Union[CreateMemoryEngineRequest, _Mapping]] = ..., schema: _Optional[str] = ..., compression: _Optional[_Union[Compression, str]] = ..., blocksize: _Optional[int] = ..., sort_by_field: _Optional[_Union[SortByField, _Mapping]] = ..., index_attributes: _Optional[_Union[IndexAttributes, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ...) -> None: ...
 
 class CreateIndexResponse(_message.Message):
     __slots__ = ["index"]
@@ -231,10 +235,9 @@ class GetIndicesResponse(_message.Message):
     def __init__(self, index_names: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexAttributes(_message.Message):
-    __slots__ = ["conflict_strategy", "created_at", "default_fields", "default_index_name", "default_snippets", "description", "multi_fields", "unique_fields"]
+    __slots__ = ["conflict_strategy", "created_at", "default_index_name", "default_snippets", "description", "multi_fields", "unique_fields"]
     CONFLICT_STRATEGY_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
-    DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_SNIPPETS_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
@@ -242,13 +245,12 @@ class IndexAttributes(_message.Message):
     UNIQUE_FIELDS_FIELD_NUMBER: _ClassVar[int]
     conflict_strategy: ConflictStrategy
     created_at: int
-    default_fields: _containers.RepeatedScalarFieldContainer[str]
     default_index_name: str
     default_snippets: _containers.RepeatedScalarFieldContainer[str]
     description: str
     multi_fields: _containers.RepeatedScalarFieldContainer[str]
     unique_fields: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., default_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
+    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ["compression", "index_aliases", "index_attributes", "index_engine", "index_name", "num_docs"]
@@ -303,16 +305,27 @@ class IndexDocumentStreamResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ..., success_docs: _Optional[int] = ..., failed_docs: _Optional[int] = ...) -> None: ...
 
 class IndexEngineConfig(_message.Message):
-    __slots__ = ["file", "memory", "merge_policy", "remote"]
+    __slots__ = ["field_triggers", "file", "memory", "merge_policy", "query_parser_config", "remote"]
+    class FieldTriggersEntry(_message.Message):
+        __slots__ = ["key", "value"]
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    FIELD_TRIGGERS_FIELD_NUMBER: _ClassVar[int]
     FILE_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
+    QUERY_PARSER_CONFIG_FIELD_NUMBER: _ClassVar[int]
     REMOTE_FIELD_NUMBER: _ClassVar[int]
+    field_triggers: _containers.ScalarMap[str, str]
     file: FileEngineConfig
     memory: MemoryEngineConfig
     merge_policy: MergePolicy
+    query_parser_config: _query_pb2.QueryParserConfig
     remote: RemoteEngineConfig
-    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ...) -> None: ...
+    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ..., field_triggers: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class IndexOperation(_message.Message):
     __slots__ = ["index_document"]

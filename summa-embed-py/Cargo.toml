@@ -1,6 +1,6 @@
 [package]
 name = "summa-embed-py"
-version = "0.15.19"
+version = "0.16.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,7 +15,7 @@ pyo3 = { version = "0.18", features = ["serde"] }
 pyo3-asyncio = { version =  "0.18", features = ["attributes", "tokio-runtime"] }
 pyo3-log = "0.8"
 serde_json = "1.0"
-summa-core = { version = "0.15.19", path = "../summa-core", default_features = false, features = ["fs", "hyper-external-request", "tokio-rt"] }
+summa-core = { version = "0.16.0", path = "../summa-core", default_features = false, features = ["fs", "hyper-external-request", "tokio-rt"] }
 summa-proto = { workspace = true }
 tantivy = { workspace = true }
 tokio = { workspace = true }
