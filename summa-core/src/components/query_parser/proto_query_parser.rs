@@ -186,13 +186,11 @@ impl ProtoQueryParser {
                 },
             )),
             proto::query::Query::Match(match_query_proto) => {
-                let nested_query_parser = QueryParser::for_index(
-                    &self.index,
-                    match_query_proto
-                        .query_parser_config
-                        .map(QueryParserConfig)
-                        .unwrap_or_else(|| self.query_parser_config.clone()),
-                )?;
+                let mut new_query_parser_config = self.query_parser_config.clone();
+                if let Some(query_parser_config) = match_query_proto.query_parser_config {
+                    new_query_parser_config.merge(QueryParserConfig(query_parser_config));
+                }
+                let nested_query_parser = QueryParser::for_index(&self.index, new_query_parser_config)?;
                 match nested_query_parser.parse_query(&match_query_proto.value) {
                     Ok(parsed_query) => {
                         info!(parsed_match_query = ?parsed_query);

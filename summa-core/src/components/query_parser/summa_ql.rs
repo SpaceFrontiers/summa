@@ -403,7 +403,7 @@ impl QueryParser {
                                 .get(field_entry.name())
                                 .cloned()
                                 .unwrap_or_default();
-                            if inflection_config.derive_plural {
+                            if let Some(derive_plural_coefficient) = inflection_config.derive_plural_coefficient {
                                 let is_singular = pluralize_rs::is_singular(&token.text);
                                 let is_plural = pluralize_rs::is_plural(&token.text);
                                 let other_token = if is_singular {
@@ -415,10 +415,13 @@ impl QueryParser {
                                 };
                                 if let Some(other_token) = other_token {
                                     let other_term = cast_field_to_term(field, full_path, field_type, &other_token, false);
-                                    let disjunction_query = DisjunctionMaxQuery::new(vec![
-                                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                                        Box::new(TermQuery::new(other_term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                                    ]);
+                                    let disjunction_query = DisjunctionMaxQuery::with_tie_breaker(
+                                        vec![
+                                            Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                                            Box::new(TermQuery::new(other_term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+                                        ],
+                                        derive_plural_coefficient,
+                                    );
                                     queries.push(boost_query(Box::new(disjunction_query) as Box<dyn Query>, boost))
                                 }
                             } else {
@@ -1067,9 +1070,14 @@ mod tests {
     pub fn test_inflection() {
         let mut query_parser = create_query_parser();
         let mut inflection_configs = HashMap::new();
-        inflection_configs.insert("title".to_string(), proto::InflectionConfig { derive_plural: true });
+        inflection_configs.insert(
+            "title".to_string(),
+            proto::InflectionConfig {
+                derive_plural_coefficient: Some(0.3),
+            },
+        );
         query_parser.query_parser_config.0.inflection_configs = inflection_configs;
         let query = query_parser.parse_query("search engine");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"search\")), TermQuery(Term(field=0, type=Str, \"searches\"))], tie_breaker: 0.0 }), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.0 })] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"search\")), TermQuery(Term(field=0, type=Str, \"searches\"))], tie_breaker: 0.3 }), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.0 })] })");
     }
 }

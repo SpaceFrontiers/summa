@@ -118,4 +118,22 @@ impl QueryParserConfig {
             16
         }
     }
+    pub fn merge(&mut self, other: Self) {
+        if !other.0.default_fields.is_empty() {
+            self.0.default_fields = other.0.default_fields;
+        }
+        self.0.field_aliases.extend(other.0.field_aliases);
+        self.0.field_mappings.extend(other.0.field_mappings);
+        self.0.field_boosts.extend(other.0.field_boosts);
+        self.0.inflection_configs.extend(other.0.inflection_configs);
+        if other.0.term_limit > 0 {
+            self.0.term_limit = other.0.term_limit;
+        }
+        if let Some(exact_matches_promoter) = other.0.exact_matches_promoter {
+            self.0.exact_matches_promoter = Some(exact_matches_promoter)
+        }
+        if let Some(default_mode) = other.0.default_mode {
+            self.0.default_mode = Some(default_mode)
+        }
+    }
 }

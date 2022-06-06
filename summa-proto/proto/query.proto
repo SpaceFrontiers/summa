@@ -23,7 +23,7 @@ enum MissingFieldPolicy {
 }
 
 message InflectionConfig {
-  bool derive_plural = 1;
+  optional float derive_plural_coefficient = 1;
 }
 
 message QueryParserConfig {
