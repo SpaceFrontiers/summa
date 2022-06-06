@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -160,7 +160,7 @@ impl IndexHolder {
         index_name: Option<&str>,
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
         merge_policy: Option<proto::MergePolicy>,
-        field_aliases: HashMap<String, String>,
+        query_parser_config: proto::QueryParserConfig,
         driver: Driver,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
@@ -192,12 +192,7 @@ impl IndexHolder {
                 .expect("no index name")
         });
 
-        let query_parser = ProtoQueryParser::for_index(
-            &index_name,
-            &index,
-            cached_index_attributes.as_ref().map(|a| a.default_fields.clone()).unwrap_or_else(Vec::new),
-            field_aliases,
-        )?;
+        let query_parser = ProtoQueryParser::for_index(&index_name, &index, query_parser_config)?;
         let index_reader = index
             .reader_builder()
             .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)
@@ -357,35 +352,27 @@ impl IndexHolder {
     }
 
     /// Load term dictionaries into memory
-    pub async fn partial_warmup(&self, load_dictionaries: bool) -> SummaResult<()> {
+    pub async fn partial_warmup<T: AsRef<str>>(&self, load_dictionaries: bool, fields: &[T]) -> SummaResult<()> {
         let searcher = self.index_reader().searcher();
         let mut warm_up_futures = Vec::new();
-        let index_attributes = self.index_attributes();
-        let default_fields = index_attributes
-            .map(|index_attributes| {
-                index_attributes
-                    .default_fields
-                    .iter()
-                    .map(|field_name| self.cached_schema.get_field(field_name))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-        if let Some(default_fields) = default_fields {
-            for field in default_fields {
-                for segment_reader in searcher.segment_readers() {
-                    let inverted_index = segment_reader.inverted_index_async(field).await?.clone();
-                    if load_dictionaries {
-                        warm_up_futures.push(async move {
-                            let dict = inverted_index.terms();
-                            info!(action = "warming_up_dictionary", index_name = ?self.index_name());
-                            dict.warm_up_dictionary().await
-                        });
-                    }
+        let default_fields = fields
+            .iter()
+            .map(|field_name| self.cached_schema.get_field(field_name.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for field in default_fields {
+            for segment_reader in searcher.segment_readers() {
+                let inverted_index = segment_reader.inverted_index_async(field).await?.clone();
+                if load_dictionaries {
+                    warm_up_futures.push(async move {
+                        let dict = inverted_index.terms();
+                        info!(action = "warming_up_dictionary", index_name = ?self.index_name());
+                        dict.warm_up_dictionary().await
+                    });
                 }
             }
-            info!(action = "warming_up");
-            try_join_all(warm_up_futures).await?;
         }
+        info!(action = "warming_up");
+        try_join_all(warm_up_futures).await?;
         Ok(())
     }
 

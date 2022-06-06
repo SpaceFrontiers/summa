@@ -179,8 +179,9 @@ mod tests {
             .create_index(tonic::Request::new(proto::CreateIndexRequest {
                 index_name: index_name.to_owned(),
                 index_engine: Some(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {})),
-                index_attributes: Some(proto::IndexAttributes {
-                    default_fields: vec!["title".to_owned(), "body".to_owned()],
+                index_attributes: Some(proto::IndexAttributes { ..Default::default() }),
+                query_parser_config: Some(proto::QueryParserConfig {
+                    default_fields: vec!["title".to_string(), "body".to_string()],
                     ..Default::default()
                 }),
                 schema: schema.to_owned(),
@@ -252,7 +253,10 @@ mod tests {
                     query: Some(proto::Query {
                         query: Some(proto::query::Query::Match(proto::MatchQuery {
                             value: "title3".to_string(),
-                            default_fields: vec!["title".to_owned(), "body".to_owned()],
+                            query_parser_config: Some(proto::QueryParserConfig {
+                                default_fields: vec!["title".to_string(), "body".to_string()],
+                                ..Default::default()
+                            }),
                             ..Default::default()
                         })),
                     }),
@@ -298,7 +302,10 @@ mod tests {
                     query: Some(proto::Query {
                         query: Some(proto::query::Query::Match(proto::MatchQuery {
                             value: "title3".to_string(),
-                            default_fields: vec!["title".to_owned(), "body".to_owned()],
+                            query_parser_config: Some(proto::QueryParserConfig {
+                                default_fields: vec!["title".to_string(), "body".to_string()],
+                                ..Default::default()
+                            }),
                             ..Default::default()
                         })),
                     }),

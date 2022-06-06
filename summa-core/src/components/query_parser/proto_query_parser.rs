@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
@@ -17,10 +16,11 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Score, Term};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::components::queries::ExistsQuery;
 use crate::components::query_parser::{QueryParser, QueryParserError};
+use crate::configs::core::QueryParserConfig;
 use crate::errors::{Error, SummaResult, ValidationError};
 #[cfg(feature = "metrics")]
 use crate::metrics::ToLabel;
@@ -35,21 +35,20 @@ pub struct ProtoQueryParser {
     query_counter: Counter<u64>,
     #[cfg(feature = "metrics")]
     subquery_counter: Counter<u64>,
-    index_default_fields: Vec<String>,
-    field_aliases: HashMap<String, String>,
+    query_parser_config: QueryParserConfig,
 }
 
-pub enum MatchQueryDefaultMode {
+pub enum QueryParserDefaultMode {
     Boolean,
     DisjuctionMax { tie_breaker: Score },
 }
 
-impl From<Option<proto::match_query::DefaultMode>> for MatchQueryDefaultMode {
-    fn from(value: Option<proto::match_query::DefaultMode>) -> Self {
+impl From<Option<proto::query_parser_config::DefaultMode>> for QueryParserDefaultMode {
+    fn from(value: Option<proto::query_parser_config::DefaultMode>) -> Self {
         match value {
-            Some(proto::match_query::DefaultMode::BooleanShouldMode(_)) | None => MatchQueryDefaultMode::Boolean,
-            Some(proto::match_query::DefaultMode::DisjuctionMaxMode(proto::MatchQueryDisjuctionMaxMode { tie_breaker })) => {
-                MatchQueryDefaultMode::DisjuctionMax { tie_breaker }
+            Some(proto::query_parser_config::DefaultMode::BooleanShouldMode(_)) | None => QueryParserDefaultMode::Boolean,
+            Some(proto::query_parser_config::DefaultMode::DisjuctionMaxMode(proto::MatchQueryDisjuctionMaxMode { tie_breaker })) => {
+                QueryParserDefaultMode::DisjuctionMax { tie_breaker }
             }
         }
     }
@@ -107,12 +106,7 @@ fn cast_value_to_bound_term(field: Field, full_path: &str, field_type: &FieldTyp
 }
 
 impl ProtoQueryParser {
-    pub fn for_index(
-        index_name: &str,
-        index: &Index,
-        index_default_fields: Vec<String>,
-        field_aliases: HashMap<String, String>,
-    ) -> SummaResult<ProtoQueryParser> {
+    pub fn for_index(index_name: &str, index: &Index, query_parser_config: proto::QueryParserConfig) -> SummaResult<ProtoQueryParser> {
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
         #[cfg(feature = "metrics")]
@@ -129,13 +123,17 @@ impl ProtoQueryParser {
             query_counter,
             #[cfg(feature = "metrics")]
             subquery_counter,
-            index_default_fields,
-            field_aliases,
+            query_parser_config: QueryParserConfig(query_parser_config),
         })
     }
 
     pub fn resolve_field_name<'a>(&'a self, field_name: &'a str) -> &str {
-        self.field_aliases.get(field_name).map(|s| s.as_str()).unwrap_or(field_name)
+        self.query_parser_config
+            .0
+            .field_aliases
+            .get(field_name)
+            .map(|s| s.as_str())
+            .unwrap_or(field_name)
     }
 
     #[inline]
@@ -188,32 +186,13 @@ impl ProtoQueryParser {
                 },
             )),
             proto::query::Query::Match(match_query_proto) => {
-                let default_fields = if !match_query_proto.default_fields.is_empty() {
-                    match_query_proto.default_fields
-                } else {
-                    self.index_default_fields.clone()
-                };
-                if default_fields.is_empty() {
-                    warn!(
-                        action = "missing_default_fields",
-                        hint = "Add `default_fields` to match query, otherwise you match nothing"
-                    )
-                }
-                let mut nested_query_parser = QueryParser::for_index(&self.index, default_fields)?;
-                nested_query_parser.set_default_mode(match_query_proto.default_mode.into());
-
-                if !match_query_proto.field_boosts.is_empty() {
-                    nested_query_parser.set_field_boosts(match_query_proto.field_boosts)
-                }
-
-                if let Some(exact_matches_promoter) = match_query_proto.exact_matches_promoter {
-                    nested_query_parser.set_exact_match_promoter(exact_matches_promoter)
-                }
-
-                if !self.field_aliases.is_empty() {
-                    nested_query_parser.set_field_aliases(self.field_aliases.clone())
-                }
-
+                let nested_query_parser = QueryParser::for_index(
+                    &self.index,
+                    match_query_proto
+                        .query_parser_config
+                        .map(QueryParserConfig)
+                        .unwrap_or_else(|| self.query_parser_config.clone()),
+                )?;
                 match nested_query_parser.parse_query(&match_query_proto.value) {
                     Ok(parsed_query) => {
                         info!(parsed_match_query = ?parsed_query);

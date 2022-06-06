@@ -267,10 +267,22 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
     async fn warmup_index(&self, proto_request: Request<proto::WarmupIndexRequest>) -> Result<Response<proto::WarmupIndexResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
+        let query_parser_config = index_holder
+            .index_engine_config()
+            .read()
+            .await
+            .get()
+            .query_parser_config
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
         let now = Instant::now();
         match proto_request.is_full {
             true => index_holder.full_warmup().await.map_err(crate::errors::Error::from)?,
-            false => index_holder.partial_warmup(true).await.map_err(crate::errors::Error::from)?,
+            false => index_holder
+                .partial_warmup(true, &query_parser_config.default_fields)
+                .await
+                .map_err(crate::errors::Error::from)?,
         }
         let elapsed_secs = now.elapsed().as_secs_f64();
         let response = proto::WarmupIndexResponse { elapsed_secs };

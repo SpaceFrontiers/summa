@@ -3,6 +3,44 @@ package summa.proto;
 
 import "utils.proto";
 
+message FieldMapper {
+  string mapper_name = 1;
+  repeated string fields = 2;
+}
+
+message MatchQueryBooleanShouldMode {};
+message MatchQueryDisjuctionMaxMode {
+  float tie_breaker = 1;
+};
+message ExactMatchesPromoter {
+  uint32 slop = 1;
+  optional float boost = 2;
+}
+enum MissingFieldPolicy {
+  AsUsualTerms = 0;
+  Remove = 1;
+  Fail = 2;
+}
+
+message InflectionConfig {
+  bool derive_plural = 1;
+}
+
+message QueryParserConfig {
+  map<string, string> field_aliases = 1;
+  map<string, float> field_boosts = 2;
+  map<string, FieldMapper> field_mappings = 3;
+  uint32 term_limit = 4;
+  repeated string default_fields = 5;
+  oneof default_mode {
+    MatchQueryBooleanShouldMode boolean_should_mode = 6;
+    MatchQueryDisjuctionMaxMode disjuction_max_mode = 7;
+  }
+  ExactMatchesPromoter exact_matches_promoter = 8;
+  MissingFieldPolicy missing_field_policy = 9;
+  map<string, InflectionConfig> inflection_configs = 10;
+}
+
 message SearchResponse {
   // Time spent inside of `search` handler
   double elapsed_secs = 1;
@@ -64,24 +102,9 @@ message RangeQuery {
   Range value = 2;
 }
 
-message MatchQueryBooleanShouldMode {};
-message MatchQueryDisjuctionMaxMode {
-  float tie_breaker = 1;
-};
-message ExactMatchesPromoter {
-  uint32 slop = 1;
-  optional float boost = 2;
-}
-
 message MatchQuery {
   string value = 1;
-  repeated string default_fields = 2;
-  oneof default_mode {
-    MatchQueryBooleanShouldMode boolean_should_mode = 3;
-    MatchQueryDisjuctionMaxMode disjuction_max_mode = 4;
-  }
-  map<string, float> field_boosts = 5;
-  ExactMatchesPromoter exact_matches_promoter = 6;
+  optional QueryParserConfig query_parser_config = 2;
 }
 
 message BooleanSubquery {

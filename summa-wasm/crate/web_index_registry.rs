@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::join_all;
@@ -97,13 +96,14 @@ impl WrappedIndexRegistry {
             }
             _ => unimplemented!(),
         };
+        let query_parser_config = index_engine_config.query_parser_config.as_ref().cloned().unwrap_or_default();
         let index_holder = IndexHolder::create_holder(
             self.core_config.read().await.get(),
             index,
             index_name.as_deref(),
             Arc::new(DirectProxy::new(index_engine_config)),
             None,
-            HashMap::new(),
+            query_parser_config,
             Driver::Native,
         )?;
         let index_attributes = index_holder.index_attributes().cloned();
@@ -124,7 +124,7 @@ impl WrappedIndexRegistry {
             .get_index_holder_by_name(index_name)
             .await
             .map_err(Error::from)?
-            .partial_warmup(false)
+            .partial_warmup(false, &[] as &[&str; 0])
             .await
             .map_err(Error::from)?;
         Ok(())

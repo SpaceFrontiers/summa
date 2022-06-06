@@ -33,7 +33,7 @@ pest_derive = "2.5"
 prost = "0.11"
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.6.1"
-safe-regex = "0.2.5"
+regex = "1.8"
 serde = { version = "1.0", default_features = false, features = ["derive", "std"] }
 serde_bytes = "0.11"
 serde_cbor = "0.11"

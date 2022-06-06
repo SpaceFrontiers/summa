@@ -8,6 +8,7 @@ use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader};
 ///
 /// ```rust
 /// use summa_core::collectors::ReservoirSampling;
+/// use summa_core::configs::core::QueryParserConfig;
 /// use tantivy::collector::Count;
 /// use summa_core::components::QueryParser;
 /// use tantivy::schema::{Schema, TEXT};
@@ -29,7 +30,7 @@ use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader};
 /// let searcher = reader.searcher();
 ///
 /// // Here comes the important part
-/// let query_parser = QueryParser::for_index(&index, vec!["title".to_string()]).unwrap();
+/// let query_parser = QueryParser::for_index(&index, QueryParserConfig::from_default_fields(vec!["title".to_string()])).unwrap();
 /// let query = query_parser.parse_query("diary").unwrap();
 /// let documents = searcher.search(&query, &ReservoirSampling::with_limit(2)).unwrap();
 ///

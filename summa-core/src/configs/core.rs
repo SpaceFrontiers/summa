@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::default::Default;
 
 use serde::{Deserialize, Serialize};
+use summa_proto::proto;
 use summa_proto::proto::IndexEngineConfig;
 
 use crate::errors::{BuilderError, SummaResult, ValidationError};
@@ -97,6 +98,24 @@ impl Config {
     pub fn delete_index_aliases(&mut self, index_aliases: &Vec<String>) {
         for alias in index_aliases {
             self.aliases.remove(alias);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct QueryParserConfig(pub proto::QueryParserConfig);
+impl QueryParserConfig {
+    pub fn from_default_fields(default_fields: Vec<String>) -> Self {
+        QueryParserConfig(proto::QueryParserConfig {
+            default_fields,
+            ..Default::default()
+        })
+    }
+    pub fn term_limit(&self) -> usize {
+        if self.0.term_limit > 0 {
+            self.0.term_limit as usize
+        } else {
+            16
         }
     }
 }

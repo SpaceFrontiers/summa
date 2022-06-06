@@ -125,7 +125,8 @@ impl Index {
             let core_config = self.server_config.read().await.get().core.clone();
             let index_engine_config_holder = self.derive_configs(&index_name).await;
             let merge_policy = core_config.indices[&index_name].merge_policy.clone();
-            let field_aliases = core_config.indices[&index_name].field_aliases.clone();
+            let query_parser_config = core_config.indices[&index_name].query_parser_config.as_ref().cloned().unwrap_or_default();
+            let default_fields = query_parser_config.default_fields.clone();
             let index_holder = tokio::task::spawn_blocking(move || {
                 IndexHolder::create_holder(
                     &core_config,
@@ -133,12 +134,12 @@ impl Index {
                     Some(&index_name),
                     index_engine_config_holder,
                     merge_policy,
-                    field_aliases,
+                    query_parser_config,
                     Driver::current_tokio(),
                 )
             })
             .await??;
-            index_holder.partial_warmup(false).await?;
+            index_holder.partial_warmup(false, &default_fields).await?;
             index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
         }
         info!(action = "setting_index_holders", indices = ?index_holders.keys().collect::<Vec<_>>());
@@ -195,7 +196,7 @@ impl Index {
         let core_config = self.server_config.read().await.get().core.clone();
         let index_engine_config_holder = self.derive_configs(index_name).await;
         let merge_policy = index_engine_config.merge_policy.clone();
-        let field_aliases = index_engine_config.field_aliases.clone();
+        let query_parser_config = index_engine_config.query_parser_config.as_ref().cloned().unwrap_or_default();
         let index_name = index_name.to_string();
         Ok(self
             .index_registry
@@ -207,7 +208,7 @@ impl Index {
                         Some(&index_name),
                         index_engine_config_holder,
                         merge_policy,
-                        field_aliases,
+                        query_parser_config,
                         Driver::current_tokio(),
                     )
                 })
@@ -220,6 +221,7 @@ impl Index {
     #[instrument(skip_all, fields(index_name = ?attach_index_request.index_name))]
     pub async fn attach_index(&self, attach_index_request: proto::AttachIndexRequest) -> SummaServerResult<Handler<IndexHolder>> {
         let index_path = self.server_config.read().await.get().get_path_for_index_data(&attach_index_request.index_name);
+        let query_parser_config = attach_index_request.query_parser_config;
         let (index, index_engine_config) = match attach_index_request.index_engine {
             None | Some(proto::attach_index_request::IndexEngine::File(proto::AttachFileEngineRequest {})) => {
                 if !index_path.exists() {
@@ -232,7 +234,8 @@ impl Index {
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::File(file_engine_config)),
                     merge_policy: attach_index_request.merge_policy,
-                    field_aliases: HashMap::new(),
+                    query_parser_config: query_parser_config.clone(),
+                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }
@@ -247,14 +250,17 @@ impl Index {
                 let index_engine_config = proto::IndexEngineConfig {
                     config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
                     merge_policy: attach_index_request.merge_policy,
-                    field_aliases: HashMap::new(),
+                    query_parser_config: query_parser_config.clone(),
+                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }
             _ => unimplemented!(),
         };
         let index_holder = self.insert_index(&attach_index_request.index_name, index, &index_engine_config).await?;
-        index_holder.partial_warmup(false).await?;
+        index_holder
+            .partial_warmup(false, &query_parser_config.map(|q| q.default_fields).unwrap_or_default())
+            .await?;
         Ok(index_holder)
     }
 
@@ -286,7 +292,9 @@ impl Index {
         let schema = validators::parse_schema(&create_index_request.schema)?;
 
         let mut index_attributes = create_index_request.index_attributes.unwrap_or_default();
-        validators::parse_fields(&schema, &index_attributes.default_fields)?;
+        let query_parser_config = create_index_request.query_parser_config;
+        let default_fields = query_parser_config.as_ref().map(|q| q.default_fields.clone()).unwrap_or_default();
+        validators::parse_fields(&schema, &default_fields)?;
         validators::parse_fields(&schema, &index_attributes.multi_fields)?;
         validators::parse_fields(&schema, &index_attributes.unique_fields)?;
 
@@ -313,7 +321,8 @@ impl Index {
                         path: index_path.to_string_lossy().to_string(),
                     })),
                     merge_policy: create_index_request.merge_policy,
-                    field_aliases: HashMap::new(),
+                    query_parser_config,
+                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }
@@ -324,13 +333,14 @@ impl Index {
                         schema: serde_yaml::to_string(&index.schema()).expect("cannot serialize"),
                     })),
                     merge_policy: create_index_request.merge_policy,
-                    field_aliases: HashMap::new(),
+                    query_parser_config,
+                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }
         };
         let index_holder = self.insert_index(&create_index_request.index_name, index, &index_engine_config).await?;
-        index_holder.partial_warmup(false).await?;
+        index_holder.partial_warmup(false, &default_fields).await?;
         Ok(index_holder)
     }
 
@@ -670,12 +680,10 @@ pub(crate) mod tests {
                 compression: 0,
                 blocksize: None,
                 sort_by_field: None,
-                index_attributes: Some(proto::IndexAttributes {
-                    default_fields: vec!["title".to_owned(), "body".to_owned()],
-                    ..Default::default()
-                }),
+                index_attributes: Some(proto::IndexAttributes { ..Default::default() }),
                 index_engine: Some(index_engine),
                 merge_policy: None,
+                query_parser_config: None,
             })
             .await
     }
@@ -694,6 +702,7 @@ pub(crate) mod tests {
                 index_attributes: None,
                 index_engine: Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})),
                 merge_policy: None,
+                query_parser_config: None,
             },)
             .await
             .is_ok());
@@ -707,6 +716,7 @@ pub(crate) mod tests {
                 index_attributes: None,
                 index_engine: Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})),
                 merge_policy: None,
+                query_parser_config: None,
             },)
             .await
             .is_err());
@@ -732,6 +742,7 @@ pub(crate) mod tests {
                 index_attributes: None,
                 index_engine: Some(proto::create_index_request::IndexEngine::File(proto::CreateFileEngineRequest {})),
                 merge_policy: None,
+                query_parser_config: None,
             })
             .await?;
         assert!(index_service
@@ -750,6 +761,7 @@ pub(crate) mod tests {
                 index_attributes: None,
                 index_engine: Some(proto::create_index_request::IndexEngine::Memory(proto::CreateMemoryEngineRequest {})),
                 merge_policy: None,
+                query_parser_config: None,
             },)
             .await
             .is_ok());

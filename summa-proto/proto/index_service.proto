@@ -76,6 +76,7 @@ message AttachIndexRequest {
     AttachRemoteEngineRequest remote = 3;
   }
   MergePolicy merge_policy = 10;
+  QueryParserConfig query_parser_config = 11;
 }
 
 // Description of the attached index
@@ -147,8 +148,6 @@ message IndexAttributes {
   uint64 created_at = 1;
   // Unique fields of the index. Summa maintains unique constraint on them and uses for deduplicating data
   repeated string unique_fields = 2;
-  // Default fields that are using in `MatchQuery`
-  repeated string default_fields = 3;
   // Multi fields is ones that may have multiple values and processed as lists. All other fields will be forcefully converted to singular value
   repeated string multi_fields = 4;
   // Descriptive field that may be used as name for index when indices are replicating over wire
@@ -181,6 +180,7 @@ message CreateIndexRequest {
   IndexAttributes index_attributes = 6;
   // Merge policy
   MergePolicy merge_policy = 20;
+  QueryParserConfig query_parser_config = 21;
 }
 
 message CreateIndexResponse {
@@ -354,8 +354,8 @@ message IndexEngineConfig {
   }
   // Merge policy
   MergePolicy merge_policy = 10;
-  map<string, string> field_aliases = 11;
-  // map<string, string> field_triggers = 12;
+  QueryParserConfig query_parser_config = 11;
+  map<string, string> field_triggers = 12;
 }
 
 // Description containing `Index` metadata fields

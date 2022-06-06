@@ -40,10 +40,11 @@ opentelemetry = { version = "0.19", features = ["metrics", "rt-tokio"], optional
 parking_lot = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }
+pluralize-rs = "0.1"
 prost = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
-safe-regex = { workspace = true }
+regex = { workspace = true }
 rustc-hash = "1.1.0"
 serde = { workspace = true }
 serde_bytes = { workspace = true }

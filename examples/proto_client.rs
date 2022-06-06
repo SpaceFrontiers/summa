@@ -92,7 +92,10 @@ async fn main() -> Result<(), tonic::Status> {
                 query: Some(proto::Query {
                     query: Some(proto::query::Query::Match(proto::MatchQuery {
                         value: "game".to_string(),
-                        default_fields: vec!["title".to_string(), "body".to_string()],
+                        query_parser_config: Some(proto::QueryParserConfig {
+                            default_fields: vec!["title".to_string(), "body".to_string()],
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     })),
                 }),

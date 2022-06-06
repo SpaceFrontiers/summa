@@ -76,14 +76,14 @@ impl IndexRegistry {
                 _ => unimplemented!(),
             };
             let core_config = this.core_config.read().await.get().clone();
-            let field_aliases = index_engine_config.field_aliases.clone();
+            let query_parser_config = index_engine_config.query_parser_config.as_ref().cloned().unwrap_or_default();
             let index_holder = IndexHolder::create_holder(
                 &core_config,
                 index,
                 index_name.as_deref(),
                 Arc::new(DirectProxy::new(index_engine_config)),
                 None,
-                field_aliases,
+                query_parser_config,
                 Driver::current_tokio(),
             )
             .unwrap();

@@ -23,7 +23,10 @@ pub mod proto_traits;
 ///                 query: Some(proto::Query {
 ///                     query: Some(proto::query::Query::Match(proto::MatchQuery {
 ///                         value: "game of thrones".to_string(),
-///                         default_fields: vec!["title".to_string()],
+///                         query_parser_config: Some(proto::QueryParserConfig {
+///                             default_fields: vec!["title".to_string()],
+///                             ..Default::default()
+///                         }),
 ///                         ..Default::default()
 ///                     })),
 ///                 }),
