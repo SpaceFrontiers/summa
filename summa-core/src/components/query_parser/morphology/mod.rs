@@ -1,11 +1,9 @@
-use std::thread_local;
-
-use rust_bert::pipelines::ner::Entity;
 use summa_proto::proto;
 use tantivy::query::{DisjunctionMaxQuery, Query, TermQuery};
 use tantivy::schema::{Field, FieldType, IndexRecordOption};
 
 mod english;
+#[cfg(feature = "nn")]
 mod english_nn;
 mod manager;
 

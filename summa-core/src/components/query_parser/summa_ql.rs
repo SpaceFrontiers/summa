@@ -6,7 +6,6 @@ use std::str::FromStr;
 use pest::iterators::{Pair, Pairs};
 use pest::Parser;
 use pest_derive::Parser;
-use rust_bert::pipelines::ner::NERModel;
 use summa_proto::proto;
 use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
@@ -294,7 +293,7 @@ impl QueryParser {
 
     fn parse_words(&self, field: Field, option: &TextFieldIndexing, words: &str) -> Result<Vec<(usize, Term)>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(field);
-        let text_analyzer = self.get_text_analyzer(field_entry, option)?;
+        let mut text_analyzer = self.get_text_analyzer(field_entry, option)?;
         let mut token_stream = text_analyzer.token_stream(words);
         let mut terms = Vec::new();
         token_stream.process(&mut |token| {
@@ -381,7 +380,8 @@ impl QueryParser {
 
                 match pre_term.as_rule() {
                     Rule::word | Rule::field_name => {
-                        let mut token_stream = self.get_text_analyzer(field_entry, indexing)?.token_stream(pre_term.as_str());
+                        let mut text_analyzer = self.get_text_analyzer(field_entry, indexing)?;
+                        let mut token_stream = text_analyzer.token_stream(pre_term.as_str());
                         let mut queries = Vec::new();
                         token_stream.process(&mut |token| {
                             let morphology_config = self
@@ -410,7 +410,8 @@ impl QueryParser {
 
                         match field_type {
                             FieldType::JsonObject(_) => {
-                                let mut token_stream = self.get_text_analyzer(field_entry, indexing)?.token_stream(words.as_str());
+                                let mut text_analyzer = self.get_text_analyzer(field_entry, indexing)?;
+                                let mut token_stream = text_analyzer.token_stream(words.as_str());
                                 let mut queries = Vec::new();
 
                                 token_stream.process(&mut |token| {
@@ -514,7 +515,7 @@ impl QueryParser {
                     // This should have been seen earlier really.
                     QueryParserError::FieldNotIndexed(field_entry.name().to_string())
                 })?;
-                let text_analyzer = self
+                let mut text_analyzer = self
                     .tokenizer_manager
                     .get(option.tokenizer())
                     .ok_or_else(|| QueryParserError::UnknownTokenizer {
@@ -650,6 +651,7 @@ impl QueryParser {
             let parsed_queries = self.parse_statement(pair)?;
             subqueries.push((Occur::Should, parsed_queries));
         }
+
         if let Some(top_level_phrase) = self.extract_top_level_phrase(pairs) {
             if let Some(ner_matches_promoter) = &self.query_parser_config.0.ner_matches_promoter {
                 if let Some(morphology) = self.morphology_manager.get(self.query_parser_config.0.query_language()) {
@@ -671,7 +673,7 @@ impl QueryParser {
                                         let Some(option) = str_option.get_indexing_options() else {
                                         continue
                                     };
-                                        let terms = match self.parse_words(field, option, &entity) {
+                                        let terms = match self.parse_words(field, option, entity) {
                                             Ok(terms) => terms,
                                             Err(err) => return Err(err),
                                         };
@@ -724,7 +726,6 @@ impl QueryParser {
                 )
             }
         }
-
         Ok(Box::new(BooleanQuery::new(subqueries.into_iter().take(self.query_parser_config.term_limit()).collect())) as Box<dyn Query>)
     }
 
@@ -1102,12 +1103,20 @@ mod tests {
     #[test]
     pub fn test_ner() {
         let mut query_parser = create_query_parser();
+        let mut morphology_configs = HashMap::new();
+        morphology_configs.insert(
+            "en".to_string(),
+            proto::MorphologyConfig {
+                derive_tenses_coefficient: Some(0.3),
+            },
+        );
+        query_parser.query_parser_config.0.morphology_configs = morphology_configs;
         query_parser.query_parser_config.0.ner_matches_promoter = Some(proto::NerMatchesPromoter {
             boost: Some(1.3),
             fields: vec!["title".to_string()],
         });
         query_parser.query_parser_config.0.query_language = Some("en".to_string());
-        let query = query_parser.parse_query("London is the capital of Great Britain");
+        let query = query_parser.parse_query("london is the capital of Great Britain");
         assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"london\"))), (Should, TermQuery(Term(field=0, type=Str, \"is\"))), (Should, TermQuery(Term(field=0, type=Str, \"the\"))), (Should, TermQuery(Term(field=0, type=Str, \"capital\"))), (Should, TermQuery(Term(field=0, type=Str, \"of\"))), (Should, TermQuery(Term(field=0, type=Str, \"great\"))), (Should, TermQuery(Term(field=0, type=Str, \"britain\"))), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"great\")), (1, Term(field=0, type=Str, \"britain\"))], slop: 0 }, boost=1.3))] })");
     }
 }

@@ -432,6 +432,12 @@ impl IndexHolder {
     ) -> SummaResult<Vec<IntermediateExtractionResult>> {
         let searcher = self.index_reader().searcher();
         trace!(action = "parse_query", index_name = ?self.index_name, query = ?query);
+        #[cfg(feature = "tokio-rt")]
+        let parsed_query = {
+            let query_parser = self.query_parser.clone();
+            tokio::task::spawn_blocking(move || query_parser.parse_query(query)).await??
+        };
+        #[cfg(not(feature = "tokio-rt"))]
         let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         trace!(action = "build_extractors", index_name = ?self.index_name);
@@ -467,6 +473,12 @@ impl IndexHolder {
 
     /// Delete `SummaDocument` by `unq`
     pub async fn delete_documents(&self, query: proto::query::Query) -> SummaResult<u64> {
+        #[cfg(feature = "tokio-rt")]
+        let parsed_query = {
+            let query_parser = self.query_parser.clone();
+            tokio::task::spawn_blocking(move || query_parser.parse_query(query)).await??
+        };
+        #[cfg(not(feature = "tokio-rt"))]
         let parsed_query = self.query_parser.parse_query(query)?;
         self.index_writer_holder()?.read().await.delete_by_query(parsed_query)
     }

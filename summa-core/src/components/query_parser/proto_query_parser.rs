@@ -27,6 +27,7 @@ use crate::errors::{Error, SummaResult, ValidationError};
 use crate::metrics::ToLabel;
 
 /// Responsible for casting `crate::proto::Query` message to `tantivy::query::Query`
+#[derive(Clone)]
 pub struct ProtoQueryParser {
     index: Index,
     index_name: String,
@@ -193,10 +194,10 @@ impl ProtoQueryParser {
                 if let Some(query_parser_config) = match_query_proto.query_parser_config {
                     new_query_parser_config.merge(QueryParserConfig(query_parser_config));
                 }
-                let nested_query_parser = QueryParser::for_index(&self.index, new_query_parser_config, &self.morphology_manager)?;
+                let nested_query_parser = QueryParser::for_index(&self.index, new_query_parser_config.clone(), &self.morphology_manager)?;
                 match nested_query_parser.parse_query(&match_query_proto.value) {
                     Ok(parsed_query) => {
-                        info!(parsed_match_query = ?parsed_query);
+                        info!(query = ?match_query_proto.value, parsed_match_query = ?parsed_query, query_parser_config = ?new_query_parser_config);
                         Ok(parsed_query)
                     }
                     Err(QueryParserError::FieldDoesNotExist(field)) => Err(ValidationError::MissingField(field).into()),
@@ -225,7 +226,7 @@ impl ProtoQueryParser {
             }
             proto::query::Query::Phrase(phrase_query_proto) => {
                 let (field, full_path, field_entry) = self.field_and_field_entry(&phrase_query_proto.field)?;
-                let tokenizer = self.index.tokenizer_for_field(field)?;
+                let mut tokenizer = self.index.tokenizer_for_field(field)?;
 
                 let mut token_stream = tokenizer.token_stream(&phrase_query_proto.value);
                 let mut terms: Vec<(usize, Term)> = vec![];

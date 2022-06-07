@@ -6,7 +6,7 @@ url_end = _{ WHITE_SPACE | "," }
 
 isbn = @{ "978" ~ ("-"? ~ ASCII_DIGIT){7,10} ~ EOI }
 doi = @{ "10." ~ ASCII_DIGIT{4,9} ~ WHITE_SPACE? ~ "/" ~ WHITE_SPACE? ~ (!WHITE_SPACE ~ ANY)+ }
-wrapped_doi = _{ ("http" ~ "s"? ~ "://")? ~ "doi.org/"? ~ doi }
+wrapped_doi = _{ ("http" ~ "s"? ~ "://")? ~ "dx."? ~"doi.org/"? ~ doi }
 // url = _{ ("http" ~ "s"? ~ "://")? ~ (!url_end ~ ANY)+ }
 
 slop = @{ DECIMAL_NUMBER+ }

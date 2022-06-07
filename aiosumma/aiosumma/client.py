@@ -72,6 +72,7 @@ class SummaClient(BaseGrpcClient):
             index_name: str,
             index_engine: dict,
             merge_policy: Optional[Dict] = None,
+            query_parser_config: Optional[Dict] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.AttachIndexResponse:
@@ -82,13 +83,18 @@ class SummaClient(BaseGrpcClient):
             index_name: index name
             index_engine: {"file": {}}, {"memory": {}} or {"remote": {"cache_config": {"cache_size": ...}}}
             merge_policy: describes how to select segments for merging, possible values: {"log": {}}, {"temporal": {}}
+            query_parser_config: describes how to parse queries by default.
             request_id: request id
             session_id: session id
         """
+        query_parser_config_pb = query_pb.QueryParserConfig()
+        if query_parser_config:
+            ParseDict(query_parser_config, query_parser_config_pb)
         return await self.stubs['index_api'].attach_index(
             index_service_pb.AttachIndexRequest(
                 index_name=index_name,
                 merge_policy=index_service_pb.MergePolicy(**(merge_policy or {})),
+                query_parser_config=query_parser_config_pb,
                 **index_engine,
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -193,6 +199,7 @@ class SummaClient(BaseGrpcClient):
             sort_by_field: Optional[Tuple] = None,
             index_attributes: Optional[Dict] = None,
             merge_policy: Optional[Dict] = None,
+            query_parser_config: Optional[Dict] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.CreateIndexResponse:
@@ -207,6 +214,7 @@ class SummaClient(BaseGrpcClient):
             blocksize: Docstore blocksize
             index_attributes: Various index attributes such as default fields, multi fields, primary keys etc.
             merge_policy: describes how to select segments for merging, possible values: {"log": {}}, {"temporal": {}}
+            query_parser_config: describes how to parse queries by default.
             request_id: request id
             session_id: session id
             sort_by_field: (field_name, order)
@@ -217,6 +225,11 @@ class SummaClient(BaseGrpcClient):
             compression = index_service_pb.Compression.Name(compression)
         if isinstance(schema, list):
             schema = json.dumps(schema)
+
+        query_parser_config_pb = query_pb.QueryParserConfig()
+        if query_parser_config:
+            ParseDict(query_parser_config, query_parser_config_pb)
+
         return await self.stubs['index_api'].create_index(
             index_service_pb.CreateIndexRequest(
                 index_name=index_name,
@@ -229,6 +242,7 @@ class SummaClient(BaseGrpcClient):
                     order=sort_by_field[1].capitalize(),
                 ) if sort_by_field else None,
                 merge_policy=index_service_pb.MergePolicy(**(merge_policy or {})),
+                query_parser_config=query_parser_config_pb,
                 **index_engine
             ),
             metadata=setup_metadata(session_id, request_id),

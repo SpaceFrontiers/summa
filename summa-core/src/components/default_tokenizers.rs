@@ -325,20 +325,25 @@ const STOP_WORDS: [&str; 318] = [
 ];
 
 /// Instantiate default tokenizers
-pub fn default_tokenizers() -> [(String, TextAnalyzer); 3] {
+pub fn default_tokenizers() -> [(String, TextAnalyzer); 4] {
     let summa_tokenizer = TextAnalyzer::builder(SummaTokenizer)
         .filter(RemoveLongFilter::limit(100))
         .filter(LowerCaser)
         .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
         .build();
-    let default_tokenizer = TextAnalyzer::builder(SimpleTokenizer)
+    let summa_without_stop_words_tokenizer = TextAnalyzer::builder(SummaTokenizer)
+        .filter(RemoveLongFilter::limit(100))
+        .filter(LowerCaser)
+        .build();
+    let default_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(100))
         .filter(LowerCaser)
         .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
         .build();
-    let raw_tokenizer = TextAnalyzer::builder(RawTokenizer).filter(LowerCaser).build();
+    let raw_tokenizer = TextAnalyzer::builder(RawTokenizer::default()).filter(LowerCaser).build();
     [
         ("summa".to_owned(), summa_tokenizer),
+        ("summa_without_stop_words".to_owned(), summa_without_stop_words_tokenizer),
         ("default".to_owned(), default_tokenizer),
         ("raw".to_owned(), raw_tokenizer),
     ]

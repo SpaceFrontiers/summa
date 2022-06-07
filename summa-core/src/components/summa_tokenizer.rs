@@ -16,7 +16,7 @@ pub struct SummaTokenStream<'a> {
 impl Tokenizer for SummaTokenizer {
     type TokenStream<'a> = SummaTokenStream<'a>;
 
-    fn token_stream<'a>(&self, text: &'a str) -> SummaTokenStream<'a> {
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> SummaTokenStream<'a> {
         let mut chars = text.char_indices();
         SummaTokenStream {
             text,
@@ -109,7 +109,7 @@ pub mod tests {
                 .filter(LowerCaser)
                 .build(),
         );
-        let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
+        let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
@@ -133,7 +133,7 @@ pub mod tests {
                 .filter(LowerCaser)
                 .build(),
         );
-        let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
+        let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
@@ -161,7 +161,7 @@ pub mod tests {
                 .filter(LowerCaser)
                 .build(),
         );
-        let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
+        let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
@@ -196,7 +196,7 @@ pub mod tests {
                 .filter(LowerCaser)
                 .build(),
         );
-        let tokenizer = tokenizer_manager.get("tokenizer").unwrap();
+        let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
