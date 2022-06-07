@@ -6,16 +6,18 @@ use std::str::FromStr;
 use pest::iterators::{Pair, Pairs};
 use pest::Parser;
 use pest_derive::Parser;
+use rust_bert::pipelines::ner::NERModel;
 use summa_proto::proto;
-use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 use tantivy::{Index, Term};
 use tantivy_query_grammar::Occur;
 
+use crate::components::query_parser::morphology::MorphologyManager;
 use crate::components::query_parser::proto_query_parser::QueryParserDefaultMode;
 use crate::components::query_parser::term_field_mappers::{DoiIsbnMapper, DoiMapper, IsbnMapper, TermFieldMapper};
+use crate::components::query_parser::utils::cast_field_to_term;
 use crate::configs::core::QueryParserConfig;
 use crate::errors::SummaResult;
 use crate::utils::transpose;
@@ -28,6 +30,7 @@ struct SummaQlParser;
 pub struct QueryParser {
     schema: Schema,
     tokenizer_manager: TokenizerManager,
+    morphology_manager: MorphologyManager,
     query_parser_config: QueryParserConfig,
 }
 
@@ -176,40 +179,26 @@ fn reduce_empty_queries(query: Box<dyn Query>) -> Box<dyn Query> {
     query
 }
 
-pub fn cast_field_to_term(field: &Field, full_path: &str, field_type: &FieldType, value: &str, force_str: bool) -> Term {
-    match field_type {
-        FieldType::Str(_) => Term::from_field_text(*field, value),
-        FieldType::JsonObject(ref json_options) => {
-            let mut term = Term::with_capacity(128);
-            let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*field, full_path, json_options.is_expand_dots_enabled(), &mut term);
-            if force_str {
-                json_term_writer.set_str(value);
-                json_term_writer.term().clone()
-            } else {
-                convert_to_fast_value_and_get_term(&mut json_term_writer, value).unwrap_or_else(|| {
-                    json_term_writer.set_str(value);
-                    json_term_writer.term().clone()
-                })
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-
 type Subqueries = Vec<(Occur, Box<dyn Query>)>;
 
 impl QueryParser {
-    pub fn new(schema: Schema, query_parser_config: QueryParserConfig, tokenizer_manager: &TokenizerManager) -> SummaResult<QueryParser> {
+    pub fn new(
+        schema: Schema,
+        query_parser_config: QueryParserConfig,
+        morphology_manager: &MorphologyManager,
+        tokenizer_manager: &TokenizerManager,
+    ) -> SummaResult<QueryParser> {
         validators::parse_fields(&schema, &query_parser_config.0.default_fields)?;
         Ok(QueryParser {
             schema,
+            morphology_manager: morphology_manager.clone(),
             tokenizer_manager: tokenizer_manager.clone(),
             query_parser_config,
         })
     }
 
-    pub fn for_index(index: &Index, query_parser_config: QueryParserConfig) -> SummaResult<QueryParser> {
-        QueryParser::new(index.schema(), query_parser_config, index.tokenizers())
+    pub fn for_index(index: &Index, query_parser_config: QueryParserConfig, morphology_manager: &MorphologyManager) -> SummaResult<QueryParser> {
+        QueryParser::new(index.schema(), query_parser_config, morphology_manager, index.tokenizers())
     }
 
     pub fn resolve_field_name<'a>(&'a self, field_name: &'a str) -> &str {
@@ -395,39 +384,20 @@ impl QueryParser {
                         let mut token_stream = self.get_text_analyzer(field_entry, indexing)?.token_stream(pre_term.as_str());
                         let mut queries = Vec::new();
                         token_stream.process(&mut |token| {
-                            let term = cast_field_to_term(field, full_path, field_type, &token.text, false);
-                            let inflection_config = self
+                            let morphology_config = self
                                 .query_parser_config
                                 .0
-                                .inflection_configs
+                                .morphology_configs
                                 .get(field_entry.name())
                                 .cloned()
                                 .unwrap_or_default();
-                            if let Some(derive_plural_coefficient) = inflection_config.derive_plural_coefficient {
-                                let is_singular = pluralize_rs::is_singular(&token.text);
-                                let is_plural = pluralize_rs::is_plural(&token.text);
-                                let other_token = if is_singular {
-                                    Some(pluralize_rs::to_plural(&token.text))
-                                } else if is_plural {
-                                    Some(pluralize_rs::to_singular(&token.text))
-                                } else {
-                                    None
-                                };
-                                if let Some(other_token) = other_token {
-                                    let other_term = cast_field_to_term(field, full_path, field_type, &other_token, false);
-                                    let disjunction_query = DisjunctionMaxQuery::with_tie_breaker(
-                                        vec![
-                                            Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                                            Box::new(TermQuery::new(other_term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-                                        ],
-                                        derive_plural_coefficient,
-                                    );
-                                    queries.push(boost_query(Box::new(disjunction_query) as Box<dyn Query>, boost))
-                                }
+                            let query = if let Some(morphology) = self.morphology_manager.get(self.query_parser_config.0.query_language()) {
+                                morphology.derive_query(morphology_config, field, full_path, field_type, &token.text)
                             } else {
-                                let query = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
-                                queries.push(boost_query(query, boost));
-                            }
+                                let term = cast_field_to_term(field, full_path, field_type, &token.text, false);
+                                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>
+                            };
+                            queries.push(boost_query(query, boost))
                         });
                         Ok(queries)
                     }
@@ -680,14 +650,54 @@ impl QueryParser {
             let parsed_queries = self.parse_statement(pair)?;
             subqueries.push((Occur::Should, parsed_queries));
         }
-
-        if let Some(exact_matches_promoter) = &self.query_parser_config.0.exact_matches_promoter {
-            if let Some(top_level_phrase) = self.extract_top_level_phrase(pairs) {
+        if let Some(top_level_phrase) = self.extract_top_level_phrase(pairs) {
+            if let Some(ner_matches_promoter) = &self.query_parser_config.0.ner_matches_promoter {
+                if let Some(morphology) = self.morphology_manager.get(self.query_parser_config.0.query_language()) {
+                    let fields = if ner_matches_promoter.fields.is_empty() {
+                        self.query_parser_config.0.default_fields.iter()
+                    } else {
+                        ner_matches_promoter.fields.iter()
+                    };
+                    let entities = morphology.detect_ners(&top_level_phrase);
+                    subqueries.extend(
+                        fields
+                            .map(|field| {
+                                let mut subsubqueries = vec![];
+                                for entity in &entities {
+                                    let field = self.schema.get_field(field).expect("no field");
+                                    let field_entry = self.schema.get_field_entry(field);
+                                    let field_boost = self.query_parser_config.0.field_boosts.get(field_entry.name()).copied();
+                                    if let FieldType::Str(ref str_option) = field_entry.field_type() {
+                                        let Some(option) = str_option.get_indexing_options() else {
+                                        continue
+                                    };
+                                        let terms = match self.parse_words(field, option, &entity) {
+                                            Ok(terms) => terms,
+                                            Err(err) => return Err(err),
+                                        };
+                                        if terms.len() > 1 && option.index_option().has_positions() {
+                                            let query = Box::new(PhraseQuery::new_with_offset(terms)) as Box<dyn Query>;
+                                            subsubqueries.push(boost_query(query, multiply_boosts(ner_matches_promoter.boost, field_boost)))
+                                        }
+                                    }
+                                }
+                                Ok(subsubqueries)
+                            })
+                            .collect::<Result<Vec<Vec<_>>, _>>()?
+                            .into_iter()
+                            .flatten()
+                            .map(|q| (Occur::Should, q)),
+                    )
+                }
+            }
+            if let Some(exact_matches_promoter) = &self.query_parser_config.0.exact_matches_promoter {
+                let fields = if exact_matches_promoter.fields.is_empty() {
+                    self.query_parser_config.0.default_fields.iter()
+                } else {
+                    exact_matches_promoter.fields.iter()
+                };
                 subqueries.extend(
-                    self.query_parser_config
-                        .0
-                        .default_fields
-                        .iter()
+                    fields
                         .filter_map(|field| {
                             let field = self.schema.get_field(field).expect("no field");
                             let field_entry = self.schema.get_field_entry(field);
@@ -714,6 +724,7 @@ impl QueryParser {
                 )
             }
         }
+
         Ok(Box::new(BooleanQuery::new(subqueries.into_iter().take(self.query_parser_config.term_limit()).collect())) as Box<dyn Query>)
     }
 
@@ -735,6 +746,7 @@ mod tests {
 
     fn create_query_parser() -> QueryParser {
         let tokenizer_manager = TokenizerManager::default();
+        let morphology_manager = MorphologyManager::default();
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("title", TEXT);
         schema_builder.add_text_field("body", TEXT);
@@ -747,7 +759,7 @@ mod tests {
             default_fields: vec!["title".to_string()],
             ..Default::default()
         });
-        QueryParser::new(schema, query_parser_config, &tokenizer_manager).expect("cannot create parser")
+        QueryParser::new(schema, query_parser_config, &morphology_manager, &tokenizer_manager).expect("cannot create parser")
     }
 
     fn create_complex_query_parser() -> QueryParser {
@@ -759,6 +771,7 @@ mod tests {
                 .filter(LowerCaser)
                 .build(),
         );
+        let morphology_manager = MorphologyManager::default();
         let mut schema_builder = Schema::builder();
         let text_options = TextOptions::default().set_indexing_options(
             TextFieldIndexing::default()
@@ -778,7 +791,7 @@ mod tests {
             default_fields: vec!["title".to_string(), "body".to_string()],
             ..Default::default()
         });
-        QueryParser::new(schema, query_parser_config, &tokenizer_manager).expect("cannot create parser")
+        QueryParser::new(schema, query_parser_config, &morphology_manager, &tokenizer_manager).expect("cannot create parser")
     }
 
     #[test]
@@ -1056,7 +1069,11 @@ mod tests {
     #[test]
     pub fn test_exact_phrase_promoter() {
         let mut query_parser = create_query_parser();
-        query_parser.query_parser_config.0.exact_matches_promoter = Some(proto::ExactMatchesPromoter { slop: 3, boost: Some(2.0) });
+        query_parser.query_parser_config.0.exact_matches_promoter = Some(proto::ExactMatchesPromoter {
+            slop: 3,
+            boost: Some(2.0),
+            fields: vec![],
+        });
         let query = query_parser.parse_query("old school holy-wood");
         assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"old\"))), (Should, TermQuery(Term(field=0, type=Str, \"school\"))), (Should, TermQuery(Term(field=0, type=Str, \"holy\"))), (Should, TermQuery(Term(field=0, type=Str, \"wood\"))), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"old\")), (1, Term(field=0, type=Str, \"school\")), (2, Term(field=0, type=Str, \"holy\")), (3, Term(field=0, type=Str, \"wood\"))], slop: 3 }, boost=2))] })");
         let query = query_parser.parse_query("old^2.0 school");
@@ -1069,15 +1086,28 @@ mod tests {
     #[test]
     pub fn test_inflection() {
         let mut query_parser = create_query_parser();
-        let mut inflection_configs = HashMap::new();
-        inflection_configs.insert(
+        let mut morphology_configs = HashMap::new();
+        morphology_configs.insert(
             "title".to_string(),
-            proto::InflectionConfig {
-                derive_plural_coefficient: Some(0.3),
+            proto::MorphologyConfig {
+                derive_tenses_coefficient: Some(0.3),
             },
         );
-        query_parser.query_parser_config.0.inflection_configs = inflection_configs;
+        query_parser.query_parser_config.0.morphology_configs = morphology_configs;
+        query_parser.query_parser_config.0.query_language = Some("en".to_string());
         let query = query_parser.parse_query("search engine");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"search\")), TermQuery(Term(field=0, type=Str, \"searches\"))], tie_breaker: 0.3 }), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.0 })] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.3 })] })");
+    }
+
+    #[test]
+    pub fn test_ner() {
+        let mut query_parser = create_query_parser();
+        query_parser.query_parser_config.0.ner_matches_promoter = Some(proto::NerMatchesPromoter {
+            boost: Some(1.3),
+            fields: vec!["title".to_string()],
+        });
+        query_parser.query_parser_config.0.query_language = Some("en".to_string());
+        let query = query_parser.parse_query("London is the capital of Great Britain");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"london\"))), (Should, TermQuery(Term(field=0, type=Str, \"is\"))), (Should, TermQuery(Term(field=0, type=Str, \"the\"))), (Should, TermQuery(Term(field=0, type=Str, \"capital\"))), (Should, TermQuery(Term(field=0, type=Str, \"of\"))), (Should, TermQuery(Term(field=0, type=Str, \"great\"))), (Should, TermQuery(Term(field=0, type=Str, \"britain\"))), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"great\")), (1, Term(field=0, type=Str, \"britain\"))], slop: 0 }, boost=1.3))] })");
     }
 }

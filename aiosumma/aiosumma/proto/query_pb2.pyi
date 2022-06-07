@@ -207,12 +207,14 @@ class EmptyQuery(_message.Message):
     def __init__(self) -> None: ...
 
 class ExactMatchesPromoter(_message.Message):
-    __slots__ = ["boost", "slop"]
+    __slots__ = ["boost", "fields", "slop"]
     BOOST_FIELD_NUMBER: _ClassVar[int]
+    FIELDS_FIELD_NUMBER: _ClassVar[int]
     SLOP_FIELD_NUMBER: _ClassVar[int]
     boost: float
+    fields: _containers.RepeatedScalarFieldContainer[str]
     slop: int
-    def __init__(self, slop: _Optional[int] = ..., boost: _Optional[float] = ...) -> None: ...
+    def __init__(self, slop: _Optional[int] = ..., boost: _Optional[float] = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ExistsQuery(_message.Message):
     __slots__ = ["field"]
@@ -286,12 +288,6 @@ class HistogramResult(_message.Message):
     buckets: _containers.RepeatedCompositeFieldContainer[BucketEntry]
     def __init__(self, buckets: _Optional[_Iterable[_Union[BucketEntry, _Mapping]]] = ...) -> None: ...
 
-class InflectionConfig(_message.Message):
-    __slots__ = ["derive_plural"]
-    DERIVE_PLURAL_FIELD_NUMBER: _ClassVar[int]
-    derive_plural: bool
-    def __init__(self, derive_plural: bool = ...) -> None: ...
-
 class Key(_message.Message):
     __slots__ = ["f64", "str"]
     F64_FIELD_NUMBER: _ClassVar[int]
@@ -356,6 +352,20 @@ class MoreLikeThisQuery(_message.Message):
     stop_words: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, document: _Optional[str] = ..., min_doc_frequency: _Optional[int] = ..., max_doc_frequency: _Optional[int] = ..., min_term_frequency: _Optional[int] = ..., max_query_terms: _Optional[int] = ..., min_word_length: _Optional[int] = ..., max_word_length: _Optional[int] = ..., boost: _Optional[str] = ..., stop_words: _Optional[_Iterable[str]] = ...) -> None: ...
 
+class MorphologyConfig(_message.Message):
+    __slots__ = ["derive_tenses_coefficient"]
+    DERIVE_TENSES_COEFFICIENT_FIELD_NUMBER: _ClassVar[int]
+    derive_tenses_coefficient: float
+    def __init__(self, derive_tenses_coefficient: _Optional[float] = ...) -> None: ...
+
+class NerMatchesPromoter(_message.Message):
+    __slots__ = ["boost", "fields"]
+    BOOST_FIELD_NUMBER: _ClassVar[int]
+    FIELDS_FIELD_NUMBER: _ClassVar[int]
+    boost: float
+    fields: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, boost: _Optional[float] = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
+
 class PhraseQuery(_message.Message):
     __slots__ = ["field", "slop", "value"]
     FIELD_FIELD_NUMBER: _ClassVar[int]
@@ -395,7 +405,7 @@ class Query(_message.Message):
     def __init__(self, boolean: _Optional[_Union[BooleanQuery, _Mapping]] = ..., match: _Optional[_Union[MatchQuery, _Mapping]] = ..., regex: _Optional[_Union[RegexQuery, _Mapping]] = ..., term: _Optional[_Union[TermQuery, _Mapping]] = ..., phrase: _Optional[_Union[PhraseQuery, _Mapping]] = ..., range: _Optional[_Union[RangeQuery, _Mapping]] = ..., all: _Optional[_Union[AllQuery, _Mapping]] = ..., more_like_this: _Optional[_Union[MoreLikeThisQuery, _Mapping]] = ..., boost: _Optional[_Union[BoostQuery, _Mapping]] = ..., disjunction_max: _Optional[_Union[DisjunctionMaxQuery, _Mapping]] = ..., empty: _Optional[_Union[EmptyQuery, _Mapping]] = ..., exists: _Optional[_Union[ExistsQuery, _Mapping]] = ...) -> None: ...
 
 class QueryParserConfig(_message.Message):
-    __slots__ = ["boolean_should_mode", "default_fields", "disjuction_max_mode", "exact_matches_promoter", "field_aliases", "field_boosts", "field_mappings", "inflection_configs", "missing_field_policy", "term_limit"]
+    __slots__ = ["boolean_should_mode", "default_fields", "disjuction_max_mode", "exact_matches_promoter", "field_aliases", "field_boosts", "field_mappings", "missing_field_policy", "morphology_configs", "ner_matches_promoter", "query_language", "term_limit"]
     class FieldAliasesEntry(_message.Message):
         __slots__ = ["key", "value"]
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -417,13 +427,13 @@ class QueryParserConfig(_message.Message):
         key: str
         value: FieldMapper
         def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[FieldMapper, _Mapping]] = ...) -> None: ...
-    class InflectionConfigsEntry(_message.Message):
+    class MorphologyConfigsEntry(_message.Message):
         __slots__ = ["key", "value"]
         KEY_FIELD_NUMBER: _ClassVar[int]
         VALUE_FIELD_NUMBER: _ClassVar[int]
         key: str
-        value: InflectionConfig
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[InflectionConfig, _Mapping]] = ...) -> None: ...
+        value: MorphologyConfig
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[MorphologyConfig, _Mapping]] = ...) -> None: ...
     BOOLEAN_SHOULD_MODE_FIELD_NUMBER: _ClassVar[int]
     DEFAULT_FIELDS_FIELD_NUMBER: _ClassVar[int]
     DISJUCTION_MAX_MODE_FIELD_NUMBER: _ClassVar[int]
@@ -431,8 +441,10 @@ class QueryParserConfig(_message.Message):
     FIELD_ALIASES_FIELD_NUMBER: _ClassVar[int]
     FIELD_BOOSTS_FIELD_NUMBER: _ClassVar[int]
     FIELD_MAPPINGS_FIELD_NUMBER: _ClassVar[int]
-    INFLECTION_CONFIGS_FIELD_NUMBER: _ClassVar[int]
     MISSING_FIELD_POLICY_FIELD_NUMBER: _ClassVar[int]
+    MORPHOLOGY_CONFIGS_FIELD_NUMBER: _ClassVar[int]
+    NER_MATCHES_PROMOTER_FIELD_NUMBER: _ClassVar[int]
+    QUERY_LANGUAGE_FIELD_NUMBER: _ClassVar[int]
     TERM_LIMIT_FIELD_NUMBER: _ClassVar[int]
     boolean_should_mode: MatchQueryBooleanShouldMode
     default_fields: _containers.RepeatedScalarFieldContainer[str]
@@ -441,10 +453,12 @@ class QueryParserConfig(_message.Message):
     field_aliases: _containers.ScalarMap[str, str]
     field_boosts: _containers.ScalarMap[str, float]
     field_mappings: _containers.MessageMap[str, FieldMapper]
-    inflection_configs: _containers.MessageMap[str, InflectionConfig]
     missing_field_policy: MissingFieldPolicy
+    morphology_configs: _containers.MessageMap[str, MorphologyConfig]
+    ner_matches_promoter: NerMatchesPromoter
+    query_language: str
     term_limit: int
-    def __init__(self, field_aliases: _Optional[_Mapping[str, str]] = ..., field_boosts: _Optional[_Mapping[str, float]] = ..., field_mappings: _Optional[_Mapping[str, FieldMapper]] = ..., term_limit: _Optional[int] = ..., default_fields: _Optional[_Iterable[str]] = ..., boolean_should_mode: _Optional[_Union[MatchQueryBooleanShouldMode, _Mapping]] = ..., disjuction_max_mode: _Optional[_Union[MatchQueryDisjuctionMaxMode, _Mapping]] = ..., exact_matches_promoter: _Optional[_Union[ExactMatchesPromoter, _Mapping]] = ..., missing_field_policy: _Optional[_Union[MissingFieldPolicy, str]] = ..., inflection_configs: _Optional[_Mapping[str, InflectionConfig]] = ...) -> None: ...
+    def __init__(self, field_aliases: _Optional[_Mapping[str, str]] = ..., field_boosts: _Optional[_Mapping[str, float]] = ..., field_mappings: _Optional[_Mapping[str, FieldMapper]] = ..., term_limit: _Optional[int] = ..., default_fields: _Optional[_Iterable[str]] = ..., boolean_should_mode: _Optional[_Union[MatchQueryBooleanShouldMode, _Mapping]] = ..., disjuction_max_mode: _Optional[_Union[MatchQueryDisjuctionMaxMode, _Mapping]] = ..., exact_matches_promoter: _Optional[_Union[ExactMatchesPromoter, _Mapping]] = ..., missing_field_policy: _Optional[_Union[MissingFieldPolicy, str]] = ..., morphology_configs: _Optional[_Mapping[str, MorphologyConfig]] = ..., query_language: _Optional[str] = ..., ner_matches_promoter: _Optional[_Union[NerMatchesPromoter, _Mapping]] = ...) -> None: ...
 
 class RandomDocument(_message.Message):
     __slots__ = ["document", "index_alias", "score"]

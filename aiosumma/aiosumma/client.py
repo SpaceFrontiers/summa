@@ -1,8 +1,19 @@
 import sys
-from typing import AsyncIterator, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    AsyncIterator,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import orjson as json
-from aiogrpcclient import BaseGrpcClient, expose
+from aiogrpcclient import (
+    BaseGrpcClient,
+    expose,
+)
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
@@ -16,7 +27,10 @@ from .proto.consumer_service_pb2_grpc import ConsumerApiStub
 from .proto.index_service_pb2_grpc import IndexApiStub
 from .proto.reflection_service_pb2_grpc import ReflectionApiStub
 from .proto.search_service_pb2_grpc import SearchApiStub
-from .proto.utils_pb2 import Asc, Desc  # noqa
+from .proto.utils_pb2 import (  # noqa
+    Asc,
+    Desc,
+)
 
 
 def setup_metadata(session_id, request_id):

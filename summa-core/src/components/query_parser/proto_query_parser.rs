@@ -19,6 +19,7 @@ use tantivy::{DateTime, Index, Score, Term};
 use tracing::info;
 
 use crate::components::queries::ExistsQuery;
+use crate::components::query_parser::morphology::MorphologyManager;
 use crate::components::query_parser::{QueryParser, QueryParserError};
 use crate::configs::core::QueryParserConfig;
 use crate::errors::{Error, SummaResult, ValidationError};
@@ -36,6 +37,7 @@ pub struct ProtoQueryParser {
     #[cfg(feature = "metrics")]
     subquery_counter: Counter<u64>,
     query_parser_config: QueryParserConfig,
+    morphology_manager: MorphologyManager,
 }
 
 pub enum QueryParserDefaultMode {
@@ -124,6 +126,7 @@ impl ProtoQueryParser {
             #[cfg(feature = "metrics")]
             subquery_counter,
             query_parser_config: QueryParserConfig(query_parser_config),
+            morphology_manager: MorphologyManager::default(),
         })
     }
 
@@ -190,7 +193,7 @@ impl ProtoQueryParser {
                 if let Some(query_parser_config) = match_query_proto.query_parser_config {
                     new_query_parser_config.merge(QueryParserConfig(query_parser_config));
                 }
-                let nested_query_parser = QueryParser::for_index(&self.index, new_query_parser_config)?;
+                let nested_query_parser = QueryParser::for_index(&self.index, new_query_parser_config, &self.morphology_manager)?;
                 match nested_query_parser.parse_query(&match_query_proto.value) {
                     Ok(parsed_query) => {
                         info!(parsed_match_query = ?parsed_query);

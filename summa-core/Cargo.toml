@@ -45,6 +45,7 @@ prost = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
+rust-bert = { version = "0.21", features = ["download-libtorch"] }
 rustc-hash = "1.1.0"
 serde = { workspace = true }
 serde_bytes = { workspace = true }

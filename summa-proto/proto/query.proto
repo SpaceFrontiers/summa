@@ -15,6 +15,11 @@ message MatchQueryDisjuctionMaxMode {
 message ExactMatchesPromoter {
   uint32 slop = 1;
   optional float boost = 2;
+  repeated string fields = 3;
+}
+message NerMatchesPromoter {
+  optional float boost = 1;
+  repeated string fields = 2;
 }
 enum MissingFieldPolicy {
   AsUsualTerms = 0;
@@ -22,8 +27,8 @@ enum MissingFieldPolicy {
   Fail = 2;
 }
 
-message InflectionConfig {
-  optional float derive_plural_coefficient = 1;
+message MorphologyConfig {
+  optional float derive_tenses_coefficient = 1;
 }
 
 message QueryParserConfig {
@@ -38,7 +43,9 @@ message QueryParserConfig {
   }
   ExactMatchesPromoter exact_matches_promoter = 8;
   MissingFieldPolicy missing_field_policy = 9;
-  map<string, InflectionConfig> inflection_configs = 10;
+  map<string, MorphologyConfig> morphology_configs = 10;
+  optional string query_language = 11;
+  NerMatchesPromoter ner_matches_promoter = 12;
 }
 
 message SearchResponse {

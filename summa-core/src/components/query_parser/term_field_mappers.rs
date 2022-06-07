@@ -2,7 +2,7 @@ use regex::Regex;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{IndexRecordOption, Schema};
 
-use crate::components::query_parser::summa_ql::cast_field_to_term;
+use crate::components::query_parser::utils::cast_field_to_term;
 
 pub trait TermFieldMapper {
     fn map(&self, value: &str) -> Option<Box<dyn Query>>;

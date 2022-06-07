@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "summa.proto.IndexAttributes",
         "summa.proto.InflectionConfig",
         "summa.proto.MoreLikeThisQuery",
+        "summa.proto.NerMatchConfig",
         "summa.proto.PhraseQuery",
         "summa.proto.QueryParserConfig",
         "summa.proto.ReservoirSamplingCollector",
