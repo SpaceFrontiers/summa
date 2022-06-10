@@ -15,7 +15,7 @@ use tantivy_query_grammar::Occur;
 
 use crate::components::query_parser::morphology::MorphologyManager;
 use crate::components::query_parser::proto_query_parser::QueryParserDefaultMode;
-use crate::components::query_parser::term_field_mappers::{DoiIsbnMapper, DoiMapper, IsbnMapper, TermFieldMapper};
+use crate::components::query_parser::term_field_mappers::TermFieldMappersManager;
 use crate::components::query_parser::utils::cast_field_to_term;
 use crate::configs::core::QueryParserConfig;
 use crate::errors::SummaResult;
@@ -30,6 +30,7 @@ pub struct QueryParser {
     schema: Schema,
     tokenizer_manager: TokenizerManager,
     morphology_manager: MorphologyManager,
+    term_field_mappers_manager: TermFieldMappersManager,
     query_parser_config: QueryParserConfig,
 }
 
@@ -189,10 +190,11 @@ impl QueryParser {
     ) -> SummaResult<QueryParser> {
         validators::parse_fields(&schema, &query_parser_config.0.default_fields)?;
         Ok(QueryParser {
-            schema,
+            term_field_mappers_manager: TermFieldMappersManager::new(&schema, tokenizer_manager),
             morphology_manager: morphology_manager.clone(),
             tokenizer_manager: tokenizer_manager.clone(),
             query_parser_config,
+            schema,
         })
     }
 
@@ -515,6 +517,7 @@ impl QueryParser {
                     // This should have been seen earlier really.
                     QueryParserError::FieldNotIndexed(field_entry.name().to_string())
                 })?;
+                let mut terms: Vec<Term> = Vec::new();
                 let mut text_analyzer = self
                     .tokenizer_manager
                     .get(option.tokenizer())
@@ -522,7 +525,6 @@ impl QueryParser {
                         field: field_entry.name().to_string(),
                         tokenizer: option.tokenizer().to_string(),
                     })?;
-                let mut terms: Vec<Term> = Vec::new();
                 let mut token_stream = text_analyzer.token_stream(phrase);
                 token_stream.process(&mut |token| {
                     let term = Term::from_field_text(field, &token.text);
@@ -617,25 +619,32 @@ impl QueryParser {
             }
             Rule::doi => {
                 let mut queries = vec![];
-                let doi_mapper = Box::new(DoiMapper::new(self.schema.clone(), vec!["doi".to_string()])) as Box<dyn TermFieldMapper>;
-                let doi_isbn_mapper = Box::new(DoiIsbnMapper::new(self.schema.clone(), vec!["metadata.isbns".to_string()])) as Box<dyn TermFieldMapper>;
 
-                for mapper in &[doi_mapper, doi_isbn_mapper] {
-                    if let Some(query) = mapper.map(isbn_doi_or_search_group_or_term.as_str()) {
-                        queries.push((Occur::Should, query));
+                for term_field_mapper_name in ["doi", "doi_isbn"] {
+                    if let Some(term_field_mapper_config) = self.query_parser_config.0.term_field_mapper_configs.get(term_field_mapper_name) {
+                        if let Some(term_field_mapper) = self.term_field_mappers_manager.get(term_field_mapper_name) {
+                            if let Some(query) = term_field_mapper.map(isbn_doi_or_search_group_or_term.as_str(), &term_field_mapper_config.fields) {
+                                queries.push((Occur::Should, query));
+                            }
+                        }
                     }
                 }
+
                 Ok(Box::new(BooleanQuery::new(queries)) as Box<dyn Query>)
             }
             Rule::isbn => {
                 let mut queries = vec![];
-                let isbn_mapper = Box::new(IsbnMapper::new(self.schema.clone(), vec!["metadata.isbns".to_string()])) as Box<dyn TermFieldMapper>;
 
-                for mapper in &[isbn_mapper] {
-                    if let Some(query) = mapper.map(isbn_doi_or_search_group_or_term.as_str()) {
-                        queries.push((Occur::Should, query));
+                for term_field_mapper_name in ["isbn"] {
+                    if let Some(term_field_mapper_config) = self.query_parser_config.0.term_field_mapper_configs.get(term_field_mapper_name) {
+                        if let Some(term_field_mapper) = self.term_field_mappers_manager.get(term_field_mapper_name) {
+                            if let Some(query) = term_field_mapper.map(isbn_doi_or_search_group_or_term.as_str(), &term_field_mapper_config.fields) {
+                                queries.push((Occur::Should, query));
+                            }
+                        }
                     }
                 }
+
                 Ok(Box::new(BooleanQuery::new(queries)) as Box<dyn Query>)
             }
             Rule::term => self.default_field_queries(isbn_doi_or_search_group_or_term, statement_boost),
@@ -819,7 +828,25 @@ mod tests {
 
     #[test]
     pub fn test_parser_fields() {
-        let query_parser = create_query_parser();
+        let mut query_parser = create_query_parser();
+        query_parser.query_parser_config.0.term_field_mapper_configs.insert(
+            "doi".to_string(),
+            proto::TermFieldMapperConfig {
+                fields: vec!["doi".to_string()],
+            },
+        );
+        query_parser.query_parser_config.0.term_field_mapper_configs.insert(
+            "doi_isbn".to_string(),
+            proto::TermFieldMapperConfig {
+                fields: vec!["metadata.isbns".to_string()],
+            },
+        );
+        query_parser.query_parser_config.0.term_field_mapper_configs.insert(
+            "isbn".to_string(),
+            proto::TermFieldMapperConfig {
+                fields: vec!["metadata.isbns".to_string()],
+            },
+        );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("body:'search engine'")),
             "Ok(PhraseQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"search\")), (1, Term(field=1, type=Str, \"engine\"))], slop: 0 })"
@@ -867,7 +894,7 @@ mod tests {
         assert_eq!(format!("{:?}", query_parser.parse_query("97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"97812\"))), (Should, TermQuery(Term(field=0, type=Str, \"34\"))), (Should, TermQuery(Term(field=0, type=Str, \"5678\"))), (Should, TermQuery(Term(field=0, type=Str, \"909\")))] })");
         assert_eq!(
             format!("{:?}", query_parser.parse_query("metadata.isbns:97812-34-5678-90")),
-            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=5, type=Json, path=isbns, type=U64, 97812))), (Should, TermQuery(Term(field=5, type=Json, path=isbns, type=U64, 34))), (Should, TermQuery(Term(field=5, type=Json, path=isbns, type=U64, 5678))), (Should, TermQuery(Term(field=5, type=Json, path=isbns, type=U64, 90)))] })"
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=5, type=Json, path=isbns, type=I64, 97812))), (Should, TermQuery(Term(field=5, type=Json, path=isbns, type=I64, 34))), (Should, TermQuery(Term(field=5, type=Json, path=isbns, type=I64, 5678))), (Should, TermQuery(Term(field=5, type=Json, path=isbns, type=I64, 90)))] })"
         );
         assert_eq!(format!("{:?}", query_parser.parse_query("123 97812-34-5678-909")), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"123\"))), (Should, TermQuery(Term(field=0, type=Str, \"97812\"))), (Should, TermQuery(Term(field=0, type=Str, \"34\"))), (Should, TermQuery(Term(field=0, type=Str, \"5678\"))), (Should, TermQuery(Term(field=0, type=Str, \"909\")))] })");
         assert_eq!(
@@ -989,7 +1016,7 @@ mod tests {
         let query_parser = create_query_parser();
         assert_eq!(
             format!("{:?}", query_parser.parse_query("metadata.a:1")),
-            "Ok(TermQuery(Term(field=5, type=Json, path=a, type=U64, 1)))"
+            "Ok(TermQuery(Term(field=5, type=Json, path=a, type=I64, 1)))"
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("metadata.a:\"1\"")),
@@ -1117,6 +1144,7 @@ mod tests {
         });
         query_parser.query_parser_config.0.query_language = Some("en".to_string());
         let query = query_parser.parse_query("london is the capital of Great Britain");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"london\"))), (Should, TermQuery(Term(field=0, type=Str, \"is\"))), (Should, TermQuery(Term(field=0, type=Str, \"the\"))), (Should, TermQuery(Term(field=0, type=Str, \"capital\"))), (Should, TermQuery(Term(field=0, type=Str, \"of\"))), (Should, TermQuery(Term(field=0, type=Str, \"great\"))), (Should, TermQuery(Term(field=0, type=Str, \"britain\"))), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"great\")), (1, Term(field=0, type=Str, \"britain\"))], slop: 0 }, boost=1.3))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"london\"))), (Should, TermQuery(Term(field=0, type=Str, \"is\"))), (Should, TermQuery(Term(field=0, type=Str, \"the\"))), (Should, TermQuery(Term(field=0, type=Str, \"capital\"))), (Should, TermQuery(Term(field=0, type=Str, \"of\"))), (Should, TermQuery(Term(field=0, type=Str, \"great\"))), (Should, TermQuery(Term(field=0, type=Str, \"britain\")))] })");
+        // assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"london\"))), (Should, TermQuery(Term(field=0, type=Str, \"is\"))), (Should, TermQuery(Term(field=0, type=Str, \"the\"))), (Should, TermQuery(Term(field=0, type=Str, \"capital\"))), (Should, TermQuery(Term(field=0, type=Str, \"of\"))), (Should, TermQuery(Term(field=0, type=Str, \"great\"))), (Should, TermQuery(Term(field=0, type=Str, \"britain\"))), (Should, Boost(query=PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"great\")), (1, Term(field=0, type=Str, \"britain\"))], slop: 0 }, boost=1.3))] })");
     }
 }

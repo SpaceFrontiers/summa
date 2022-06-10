@@ -157,7 +157,7 @@ impl IndexHolder {
     pub fn create_holder(
         core_config: &crate::configs::core::Config,
         mut index: Index,
-        index_name: Option<&str>,
+        index_name: &str,
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
         merge_policy: Option<proto::MergePolicy>,
         query_parser_config: proto::QueryParserConfig,
@@ -183,16 +183,7 @@ impl IndexHolder {
             .transpose()?
             .unwrap_or_default();
 
-        let index_name = index_name.map(|x| x.to_string()).unwrap_or_else(|| {
-            cached_index_attributes
-                .as_ref()
-                .expect("no attributes")
-                .default_index_name
-                .clone()
-                .expect("no index name")
-        });
-
-        let query_parser = ProtoQueryParser::for_index(&index_name, &index, query_parser_config)?;
+        let query_parser = ProtoQueryParser::for_index(index_name, &index, query_parser_config)?;
         let index_reader = index
             .reader_builder()
             .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)
@@ -215,7 +206,7 @@ impl IndexHolder {
 
         Ok(IndexHolder {
             index_engine_config,
-            index_name,
+            index_name: index_name.to_string(),
             index: index.clone(),
             query_parser,
             cached_schema,

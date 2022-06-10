@@ -57,9 +57,10 @@ impl IndexRegistry {
         }
     }
 
-    fn add<'a>(&'a self, py: Python<'a>, index_engine_config: &PyBytes, index_name: Option<String>) -> PyResult<&'a PyAny> {
+    fn add<'a>(&'a self, py: Python<'a>, index_engine_config: &PyBytes, index_name: &str) -> PyResult<&'a PyAny> {
         let index_engine_config = proto::IndexEngineConfig::decode(index_engine_config.as_bytes()).unwrap();
         let this = self.clone();
+        let index_name = index_name.to_string();
         pyo3_asyncio::tokio::future_into_py(py, async move {
             let index = match &index_engine_config.config {
                 Some(proto::index_engine_config::Config::Memory(memory_engine_config)) => {
@@ -80,7 +81,7 @@ impl IndexRegistry {
             let index_holder = IndexHolder::create_holder(
                 &core_config,
                 index,
-                index_name.as_deref(),
+                &index_name,
                 Arc::new(DirectProxy::new(index_engine_config)),
                 None,
                 query_parser_config,

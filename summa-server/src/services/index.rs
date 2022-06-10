@@ -127,11 +127,12 @@ impl Index {
             let merge_policy = core_config.indices[&index_name].merge_policy.clone();
             let query_parser_config = core_config.indices[&index_name].query_parser_config.as_ref().cloned().unwrap_or_default();
             let default_fields = query_parser_config.default_fields.clone();
+            let index_name_clone = index_name.clone();
             let index_holder = tokio::task::spawn_blocking(move || {
                 IndexHolder::create_holder(
                     &core_config,
                     index,
-                    Some(&index_name),
+                    &index_name_clone,
                     index_engine_config_holder,
                     merge_policy,
                     query_parser_config,
@@ -140,7 +141,7 @@ impl Index {
             })
             .await??;
             index_holder.partial_warmup(false, &default_fields).await?;
-            index_holders.insert(index_holder.index_name().to_string(), OwningHandler::new(index_holder));
+            index_holders.insert(index_name, OwningHandler::new(index_holder));
         }
         info!(action = "setting_index_holders", indices = ?index_holders.keys().collect::<Vec<_>>());
         *self.index_registry.index_holders().write().await = index_holders;
@@ -205,7 +206,7 @@ impl Index {
                     IndexHolder::create_holder(
                         &core_config,
                         index,
-                        Some(&index_name),
+                        &index_name,
                         index_engine_config_holder,
                         merge_policy,
                         query_parser_config,

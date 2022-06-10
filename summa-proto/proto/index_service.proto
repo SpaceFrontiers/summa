@@ -150,12 +150,8 @@ message IndexAttributes {
   repeated string unique_fields = 2;
   // Multi fields is ones that may have multiple values and processed as lists. All other fields will be forcefully converted to singular value
   repeated string multi_fields = 4;
-  // Descriptive field that may be used as name for index when indices are replicating over wire
-  optional string default_index_name = 5;
   // Text index description
   optional string description = 6;
-  // (Not-used)
-  repeated string default_snippets = 7;
   ConflictStrategy conflict_strategy = 8;
 }
 

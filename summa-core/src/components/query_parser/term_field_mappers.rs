@@ -1,49 +1,68 @@
+use std::collections::HashMap;
+
 use regex::Regex;
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
-use tantivy::schema::{IndexRecordOption, Schema};
+use tantivy::query::{BooleanQuery, Occur, Query};
+use tantivy::schema::{Field, FieldType, Schema};
+use tantivy::tokenizer::TokenizerManager;
+use tantivy::Term;
 
 use crate::components::query_parser::utils::cast_field_to_term;
+use crate::components::QueryParserError;
 
 pub trait TermFieldMapper {
-    fn map(&self, value: &str) -> Option<Box<dyn Query>>;
-    fn is_terminal(&self) -> bool;
+    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>>;
+}
+
+fn tokenize_value(schema: &Schema, field: &Field, full_path: &str, value: &str, tokenizer_manager: &TokenizerManager) -> Vec<Term> {
+    let field_entry = schema.get_field_entry(*field);
+    let mut terms = vec![];
+    match field_entry.field_type() {
+        FieldType::Str(ref str_options) => {
+            let option = str_options.get_indexing_options().unwrap();
+            let mut text_analyzer = tokenizer_manager
+                .get(option.tokenizer())
+                .ok_or_else(|| QueryParserError::UnknownTokenizer {
+                    field: field_entry.name().to_string(),
+                    tokenizer: option.tokenizer().to_string(),
+                })
+                .unwrap();
+            let mut token_stream = text_analyzer.token_stream(value);
+            token_stream.process(&mut |token| {
+                let term = cast_field_to_term(field, full_path, schema.get_field_entry(*field).field_type(), &token.text, true);
+                terms.push(term);
+            });
+        }
+        _ => terms.push(cast_field_to_term(
+            field,
+            full_path,
+            schema.get_field_entry(*field).field_type(),
+            &value.replace('-', ""),
+            true,
+        )),
+    };
+    terms
 }
 
 pub struct DoiMapper {
     schema: Schema,
-    fields: Vec<String>,
-    is_terminal: bool,
+    tokenizer_manager: TokenizerManager,
 }
 
 impl DoiMapper {
-    pub fn new(schema: Schema, fields: Vec<String>) -> Self {
-        DoiMapper {
-            schema,
-            fields,
-            is_terminal: true,
-        }
+    pub fn new(schema: Schema, tokenizer_manager: TokenizerManager) -> Self {
+        DoiMapper { schema, tokenizer_manager }
     }
 }
 
 impl TermFieldMapper for DoiMapper {
-    fn is_terminal(&self) -> bool {
-        self.is_terminal
-    }
-
-    fn map(&self, value: &str) -> Option<Box<dyn Query>> {
-        let terms = self
-            .fields
+    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>> {
+        let terms = fields
             .iter()
             .map(|field_name| {
                 let (field, full_path) = self.schema.find_field(field_name).expect("inconsistent state");
-                cast_field_to_term(
-                    &field,
-                    full_path,
-                    self.schema.get_field_entry(field).field_type(),
-                    &value.replace(' ', ""),
-                    true,
-                )
+                tokenize_value(&self.schema, &field, full_path, value, &self.tokenizer_manager)
             })
+            .flatten()
             .collect();
         Some(Box::new(BooleanQuery::new_multiterms_query(terms)) as Box<dyn Query>)
     }
@@ -51,26 +70,17 @@ impl TermFieldMapper for DoiMapper {
 
 pub struct DoiIsbnMapper {
     schema: Schema,
-    fields: Vec<String>,
-    is_terminal: bool,
+    tokenizer_manager: TokenizerManager,
 }
 
 impl DoiIsbnMapper {
-    pub fn new(schema: Schema, fields: Vec<String>) -> Self {
-        DoiIsbnMapper {
-            schema,
-            fields,
-            is_terminal: true,
-        }
+    pub fn new(schema: Schema, tokenizer_manager: TokenizerManager) -> Self {
+        DoiIsbnMapper { schema, tokenizer_manager }
     }
 }
 
 impl TermFieldMapper for DoiIsbnMapper {
-    fn is_terminal(&self) -> bool {
-        self.is_terminal
-    }
-
-    fn map(&self, value: &str) -> Option<Box<dyn Query>> {
+    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>> {
         thread_local! {
             static MATCHER: Regex = Regex::new(r"(10.[0-9]+)/((?:cbo)?(?:(?:978[0-9]{10})|(?:978[0-9]{13})|(?:978[-0-9]+)))(.*)").expect("cannot compile regex");
         }
@@ -80,13 +90,12 @@ impl TermFieldMapper for DoiIsbnMapper {
                 let (_, isbn, _) = (&cap[1], &cap[2], &cap[3]);
                 let corrected_isbn = isbn.replace('-', "").replace("cbo", "");
                 if corrected_isbn.len() == 10 || corrected_isbn.len() == 13 {
-                    let subqueries: Vec<_> = self
-                        .fields
+                    let subqueries: Vec<_> = fields
                         .iter()
                         .map(|field_name| {
                             let (field, full_path) = self.schema.find_field(field_name).expect("inconsistent state");
-                            let term = cast_field_to_term(&field, full_path, self.schema.get_field_entry(field).field_type(), &corrected_isbn, true);
-                            let query = Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>;
+                            let terms = tokenize_value(&self.schema, &field, full_path, &corrected_isbn, &self.tokenizer_manager);
+                            let query = Box::new(BooleanQuery::new_multiterms_query(terms)) as Box<dyn Query>;
                             (Occur::Should, query)
                         })
                         .collect();
@@ -100,42 +109,52 @@ impl TermFieldMapper for DoiIsbnMapper {
 
 pub struct IsbnMapper {
     schema: Schema,
-    fields: Vec<String>,
-    is_terminal: bool,
+    tokenizer_manager: TokenizerManager,
 }
 
 impl IsbnMapper {
-    pub fn new(schema: Schema, fields: Vec<String>) -> Self {
-        IsbnMapper {
-            schema,
-            fields,
-            is_terminal: true,
-        }
+    pub fn new(schema: Schema, tokenizer_manager: TokenizerManager) -> Self {
+        IsbnMapper { schema, tokenizer_manager }
     }
 }
 
 impl TermFieldMapper for IsbnMapper {
-    fn is_terminal(&self) -> bool {
-        self.is_terminal
-    }
-
-    fn map(&self, value: &str) -> Option<Box<dyn Query>> {
-        let subqueries: Vec<_> = self
-            .fields
+    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>> {
+        let subqueries: Vec<_> = fields
             .iter()
             .map(|field_name| {
                 let (field, full_path) = self.schema.find_field(field_name).expect("inconsistent state");
-                let term = cast_field_to_term(
-                    &field,
-                    full_path,
-                    self.schema.get_field_entry(field).field_type(),
-                    &value.replace('-', ""),
-                    true,
-                );
-                let query = Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>;
-                (Occur::Should, query)
+                let terms = tokenize_value(&self.schema, &field, full_path, &value.replace('-', ""), &self.tokenizer_manager);
+                (Occur::Should, Box::new(BooleanQuery::new_multiterms_query(terms)) as Box<dyn Query>)
             })
             .collect();
         Some(Box::new(BooleanQuery::new(subqueries)) as Box<dyn Query>)
+    }
+}
+
+pub struct TermFieldMappersManager {
+    term_field_mappers: HashMap<String, Box<dyn TermFieldMapper>>,
+}
+
+impl TermFieldMappersManager {
+    pub fn new(schema: &Schema, tokenizer_manager: &TokenizerManager) -> Self {
+        let mut term_field_mappers = HashMap::new();
+        term_field_mappers.insert(
+            "doi".to_string(),
+            Box::new(DoiMapper::new(schema.clone(), tokenizer_manager.clone())) as Box<dyn TermFieldMapper>,
+        );
+        term_field_mappers.insert(
+            "doi_isbn".to_string(),
+            Box::new(DoiIsbnMapper::new(schema.clone(), tokenizer_manager.clone())) as Box<dyn TermFieldMapper>,
+        );
+        term_field_mappers.insert(
+            "isbn".to_string(),
+            Box::new(IsbnMapper::new(schema.clone(), tokenizer_manager.clone())) as Box<dyn TermFieldMapper>,
+        );
+        TermFieldMappersManager { term_field_mappers }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Box<dyn TermFieldMapper>> {
+        self.term_field_mappers.get(name)
     }
 }

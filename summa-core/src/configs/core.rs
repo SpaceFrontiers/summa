@@ -123,7 +123,7 @@ impl QueryParserConfig {
             self.0.default_fields = other.0.default_fields;
         }
         self.0.field_aliases.extend(other.0.field_aliases);
-        self.0.field_mappings.extend(other.0.field_mappings);
+        self.0.term_field_mapper_configs.extend(other.0.term_field_mapper_configs);
         self.0.field_boosts.extend(other.0.field_boosts);
         self.0.morphology_configs.extend(other.0.morphology_configs);
         if other.0.term_limit > 0 {

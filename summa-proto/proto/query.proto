@@ -3,9 +3,8 @@ package summa.proto;
 
 import "utils.proto";
 
-message FieldMapper {
-  string mapper_name = 1;
-  repeated string fields = 2;
+message TermFieldMapperConfig {
+  repeated string fields = 1;
 }
 
 message MatchQueryBooleanShouldMode {};
@@ -34,7 +33,7 @@ message MorphologyConfig {
 message QueryParserConfig {
   map<string, string> field_aliases = 1;
   map<string, float> field_boosts = 2;
-  map<string, FieldMapper> field_mappings = 3;
+  map<string, TermFieldMapperConfig> term_field_mapper_configs = 3;
   uint32 term_limit = 4;
   repeated string default_fields = 5;
   oneof default_mode {

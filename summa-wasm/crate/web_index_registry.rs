@@ -73,7 +73,7 @@ impl WrappedIndexRegistry {
 
     /// Add new index to `WrappedIndexRegistry`
     #[wasm_bindgen]
-    pub async fn add(&self, index_engine_config: JsValue, index_name: Option<String>) -> Result<JsValue, JsValue> {
+    pub async fn add(&self, index_engine_config: JsValue, index_name: &str) -> Result<JsValue, JsValue> {
         let index_engine_config: proto::IndexEngineConfig = serde_wasm_bindgen::from_value(index_engine_config)?;
         let serializer = Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true);
         Ok(self
@@ -83,7 +83,7 @@ impl WrappedIndexRegistry {
             .serialize(&serializer)?)
     }
 
-    async fn add_internal(&self, index_engine_config: proto::IndexEngineConfig, index_name: Option<String>) -> SummaWasmResult<Option<proto::IndexAttributes>> {
+    async fn add_internal(&self, index_engine_config: proto::IndexEngineConfig, index_name: &str) -> SummaWasmResult<Option<proto::IndexAttributes>> {
         let index = match &index_engine_config.config {
             Some(proto::index_engine_config::Config::Memory(memory_engine_config)) => {
                 let schema = serde_wasm_bindgen::from_value(memory_engine_config.schema.clone().into()).expect("cannot parse schema");
@@ -100,7 +100,7 @@ impl WrappedIndexRegistry {
         let index_holder = IndexHolder::create_holder(
             self.core_config.read().await.get(),
             index,
-            index_name.as_deref(),
+            index_name,
             Arc::new(DirectProxy::new(index_engine_config)),
             None,
             query_parser_config,
