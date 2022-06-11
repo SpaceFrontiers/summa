@@ -211,6 +211,7 @@ impl IndexRegistry {
                                 snippet_generators_futures.push(async move { (doc_references.index_alias.as_str(), sg_config.as_tantivy_async().await) });
                             }
                         }
+                        has_next |= total_documents > limit + offset;
 
                         trace!(action = "generate_snippets");
                         let snippet_generators: HashMap<&str, Vec<(String, SnippetGenerator)>> =

@@ -235,22 +235,18 @@ class GetIndicesResponse(_message.Message):
     def __init__(self, index_names: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexAttributes(_message.Message):
-    __slots__ = ["conflict_strategy", "created_at", "default_index_name", "default_snippets", "description", "multi_fields", "unique_fields"]
+    __slots__ = ["conflict_strategy", "created_at", "description", "multi_fields", "unique_fields"]
     CONFLICT_STRATEGY_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
-    DEFAULT_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
-    DEFAULT_SNIPPETS_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
     MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
     UNIQUE_FIELDS_FIELD_NUMBER: _ClassVar[int]
     conflict_strategy: ConflictStrategy
     created_at: int
-    default_index_name: str
-    default_snippets: _containers.RepeatedScalarFieldContainer[str]
     description: str
     multi_fields: _containers.RepeatedScalarFieldContainer[str]
     unique_fields: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., default_index_name: _Optional[str] = ..., description: _Optional[str] = ..., default_snippets: _Optional[_Iterable[str]] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
+    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., description: _Optional[str] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ["compression", "index_aliases", "index_attributes", "index_engine", "index_name", "num_docs"]

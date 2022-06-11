@@ -10,7 +10,7 @@ class IndexRegistry:
     def __init__(self):
         self.index_registry = IndexRegistryBin()
 
-    async def add(self, index_config, index_name: Optional[str] = None) -> index_service_pb2.IndexAttributes:
+    async def add(self, index_config, index_name: str) -> index_service_pb2.IndexAttributes:
         parsed_index_config = index_service_pb2.IndexEngineConfig()
         ParseDict(index_config, parsed_index_config)
         index_attributes_bytes = await self.index_registry.add(
