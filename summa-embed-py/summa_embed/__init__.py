@@ -19,13 +19,6 @@ async def detect_host_header(url, aiohttp=None):
                     return re.search(r'(.*)\.localhost.*', parsed_url.netloc).group(0)
 
 
-def canonoize_endpoint(endpoint):
-    endpoint = endpoint.rstrip('/')
-    if not endpoint.startswith('http'):
-        endpoint = 'http://' + endpoint
-    return endpoint
-
-
 class SummaEmbedClient(AioThing):
     def __init__(self):
         super().__init__()
