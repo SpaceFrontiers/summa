@@ -1,1 +1,3 @@
+aiohttp
+aiokit
 izihawa_utils
