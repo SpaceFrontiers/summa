@@ -9,13 +9,16 @@ name = "summa_embed"
 crate-type = ["cdylib"]
 
 [dependencies]
+async-broadcast = { workspace = true }
 futures = "0.3"
 prost = { workspace = true }
 pyo3 = { version = "0.18", features = ["serde"] }
 pyo3-asyncio = { version =  "0.18", features = ["attributes", "tokio-runtime"] }
 pyo3-log = "0.8"
+pythonize = "0.18"
 serde_json = "1.0"
 summa-core = { version = "0.17.0", path = "../summa-core", default_features = false, features = ["fs", "hyper-external-request", "tokio-rt"] }
+summa-server = { version = "0.17.0", path = "../summa-server" }
 summa-proto = { workspace = true }
 tantivy = { workspace = true }
 tokio = { workspace = true }

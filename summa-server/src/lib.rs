@@ -44,4 +44,6 @@ pub mod server;
 pub mod services;
 pub(crate) mod utils;
 
+pub use errors::SummaServerResult;
 pub use server::Server;
+pub use utils::ControlMessage;

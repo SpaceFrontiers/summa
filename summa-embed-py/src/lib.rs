@@ -1,120 +1,48 @@
 extern crate core;
 
-use std::sync::Arc;
-
-use futures::future::join_all;
-use prost::Message;
-use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
-use summa_core::components::{Driver, IndexHolder};
-use summa_core::configs::{ConfigProxy, DirectProxy};
-use summa_core::directories::DefaultExternalRequestGenerator;
-use summa_core::hyper_external_request::HyperExternalRequest;
-use summa_proto::proto;
-use tantivy::IndexBuilder;
+use pythonize::depythonize;
+use summa_server::configs::server::ConfigHolder;
+use summa_server::Server;
 
-struct SummaPyError(String);
+/*
+   let core_config = summa_core::configs::core::ConfigBuilder::default()
+       .doc_store_compress_threads(1)
+       .writer_threads(None)
+       .build()
+       .expect("cannot build");
+   let data_path = PathBuf::from(data_directory);
+   let server_config = summa_server::configs::server::ConfigBuilder::default()
+       .data_path(data_path.join("bin"))
+       .logs_path(data_path.join("logs"))
+       .core(core_config)
+       .api(
+           summa_server::configs::api::ConfigBuilder::default()
+               .grpc_endpoint(endpoint.to_string())
+               .build()
+               .map_err(summa_core::Error::from)
+               .unwrap(),
+       )
+       .build()
+       .map_err(summa_core::Error::from)
+       .unwrap();
+*/
 
-impl From<summa_core::Error> for SummaPyError {
-    fn from(value: summa_core::Error) -> Self {
-        SummaPyError(format!("{:?}", value))
-    }
-}
-
-impl From<SummaPyError> for PyErr {
-    fn from(err: SummaPyError) -> PyErr {
-        PyOSError::new_err(err.0)
-    }
-}
-
-#[pyclass]
-#[derive(Clone)]
-struct IndexRegistry {
-    index_registry: summa_core::components::IndexRegistry,
-    core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
-}
-
-impl Default for IndexRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[pymethods]
-impl IndexRegistry {
-    #[new]
-    pub fn new() -> Self {
-        let core_config = summa_core::configs::core::ConfigBuilder::default()
-            .doc_store_compress_threads(1)
-            .writer_threads(None)
-            .build()
-            .expect("cannot build");
-        let core_config = Arc::new(DirectProxy::new(core_config)) as Arc<dyn ConfigProxy<_>>;
-        IndexRegistry {
-            index_registry: summa_core::components::IndexRegistry::new(&core_config),
-            core_config,
-        }
-    }
-
-    fn add<'a>(&'a self, py: Python<'a>, index_engine_config: &PyBytes, index_name: &str) -> PyResult<&'a PyAny> {
-        let index_engine_config = proto::IndexEngineConfig::decode(index_engine_config.as_bytes()).unwrap();
-        let this = self.clone();
-        let index_name = index_name.to_string();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let index = match &index_engine_config.config {
-                Some(proto::index_engine_config::Config::Memory(memory_engine_config)) => {
-                    let schema = serde_json::from_str(&memory_engine_config.schema).unwrap();
-                    let index_builder = IndexBuilder::new().schema(schema);
-                    IndexHolder::create_memory_index(index_builder).unwrap()
-                }
-                Some(proto::index_engine_config::Config::Remote(remote_engine_config)) => IndexHolder::open_remote_index::<
-                    HyperExternalRequest,
-                    DefaultExternalRequestGenerator<HyperExternalRequest>,
-                >(remote_engine_config.clone(), true)
-                .await
-                .unwrap(),
-                _ => unimplemented!(),
-            };
-            let core_config = this.core_config.read().await.get().clone();
-            let query_parser_config = index_engine_config.query_parser_config.as_ref().cloned().unwrap_or_default();
-            let index_holder = IndexHolder::create_holder(
-                &core_config,
-                index,
-                &index_name,
-                Arc::new(DirectProxy::new(index_engine_config)),
-                None,
-                query_parser_config,
-                Driver::current_tokio(),
-            )
-            .unwrap();
-            let index_attributes = index_holder.index_attributes().cloned().unwrap();
-            this.index_registry.add(index_holder).await.unwrap();
-            Ok(Python::with_gil(|py| index_attributes.encode_to_vec().as_slice().into_py(py)))
-        })
-    }
-
-    fn search<'a>(&'a self, py: Python<'a>, index_queries: &PyBytes) -> PyResult<&'a PyAny> {
-        let search_request = proto::SearchRequest::decode(index_queries.as_bytes()).unwrap();
-        let this = self.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
-            let futures = this.index_registry.search_futures(search_request.index_queries).unwrap();
-            let extraction_results = join_all(futures).await.into_iter().map(|r| r.expect("cannot receive")).collect::<Vec<_>>();
-            let result = this.index_registry.finalize_extraction(extraction_results).await.unwrap();
-            let search_response = proto::SearchResponse {
-                elapsed_secs: 0.0,
-                collector_outputs: result,
-            };
-            Ok(Python::with_gil(|py| search_response.encode_to_vec().as_slice().into_py(py)))
-        })
-    }
+#[pyfunction]
+fn summa_server_future<'a>(py: Python<'a>, config: &'a PyAny) -> PyResult<&'a PyAny> {
+    let server_config: summa_server::configs::server::Config = depythonize(config).unwrap();
+    let server_config_holder = ConfigHolder::from_config(server_config);
+    let server = Server::from_server_config(server_config_holder);
+    pyo3_asyncio::tokio::future_into_py(py, async move {
+        server.run().await.unwrap();
+        Ok(())
+    })
 }
 
 /// A Python module implemented in Rust.
 #[pymodule]
-#[pyo3(name = "summa_embed_bin")]
 fn summa_embed_bin(_py: Python, m: &PyModule) -> PyResult<()> {
     pyo3_log::init();
-    m.add_class::<IndexRegistry>()?;
+    m.add_function(wrap_pyfunction!(summa_server_future, m)?)?;
     Ok(())
 }

@@ -119,7 +119,7 @@ impl Server {
         .instrument(info_span!("lifecycle")))
     }
 
-    async fn run(&self) -> SummaServerResult<()> {
+    pub async fn run(&self) -> SummaServerResult<()> {
         let server = self.serve(signal_channel()?).await?;
         server.await
     }

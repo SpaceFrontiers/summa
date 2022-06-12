@@ -15,7 +15,6 @@ dynamic = ["dependencies"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "summa_embed.summa_embed_bin"
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
