@@ -41,23 +41,17 @@ COPY rustfmt.toml rustfmt.toml
 
 # amd64 build ----------------------------
 FROM --platform=$BUILDPLATFORM base-dir AS build-amd64
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/home/root/app/target \
-    cargo build --profile release -p summa-server --target x86_64-unknown-linux-gnu
+RUN cargo build --profile release -p summa-server --target x86_64-unknown-linux-gnu
 RUN mv target/x86_64-unknown-linux-gnu/release/summa-server-bin /bin/summa-server
 
 # arm64 build ----------------------------
 FROM --platform=$BUILDPLATFORM base-dir AS build-arm64
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/home/root/app/target \
-    CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ cargo build --profile release -p summa-server --target aarch64-unknown-linux-gnu
+RUN CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ cargo build --profile release -p summa-server --target aarch64-unknown-linux-gnu
 RUN mv target/aarch64-unknown-linux-gnu/release/summa-server-bin /bin/summa-server
 
 # armv7 build ----------------------------
 FROM --platform=$BUILDPLATFORM base-dir AS build-arm
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/home/root/app/target \
-    CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++ cargo build --profile release -p summa-server --target armv7-unknown-linux-gnueabihf
+RUN CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++ cargo build --profile release -p summa-server --target armv7-unknown-linux-gnueabihf
 RUN mv target/armv7-unknown-linux-gnueabihf/release/summa-server-bin /bin/summa-server
 
 # Final arch images ----------------------
