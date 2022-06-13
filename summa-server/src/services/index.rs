@@ -108,7 +108,7 @@ impl Index {
             },
             {
                 let index_name = index_name.to_string();
-                m | server_config | server_config.core.indices.get_mut(&index_name).expect("index disappeared")
+                move |server_config| server_config.core.indices.get_mut(&index_name).expect("index disappeared")
             },
         ))
     }
