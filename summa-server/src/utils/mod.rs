@@ -10,7 +10,7 @@ use tokio::task;
 use tracing::error;
 
 use crate::errors::{Error, SummaServerResult};
-pub use crate::utils::thread_handler::ControlMessage;
+pub use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
 
 /// Spawns a thread for processing `SignalKind` and returns `oneshot::Receiver` for a signal event
 pub fn signal_channel() -> SummaServerResult<Receiver<ControlMessage>> {

@@ -15,6 +15,3 @@ dynamic = ["dependencies"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-
-[tool.setuptools.dynamic]
-dependencies = {file = ["requirements.txt"]}

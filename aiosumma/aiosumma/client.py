@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from typing import (
     AsyncIterator,
@@ -9,6 +10,7 @@ from typing import (
     Union,
 )
 
+import grpc
 import orjson as json
 from aiogrpcclient import (
     BaseGrpcClient,
@@ -463,10 +465,15 @@ class SummaClient(BaseGrpcClient):
             request_id: request id
             session_id: session id
         """
-        async for document in self.stubs['index_api'].documents(
-                index_service_pb.DocumentsRequest(index_name=index_name),
-                metadata=setup_metadata(session_id, request_id),
-        ):
+        # asyncfor is buggy: https://github.com/grpc/grpc/issues/32005
+        streaming_call = self.stubs['index_api'].documents(
+            index_service_pb.DocumentsRequest(index_name=index_name),
+            metadata=setup_metadata(session_id, request_id),
+        )
+        while True:
+            document = await asyncio.create_task(streaming_call.read())
+            if document == grpc.aio.EOF:
+                break
             yield document.document
 
     @expose

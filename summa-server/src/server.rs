@@ -105,8 +105,10 @@ impl Server {
         let index_service = Index::new(&self.server_config_holder)?;
         futures.push(Box::new(index_service.prepare_serving_future(terminator.clone()).await?));
 
-        let metrics_service = Metrics::new(&server_config.metrics)?;
-        futures.push(Box::new(metrics_service.prepare_serving_future(&index_service, terminator.clone()).await?));
+        if let Some(metrics_config) = &server_config.metrics {
+            let metrics_service = Metrics::new(metrics_config)?;
+            futures.push(Box::new(metrics_service.prepare_serving_future(&index_service, terminator.clone()).await?));
+        }
 
         let api_service = Api::new(&self.server_config_holder, &index_service)?;
         futures.push(Box::new(api_service.prepare_serving_future(terminator.clone()).await?));

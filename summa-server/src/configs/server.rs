@@ -24,7 +24,7 @@ pub struct Config {
     #[builder(setter(custom))]
     pub log_path: PathBuf,
     /// Summa Metrics configuration
-    pub metrics: crate::configs::metrics::Config,
+    pub metrics: Option<crate::configs::metrics::Config>,
     /// Kafka consumers
     #[builder(default = "HashMap::new()")]
     pub consumers: HashMap<String, crate::configs::consumer::Config>,
@@ -40,7 +40,7 @@ impl Default for Config {
             debug: true,
             api: crate::configs::api::Config::default(),
             log_path: PathBuf::new(),
-            metrics: crate::configs::metrics::Config::default(),
+            metrics: Some(crate::configs::metrics::Config::default()),
             consumers: HashMap::new(),
             core: summa_core::configs::core::Config::default(),
         }
@@ -104,12 +104,6 @@ pub mod tests {
                     .grpc_endpoint(format!("127.0.0.1:{}", acquire_free_port()))
                     .build()
                     .expect("cannot create api config"),
-            )
-            .metrics(
-                crate::configs::metrics::ConfigBuilder::default()
-                    .endpoint(format!("127.0.0.1:{}", acquire_free_port()))
-                    .build()
-                    .expect("cannot create metrics config"),
             )
             .build()
             .expect("cannot create server config")

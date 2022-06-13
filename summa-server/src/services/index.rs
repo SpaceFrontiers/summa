@@ -108,7 +108,7 @@ impl Index {
             },
             {
                 let index_name = index_name.to_string();
-                move |server_config| server_config.core.indices.get_mut(&index_name).expect("index disappeared")
+                m | server_config | server_config.core.indices.get_mut(&index_name).expect("index disappeared")
             },
         ))
     }
@@ -165,7 +165,8 @@ impl Index {
         Ok(async move {
             let signal_result = terminator.recv().await;
             info!(action = "sigterm_received", received = ?signal_result);
-            match this.stop(false).await {
+            let force = matches!(signal_result, Ok(ControlMessage::ForceShutdown));
+            match this.stop(force).await {
                 Ok(_) => info!(action = "terminated"),
                 Err(error) => info!(action = "terminated", error = ?error),
             };

@@ -39,11 +39,11 @@ pub mod apis;
 pub mod components;
 pub mod configs;
 pub mod errors;
-pub(crate) mod logging;
+pub mod logging;
 pub mod server;
 pub mod services;
 pub(crate) mod utils;
 
 pub use errors::SummaServerResult;
 pub use server::Server;
-pub use utils::ControlMessage;
+pub use utils::{ControlMessage, ThreadHandler};

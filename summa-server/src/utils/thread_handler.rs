@@ -6,6 +6,7 @@ use crate::errors::SummaServerResult;
 #[derive(Clone, Debug)]
 pub enum ControlMessage {
     Shutdown,
+    ForceShutdown,
 }
 
 /// Holds `JoinHandle` together with its `shutdown_trigger`
@@ -22,6 +23,11 @@ impl<T> ThreadHandler<T> {
 
     pub async fn stop(self) -> SummaServerResult<T> {
         self.shutdown_trigger.broadcast(ControlMessage::Shutdown).await?;
+        Ok(self.join_handle.await?)
+    }
+
+    pub async fn force_stop(self) -> SummaServerResult<T> {
+        self.shutdown_trigger.broadcast(ControlMessage::ForceShutdown).await?;
         Ok(self.join_handle.await?)
     }
 }
