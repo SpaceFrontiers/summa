@@ -2,18 +2,24 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::StreamExt;
 use opentelemetry::{global, Context, KeyValue};
 use rdkafka::admin::{AdminClient, AdminOptions, AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::config::{ClientConfig, FromClientConfig};
 use rdkafka::consumer::{CommitMode, Consumer as KafkaConsumer, StreamConsumer as KafkaStreamConsumer, StreamConsumer};
-use rdkafka::error::KafkaError;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::BorrowedMessage;
 use rdkafka::util::Timeout;
-use tokio::sync::Mutex;
+use rdkafka::Message;
+use summa_core::components::{IndexWriterHolder, SummaDocument};
+use summa_proto::proto;
+use tantivy::schema::Schema;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard};
 use tracing::{info, info_span, instrument, warn, Instrument};
 
 use super::status::{KafkaConsumingError, KafkaConsumingStatus};
+use crate::components::consumers::ConsumerThread;
 use crate::errors::{Error, SummaServerResult};
 use crate::utils::thread_handler::ThreadHandler;
 
@@ -28,18 +34,41 @@ impl std::fmt::Debug for ConsumingState {
     }
 }
 
+pub fn process_message(
+    index_writer_holder: &OwnedRwLockReadGuard<IndexWriterHolder>,
+    conflict_strategy: proto::ConflictStrategy,
+    schema: &Schema,
+    message: Result<BorrowedMessage<'_>, KafkaError>,
+) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
+    let message = message.map_err(KafkaConsumingError::Kafka)?;
+    let payload = message.payload().ok_or(KafkaConsumingError::EmptyPayload)?;
+    let proto_message: proto::IndexOperation = prost::Message::decode(payload).map_err(KafkaConsumingError::ProtoDecode)?;
+    let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperation)?;
+    match index_operation {
+        proto::index_operation::Operation::IndexDocument(index_document_operation) => {
+            let parsed_document = SummaDocument::BoundJsonBytes((schema, &index_document_operation.document))
+                .try_into()
+                .map_err(KafkaConsumingError::ParseDocument)?;
+            index_writer_holder
+                .index_document(parsed_document, conflict_strategy)
+                .map_err(|e| KafkaConsumingError::Index(e.into()))?;
+            Ok(KafkaConsumingStatus::Consumed)
+        }
+    }
+}
+
 /// Manages consuming thread
 #[derive(Clone, Debug)]
-pub struct ConsumerThread {
+pub struct KafkaConsumerThread {
     consumer_name: String,
     config: crate::configs::consumer::Config,
     kafka_producer_config: ClientConfig,
     consuming_state: Arc<Mutex<Option<ConsumingState>>>,
 }
 
-impl ConsumerThread {
+impl KafkaConsumerThread {
     #[instrument]
-    pub fn new(consumer_name: &str, config: &crate::configs::consumer::Config) -> SummaServerResult<ConsumerThread> {
+    pub fn new(consumer_name: &str, config: &crate::configs::consumer::Config) -> SummaServerResult<KafkaConsumerThread> {
         let mut kafka_consumer_config = ClientConfig::new();
         kafka_consumer_config
             .set("broker.address.ttl", "1000")
@@ -54,10 +83,12 @@ impl ConsumerThread {
         let mut kafka_producer_config = ClientConfig::new();
         kafka_producer_config.set("bootstrap.servers", config.bootstrap_servers.join(","));
 
-        let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create()?;
-        stream_consumer.subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create().map_err(|e| Error::Consumer(e.to_string()))?;
+        stream_consumer
+            .subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>())
+            .map_err(|e| Error::Consumer(e.to_string()))?;
 
-        Ok(ConsumerThread {
+        Ok(KafkaConsumerThread {
             consumer_name: consumer_name.to_owned(),
             config: config.clone(),
             kafka_producer_config,
@@ -65,15 +96,71 @@ impl ConsumerThread {
         })
     }
 
-    pub fn consumer_name(&self) -> &str {
+    #[instrument(skip(self))]
+    async fn create_topics(&self) -> SummaServerResult<()> {
+        let admin_client = AdminClient::from_config(&self.kafka_producer_config).map_err(|e| Error::Consumer(e.to_string()))?;
+        let admin_options = AdminOptions::new().operation_timeout(Some(Timeout::Never));
+        let new_topics: Vec<_> = self
+            .config
+            .topics
+            .iter()
+            .map(|topic_name| NewTopic::new(topic_name.as_str(), 1, TopicReplication::Fixed(1)))
+            .collect();
+        let alter_topics: Vec<_> = self
+            .config
+            .topics
+            .iter()
+            .map(|topic_name| {
+                AlterConfig::new(ResourceSpecifier::Topic(topic_name.as_str()))
+                    .set("retention.ms", "14400000")
+                    .set("retention.bytes", "1073741824")
+                    .set("max.message.bytes", "134217728")
+            })
+            .collect();
+        let response = admin_client
+            .create_topics(&new_topics, &admin_options)
+            .await
+            .map_err(|e| Error::Consumer(e.to_string()))?;
+        info!(action = "create_topics", topics = ?new_topics, response = ?response);
+        let response = admin_client
+            .alter_configs(&alter_topics, &admin_options)
+            .await
+            .map_err(|e| Error::Consumer(e.to_string()))?;
+        info!(action = "alter_configs", topics = ?new_topics, response = ?response);
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn delete_topics(&self) -> SummaServerResult<()> {
+        let admin_client = AdminClient::from_config(&self.kafka_producer_config).map_err(|e| Error::Consumer(e.to_string()))?;
+        let topics: Vec<_> = self.config.topics.iter().map(String::as_str).collect();
+        let response = admin_client
+            .delete_topics(
+                &topics,
+                &AdminOptions::new()
+                    .operation_timeout(Some(Timeout::Never))
+                    .request_timeout(Some(Timeout::After(Duration::from_secs(600)))),
+            )
+            .await
+            .map_err(|e| Error::Consumer(e.to_string()))?;
+        info!(action = "delete_topics", topics = ?topics, response = ?response);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ConsumerThread for KafkaConsumerThread {
+    fn consumer_name(&self) -> &str {
         &self.consumer_name
     }
 
     #[instrument(skip_all, fields(consumer_name = ?self.consumer_name))]
-    pub async fn start<TProcessor>(&self, processor: TProcessor)
-    where
-        TProcessor: Fn(Result<BorrowedMessage<'_>, KafkaError>) -> Result<KafkaConsumingStatus, KafkaConsumingError> + 'static + Send + Sync,
-    {
+    async fn start(
+        &self,
+        index_writer_holder: OwnedRwLockReadGuard<IndexWriterHolder>,
+        conflict_strategy: proto::ConflictStrategy,
+        schema: Schema,
+    ) -> SummaServerResult<()> {
         let mut consuming = self.consuming_state.lock().await;
         *consuming = match consuming.take() {
             Some(ConsumingState::Disabled(stream_consumer)) => {
@@ -91,7 +178,7 @@ impl ConsumerThread {
                         loop {
                             match terminatable_stream.next().await {
                                 Some(message) => {
-                                    match processor(message) {
+                                    match process_message(&index_writer_holder, conflict_strategy, &schema, message) {
                                         Ok(_) => counter.add(
                                             &context,
                                             1,
@@ -120,11 +207,12 @@ impl ConsumerThread {
                 Some(ConsumingState::Enabled(ThreadHandler::new(tokio::spawn(stream_processor), shutdown_trigger)))
             }
             old => old,
-        }
+        };
+        Ok(())
     }
 
     #[instrument(skip(self))]
-    pub async fn stop(&self) -> SummaServerResult<()> {
+    async fn stop(&self) -> SummaServerResult<()> {
         let mut consuming = self.consuming_state.lock().await;
         *consuming = match consuming.take() {
             Some(ConsumingState::Enabled(thread_handler)) => {
@@ -137,13 +225,28 @@ impl ConsumerThread {
     }
 
     #[instrument(skip(self))]
-    pub async fn commit(&self) -> SummaServerResult<()> {
+    async fn commit(&self) -> SummaServerResult<()> {
         let mut consuming = self.consuming_state.lock().await;
         *consuming = match consuming.take() {
             Some(ConsumingState::Disabled(stream_consumer)) => {
                 info!(action = "committing_consumer_state", position = ?stream_consumer.position());
                 let stream_consumer = tokio::task::spawn_blocking(move || {
-                    stream_consumer.commit_consumer_state(CommitMode::Sync)?;
+                    match stream_consumer.commit_consumer_state(CommitMode::Sync) {
+                        Ok(_) => {
+                            info!(action = "committed_offsets");
+                            Ok(())
+                        }
+                        Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::AssignmentLost)) => {
+                            warn!(error = "assignment_lost");
+                            Ok(())
+                        }
+                        Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::NoOffset)) => {
+                            warn!(error = "no_offset");
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| Error::Consumer(e.to_string()))?;
                     Ok::<StreamConsumer, Error>(stream_consumer)
                 })
                 .await?;
@@ -154,52 +257,8 @@ impl ConsumerThread {
         Ok(())
     }
 
-    #[instrument(skip(self))]
-    async fn create_topics(&self) -> SummaServerResult<()> {
-        let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
-        let admin_options = AdminOptions::new().operation_timeout(Some(Timeout::Never));
-        let new_topics: Vec<_> = self
-            .config
-            .topics
-            .iter()
-            .map(|topic_name| NewTopic::new(topic_name.as_str(), 1, TopicReplication::Fixed(1)))
-            .collect();
-        let alter_topics: Vec<_> = self
-            .config
-            .topics
-            .iter()
-            .map(|topic_name| {
-                AlterConfig::new(ResourceSpecifier::Topic(topic_name.as_str()))
-                    .set("retention.ms", "14400000")
-                    .set("retention.bytes", "1073741824")
-                    .set("max.message.bytes", "134217728")
-            })
-            .collect();
-        let response = admin_client.create_topics(&new_topics, &admin_options).await?;
-        info!(action = "create_topics", topics = ?new_topics, response = ?response);
-        let response = admin_client.alter_configs(&alter_topics, &admin_options).await?;
-        info!(action = "alter_configs", topics = ?new_topics, response = ?response);
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    async fn delete_topics(&self) -> SummaServerResult<()> {
-        let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
-        let topics: Vec<_> = self.config.topics.iter().map(String::as_str).collect();
-        let response = admin_client
-            .delete_topics(
-                &topics,
-                &AdminOptions::new()
-                    .operation_timeout(Some(Timeout::Never))
-                    .request_timeout(Some(Timeout::After(Duration::from_secs(600)))),
-            )
-            .await?;
-        info!(action = "delete_topics", topics = ?topics, response = ?response);
-        Ok(())
-    }
-
     #[instrument]
-    pub async fn on_create(&self) -> SummaServerResult<()> {
+    async fn on_create(&self) -> SummaServerResult<()> {
         if self.config.create_topics {
             return self.create_topics().await;
         }
@@ -207,14 +266,14 @@ impl ConsumerThread {
     }
 
     #[instrument(skip(self), fields(consumer_name = ?self.consumer_name))]
-    pub async fn on_delete(&self) -> SummaServerResult<()> {
+    async fn on_delete(&self) -> SummaServerResult<()> {
         if self.config.delete_topics {
             return self.delete_topics().await;
         }
         Ok(())
     }
 
-    pub fn config(&self) -> &crate::configs::consumer::Config {
+    fn config(&self) -> &crate::configs::consumer::Config {
         &self.config
     }
 }

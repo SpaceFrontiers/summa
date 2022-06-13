@@ -1,4 +1,4 @@
 mod consumer;
 pub(crate) mod status;
 
-pub(crate) use consumer::ConsumerThread;
+pub(crate) use consumer::KafkaConsumerThread;

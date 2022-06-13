@@ -38,6 +38,8 @@ pub enum Error {
     #[error("clap_matches_error: {0}")]
     ClapMatches(#[from] clap::parser::MatchesError),
     #[error("{0}")]
+    Consumer(String),
+    #[error("{0}")]
     Core(#[from] summa_core::Error),
     #[error("internal_error")]
     Internal,
@@ -59,8 +61,6 @@ pub enum Error {
     Utf8(#[from] std::str::Utf8Error),
     #[error("{0}")]
     Validation(#[from] ValidationError),
-    #[error("{0}")]
-    Kafka(#[from] rdkafka::error::KafkaError),
     #[error("{0}")]
     Yaml(#[from] serde_yaml::Error),
 }

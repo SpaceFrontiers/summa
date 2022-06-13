@@ -18,7 +18,7 @@ pyo3-log = "0.8"
 pythonize = "0.18"
 serde_json = "1.0"
 summa-core = { version = "0.17.2", path = "../summa-core", default_features = false, features = ["fs", "hyper-external-request", "tokio-rt"] }
-summa-server = { version = "0.17.2", path = "../summa-server" }
+summa-server = { version = "0.17.2", path = "../summa-server", default_features = false }
 summa-proto = { workspace = true }
 tantivy = { workspace = true }
 tokio = { workspace = true }

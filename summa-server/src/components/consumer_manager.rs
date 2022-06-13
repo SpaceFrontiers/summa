@@ -2,71 +2,24 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use futures_util::future::join_all;
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::message::BorrowedMessage;
-use rdkafka::Message;
-use summa_core::components::{IndexHolder, IndexWriterHolder, SummaDocument};
+use summa_core::components::IndexHolder;
 use summa_core::utils::sync::Handler;
-use summa_proto::proto;
-use tantivy::schema::Schema;
-use tokio::sync::OwnedRwLockReadGuard;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
-use crate::components::consumers::kafka::status::{KafkaConsumingError, KafkaConsumingStatus};
-use crate::components::consumers::kafka::ConsumerThread;
-use crate::errors::{Error, SummaServerResult, ValidationError};
-
-pub fn process_message(
-    index_writer_holder: &OwnedRwLockReadGuard<IndexWriterHolder>,
-    conflict_strategy: proto::ConflictStrategy,
-    schema: &Schema,
-    message: Result<BorrowedMessage<'_>, KafkaError>,
-) -> Result<KafkaConsumingStatus, KafkaConsumingError> {
-    let message = message.map_err(KafkaConsumingError::Kafka)?;
-    let payload = message.payload().ok_or(KafkaConsumingError::EmptyPayload)?;
-    let proto_message: proto::IndexOperation = prost::Message::decode(payload).map_err(KafkaConsumingError::ProtoDecode)?;
-    let index_operation = proto_message.operation.ok_or(KafkaConsumingError::EmptyOperation)?;
-    match index_operation {
-        proto::index_operation::Operation::IndexDocument(index_document_operation) => {
-            let parsed_document = SummaDocument::BoundJsonBytes((schema, &index_document_operation.document))
-                .try_into()
-                .map_err(KafkaConsumingError::ParseDocument)?;
-            index_writer_holder
-                .index_document(parsed_document, conflict_strategy)
-                .map_err(|e| KafkaConsumingError::Index(e.into()))?;
-            Ok(KafkaConsumingStatus::Consumed)
-        }
-    }
-}
+use crate::components::consumers::ConsumerThread;
+use crate::errors::{SummaServerResult, ValidationError};
 
 #[derive(Debug)]
 pub struct StoppedConsumption {
-    consumer_thread: ConsumerThread,
+    consumer_thread: Box<dyn ConsumerThread>,
 }
 
 impl StoppedConsumption {
     pub async fn commit_offsets(self) -> SummaServerResult<PreparedConsumption> {
-        match self.consumer_thread.commit().await {
-            Ok(_) => {
-                info!(action = "committed_offsets");
-                Ok(PreparedConsumption {
-                    committed_consumer_thread: self.consumer_thread,
-                })
-            }
-            Err(Error::Kafka(KafkaError::ConsumerCommit(RDKafkaErrorCode::AssignmentLost))) => {
-                warn!(error = "assignment_lost");
-                Ok(PreparedConsumption {
-                    committed_consumer_thread: self.consumer_thread,
-                })
-            }
-            Err(Error::Kafka(KafkaError::ConsumerCommit(RDKafkaErrorCode::NoOffset))) => {
-                warn!(error = "no_offset");
-                Ok(PreparedConsumption {
-                    committed_consumer_thread: self.consumer_thread,
-                })
-            }
-            Err(e) => Err(e),
-        }
+        self.consumer_thread.commit().await?;
+        Ok(PreparedConsumption {
+            committed_consumer_thread: self.consumer_thread,
+        })
     }
 
     pub fn ignore(self) -> PreparedConsumption {
@@ -78,13 +31,17 @@ impl StoppedConsumption {
 
 #[derive(Debug)]
 pub struct PreparedConsumption {
-    committed_consumer_thread: ConsumerThread,
+    committed_consumer_thread: Box<dyn ConsumerThread>,
 }
 
 impl PreparedConsumption {
     pub fn from_config(consumer_name: &str, consumer_config: &crate::configs::consumer::Config) -> SummaServerResult<PreparedConsumption> {
+        #[cfg(not(feature = "kafka"))]
+        unimplemented!();
+        #[cfg(feature = "kafka")]
         Ok(PreparedConsumption {
-            committed_consumer_thread: ConsumerThread::new(consumer_name, consumer_config)?,
+            committed_consumer_thread: Box::new(crate::components::consumers::kafka::KafkaConsumerThread::new(consumer_name, consumer_config)?)
+                as Box<dyn ConsumerThread>,
         })
     }
 
@@ -103,7 +60,7 @@ impl PreparedConsumption {
 
 #[derive(Debug, Default)]
 pub struct ConsumerManager {
-    consumptions: HashMap<Handler<IndexHolder>, ConsumerThread>,
+    consumptions: HashMap<Handler<IndexHolder>, Box<dyn ConsumerThread>>,
 }
 
 impl ConsumerManager {
@@ -122,8 +79,9 @@ impl ConsumerManager {
         let conflict_strategy = index_holder.conflict_strategy();
         prepared_consumption
             .committed_consumer_thread
-            .start(move |message| process_message(&index_writer_holder, conflict_strategy, &schema, message))
-            .await;
+            .start(index_writer_holder, conflict_strategy, schema)
+            .await
+            .unwrap();
         self.consumptions.insert(index_holder.clone(), prepared_consumption.committed_consumer_thread);
         Ok(())
     }
@@ -156,7 +114,7 @@ impl ConsumerManager {
         }
     }
 
-    pub async fn get_consumer_for(&self, index_holder: &Handler<IndexHolder>) -> Option<&ConsumerThread> {
+    pub async fn get_consumer_for(&self, index_holder: &Handler<IndexHolder>) -> Option<&Box<dyn ConsumerThread>> {
         self.consumptions.get(index_holder)
     }
 
