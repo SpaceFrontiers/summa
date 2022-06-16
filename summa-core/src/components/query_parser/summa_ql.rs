@@ -3,12 +3,14 @@ use std::ops::Bound::{Included, Unbounded};
 use std::ops::Deref;
 use std::str::FromStr;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use pest::iterators::{Pair, Pairs};
 use pest::Parser;
 use pest_derive::Parser;
 use summa_proto::proto;
 use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
-use tantivy::schema::{FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
+use tantivy::schema::{Facet, FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 use tantivy::{Index, Term};
 use tantivy_query_grammar::Occur;
@@ -293,13 +295,13 @@ impl QueryParser {
         ))
     }
 
-    fn parse_words(&self, field: Field, option: &TextFieldIndexing, words: &str) -> Result<Vec<(usize, Term)>, QueryParserError> {
+    fn parse_words(&self, field: Field, full_path: &str, option: &TextFieldIndexing, words: &str) -> Result<Vec<(usize, Term)>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(field);
         let mut text_analyzer = self.get_text_analyzer(field_entry, option)?;
         let mut token_stream = text_analyzer.token_stream(words);
         let mut terms = Vec::new();
         token_stream.process(&mut |token| {
-            let term = Term::from_field_text(field, &token.text);
+            let term = cast_field_to_term(&field, full_path, field_entry.field_type(), &token.text, false);
             terms.push((token.position, term));
         });
         Ok(terms)
@@ -332,6 +334,15 @@ impl QueryParser {
         }
 
         return match *field_type {
+            FieldType::Bytes(_) => match pre_term.as_rule() {
+                Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
+                Rule::phrase | Rule::word => {
+                    let val = &BASE64.decode(pre_term.as_str())?;
+                    let query = Box::new(TermQuery::new(Term::from_field_bytes(*field, val), IndexRecordOption::Basic)) as Box<dyn Query>;
+                    Ok(vec![boost_query(query, boost)])
+                }
+                _ => unreachable!(),
+            },
             FieldType::U64(_) => match pre_term.as_rule() {
                 Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                 Rule::phrase | Rule::word => {
@@ -346,6 +357,14 @@ impl QueryParser {
                 Rule::phrase | Rule::word => {
                     let val: i64 = i64::from_str(pre_term.as_str())?;
                     let query = Box::new(TermQuery::new(Term::from_field_i64(*field, val), IndexRecordOption::WithFreqs)) as Box<dyn Query>;
+                    Ok(vec![boost_query(query, boost)])
+                }
+                _ => unreachable!(),
+            },
+            FieldType::Facet(_) => match pre_term.as_rule() {
+                Rule::phrase | Rule::word => {
+                    let val = Facet::from_text(pre_term.as_str())?;
+                    let query = Box::new(TermQuery::new(Term::from_facet(*field, &val), IndexRecordOption::Basic)) as Box<dyn Query>;
                     Ok(vec![boost_query(query, boost)])
                 }
                 _ => unreachable!(),
@@ -432,7 +451,7 @@ impl QueryParser {
                                         _ => u32::from_str(v.as_str()).expect("cannot parse"),
                                     })
                                     .unwrap_or(0);
-                                let terms = self.parse_words(*field, indexing, words.as_str())?;
+                                let terms = self.parse_words(*field, full_path, indexing, words.as_str())?;
                                 if terms.len() <= 1 {
                                     return Ok(terms
                                         .into_iter()
@@ -511,6 +530,10 @@ impl QueryParser {
             FieldType::Bool(_) => {
                 let val: bool = bool::from_str(phrase)?;
                 Ok(Term::from_field_bool(field, val))
+            }
+            FieldType::Bytes(_) => {
+                let val = &BASE64.decode(phrase)?;
+                Ok(Term::from_field_bytes(field, val))
             }
             FieldType::Str(ref str_options) => {
                 let option = str_options.get_indexing_options().ok_or_else(|| {
@@ -675,14 +698,14 @@ impl QueryParser {
                             .map(|field| {
                                 let mut subsubqueries = vec![];
                                 for entity in &entities {
-                                    let field = self.schema.get_field(field).expect("no field");
+                                    let (field, full_path) = self.schema.find_field(self.resolve_field_name(field)).expect("no field");
                                     let field_entry = self.schema.get_field_entry(field);
                                     let field_boost = self.query_parser_config.0.field_boosts.get(field_entry.name()).copied();
                                     if let FieldType::Str(ref str_option) = field_entry.field_type() {
                                         let Some(option) = str_option.get_indexing_options() else {
                                         continue
                                     };
-                                        let terms = match self.parse_words(field, option, entity) {
+                                        let terms = match self.parse_words(field, full_path, option, entity) {
                                             Ok(terms) => terms,
                                             Err(err) => return Err(err),
                                         };
@@ -710,23 +733,37 @@ impl QueryParser {
                 subqueries.extend(
                     fields
                         .filter_map(|field| {
-                            let field = self.schema.get_field(field).expect("no field");
+                            let (field, full_path) = self.schema.find_field(self.resolve_field_name(field)).expect("no field");
                             let field_entry = self.schema.get_field_entry(field);
                             let field_boost = self.query_parser_config.0.field_boosts.get(field_entry.name()).copied();
-                            if let FieldType::Str(ref str_option) = field_entry.field_type() {
-                                let Some(option) = str_option.get_indexing_options() else {
-                                    return None
-                                };
-                                let terms = match self.parse_words(field, option, &top_level_phrase) {
-                                    Ok(terms) => terms,
-                                    Err(err) => return Some(Err(err)),
-                                };
-                                (terms.len() > 1 && option.index_option().has_positions()).then(|| {
-                                    let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, exact_matches_promoter.slop)) as Box<dyn Query>;
-                                    Ok(boost_query(query, multiply_boosts(exact_matches_promoter.boost, field_boost)))
-                                })
-                            } else {
-                                None
+                            match field_entry.field_type() {
+                                FieldType::Str(ref str_option) => {
+                                    let Some(option) = str_option.get_indexing_options() else {
+                                        return None
+                                    };
+                                    let terms = match self.parse_words(field, full_path, option, &top_level_phrase) {
+                                        Ok(terms) => terms,
+                                        Err(err) => return Some(Err(err)),
+                                    };
+                                    (terms.len() > 1 && option.index_option().has_positions()).then(|| {
+                                        let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, exact_matches_promoter.slop)) as Box<dyn Query>;
+                                        Ok(boost_query(query, multiply_boosts(exact_matches_promoter.boost, field_boost)))
+                                    })
+                                }
+                                FieldType::JsonObject(ref json_option) => {
+                                    let Some(option) = json_option.get_text_indexing_options() else {
+                                        return None
+                                    };
+                                    let terms = match self.parse_words(field, full_path, option, &top_level_phrase) {
+                                        Ok(terms) => terms,
+                                        Err(err) => return Some(Err(err)),
+                                    };
+                                    (terms.len() > 1 && option.index_option().has_positions()).then(|| {
+                                        let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, exact_matches_promoter.slop)) as Box<dyn Query>;
+                                        Ok(boost_query(query, multiply_boosts(exact_matches_promoter.boost, field_boost)))
+                                    })
+                                }
+                                _ => None,
                             }
                         })
                         .collect::<Result<Vec<_>, _>>()?
