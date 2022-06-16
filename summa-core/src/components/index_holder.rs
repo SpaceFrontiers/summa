@@ -33,7 +33,7 @@ use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{Driver, IndexWriterHolder, SummaDocument};
 use crate::configs::ConfigProxy;
 use crate::directories::{CachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
-use crate::errors::SummaResult;
+use crate::errors::{SummaResult, ValidationError};
 use crate::proto_traits::Wrapper;
 use crate::Error;
 
@@ -348,8 +348,13 @@ impl IndexHolder {
         let mut warm_up_futures = Vec::new();
         let default_fields = fields
             .iter()
-            .map(|field_name| self.cached_schema.get_field(field_name.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|field_name| {
+                self.cached_schema
+                    .find_field(field_name.as_ref())
+                    .map(|x| x.0)
+                    .ok_or_else(|| ValidationError::MissingField(field_name.as_ref().to_string()))
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
         for field in default_fields {
             for segment_reader in searcher.segment_readers() {
                 let inverted_index = segment_reader.inverted_index_async(field).await?.clone();
@@ -357,7 +362,7 @@ impl IndexHolder {
                     warm_up_futures.push(async move {
                         let dict = inverted_index.terms();
                         info!(action = "warming_up_dictionary", index_name = ?self.index_name());
-                        dict.warm_up_dictionary().await
+                        dict.warm_up_dictionary_async().await
                     });
                 }
             }

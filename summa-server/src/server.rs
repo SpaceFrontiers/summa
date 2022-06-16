@@ -102,13 +102,12 @@ impl Server {
         }
 
         let mut futures: Vec<Box<dyn Future<Output = SummaServerResult<()>> + Send>> = vec![];
-        let server_config = self.server_config_holder.read().await.get().clone();
 
         let index_service = Index::new(&self.server_config_holder)?;
         futures.push(Box::new(index_service.prepare_serving_future(terminator.clone()).await?));
 
         #[cfg(feature = "metrics")]
-        if let Some(metrics_config) = &server_config.metrics {
+        if let Some(metrics_config) = &self.server_config_holder.read().await.get().metrics.clone() {
             let metrics_service = Metrics::new(metrics_config)?;
             futures.push(Box::new(metrics_service.prepare_serving_future(&index_service, terminator.clone()).await?));
         }

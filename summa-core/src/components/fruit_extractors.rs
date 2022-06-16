@@ -116,7 +116,7 @@ pub fn build_fruit_extractor(
     match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
             let query_fields = validators::parse_fields(searcher.schema(), &top_docs_collector_proto.fields)?;
-            let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter()));
+            let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter().map(|x| x.0)));
             Ok(match top_docs_collector_proto.scorer {
                 None | Some(proto::Scorer { scorer: None }) => Box::new(
                     TopDocsBuilder::default()
@@ -178,7 +178,7 @@ pub fn build_fruit_extractor(
         }
         Some(proto::collector::Collector::ReservoirSampling(reservoir_sampling_collector_proto)) => {
             let query_fields = validators::parse_fields(searcher.schema(), &reservoir_sampling_collector_proto.fields)?;
-            let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter()));
+            let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter().map(|x| x.0)));
             let reservoir_sampling_collector = collectors::ReservoirSampling::with_limit(reservoir_sampling_collector_proto.limit as usize);
             Ok(Box::new(
                 ReservoirSamplingBuilder::default()

@@ -35,10 +35,12 @@ pub struct PreparedConsumption {
 }
 
 impl PreparedConsumption {
-    pub fn from_config(consumer_name: &str, consumer_config: &crate::configs::consumer::Config) -> SummaServerResult<PreparedConsumption> {
-        #[cfg(not(feature = "kafka"))]
+    #[cfg(not(feature = "kafka"))]
+    pub fn from_config(_consumer_name: &str, _consumer_config: &crate::configs::consumer::Config) -> SummaServerResult<PreparedConsumption> {
         unimplemented!();
-        #[cfg(feature = "kafka")]
+    }
+    #[cfg(feature = "kafka")]
+    pub fn from_config(consumer_name: &str, consumer_config: &crate::configs::consumer::Config) -> SummaServerResult<PreparedConsumption> {
         Ok(PreparedConsumption {
             committed_consumer_thread: Box::new(crate::components::consumers::kafka::KafkaConsumerThread::new(consumer_name, consumer_config)?)
                 as Box<dyn ConsumerThread>,

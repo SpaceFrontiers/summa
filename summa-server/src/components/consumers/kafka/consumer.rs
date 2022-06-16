@@ -83,10 +83,8 @@ impl KafkaConsumerThread {
         let mut kafka_producer_config = ClientConfig::new();
         kafka_producer_config.set("bootstrap.servers", config.bootstrap_servers.join(","));
 
-        let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create().map_err(|e| Error::Consumer(e.to_string()))?;
-        stream_consumer
-            .subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>())
-            .map_err(|e| Error::Consumer(e.to_string()))?;
+        let stream_consumer: KafkaStreamConsumer = kafka_consumer_config.create()?;
+        stream_consumer.subscribe(&config.topics.iter().map(String::as_str).collect::<Vec<_>>())?;
 
         Ok(KafkaConsumerThread {
             consumer_name: consumer_name.to_owned(),
@@ -98,7 +96,7 @@ impl KafkaConsumerThread {
 
     #[instrument(skip(self))]
     async fn create_topics(&self) -> SummaServerResult<()> {
-        let admin_client = AdminClient::from_config(&self.kafka_producer_config).map_err(|e| Error::Consumer(e.to_string()))?;
+        let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let admin_options = AdminOptions::new().operation_timeout(Some(Timeout::Never));
         let new_topics: Vec<_> = self
             .config
@@ -117,22 +115,16 @@ impl KafkaConsumerThread {
                     .set("max.message.bytes", "134217728")
             })
             .collect();
-        let response = admin_client
-            .create_topics(&new_topics, &admin_options)
-            .await
-            .map_err(|e| Error::Consumer(e.to_string()))?;
+        let response = admin_client.create_topics(&new_topics, &admin_options).await?;
         info!(action = "create_topics", topics = ?new_topics, response = ?response);
-        let response = admin_client
-            .alter_configs(&alter_topics, &admin_options)
-            .await
-            .map_err(|e| Error::Consumer(e.to_string()))?;
+        let response = admin_client.alter_configs(&alter_topics, &admin_options).await?;
         info!(action = "alter_configs", topics = ?new_topics, response = ?response);
         Ok(())
     }
 
     #[instrument(skip(self))]
     async fn delete_topics(&self) -> SummaServerResult<()> {
-        let admin_client = AdminClient::from_config(&self.kafka_producer_config).map_err(|e| Error::Consumer(e.to_string()))?;
+        let admin_client = AdminClient::from_config(&self.kafka_producer_config)?;
         let topics: Vec<_> = self.config.topics.iter().map(String::as_str).collect();
         let response = admin_client
             .delete_topics(
@@ -141,8 +133,7 @@ impl KafkaConsumerThread {
                     .operation_timeout(Some(Timeout::Never))
                     .request_timeout(Some(Timeout::After(Duration::from_secs(600)))),
             )
-            .await
-            .map_err(|e| Error::Consumer(e.to_string()))?;
+            .await?;
         info!(action = "delete_topics", topics = ?topics, response = ?response);
         Ok(())
     }
@@ -245,8 +236,7 @@ impl ConsumerThread for KafkaConsumerThread {
                             Ok(())
                         }
                         Err(e) => Err(e),
-                    }
-                    .map_err(|e| Error::Consumer(e.to_string()))?;
+                    }?;
                     Ok::<StreamConsumer, Error>(stream_consumer)
                 })
                 .await?;
