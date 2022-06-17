@@ -1,6 +1,5 @@
 mod custom_serializer;
 mod default_tokenizers;
-mod driver;
 mod fruit_extractors;
 mod index_holder;
 mod index_registry;
@@ -15,7 +14,6 @@ mod summa_tokenizer;
 
 pub use custom_serializer::NamedFieldDocument;
 pub use default_tokenizers::default_tokenizers;
-pub use driver::Driver;
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor, IntermediateExtractionResult};
 pub use index_holder::{cleanup_index, IndexHolder};
 pub use index_registry::IndexRegistry;

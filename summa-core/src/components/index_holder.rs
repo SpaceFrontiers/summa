@@ -30,7 +30,7 @@ use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, ProtoQueryParser};
 use crate::components::fruit_extractors::IntermediateExtractionResult;
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
-use crate::components::{Driver, IndexWriterHolder, SummaDocument};
+use crate::components::{IndexWriterHolder, SummaDocument};
 use crate::configs::ConfigProxy;
 use crate::directories::{CachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
@@ -50,7 +50,6 @@ pub struct IndexHolder {
     /// Counters
     #[cfg(feature = "metrics")]
     search_times_meter: Histogram<f64>,
-    driver: Driver,
 }
 
 impl Hash for IndexHolder {
@@ -161,7 +160,6 @@ impl IndexHolder {
         index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
         merge_policy: Option<proto::MergePolicy>,
         query_parser_config: proto::QueryParserConfig,
-        driver: Driver,
     ) -> SummaResult<IndexHolder> {
         register_default_tokenizers(&index);
 
@@ -220,7 +218,6 @@ impl IndexHolder {
                 .with_unit(Unit::new("seconds"))
                 .with_description("Search times")
                 .init(),
-            driver,
         })
     }
 

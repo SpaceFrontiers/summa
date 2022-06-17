@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::future::join_all;
 use serde::Serialize;
 use serde_wasm_bindgen::Serializer;
-use summa_core::components::{Driver, IndexHolder, IndexRegistry, SummaDocument};
+use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
@@ -104,7 +104,6 @@ impl WrappedIndexRegistry {
             Arc::new(DirectProxy::new(index_engine_config)),
             None,
             query_parser_config,
-            Driver::Native,
         )?;
         let index_attributes = index_holder.index_attributes().cloned();
         self.index_registry.add(index_holder).await?;

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_broadcast::Receiver;
 use futures_util::future::join_all;
-use summa_core::components::{cleanup_index, Driver, IndexHolder, IndexRegistry};
+use summa_core::components::{cleanup_index, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
@@ -136,7 +136,6 @@ impl Index {
                     index_engine_config_holder,
                     merge_policy,
                     query_parser_config,
-                    Driver::current_tokio(),
                 )
             })
             .await??;
@@ -204,15 +203,7 @@ impl Index {
             .index_registry
             .add(
                 tokio::task::spawn_blocking(move || {
-                    IndexHolder::create_holder(
-                        &core_config,
-                        index,
-                        &index_name,
-                        index_engine_config_holder,
-                        merge_policy,
-                        query_parser_config,
-                        Driver::current_tokio(),
-                    )
+                    IndexHolder::create_holder(&core_config, index, &index_name, index_engine_config_holder, merge_policy, query_parser_config)
                 })
                 .await??,
             )
