@@ -340,9 +340,7 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 5] {
         .filter(LowerCaser)
         .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
         .build();
-    let whitespace_tokenizer = TextAnalyzer::builder(WhitespaceTokenizer::default())
-        .filter(LowerCaser)
-        .build();
+    let whitespace_tokenizer = TextAnalyzer::builder(WhitespaceTokenizer::default()).filter(LowerCaser).build();
     let raw_tokenizer = TextAnalyzer::builder(RawTokenizer::default()).filter(LowerCaser).build();
     [
         ("summa".to_owned(), summa_tokenizer),

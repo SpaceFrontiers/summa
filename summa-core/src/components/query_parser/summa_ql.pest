@@ -31,7 +31,7 @@ default_term = ${ pre_term }
 pre_grouping = _{ "(" ~ WHITE_SPACE? ~ term ~ (WHITE_SPACE+ ~ term)* ~ WHITE_SPACE? ~ ")" }
 
 positive_grouping = ${ "+" ~ pre_grouping }
-negative_grouping = ${ "+" ~ pre_grouping }
+negative_grouping = ${ "-" ~ pre_grouping }
 default_grouping = ${ pre_grouping }
 
 term = { positive_term | negative_term | default_term }

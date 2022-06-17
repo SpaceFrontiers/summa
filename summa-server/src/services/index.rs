@@ -266,7 +266,6 @@ impl Index {
         Ok(index_holder)
     }
 
-    /// Create consumer and insert it into the consumer registry. Add it to the `IndexHolder` afterwards.
     #[instrument(skip_all, fields(source_index_name = ?copy_documents_request.source_index_name, target_index_name = ?copy_documents_request.target_index_name))]
     pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<u32> {
         let target_index_holder = self.get_index_holder(&copy_documents_request.target_index_name).await?;

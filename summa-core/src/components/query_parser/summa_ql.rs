@@ -301,7 +301,7 @@ impl QueryParser {
         let mut token_stream = text_analyzer.token_stream(words);
         let mut terms = Vec::new();
         token_stream.process(&mut |token| {
-            let term = cast_field_to_term(&field, full_path, field_entry.field_type(), &token.text, false);
+            let term = cast_field_to_term(&field, full_path, field_entry.field_type(), &token.text, true);
             terms.push((token.position, term));
         });
         Ok(terms)
@@ -429,45 +429,28 @@ impl QueryParser {
                             Some(words) => words,
                         };
 
-                        match field_type {
-                            FieldType::JsonObject(_) => {
-                                let mut text_analyzer = self.get_text_analyzer(field_entry, indexing)?;
-                                let mut token_stream = text_analyzer.token_stream(words.as_str());
-                                let mut queries = Vec::new();
-
-                                token_stream.process(&mut |token| {
-                                    let term = cast_field_to_term(field, full_path, field_type, &token.text, true);
+                        let slop = phrase_pairs
+                            .next()
+                            .map(|v| match v.as_str() {
+                                "" => 0,
+                                _ => u32::from_str(v.as_str()).expect("cannot parse"),
+                            })
+                            .unwrap_or(0);
+                        let terms = self.parse_words(*field, full_path, indexing, words.as_str())?;
+                        if terms.len() <= 1 {
+                            return Ok(terms
+                                .into_iter()
+                                .map(|(_, term)| {
                                     let query = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
-                                    queries.push(boost_query(query, boost));
-                                });
-
-                                Ok(queries)
-                            }
-                            _ => {
-                                let slop = phrase_pairs
-                                    .next()
-                                    .map(|v| match v.as_str() {
-                                        "" => 0,
-                                        _ => u32::from_str(v.as_str()).expect("cannot parse"),
-                                    })
-                                    .unwrap_or(0);
-                                let terms = self.parse_words(*field, full_path, indexing, words.as_str())?;
-                                if terms.len() <= 1 {
-                                    return Ok(terms
-                                        .into_iter()
-                                        .map(|(_, term)| {
-                                            let query = Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
-                                            boost_query(query, boost)
-                                        })
-                                        .collect());
-                                }
-                                if !indexing.index_option().has_positions() {
-                                    return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
-                                }
-                                let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>;
-                                return Ok(vec![boost_query(query, boost)]);
-                            }
+                                    boost_query(query, boost)
+                                })
+                                .collect());
                         }
+                        if !indexing.index_option().has_positions() {
+                            return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
+                        }
+                        let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>;
+                        return Ok(vec![boost_query(query, boost)]);
                     }
                     Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                     Rule::regex => {
@@ -1066,6 +1049,10 @@ mod tests {
             format!("{:?}", query_parser.parse_query("metadata.a:\"1\"")),
             "Ok(TermQuery(Term(field=5, type=Json, path=a, type=Str, \"1\")))"
         );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("metadata.a:\"1 2 3\"")),
+            "Ok(PhraseQuery { field: Field(5), phrase_terms: [(0, Term(field=5, type=Json, path=a, type=Str, \"1\")), (1, Term(field=5, type=Json, path=a, type=Str, \"2\")), (2, Term(field=5, type=Json, path=a, type=Str, \"3\"))], slop: 0 })"
+        );
     }
 
     #[test]
@@ -1074,6 +1061,10 @@ mod tests {
         assert_eq!(
             format!("{:?}", query_parser.parse_query("body:+(a b)")),
             "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=1, type=Str, \"a\"))), (Should, TermQuery(Term(field=1, type=Str, \"b\")))] })] })"
+        );
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("body:-(a b)")),
+            "Ok(BooleanQuery { subqueries: [(MustNot, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=1, type=Str, \"a\"))), (Should, TermQuery(Term(field=1, type=Str, \"b\")))] })] })"
         );
     }
 
