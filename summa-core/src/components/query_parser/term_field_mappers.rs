@@ -7,10 +7,9 @@ use tantivy::tokenizer::TokenizerManager;
 use tantivy::Term;
 
 use crate::components::query_parser::utils::cast_field_to_term;
-use crate::components::QueryParserError;
 
 pub trait TermFieldMapper {
-    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>>;
+    fn map(&self, value: &str, fields: &[String]) -> Option<Box<dyn Query>>;
 }
 
 fn tokenize_value(schema: &Schema, field: &Field, full_path: &str, value: &str, tokenizer_manager: &TokenizerManager) -> Vec<Term> {
@@ -19,13 +18,7 @@ fn tokenize_value(schema: &Schema, field: &Field, full_path: &str, value: &str, 
     match field_entry.field_type() {
         FieldType::Str(ref str_options) => {
             let option = str_options.get_indexing_options().unwrap();
-            let mut text_analyzer = tokenizer_manager
-                .get(option.tokenizer())
-                .ok_or_else(|| QueryParserError::UnknownTokenizer {
-                    field: field_entry.name().to_string(),
-                    tokenizer: option.tokenizer().to_string(),
-                })
-                .unwrap();
+            let mut text_analyzer = tokenizer_manager.get(option.tokenizer()).expect("unknown tokenizer");
             let mut token_stream = text_analyzer.token_stream(value);
             token_stream.process(&mut |token| {
                 let term = cast_field_to_term(field, full_path, schema.get_field_entry(*field).field_type(), &token.text, true);
@@ -55,14 +48,13 @@ impl DoiMapper {
 }
 
 impl TermFieldMapper for DoiMapper {
-    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>> {
+    fn map(&self, value: &str, fields: &[String]) -> Option<Box<dyn Query>> {
         let terms = fields
             .iter()
-            .map(|field_name| {
+            .flat_map(|field_name| {
                 let (field, full_path) = self.schema.find_field(field_name).expect("inconsistent state");
                 tokenize_value(&self.schema, &field, full_path, value, &self.tokenizer_manager)
             })
-            .flatten()
             .collect();
         Some(Box::new(BooleanQuery::new_multiterms_query(terms)) as Box<dyn Query>)
     }
@@ -80,7 +72,7 @@ impl DoiIsbnMapper {
 }
 
 impl TermFieldMapper for DoiIsbnMapper {
-    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>> {
+    fn map(&self, value: &str, fields: &[String]) -> Option<Box<dyn Query>> {
         thread_local! {
             static MATCHER: Regex = Regex::new(r"(10.[0-9]+)/((?:cbo)?(?:(?:978[0-9]{10})|(?:978[0-9]{13})|(?:978[-0-9]+)))(.*)").expect("cannot compile regex");
         }
@@ -119,7 +111,7 @@ impl IsbnMapper {
 }
 
 impl TermFieldMapper for IsbnMapper {
-    fn map(&self, value: &str, fields: &Vec<String>) -> Option<Box<dyn Query>> {
+    fn map(&self, value: &str, fields: &[String]) -> Option<Box<dyn Query>> {
         let subqueries: Vec<_> = fields
             .iter()
             .map(|field_name| {

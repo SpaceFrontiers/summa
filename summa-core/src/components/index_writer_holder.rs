@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use summa_proto::proto;
+use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::merge_policy::MergePolicy;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Value};
@@ -124,7 +125,7 @@ impl IndexWriterImpl {
 pub struct IndexWriterHolder {
     index_writer: IndexWriterImpl,
     merge_policy: Arc<dyn MergePolicy>,
-    unique_fields: Vec<Field>,
+    unique_fields: Vec<(Field, String)>,
     writer_threads: WriterThreads,
     writer_heap_size_bytes: usize,
 }
@@ -138,7 +139,7 @@ impl IndexWriterHolder {
     pub(super) fn new(
         index_writer: IndexWriterImpl,
         merge_policy: Arc<dyn MergePolicy>,
-        unique_fields: Vec<Field>,
+        unique_fields: Vec<(Field, String)>,
         writer_threads: WriterThreads,
         writer_heap_size_bytes: usize,
     ) -> SummaResult<IndexWriterHolder> {
@@ -166,7 +167,13 @@ impl IndexWriterHolder {
                 attributes
                     .unique_fields
                     .iter()
-                    .map(|unique_field| index.schema().get_field(unique_field))
+                    .map(|unique_field| {
+                        index
+                            .schema()
+                            .find_field(unique_field)
+                            .ok_or_else(|| ValidationError::MissingField(unique_field.to_string()))
+                            .map(|x| (x.0, x.1.to_string()))
+                    })
                     .collect::<Result<_, _>>()
             })
             .transpose()?
@@ -183,13 +190,31 @@ impl IndexWriterHolder {
         let unique_terms = self
             .unique_fields
             .iter()
-            .filter_map(|unique_field| {
-                document.get_first(*unique_field).map(|value| match value {
-                    Value::Str(s) => Ok(Term::from_field_text(*unique_field, s)),
-                    Value::I64(i) => Ok(Term::from_field_i64(*unique_field, *i)),
-                    _ => Err(Error::Validation(Box::new(ValidationError::InvalidUniqueFieldType(
-                        self.index_writer.index().schema().get_field_entry(*unique_field).field_type().clone(),
-                    )))),
+            .filter_map(|(unique_field, full_path)| {
+                document.get_first(*unique_field).and_then(|value| match value {
+                    Value::Str(s) => Some(Ok(Term::from_field_text(*unique_field, s))),
+                    Value::JsonObject(i) => i.get(full_path).map(|value| {
+                        let mut term = Term::with_capacity(128);
+                        let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*unique_field, full_path, true, &mut term);
+                        match value {
+                            serde_json::Value::Number(n) => {
+                                Ok(convert_to_fast_value_and_get_term(&mut json_term_writer, &n.to_string()).expect("incorrect json type"))
+                            }
+                            serde_json::Value::String(s) => {
+                                json_term_writer.set_str(s);
+                                Ok(json_term_writer.term().clone())
+                            }
+                            _ => unreachable!(),
+                        }
+                    }),
+                    Value::I64(i) => Some(Ok(Term::from_field_i64(*unique_field, *i))),
+                    Value::U64(i) => Some(Ok(Term::from_field_u64(*unique_field, *i))),
+                    Value::F64(i) => Some(Ok(Term::from_field_f64(*unique_field, *i))),
+                    _ => {
+                        let schema = self.index_writer.index().schema();
+                        let field_type = schema.get_field_entry(*unique_field).field_type();
+                        Some(Err(Error::Validation(Box::new(ValidationError::InvalidUniqueFieldType(field_type.clone())))))
+                    }
                 })
             })
             .collect::<SummaResult<Vec<_>>>()?;

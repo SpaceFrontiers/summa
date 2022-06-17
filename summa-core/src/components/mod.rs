@@ -32,8 +32,9 @@ pub mod test_utils {
     use itertools::Itertools;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
+    use serde_json::json;
     use tantivy::doc;
-    use tantivy::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
+    use tantivy::schema::{IndexRecordOption, JsonObjectOptions, Schema, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
 
     use crate::components::SummaDocument;
 
@@ -63,6 +64,17 @@ pub mod test_utils {
             TextOptions::default()
                 .set_stored()
                 .set_indexing_options(TextFieldIndexing::default().set_tokenizer("summa").set_index_option(IndexRecordOption::Basic)),
+        );
+        schema_builder.add_json_field(
+            "metadata",
+            JsonObjectOptions::default()
+                .set_stored()
+                .set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("summa_without_stop_words")
+                        .set_index_option(IndexRecordOption::Basic),
+                )
+                .set_expand_dots_enabled(),
         );
         schema_builder.build()
     }
@@ -95,13 +107,15 @@ pub mod test_utils {
         static DOC_ID: AtomicI64 = AtomicI64::new(1);
 
         let issued_at = 1674041452i64 - rng.gen_range(100..1000);
+        let doc_id = doc_id.unwrap_or_else(|| DOC_ID.fetch_add(1, Ordering::SeqCst));
 
         SummaDocument::TantivyDocument(doc!(
-            schema.get_field("id").expect("no expected field") => doc_id.unwrap_or_else(|| DOC_ID.fetch_add(1, Ordering::SeqCst)),
+            schema.get_field("id").expect("no expected field") => doc_id,
             schema.get_field("title").expect("no expected field") => generate_sentence(rng, title_prefix, title_power, 3),
             schema.get_field("body").expect("no expected field") => generate_sentence(rng, body_prefix, body_power, 50),
             schema.get_field("tags").expect("no expected field") => generate_sentence(rng, tag_prefix, tag_power, 5),
-            schema.get_field("issued_at").expect("no expected field") => issued_at
+            schema.get_field("issued_at").expect("no expected field") => issued_at,
+            schema.get_field("metadata").expect("no expected field") => json!({"id": doc_id}),
         ))
     }
 

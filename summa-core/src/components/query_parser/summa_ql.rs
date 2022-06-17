@@ -295,7 +295,7 @@ impl QueryParser {
         ))
     }
 
-    fn parse_words(&self, field: Field, full_path: &str, option: &TextFieldIndexing, words: &str) -> Result<Vec<(usize, Term)>, QueryParserError> {
+    pub fn parse_words(&self, field: Field, full_path: &str, option: &TextFieldIndexing, words: &str) -> Result<Vec<(usize, Term)>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(field);
         let mut text_analyzer = self.get_text_analyzer(field_entry, option)?;
         let mut token_stream = text_analyzer.token_stream(words);

@@ -2,7 +2,7 @@ mod morphology;
 mod proto_query_parser;
 mod summa_ql;
 mod term_field_mappers;
-mod utils;
+pub(crate) mod utils;
 
 pub use proto_query_parser::ProtoQueryParser;
 

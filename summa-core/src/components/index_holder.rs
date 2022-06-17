@@ -95,7 +95,7 @@ impl Debug for IndexHolder {
 /// Sets up standard Summa tokenizers
 ///
 /// The set of tokenizers includes standard Tantivy tokenizers as well as `SummaTokenizer` that supports CJK
-fn register_default_tokenizers(index: &Index) {
+pub fn register_default_tokenizers(index: &Index) {
     for (tokenizer_name, tokenizer) in &default_tokenizers() {
         index.tokenizers().register(tokenizer_name, tokenizer.clone())
     }
@@ -556,13 +556,16 @@ pub mod tests {
     use std::error::Error;
     use std::sync::Arc;
 
+    use serde_json::json;
     use summa_proto::proto;
     use summa_proto::proto::ConflictStrategy;
-    use tantivy::collector::Count;
-    use tantivy::query::TermQuery;
+    use tantivy::collector::{Count, TopDocs};
+    use tantivy::json_utils::JsonTermWriter;
+    use tantivy::query::{AllQuery, TermQuery};
     use tantivy::schema::IndexRecordOption;
     use tantivy::{doc, Document, IndexBuilder, Term};
 
+    use crate::components::index_holder::register_default_tokenizers;
     use crate::components::test_utils::{create_test_schema, generate_documents};
     use crate::components::IndexWriterHolder;
     use crate::configs::core::WriterThreads;
@@ -577,6 +580,7 @@ pub mod tests {
                 ..Default::default()
             })
             .create_in_ram()?;
+        register_default_tokenizers(&index);
         let mut index_writer_holder = IndexWriterHolder::create(
             &index,
             WriterThreads::N(12),
@@ -610,6 +614,79 @@ pub mod tests {
             &Count,
         )?;
         assert_eq!(counter, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_unique_json_fields() -> Result<(), Box<dyn Error>> {
+        let schema = create_test_schema();
+        let index = IndexBuilder::new()
+            .schema(schema.clone())
+            .index_attributes(proto::IndexAttributes {
+                unique_fields: vec!["metadata.id".to_string()],
+                ..Default::default()
+            })
+            .create_in_ram()?;
+        register_default_tokenizers(&index);
+        let mut index_writer_holder = IndexWriterHolder::create(
+            &index,
+            WriterThreads::N(12),
+            1024 * 1024 * 1024,
+            Arc::new(tantivy::merge_policy::LogMergePolicy::default()),
+        )?;
+
+        index_writer_holder.index_document(
+            doc!(schema.get_field("metadata").expect("no field") => json!({"id": 1})),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.index_document(
+            doc!(schema.get_field("metadata").expect("no field") => json!({"id": 2})),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.index_document(
+            doc!(schema.get_field("metadata").expect("no field") => json!({"id": 3})),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let counter = searcher.search(&AllQuery, &Count)?;
+        assert_eq!(counter, 3);
+        index_writer_holder.index_document(
+            doc!(schema.get_field("metadata").expect("no field") => json!({"id": "g"})),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let counter = searcher.search(&AllQuery, &Count)?;
+        assert_eq!(counter, 4);
+        index_writer_holder.index_document(
+            doc!(schema.get_field("metadata").expect("no field") => json!({"id": "g"})),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let counter = searcher.search(&AllQuery, &Count)?;
+        assert_eq!(counter, 4);
+        index_writer_holder.index_document(
+            doc!(schema.get_field("metadata").expect("no field") => json!({"id": 2})),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.index_document(
+            doc!(schema.get_field("metadata").expect("no field") => json!({"id": 4})),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let counter = searcher.search(&AllQuery, &Count)?;
+        assert_eq!(counter, 5);
         Ok(())
     }
 }
