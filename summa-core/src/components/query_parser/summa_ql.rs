@@ -240,7 +240,7 @@ impl QueryParser {
             .iter()
             .map(|field| {
                 let (field, full_path) = self.schema.find_field(field).expect("inconsistent state");
-                self.parse_pre_term(&field, full_path, term.clone(), boost)
+                self.parse_pre_term(&field, full_path, term.clone(), boost, true)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -307,7 +307,14 @@ impl QueryParser {
         Ok(terms)
     }
 
-    fn parse_pre_term(&self, field: &Field, full_path: &str, pre_term: Pair<Rule>, boost: Option<f32>) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
+    fn parse_pre_term(
+        &self,
+        field: &Field,
+        full_path: &str,
+        pre_term: Pair<Rule>,
+        boost: Option<f32>,
+        split_phrase_to_terms: bool,
+    ) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(*field);
         let field_type = field_entry.field_type();
 
@@ -446,10 +453,19 @@ impl QueryParser {
                                 })
                                 .collect());
                         }
-                        if !indexing.index_option().has_positions() {
+                        if !indexing.index_option().has_positions() && !split_phrase_to_terms {
                             return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
                         }
-                        let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>;
+                        let query = if split_phrase_to_terms && !indexing.index_option().has_positions() {
+                            Box::new(BooleanQuery::new(
+                                terms
+                                    .into_iter()
+                                    .map(|(_, term)| (Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>))
+                                    .collect(),
+                            )) as Box<dyn Query>
+                        } else {
+                            Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>
+                        };
                         return Ok(vec![boost_query(query, boost)]);
                     }
                     Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
@@ -477,11 +493,11 @@ impl QueryParser {
     }
 
     fn parse_term(&self, term: Pair<Rule>, field: &Field, full_path: &str, boost: Option<f32>) -> Result<Box<dyn Query>, QueryParserError> {
-        let term = term.into_inner().next().expect("grammar_failure");
+        let term = term.into_inner().next().expect("grammar failure");
         let occur = self.parse_occur(&term);
         let pre_term = term.into_inner().next().expect("grammar failure");
         Ok(Box::new(BooleanQuery::new(
-            self.parse_pre_term(field, full_path, pre_term, boost)?
+            self.parse_pre_term(field, full_path, pre_term, boost, false)?
                 .into_iter()
                 .map(|q| (occur, q))
                 .collect(),
