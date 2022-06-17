@@ -1,8 +1,6 @@
-use std::str::FromStr;
-
 use prost::encoding::bool;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
-use tantivy::schema::{Facet, Field, FieldType};
+use tantivy::schema::{Field, FieldType};
 use tantivy::Term;
 
 pub fn cast_field_to_term(field: &Field, full_path: &str, field_type: &FieldType, value: &str, force_str: bool) -> Term {

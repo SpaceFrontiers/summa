@@ -486,9 +486,9 @@ impl QueryParser {
 
     fn parse_occur(&self, occur: &Pair<Rule>) -> Occur {
         match occur.as_rule() {
-            Rule::positive_term => Occur::Must,
-            Rule::negative_term => Occur::MustNot,
-            Rule::default_term => Occur::Should,
+            Rule::positive_term | Rule::positive_grouping => Occur::Must,
+            Rule::negative_term | Rule::negative_grouping => Occur::MustNot,
+            Rule::default_term | Rule::default_grouping => Occur::Should,
             _ => unreachable!(),
         }
     }
@@ -604,17 +604,19 @@ impl QueryParser {
                 let grouping_or_term = search_group.next().expect("grammar failure");
                 match grouping_or_term.as_rule() {
                     Rule::grouping => {
+                        let grouping = grouping_or_term.into_inner().next().expect("grammar failure");
+                        let occur = self.parse_occur(&grouping);
                         let mut intermediate_results = vec![];
                         match self.schema.find_field(self.resolve_field_name(field_name.as_str())) {
                             Some((field, full_path)) => {
-                                for term in grouping_or_term.into_inner() {
+                                for term in grouping.into_inner() {
                                     intermediate_results.push(self.parse_term(term, &field, full_path, statement_boost)?);
                                 }
                             }
                             None => match proto::MissingFieldPolicy::from_i32(self.query_parser_config.0.missing_field_policy) {
                                 Some(proto::MissingFieldPolicy::AsUsualTerms) => {
                                     intermediate_results.push(self.default_field_queries(field_name, statement_boost)?);
-                                    for term in grouping_or_term.into_inner() {
+                                    for term in grouping.into_inner() {
                                         intermediate_results.push(self.default_field_queries(term, statement_boost)?)
                                     }
                                 }
@@ -623,7 +625,12 @@ impl QueryParser {
                                 _ => unreachable!(),
                             },
                         }
-                        Ok(Box::new(BooleanQuery::new(intermediate_results.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>)
+                        let group_query = Box::new(BooleanQuery::new(intermediate_results.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>;
+                        match occur {
+                            Occur::Should => Ok(group_query),
+                            Occur::Must => Ok(Box::new(BooleanQuery::new(vec![(Occur::Must, group_query)])) as Box<dyn Query>),
+                            Occur::MustNot => Ok(Box::new(BooleanQuery::new(vec![(Occur::MustNot, group_query)])) as Box<dyn Query>),
+                        }
                     }
                     Rule::term => match self.schema.find_field(self.resolve_field_name(field_name.as_str())) {
                         Some((field, full_path)) => self.parse_term(grouping_or_term, &field, full_path, statement_boost),
@@ -1062,6 +1069,15 @@ mod tests {
     }
 
     #[test]
+    pub fn test_grouping() {
+        let query_parser = create_query_parser();
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("body:+(a b)")),
+            "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=1, type=Str, \"a\"))), (Should, TermQuery(Term(field=1, type=Str, \"b\")))] })] })"
+        );
+    }
+
+    #[test]
     pub fn test_plus_minus() {
         let query_parser = create_query_parser();
         assert_eq!(
@@ -1160,8 +1176,8 @@ mod tests {
         );
         query_parser.query_parser_config.0.morphology_configs = morphology_configs;
         query_parser.query_parser_config.0.query_language = Some("en".to_string());
-        let query = query_parser.parse_query("search engine");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"search\")), TermQuery(Term(field=0, type=Str, \"searches\"))], tie_breaker: 0.3 }), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.3 })] })");
+        let query = query_parser.parse_query("red search engine");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"red\")), TermQuery(Term(field=0, type=Str, \"reds\"))], tie_breaker: 0.3 }), (Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.3 })] })");
     }
 
     #[test]

@@ -58,9 +58,11 @@ RUN mv target/armv7-unknown-linux-gnueabihf/release/summa-server-bin /bin/summa-
 FROM --platform=amd64 gcr.io/distroless/cc AS final-amd64
 COPY --from=build-amd64 /bin/summa-server /bin/summa-server
 COPY --from=build-amd64 /usr/local/lib /usr/local/lib
+
 FROM --platform=arm64 gcr.io/distroless/cc:latest-arm64 AS final-arm64
 COPY --from=build-arm64 /bin/summa-server /bin/summa-server
 COPY --from=build-arm64 /usr/local/lib /usr/local/lib
+
 FROM --platform=arm/v7 gcr.io/distroless/cc:latest-arm AS final-arm
 COPY --from=build-arm /bin/summa-server /bin/summa-server
 COPY --from=build-arm /usr/local/lib /usr/local/lib
