@@ -457,12 +457,13 @@ impl QueryParser {
                             return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
                         }
                         let query = if split_phrase_to_terms && !indexing.index_option().has_positions() {
-                            Box::new(BooleanQuery::new(
+                            let subquery = Box::new(BooleanQuery::new(
                                 terms
                                     .into_iter()
                                     .map(|(_, term)| (Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>))
                                     .collect(),
-                            )) as Box<dyn Query>
+                            )) as Box<dyn Query>;
+                            Box::new(BooleanQuery::new(vec![(Occur::Should, subquery)])) as Box<dyn Query>
                         } else {
                             Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>
                         };

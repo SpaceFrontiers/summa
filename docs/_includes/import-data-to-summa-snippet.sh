@@ -3,4 +3,4 @@
 awk 'NR%4==0' enwikibooks.json | summa-cli localhost:8082 - index-document-stream books
 
 # Commit index to make them searchable
-summa-cli localhost:8082 - commit-index books --commit-mode Sync
+summa-cli localhost:8082 - commit-index books
