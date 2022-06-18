@@ -14,7 +14,47 @@ use tracing::info;
 use super::SummaSegmentAttributes;
 use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
+use crate::page_rank::quantize_page_rank;
+use crate::utils::current_time;
 use crate::Error;
+
+fn extract_flatten<T: AsRef<str>>(v: &serde_json::Value, parts: &[T], buffer: &mut Vec<String>) {
+    let mut current = v;
+    for (i, part) in parts.iter().enumerate() {
+        match current {
+            serde_json::value::Value::Object(m) => {
+                if let Some(next) = m.get(part.as_ref()) {
+                    current = next
+                }
+            }
+            serde_json::value::Value::Array(a) => {
+                for child in a {
+                    extract_flatten(child, &parts[i..], buffer)
+                }
+            }
+            _ => break,
+        }
+    }
+    if let serde_json::Value::String(last_value) = &current {
+        buffer.push(last_value.to_string())
+    }
+}
+
+fn extract_flatten_from_map<T: AsRef<str>>(m: &serde_json::value::Map<String, serde_json::Value>, parts: &[T], buffer: &mut Vec<String>) {
+    for (i, part) in parts.iter().enumerate() {
+        match m.get(part.as_ref()) {
+            Some(v) => match v {
+                serde_json::value::Value::Array(a) => {
+                    for child in a {
+                        extract_flatten(child, &parts[i..], buffer)
+                    }
+                }
+                _ => extract_flatten(v, &parts[i..], buffer),
+            },
+            None => break,
+        }
+    }
+}
 
 /// Wrap `tantivy::SingleSegmentIndexWriter` and allows to recreate it
 pub struct SingleIndexWriter {
@@ -128,6 +168,10 @@ pub struct IndexWriterHolder {
     unique_fields: Vec<(Field, String)>,
     writer_threads: WriterThreads,
     writer_heap_size_bytes: usize,
+
+    page_rank_field: Option<(Field, Field)>,
+    updated_at_field: Option<Field>,
+    mapped_fields: Vec<((Field, Vec<String>), Field)>,
 }
 
 impl IndexWriterHolder {
@@ -140,15 +184,27 @@ impl IndexWriterHolder {
         index_writer: IndexWriterImpl,
         merge_policy: Arc<dyn MergePolicy>,
         unique_fields: Vec<(Field, String)>,
+        mapped_fields: Vec<((Field, Vec<String>), Field)>,
         writer_threads: WriterThreads,
         writer_heap_size_bytes: usize,
     ) -> SummaResult<IndexWriterHolder> {
+        let schema = index_writer.index().schema();
+        let page_rank_field =
+            if let (Ok(page_rank_field), Ok(quantized_page_rank_field)) = (schema.get_field("page_rank"), schema.get_field("quantized_page_rank")) {
+                Some((page_rank_field, quantized_page_rank_field))
+            } else {
+                None
+            };
         Ok(IndexWriterHolder {
             index_writer,
             merge_policy,
             unique_fields,
             writer_threads,
             writer_heap_size_bytes,
+
+            page_rank_field,
+            updated_at_field: schema.get_field("updated_at").ok(),
+            mapped_fields,
         })
     }
 
@@ -160,25 +216,46 @@ impl IndexWriterHolder {
         merge_policy: Arc<dyn MergePolicy>,
     ) -> SummaResult<IndexWriterHolder> {
         let index_writer = IndexWriterImpl::new(index, writer_threads.clone(), writer_heap_size_bytes, merge_policy.clone())?;
-        let unique_fields = index
-            .load_metas()?
+        let schema = index_writer.index().schema();
+        let metas = index.load_metas()?;
+        let mapped_fields = metas
+            .index_attributes()?
+            .map(|attributes: proto::IndexAttributes| {
+                attributes
+                    .mapped_fields
+                    .iter()
+                    .map(|proto::MappedField { source_field, target_field }| {
+                        Ok::<((Field, Vec<String>), Field), ValidationError>((
+                            schema
+                                .find_field(source_field)
+                                .ok_or_else(|| ValidationError::MissingField(source_field.to_string()))
+                                .map(|(field, full_path)| (field, full_path.split('.').map(|x| x.to_string()).collect()))?,
+                            schema
+                                .get_field(target_field)
+                                .map_err(|_| ValidationError::MissingField(source_field.to_string()))?,
+                        ))
+                    })
+                    .collect::<Result<Vec<(_, _)>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let unique_fields = metas
             .index_attributes()?
             .map(|attributes: proto::IndexAttributes| {
                 attributes
                     .unique_fields
                     .iter()
                     .map(|unique_field| {
-                        index
-                            .schema()
+                        schema
                             .find_field(unique_field)
                             .ok_or_else(|| ValidationError::MissingField(unique_field.to_string()))
                             .map(|x| (x.0, x.1.to_string()))
                     })
-                    .collect::<Result<_, _>>()
+                    .collect::<Result<Vec<_>, _>>()
             })
             .transpose()?
             .unwrap_or_default();
-        IndexWriterHolder::new(index_writer, merge_policy, unique_fields, writer_threads, writer_heap_size_bytes)
+        IndexWriterHolder::new(index_writer, merge_policy, unique_fields, mapped_fields, writer_threads, writer_heap_size_bytes)
     }
 
     /// Delete index by its unique fields
@@ -249,8 +326,42 @@ impl IndexWriterHolder {
         self.index_writer.index()
     }
 
+    #[inline]
+    fn process_dynamic_fields(&self, mut document: Document) -> Document {
+        if let Some((page_rank_field, quantized_page_rank_field)) = self.page_rank_field {
+            if let Some(page_rank_value) = document.get_first(page_rank_field) {
+                if let Some(page_rank_value_f64) = page_rank_value.as_f64() {
+                    document.add_u64(quantized_page_rank_field, quantize_page_rank(page_rank_value_f64))
+                }
+            }
+        }
+
+        if let Some(updated_at_field) = self.updated_at_field {
+            document.add_i64(updated_at_field, current_time() as i64)
+        }
+
+        let mut buffer = vec![];
+        for ((source_field, source_full_path), target_field) in &self.mapped_fields {
+            for value in document.get_all(*source_field) {
+                match value {
+                    Value::Str(s) => buffer.push(s.to_string()),
+                    Value::JsonObject(m) => {
+                        extract_flatten_from_map(m, source_full_path, &mut buffer);
+                    }
+                    _ => unimplemented!(),
+                }
+            }
+            for v in &buffer {
+                document.add_text(*target_field, v)
+            }
+            buffer.clear();
+        }
+        document
+    }
+
     /// Put document to the index. Before comes searchable it must be committed
     pub fn index_document(&self, document: Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
+        let document = self.process_dynamic_fields(document);
         self.resolve_conflicts(&document, conflict_strategy)?;
         self.index_writer.add_document(document)?;
         Ok(())

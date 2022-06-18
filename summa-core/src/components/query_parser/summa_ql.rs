@@ -13,6 +13,7 @@ use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, 
 use tantivy::schema::{Facet, FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 use tantivy::{Index, Term};
+use tantivy_common::HasLen;
 use tantivy_query_grammar::Occur;
 
 use crate::components::query_parser::morphology::MorphologyManager;
@@ -142,11 +143,18 @@ fn reduce_should_clause(query: Box<dyn Query>) -> Box<dyn Query> {
         for (occur, nested_query) in boolean_query.clauses() {
             let nested_query = reduce_should_clause(nested_query.box_clone());
             match occur {
-                Occur::Must | Occur::MustNot | Occur::Should => subqueries.push((*occur, reduce_should_clause(nested_query.box_clone()))),
+                Occur::Must | Occur::MustNot => subqueries.push((*occur, nested_query)),
+                Occur::Should => {
+                    if let Some(nested_boolean_query) = nested_query.deref().as_any().downcast_ref::<BooleanQuery>() {
+                        subqueries.extend(nested_boolean_query.clauses().iter().map(|(o, q)| (*o, reduce_should_clause(q.box_clone()))))
+                    } else {
+                        subqueries.push((*occur, nested_query))
+                    }
+                }
             }
         }
         if subqueries.len() == 1 && subqueries[0].0 == Occur::Should {
-            return subqueries[0].1.box_clone();
+            return subqueries.into_iter().next().expect("impossible").1;
         }
         return Box::new(BooleanQuery::new(subqueries)) as Box<dyn Query>;
     }
@@ -306,7 +314,7 @@ impl QueryParser {
         full_path: &str,
         pre_term: Pair<Rule>,
         boost: Option<f32>,
-        split_phrase_to_terms: bool,
+        ignore_phrase_for_non_position_field: bool,
     ) -> Result<Vec<Box<dyn Query>>, QueryParserError> {
         let field_entry = self.schema.get_field_entry(*field);
         let field_type = field_entry.field_type();
@@ -446,21 +454,14 @@ impl QueryParser {
                                 })
                                 .collect());
                         }
-                        if !indexing.index_option().has_positions() && !split_phrase_to_terms {
-                            return Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()));
-                        }
-                        let query = if split_phrase_to_terms && !indexing.index_option().has_positions() {
-                            let subquery = Box::new(BooleanQuery::new(
-                                terms
-                                    .into_iter()
-                                    .map(|(_, term)| (Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>))
-                                    .collect(),
-                            )) as Box<dyn Query>;
-                            Box::new(BooleanQuery::new(vec![(Occur::Should, subquery)])) as Box<dyn Query>
+                        return if indexing.index_option().has_positions() {
+                            let query = Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>;
+                            Ok(vec![boost_query(query, boost)])
+                        } else if ignore_phrase_for_non_position_field {
+                            Ok(vec![])
                         } else {
-                            Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)) as Box<dyn Query>
+                            Err(QueryParserError::FieldDoesNotHavePositionsIndexed(field_entry.name().to_string()))
                         };
-                        return Ok(vec![boost_query(query, boost)]);
                     }
                     Rule::range => Ok(vec![Box::new(self.parse_range(pre_term, field)?) as Box<dyn Query>]),
                     Rule::regex => {

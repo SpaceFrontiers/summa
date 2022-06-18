@@ -143,6 +143,11 @@ enum ConflictStrategy {
   MERGE = 3;
 }
 
+message MappedField {
+  string source_field = 1;
+  string target_field = 2;
+}
+
 message IndexAttributes {
   // Timestamp when index has been created
   uint64 created_at = 1;
@@ -153,6 +158,7 @@ message IndexAttributes {
   // Text index description
   optional string description = 6;
   ConflictStrategy conflict_strategy = 8;
+  repeated MappedField mapped_fields = 9;
 }
 
 // Request for index creation

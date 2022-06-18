@@ -74,6 +74,14 @@ pub mod test_utils {
                 )
                 .set_expand_dots_enabled(),
         );
+        schema_builder.add_text_field(
+            "extra",
+            TextOptions::default().set_stored().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("summa")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
         schema_builder.build()
     }
 

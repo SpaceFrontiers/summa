@@ -557,7 +557,6 @@ pub mod tests {
     use summa_proto::proto;
     use summa_proto::proto::ConflictStrategy;
     use tantivy::collector::{Count, TopDocs};
-    use tantivy::json_utils::JsonTermWriter;
     use tantivy::query::{AllQuery, TermQuery};
     use tantivy::schema::IndexRecordOption;
     use tantivy::{doc, Document, IndexBuilder, Term};
@@ -611,6 +610,100 @@ pub mod tests {
             &Count,
         )?;
         assert_eq!(counter, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mapped_fields() -> Result<(), Box<dyn Error>> {
+        let schema = create_test_schema();
+        let metadata_field = schema.get_field("metadata").expect("no field");
+        let tags_field = schema.get_field("tags").expect("no field");
+        let title_field = schema.get_field("title").expect("no field");
+        let extra_field = schema.get_field("extra").expect("no field");
+        let index = IndexBuilder::new()
+            .schema(schema.clone())
+            .index_attributes(proto::IndexAttributes {
+                mapped_fields: vec![
+                    proto::MappedField {
+                        source_field: "metadata.isbn".to_string(),
+                        target_field: "extra".to_string(),
+                    },
+                    proto::MappedField {
+                        source_field: "tags".to_string(),
+                        target_field: "extra".to_string(),
+                    },
+                    proto::MappedField {
+                        source_field: "title".to_string(),
+                        target_field: "extra".to_string(),
+                    },
+                ],
+                ..Default::default()
+            })
+            .create_in_ram()?;
+        register_default_tokenizers(&index);
+        let mut index_writer_holder = IndexWriterHolder::create(
+            &index,
+            WriterThreads::N(12),
+            1024 * 1024 * 1024,
+            Arc::new(tantivy::merge_policy::LogMergePolicy::default()),
+        )?;
+        index_writer_holder.index_document(
+            doc!(
+                title_field => "Hitchhiker's guide",
+                metadata_field => json!({"isbn": ["100", "200", "300", "500", "600"], "another_title": "Super Title"}),
+                tags_field => "reality",
+            ),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.index_document(
+            doc!(
+                title_field => "Envy of the Stars",
+                metadata_field => json!({"isbn": "500"}),
+                tags_field => "scifi",
+                tags_field => "novel",
+            ),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let docs = searcher
+            .search(
+                &TermQuery::new(Term::from_field_text(extra_field, "500"), IndexRecordOption::Basic),
+                &TopDocs::with_limit(10),
+            )?
+            .into_iter()
+            .map(|x| {
+                searcher
+                    .doc(x.1)
+                    .unwrap()
+                    .get_first(title_field)
+                    .unwrap()
+                    .as_text()
+                    .map(|x| x.to_string())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(format!("{:?}", docs), "[\"Envy of the Stars\", \"Hitchhiker's guide\"]");
+        let docs = searcher
+            .search(
+                &TermQuery::new(Term::from_field_text(extra_field, "scifi"), IndexRecordOption::Basic),
+                &TopDocs::with_limit(10),
+            )?
+            .into_iter()
+            .map(|x| {
+                searcher
+                    .doc(x.1)
+                    .unwrap()
+                    .get_first(title_field)
+                    .unwrap()
+                    .as_text()
+                    .map(|x| x.to_string())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(format!("{:?}", docs), "[\"Envy of the Stars\"]");
         Ok(())
     }
 
