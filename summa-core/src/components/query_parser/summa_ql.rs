@@ -142,14 +142,7 @@ fn reduce_should_clause(query: Box<dyn Query>) -> Box<dyn Query> {
         for (occur, nested_query) in boolean_query.clauses() {
             let nested_query = reduce_should_clause(nested_query.box_clone());
             match occur {
-                Occur::Must | Occur::MustNot => subqueries.push((*occur, reduce_should_clause(nested_query.box_clone()))),
-                Occur::Should => {
-                    if let Some(nested_nested_query) = nested_query.deref().as_any().downcast_ref::<BooleanQuery>() {
-                        subqueries.extend(nested_nested_query.clauses().iter().map(|(o, q)| (*o, q.box_clone())))
-                    } else {
-                        subqueries.push((*occur, reduce_should_clause(nested_query.box_clone())))
-                    }
-                }
+                Occur::Must | Occur::MustNot | Occur::Should => subqueries.push((*occur, reduce_should_clause(nested_query.box_clone()))),
             }
         }
         if subqueries.len() == 1 && subqueries[0].0 == Occur::Should {
