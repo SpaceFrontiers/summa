@@ -133,7 +133,7 @@ class SummaClient(BaseGrpcClient):
             self,
             source_index_name: str,
             target_index_name: str,
-            conflict_strategy: Optional[dict] = None,
+            conflict_strategy: Optional[str] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.CopyDocumentsResponse:
@@ -146,9 +146,9 @@ class SummaClient(BaseGrpcClient):
             conflict_strategy: recommended to set to DoNothing for large updates and maintain uniqueness in your application
             request_id: request id
             session_id: session id
-        Returns:
-            Commit scheduling result
         """
+        if isinstance(conflict_strategy, str):
+            conflict_strategy = index_service_pb.ConflictStrategy.Value(conflict_strategy)
         return await self.stubs['index_api'].copy_documents(
             index_service_pb.CopyDocumentsRequest(
                 source_index_name=source_index_name,

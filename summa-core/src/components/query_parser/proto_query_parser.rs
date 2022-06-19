@@ -2,7 +2,6 @@ use std::ops::Bound;
 use std::ops::Bound::Unbounded;
 use std::str::FromStr;
 
-use base64::Engine;
 #[cfg(feature = "metrics")]
 use opentelemetry::metrics::Counter;
 #[cfg(feature = "metrics")]
@@ -10,16 +9,18 @@ use opentelemetry::Context;
 #[cfg(feature = "metrics")]
 use opentelemetry::{global, KeyValue};
 use summa_proto::proto;
-use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
+use tantivy::json_utils::JsonTermWriter;
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, RangeQuery,
+    RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
-use tantivy::{DateTime, Index, Score, Term};
+use tantivy::{Index, Score, Term};
 use tracing::info;
 
 use crate::components::queries::ExistsQuery;
 use crate::components::query_parser::morphology::MorphologyManager;
+use crate::components::query_parser::utils::cast_field_to_typed_term;
 use crate::components::query_parser::{QueryParser, QueryParserError};
 use crate::configs::core::QueryParserConfig;
 use crate::errors::{Error, SummaResult, ValidationError};
@@ -57,48 +58,11 @@ impl From<Option<proto::query_parser_config::DefaultMode>> for QueryParserDefaul
     }
 }
 
-fn cast_value_to_term(field: Field, full_path: &str, field_type: &FieldType, value: &str) -> SummaResult<Term> {
-    Ok(match field_type {
-        FieldType::Str(_) => Term::from_field_text(field, value),
-        FieldType::JsonObject(json_options) => {
-            let mut term = Term::with_capacity(128);
-            let mut json_term_writer = JsonTermWriter::from_field_and_json_path(field, full_path, json_options.is_expand_dots_enabled(), &mut term);
-            convert_to_fast_value_and_get_term(&mut json_term_writer, value).unwrap_or_else(|| {
-                json_term_writer.set_str(value.trim_matches(|c| c == '\'' || c == '\"'));
-                json_term_writer.term().clone()
-            })
-        }
-        FieldType::I64(_) => Term::from_field_i64(
-            field,
-            i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as i64")))?,
-        ),
-        FieldType::U64(_) => Term::from_field_u64(
-            field,
-            u64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as u64")))?,
-        ),
-        FieldType::F64(_) => Term::from_field_f64(
-            field,
-            f64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as f64")))?,
-        ),
-        FieldType::Bytes(_) => Term::from_field_bytes(
-            field,
-            &base64::engine::general_purpose::STANDARD
-                .decode(value)
-                .map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as bytes")))?,
-        ),
-        FieldType::Date(_) => Term::from_field_date(
-            field,
-            DateTime::from_timestamp_secs(i64::from_str(value).map_err(|_e| Error::InvalidSyntax(format!("cannot parse {value} as date")))?),
-        ),
-        _ => return Err(Error::InvalidSyntax("invalid range type".to_owned())),
-    })
-}
-
-fn cast_value_to_bound_term(field: Field, full_path: &str, field_type: &FieldType, value: &str, including: bool) -> SummaResult<Bound<Term>> {
+fn cast_value_to_bound_term(field: &Field, full_path: &str, field_type: &FieldType, value: &str, including: bool) -> SummaResult<Bound<Term>> {
     Ok(match value {
         "*" => Unbounded,
         value => {
-            let casted_value = cast_value_to_term(field, full_path, field_type, value)?;
+            let casted_value = cast_field_to_typed_term(field, full_path, field_type, value)?;
             if including {
                 Bound::Included(casted_value)
             } else {
@@ -207,8 +171,8 @@ impl ProtoQueryParser {
             proto::query::Query::Range(range_query_proto) => {
                 let (field, full_path, field_entry) = self.field_and_field_entry(&range_query_proto.field)?;
                 let value = range_query_proto.value.as_ref().ok_or(ValidationError::MissingRange)?;
-                let left = cast_value_to_bound_term(field, full_path, field_entry.field_type(), &value.left, value.including_left)?;
-                let right = cast_value_to_bound_term(field, full_path, field_entry.field_type(), &value.right, value.including_right)?;
+                let left = cast_value_to_bound_term(&field, full_path, field_entry.field_type(), &value.left, value.including_left)?;
+                let right = cast_value_to_bound_term(&field, full_path, field_entry.field_type(), &value.right, value.including_right)?;
                 Box::new(RangeQuery::new_term_bounds(
                     range_query_proto.field.clone(),
                     field_entry.field_type().value_type(),
@@ -231,7 +195,10 @@ impl ProtoQueryParser {
                 let mut token_stream = tokenizer.token_stream(&phrase_query_proto.value);
                 let mut terms: Vec<(usize, Term)> = vec![];
                 while let Some(token) = token_stream.next() {
-                    terms.push((token.position, cast_value_to_term(field, full_path, field_entry.field_type(), &token.text)?))
+                    terms.push((
+                        token.position,
+                        cast_field_to_typed_term(&field, full_path, field_entry.field_type(), &token.text)?,
+                    ))
                 }
                 if terms.is_empty() {
                     Box::new(EmptyQuery)
@@ -247,7 +214,7 @@ impl ProtoQueryParser {
             proto::query::Query::Term(term_query_proto) => {
                 let (field, full_path, field_entry) = self.field_and_field_entry(&term_query_proto.field)?;
                 Box::new(TermQuery::new(
-                    cast_value_to_term(field, full_path, field_entry.field_type(), &term_query_proto.value)?,
+                    cast_field_to_typed_term(&field, full_path, field_entry.field_type(), &term_query_proto.value)?,
                     field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
                 ))
             }
@@ -296,10 +263,11 @@ impl ProtoQueryParser {
                 if full_path.is_empty() {
                     Box::new(ExistsQuery::new(field))
                 } else {
-                    Box::new(TermQuery::new(
-                        cast_value_to_term(field, full_path, field_entry.field_type(), "")?,
-                        field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
-                    ))
+                    // Generalize approach (now position indexing is required and expand_dots_enabled is fixes)
+                    let mut term = Term::with_capacity(128);
+                    let json_term_writer = JsonTermWriter::from_field_and_json_path(field, full_path, true, &mut term);
+                    let prefix_term = json_term_writer.term().clone();
+                    Box::new(PhrasePrefixQuery::new(vec![prefix_term]))
                 }
             }
         })
