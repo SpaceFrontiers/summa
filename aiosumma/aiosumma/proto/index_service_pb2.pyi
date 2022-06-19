@@ -76,12 +76,14 @@ class CommitIndexResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ...) -> None: ...
 
 class CopyDocumentsRequest(_message.Message):
-    __slots__ = ["source_index_name", "target_index_name"]
+    __slots__ = ["conflict_strategy", "source_index_name", "target_index_name"]
+    CONFLICT_STRATEGY_FIELD_NUMBER: _ClassVar[int]
     SOURCE_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     TARGET_INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    conflict_strategy: ConflictStrategy
     source_index_name: str
     target_index_name: str
-    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ...) -> None: ...
+    def __init__(self, source_index_name: _Optional[str] = ..., target_index_name: _Optional[str] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
 
 class CopyDocumentsResponse(_message.Message):
     __slots__ = ["copied_documents", "elapsed_secs"]

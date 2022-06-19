@@ -267,8 +267,8 @@ impl IndexWriterHolder {
     }
 
     /// Delete index by its unique fields
-    pub(super) fn resolve_conflicts(&self, document: &Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<Option<u64>> {
-        if self.unique_fields.is_empty() {
+    pub(super) fn resolve_conflicts(&self, document: &mut Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<Option<u64>> {
+        if self.unique_fields.is_empty() || matches!(conflict_strategy, proto::ConflictStrategy::DoNothing) {
             return Ok(None);
         }
 
@@ -335,7 +335,7 @@ impl IndexWriterHolder {
     }
 
     #[inline]
-    fn process_dynamic_fields(&self, mut document: Document) -> Document {
+    fn process_dynamic_fields(&self, document: &mut Document) {
         if let Some((page_rank_field, quantized_page_rank_field)) = self.page_rank_field {
             if let Some(page_rank_value) = document.get_first(page_rank_field) {
                 if let Some(page_rank_value_f64) = page_rank_value.as_f64() {
@@ -375,13 +375,12 @@ impl IndexWriterHolder {
             }
             buffer.clear();
         }
-        document
     }
 
     /// Put document to the index. Before comes searchable it must be committed
-    pub fn index_document(&self, document: Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
-        let document = self.process_dynamic_fields(document);
-        self.resolve_conflicts(&document, conflict_strategy)?;
+    pub fn index_document(&self, mut document: Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
+        self.process_dynamic_fields(&mut document);
+        self.resolve_conflicts(&mut document, conflict_strategy)?;
         self.index_writer.add_document(document)?;
         Ok(())
     }

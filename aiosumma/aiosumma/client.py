@@ -133,6 +133,7 @@ class SummaClient(BaseGrpcClient):
             self,
             source_index_name: str,
             target_index_name: str,
+            conflict_strategy: Optional[dict] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.CopyDocumentsResponse:
@@ -142,6 +143,7 @@ class SummaClient(BaseGrpcClient):
         Args:
             source_index_name: source index name
             target_index_name: target index name
+            conflict_strategy: recommended to set to DoNothing for large updates and maintain uniqueness in your application
             request_id: request id
             session_id: session id
         Returns:
@@ -151,6 +153,7 @@ class SummaClient(BaseGrpcClient):
             index_service_pb.CopyDocumentsRequest(
                 source_index_name=source_index_name,
                 target_index_name=target_index_name,
+                conflict_strategy=conflict_strategy,
             ),
             metadata=setup_metadata(session_id, request_id),
         )

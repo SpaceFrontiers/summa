@@ -101,6 +101,8 @@ message CopyDocumentsRequest {
   string source_index_name = 1;
   // Where documents should be copied to
   string target_index_name = 2;
+  // How to deal with conflicts on unique fields. Recommended to set to DoNothing for large updates and maintain uniqueness in your application
+  optional ConflictStrategy conflict_strategy = 3;
 }
 
 // Copy documents response
