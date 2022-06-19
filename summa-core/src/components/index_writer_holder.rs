@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use summa_proto::proto;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::merge_policy::MergePolicy;
@@ -171,6 +172,7 @@ pub struct IndexWriterHolder {
 
     page_rank_field: Option<(Field, Field)>,
     updated_at_field: Option<Field>,
+    extra_year_field: Option<(Field, Field)>,
     mapped_fields: Vec<((Field, Vec<String>), Field)>,
 }
 
@@ -195,6 +197,11 @@ impl IndexWriterHolder {
             } else {
                 None
             };
+        let extra_year_field = if let (Ok(extra_field), Ok(issued_at_field)) = (schema.get_field("extra"), schema.get_field("issued_at")) {
+            Some((extra_field, issued_at_field))
+        } else {
+            None
+        };
         Ok(IndexWriterHolder {
             index_writer,
             merge_policy,
@@ -204,6 +211,7 @@ impl IndexWriterHolder {
 
             page_rank_field,
             updated_at_field: schema.get_field("updated_at").ok(),
+            extra_year_field,
             mapped_fields,
         })
     }
@@ -338,6 +346,17 @@ impl IndexWriterHolder {
 
         if let Some(updated_at_field) = self.updated_at_field {
             document.add_i64(updated_at_field, current_time() as i64)
+        }
+
+        if let Some((extra_field, issued_at_field)) = self.extra_year_field {
+            if let Some(issued_at_value) = document.get_first(issued_at_field) {
+                if let Some(issued_at_value) = issued_at_value.as_i64() {
+                    if let Some(correct_timestamp) = NaiveDateTime::from_timestamp_opt(issued_at_value, 0) {
+                        let datetime: DateTime<Utc> = DateTime::from_utc(correct_timestamp, Utc);
+                        document.add_text(extra_field, datetime.year().to_string())
+                    }
+                }
+            }
         }
 
         let mut buffer = vec![];

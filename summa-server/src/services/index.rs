@@ -260,7 +260,7 @@ impl Index {
     #[instrument(skip_all, fields(source_index_name = ?copy_documents_request.source_index_name, target_index_name = ?copy_documents_request.target_index_name))]
     pub async fn copy_documents(&self, copy_documents_request: proto::CopyDocumentsRequest) -> SummaServerResult<u32> {
         let target_index_holder = self.get_index_holder(&copy_documents_request.target_index_name).await?;
-        let target_index_writer = target_index_holder.index_writer_holder()?.clone().read_owned().await;
+        let mut target_index_writer = target_index_holder.index_writer_holder()?.clone().read_owned().await;
         let conflict_strategy = target_index_holder.conflict_strategy();
         let source_index_holder = self.get_index_holder(&copy_documents_request.source_index_name).await?;
         let searcher = source_index_holder.index_reader().searcher();
@@ -271,8 +271,12 @@ impl Index {
                 .index_document(document, conflict_strategy)
                 .map_err(crate::errors::Error::from)?;
             documents += 1;
-            if documents % 100_000 == 0 {
-                info!(action = "copied", documents = documents)
+            target_index_writer = if documents % 100_000 == 0 {
+                info!(action = "copied", documents = documents);
+                drop(target_index_writer);
+                target_index_holder.index_writer_holder()?.clone().read_owned().await
+            } else {
+                target_index_writer
             }
         }
         Ok(documents)

@@ -235,18 +235,20 @@ class GetIndicesResponse(_message.Message):
     def __init__(self, index_names: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexAttributes(_message.Message):
-    __slots__ = ["conflict_strategy", "created_at", "description", "multi_fields", "unique_fields"]
+    __slots__ = ["conflict_strategy", "created_at", "description", "mapped_fields", "multi_fields", "unique_fields"]
     CONFLICT_STRATEGY_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
+    MAPPED_FIELDS_FIELD_NUMBER: _ClassVar[int]
     MULTI_FIELDS_FIELD_NUMBER: _ClassVar[int]
     UNIQUE_FIELDS_FIELD_NUMBER: _ClassVar[int]
     conflict_strategy: ConflictStrategy
     created_at: int
     description: str
+    mapped_fields: _containers.RepeatedCompositeFieldContainer[MappedField]
     multi_fields: _containers.RepeatedScalarFieldContainer[str]
     unique_fields: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., description: _Optional[str] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
+    def __init__(self, created_at: _Optional[int] = ..., unique_fields: _Optional[_Iterable[str]] = ..., multi_fields: _Optional[_Iterable[str]] = ..., description: _Optional[str] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ..., mapped_fields: _Optional[_Iterable[_Union[MappedField, _Mapping]]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ["compression", "index_aliases", "index_attributes", "index_engine", "index_name", "num_docs"]
@@ -334,6 +336,14 @@ class LogMergePolicy(_message.Message):
     IS_FROZEN_FIELD_NUMBER: _ClassVar[int]
     is_frozen: bool
     def __init__(self, is_frozen: bool = ...) -> None: ...
+
+class MappedField(_message.Message):
+    __slots__ = ["source_field", "target_field"]
+    SOURCE_FIELD_FIELD_NUMBER: _ClassVar[int]
+    TARGET_FIELD_FIELD_NUMBER: _ClassVar[int]
+    source_field: str
+    target_field: str
+    def __init__(self, source_field: _Optional[str] = ..., target_field: _Optional[str] = ...) -> None: ...
 
 class MemoryEngineConfig(_message.Message):
     __slots__ = ["schema"]
