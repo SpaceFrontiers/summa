@@ -1,7 +1,12 @@
-from google.protobuf.internal import containers as _containers
+from typing import ClassVar as _ClassVar
+from typing import Iterable as _Iterable
+from typing import Mapping as _Mapping
+from typing import Optional as _Optional
+from typing import Union as _Union
+
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
+from google.protobuf.internal import containers as _containers
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
@@ -16,9 +21,9 @@ class PBLink(_message.Message):
     def __init__(self, hash: _Optional[bytes] = ..., name: _Optional[str] = ..., t_size: _Optional[int] = ...) -> None: ...
 
 class PBNode(_message.Message):
-    __slots__ = ["data", "links"]
-    DATA_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["links", "data"]
     LINKS_FIELD_NUMBER: _ClassVar[int]
-    data: bytes
+    DATA_FIELD_NUMBER: _ClassVar[int]
     links: _containers.RepeatedCompositeFieldContainer[PBLink]
+    data: bytes
     def __init__(self, links: _Optional[_Iterable[_Union[PBLink, _Mapping]]] = ..., data: _Optional[bytes] = ...) -> None: ...

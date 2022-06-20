@@ -15,8 +15,6 @@ use tracing::info;
 use super::SummaSegmentAttributes;
 use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
-use crate::page_rank::quantize_page_rank;
-use crate::utils::current_time;
 use crate::Error;
 
 fn extract_flatten<T: AsRef<str>>(v: &serde_json::Value, parts: &[T], buffer: &mut Vec<String>) {
@@ -170,11 +168,8 @@ pub struct IndexWriterHolder {
     writer_threads: WriterThreads,
     writer_heap_size_bytes: usize,
 
-    page_rank_field: Option<(Field, Field)>,
-    updated_at_field: Option<Field>,
     extra_year_field: Option<(Field, Field)>,
     mapped_fields: Vec<((Field, Vec<String>), Field)>,
-    custom_score_field: Option<Field>,
 }
 
 impl IndexWriterHolder {
@@ -192,12 +187,6 @@ impl IndexWriterHolder {
         writer_heap_size_bytes: usize,
     ) -> SummaResult<IndexWriterHolder> {
         let schema = index_writer.index().schema();
-        let page_rank_field =
-            if let (Ok(page_rank_field), Ok(quantized_page_rank_field)) = (schema.get_field("page_rank"), schema.get_field("quantized_page_rank")) {
-                Some((page_rank_field, quantized_page_rank_field))
-            } else {
-                None
-            };
         let extra_year_field = if let (Ok(extra_field), Ok(issued_at_field)) = (schema.get_field("extra"), schema.get_field("issued_at")) {
             Some((extra_field, issued_at_field))
         } else {
@@ -209,10 +198,6 @@ impl IndexWriterHolder {
             unique_fields,
             writer_threads,
             writer_heap_size_bytes,
-
-            page_rank_field,
-            custom_score_field: schema.get_field("custom_score").ok(),
-            updated_at_field: schema.get_field("updated_at").ok(),
             extra_year_field,
             mapped_fields,
         })
@@ -338,22 +323,6 @@ impl IndexWriterHolder {
 
     #[inline]
     fn process_dynamic_fields(&self, document: &mut Document) -> SummaResult<()> {
-        if let Some((page_rank_field, quantized_page_rank_field)) = self.page_rank_field {
-            if let Some(page_rank_value) = document.get_first(page_rank_field) {
-                if let Some(page_rank_value_f64) = page_rank_value.as_f64() {
-                    document.add_u64(quantized_page_rank_field, quantize_page_rank(page_rank_value_f64))
-                }
-            }
-        }
-
-        if let Some(updated_at_field) = self.updated_at_field {
-            document.add_i64(updated_at_field, current_time() as i64)
-        }
-
-        if let Some(custom_score_field) = self.custom_score_field {
-            document.add_f64(custom_score_field, 1.0)
-        }
-
         if let Some((extra_field, issued_at_field)) = self.extra_year_field {
             if let Some(issued_at_value) = document.get_first(issued_at_field) {
                 if let Some(issued_at_value) = issued_at_value.as_i64() {

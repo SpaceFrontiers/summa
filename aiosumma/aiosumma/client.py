@@ -44,7 +44,7 @@ def setup_metadata(session_id, request_id):
     return metadata
 
 
-def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int):
+def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int, conflict_strategy: Optional[index_service_pb.ConflictStrategy] = None):
     documents_portion = []
     for document in documents:
         documents_portion.append(document)
@@ -52,12 +52,14 @@ def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int)
             yield index_service_pb.IndexDocumentStreamRequest(
                 index_name=index_name,
                 documents=documents_portion,
+                conflict_strategy=conflict_strategy,
             )
             documents_portion = []
     if documents_portion:
         yield index_service_pb.IndexDocumentStreamRequest(
             index_name=index_name,
             documents=documents_portion,
+            conflict_strategy=conflict_strategy,
         )
 
 class SummaClient(BaseGrpcClient):
@@ -484,6 +486,7 @@ class SummaClient(BaseGrpcClient):
             self,
             index_name: str,
             documents: Union[Iterable[str], str] = None,
+            conflict_strategy: Optional[str] = None,
             bulk_size: int = 100,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
@@ -494,10 +497,14 @@ class SummaClient(BaseGrpcClient):
         Args:
             index_name: index name
             documents: list of bytes
+            conflict_strategy: recommended to set to DoNothing for large updates and maintain uniqueness in your application
             bulk_size: document portion size to send
             request_id: request id
             session_id: session id
         """
+        if isinstance(conflict_strategy, str):
+            conflict_strategy = index_service_pb.ConflictStrategy.Value(conflict_strategy)
+
         if documents is None and not sys.stdin.isatty():
             def documents_iter():
                 for line in sys.stdin:
@@ -506,7 +513,7 @@ class SummaClient(BaseGrpcClient):
             documents = documents_iter()
 
         return await self.stubs['index_api'].index_document_stream(
-            documents_portion_iter(index_name, documents, bulk_size),
+            documents_portion_iter(index_name, documents, bulk_size, conflict_strategy=conflict_strategy),
             metadata=setup_metadata(session_id, request_id),
         )
 

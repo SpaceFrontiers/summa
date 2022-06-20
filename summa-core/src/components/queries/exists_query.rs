@@ -40,7 +40,7 @@ use tantivy_common::BitSet;
 /// let reader = index.reader()?;
 /// let searcher = reader.searcher();
 ///
-/// let query = ExistsQuery::new(author);
+/// let query = ExistsQuery::new(author, "");
 /// let count = searcher.search(&query, &Count)?;
 /// assert_eq!(count, 2);
 /// Ok(())

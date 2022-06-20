@@ -485,10 +485,10 @@ impl IndexHolder {
     }
 
     /// Index multiple documents at a time
-    pub async fn index_bulk(&self, documents: &Vec<Vec<u8>>) -> SummaResult<(u64, u64)> {
+    pub async fn index_bulk(&self, documents: &Vec<Vec<u8>>, conflict_strategy: Option<proto::ConflictStrategy>) -> SummaResult<(u64, u64)> {
         let (mut success_docs, mut failed_docs) = (0u64, 0u64);
         let index_writer_holder = self.index_writer_holder()?.read().await;
-        let conflict_strategy = self.conflict_strategy();
+        let conflict_strategy = conflict_strategy.unwrap_or_else(|| self.conflict_strategy());
         for document in documents {
             match SummaDocument::UnboundJsonBytes(document)
                 .bound_with(&self.index.schema())
