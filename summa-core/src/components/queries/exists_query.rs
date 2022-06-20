@@ -1,6 +1,9 @@
+use std::ops::RangeInclusive;
+
+use tantivy::json_utils::JsonTermWriter;
 use tantivy::query::{BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
 use tantivy::schema::{Field, IndexRecordOption};
-use tantivy::{DocId, Result, Score, SegmentReader, TantivyError};
+use tantivy::{DocId, Result, Score, SegmentReader, TantivyError, Term};
 use tantivy_common::BitSet;
 
 /// An Exists Query matches all of the documents
@@ -44,32 +47,57 @@ use tantivy_common::BitSet;
 /// # }
 /// # assert!(test().is_ok());
 /// ```
+
+pub const JSON_SEGMENT_UPPER_TERMINATOR: u8 = 2u8;
+pub const JSON_SEGMENT_UPPER_TERMINATOR_STR: &str = unsafe { std::str::from_utf8_unchecked(&[JSON_SEGMENT_UPPER_TERMINATOR]) };
+
 #[derive(Clone, Debug)]
 pub struct ExistsQuery {
     field: Field,
+    full_path: String,
 }
 
 impl ExistsQuery {
     /// Creates a new ExistsQuery with a given field
-    pub fn new(field: Field) -> Self {
-        ExistsQuery { field }
+    pub fn new(field: Field, full_path: &str) -> Self {
+        ExistsQuery {
+            field,
+            full_path: full_path.to_string(),
+        }
     }
 }
 
 #[async_trait]
 impl Query for ExistsQuery {
     fn weight(&self, _: EnableScoring<'_>) -> Result<Box<dyn Weight>> {
-        Ok(Box::new(ExistsWeight { field: self.field }))
+        Ok(Box::new(ExistsWeight {
+            field: self.field,
+            full_path: self.full_path.clone(),
+        }))
     }
 
-    async fn weight_async(&self, _: EnableScoring<'_>) -> Result<Box<dyn Weight>> {
-        Ok(Box::new(ExistsWeight { field: self.field }))
+    async fn weight_async(&self, enable_scoring: EnableScoring<'_>) -> Result<Box<dyn Weight>> {
+        self.weight(enable_scoring)
     }
 }
 
 /// Weight associated with the `ExistsQuery` query.
 pub struct ExistsWeight {
     field: Field,
+    full_path: String,
+}
+
+impl ExistsWeight {
+    fn get_json_term(&self, json_path: &str) -> Term {
+        let mut term = Term::with_capacity(128);
+        let json_term_writer = JsonTermWriter::from_field_and_json_path(self.field, json_path, true, &mut term);
+        json_term_writer.term().clone()
+    }
+    fn generate_json_term_range(&self) -> RangeInclusive<Term> {
+        let start_term_str = format!("{}\0", self.full_path);
+        let end_term_str = format!("{}{}", self.full_path, JSON_SEGMENT_UPPER_TERMINATOR_STR);
+        self.get_json_term(&start_term_str)..=self.get_json_term(&end_term_str)
+    }
 }
 
 #[async_trait]
@@ -80,10 +108,16 @@ impl Weight for ExistsWeight {
 
         let inverted_index = reader.inverted_index(self.field)?;
         let terms = inverted_index.terms();
-
-        terms.warm_up_dictionary()?;
-        let mut term_stream = terms.stream()?;
-
+        let mut term_stream = if self.full_path.is_empty() {
+            terms.stream()?
+        } else {
+            let json_term_range = self.generate_json_term_range();
+            terms
+                .range()
+                .ge(json_term_range.start().serialized_value_bytes())
+                .le(json_term_range.end().serialized_value_bytes())
+                .into_stream()?
+        };
         while term_stream.advance() {
             let term_info = term_stream.value();
 
@@ -111,8 +145,18 @@ impl Weight for ExistsWeight {
         let mut doc_bitset = BitSet::with_max_value(max_doc);
 
         let inverted_index = reader.inverted_index_async(self.field).await?;
-        let mut term_stream = inverted_index.terms().range().into_stream_async().await?;
-
+        let terms = inverted_index.terms();
+        let mut term_stream = if self.full_path.is_empty() {
+            terms.range().into_stream_async().await?
+        } else {
+            let json_term_range = self.generate_json_term_range();
+            terms
+                .range()
+                .ge(json_term_range.start().serialized_value_bytes())
+                .le(json_term_range.end().serialized_value_bytes())
+                .into_stream_async()
+                .await?
+        };
         while term_stream.advance() {
             let term_info = term_stream.value();
 

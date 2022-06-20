@@ -9,10 +9,8 @@ use opentelemetry::Context;
 #[cfg(feature = "metrics")]
 use opentelemetry::{global, KeyValue};
 use summa_proto::proto;
-use tantivy::json_utils::JsonTermWriter;
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, RangeQuery,
-    RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
 use tantivy::{Index, Score, Term};
@@ -260,15 +258,7 @@ impl ProtoQueryParser {
                     let fni = QueryParserError::FieldNotIndexed(field_entry.name().to_string());
                     return Err(Error::InvalidQuerySyntax(Box::new(fni), exists_query_proto.field.to_string()));
                 }
-                if full_path.is_empty() {
-                    Box::new(ExistsQuery::new(field))
-                } else {
-                    // Generalize approach (now position indexing is required and expand_dots_enabled is fixes)
-                    let mut term = Term::with_capacity(128);
-                    let json_term_writer = JsonTermWriter::from_field_and_json_path(field, full_path, true, &mut term);
-                    let prefix_term = json_term_writer.term().clone();
-                    Box::new(PhrasePrefixQuery::new(vec![prefix_term]))
-                }
+                Box::new(ExistsQuery::new(field, full_path))
             }
         })
     }
