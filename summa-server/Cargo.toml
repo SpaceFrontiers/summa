@@ -59,7 +59,7 @@ serde = { workspace = true }
 serde_derive = "1.0"
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-summa-core = { version = "0.17.2", path = "../summa-core", features = ["fs", "hyper-external-request", "tokio-rt"] }
+summa-core = { version = "0.17.2", path = "../summa-core", features = ["fs", "hyper-external-request", "nn", "tokio-rt"] }
 summa-proto = { workspace = true, features = ["grpc"] }
 take_mut = { workspace = true }
 tantivy = { workspace = true }

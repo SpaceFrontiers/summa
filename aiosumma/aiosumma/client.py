@@ -44,7 +44,7 @@ def setup_metadata(session_id, request_id):
     return metadata
 
 
-def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int, conflict_strategy: Optional[index_service_pb.ConflictStrategy] = None):
+def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int, conflict_strategy: Optional[str] = None):
     documents_portion = []
     for document in documents:
         documents_portion.append(document)
