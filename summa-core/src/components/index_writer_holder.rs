@@ -174,6 +174,7 @@ pub struct IndexWriterHolder {
     updated_at_field: Option<Field>,
     extra_year_field: Option<(Field, Field)>,
     mapped_fields: Vec<((Field, Vec<String>), Field)>,
+    custom_score_field: Option<Field>,
 }
 
 impl IndexWriterHolder {
@@ -210,6 +211,7 @@ impl IndexWriterHolder {
             writer_heap_size_bytes,
 
             page_rank_field,
+            custom_score_field: schema.get_field("custom_score").ok(),
             updated_at_field: schema.get_field("updated_at").ok(),
             extra_year_field,
             mapped_fields,
@@ -335,7 +337,7 @@ impl IndexWriterHolder {
     }
 
     #[inline]
-    fn process_dynamic_fields(&self, document: &mut Document) {
+    fn process_dynamic_fields(&self, document: &mut Document) -> SummaResult<()> {
         if let Some((page_rank_field, quantized_page_rank_field)) = self.page_rank_field {
             if let Some(page_rank_value) = document.get_first(page_rank_field) {
                 if let Some(page_rank_value_f64) = page_rank_value.as_f64() {
@@ -346,6 +348,10 @@ impl IndexWriterHolder {
 
         if let Some(updated_at_field) = self.updated_at_field {
             document.add_i64(updated_at_field, current_time() as i64)
+        }
+
+        if let Some(custom_score_field) = self.custom_score_field {
+            document.add_f64(custom_score_field, 1.0)
         }
 
         if let Some((extra_field, issued_at_field)) = self.extra_year_field {
@@ -375,11 +381,12 @@ impl IndexWriterHolder {
             }
             buffer.clear();
         }
+        Ok(())
     }
 
     /// Put document to the index. Before comes searchable it must be committed
     pub fn index_document(&self, mut document: Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
-        self.process_dynamic_fields(&mut document);
+        self.process_dynamic_fields(&mut document)?;
         self.resolve_conflicts(&mut document, conflict_strategy)?;
         self.index_writer.add_document(document)?;
         Ok(())
