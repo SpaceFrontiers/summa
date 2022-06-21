@@ -3,8 +3,6 @@ use tantivy::query::{DisjunctionMaxQuery, Query, TermQuery};
 use tantivy::schema::{Field, FieldType, IndexRecordOption};
 
 mod english;
-#[cfg(feature = "nn")]
-mod english_nn;
 mod manager;
 
 pub use manager::MorphologyManager;

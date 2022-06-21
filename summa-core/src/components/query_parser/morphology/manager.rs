@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 
-#[cfg(not(feature = "nn"))]
 use crate::components::query_parser::morphology::english::EnglishMorphology;
-#[cfg(feature = "nn")]
-use crate::components::query_parser::morphology::english_nn::EnglishNNMorphology as EnglishMorphology;
 use crate::components::query_parser::morphology::Morphology;
 
 #[derive(Clone)]

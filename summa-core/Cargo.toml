@@ -15,7 +15,6 @@ doc = true
 fs = ["tantivy/mmap", "tokio/fs"]
 hyper-external-request = ["hyper", "hyper-tls"]
 metrics = ["opentelemetry"]
-nn = ["rust-bert"]
 tokio-rt = ["tokio/rt"]
 
 [dev-dependencies]
@@ -47,7 +46,6 @@ prost = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
-rust-bert = { version = "0.21", optional = true }
 rustc-hash = "1.1.0"
 serde = { workspace = true }
 serde_bytes = { workspace = true }
