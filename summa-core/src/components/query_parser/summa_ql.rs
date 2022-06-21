@@ -421,7 +421,13 @@ impl QueryParser {
                                 .cloned()
                                 .unwrap_or_default();
                             let query = if let Some(morphology) = self.morphology_manager.get(self.query_parser_config.0.query_language()) {
-                                morphology.derive_query(morphology_config, field, full_path, field_type, &token.text)
+                                // ToDo: Change heuristic
+                                if pre_term.as_str().len() < 24 {
+                                    morphology.derive_query(morphology_config, field, full_path, field_type, &token.text)
+                                } else {
+                                    let term = cast_field_to_term(field, full_path, field_type, &token.text, false);
+                                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>
+                                }
                             } else {
                                 let term = cast_field_to_term(field, full_path, field_type, &token.text, false);
                                 Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>
@@ -1178,8 +1184,8 @@ mod tests {
         );
         query_parser.query_parser_config.0.morphology_configs = morphology_configs;
         query_parser.query_parser_config.0.query_language = Some("en".to_string());
-        let query = query_parser.parse_query("red search engine");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"red\")), TermQuery(Term(field=0, type=Str, \"reds\"))], tie_breaker: 0.3 }), (Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.3 })] })");
+        let query = query_parser.parse_query("red1 search engine going");
+        assert_eq!(format!("{:?}", query), "");
         let query = query_parser.parse_query("iso 34-1:2022");
         assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"iso\"))), (Should, TermQuery(Term(field=0, type=Str, \"34\"))), (Should, TermQuery(Term(field=0, type=Str, \"1\")))] })");
     }

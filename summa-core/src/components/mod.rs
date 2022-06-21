@@ -13,7 +13,7 @@ mod summa_document;
 mod summa_tokenizer;
 
 pub use custom_serializer::NamedFieldDocument;
-pub use default_tokenizers::default_tokenizers;
+pub use default_tokenizers::{default_tokenizers, STOP_WORDS};
 pub use fruit_extractors::{build_fruit_extractor, FruitExtractor, IntermediateExtractionResult};
 pub use index_holder::{cleanup_index, IndexHolder};
 pub use index_registry::IndexRegistry;

@@ -3,7 +3,7 @@ use tantivy::tokenizer::{LowerCaser, RawTokenizer, RemoveLongFilter, SimpleToken
 use super::summa_tokenizer::SummaTokenizer;
 
 /// List of stop words mixed for multiple languages
-const STOP_WORDS: [&str; 318] = [
+pub const STOP_WORDS: [&str; 318] = [
     "a",
     "an",
     "and",
