@@ -263,7 +263,7 @@ impl Index {
         let mut target_index_writer = target_index_holder.index_writer_holder()?.clone().read_owned().await;
         let conflict_strategy = copy_documents_request
             .conflict_strategy
-            .map(|c| proto::ConflictStrategy::from_i32(c).unwrap())
+            .and_then(proto::ConflictStrategy::from_i32)
             .unwrap_or(target_index_holder.conflict_strategy());
         let source_index_holder = self.get_index_holder(&copy_documents_request.source_index_name).await?;
         let searcher = source_index_holder.index_reader().searcher();

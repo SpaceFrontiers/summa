@@ -10,7 +10,7 @@ pub struct EnglishMorphology {}
 impl Morphology for EnglishMorphology {
     fn derive_tenses(&self, word: &str) -> Option<String> {
         thread_local! {
-            static NOT_A_NOUN: (RegexSet, HashSet<&'static str>) = (RegexSet::new(&[
+            static NOT_A_NOUN: (RegexSet, HashSet<&'static str>) = (RegexSet::new([
                 r"\d$",
                 r"ing$",
             ]).expect("cannot compile regex"), HashSet::from_iter(crate::components::default_tokenizers::STOP_WORDS.into_iter()));

@@ -88,7 +88,7 @@ impl CachingDirectory {
     ///
     /// Warming: The resulting CacheDirectory will cache all information without ever
     /// removing any item from the cache.
-    pub fn bounded(underlying: Arc<dyn Directory>, capacity_in_bytes: usize, file_stats: FileStats) -> CachingDirectory {
+    pub fn bounded(underlying: Arc<dyn Directory>, _capacity_in_bytes: usize, file_stats: FileStats) -> CachingDirectory {
         CachingDirectory {
             underlying,
             cache: Arc::new(ByteRangeCache::with_infinite_capacity()),

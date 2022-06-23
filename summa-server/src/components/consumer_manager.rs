@@ -82,8 +82,7 @@ impl ConsumerManager {
         prepared_consumption
             .committed_consumer_thread
             .start(index_writer_holder, conflict_strategy, schema)
-            .await
-            .unwrap();
+            .await?;
         self.consumptions.insert(index_holder.clone(), prepared_consumption.committed_consumer_thread);
         Ok(())
     }

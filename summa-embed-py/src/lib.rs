@@ -38,7 +38,7 @@ impl SummaEmbedServerBin {
             let server = Server::from_server_config(server_config_holder);
             let (sender, receiver) = async_broadcast::broadcast(1);
             let fut = server.serve(receiver).await.unwrap();
-            let join_handle = tokio::spawn(async move { fut.await });
+            let join_handle = tokio::spawn(fut);
             *thread_handler = Some(ThreadHandler::new(join_handle, sender));
             Ok(())
         })

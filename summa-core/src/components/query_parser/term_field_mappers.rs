@@ -17,7 +17,7 @@ fn tokenize_value(schema: &Schema, field: &Field, full_path: &str, value: &str, 
     let mut terms = vec![];
     match field_entry.field_type() {
         FieldType::Str(ref str_options) => {
-            let option = str_options.get_indexing_options().unwrap();
+            let option = str_options.get_indexing_options().expect("no options");
             let mut text_analyzer = tokenizer_manager.get(option.tokenizer()).expect("unknown tokenizer");
             let mut token_stream = text_analyzer.token_stream(value);
             token_stream.process(&mut |token| {
