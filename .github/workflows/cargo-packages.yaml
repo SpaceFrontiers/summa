@@ -28,6 +28,6 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - uses: katyo/publish-crates@v1
+      - uses: katyo/publish-crates@v2
         with:
           registry-token: ${{ secrets.CRATES_IO_TOKEN }}
