@@ -10,6 +10,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cid = "0.10"
-ipfs-hamt-directory = { path = "../ipfs-hamt-directory" }
+ipfs-hamt-directory = { path = "../ipfs-hamt-directory", version = "0.1.1" }
 multihash = "0.18"
 pyo3 = { version = "0.18", features = ["serde"] }

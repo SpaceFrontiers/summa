@@ -1,11 +1,13 @@
 # yamllint disable
 
-name: Check
-on: [ pull_request ]
+name: cargo-packages
+on:
+  release:
+    types: [ published ]
 env:
   CARGO_TERM_COLOR: always
 jobs:
-  check:
+  cargo-publish:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
@@ -13,7 +15,11 @@ jobs:
         uses: arduino/setup-protoc@v1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/cache@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          override: true
+          toolchain: stable
+      - uses: actions/cache@v2
         with:
           path: |
             ~/.cargo/bin/
@@ -22,15 +28,6 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - uses: actions-rs/toolchain@v1.0.7
+      - uses: katyo/publish-crates@v1
         with:
-          toolchain: stable
-          components: rustfmt, clippy
-      - uses: actions-rs/cargo@v1.0.3
-        with:
-          command: fmt
-          args: -- --check
-      - uses: actions-rs/clippy-check@v1.0.7
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features
+          registry-token: ${{ secrets.CRATES_IO_TOKEN }}

@@ -1,6 +1,6 @@
 # yamllint disable
 
-name: Docker images
+name: docker-images
 on:
   release:
     types: [ published ]

@@ -1,0 +1,24 @@
+# yamllint disable
+
+name: summa-wasm
+on:
+  release:
+    types: [ published ]
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  summa-wasm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 19
+      - run: npm install
+        working-directory: summa-wasm
+      - run: ./build.sh
+        working-directory: summa-wasm
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: summa-wasm

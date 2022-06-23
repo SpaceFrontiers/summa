@@ -51,7 +51,7 @@ export class IndexRegistry implements IIndexRegistry {
     await this.registry.setup(actual_options.num_threads!);
   }
 
-  async add(index_engine_config: summa.proto.IndexEngineConfig, index_name?: string): Promise<summa.proto.IndexAttributes> {
+  async add(index_engine_config: summa.proto.IndexEngineConfig, index_name: string): Promise<summa.proto.IndexAttributes> {
     return await this.registry!.add(index_engine_config, index_name);
   }
   async delete(index_name: string) {

@@ -1,5 +1,4 @@
-name: Summa for Python
-
+name: summa-embed-py
 on:
   release:
     types: [ published ]
