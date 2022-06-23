@@ -1,5 +1,5 @@
 /*eslint-disable block-scoped-var, id-length, no-control-regex, no-magic-numbers, no-prototype-builtins, no-redeclare, no-shadow, no-var, sort-vars*/
-import * as $protobuf from "protobufjs/minimal.js";
+import * as $protobuf from "protobufjs/minimal";
 
 // Common aliases
 const $util = $protobuf.util;
@@ -170,6 +170,543 @@ export const summa = $root.summa = (() => {
             };
 
             return IndexQuery;
+        })();
+
+        proto.TermFieldMapperConfig = (function() {
+
+            /**
+             * Properties of a TermFieldMapperConfig.
+             * @memberof summa.proto
+             * @interface ITermFieldMapperConfig
+             * @property {Array.<string>|null} [fields] TermFieldMapperConfig fields
+             */
+
+            /**
+             * Constructs a new TermFieldMapperConfig.
+             * @memberof summa.proto
+             * @classdesc Represents a TermFieldMapperConfig.
+             * @implements ITermFieldMapperConfig
+             * @constructor
+             * @param {summa.proto.ITermFieldMapperConfig=} [properties] Properties to set
+             */
+            function TermFieldMapperConfig(properties) {
+                this.fields = [];
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * TermFieldMapperConfig fields.
+             * @member {Array.<string>} fields
+             * @memberof summa.proto.TermFieldMapperConfig
+             * @instance
+             */
+            TermFieldMapperConfig.prototype.fields = $util.emptyArray;
+
+            /**
+             * Creates a new TermFieldMapperConfig instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.TermFieldMapperConfig
+             * @static
+             * @param {summa.proto.ITermFieldMapperConfig=} [properties] Properties to set
+             * @returns {summa.proto.TermFieldMapperConfig} TermFieldMapperConfig instance
+             */
+            TermFieldMapperConfig.create = function create(properties) {
+                return new TermFieldMapperConfig(properties);
+            };
+
+            return TermFieldMapperConfig;
+        })();
+
+        proto.MatchQueryBooleanShouldMode = (function() {
+
+            /**
+             * Properties of a MatchQueryBooleanShouldMode.
+             * @memberof summa.proto
+             * @interface IMatchQueryBooleanShouldMode
+             */
+
+            /**
+             * Constructs a new MatchQueryBooleanShouldMode.
+             * @memberof summa.proto
+             * @classdesc Represents a MatchQueryBooleanShouldMode.
+             * @implements IMatchQueryBooleanShouldMode
+             * @constructor
+             * @param {summa.proto.IMatchQueryBooleanShouldMode=} [properties] Properties to set
+             */
+            function MatchQueryBooleanShouldMode(properties) {
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * Creates a new MatchQueryBooleanShouldMode instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.MatchQueryBooleanShouldMode
+             * @static
+             * @param {summa.proto.IMatchQueryBooleanShouldMode=} [properties] Properties to set
+             * @returns {summa.proto.MatchQueryBooleanShouldMode} MatchQueryBooleanShouldMode instance
+             */
+            MatchQueryBooleanShouldMode.create = function create(properties) {
+                return new MatchQueryBooleanShouldMode(properties);
+            };
+
+            return MatchQueryBooleanShouldMode;
+        })();
+
+        proto.MatchQueryDisjuctionMaxMode = (function() {
+
+            /**
+             * Properties of a MatchQueryDisjuctionMaxMode.
+             * @memberof summa.proto
+             * @interface IMatchQueryDisjuctionMaxMode
+             * @property {number|null} [tie_breaker] MatchQueryDisjuctionMaxMode tie_breaker
+             */
+
+            /**
+             * Constructs a new MatchQueryDisjuctionMaxMode.
+             * @memberof summa.proto
+             * @classdesc Represents a MatchQueryDisjuctionMaxMode.
+             * @implements IMatchQueryDisjuctionMaxMode
+             * @constructor
+             * @param {summa.proto.IMatchQueryDisjuctionMaxMode=} [properties] Properties to set
+             */
+            function MatchQueryDisjuctionMaxMode(properties) {
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * MatchQueryDisjuctionMaxMode tie_breaker.
+             * @member {number} tie_breaker
+             * @memberof summa.proto.MatchQueryDisjuctionMaxMode
+             * @instance
+             */
+            MatchQueryDisjuctionMaxMode.prototype.tie_breaker = 0;
+
+            /**
+             * Creates a new MatchQueryDisjuctionMaxMode instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.MatchQueryDisjuctionMaxMode
+             * @static
+             * @param {summa.proto.IMatchQueryDisjuctionMaxMode=} [properties] Properties to set
+             * @returns {summa.proto.MatchQueryDisjuctionMaxMode} MatchQueryDisjuctionMaxMode instance
+             */
+            MatchQueryDisjuctionMaxMode.create = function create(properties) {
+                return new MatchQueryDisjuctionMaxMode(properties);
+            };
+
+            return MatchQueryDisjuctionMaxMode;
+        })();
+
+        proto.ExactMatchesPromoter = (function() {
+
+            /**
+             * Properties of an ExactMatchesPromoter.
+             * @memberof summa.proto
+             * @interface IExactMatchesPromoter
+             * @property {number|null} [slop] ExactMatchesPromoter slop
+             * @property {number|null} [boost] ExactMatchesPromoter boost
+             * @property {Array.<string>|null} [fields] ExactMatchesPromoter fields
+             */
+
+            /**
+             * Constructs a new ExactMatchesPromoter.
+             * @memberof summa.proto
+             * @classdesc Represents an ExactMatchesPromoter.
+             * @implements IExactMatchesPromoter
+             * @constructor
+             * @param {summa.proto.IExactMatchesPromoter=} [properties] Properties to set
+             */
+            function ExactMatchesPromoter(properties) {
+                this.fields = [];
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * ExactMatchesPromoter slop.
+             * @member {number} slop
+             * @memberof summa.proto.ExactMatchesPromoter
+             * @instance
+             */
+            ExactMatchesPromoter.prototype.slop = 0;
+
+            /**
+             * ExactMatchesPromoter boost.
+             * @member {number|null|undefined} boost
+             * @memberof summa.proto.ExactMatchesPromoter
+             * @instance
+             */
+            ExactMatchesPromoter.prototype.boost = null;
+
+            /**
+             * ExactMatchesPromoter fields.
+             * @member {Array.<string>} fields
+             * @memberof summa.proto.ExactMatchesPromoter
+             * @instance
+             */
+            ExactMatchesPromoter.prototype.fields = $util.emptyArray;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
+
+            /**
+             * ExactMatchesPromoter _boost.
+             * @member {"boost"|undefined} _boost
+             * @memberof summa.proto.ExactMatchesPromoter
+             * @instance
+             */
+            Object.defineProperty(ExactMatchesPromoter.prototype, "_boost", {
+                get: $util.oneOfGetter($oneOfFields = ["boost"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
+
+            /**
+             * Creates a new ExactMatchesPromoter instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.ExactMatchesPromoter
+             * @static
+             * @param {summa.proto.IExactMatchesPromoter=} [properties] Properties to set
+             * @returns {summa.proto.ExactMatchesPromoter} ExactMatchesPromoter instance
+             */
+            ExactMatchesPromoter.create = function create(properties) {
+                return new ExactMatchesPromoter(properties);
+            };
+
+            return ExactMatchesPromoter;
+        })();
+
+        proto.NerMatchesPromoter = (function() {
+
+            /**
+             * Properties of a NerMatchesPromoter.
+             * @memberof summa.proto
+             * @interface INerMatchesPromoter
+             * @property {number|null} [boost] NerMatchesPromoter boost
+             * @property {Array.<string>|null} [fields] NerMatchesPromoter fields
+             */
+
+            /**
+             * Constructs a new NerMatchesPromoter.
+             * @memberof summa.proto
+             * @classdesc Represents a NerMatchesPromoter.
+             * @implements INerMatchesPromoter
+             * @constructor
+             * @param {summa.proto.INerMatchesPromoter=} [properties] Properties to set
+             */
+            function NerMatchesPromoter(properties) {
+                this.fields = [];
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * NerMatchesPromoter boost.
+             * @member {number|null|undefined} boost
+             * @memberof summa.proto.NerMatchesPromoter
+             * @instance
+             */
+            NerMatchesPromoter.prototype.boost = null;
+
+            /**
+             * NerMatchesPromoter fields.
+             * @member {Array.<string>} fields
+             * @memberof summa.proto.NerMatchesPromoter
+             * @instance
+             */
+            NerMatchesPromoter.prototype.fields = $util.emptyArray;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
+
+            /**
+             * NerMatchesPromoter _boost.
+             * @member {"boost"|undefined} _boost
+             * @memberof summa.proto.NerMatchesPromoter
+             * @instance
+             */
+            Object.defineProperty(NerMatchesPromoter.prototype, "_boost", {
+                get: $util.oneOfGetter($oneOfFields = ["boost"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
+
+            /**
+             * Creates a new NerMatchesPromoter instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.NerMatchesPromoter
+             * @static
+             * @param {summa.proto.INerMatchesPromoter=} [properties] Properties to set
+             * @returns {summa.proto.NerMatchesPromoter} NerMatchesPromoter instance
+             */
+            NerMatchesPromoter.create = function create(properties) {
+                return new NerMatchesPromoter(properties);
+            };
+
+            return NerMatchesPromoter;
+        })();
+
+        /**
+         * MissingFieldPolicy enum.
+         * @name summa.proto.MissingFieldPolicy
+         * @enum {number}
+         * @property {number} AsUsualTerms=0 AsUsualTerms value
+         * @property {number} Remove=1 Remove value
+         * @property {number} Fail=2 Fail value
+         */
+        proto.MissingFieldPolicy = (function() {
+            const valuesById = {}, values = Object.create(valuesById);
+            values[valuesById[0] = "AsUsualTerms"] = 0;
+            values[valuesById[1] = "Remove"] = 1;
+            values[valuesById[2] = "Fail"] = 2;
+            return values;
+        })();
+
+        proto.MorphologyConfig = (function() {
+
+            /**
+             * Properties of a MorphologyConfig.
+             * @memberof summa.proto
+             * @interface IMorphologyConfig
+             * @property {number|null} [derive_tenses_coefficient] MorphologyConfig derive_tenses_coefficient
+             */
+
+            /**
+             * Constructs a new MorphologyConfig.
+             * @memberof summa.proto
+             * @classdesc Represents a MorphologyConfig.
+             * @implements IMorphologyConfig
+             * @constructor
+             * @param {summa.proto.IMorphologyConfig=} [properties] Properties to set
+             */
+            function MorphologyConfig(properties) {
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * MorphologyConfig derive_tenses_coefficient.
+             * @member {number|null|undefined} derive_tenses_coefficient
+             * @memberof summa.proto.MorphologyConfig
+             * @instance
+             */
+            MorphologyConfig.prototype.derive_tenses_coefficient = null;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
+
+            /**
+             * MorphologyConfig _derive_tenses_coefficient.
+             * @member {"derive_tenses_coefficient"|undefined} _derive_tenses_coefficient
+             * @memberof summa.proto.MorphologyConfig
+             * @instance
+             */
+            Object.defineProperty(MorphologyConfig.prototype, "_derive_tenses_coefficient", {
+                get: $util.oneOfGetter($oneOfFields = ["derive_tenses_coefficient"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
+
+            /**
+             * Creates a new MorphologyConfig instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.MorphologyConfig
+             * @static
+             * @param {summa.proto.IMorphologyConfig=} [properties] Properties to set
+             * @returns {summa.proto.MorphologyConfig} MorphologyConfig instance
+             */
+            MorphologyConfig.create = function create(properties) {
+                return new MorphologyConfig(properties);
+            };
+
+            return MorphologyConfig;
+        })();
+
+        proto.QueryParserConfig = (function() {
+
+            /**
+             * Properties of a QueryParserConfig.
+             * @memberof summa.proto
+             * @interface IQueryParserConfig
+             * @property {Object.<string,string>|null} [field_aliases] QueryParserConfig field_aliases
+             * @property {Object.<string,number>|null} [field_boosts] QueryParserConfig field_boosts
+             * @property {Object.<string,summa.proto.ITermFieldMapperConfig>|null} [term_field_mapper_configs] QueryParserConfig term_field_mapper_configs
+             * @property {number|null} [term_limit] QueryParserConfig term_limit
+             * @property {Array.<string>|null} [default_fields] QueryParserConfig default_fields
+             * @property {summa.proto.IMatchQueryBooleanShouldMode|null} [boolean_should_mode] QueryParserConfig boolean_should_mode
+             * @property {summa.proto.IMatchQueryDisjuctionMaxMode|null} [disjuction_max_mode] QueryParserConfig disjuction_max_mode
+             * @property {summa.proto.IExactMatchesPromoter|null} [exact_matches_promoter] QueryParserConfig exact_matches_promoter
+             * @property {summa.proto.MissingFieldPolicy|null} [missing_field_policy] QueryParserConfig missing_field_policy
+             * @property {Object.<string,summa.proto.IMorphologyConfig>|null} [morphology_configs] QueryParserConfig morphology_configs
+             * @property {string|null} [query_language] QueryParserConfig query_language
+             * @property {summa.proto.INerMatchesPromoter|null} [ner_matches_promoter] QueryParserConfig ner_matches_promoter
+             */
+
+            /**
+             * Constructs a new QueryParserConfig.
+             * @memberof summa.proto
+             * @classdesc Represents a QueryParserConfig.
+             * @implements IQueryParserConfig
+             * @constructor
+             * @param {summa.proto.IQueryParserConfig=} [properties] Properties to set
+             */
+            function QueryParserConfig(properties) {
+                this.field_aliases = {};
+                this.field_boosts = {};
+                this.term_field_mapper_configs = {};
+                this.default_fields = [];
+                this.morphology_configs = {};
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * QueryParserConfig field_aliases.
+             * @member {Object.<string,string>} field_aliases
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.field_aliases = $util.emptyObject;
+
+            /**
+             * QueryParserConfig field_boosts.
+             * @member {Object.<string,number>} field_boosts
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.field_boosts = $util.emptyObject;
+
+            /**
+             * QueryParserConfig term_field_mapper_configs.
+             * @member {Object.<string,summa.proto.ITermFieldMapperConfig>} term_field_mapper_configs
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.term_field_mapper_configs = $util.emptyObject;
+
+            /**
+             * QueryParserConfig term_limit.
+             * @member {number} term_limit
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.term_limit = 0;
+
+            /**
+             * QueryParserConfig default_fields.
+             * @member {Array.<string>} default_fields
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.default_fields = $util.emptyArray;
+
+            /**
+             * QueryParserConfig boolean_should_mode.
+             * @member {summa.proto.IMatchQueryBooleanShouldMode|null|undefined} boolean_should_mode
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.boolean_should_mode = null;
+
+            /**
+             * QueryParserConfig disjuction_max_mode.
+             * @member {summa.proto.IMatchQueryDisjuctionMaxMode|null|undefined} disjuction_max_mode
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.disjuction_max_mode = null;
+
+            /**
+             * QueryParserConfig exact_matches_promoter.
+             * @member {summa.proto.IExactMatchesPromoter|null|undefined} exact_matches_promoter
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.exact_matches_promoter = null;
+
+            /**
+             * QueryParserConfig missing_field_policy.
+             * @member {summa.proto.MissingFieldPolicy} missing_field_policy
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.missing_field_policy = 0;
+
+            /**
+             * QueryParserConfig morphology_configs.
+             * @member {Object.<string,summa.proto.IMorphologyConfig>} morphology_configs
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.morphology_configs = $util.emptyObject;
+
+            /**
+             * QueryParserConfig query_language.
+             * @member {string|null|undefined} query_language
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.query_language = null;
+
+            /**
+             * QueryParserConfig ner_matches_promoter.
+             * @member {summa.proto.INerMatchesPromoter|null|undefined} ner_matches_promoter
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            QueryParserConfig.prototype.ner_matches_promoter = null;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
+
+            /**
+             * QueryParserConfig default_mode.
+             * @member {"boolean_should_mode"|"disjuction_max_mode"|undefined} default_mode
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            Object.defineProperty(QueryParserConfig.prototype, "default_mode", {
+                get: $util.oneOfGetter($oneOfFields = ["boolean_should_mode", "disjuction_max_mode"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
+
+            /**
+             * QueryParserConfig _query_language.
+             * @member {"query_language"|undefined} _query_language
+             * @memberof summa.proto.QueryParserConfig
+             * @instance
+             */
+            Object.defineProperty(QueryParserConfig.prototype, "_query_language", {
+                get: $util.oneOfGetter($oneOfFields = ["query_language"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
+
+            /**
+             * Creates a new QueryParserConfig instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.QueryParserConfig
+             * @static
+             * @param {summa.proto.IQueryParserConfig=} [properties] Properties to set
+             * @returns {summa.proto.QueryParserConfig} QueryParserConfig instance
+             */
+            QueryParserConfig.create = function create(properties) {
+                return new QueryParserConfig(properties);
+            };
+
+            return QueryParserConfig;
         })();
 
         proto.SearchResponse = (function() {
@@ -899,161 +1436,6 @@ export const summa = $root.summa = (() => {
             return RangeQuery;
         })();
 
-        proto.MatchQueryBooleanShouldMode = (function() {
-
-            /**
-             * Properties of a MatchQueryBooleanShouldMode.
-             * @memberof summa.proto
-             * @interface IMatchQueryBooleanShouldMode
-             */
-
-            /**
-             * Constructs a new MatchQueryBooleanShouldMode.
-             * @memberof summa.proto
-             * @classdesc Represents a MatchQueryBooleanShouldMode.
-             * @implements IMatchQueryBooleanShouldMode
-             * @constructor
-             * @param {summa.proto.IMatchQueryBooleanShouldMode=} [properties] Properties to set
-             */
-            function MatchQueryBooleanShouldMode(properties) {
-                if (properties)
-                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
-                        if (properties[keys[i]] != null)
-                            this[keys[i]] = properties[keys[i]];
-            }
-
-            /**
-             * Creates a new MatchQueryBooleanShouldMode instance using the specified properties.
-             * @function create
-             * @memberof summa.proto.MatchQueryBooleanShouldMode
-             * @static
-             * @param {summa.proto.IMatchQueryBooleanShouldMode=} [properties] Properties to set
-             * @returns {summa.proto.MatchQueryBooleanShouldMode} MatchQueryBooleanShouldMode instance
-             */
-            MatchQueryBooleanShouldMode.create = function create(properties) {
-                return new MatchQueryBooleanShouldMode(properties);
-            };
-
-            return MatchQueryBooleanShouldMode;
-        })();
-
-        proto.MatchQueryDisjuctionMaxMode = (function() {
-
-            /**
-             * Properties of a MatchQueryDisjuctionMaxMode.
-             * @memberof summa.proto
-             * @interface IMatchQueryDisjuctionMaxMode
-             * @property {number|null} [tie_breaker] MatchQueryDisjuctionMaxMode tie_breaker
-             */
-
-            /**
-             * Constructs a new MatchQueryDisjuctionMaxMode.
-             * @memberof summa.proto
-             * @classdesc Represents a MatchQueryDisjuctionMaxMode.
-             * @implements IMatchQueryDisjuctionMaxMode
-             * @constructor
-             * @param {summa.proto.IMatchQueryDisjuctionMaxMode=} [properties] Properties to set
-             */
-            function MatchQueryDisjuctionMaxMode(properties) {
-                if (properties)
-                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
-                        if (properties[keys[i]] != null)
-                            this[keys[i]] = properties[keys[i]];
-            }
-
-            /**
-             * MatchQueryDisjuctionMaxMode tie_breaker.
-             * @member {number} tie_breaker
-             * @memberof summa.proto.MatchQueryDisjuctionMaxMode
-             * @instance
-             */
-            MatchQueryDisjuctionMaxMode.prototype.tie_breaker = 0;
-
-            /**
-             * Creates a new MatchQueryDisjuctionMaxMode instance using the specified properties.
-             * @function create
-             * @memberof summa.proto.MatchQueryDisjuctionMaxMode
-             * @static
-             * @param {summa.proto.IMatchQueryDisjuctionMaxMode=} [properties] Properties to set
-             * @returns {summa.proto.MatchQueryDisjuctionMaxMode} MatchQueryDisjuctionMaxMode instance
-             */
-            MatchQueryDisjuctionMaxMode.create = function create(properties) {
-                return new MatchQueryDisjuctionMaxMode(properties);
-            };
-
-            return MatchQueryDisjuctionMaxMode;
-        })();
-
-        proto.ExactMatchesPromoter = (function() {
-
-            /**
-             * Properties of an ExactMatchesPromoter.
-             * @memberof summa.proto
-             * @interface IExactMatchesPromoter
-             * @property {number|null} [slop] ExactMatchesPromoter slop
-             * @property {number|null} [boost] ExactMatchesPromoter boost
-             */
-
-            /**
-             * Constructs a new ExactMatchesPromoter.
-             * @memberof summa.proto
-             * @classdesc Represents an ExactMatchesPromoter.
-             * @implements IExactMatchesPromoter
-             * @constructor
-             * @param {summa.proto.IExactMatchesPromoter=} [properties] Properties to set
-             */
-            function ExactMatchesPromoter(properties) {
-                if (properties)
-                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
-                        if (properties[keys[i]] != null)
-                            this[keys[i]] = properties[keys[i]];
-            }
-
-            /**
-             * ExactMatchesPromoter slop.
-             * @member {number} slop
-             * @memberof summa.proto.ExactMatchesPromoter
-             * @instance
-             */
-            ExactMatchesPromoter.prototype.slop = 0;
-
-            /**
-             * ExactMatchesPromoter boost.
-             * @member {number|null|undefined} boost
-             * @memberof summa.proto.ExactMatchesPromoter
-             * @instance
-             */
-            ExactMatchesPromoter.prototype.boost = null;
-
-            // OneOf field names bound to virtual getters and setters
-            let $oneOfFields;
-
-            /**
-             * ExactMatchesPromoter _boost.
-             * @member {"boost"|undefined} _boost
-             * @memberof summa.proto.ExactMatchesPromoter
-             * @instance
-             */
-            Object.defineProperty(ExactMatchesPromoter.prototype, "_boost", {
-                get: $util.oneOfGetter($oneOfFields = ["boost"]),
-                set: $util.oneOfSetter($oneOfFields)
-            });
-
-            /**
-             * Creates a new ExactMatchesPromoter instance using the specified properties.
-             * @function create
-             * @memberof summa.proto.ExactMatchesPromoter
-             * @static
-             * @param {summa.proto.IExactMatchesPromoter=} [properties] Properties to set
-             * @returns {summa.proto.ExactMatchesPromoter} ExactMatchesPromoter instance
-             */
-            ExactMatchesPromoter.create = function create(properties) {
-                return new ExactMatchesPromoter(properties);
-            };
-
-            return ExactMatchesPromoter;
-        })();
-
         proto.MatchQuery = (function() {
 
             /**
@@ -1061,11 +1443,7 @@ export const summa = $root.summa = (() => {
              * @memberof summa.proto
              * @interface IMatchQuery
              * @property {string|null} [value] MatchQuery value
-             * @property {Array.<string>|null} [default_fields] MatchQuery default_fields
-             * @property {summa.proto.IMatchQueryBooleanShouldMode|null} [boolean_should_mode] MatchQuery boolean_should_mode
-             * @property {summa.proto.IMatchQueryDisjuctionMaxMode|null} [disjuction_max_mode] MatchQuery disjuction_max_mode
-             * @property {Object.<string,number>|null} [field_boosts] MatchQuery field_boosts
-             * @property {summa.proto.IExactMatchesPromoter|null} [exact_matches_promoter] MatchQuery exact_matches_promoter
+             * @property {summa.proto.IQueryParserConfig|null} [query_parser_config] MatchQuery query_parser_config
              */
 
             /**
@@ -1077,8 +1455,6 @@ export const summa = $root.summa = (() => {
              * @param {summa.proto.IMatchQuery=} [properties] Properties to set
              */
             function MatchQuery(properties) {
-                this.default_fields = [];
-                this.field_boosts = {};
                 if (properties)
                     for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
                         if (properties[keys[i]] != null)
@@ -1094,56 +1470,24 @@ export const summa = $root.summa = (() => {
             MatchQuery.prototype.value = "";
 
             /**
-             * MatchQuery default_fields.
-             * @member {Array.<string>} default_fields
+             * MatchQuery query_parser_config.
+             * @member {summa.proto.IQueryParserConfig|null|undefined} query_parser_config
              * @memberof summa.proto.MatchQuery
              * @instance
              */
-            MatchQuery.prototype.default_fields = $util.emptyArray;
-
-            /**
-             * MatchQuery boolean_should_mode.
-             * @member {summa.proto.IMatchQueryBooleanShouldMode|null|undefined} boolean_should_mode
-             * @memberof summa.proto.MatchQuery
-             * @instance
-             */
-            MatchQuery.prototype.boolean_should_mode = null;
-
-            /**
-             * MatchQuery disjuction_max_mode.
-             * @member {summa.proto.IMatchQueryDisjuctionMaxMode|null|undefined} disjuction_max_mode
-             * @memberof summa.proto.MatchQuery
-             * @instance
-             */
-            MatchQuery.prototype.disjuction_max_mode = null;
-
-            /**
-             * MatchQuery field_boosts.
-             * @member {Object.<string,number>} field_boosts
-             * @memberof summa.proto.MatchQuery
-             * @instance
-             */
-            MatchQuery.prototype.field_boosts = $util.emptyObject;
-
-            /**
-             * MatchQuery exact_matches_promoter.
-             * @member {summa.proto.IExactMatchesPromoter|null|undefined} exact_matches_promoter
-             * @memberof summa.proto.MatchQuery
-             * @instance
-             */
-            MatchQuery.prototype.exact_matches_promoter = null;
+            MatchQuery.prototype.query_parser_config = null;
 
             // OneOf field names bound to virtual getters and setters
             let $oneOfFields;
 
             /**
-             * MatchQuery default_mode.
-             * @member {"boolean_should_mode"|"disjuction_max_mode"|undefined} default_mode
+             * MatchQuery _query_parser_config.
+             * @member {"query_parser_config"|undefined} _query_parser_config
              * @memberof summa.proto.MatchQuery
              * @instance
              */
-            Object.defineProperty(MatchQuery.prototype, "default_mode", {
-                get: $util.oneOfGetter($oneOfFields = ["boolean_should_mode", "disjuction_max_mode"]),
+            Object.defineProperty(MatchQuery.prototype, "_query_parser_config", {
+                get: $util.oneOfGetter($oneOfFields = ["query_parser_config"]),
                 set: $util.oneOfSetter($oneOfFields)
             });
 
@@ -4708,6 +5052,7 @@ export const summa = $root.summa = (() => {
              * @property {summa.proto.IAttachFileEngineRequest|null} [file] AttachIndexRequest file
              * @property {summa.proto.IAttachRemoteEngineRequest|null} [remote] AttachIndexRequest remote
              * @property {summa.proto.IMergePolicy|null} [merge_policy] AttachIndexRequest merge_policy
+             * @property {summa.proto.IQueryParserConfig|null} [query_parser_config] AttachIndexRequest query_parser_config
              */
 
             /**
@@ -4756,6 +5101,14 @@ export const summa = $root.summa = (() => {
              * @instance
              */
             AttachIndexRequest.prototype.merge_policy = null;
+
+            /**
+             * AttachIndexRequest query_parser_config.
+             * @member {summa.proto.IQueryParserConfig|null|undefined} query_parser_config
+             * @memberof summa.proto.AttachIndexRequest
+             * @instance
+             */
+            AttachIndexRequest.prototype.query_parser_config = null;
 
             // OneOf field names bound to virtual getters and setters
             let $oneOfFields;
@@ -4935,6 +5288,7 @@ export const summa = $root.summa = (() => {
              * @interface ICopyDocumentsRequest
              * @property {string|null} [source_index_name] CopyDocumentsRequest source_index_name
              * @property {string|null} [target_index_name] CopyDocumentsRequest target_index_name
+             * @property {summa.proto.ConflictStrategy|null} [conflict_strategy] CopyDocumentsRequest conflict_strategy
              */
 
             /**
@@ -4967,6 +5321,28 @@ export const summa = $root.summa = (() => {
              * @instance
              */
             CopyDocumentsRequest.prototype.target_index_name = "";
+
+            /**
+             * CopyDocumentsRequest conflict_strategy.
+             * @member {summa.proto.ConflictStrategy|null|undefined} conflict_strategy
+             * @memberof summa.proto.CopyDocumentsRequest
+             * @instance
+             */
+            CopyDocumentsRequest.prototype.conflict_strategy = null;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
+
+            /**
+             * CopyDocumentsRequest _conflict_strategy.
+             * @member {"conflict_strategy"|undefined} _conflict_strategy
+             * @memberof summa.proto.CopyDocumentsRequest
+             * @instance
+             */
+            Object.defineProperty(CopyDocumentsRequest.prototype, "_conflict_strategy", {
+                get: $util.oneOfGetter($oneOfFields = ["conflict_strategy"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
 
             /**
              * Creates a new CopyDocumentsRequest instance using the specified properties.
@@ -5333,6 +5709,62 @@ export const summa = $root.summa = (() => {
             return values;
         })();
 
+        proto.MappedField = (function() {
+
+            /**
+             * Properties of a MappedField.
+             * @memberof summa.proto
+             * @interface IMappedField
+             * @property {string|null} [source_field] MappedField source_field
+             * @property {string|null} [target_field] MappedField target_field
+             */
+
+            /**
+             * Constructs a new MappedField.
+             * @memberof summa.proto
+             * @classdesc Represents a MappedField.
+             * @implements IMappedField
+             * @constructor
+             * @param {summa.proto.IMappedField=} [properties] Properties to set
+             */
+            function MappedField(properties) {
+                if (properties)
+                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
+                        if (properties[keys[i]] != null)
+                            this[keys[i]] = properties[keys[i]];
+            }
+
+            /**
+             * MappedField source_field.
+             * @member {string} source_field
+             * @memberof summa.proto.MappedField
+             * @instance
+             */
+            MappedField.prototype.source_field = "";
+
+            /**
+             * MappedField target_field.
+             * @member {string} target_field
+             * @memberof summa.proto.MappedField
+             * @instance
+             */
+            MappedField.prototype.target_field = "";
+
+            /**
+             * Creates a new MappedField instance using the specified properties.
+             * @function create
+             * @memberof summa.proto.MappedField
+             * @static
+             * @param {summa.proto.IMappedField=} [properties] Properties to set
+             * @returns {summa.proto.MappedField} MappedField instance
+             */
+            MappedField.create = function create(properties) {
+                return new MappedField(properties);
+            };
+
+            return MappedField;
+        })();
+
         proto.IndexAttributes = (function() {
 
             /**
@@ -5341,12 +5773,10 @@ export const summa = $root.summa = (() => {
              * @interface IIndexAttributes
              * @property {number|Long|null} [created_at] IndexAttributes created_at
              * @property {Array.<string>|null} [unique_fields] IndexAttributes unique_fields
-             * @property {Array.<string>|null} [default_fields] IndexAttributes default_fields
              * @property {Array.<string>|null} [multi_fields] IndexAttributes multi_fields
-             * @property {string|null} [default_index_name] IndexAttributes default_index_name
              * @property {string|null} [description] IndexAttributes description
-             * @property {Array.<string>|null} [default_snippets] IndexAttributes default_snippets
              * @property {summa.proto.ConflictStrategy|null} [conflict_strategy] IndexAttributes conflict_strategy
+             * @property {Array.<summa.proto.IMappedField>|null} [mapped_fields] IndexAttributes mapped_fields
              */
 
             /**
@@ -5359,9 +5789,8 @@ export const summa = $root.summa = (() => {
              */
             function IndexAttributes(properties) {
                 this.unique_fields = [];
-                this.default_fields = [];
                 this.multi_fields = [];
-                this.default_snippets = [];
+                this.mapped_fields = [];
                 if (properties)
                     for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
                         if (properties[keys[i]] != null)
@@ -5385,28 +5814,12 @@ export const summa = $root.summa = (() => {
             IndexAttributes.prototype.unique_fields = $util.emptyArray;
 
             /**
-             * IndexAttributes default_fields.
-             * @member {Array.<string>} default_fields
-             * @memberof summa.proto.IndexAttributes
-             * @instance
-             */
-            IndexAttributes.prototype.default_fields = $util.emptyArray;
-
-            /**
              * IndexAttributes multi_fields.
              * @member {Array.<string>} multi_fields
              * @memberof summa.proto.IndexAttributes
              * @instance
              */
             IndexAttributes.prototype.multi_fields = $util.emptyArray;
-
-            /**
-             * IndexAttributes default_index_name.
-             * @member {string|null|undefined} default_index_name
-             * @memberof summa.proto.IndexAttributes
-             * @instance
-             */
-            IndexAttributes.prototype.default_index_name = null;
 
             /**
              * IndexAttributes description.
@@ -5417,14 +5830,6 @@ export const summa = $root.summa = (() => {
             IndexAttributes.prototype.description = null;
 
             /**
-             * IndexAttributes default_snippets.
-             * @member {Array.<string>} default_snippets
-             * @memberof summa.proto.IndexAttributes
-             * @instance
-             */
-            IndexAttributes.prototype.default_snippets = $util.emptyArray;
-
-            /**
              * IndexAttributes conflict_strategy.
              * @member {summa.proto.ConflictStrategy} conflict_strategy
              * @memberof summa.proto.IndexAttributes
@@ -5432,19 +5837,16 @@ export const summa = $root.summa = (() => {
              */
             IndexAttributes.prototype.conflict_strategy = 0;
 
-            // OneOf field names bound to virtual getters and setters
-            let $oneOfFields;
-
             /**
-             * IndexAttributes _default_index_name.
-             * @member {"default_index_name"|undefined} _default_index_name
+             * IndexAttributes mapped_fields.
+             * @member {Array.<summa.proto.IMappedField>} mapped_fields
              * @memberof summa.proto.IndexAttributes
              * @instance
              */
-            Object.defineProperty(IndexAttributes.prototype, "_default_index_name", {
-                get: $util.oneOfGetter($oneOfFields = ["default_index_name"]),
-                set: $util.oneOfSetter($oneOfFields)
-            });
+            IndexAttributes.prototype.mapped_fields = $util.emptyArray;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
 
             /**
              * IndexAttributes _description.
@@ -5487,6 +5889,7 @@ export const summa = $root.summa = (() => {
              * @property {summa.proto.ISortByField|null} [sort_by_field] CreateIndexRequest sort_by_field
              * @property {summa.proto.IIndexAttributes|null} [index_attributes] CreateIndexRequest index_attributes
              * @property {summa.proto.IMergePolicy|null} [merge_policy] CreateIndexRequest merge_policy
+             * @property {summa.proto.IQueryParserConfig|null} [query_parser_config] CreateIndexRequest query_parser_config
              */
 
             /**
@@ -5575,6 +5978,14 @@ export const summa = $root.summa = (() => {
              * @instance
              */
             CreateIndexRequest.prototype.merge_policy = null;
+
+            /**
+             * CreateIndexRequest query_parser_config.
+             * @member {summa.proto.IQueryParserConfig|null|undefined} query_parser_config
+             * @memberof summa.proto.CreateIndexRequest
+             * @instance
+             */
+            CreateIndexRequest.prototype.query_parser_config = null;
 
             // OneOf field names bound to virtual getters and setters
             let $oneOfFields;
@@ -6145,6 +6556,7 @@ export const summa = $root.summa = (() => {
              * @interface IIndexDocumentStreamRequest
              * @property {string|null} [index_name] IndexDocumentStreamRequest index_name
              * @property {Array.<Uint8Array>|null} [documents] IndexDocumentStreamRequest documents
+             * @property {summa.proto.ConflictStrategy|null} [conflict_strategy] IndexDocumentStreamRequest conflict_strategy
              */
 
             /**
@@ -6178,6 +6590,28 @@ export const summa = $root.summa = (() => {
              * @instance
              */
             IndexDocumentStreamRequest.prototype.documents = $util.emptyArray;
+
+            /**
+             * IndexDocumentStreamRequest conflict_strategy.
+             * @member {summa.proto.ConflictStrategy|null|undefined} conflict_strategy
+             * @memberof summa.proto.IndexDocumentStreamRequest
+             * @instance
+             */
+            IndexDocumentStreamRequest.prototype.conflict_strategy = null;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
+
+            /**
+             * IndexDocumentStreamRequest _conflict_strategy.
+             * @member {"conflict_strategy"|undefined} _conflict_strategy
+             * @memberof summa.proto.IndexDocumentStreamRequest
+             * @instance
+             */
+            Object.defineProperty(IndexDocumentStreamRequest.prototype, "_conflict_strategy", {
+                get: $util.oneOfGetter($oneOfFields = ["conflict_strategy"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
 
             /**
              * Creates a new IndexDocumentStreamRequest instance using the specified properties.
@@ -7272,7 +7706,8 @@ export const summa = $root.summa = (() => {
              * @property {summa.proto.IMemoryEngineConfig|null} [memory] IndexEngineConfig memory
              * @property {summa.proto.IRemoteEngineConfig|null} [remote] IndexEngineConfig remote
              * @property {summa.proto.IMergePolicy|null} [merge_policy] IndexEngineConfig merge_policy
-             * @property {Object.<string,string>|null} [field_aliases] IndexEngineConfig field_aliases
+             * @property {summa.proto.IQueryParserConfig|null} [query_parser_config] IndexEngineConfig query_parser_config
+             * @property {Object.<string,string>|null} [field_triggers] IndexEngineConfig field_triggers
              */
 
             /**
@@ -7284,7 +7719,7 @@ export const summa = $root.summa = (() => {
              * @param {summa.proto.IIndexEngineConfig=} [properties] Properties to set
              */
             function IndexEngineConfig(properties) {
-                this.field_aliases = {};
+                this.field_triggers = {};
                 if (properties)
                     for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
                         if (properties[keys[i]] != null)
@@ -7324,12 +7759,20 @@ export const summa = $root.summa = (() => {
             IndexEngineConfig.prototype.merge_policy = null;
 
             /**
-             * IndexEngineConfig field_aliases.
-             * @member {Object.<string,string>} field_aliases
+             * IndexEngineConfig query_parser_config.
+             * @member {summa.proto.IQueryParserConfig|null|undefined} query_parser_config
              * @memberof summa.proto.IndexEngineConfig
              * @instance
              */
-            IndexEngineConfig.prototype.field_aliases = $util.emptyObject;
+            IndexEngineConfig.prototype.query_parser_config = null;
+
+            /**
+             * IndexEngineConfig field_triggers.
+             * @member {Object.<string,string>} field_triggers
+             * @memberof summa.proto.IndexEngineConfig
+             * @instance
+             */
+            IndexEngineConfig.prototype.field_triggers = $util.emptyObject;
 
             // OneOf field names bound to virtual getters and setters
             let $oneOfFields;

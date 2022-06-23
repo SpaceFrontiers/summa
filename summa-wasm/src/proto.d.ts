@@ -87,6 +87,295 @@ export namespace summa {
             public static create(properties?: summa.proto.IIndexQuery): summa.proto.IndexQuery;
         }
 
+        /** Properties of a TermFieldMapperConfig. */
+        interface ITermFieldMapperConfig {
+
+            /** TermFieldMapperConfig fields */
+            fields?: (string[]|null);
+        }
+
+        /** Represents a TermFieldMapperConfig. */
+        class TermFieldMapperConfig implements ITermFieldMapperConfig {
+
+            /**
+             * Constructs a new TermFieldMapperConfig.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.ITermFieldMapperConfig);
+
+            /** TermFieldMapperConfig fields. */
+            public fields: string[];
+
+            /**
+             * Creates a new TermFieldMapperConfig instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns TermFieldMapperConfig instance
+             */
+            public static create(properties?: summa.proto.ITermFieldMapperConfig): summa.proto.TermFieldMapperConfig;
+        }
+
+        /** Properties of a MatchQueryBooleanShouldMode. */
+        interface IMatchQueryBooleanShouldMode {
+        }
+
+        /** Represents a MatchQueryBooleanShouldMode. */
+        class MatchQueryBooleanShouldMode implements IMatchQueryBooleanShouldMode {
+
+            /**
+             * Constructs a new MatchQueryBooleanShouldMode.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.IMatchQueryBooleanShouldMode);
+
+            /**
+             * Creates a new MatchQueryBooleanShouldMode instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns MatchQueryBooleanShouldMode instance
+             */
+            public static create(properties?: summa.proto.IMatchQueryBooleanShouldMode): summa.proto.MatchQueryBooleanShouldMode;
+        }
+
+        /** Properties of a MatchQueryDisjuctionMaxMode. */
+        interface IMatchQueryDisjuctionMaxMode {
+
+            /** MatchQueryDisjuctionMaxMode tie_breaker */
+            tie_breaker?: (number|null);
+        }
+
+        /** Represents a MatchQueryDisjuctionMaxMode. */
+        class MatchQueryDisjuctionMaxMode implements IMatchQueryDisjuctionMaxMode {
+
+            /**
+             * Constructs a new MatchQueryDisjuctionMaxMode.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.IMatchQueryDisjuctionMaxMode);
+
+            /** MatchQueryDisjuctionMaxMode tie_breaker. */
+            public tie_breaker: number;
+
+            /**
+             * Creates a new MatchQueryDisjuctionMaxMode instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns MatchQueryDisjuctionMaxMode instance
+             */
+            public static create(properties?: summa.proto.IMatchQueryDisjuctionMaxMode): summa.proto.MatchQueryDisjuctionMaxMode;
+        }
+
+        /** Properties of an ExactMatchesPromoter. */
+        interface IExactMatchesPromoter {
+
+            /** ExactMatchesPromoter slop */
+            slop?: (number|null);
+
+            /** ExactMatchesPromoter boost */
+            boost?: (number|null);
+
+            /** ExactMatchesPromoter fields */
+            fields?: (string[]|null);
+        }
+
+        /** Represents an ExactMatchesPromoter. */
+        class ExactMatchesPromoter implements IExactMatchesPromoter {
+
+            /**
+             * Constructs a new ExactMatchesPromoter.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.IExactMatchesPromoter);
+
+            /** ExactMatchesPromoter slop. */
+            public slop: number;
+
+            /** ExactMatchesPromoter boost. */
+            public boost?: (number|null);
+
+            /** ExactMatchesPromoter fields. */
+            public fields: string[];
+
+            /** ExactMatchesPromoter _boost. */
+            public _boost?: "boost";
+
+            /**
+             * Creates a new ExactMatchesPromoter instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns ExactMatchesPromoter instance
+             */
+            public static create(properties?: summa.proto.IExactMatchesPromoter): summa.proto.ExactMatchesPromoter;
+        }
+
+        /** Properties of a NerMatchesPromoter. */
+        interface INerMatchesPromoter {
+
+            /** NerMatchesPromoter boost */
+            boost?: (number|null);
+
+            /** NerMatchesPromoter fields */
+            fields?: (string[]|null);
+        }
+
+        /** Represents a NerMatchesPromoter. */
+        class NerMatchesPromoter implements INerMatchesPromoter {
+
+            /**
+             * Constructs a new NerMatchesPromoter.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.INerMatchesPromoter);
+
+            /** NerMatchesPromoter boost. */
+            public boost?: (number|null);
+
+            /** NerMatchesPromoter fields. */
+            public fields: string[];
+
+            /** NerMatchesPromoter _boost. */
+            public _boost?: "boost";
+
+            /**
+             * Creates a new NerMatchesPromoter instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns NerMatchesPromoter instance
+             */
+            public static create(properties?: summa.proto.INerMatchesPromoter): summa.proto.NerMatchesPromoter;
+        }
+
+        /** MissingFieldPolicy enum. */
+        enum MissingFieldPolicy {
+            AsUsualTerms = 0,
+            Remove = 1,
+            Fail = 2
+        }
+
+        /** Properties of a MorphologyConfig. */
+        interface IMorphologyConfig {
+
+            /** MorphologyConfig derive_tenses_coefficient */
+            derive_tenses_coefficient?: (number|null);
+        }
+
+        /** Represents a MorphologyConfig. */
+        class MorphologyConfig implements IMorphologyConfig {
+
+            /**
+             * Constructs a new MorphologyConfig.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.IMorphologyConfig);
+
+            /** MorphologyConfig derive_tenses_coefficient. */
+            public derive_tenses_coefficient?: (number|null);
+
+            /** MorphologyConfig _derive_tenses_coefficient. */
+            public _derive_tenses_coefficient?: "derive_tenses_coefficient";
+
+            /**
+             * Creates a new MorphologyConfig instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns MorphologyConfig instance
+             */
+            public static create(properties?: summa.proto.IMorphologyConfig): summa.proto.MorphologyConfig;
+        }
+
+        /** Properties of a QueryParserConfig. */
+        interface IQueryParserConfig {
+
+            /** QueryParserConfig field_aliases */
+            field_aliases?: ({ [k: string]: string }|null);
+
+            /** QueryParserConfig field_boosts */
+            field_boosts?: ({ [k: string]: number }|null);
+
+            /** QueryParserConfig term_field_mapper_configs */
+            term_field_mapper_configs?: ({ [k: string]: summa.proto.ITermFieldMapperConfig }|null);
+
+            /** QueryParserConfig term_limit */
+            term_limit?: (number|null);
+
+            /** QueryParserConfig default_fields */
+            default_fields?: (string[]|null);
+
+            /** QueryParserConfig boolean_should_mode */
+            boolean_should_mode?: (summa.proto.IMatchQueryBooleanShouldMode|null);
+
+            /** QueryParserConfig disjuction_max_mode */
+            disjuction_max_mode?: (summa.proto.IMatchQueryDisjuctionMaxMode|null);
+
+            /** QueryParserConfig exact_matches_promoter */
+            exact_matches_promoter?: (summa.proto.IExactMatchesPromoter|null);
+
+            /** QueryParserConfig missing_field_policy */
+            missing_field_policy?: (summa.proto.MissingFieldPolicy|null);
+
+            /** QueryParserConfig morphology_configs */
+            morphology_configs?: ({ [k: string]: summa.proto.IMorphologyConfig }|null);
+
+            /** QueryParserConfig query_language */
+            query_language?: (string|null);
+
+            /** QueryParserConfig ner_matches_promoter */
+            ner_matches_promoter?: (summa.proto.INerMatchesPromoter|null);
+        }
+
+        /** Represents a QueryParserConfig. */
+        class QueryParserConfig implements IQueryParserConfig {
+
+            /**
+             * Constructs a new QueryParserConfig.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.IQueryParserConfig);
+
+            /** QueryParserConfig field_aliases. */
+            public field_aliases: { [k: string]: string };
+
+            /** QueryParserConfig field_boosts. */
+            public field_boosts: { [k: string]: number };
+
+            /** QueryParserConfig term_field_mapper_configs. */
+            public term_field_mapper_configs: { [k: string]: summa.proto.ITermFieldMapperConfig };
+
+            /** QueryParserConfig term_limit. */
+            public term_limit: number;
+
+            /** QueryParserConfig default_fields. */
+            public default_fields: string[];
+
+            /** QueryParserConfig boolean_should_mode. */
+            public boolean_should_mode?: (summa.proto.IMatchQueryBooleanShouldMode|null);
+
+            /** QueryParserConfig disjuction_max_mode. */
+            public disjuction_max_mode?: (summa.proto.IMatchQueryDisjuctionMaxMode|null);
+
+            /** QueryParserConfig exact_matches_promoter. */
+            public exact_matches_promoter?: (summa.proto.IExactMatchesPromoter|null);
+
+            /** QueryParserConfig missing_field_policy. */
+            public missing_field_policy: summa.proto.MissingFieldPolicy;
+
+            /** QueryParserConfig morphology_configs. */
+            public morphology_configs: { [k: string]: summa.proto.IMorphologyConfig };
+
+            /** QueryParserConfig query_language. */
+            public query_language?: (string|null);
+
+            /** QueryParserConfig ner_matches_promoter. */
+            public ner_matches_promoter?: (summa.proto.INerMatchesPromoter|null);
+
+            /** QueryParserConfig default_mode. */
+            public default_mode?: ("boolean_should_mode"|"disjuction_max_mode");
+
+            /** QueryParserConfig _query_language. */
+            public _query_language?: "query_language";
+
+            /**
+             * Creates a new QueryParserConfig instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns QueryParserConfig instance
+             */
+            public static create(properties?: summa.proto.IQueryParserConfig): summa.proto.QueryParserConfig;
+        }
+
         /** Properties of a SearchResponse. */
         interface ISearchResponse {
 
@@ -492,110 +781,14 @@ export namespace summa {
             public static create(properties?: summa.proto.IRangeQuery): summa.proto.RangeQuery;
         }
 
-        /** Properties of a MatchQueryBooleanShouldMode. */
-        interface IMatchQueryBooleanShouldMode {
-        }
-
-        /** Represents a MatchQueryBooleanShouldMode. */
-        class MatchQueryBooleanShouldMode implements IMatchQueryBooleanShouldMode {
-
-            /**
-             * Constructs a new MatchQueryBooleanShouldMode.
-             * @param [properties] Properties to set
-             */
-            constructor(properties?: summa.proto.IMatchQueryBooleanShouldMode);
-
-            /**
-             * Creates a new MatchQueryBooleanShouldMode instance using the specified properties.
-             * @param [properties] Properties to set
-             * @returns MatchQueryBooleanShouldMode instance
-             */
-            public static create(properties?: summa.proto.IMatchQueryBooleanShouldMode): summa.proto.MatchQueryBooleanShouldMode;
-        }
-
-        /** Properties of a MatchQueryDisjuctionMaxMode. */
-        interface IMatchQueryDisjuctionMaxMode {
-
-            /** MatchQueryDisjuctionMaxMode tie_breaker */
-            tie_breaker?: (number|null);
-        }
-
-        /** Represents a MatchQueryDisjuctionMaxMode. */
-        class MatchQueryDisjuctionMaxMode implements IMatchQueryDisjuctionMaxMode {
-
-            /**
-             * Constructs a new MatchQueryDisjuctionMaxMode.
-             * @param [properties] Properties to set
-             */
-            constructor(properties?: summa.proto.IMatchQueryDisjuctionMaxMode);
-
-            /** MatchQueryDisjuctionMaxMode tie_breaker. */
-            public tie_breaker: number;
-
-            /**
-             * Creates a new MatchQueryDisjuctionMaxMode instance using the specified properties.
-             * @param [properties] Properties to set
-             * @returns MatchQueryDisjuctionMaxMode instance
-             */
-            public static create(properties?: summa.proto.IMatchQueryDisjuctionMaxMode): summa.proto.MatchQueryDisjuctionMaxMode;
-        }
-
-        /** Properties of an ExactMatchesPromoter. */
-        interface IExactMatchesPromoter {
-
-            /** ExactMatchesPromoter slop */
-            slop?: (number|null);
-
-            /** ExactMatchesPromoter boost */
-            boost?: (number|null);
-        }
-
-        /** Represents an ExactMatchesPromoter. */
-        class ExactMatchesPromoter implements IExactMatchesPromoter {
-
-            /**
-             * Constructs a new ExactMatchesPromoter.
-             * @param [properties] Properties to set
-             */
-            constructor(properties?: summa.proto.IExactMatchesPromoter);
-
-            /** ExactMatchesPromoter slop. */
-            public slop: number;
-
-            /** ExactMatchesPromoter boost. */
-            public boost?: (number|null);
-
-            /** ExactMatchesPromoter _boost. */
-            public _boost?: "boost";
-
-            /**
-             * Creates a new ExactMatchesPromoter instance using the specified properties.
-             * @param [properties] Properties to set
-             * @returns ExactMatchesPromoter instance
-             */
-            public static create(properties?: summa.proto.IExactMatchesPromoter): summa.proto.ExactMatchesPromoter;
-        }
-
         /** Properties of a MatchQuery. */
         interface IMatchQuery {
 
             /** MatchQuery value */
             value?: (string|null);
 
-            /** MatchQuery default_fields */
-            default_fields?: (string[]|null);
-
-            /** MatchQuery boolean_should_mode */
-            boolean_should_mode?: (summa.proto.IMatchQueryBooleanShouldMode|null);
-
-            /** MatchQuery disjuction_max_mode */
-            disjuction_max_mode?: (summa.proto.IMatchQueryDisjuctionMaxMode|null);
-
-            /** MatchQuery field_boosts */
-            field_boosts?: ({ [k: string]: number }|null);
-
-            /** MatchQuery exact_matches_promoter */
-            exact_matches_promoter?: (summa.proto.IExactMatchesPromoter|null);
+            /** MatchQuery query_parser_config */
+            query_parser_config?: (summa.proto.IQueryParserConfig|null);
         }
 
         /** Represents a MatchQuery. */
@@ -610,23 +803,11 @@ export namespace summa {
             /** MatchQuery value. */
             public value: string;
 
-            /** MatchQuery default_fields. */
-            public default_fields: string[];
+            /** MatchQuery query_parser_config. */
+            public query_parser_config?: (summa.proto.IQueryParserConfig|null);
 
-            /** MatchQuery boolean_should_mode. */
-            public boolean_should_mode?: (summa.proto.IMatchQueryBooleanShouldMode|null);
-
-            /** MatchQuery disjuction_max_mode. */
-            public disjuction_max_mode?: (summa.proto.IMatchQueryDisjuctionMaxMode|null);
-
-            /** MatchQuery field_boosts. */
-            public field_boosts: { [k: string]: number };
-
-            /** MatchQuery exact_matches_promoter. */
-            public exact_matches_promoter?: (summa.proto.IExactMatchesPromoter|null);
-
-            /** MatchQuery default_mode. */
-            public default_mode?: ("boolean_should_mode"|"disjuction_max_mode");
+            /** MatchQuery _query_parser_config. */
+            public _query_parser_config?: "query_parser_config";
 
             /**
              * Creates a new MatchQuery instance using the specified properties.
@@ -2571,6 +2752,9 @@ export namespace summa {
 
             /** AttachIndexRequest merge_policy */
             merge_policy?: (summa.proto.IMergePolicy|null);
+
+            /** AttachIndexRequest query_parser_config */
+            query_parser_config?: (summa.proto.IQueryParserConfig|null);
         }
 
         /** Represents an AttachIndexRequest. */
@@ -2593,6 +2777,9 @@ export namespace summa {
 
             /** AttachIndexRequest merge_policy. */
             public merge_policy?: (summa.proto.IMergePolicy|null);
+
+            /** AttachIndexRequest query_parser_config. */
+            public query_parser_config?: (summa.proto.IQueryParserConfig|null);
 
             /** AttachIndexRequest index_engine. */
             public index_engine?: ("file"|"remote");
@@ -2694,6 +2881,9 @@ export namespace summa {
 
             /** CopyDocumentsRequest target_index_name */
             target_index_name?: (string|null);
+
+            /** CopyDocumentsRequest conflict_strategy */
+            conflict_strategy?: (summa.proto.ConflictStrategy|null);
         }
 
         /** Represents a CopyDocumentsRequest. */
@@ -2710,6 +2900,12 @@ export namespace summa {
 
             /** CopyDocumentsRequest target_index_name. */
             public target_index_name: string;
+
+            /** CopyDocumentsRequest conflict_strategy. */
+            public conflict_strategy?: (summa.proto.ConflictStrategy|null);
+
+            /** CopyDocumentsRequest _conflict_strategy. */
+            public _conflict_strategy?: "conflict_strategy";
 
             /**
              * Creates a new CopyDocumentsRequest instance using the specified properties.
@@ -2916,6 +3112,39 @@ export namespace summa {
             MERGE = 3
         }
 
+        /** Properties of a MappedField. */
+        interface IMappedField {
+
+            /** MappedField source_field */
+            source_field?: (string|null);
+
+            /** MappedField target_field */
+            target_field?: (string|null);
+        }
+
+        /** Represents a MappedField. */
+        class MappedField implements IMappedField {
+
+            /**
+             * Constructs a new MappedField.
+             * @param [properties] Properties to set
+             */
+            constructor(properties?: summa.proto.IMappedField);
+
+            /** MappedField source_field. */
+            public source_field: string;
+
+            /** MappedField target_field. */
+            public target_field: string;
+
+            /**
+             * Creates a new MappedField instance using the specified properties.
+             * @param [properties] Properties to set
+             * @returns MappedField instance
+             */
+            public static create(properties?: summa.proto.IMappedField): summa.proto.MappedField;
+        }
+
         /** Properties of an IndexAttributes. */
         interface IIndexAttributes {
 
@@ -2925,23 +3154,17 @@ export namespace summa {
             /** IndexAttributes unique_fields */
             unique_fields?: (string[]|null);
 
-            /** IndexAttributes default_fields */
-            default_fields?: (string[]|null);
-
             /** IndexAttributes multi_fields */
             multi_fields?: (string[]|null);
-
-            /** IndexAttributes default_index_name */
-            default_index_name?: (string|null);
 
             /** IndexAttributes description */
             description?: (string|null);
 
-            /** IndexAttributes default_snippets */
-            default_snippets?: (string[]|null);
-
             /** IndexAttributes conflict_strategy */
             conflict_strategy?: (summa.proto.ConflictStrategy|null);
+
+            /** IndexAttributes mapped_fields */
+            mapped_fields?: (summa.proto.IMappedField[]|null);
         }
 
         /** Represents an IndexAttributes. */
@@ -2959,26 +3182,17 @@ export namespace summa {
             /** IndexAttributes unique_fields. */
             public unique_fields: string[];
 
-            /** IndexAttributes default_fields. */
-            public default_fields: string[];
-
             /** IndexAttributes multi_fields. */
             public multi_fields: string[];
-
-            /** IndexAttributes default_index_name. */
-            public default_index_name?: (string|null);
 
             /** IndexAttributes description. */
             public description?: (string|null);
 
-            /** IndexAttributes default_snippets. */
-            public default_snippets: string[];
-
             /** IndexAttributes conflict_strategy. */
             public conflict_strategy: summa.proto.ConflictStrategy;
 
-            /** IndexAttributes _default_index_name. */
-            public _default_index_name?: "default_index_name";
+            /** IndexAttributes mapped_fields. */
+            public mapped_fields: summa.proto.IMappedField[];
 
             /** IndexAttributes _description. */
             public _description?: "description";
@@ -3020,6 +3234,9 @@ export namespace summa {
 
             /** CreateIndexRequest merge_policy */
             merge_policy?: (summa.proto.IMergePolicy|null);
+
+            /** CreateIndexRequest query_parser_config */
+            query_parser_config?: (summa.proto.IQueryParserConfig|null);
         }
 
         /** Represents a CreateIndexRequest. */
@@ -3057,6 +3274,9 @@ export namespace summa {
 
             /** CreateIndexRequest merge_policy. */
             public merge_policy?: (summa.proto.IMergePolicy|null);
+
+            /** CreateIndexRequest query_parser_config. */
+            public query_parser_config?: (summa.proto.IQueryParserConfig|null);
 
             /** CreateIndexRequest index_engine. */
             public index_engine?: ("file"|"memory");
@@ -3374,6 +3594,9 @@ export namespace summa {
 
             /** IndexDocumentStreamRequest documents */
             documents?: (Uint8Array[]|null);
+
+            /** IndexDocumentStreamRequest conflict_strategy */
+            conflict_strategy?: (summa.proto.ConflictStrategy|null);
         }
 
         /** Represents an IndexDocumentStreamRequest. */
@@ -3390,6 +3613,12 @@ export namespace summa {
 
             /** IndexDocumentStreamRequest documents. */
             public documents: Uint8Array[];
+
+            /** IndexDocumentStreamRequest conflict_strategy. */
+            public conflict_strategy?: (summa.proto.ConflictStrategy|null);
+
+            /** IndexDocumentStreamRequest _conflict_strategy. */
+            public _conflict_strategy?: "conflict_strategy";
 
             /**
              * Creates a new IndexDocumentStreamRequest instance using the specified properties.
@@ -4016,8 +4245,11 @@ export namespace summa {
             /** IndexEngineConfig merge_policy */
             merge_policy?: (summa.proto.IMergePolicy|null);
 
-            /** IndexEngineConfig field_aliases */
-            field_aliases?: ({ [k: string]: string }|null);
+            /** IndexEngineConfig query_parser_config */
+            query_parser_config?: (summa.proto.IQueryParserConfig|null);
+
+            /** IndexEngineConfig field_triggers */
+            field_triggers?: ({ [k: string]: string }|null);
         }
 
         /** Represents an IndexEngineConfig. */
@@ -4041,8 +4273,11 @@ export namespace summa {
             /** IndexEngineConfig merge_policy. */
             public merge_policy?: (summa.proto.IMergePolicy|null);
 
-            /** IndexEngineConfig field_aliases. */
-            public field_aliases: { [k: string]: string };
+            /** IndexEngineConfig query_parser_config. */
+            public query_parser_config?: (summa.proto.IQueryParserConfig|null);
+
+            /** IndexEngineConfig field_triggers. */
+            public field_triggers: { [k: string]: string };
 
             /** IndexEngineConfig config. */
             public config?: ("file"|"memory"|"remote");
