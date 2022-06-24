@@ -1,6 +1,6 @@
 [package]
 name = "summa-wasm"
-version = "0.124.4"
+version = "0.125.0"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -26,7 +26,7 @@ prost = { workspace = true }
 serde = { workspace = true }
 serde-wasm-bindgen = "0.5"
 strfmt = { workspace = true }
-summa-core = { version = "0.17.4", path = "../summa-core", default_features = false }
+summa-core = { version = "0.17.5", path = "../summa-core", default_features = false }
 summa-proto = { workspace = true }
 tantivy = { workspace = true, features = ["wasm"] }
 thiserror = { workspace = true }

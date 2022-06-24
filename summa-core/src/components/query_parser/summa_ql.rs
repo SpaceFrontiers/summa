@@ -614,7 +614,7 @@ impl QueryParser {
                                 }
                             }
                             None => {
-                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == resolved_field_name) {
+                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == field_name.as_str()) {
                                     return Ok(Box::new(EmptyQuery {}));
                                 }
                                 intermediate_results.push(self.default_field_queries(field_name, statement_boost)?);
@@ -635,7 +635,7 @@ impl QueryParser {
                         match self.schema.find_field(resolved_field_name) {
                             Some((field, full_path)) => self.parse_term(grouping_or_term, &field, full_path, statement_boost),
                             None => {
-                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == resolved_field_name) {
+                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == field_name.as_str()) {
                                     Ok(Box::new(EmptyQuery {}) as Box<dyn Query>)
                                 } else {
                                     Ok(Box::new(BooleanQuery::new(vec![
