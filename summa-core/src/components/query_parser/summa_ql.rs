@@ -606,23 +606,22 @@ impl QueryParser {
                         let grouping = grouping_or_term.into_inner().next().expect("grammar failure");
                         let occur = self.parse_occur(&grouping);
                         let mut intermediate_results = vec![];
-                        match self.schema.find_field(self.resolve_field_name(field_name.as_str())) {
+                        let resolved_field_name = self.resolve_field_name(field_name.as_str());
+                        match self.schema.find_field(resolved_field_name) {
                             Some((field, full_path)) => {
                                 for term in grouping.into_inner() {
                                     intermediate_results.push(self.parse_term(term, &field, full_path, statement_boost)?);
                                 }
                             }
-                            None => match proto::MissingFieldPolicy::from_i32(self.query_parser_config.0.missing_field_policy) {
-                                Some(proto::MissingFieldPolicy::AsUsualTerms) => {
-                                    intermediate_results.push(self.default_field_queries(field_name, statement_boost)?);
-                                    for term in grouping.into_inner() {
-                                        intermediate_results.push(self.default_field_queries(term, statement_boost)?)
-                                    }
+                            None => {
+                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == resolved_field_name) {
+                                    return Ok(Box::new(EmptyQuery {}));
                                 }
-                                Some(proto::MissingFieldPolicy::Remove) => return Ok(Box::new(EmptyQuery {})),
-                                Some(proto::MissingFieldPolicy::Fail) => return Err(QueryParserError::FieldDoesNotExist(field_name.as_str().to_string())),
-                                _ => unreachable!(),
-                            },
+                                intermediate_results.push(self.default_field_queries(field_name, statement_boost)?);
+                                for term in grouping.into_inner() {
+                                    intermediate_results.push(self.default_field_queries(term, statement_boost)?)
+                                }
+                            }
                         }
                         let group_query = Box::new(BooleanQuery::new(intermediate_results.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>;
                         match occur {
@@ -631,18 +630,22 @@ impl QueryParser {
                             Occur::MustNot => Ok(Box::new(BooleanQuery::new(vec![(Occur::MustNot, group_query)])) as Box<dyn Query>),
                         }
                     }
-                    Rule::term => match self.schema.find_field(self.resolve_field_name(field_name.as_str())) {
-                        Some((field, full_path)) => self.parse_term(grouping_or_term, &field, full_path, statement_boost),
-                        None => match proto::MissingFieldPolicy::from_i32(self.query_parser_config.0.missing_field_policy) {
-                            Some(proto::MissingFieldPolicy::AsUsualTerms) => Ok(Box::new(BooleanQuery::new(vec![
-                                (Occur::Should, self.default_field_queries(field_name, statement_boost)?),
-                                (Occur::Should, self.default_field_queries(grouping_or_term, statement_boost)?),
-                            ])) as Box<dyn Query>),
-                            Some(proto::MissingFieldPolicy::Remove) => Ok(Box::new(EmptyQuery {}) as Box<dyn Query>),
-                            Some(proto::MissingFieldPolicy::Fail) => Err(QueryParserError::FieldDoesNotExist(field_name.as_str().to_string())),
-                            _ => unreachable!(),
-                        },
-                    },
+                    Rule::term => {
+                        let resolved_field_name = self.resolve_field_name(field_name.as_str());
+                        match self.schema.find_field(resolved_field_name) {
+                            Some((field, full_path)) => self.parse_term(grouping_or_term, &field, full_path, statement_boost),
+                            None => {
+                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == resolved_field_name) {
+                                    Ok(Box::new(EmptyQuery {}) as Box<dyn Query>)
+                                } else {
+                                    Ok(Box::new(BooleanQuery::new(vec![
+                                        (Occur::Should, self.default_field_queries(field_name, statement_boost)?),
+                                        (Occur::Should, self.default_field_queries(grouping_or_term, statement_boost)?),
+                                    ])) as Box<dyn Query>)
+                                }
+                            }
+                        }
+                    }
                     _ => unreachable!(),
                 }
             }

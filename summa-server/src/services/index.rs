@@ -228,7 +228,6 @@ impl Index {
                     config: Some(proto::index_engine_config::Config::File(file_engine_config)),
                     merge_policy: attach_index_request.merge_policy,
                     query_parser_config: query_parser_config.clone(),
-                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }
@@ -244,7 +243,6 @@ impl Index {
                     config: Some(proto::index_engine_config::Config::Remote(remote_engine_config)),
                     merge_policy: attach_index_request.merge_policy,
                     query_parser_config: query_parser_config.clone(),
-                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }
@@ -321,7 +319,6 @@ impl Index {
                     })),
                     merge_policy: create_index_request.merge_policy,
                     query_parser_config,
-                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }
@@ -333,7 +330,6 @@ impl Index {
                     })),
                     merge_policy: create_index_request.merge_policy,
                     query_parser_config,
-                    field_triggers: Default::default(),
                 };
                 (index, index_engine_config)
             }

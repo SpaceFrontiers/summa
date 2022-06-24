@@ -24,6 +24,7 @@ interface IIndexConfig {
   index_seed: Object;
   index_properties: Object;
   remote_engine_config: summa.proto.RemoteEngineConfig;
+  query_parser_config: summa.proto.QueryParserConfig;
 }
 
 export class IndexConfig implements IIndexConfig {
@@ -31,22 +32,25 @@ export class IndexConfig implements IIndexConfig {
   description: string;
   created_at: number;
   index_seed: Object;
-  index_properties: Object;
   remote_engine_config: summa.proto.RemoteEngineConfig;
+  query_parser_config: summa.proto.QueryParserConfig;
+  index_properties: Object;
 
   constructor(
     index_name: string,
     description: string,
     created_at: number,
     index_seed: Object,
+    remote_engine_config: summa.proto.RemoteEngineConfig,
+    query_parser_config: summa.proto.QueryParserConfig,
     index_properties: Object,
-    remote_engine_config: summa.proto.RemoteEngineConfig
   ) {
     this.index_name = index_name;
     this.description = description;
     this.created_at = created_at;
     this.index_seed = index_seed;
-    this.index_properties = index_properties;
     this.remote_engine_config = remote_engine_config;
+    this.query_parser_config = query_parser_config;
+    this.index_properties = index_properties;
   }
 }

@@ -16,14 +16,10 @@ message ExactMatchesPromoter {
   optional float boost = 2;
   repeated string fields = 3;
 }
+
 message NerMatchesPromoter {
   optional float boost = 1;
   repeated string fields = 2;
-}
-enum MissingFieldPolicy {
-  AsUsualTerms = 0;
-  Remove = 1;
-  Fail = 2;
 }
 
 message MorphologyConfig {
@@ -41,7 +37,7 @@ message QueryParserConfig {
     MatchQueryDisjuctionMaxMode disjuction_max_mode = 7;
   }
   ExactMatchesPromoter exact_matches_promoter = 8;
-  MissingFieldPolicy missing_field_policy = 9;
+  repeated string removed_fields = 9;
   map<string, MorphologyConfig> morphology_configs = 10;
   optional string query_language = 11;
   NerMatchesPromoter ner_matches_promoter = 12;

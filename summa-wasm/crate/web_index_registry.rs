@@ -73,17 +73,17 @@ impl WrappedIndexRegistry {
 
     /// Add new index to `WrappedIndexRegistry`
     #[wasm_bindgen]
-    pub async fn add(&self, index_engine_config: JsValue, index_name: &str) -> Result<JsValue, JsValue> {
+    pub async fn add(&self, index_name: &str, index_engine_config: JsValue) -> Result<JsValue, JsValue> {
         let index_engine_config: proto::IndexEngineConfig = serde_wasm_bindgen::from_value(index_engine_config)?;
         let serializer = Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true);
         Ok(self
-            .add_internal(index_engine_config, index_name)
+            .add_internal(index_name, index_engine_config)
             .await
             .map_err(Error::from)?
             .serialize(&serializer)?)
     }
 
-    async fn add_internal(&self, index_engine_config: proto::IndexEngineConfig, index_name: &str) -> SummaWasmResult<Option<proto::IndexAttributes>> {
+    async fn add_internal(&self, index_name: &str, index_engine_config: proto::IndexEngineConfig) -> SummaWasmResult<Option<proto::IndexAttributes>> {
         let index = match &index_engine_config.config {
             Some(proto::index_engine_config::Config::Memory(memory_engine_config)) => {
                 let schema = serde_wasm_bindgen::from_value(memory_engine_config.schema.clone().into()).expect("cannot parse schema");
@@ -159,8 +159,8 @@ impl WrappedIndexRegistry {
     }
 
     #[wasm_bindgen]
-    pub async fn get_index_field_names(&self, index_alias: &str) -> Result<JsValue, JsValue> {
-        let index_holder = self.index_registry.get_index_holder(index_alias).await.map_err(Error::from)?;
+    pub async fn get_index_field_names(&self, index_name: &str) -> Result<JsValue, JsValue> {
+        let index_holder = self.index_registry.get_index_holder(index_name).await.map_err(Error::from)?;
         Ok(serde_wasm_bindgen::to_value(
             &index_holder
                 .schema()

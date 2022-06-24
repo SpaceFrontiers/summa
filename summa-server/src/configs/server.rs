@@ -105,6 +105,12 @@ pub mod tests {
                     .build()
                     .expect("cannot create api config"),
             )
+            .metrics(Some(
+                crate::configs::metrics::ConfigBuilder::default()
+                    .endpoint(format!("127.0.0.1:{}", acquire_free_port()))
+                    .build()
+                    .expect("cannot create metrics config"),
+            ))
             .build()
             .expect("cannot create server config")
     }

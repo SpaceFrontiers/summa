@@ -360,7 +360,6 @@ message IndexEngineConfig {
   // Merge policy
   MergePolicy merge_policy = 10;
   QueryParserConfig query_parser_config = 11;
-  map<string, string> field_triggers = 12;
 }
 
 // Description containing `Index` metadata fields

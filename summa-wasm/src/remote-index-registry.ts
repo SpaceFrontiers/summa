@@ -16,8 +16,8 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         this.init_guard = this.setup(wasm_url, options);
     }
 
-    add(index_engine_config: summa.proto.IndexEngineConfig, index_name: string): Promise<summa.proto.IndexAttributes> {
-        return this.index_registry.add(index_engine_config, index_name);
+    add(index_name: string, index_engine_config: summa.proto.IndexEngineConfig): Promise<summa.proto.IndexAttributes> {
+        return this.index_registry.add(index_name, index_engine_config);
     }
 
     delete(index_name: string): Promise<void> {

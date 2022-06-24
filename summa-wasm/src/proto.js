@@ -1,5 +1,5 @@
 /*eslint-disable block-scoped-var, id-length, no-control-regex, no-magic-numbers, no-prototype-builtins, no-redeclare, no-shadow, no-var, sort-vars*/
-import * as $protobuf from "protobufjs/minimal";
+import * as $protobuf from "protobufjs/minimal.js";
 
 // Common aliases
 const $util = $protobuf.util;
@@ -456,22 +456,6 @@ export const summa = $root.summa = (() => {
             return NerMatchesPromoter;
         })();
 
-        /**
-         * MissingFieldPolicy enum.
-         * @name summa.proto.MissingFieldPolicy
-         * @enum {number}
-         * @property {number} AsUsualTerms=0 AsUsualTerms value
-         * @property {number} Remove=1 Remove value
-         * @property {number} Fail=2 Fail value
-         */
-        proto.MissingFieldPolicy = (function() {
-            const valuesById = {}, values = Object.create(valuesById);
-            values[valuesById[0] = "AsUsualTerms"] = 0;
-            values[valuesById[1] = "Remove"] = 1;
-            values[valuesById[2] = "Fail"] = 2;
-            return values;
-        })();
-
         proto.MorphologyConfig = (function() {
 
             /**
@@ -547,7 +531,7 @@ export const summa = $root.summa = (() => {
              * @property {summa.proto.IMatchQueryBooleanShouldMode|null} [boolean_should_mode] QueryParserConfig boolean_should_mode
              * @property {summa.proto.IMatchQueryDisjuctionMaxMode|null} [disjuction_max_mode] QueryParserConfig disjuction_max_mode
              * @property {summa.proto.IExactMatchesPromoter|null} [exact_matches_promoter] QueryParserConfig exact_matches_promoter
-             * @property {summa.proto.MissingFieldPolicy|null} [missing_field_policy] QueryParserConfig missing_field_policy
+             * @property {Array.<string>|null} [removed_fields] QueryParserConfig removed_fields
              * @property {Object.<string,summa.proto.IMorphologyConfig>|null} [morphology_configs] QueryParserConfig morphology_configs
              * @property {string|null} [query_language] QueryParserConfig query_language
              * @property {summa.proto.INerMatchesPromoter|null} [ner_matches_promoter] QueryParserConfig ner_matches_promoter
@@ -566,6 +550,7 @@ export const summa = $root.summa = (() => {
                 this.field_boosts = {};
                 this.term_field_mapper_configs = {};
                 this.default_fields = [];
+                this.removed_fields = [];
                 this.morphology_configs = {};
                 if (properties)
                     for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
@@ -638,12 +623,12 @@ export const summa = $root.summa = (() => {
             QueryParserConfig.prototype.exact_matches_promoter = null;
 
             /**
-             * QueryParserConfig missing_field_policy.
-             * @member {summa.proto.MissingFieldPolicy} missing_field_policy
+             * QueryParserConfig removed_fields.
+             * @member {Array.<string>} removed_fields
              * @memberof summa.proto.QueryParserConfig
              * @instance
              */
-            QueryParserConfig.prototype.missing_field_policy = 0;
+            QueryParserConfig.prototype.removed_fields = $util.emptyArray;
 
             /**
              * QueryParserConfig morphology_configs.
@@ -7707,7 +7692,6 @@ export const summa = $root.summa = (() => {
              * @property {summa.proto.IRemoteEngineConfig|null} [remote] IndexEngineConfig remote
              * @property {summa.proto.IMergePolicy|null} [merge_policy] IndexEngineConfig merge_policy
              * @property {summa.proto.IQueryParserConfig|null} [query_parser_config] IndexEngineConfig query_parser_config
-             * @property {Object.<string,string>|null} [field_triggers] IndexEngineConfig field_triggers
              */
 
             /**
@@ -7719,7 +7703,6 @@ export const summa = $root.summa = (() => {
              * @param {summa.proto.IIndexEngineConfig=} [properties] Properties to set
              */
             function IndexEngineConfig(properties) {
-                this.field_triggers = {};
                 if (properties)
                     for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
                         if (properties[keys[i]] != null)
@@ -7765,14 +7748,6 @@ export const summa = $root.summa = (() => {
              * @instance
              */
             IndexEngineConfig.prototype.query_parser_config = null;
-
-            /**
-             * IndexEngineConfig field_triggers.
-             * @member {Object.<string,string>} field_triggers
-             * @memberof summa.proto.IndexEngineConfig
-             * @instance
-             */
-            IndexEngineConfig.prototype.field_triggers = $util.emptyObject;
 
             // OneOf field names bound to virtual getters and setters
             let $oneOfFields;

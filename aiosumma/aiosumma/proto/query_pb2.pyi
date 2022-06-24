@@ -12,20 +12,11 @@ from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
-class MissingFieldPolicy(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-    __slots__ = []
-    AsUsualTerms: _ClassVar[MissingFieldPolicy]
-    Remove: _ClassVar[MissingFieldPolicy]
-    Fail: _ClassVar[MissingFieldPolicy]
-
 class Occur(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []
     should: _ClassVar[Occur]
     must: _ClassVar[Occur]
     must_not: _ClassVar[Occur]
-AsUsualTerms: MissingFieldPolicy
-Remove: MissingFieldPolicy
-Fail: MissingFieldPolicy
 should: Occur
 must: Occur
 must_not: Occur
@@ -71,7 +62,7 @@ class MorphologyConfig(_message.Message):
     def __init__(self, derive_tenses_coefficient: _Optional[float] = ...) -> None: ...
 
 class QueryParserConfig(_message.Message):
-    __slots__ = ["field_aliases", "field_boosts", "term_field_mapper_configs", "term_limit", "default_fields", "boolean_should_mode", "disjuction_max_mode", "exact_matches_promoter", "missing_field_policy", "morphology_configs", "query_language", "ner_matches_promoter"]
+    __slots__ = ["field_aliases", "field_boosts", "term_field_mapper_configs", "term_limit", "default_fields", "boolean_should_mode", "disjuction_max_mode", "exact_matches_promoter", "removed_fields", "morphology_configs", "query_language", "ner_matches_promoter"]
     class FieldAliasesEntry(_message.Message):
         __slots__ = ["key", "value"]
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -108,7 +99,7 @@ class QueryParserConfig(_message.Message):
     BOOLEAN_SHOULD_MODE_FIELD_NUMBER: _ClassVar[int]
     DISJUCTION_MAX_MODE_FIELD_NUMBER: _ClassVar[int]
     EXACT_MATCHES_PROMOTER_FIELD_NUMBER: _ClassVar[int]
-    MISSING_FIELD_POLICY_FIELD_NUMBER: _ClassVar[int]
+    REMOVED_FIELDS_FIELD_NUMBER: _ClassVar[int]
     MORPHOLOGY_CONFIGS_FIELD_NUMBER: _ClassVar[int]
     QUERY_LANGUAGE_FIELD_NUMBER: _ClassVar[int]
     NER_MATCHES_PROMOTER_FIELD_NUMBER: _ClassVar[int]
@@ -120,11 +111,11 @@ class QueryParserConfig(_message.Message):
     boolean_should_mode: MatchQueryBooleanShouldMode
     disjuction_max_mode: MatchQueryDisjuctionMaxMode
     exact_matches_promoter: ExactMatchesPromoter
-    missing_field_policy: MissingFieldPolicy
+    removed_fields: _containers.RepeatedScalarFieldContainer[str]
     morphology_configs: _containers.MessageMap[str, MorphologyConfig]
     query_language: str
     ner_matches_promoter: NerMatchesPromoter
-    def __init__(self, field_aliases: _Optional[_Mapping[str, str]] = ..., field_boosts: _Optional[_Mapping[str, float]] = ..., term_field_mapper_configs: _Optional[_Mapping[str, TermFieldMapperConfig]] = ..., term_limit: _Optional[int] = ..., default_fields: _Optional[_Iterable[str]] = ..., boolean_should_mode: _Optional[_Union[MatchQueryBooleanShouldMode, _Mapping]] = ..., disjuction_max_mode: _Optional[_Union[MatchQueryDisjuctionMaxMode, _Mapping]] = ..., exact_matches_promoter: _Optional[_Union[ExactMatchesPromoter, _Mapping]] = ..., missing_field_policy: _Optional[_Union[MissingFieldPolicy, str]] = ..., morphology_configs: _Optional[_Mapping[str, MorphologyConfig]] = ..., query_language: _Optional[str] = ..., ner_matches_promoter: _Optional[_Union[NerMatchesPromoter, _Mapping]] = ...) -> None: ...
+    def __init__(self, field_aliases: _Optional[_Mapping[str, str]] = ..., field_boosts: _Optional[_Mapping[str, float]] = ..., term_field_mapper_configs: _Optional[_Mapping[str, TermFieldMapperConfig]] = ..., term_limit: _Optional[int] = ..., default_fields: _Optional[_Iterable[str]] = ..., boolean_should_mode: _Optional[_Union[MatchQueryBooleanShouldMode, _Mapping]] = ..., disjuction_max_mode: _Optional[_Union[MatchQueryDisjuctionMaxMode, _Mapping]] = ..., exact_matches_promoter: _Optional[_Union[ExactMatchesPromoter, _Mapping]] = ..., removed_fields: _Optional[_Iterable[str]] = ..., morphology_configs: _Optional[_Mapping[str, MorphologyConfig]] = ..., query_language: _Optional[str] = ..., ner_matches_promoter: _Optional[_Union[NerMatchesPromoter, _Mapping]] = ...) -> None: ...
 
 class SearchResponse(_message.Message):
     __slots__ = ["elapsed_secs", "collector_outputs"]

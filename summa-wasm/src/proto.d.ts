@@ -240,13 +240,6 @@ export namespace summa {
             public static create(properties?: summa.proto.INerMatchesPromoter): summa.proto.NerMatchesPromoter;
         }
 
-        /** MissingFieldPolicy enum. */
-        enum MissingFieldPolicy {
-            AsUsualTerms = 0,
-            Remove = 1,
-            Fail = 2
-        }
-
         /** Properties of a MorphologyConfig. */
         interface IMorphologyConfig {
 
@@ -304,8 +297,8 @@ export namespace summa {
             /** QueryParserConfig exact_matches_promoter */
             exact_matches_promoter?: (summa.proto.IExactMatchesPromoter|null);
 
-            /** QueryParserConfig missing_field_policy */
-            missing_field_policy?: (summa.proto.MissingFieldPolicy|null);
+            /** QueryParserConfig removed_fields */
+            removed_fields?: (string[]|null);
 
             /** QueryParserConfig morphology_configs */
             morphology_configs?: ({ [k: string]: summa.proto.IMorphologyConfig }|null);
@@ -350,8 +343,8 @@ export namespace summa {
             /** QueryParserConfig exact_matches_promoter. */
             public exact_matches_promoter?: (summa.proto.IExactMatchesPromoter|null);
 
-            /** QueryParserConfig missing_field_policy. */
-            public missing_field_policy: summa.proto.MissingFieldPolicy;
+            /** QueryParserConfig removed_fields. */
+            public removed_fields: string[];
 
             /** QueryParserConfig morphology_configs. */
             public morphology_configs: { [k: string]: summa.proto.IMorphologyConfig };
@@ -4247,9 +4240,6 @@ export namespace summa {
 
             /** IndexEngineConfig query_parser_config */
             query_parser_config?: (summa.proto.IQueryParserConfig|null);
-
-            /** IndexEngineConfig field_triggers */
-            field_triggers?: ({ [k: string]: string }|null);
         }
 
         /** Represents an IndexEngineConfig. */
@@ -4275,9 +4265,6 @@ export namespace summa {
 
             /** IndexEngineConfig query_parser_config. */
             public query_parser_config?: (summa.proto.IQueryParserConfig|null);
-
-            /** IndexEngineConfig field_triggers. */
-            public field_triggers: { [k: string]: string };
 
             /** IndexEngineConfig config. */
             public config?: ("file"|"memory"|"remote");

@@ -432,27 +432,18 @@ class TemporalMergePolicy(_message.Message):
     def __init__(self, merge_older_then_secs: _Optional[int] = ...) -> None: ...
 
 class IndexEngineConfig(_message.Message):
-    __slots__ = ["file", "memory", "remote", "merge_policy", "query_parser_config", "field_triggers"]
-    class FieldTriggersEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: str
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    __slots__ = ["file", "memory", "remote", "merge_policy", "query_parser_config"]
     FILE_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     REMOTE_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     QUERY_PARSER_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    FIELD_TRIGGERS_FIELD_NUMBER: _ClassVar[int]
     file: FileEngineConfig
     memory: MemoryEngineConfig
     remote: RemoteEngineConfig
     merge_policy: MergePolicy
     query_parser_config: _query_pb2.QueryParserConfig
-    field_triggers: _containers.ScalarMap[str, str]
-    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ..., field_triggers: _Optional[_Mapping[str, str]] = ...) -> None: ...
+    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ["index_name", "index_aliases", "index_engine", "num_docs", "compression", "index_attributes"]
