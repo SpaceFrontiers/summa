@@ -132,9 +132,6 @@ impl QueryParserConfig {
         if let Some(exact_matches_promoter) = other.0.exact_matches_promoter {
             self.0.exact_matches_promoter = Some(exact_matches_promoter)
         }
-        if let Some(ner_matches_promoter) = other.0.ner_matches_promoter {
-            self.0.ner_matches_promoter = Some(ner_matches_promoter)
-        }
         if let Some(default_mode) = other.0.default_mode {
             self.0.default_mode = Some(default_mode)
         }

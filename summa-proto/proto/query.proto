@@ -40,7 +40,6 @@ message QueryParserConfig {
   repeated string removed_fields = 9;
   map<string, MorphologyConfig> morphology_configs = 10;
   optional string query_language = 11;
-  NerMatchesPromoter ner_matches_promoter = 12;
 }
 
 message SearchResponse {

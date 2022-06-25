@@ -694,45 +694,6 @@ impl QueryParser {
         }
 
         if let Some(top_level_phrase) = self.extract_top_level_phrase(pairs) {
-            if let Some(ner_matches_promoter) = &self.query_parser_config.0.ner_matches_promoter {
-                if let Some(morphology) = self.morphology_manager.get(self.query_parser_config.0.query_language()) {
-                    let fields = if ner_matches_promoter.fields.is_empty() {
-                        self.query_parser_config.0.default_fields.iter()
-                    } else {
-                        ner_matches_promoter.fields.iter()
-                    };
-                    let entities = morphology.detect_ners(&top_level_phrase);
-                    subqueries.extend(
-                        fields
-                            .map(|field| {
-                                let mut subsubqueries = vec![];
-                                for entity in &entities {
-                                    let (field, full_path) = self.schema.find_field(self.resolve_field_name(field)).expect("no field");
-                                    let field_entry = self.schema.get_field_entry(field);
-                                    let field_boost = self.query_parser_config.0.field_boosts.get(field_entry.name()).copied();
-                                    if let FieldType::Str(ref str_option) = field_entry.field_type() {
-                                        let Some(option) = str_option.get_indexing_options() else {
-                                        continue
-                                    };
-                                        let terms = match self.parse_words(field, full_path, option, entity) {
-                                            Ok(terms) => terms,
-                                            Err(err) => return Err(err),
-                                        };
-                                        if terms.len() > 1 && option.index_option().has_positions() {
-                                            let query = Box::new(PhraseQuery::new_with_offset(terms)) as Box<dyn Query>;
-                                            subsubqueries.push(boost_query(query, multiply_boosts(ner_matches_promoter.boost, field_boost)))
-                                        }
-                                    }
-                                }
-                                Ok(subsubqueries)
-                            })
-                            .collect::<Result<Vec<Vec<_>>, _>>()?
-                            .into_iter()
-                            .flatten()
-                            .map(|q| (Occur::Should, q)),
-                    )
-                }
-            }
             if let Some(exact_matches_promoter) = &self.query_parser_config.0.exact_matches_promoter {
                 let fields = if exact_matches_promoter.fields.is_empty() {
                     self.query_parser_config.0.default_fields.iter()
@@ -1190,25 +1151,5 @@ mod tests {
         assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"red1\"))), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"search\")), TermQuery(Term(field=0, type=Str, \"searches\"))], tie_breaker: 0.3 }), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.3 }), (Should, TermQuery(Term(field=0, type=Str, \"going\")))] })");
         let query = query_parser.parse_query("iso 34-1:2022");
         assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"iso\")), TermQuery(Term(field=0, type=Str, \"isos\"))], tie_breaker: 0.3 }), (Should, TermQuery(Term(field=0, type=Str, \"34\"))), (Should, TermQuery(Term(field=0, type=Str, \"1\")))] })");
-    }
-
-    #[test]
-    pub fn test_ner() {
-        let mut query_parser = create_query_parser();
-        let mut morphology_configs = HashMap::new();
-        morphology_configs.insert(
-            "en".to_string(),
-            proto::MorphologyConfig {
-                derive_tenses_coefficient: Some(0.3),
-            },
-        );
-        query_parser.query_parser_config.0.morphology_configs = morphology_configs;
-        query_parser.query_parser_config.0.ner_matches_promoter = Some(proto::NerMatchesPromoter {
-            boost: Some(1.3),
-            fields: vec!["title".to_string()],
-        });
-        query_parser.query_parser_config.0.query_language = Some("en".to_string());
-        let query = query_parser.parse_query("london is the capital of Great Britain");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"london\"))), (Should, TermQuery(Term(field=0, type=Str, \"is\"))), (Should, TermQuery(Term(field=0, type=Str, \"the\"))), (Should, TermQuery(Term(field=0, type=Str, \"capital\"))), (Should, TermQuery(Term(field=0, type=Str, \"of\"))), (Should, TermQuery(Term(field=0, type=Str, \"great\"))), (Should, TermQuery(Term(field=0, type=Str, \"britain\")))] })");
     }
 }
