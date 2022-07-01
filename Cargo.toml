@@ -40,7 +40,7 @@ serde_cbor = "0.11"
 serde_json = { version = "1.0" }
 serde_yaml = { version = "0.8" }
 strfmt = "0.2"
-summa-proto = { version = "0.29.0", path = "./summa-proto", default_features = false }
+summa-proto = { version = "0.29.1", path = "./summa-proto", default_features = false }
 take_mut = "0.2"
 tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa", default_features = false, features = ["quickwit", "zstd-compression"] }
 tantivy-common = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa" }
