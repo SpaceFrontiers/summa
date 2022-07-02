@@ -578,6 +578,28 @@ class SummaClient(BaseGrpcClient):
             raise
 
     @expose
+    async def search_documents(
+            self,
+            index_queries: List[dict],
+            tags: Optional[Dict[str, str]] = None,
+            request_id: Optional[str] = None,
+            session_id: Optional[str] = None,
+    ) -> List[dict]:
+        """Send search request and interprets first collector as, thus parse returned documents as json.
+
+        Args:
+            index_queries: index queries
+            tags: extra dict for logging purposes
+            request_id: request id
+            session_id: session id
+        """
+        search_results = await self.search(index_queries=index_queries, tags=tags, request_id=request_id, session_id=session_id)
+        return [
+            json.loads(scored_document.document)
+            for scored_document in search_results.collector_outputs[0].documents.scored_documents
+        ]
+
+    @expose
     async def merge_segments(
             self,
             index_name: str,
