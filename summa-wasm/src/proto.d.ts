@@ -305,9 +305,6 @@ export namespace summa {
 
             /** QueryParserConfig query_language */
             query_language?: (string|null);
-
-            /** QueryParserConfig ner_matches_promoter */
-            ner_matches_promoter?: (summa.proto.INerMatchesPromoter|null);
         }
 
         /** Represents a QueryParserConfig. */
@@ -351,9 +348,6 @@ export namespace summa {
 
             /** QueryParserConfig query_language. */
             public query_language?: (string|null);
-
-            /** QueryParserConfig ner_matches_promoter. */
-            public ner_matches_promoter?: (summa.proto.INerMatchesPromoter|null);
 
             /** QueryParserConfig default_mode. */
             public default_mode?: ("boolean_should_mode"|"disjuction_max_mode");

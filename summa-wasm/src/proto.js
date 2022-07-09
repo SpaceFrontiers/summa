@@ -534,7 +534,6 @@ export const summa = $root.summa = (() => {
              * @property {Array.<string>|null} [removed_fields] QueryParserConfig removed_fields
              * @property {Object.<string,summa.proto.IMorphologyConfig>|null} [morphology_configs] QueryParserConfig morphology_configs
              * @property {string|null} [query_language] QueryParserConfig query_language
-             * @property {summa.proto.INerMatchesPromoter|null} [ner_matches_promoter] QueryParserConfig ner_matches_promoter
              */
 
             /**
@@ -645,14 +644,6 @@ export const summa = $root.summa = (() => {
              * @instance
              */
             QueryParserConfig.prototype.query_language = null;
-
-            /**
-             * QueryParserConfig ner_matches_promoter.
-             * @member {summa.proto.INerMatchesPromoter|null|undefined} ner_matches_promoter
-             * @memberof summa.proto.QueryParserConfig
-             * @instance
-             */
-            QueryParserConfig.prototype.ner_matches_promoter = null;
 
             // OneOf field names bound to virtual getters and setters
             let $oneOfFields;
