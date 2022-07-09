@@ -6,7 +6,7 @@ use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
 use tantivy::schema::Field;
-use tantivy::Searcher;
+use tantivy::{Order, Searcher};
 
 use crate::components::snippet_generator::SnippetGeneratorConfig;
 use crate::components::IndexHolder;
@@ -159,8 +159,8 @@ pub fn build_fruit_extractor(
                 }) => {
                     let top_docs_collector =
                         tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
-                            .order_by_u64_field(field_name);
-                    Box::new(
+                            .order_by_fast_field(field_name, Order::Desc);
+                    Box::<TopDocs<u64>>::new(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))
                             .index_alias(index_alias.to_string())

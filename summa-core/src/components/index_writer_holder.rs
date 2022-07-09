@@ -55,6 +55,24 @@ fn extract_flatten_from_map<T: AsRef<str>>(m: &serde_json::value::Map<String, se
     }
 }
 
+fn cast_to_term(unique_field: &Field, full_path: &str, value: &serde_json::Value) -> Vec<Term> {
+    let mut term = Term::with_capacity(128);
+    let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*unique_field, full_path, true, &mut term);
+    match value {
+        serde_json::Value::Number(n) => {
+            vec![convert_to_fast_value_and_get_term(&mut json_term_writer, &n.to_string()).expect("incorrect json type")]
+        }
+        serde_json::Value::String(s) => {
+            let mut term = Term::with_capacity(128);
+            let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*unique_field, full_path, true, &mut term);
+            json_term_writer.set_str(s);
+            vec![json_term_writer.term().clone()]
+        }
+        serde_json::Value::Array(v) => v.iter().flat_map(|e| cast_to_term(unique_field, full_path, e)).collect(),
+        _ => unreachable!(),
+    }
+}
+
 /// Wrap `tantivy::SingleSegmentIndexWriter` and allows to recreate it
 pub struct SingleIndexWriter {
     pub index_writer: RwLock<SingleSegmentIndexWriter>,
@@ -259,29 +277,16 @@ impl IndexWriterHolder {
             return Ok(None);
         }
 
-        let unique_terms = self
+        let unique_terms: Vec<Term> = self
             .unique_fields
             .iter()
             .filter_map(|(unique_field, full_path)| {
                 document.get_first(*unique_field).and_then(|value| match value {
-                    Value::Str(s) => Some(Ok(Term::from_field_text(*unique_field, s))),
-                    Value::JsonObject(i) => i.get(full_path).map(|value| {
-                        let mut term = Term::with_capacity(128);
-                        let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*unique_field, full_path, true, &mut term);
-                        match value {
-                            serde_json::Value::Number(n) => {
-                                Ok(convert_to_fast_value_and_get_term(&mut json_term_writer, &n.to_string()).expect("incorrect json type"))
-                            }
-                            serde_json::Value::String(s) => {
-                                json_term_writer.set_str(s);
-                                Ok(json_term_writer.term().clone())
-                            }
-                            _ => unreachable!(),
-                        }
-                    }),
-                    Value::I64(i) => Some(Ok(Term::from_field_i64(*unique_field, *i))),
-                    Value::U64(i) => Some(Ok(Term::from_field_u64(*unique_field, *i))),
-                    Value::F64(i) => Some(Ok(Term::from_field_f64(*unique_field, *i))),
+                    Value::Str(s) => Some(Ok(vec![Term::from_field_text(*unique_field, s)])),
+                    Value::JsonObject(i) => i.get(full_path).map(|value| Ok(cast_to_term(unique_field, full_path, value))),
+                    Value::I64(i) => Some(Ok(vec![Term::from_field_i64(*unique_field, *i)])),
+                    Value::U64(i) => Some(Ok(vec![Term::from_field_u64(*unique_field, *i)])),
+                    Value::F64(i) => Some(Ok(vec![Term::from_field_f64(*unique_field, *i)])),
                     _ => {
                         let schema = self.index_writer.index().schema();
                         let field_type = schema.get_field_entry(*unique_field).field_type();
@@ -289,7 +294,10 @@ impl IndexWriterHolder {
                     }
                 })
             })
-            .collect::<SummaResult<Vec<_>>>()?;
+            .collect::<SummaResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         if unique_terms.is_empty() {
             Err(ValidationError::MissingUniqueField(format!(
