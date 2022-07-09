@@ -5,7 +5,7 @@ use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
-use tantivy::schema::Field;
+use tantivy::schema::{Field, FieldType};
 use tantivy::{Order, Searcher};
 
 use crate::components::snippet_generator::SnippetGeneratorConfig;
