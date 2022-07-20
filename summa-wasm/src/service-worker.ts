@@ -65,6 +65,7 @@ async function handle_request(event: FetchEvent) {
   const request = event.request
   let filename = request.url;
   let url = request.url;
+  let is_development = (new URL(request.url)).host == "localhost:5173"
 
   let is_immutable_file = filename.endsWith(".fast") ||
       filename.endsWith(".term") ||
@@ -74,12 +75,14 @@ async function handle_request(event: FetchEvent) {
       filename.endsWith(".idx") ||
       filename.endsWith(".del") ||
       filename.endsWith(".wasm") ||
-      filename.endsWith(".bin") ||
+      filename.endsWith(".bin");
+
+  let is_view_file =
       (filename.endsWith(".json") && !filename.endsWith("meta.json")) ||
       event.request.destination === "image" ||
       event.request.destination === "font" ||
       event.request.destination === "style" ||
-      (event.request.destination === "script" && !request.url.startsWith("chrome-extension"));
+      (event.request.destination === "script" && !request.url.startsWith("chrome-extension"))
 
   let crop_after: boolean = filename.endsWith(".del");
   let range_start = '0'
@@ -101,7 +104,7 @@ async function handle_request(event: FetchEvent) {
     }
   }
 
-  let caching_enabled = is_immutable_file && request.method === "GET";
+  let caching_enabled = (is_immutable_file || (is_view_file && !is_development)) && request.method === "GET";
 
   const cache = await caches.open("cache_v2");
   let response = undefined;

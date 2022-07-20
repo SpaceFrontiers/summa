@@ -6,8 +6,15 @@
     doReload: () => window.location.reload(),
   };
 
-
   const n = navigator;
+  console.info("SW Environment Data:", {
+      'service_worker': n.serviceWorker,
+      'is_secure_context': window.isSecureContext,
+      'cross_origin_isolated': window.crossOriginIsolated,
+      'should_register': coi.shouldRegister()
+  });
+
+
   if (coi.shouldDeregister() && n.serviceWorker && n.serviceWorker.controller) {
     n.serviceWorker.controller.postMessage({ type: "deregister" });
   }
@@ -23,7 +30,7 @@
   // In some environments (e.g. Chrome incognito mode) this won't be available
   if (n.serviceWorker) {
     n.serviceWorker
-      .register("/service-worker.js")
+      .register(window.location.pathname.replace(/\/$/, "") + "/service-worker.js", {scope: window.location.pathname})
       .then(
         (registration) => {
           registration.addEventListener("updatefound", () => {

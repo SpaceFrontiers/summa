@@ -234,7 +234,7 @@ impl IndexHolder {
     #[cfg(feature = "fs")]
     pub async fn create_file_index(index_path: &Path, index_builder: IndexBuilder) -> SummaResult<Index> {
         if index_path.exists() {
-            return Err(crate::errors::ValidationError::ExistingPath(index_path.to_owned()).into());
+            return Err(ValidationError::ExistingPath(index_path.to_owned()).into());
         }
         tokio::fs::create_dir_all(index_path).await?;
         let index = index_builder.create_in_dir(index_path)?;

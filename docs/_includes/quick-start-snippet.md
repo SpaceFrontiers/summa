@@ -29,8 +29,7 @@ docker run izihawa/summa-server:testing generate-config -d /data \
 -a 0.0.0.0:8082 > summa.yaml
 
 # Launch `summa-server`
-docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data \
--p 8082:8082 -p 8080:8080 -p 4444:4444 -p 4445:4445 \
+docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data -p 8082:8082 \
 izihawa/summa-server:testing serve /summa.yaml
 ```
 

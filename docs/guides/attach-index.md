@@ -10,7 +10,7 @@ First, you should set up Summa Server and create a test index using our [Quick-S
 ### Local File Indices
 
 Put downloaded directory with index files to `data/bin/<index_name>` folder and then do
-`summa-cli 0.0.0.0:82 attach-index <index_name> '{"file": {}}'`
+`summa-cli 0.0.0.0:8082 attach-index <index_name> '{"file": {}}'`
 
 ### Remote File Indices
 You may also attach any index available through HTTP:
