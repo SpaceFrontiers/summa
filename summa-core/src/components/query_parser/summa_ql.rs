@@ -757,6 +757,7 @@ mod tests {
 
     use tantivy::schema::{TextOptions, INDEXED, STRING, TEXT};
     use tantivy::tokenizer::{LowerCaser, RemoveLongFilter};
+    use summa_proto::proto;
 
     use super::*;
     use crate::components::SummaTokenizer;

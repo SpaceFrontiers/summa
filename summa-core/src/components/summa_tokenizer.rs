@@ -93,7 +93,6 @@ impl<'a> TokenStream for SummaTokenStream<'a> {
         while let Some((offset_from, c)) = self.current_char_index {
             if c.is_alphanumeric() {
                 let offset_to = if !is_cjk(&c) {
-                    
                     self.move_to_token_end()
                 } else {
                     self.current_char_index = self.chars.next();
@@ -181,6 +180,20 @@ pub mod tests {
         assert_token(&tokens[4], 4, "土", 17, 20);
         assert_token(&tokens[5], 5, "d", 20, 21);
         assert_token(&tokens[6], 6, "动", 21, 24);
+
+        let mut tokens: Vec<Token> = vec![];
+        {
+            let mut add_token = |token: &Token| {
+                tokens.push(token.clone());
+            };
+            tokenizer.token_stream("在查土d动").process(&mut add_token);
+        }
+        assert_eq!(tokens.len(), 5);
+        assert_token(&tokens[0], 0, "在", 0, 3);
+        assert_token(&tokens[1], 1, "查", 3, 6);
+        assert_token(&tokens[2], 2, "土", 6, 9);
+        assert_token(&tokens[3], 3, "d", 9, 10);
+        assert_token(&tokens[4], 4, "动", 10, 13);
     }
 
     #[test]
