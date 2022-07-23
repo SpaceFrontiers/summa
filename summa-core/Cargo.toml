@@ -62,3 +62,4 @@ thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, default_features = false, features = ["macros", "signal-hook-registry", "sync"] }
 tracing = { workspace = true }
+xmlparser = "0.13"

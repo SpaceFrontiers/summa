@@ -11,19 +11,48 @@ pub struct SummaTokenStream<'a> {
     current_char_index: Option<(usize, char)>,
     chars: CharIndices<'a>,
     token: Token,
+
+    base_offset: usize,
 }
 
-impl Tokenizer for SummaTokenizer {
-    type TokenStream<'a> = SummaTokenStream<'a>;
-
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> SummaTokenStream<'a> {
+impl<'a> SummaTokenStream<'a> {
+    pub fn new(text: &'a str) -> SummaTokenStream<'a> {
         let mut chars = text.char_indices();
         SummaTokenStream {
             text,
             current_char_index: chars.next(),
             chars,
             token: Token::default(),
+            base_offset: 0,
         }
+    }
+
+    pub fn new_with_offset_and_position(text: &'a str, offset: usize, position: usize) -> SummaTokenStream<'a> {
+        let mut chars = text.char_indices();
+        let token = Token { position, ..Default::default() };
+        SummaTokenStream {
+            text,
+            current_char_index: chars.next(),
+            chars,
+            token,
+            base_offset: offset,
+        }
+    }
+
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
+
+    pub fn token_mut(&mut self) -> &mut Token {
+        &mut self.token
+    }
+}
+
+impl Tokenizer for SummaTokenizer {
+    type TokenStream<'a> = SummaTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> SummaTokenStream<'a> {
+        SummaTokenStream::new(text)
     }
 }
 
@@ -37,17 +66,23 @@ fn is_cjk(c: &char) -> bool {
 }
 
 impl<'a> SummaTokenStream<'a> {
-    fn search_token_end(&mut self) -> usize {
+    fn move_to_token_end(&mut self) -> usize {
         let cci = &mut self.current_char_index;
-        (&mut self.chars)
+        let c = (&mut self.chars)
             .map(|(offset, c)| {
                 *cci = Some((offset, c));
                 (offset, c)
             })
             .filter(|(_, c)| !(c.is_alphanumeric() || *c == '#' || *c == '+') || is_cjk(c))
             .map(|(offset, _)| offset)
-            .next()
-            .unwrap_or(self.text.len())
+            .next();
+        match c {
+            Some(offset) => offset,
+            None => {
+                *cci = None;
+                self.text.len()
+            }
+        }
     }
 }
 
@@ -58,17 +93,14 @@ impl<'a> TokenStream for SummaTokenStream<'a> {
         while let Some((offset_from, c)) = self.current_char_index {
             if c.is_alphanumeric() {
                 let offset_to = if !is_cjk(&c) {
-                    let offset_to = self.search_token_end();
-                    if !is_cjk(&self.current_char_index.expect("expected char").1) {
-                        self.current_char_index = self.chars.next();
-                    }
-                    offset_to
+                    
+                    self.move_to_token_end()
                 } else {
                     self.current_char_index = self.chars.next();
                     offset_from + c.len_utf8()
                 };
-                self.token.offset_from = offset_from;
-                self.token.offset_to = offset_to;
+                self.token.offset_from = self.base_offset + offset_from;
+                self.token.offset_to = self.base_offset + offset_to;
                 self.token.text.push_str(&self.text[offset_from..offset_to]);
                 return true;
             }

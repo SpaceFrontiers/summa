@@ -10,6 +10,7 @@ mod query_parser;
 mod segment_attributes;
 mod snippet_generator;
 mod summa_document;
+mod summa_html_tokenizer;
 mod summa_tokenizer;
 
 pub use custom_serializer::NamedFieldDocument;
