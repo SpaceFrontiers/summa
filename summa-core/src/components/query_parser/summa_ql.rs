@@ -783,10 +783,7 @@ mod tests {
         let tokenizer_manager = TokenizerManager::default();
         tokenizer_manager.register(
             "summa",
-            TextAnalyzer::builder(Tokenizer)
-                .filter(RemoveLongFilter::limit(100))
-                .filter(LowerCaser)
-                .build(),
+            TextAnalyzer::builder(Tokenizer).filter(RemoveLongFilter::limit(100)).filter(LowerCaser).build(),
         );
         let morphology_manager = MorphologyManager::default();
         let mut schema_builder = Schema::builder();

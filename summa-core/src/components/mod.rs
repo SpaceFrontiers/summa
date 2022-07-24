@@ -81,6 +81,14 @@ pub mod test_utils {
                     .set_index_option(IndexRecordOption::WithFreqsAndPositions),
             ),
         );
+        schema_builder.add_text_field(
+            "concepts",
+            TextOptions::default().set_stored().set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("summa_dict")
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
         schema_builder.build()
     }
 

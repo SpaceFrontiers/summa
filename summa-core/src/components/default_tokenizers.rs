@@ -333,15 +333,7 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 7] {
         .filter(LowerCaser)
         .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
         .build();
-    let mut dict = vec![];
-    for line in include_str!("../../resources/drugs.csv").lines() {
-        let mut l = vec![];
-        for word in line.split(',') {
-            l.push(word.to_string())
-        }
-        dict.push(l);
-    }
-    let summa_dict_tokenizer = TextAnalyzer::builder(DictTokenizer::new(dict)).build();
+    let summa_dict_tokenizer = TextAnalyzer::builder(DictTokenizer::new()).build();
     let summa_html_tokenizer = TextAnalyzer::builder(HtmlTokenizer::new(HashSet::from_iter(
         vec!["formula".to_string(), "figure".to_string(), "math".to_string(), "ref".to_string()].into_iter(),
     )))
@@ -349,10 +341,7 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 7] {
     .filter(LowerCaser)
     .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
     .build();
-    let summa_without_stop_words_tokenizer = TextAnalyzer::builder(Tokenizer)
-        .filter(RemoveLongFilter::limit(100))
-        .filter(LowerCaser)
-        .build();
+    let summa_without_stop_words_tokenizer = TextAnalyzer::builder(Tokenizer).filter(RemoveLongFilter::limit(100)).filter(LowerCaser).build();
     let default_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(100))
         .filter(LowerCaser)

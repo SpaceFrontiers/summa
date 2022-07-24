@@ -10,7 +10,20 @@ pub struct DictTokenizer {
 }
 
 impl DictTokenizer {
-    pub fn new(synsets: Vec<Vec<String>>) -> DictTokenizer {
+    pub fn new() -> DictTokenizer {
+        let mut synsets = vec![];
+        let mut csv_reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(include_bytes!("../../../resources/drugs.csv").as_slice());
+        for record in csv_reader.records() {
+            let mut synset = vec![];
+            for word in record.unwrap().iter() {
+                synset.push(word.to_string())
+            }
+            synsets.push(synset);
+        }
+
         let mut base_offset = 0;
         let mut dict = vec![];
         let words: Vec<String> = synsets
@@ -25,8 +38,13 @@ impl DictTokenizer {
             .ascii_case_insensitive(true)
             .match_kind(MatchKind::LeftmostLongest)
             .build(words.iter());
-        println!("{:?} {:?}", words, dict);
         DictTokenizer { ac, words, dict }
+    }
+}
+
+impl Default for DictTokenizer {
+    fn default() -> Self {
+        DictTokenizer::new()
     }
 }
 
@@ -90,7 +108,7 @@ impl<'a> TokenStream for DictTokenStream<'a> {
 
 #[cfg(test)]
 pub mod tests {
-    use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenizerManager};
+    use tantivy::tokenizer::{TextAnalyzer, Token, TokenizerManager};
 
     use super::DictTokenizer;
 
@@ -104,17 +122,7 @@ pub mod tests {
     #[test]
     fn test_dict_tokenizer() {
         let tokenizer_manager = TokenizerManager::default();
-        let dict = vec![
-            vec!["foxp2".to_string(), "forkhead box p2".to_string(), "cagh44".to_string()],
-            vec!["autism".to_string(), "autism disorder".to_string()],
-        ];
-        tokenizer_manager.register(
-            "tokenizer",
-            TextAnalyzer::builder(DictTokenizer::new(dict))
-                .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser)
-                .build(),
-        );
+        tokenizer_manager.register("tokenizer", TextAnalyzer::builder(DictTokenizer::new()).build());
         let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {

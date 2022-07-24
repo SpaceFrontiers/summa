@@ -29,6 +29,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = "0.4"
 config = { workspace = true }
+csv = "1.2"
 derive_builder = { workspace = true }
 downcast-rs = { workspace = true }
 fasteval2 = { workspace = true }

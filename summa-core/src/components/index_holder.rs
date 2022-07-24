@@ -563,7 +563,7 @@ pub mod tests {
 
     use crate::components::index_holder::register_default_tokenizers;
     use crate::components::test_utils::{create_test_schema, generate_documents};
-    use crate::components::IndexWriterHolder;
+    use crate::components::{IndexHolder, IndexWriterHolder};
     use crate::configs::core::WriterThreads;
 
     #[test]
@@ -704,6 +704,59 @@ pub mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(format!("{:?}", docs), "[\"Envy of the Stars\"]");
+        Ok(())
+    }
+
+    #[test]
+    fn test_dict_tokenizer() -> Result<(), Box<dyn Error>> {
+        let schema = create_test_schema();
+        let title_field = schema.get_field("title").expect("no field");
+        let concepts_field = schema.get_field("concepts").expect("no field");
+        let index = IndexBuilder::new()
+            .schema(schema.clone())
+            .index_attributes(proto::IndexAttributes {
+                mapped_fields: vec![proto::MappedField {
+                    source_field: "title".to_string(),
+                    target_field: "concepts".to_string(),
+                }],
+                ..Default::default()
+            })
+            .create_in_ram()?;
+        register_default_tokenizers(&index);
+        let mut index_writer_holder = IndexWriterHolder::create(
+            &index,
+            WriterThreads::N(12),
+            1024 * 1024 * 1024,
+            Arc::new(tantivy::merge_policy::LogMergePolicy::default()),
+        )?;
+        index_writer_holder.index_document(
+            doc!(
+                title_field => "CAGH44 gene (not CAGH45) can be correlated with autism disorder",
+            ),
+            ConflictStrategy::Merge,
+        )?;
+        index_writer_holder.commit()?;
+        let reader = index.reader()?;
+        reader.reload()?;
+        let searcher = reader.searcher();
+        let docs = searcher
+            .search(
+                &TermQuery::new(Term::from_field_text(concepts_field, "foxp2"), IndexRecordOption::Basic),
+                &TopDocs::with_limit(10),
+            )?
+            .into_iter()
+            .map(|x| {
+                searcher
+                    .doc(x.1)
+                    .unwrap()
+                    .get_first(title_field)
+                    .unwrap()
+                    .as_text()
+                    .map(|x| x.to_string())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(format!("{:?}", docs), "[\"CAGH44 gene (not CAGH45) can be correlated with autism disorder\"]");
         Ok(())
     }
 
