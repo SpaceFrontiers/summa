@@ -563,7 +563,7 @@ pub mod tests {
 
     use crate::components::index_holder::register_default_tokenizers;
     use crate::components::test_utils::{create_test_schema, generate_documents};
-    use crate::components::{IndexHolder, IndexWriterHolder};
+    use crate::components::IndexWriterHolder;
     use crate::configs::core::WriterThreads;
 
     #[test]
@@ -731,7 +731,7 @@ pub mod tests {
         )?;
         index_writer_holder.index_document(
             doc!(
-                title_field => "CAGH44 gene (not CAGH45) can be correlated with autism disorder",
+                title_field => "CAGH44 gene (not CAGH45) can be correlated with autism disorder. Do not try to treat it with aspirin",
             ),
             ConflictStrategy::Merge,
         )?;
@@ -741,7 +741,7 @@ pub mod tests {
         let searcher = reader.searcher();
         let docs = searcher
             .search(
-                &TermQuery::new(Term::from_field_text(concepts_field, "foxp2"), IndexRecordOption::Basic),
+                &TermQuery::new(Term::from_field_text(concepts_field, "acetylsalicylic acid"), IndexRecordOption::Basic),
                 &TopDocs::with_limit(10),
             )?
             .into_iter()
@@ -756,7 +756,7 @@ pub mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(format!("{:?}", docs), "[\"CAGH44 gene (not CAGH45) can be correlated with autism disorder\"]");
+        assert_eq!(format!("{:?}", docs), "[\"CAGH44 gene (not CAGH45) can be correlated with autism disorder. Do not try to treat it with aspirin\"]");
         Ok(())
     }
 
