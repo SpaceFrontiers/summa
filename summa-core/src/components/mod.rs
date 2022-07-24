@@ -10,8 +10,7 @@ mod query_parser;
 mod segment_attributes;
 mod snippet_generator;
 mod summa_document;
-mod summa_html_tokenizer;
-mod summa_tokenizer;
+pub mod tokenizers;
 
 pub use custom_serializer::NamedFieldDocument;
 pub use default_tokenizers::{default_tokenizers, STOP_WORDS};
@@ -22,7 +21,6 @@ pub use index_writer_holder::IndexWriterHolder;
 pub use query_parser::{MorphologyManager, ProtoQueryParser, QueryParser, QueryParserError};
 pub use segment_attributes::SummaSegmentAttributes;
 pub use summa_document::{DocumentParsingError, SummaDocument};
-pub use summa_tokenizer::SummaTokenizer;
 
 pub mod test_utils {
     use std::default::Default;

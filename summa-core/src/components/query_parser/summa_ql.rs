@@ -8,7 +8,6 @@ use base64::Engine;
 use pest::iterators::{Pair, Pairs};
 use pest::Parser;
 use pest_derive::Parser;
-
 use tantivy::query::{BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, PhraseQuery, Query, QueryClone, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{Facet, FacetParseError, Field, FieldEntry, FieldType, IndexRecordOption, Schema, TextFieldIndexing, Type};
 use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
@@ -755,12 +754,12 @@ impl QueryParser {
 mod tests {
     use std::collections::HashMap;
 
+    use summa_proto::proto;
     use tantivy::schema::{TextOptions, INDEXED, STRING, TEXT};
     use tantivy::tokenizer::{LowerCaser, RemoveLongFilter};
-    use summa_proto::proto;
 
     use super::*;
-    use crate::components::SummaTokenizer;
+    use crate::components::tokenizers::Tokenizer;
 
     fn create_query_parser() -> QueryParser {
         let tokenizer_manager = TokenizerManager::default();
@@ -784,7 +783,7 @@ mod tests {
         let tokenizer_manager = TokenizerManager::default();
         tokenizer_manager.register(
             "summa",
-            TextAnalyzer::builder(SummaTokenizer)
+            TextAnalyzer::builder(Tokenizer)
                 .filter(RemoveLongFilter::limit(100))
                 .filter(LowerCaser)
                 .build(),

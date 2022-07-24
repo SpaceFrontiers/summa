@@ -93,7 +93,7 @@ impl Debug for IndexHolder {
 
 /// Sets up standard Summa tokenizers
 ///
-/// The set of tokenizers includes standard Tantivy tokenizers as well as `SummaTokenizer` that supports CJK
+/// The set of tokenizers includes standard Tantivy tokenizers as well as `Tokenizer` that supports CJK
 pub fn register_default_tokenizers(index: &Index) {
     for (tokenizer_name, tokenizer) in &default_tokenizers() {
         index.tokenizers().register(tokenizer_name, tokenizer.clone())

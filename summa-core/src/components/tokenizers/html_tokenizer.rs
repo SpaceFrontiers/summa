@@ -1,47 +1,43 @@
 use std::collections::HashSet;
 
-
-use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
-use tantivy_common::HasLen;
-
-use crate::components::summa_tokenizer::SummaTokenStream;
+use super::tokenizer::TokenStream;
 
 /// Tokenize the text by splitting on whitespaces and punctuation.
 #[derive(Clone)]
-pub struct SummaHtmlTokenizer {
+pub struct HtmlTokenizer {
     ignored_tags: HashSet<String>,
 }
 
-impl SummaHtmlTokenizer {
-    pub fn new(ignored_tags: HashSet<String>) -> SummaHtmlTokenizer {
-        SummaHtmlTokenizer { ignored_tags }
+impl HtmlTokenizer {
+    pub fn new(ignored_tags: HashSet<String>) -> HtmlTokenizer {
+        HtmlTokenizer { ignored_tags }
     }
 }
 
-pub struct SummaHtmlTokenStream<'a> {
+pub struct HtmlTokenStream<'a> {
     text: &'a str,
     html_tokenizer: xmlparser::Tokenizer<'a>,
-    current_nested_token_stream: SummaTokenStream<'a>,
+    current_nested_token_stream: TokenStream<'a>,
     ignored_tags: &'a HashSet<String>,
     position: usize,
 }
 
-impl Tokenizer for SummaHtmlTokenizer {
-    type TokenStream<'a> = SummaHtmlTokenStream<'a>;
+impl tantivy::tokenizer::Tokenizer for HtmlTokenizer {
+    type TokenStream<'a> = HtmlTokenStream<'a>;
 
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> SummaHtmlTokenStream<'a> {
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> HtmlTokenStream<'a> {
         let html_tokenizer = xmlparser::Tokenizer::from_fragment(text, 0..text.len());
-        SummaHtmlTokenStream {
+        HtmlTokenStream {
             text,
             html_tokenizer,
-            current_nested_token_stream: SummaTokenStream::new(""),
+            current_nested_token_stream: TokenStream::new(""),
             ignored_tags: &self.ignored_tags,
             position: usize::MAX,
         }
     }
 }
 
-impl<'a> TokenStream for SummaHtmlTokenStream<'a> {
+impl<'a> tantivy::tokenizer::TokenStream for HtmlTokenStream<'a> {
     fn advance(&mut self) -> bool {
         loop {
             if self.current_nested_token_stream.advance() {
@@ -75,7 +71,7 @@ impl<'a> TokenStream for SummaHtmlTokenStream<'a> {
                         }
                         xmlparser::Token::Text { text } => {
                             self.current_nested_token_stream =
-                                SummaTokenStream::new_with_offset_and_position(&self.text[text.start()..text.end()], text.start(), self.position);
+                                TokenStream::new_with_offset_and_position(&self.text[text.start()..text.end()], text.start(), self.position);
                             break;
                         }
                         _ => {}
@@ -87,11 +83,11 @@ impl<'a> TokenStream for SummaHtmlTokenStream<'a> {
         }
     }
 
-    fn token(&self) -> &Token {
+    fn token(&self) -> &tantivy::tokenizer::Token {
         self.current_nested_token_stream.token()
     }
 
-    fn token_mut(&mut self) -> &mut Token {
+    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
         self.current_nested_token_stream.token_mut()
     }
 }
@@ -100,12 +96,11 @@ impl<'a> TokenStream for SummaHtmlTokenStream<'a> {
 pub mod tests {
     use std::collections::HashSet;
 
-    use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenizerManager};
+    use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenizerManager};
 
-    use crate::components::summa_html_tokenizer::SummaHtmlTokenizer;
-    use crate::components::SummaTokenizer;
+    use super::HtmlTokenizer;
 
-    pub fn assert_token(token: &Token, position: usize, text: &str, from: usize, to: usize) {
+    pub fn assert_token(token: &tantivy::tokenizer::Token, position: usize, text: &str, from: usize, to: usize) {
         assert_eq!(token.position, position, "expected position {} but {:?}", position, token);
         assert_eq!(token.text, text, "expected text {} but {:?}", text, token);
         assert_eq!(token.offset_from, from, "expected offset_from {} but {:?}", from, token);
@@ -117,15 +112,15 @@ pub mod tests {
         let tokenizer_manager = TokenizerManager::default();
         tokenizer_manager.register(
             "tokenizer",
-            TextAnalyzer::builder(SummaHtmlTokenizer::new(HashSet::from_iter(vec!["formula".to_string()].into_iter())))
+            TextAnalyzer::builder(HtmlTokenizer::new(HashSet::from_iter(vec!["formula".to_string()].into_iter())))
                 .filter(RemoveLongFilter::limit(40))
                 .filter(LowerCaser)
                 .build(),
         );
         let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
-        let mut tokens: Vec<Token> = vec![];
+        let mut tokens: Vec<tantivy::tokenizer::Token> = vec![];
         {
-            let mut add_token = |token: &Token| {
+            let mut add_token = |token: &tantivy::tokenizer::Token| {
                 tokens.push(token.clone());
             };
             tokenizer.token_stream("Hello, world!").process(&mut add_token);
@@ -136,9 +131,9 @@ pub mod tests {
         assert_token(&tokens[1], 1, "world", 7, 12);
 
         let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
-        let mut tokens: Vec<Token> = vec![];
+        let mut tokens: Vec<tantivy::tokenizer::Token> = vec![];
         {
-            let mut add_token = |token: &Token| {
+            let mut add_token = |token: &tantivy::tokenizer::Token| {
                 tokens.push(token.clone());
             };
             tokenizer.token_stream("<article>test1 <t2>test2 TEST3</t2></article>").process(&mut add_token);
@@ -150,9 +145,9 @@ pub mod tests {
         assert_token(&tokens[2], 2, "test3", 25, 30);
 
         let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
-        let mut tokens: Vec<Token> = vec![];
+        let mut tokens: Vec<tantivy::tokenizer::Token> = vec![];
         {
-            let mut add_token = |token: &Token| {
+            let mut add_token = |token: &tantivy::tokenizer::Token| {
                 tokens.push(token.clone());
             };
             tokenizer
@@ -164,9 +159,9 @@ pub mod tests {
         assert_eq!(format!("{:?}", tokens), "[Token { offset_from: 9, offset_to: 14, position: 0, text: \"test1\", position_length: 1 }, Token { offset_from: 15, offset_to: 20, position: 1, text: \"test2\", position_length: 1 }, Token { offset_from: 23, offset_to: 27, position: 2, text: \"link\", position_length: 1 }, Token { offset_from: 28, offset_to: 33, position: 3, text: \"link2\", position_length: 1 }, Token { offset_from: 64, offset_to: 69, position: 4, text: \"link3\", position_length: 1 }, Token { offset_from: 70, offset_to: 75, position: 5, text: \"link4\", position_length: 1 }]");
 
         let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();
-        let mut tokens: Vec<Token> = vec![];
+        let mut tokens: Vec<tantivy::tokenizer::Token> = vec![];
         {
-            let mut add_token = |token: &Token| {
+            let mut add_token = |token: &tantivy::tokenizer::Token| {
                 tokens.push(token.clone());
             };
             tokenizer
