@@ -756,7 +756,10 @@ pub mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(format!("{:?}", docs), "[\"CAGH44 gene (not CAGH45) can be correlated with autism disorder. Do not try to treat it with aspirin\"]");
+        assert_eq!(
+            format!("{:?}", docs),
+            "[\"CAGH44 gene (not CAGH45) can be correlated with autism disorder. Do not try to treat it with aspirin\"]"
+        );
         Ok(())
     }
 

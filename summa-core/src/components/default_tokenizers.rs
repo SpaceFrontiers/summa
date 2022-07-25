@@ -334,9 +334,21 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 7] {
         .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
         .build();
     let summa_dict_tokenizer = TextAnalyzer::builder(DictTokenizer::new()).build();
-    let summa_html_tokenizer = TextAnalyzer::builder(HtmlTokenizer::new(HashSet::from_iter(
-        vec!["formula".to_string(), "figure".to_string(), "math".to_string(), "ref".to_string()].into_iter(),
-    )))
+    let summa_html_tokenizer = TextAnalyzer::builder(HtmlTokenizer::new(
+        HashSet::from_iter(vec!["formula".to_string(), "figure".to_string(), "math".to_string(), "ref".to_string()].into_iter()),
+        HashSet::from_iter(
+            vec![
+                "sup".to_string(),
+                "sub".to_string(),
+                "i".to_string(),
+                "b".to_string(),
+                "u".to_string(),
+                "scp".to_string(),
+                "tt".to_string(),
+            ]
+            .into_iter(),
+        ),
+    ))
     .filter(RemoveLongFilter::limit(100))
     .filter(LowerCaser)
     .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))

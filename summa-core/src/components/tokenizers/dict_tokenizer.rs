@@ -18,7 +18,7 @@ impl DictTokenizer {
             .from_reader(include_bytes!("../../../resources/drugs.csv").as_slice());
         for record in csv_reader.records() {
             let mut synset = vec![];
-            for word in record.unwrap().iter() {
+            for word in record.expect("dictionary is broken").iter() {
                 synset.push(word.to_string())
             }
             synsets.push(synset);
