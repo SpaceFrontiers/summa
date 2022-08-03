@@ -810,13 +810,18 @@ mod tests {
 
     #[test]
     pub fn test_parser_base() {
-        let query_parser = create_query_parser();
+        let query_parser = create_complex_query_parser();
         let query = query_parser.parse_query("search engine");
-        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=0, type=Str, \"engine\")))] })");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"search\"))), (Should, TermQuery(Term(field=1, type=Str, \"search\"))), (Should, TermQuery(Term(field=0, type=Str, \"engine\"))), (Should, TermQuery(Term(field=1, type=Str, \"engine\")))] })");
         let query = query_parser.parse_query("'search engine'");
         assert_eq!(
             format!("{:?}", query),
-            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"search\")), (1, Term(field=0, type=Str, \"engine\"))], slop: 0 })"
+            "Ok(BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"search\")), (1, Term(field=0, type=Str, \"engine\"))], slop: 0 }), (Should, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"search\")), (1, Term(field=1, type=Str, \"engine\"))], slop: 0 })] })"
+        );
+        let query = query_parser.parse_query("+'I sette messaggeri'");
+        assert_eq!(
+            format!("{:?}", query),
+            "Ok(BooleanQuery { subqueries: [(Must, BooleanQuery { subqueries: [(Should, PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"i\")), (1, Term(field=0, type=Str, \"sette\")), (2, Term(field=0, type=Str, \"messaggeri\"))], slop: 0 }), (Should, PhraseQuery { field: Field(1), phrase_terms: [(0, Term(field=1, type=Str, \"i\")), (1, Term(field=1, type=Str, \"sette\")), (2, Term(field=1, type=Str, \"messaggeri\"))], slop: 0 })] })] })"
         );
     }
 
