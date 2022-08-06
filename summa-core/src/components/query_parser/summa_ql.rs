@@ -634,7 +634,13 @@ impl QueryParser {
                         match self.schema.find_field(resolved_field_name) {
                             Some((field, full_path)) => self.parse_term(grouping_or_term, &field, full_path, statement_boost),
                             None => {
-                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == field_name.as_str()) {
+                                if self
+                                    .query_parser_config
+                                    .0
+                                    .removed_fields
+                                    .iter()
+                                    .any(|x| x == field_name.as_str() || Some(x.as_str()) == field_name.as_str().split(".").next())
+                                {
                                     Ok(Box::new(EmptyQuery {}) as Box<dyn Query>)
                                 } else {
                                     Ok(Box::new(BooleanQuery::new(vec![
