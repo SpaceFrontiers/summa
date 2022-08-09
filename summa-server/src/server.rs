@@ -14,8 +14,8 @@ use crate::logging;
 #[cfg(feature = "metrics")]
 use crate::services::Metrics;
 use crate::services::{Api, Index};
+use crate::utils::signal_channel;
 use crate::utils::thread_handler::ControlMessage;
-use crate::utils::{increase_fd_limit, signal_channel};
 
 pub struct Server {
     server_config_holder: Arc<dyn ConfigProxy<crate::configs::server::Config>>,
@@ -96,7 +96,7 @@ impl Server {
 
     pub async fn serve(&self, terminator: Receiver<ControlMessage>) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         #[cfg(unix)]
-        match increase_fd_limit() {
+        match crate::utils::increase_fd_limit() {
             Ok(soft) => tracing::debug!("NOFILE limit: soft = {}", soft),
             Err(err) => tracing::error!("Error increasing NOFILE limit: {}", err),
         }

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_broadcast::{broadcast, Receiver};
 use tokio::net::TcpStream;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::ctrl_c;
 use tokio::task;
 use tracing::error;
 
@@ -15,12 +15,18 @@ pub use crate::utils::thread_handler::{ControlMessage, ThreadHandler};
 /// Spawns a thread for processing `SignalKind` and returns `oneshot::Receiver` for a signal event
 pub fn signal_channel() -> SummaServerResult<Receiver<ControlMessage>> {
     let (sender, receiver) = broadcast::<ControlMessage>(1);
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut ctrl_c_sig = ctrl_c();
     task::spawn(async move {
+        #[cfg(unix)]
         tokio::select! {
-            _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
+            _ = ctrl_c_sig => {}
+        }
+        #[cfg(windows)]
+        tokio::select! {
+            _ = ctrl_c_sig => {}
         }
         if let Err(error) = sender.broadcast(ControlMessage::Shutdown).await {
             error!(action = "signal_channel_termination", error = ?error)
