@@ -1,10 +1,12 @@
 ---
 # yamllint disable rule:key-ordering
-index_name: books
+blocksize: 131072
 compression: Zstd
+index_name: books
 index_attributes:
+  conflict_strategy: OVERWRITE_ALWAYS
+  description: Wiki
   multi_fields: ["category"]
-  default_fields: ["opening_text", "title", "text"]
 index_engine:
   file: {}
 schema: >

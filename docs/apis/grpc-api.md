@@ -17,6 +17,10 @@ parent: APIs
     - [GetConsumersRequest](#summa-proto-GetConsumersRequest)
     - [GetConsumersResponse](#summa-proto-GetConsumersResponse)
   
+- [dag_pb.proto](#dag_pb-proto)
+    - [PBLink](#dag_pb-PBLink)
+    - [PBNode](#dag_pb-PBNode)
+  
 - [index_service.proto](#index_service-proto)
     - [IndexApi](#summa-proto-IndexApi)
   
@@ -59,6 +63,7 @@ parent: APIs
     - [IndexEngineConfig](#summa-proto-IndexEngineConfig)
     - [IndexOperation](#summa-proto-IndexOperation)
     - [LogMergePolicy](#summa-proto-LogMergePolicy)
+    - [MappedField](#summa-proto-MappedField)
     - [MemoryEngineConfig](#summa-proto-MemoryEngineConfig)
     - [MergePolicy](#summa-proto-MergePolicy)
     - [MergeSegmentsRequest](#summa-proto-MergeSegmentsRequest)
@@ -114,14 +119,20 @@ parent: APIs
     - [HistogramResult](#summa-proto-HistogramResult)
     - [Key](#summa-proto-Key)
     - [MatchQuery](#summa-proto-MatchQuery)
-    - [MatchQuery.FieldBoostsEntry](#summa-proto-MatchQuery-FieldBoostsEntry)
     - [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode)
     - [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode)
     - [MetricAggregation](#summa-proto-MetricAggregation)
     - [MetricResult](#summa-proto-MetricResult)
     - [MoreLikeThisQuery](#summa-proto-MoreLikeThisQuery)
+    - [MorphologyConfig](#summa-proto-MorphologyConfig)
+    - [NerMatchesPromoter](#summa-proto-NerMatchesPromoter)
     - [PhraseQuery](#summa-proto-PhraseQuery)
     - [Query](#summa-proto-Query)
+    - [QueryParserConfig](#summa-proto-QueryParserConfig)
+    - [QueryParserConfig.FieldAliasesEntry](#summa-proto-QueryParserConfig-FieldAliasesEntry)
+    - [QueryParserConfig.FieldBoostsEntry](#summa-proto-QueryParserConfig-FieldBoostsEntry)
+    - [QueryParserConfig.MorphologyConfigsEntry](#summa-proto-QueryParserConfig-MorphologyConfigsEntry)
+    - [QueryParserConfig.TermFieldMapperConfigsEntry](#summa-proto-QueryParserConfig-TermFieldMapperConfigsEntry)
     - [RandomDocument](#summa-proto-RandomDocument)
     - [Range](#summa-proto-Range)
     - [RangeAggregation](#summa-proto-RangeAggregation)
@@ -142,6 +153,7 @@ parent: APIs
     - [Snippet](#summa-proto-Snippet)
     - [StatsAggregation](#summa-proto-StatsAggregation)
     - [StatsResult](#summa-proto-StatsResult)
+    - [TermFieldMapperConfig](#summa-proto-TermFieldMapperConfig)
     - [TermQuery](#summa-proto-TermQuery)
     - [TermsAggregation](#summa-proto-TermsAggregation)
     - [TermsResult](#summa-proto-TermsResult)
@@ -165,6 +177,12 @@ parent: APIs
     - [IndexQuery](#summa-proto-IndexQuery)
     - [SearchRequest](#summa-proto-SearchRequest)
     - [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry)
+  
+- [unixfs.proto](#unixfs-proto)
+    - [Data](#unixfs-Data)
+    - [Metadata](#unixfs-Metadata)
+  
+    - [Data.DataType](#unixfs-Data-DataType)
   
 - [utils.proto](#utils-proto)
     - [Empty](#summa-proto-Empty)
@@ -338,6 +356,54 @@ Manage ingestion data from Kafka
 
 
 
+<a name="dag_pb-proto"></a>
+
+## dag_pb.proto
+
+
+
+<a name="dag_pb-PBLink"></a>
+
+### PBLink
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| hash | [bytes](#bytes) | optional | binary CID (with no multibase prefix) of the target object |
+| name | [string](#string) | optional | UTF-8 string name |
+| t_size | [uint64](#uint64) | optional | cumulative size of target object |
+
+
+
+
+
+
+<a name="dag_pb-PBNode"></a>
+
+### PBNode
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| links | [PBLink](#dag_pb-PBLink) | repeated | refs to other objects |
+| data | [bytes](#bytes) | optional | opaque user data |
+
+
+
+
+
+ <!-- end messages -->
+
+ <!-- end enums -->
+
+ <!-- end HasExtensions -->
+
+ <!-- end services -->
+
+
+
 <a name="index_service-proto"></a>
 
 ## index_service.proto
@@ -366,6 +432,7 @@ Attach index request
 | file | [AttachFileEngineRequest](#summa-proto-AttachFileEngineRequest) |  |  |
 | remote | [AttachRemoteEngineRequest](#summa-proto-AttachRemoteEngineRequest) |  |  |
 | merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  |  |
+| query_parser_config | [QueryParserConfig](#summa-proto-QueryParserConfig) |  |  |
 
 
 
@@ -457,6 +524,7 @@ Copy documents from one index to another. Their schemes must be compatible
 | ----- | ---- | ----- | ----------- |
 | source_index_name | [string](#string) |  | Where documents should be taken from |
 | target_index_name | [string](#string) |  | Where documents should be copied to |
+| conflict_strategy | [ConflictStrategy](#summa-proto-ConflictStrategy) | optional | How to deal with conflicts on unique fields. Recommended to set to DoNothing for large updates and maintain uniqueness in your application |
 
 
 
@@ -540,6 +608,7 @@ Request for index creation
 | sort_by_field | [SortByField](#summa-proto-SortByField) | optional | Field for sorting |
 | index_attributes | [IndexAttributes](#summa-proto-IndexAttributes) |  | Optional index fields |
 | merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  | Merge policy |
+| query_parser_config | [QueryParserConfig](#summa-proto-QueryParserConfig) |  |  |
 
 
 
@@ -784,12 +853,10 @@ Single document from the index
 | ----- | ---- | ----- | ----------- |
 | created_at | [uint64](#uint64) |  | Timestamp when index has been created |
 | unique_fields | [string](#string) | repeated | Unique fields of the index. Summa maintains unique constraint on them and uses for deduplicating data |
-| default_fields | [string](#string) | repeated | Default fields that are using in `MatchQuery` |
 | multi_fields | [string](#string) | repeated | Multi fields is ones that may have multiple values and processed as lists. All other fields will be forcefully converted to singular value |
-| default_index_name | [string](#string) | optional | Descriptive field that may be used as name for index when indices are replicating over wire |
 | description | [string](#string) | optional | Text index description |
-| default_snippets | [string](#string) | repeated | (Not-used) |
 | conflict_strategy | [ConflictStrategy](#summa-proto-ConflictStrategy) |  |  |
+| mapped_fields | [MappedField](#summa-proto-MappedField) | repeated |  |
 
 
 
@@ -867,6 +934,7 @@ Indexing operations that contains document serialized in JSON format
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
 | documents | [bytes](#bytes) | repeated |  |
+| conflict_strategy | [ConflictStrategy](#summa-proto-ConflictStrategy) | optional |  |
 
 
 
@@ -902,6 +970,7 @@ Description of the `IndexEngine` responsible for managing files in the persisten
 | memory | [MemoryEngineConfig](#summa-proto-MemoryEngineConfig) |  |  |
 | remote | [RemoteEngineConfig](#summa-proto-RemoteEngineConfig) |  |  |
 | merge_policy | [MergePolicy](#summa-proto-MergePolicy) |  | Merge policy |
+| query_parser_config | [QueryParserConfig](#summa-proto-QueryParserConfig) |  |  |
 
 
 
@@ -932,6 +1001,22 @@ Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/ta
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | is_frozen | [bool](#bool) |  | Set if once merged segment should be left intact |
+
+
+
+
+
+
+<a name="summa-proto-MappedField"></a>
+
+### MappedField
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| source_field | [string](#string) |  |  |
+| target_field | [string](#string) |  |  |
 
 
 
@@ -1632,6 +1717,7 @@ Collectors and CollectorOutputs
 | ----- | ---- | ----- | ----------- |
 | slop | [uint32](#uint32) |  |  |
 | boost | [float](#float) | optional |  |
+| fields | [string](#string) | repeated |  |
 
 
 
@@ -1792,27 +1878,7 @@ Collectors and CollectorOutputs
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | value | [string](#string) |  |  |
-| default_fields | [string](#string) | repeated |  |
-| boolean_should_mode | [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode) |  |  |
-| disjuction_max_mode | [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode) |  |  |
-| field_boosts | [MatchQuery.FieldBoostsEntry](#summa-proto-MatchQuery-FieldBoostsEntry) | repeated |  |
-| exact_matches_promoter | [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-MatchQuery-FieldBoostsEntry"></a>
-
-### MatchQuery.FieldBoostsEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [string](#string) |  |  |
-| value | [float](#float) |  |  |
+| query_parser_config | [QueryParserConfig](#summa-proto-QueryParserConfig) | optional |  |
 
 
 
@@ -1899,6 +1965,37 @@ Collectors and CollectorOutputs
 
 
 
+<a name="summa-proto-MorphologyConfig"></a>
+
+### MorphologyConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| derive_tenses_coefficient | [float](#float) | optional |  |
+
+
+
+
+
+
+<a name="summa-proto-NerMatchesPromoter"></a>
+
+### NerMatchesPromoter
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| boost | [float](#float) | optional |  |
+| fields | [string](#string) | repeated |  |
+
+
+
+
+
+
 <a name="summa-proto-PhraseQuery"></a>
 
 ### PhraseQuery
@@ -1936,6 +2033,95 @@ Recursive query DSL
 | disjunction_max | [DisjunctionMaxQuery](#summa-proto-DisjunctionMaxQuery) |  |  |
 | empty | [EmptyQuery](#summa-proto-EmptyQuery) |  |  |
 | exists | [ExistsQuery](#summa-proto-ExistsQuery) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-QueryParserConfig"></a>
+
+### QueryParserConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| field_aliases | [QueryParserConfig.FieldAliasesEntry](#summa-proto-QueryParserConfig-FieldAliasesEntry) | repeated |  |
+| field_boosts | [QueryParserConfig.FieldBoostsEntry](#summa-proto-QueryParserConfig-FieldBoostsEntry) | repeated |  |
+| term_field_mapper_configs | [QueryParserConfig.TermFieldMapperConfigsEntry](#summa-proto-QueryParserConfig-TermFieldMapperConfigsEntry) | repeated |  |
+| term_limit | [uint32](#uint32) |  |  |
+| default_fields | [string](#string) | repeated |  |
+| boolean_should_mode | [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode) |  |  |
+| disjuction_max_mode | [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode) |  |  |
+| exact_matches_promoter | [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter) |  |  |
+| removed_fields | [string](#string) | repeated |  |
+| morphology_configs | [QueryParserConfig.MorphologyConfigsEntry](#summa-proto-QueryParserConfig-MorphologyConfigsEntry) | repeated |  |
+| query_language | [string](#string) | optional |  |
+
+
+
+
+
+
+<a name="summa-proto-QueryParserConfig-FieldAliasesEntry"></a>
+
+### QueryParserConfig.FieldAliasesEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-QueryParserConfig-FieldBoostsEntry"></a>
+
+### QueryParserConfig.FieldBoostsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [float](#float) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-QueryParserConfig-MorphologyConfigsEntry"></a>
+
+### QueryParserConfig.MorphologyConfigsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [MorphologyConfig](#summa-proto-MorphologyConfig) |  |  |
+
+
+
+
+
+
+<a name="summa-proto-QueryParserConfig-TermFieldMapperConfigsEntry"></a>
+
+### QueryParserConfig.TermFieldMapperConfigsEntry
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| key | [string](#string) |  |  |
+| value | [TermFieldMapperConfig](#summa-proto-TermFieldMapperConfig) |  |  |
 
 
 
@@ -2272,6 +2458,21 @@ Recursive query DSL
 
 
 
+<a name="summa-proto-TermFieldMapperConfig"></a>
+
+### TermFieldMapperConfig
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| fields | [string](#string) | repeated |  |
+
+
+
+
+
+
 <a name="summa-proto-TermQuery"></a>
 
 ### TermQuery
@@ -2558,6 +2759,72 @@ Searches documents in the stored indices
 | Method Name | Request Type | Response Type | Description |
 | ----------- | ------------ | ------------- | ------------|
 | search | [SearchRequest](#summa-proto-SearchRequest) | [SearchResponse](#summa-proto-SearchResponse) | Make search in Summa |
+
+ <!-- end services -->
+
+
+
+<a name="unixfs-proto"></a>
+
+## unixfs.proto
+
+
+
+<a name="unixfs-Data"></a>
+
+### Data
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| type | [Data.DataType](#unixfs-Data-DataType) |  |  |
+| data | [bytes](#bytes) | optional |  |
+| filesize | [uint64](#uint64) | optional |  |
+| blocksizes | [uint64](#uint64) | repeated |  |
+| hashType | [uint64](#uint64) | optional |  |
+| fanout | [uint64](#uint64) | optional |  |
+
+
+
+
+
+
+<a name="unixfs-Metadata"></a>
+
+### Metadata
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| MimeType | [string](#string) | optional |  |
+
+
+
+
+
+ <!-- end messages -->
+
+
+<a name="unixfs-Data-DataType"></a>
+
+### Data.DataType
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| Raw | 0 |  |
+| Directory | 1 |  |
+| File | 2 |  |
+| Metadata | 3 |  |
+| Symlink | 4 |  |
+| HAMTShard | 5 |  |
+
+
+ <!-- end enums -->
+
+ <!-- end HasExtensions -->
 
  <!-- end services -->
 

@@ -17,7 +17,7 @@ pub fn signal_channel() -> SummaServerResult<Receiver<ControlMessage>> {
     let (sender, receiver) = broadcast::<ControlMessage>(1);
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut ctrl_c_sig = ctrl_c();
+    let ctrl_c_sig = ctrl_c();
     task::spawn(async move {
         #[cfg(unix)]
         tokio::select! {
