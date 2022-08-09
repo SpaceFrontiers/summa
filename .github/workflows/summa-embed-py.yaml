@@ -36,30 +36,30 @@ jobs:
           name: wheels
           path: dist
 
-  # windows:
-  #   runs-on: windows-latest
-  #   strategy:
-  #     matrix:
-  #       package: ["summa-embed-py", "ipfs-hamt-directory-py"]
-  #       python-version: ['3.10', '3.11']
-  #       target: [x64, x86]
-  #   steps:
-  #     - uses: actions/checkout@v3
-  #     - uses: actions/setup-python@v4
-  #       with:
-  #         python-version: ${{ matrix.python-version }}
-  #         architecture: ${{ matrix.target }}
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - name: Build wheels
-  #       uses: PyO3/maturin-action@v1
-  #       with:
-  #         target: ${{ matrix.target }}
-  #         args: --release --out dist -m ${{ matrix.package }}/Cargo.toml
-  #     - name: Upload wheels
-  #       uses: actions/upload-artifact@v3
-  #       with:
-  #         name: wheels
-  #         path: dist
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        package: ["summa-embed-py", "ipfs-hamt-directory-py"]
+        python-version: ['3.10', '3.11']
+        target: [x64, x86]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -m ${{ matrix.package }}/Cargo.toml
+      - name: Upload wheels
+        uses: actions/upload-artifact@v3
+        with:
+          name: wheels
+          path: dist
 
   linux:
     runs-on: ubuntu-latest
@@ -113,8 +113,8 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    # needs: [ macos, windows, linux, linux-cross ]
-    needs: [ macos, linux, linux-cross ]
+    needs: [ macos, windows, linux, linux-cross ]
+    # needs: [ macos, linux, linux-cross ]
     steps:
       - uses: actions/download-artifact@v3
         with:

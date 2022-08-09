@@ -59,21 +59,6 @@ pub fn process_dynamic_fields(schema: &Schema, json_object: &mut serde_json::Map
     if schema.get_field("updated_at").is_ok() {
         json_object.insert("updated_at".to_string(), json!(current_time()));
     }
-    if schema.get_field("custom_score").is_ok() && !json_object.contains_key("custom_score") {
-        match json_object.get("type") {
-            Some(serde_json::value::Value::String(s)) => {
-                if s == "book-chapter" {
-                    json_object.insert("custom_score".to_string(), json!(0.85))
-                } else {
-                    json_object.insert("custom_score".to_string(), json!(1.0))
-                }
-            }
-            _ => json_object.insert("custom_score".to_string(), json!(1.0)),
-        };
-    }
-    if schema.get_field("links").is_ok() && schema.get_field("ctr").is_ok() && !json_object.contains_key("ctr") {
-        json_object.insert("ctr".to_string(), json!(0.1));
-    }
 }
 
 impl<'a> SummaDocument<'a> {
