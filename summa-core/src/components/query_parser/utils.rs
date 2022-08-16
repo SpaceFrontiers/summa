@@ -5,7 +5,7 @@ use prost::encoding::bool;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::schema::{Field, FieldType};
 use tantivy::Term;
-use tantivy_common::DateTime;
+use tantivy_common::{DateTime, HasLen};
 
 use crate::errors::SummaResult;
 use crate::Error;
@@ -16,7 +16,11 @@ pub fn cast_field_to_term(field: &Field, full_path: &str, field_type: &FieldType
         FieldType::JsonObject(ref json_options) => {
             let mut term = Term::with_capacity(128);
             let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*field, full_path, json_options.is_expand_dots_enabled(), &mut term);
-            if force_str {
+            let is_quoted = value.len() >= 2 && value.starts_with('\"') && value.ends_with('\"');
+            if is_quoted {
+                json_term_writer.set_str(&value[1..value.len() - 1]);
+                json_term_writer.term().clone()
+            } else if force_str {
                 json_term_writer.set_str(value);
                 json_term_writer.term().clone()
             } else {

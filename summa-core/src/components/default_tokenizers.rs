@@ -5,7 +5,7 @@ use tantivy::tokenizer::{LowerCaser, RawTokenizer, RemoveLongFilter, SimpleToken
 use super::tokenizers::{DictTokenizer, HtmlTokenizer, Tokenizer};
 
 /// List of stop words mixed for multiple languages
-pub const STOP_WORDS: [&str; 318] = [
+pub const STOP_WORDS: [&str; 321] = [
     "a",
     "an",
     "and",
@@ -324,6 +324,9 @@ pub const STOP_WORDS: [&str; 318] = [
     "o",
     "este",
     "sí",
+    "lt",
+    "gt",
+    "amp",
 ];
 
 /// Instantiate default tokenizers
