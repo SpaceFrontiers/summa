@@ -1078,6 +1078,15 @@ mod tests {
     }
 
     #[test]
+    pub fn test_quotes() {
+        let query_parser = create_query_parser();
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("Don't duck with my family")),
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"don\"))), (Should, TermQuery(Term(field=0, type=Str, \"t\"))), (Should, TermQuery(Term(field=0, type=Str, \"duck\"))), (Should, TermQuery(Term(field=0, type=Str, \"with\"))), (Should, TermQuery(Term(field=0, type=Str, \"my\"))), (Should, TermQuery(Term(field=0, type=Str, \"family\")))] })"
+        );
+    }
+
+    #[test]
     pub fn test_parser_boostings() {
         let query_parser = create_query_parser();
         let query = query_parser.parse_query("search^2.0");
