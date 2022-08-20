@@ -17,7 +17,7 @@ field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_" | ".")* }
 word = @{ wrapped_doi | ((LETTER | NUMBER) ~ (LETTER | NUMBER | "_" | "+" | "#" | "-" | "–" | "'")*) }
 
 boundary_word = _{ star | word }
-phrase_internals = { (!quote ~ ANY)* }
+phrase_internals = { (!PEEK ~ ANY)* }
 phrase = ${ PUSH(quote) ~ phrase_internals? ~ (POP | EOI) ~ ("~" ~ slop)? }
 regex_internals = ${ (!PEEK ~ ANY)* }
 regex = ${ PUSH("/"+) ~ regex_internals ~ POP }
