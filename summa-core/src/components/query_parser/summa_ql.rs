@@ -1086,7 +1086,7 @@ mod tests {
         );
         assert_eq!(
             format!("{:?}", query_parser.parse_query("\"I Don't Want to be Me\"")),
-            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"i\")), (1, Term(field=0, type=Str, \"don\")), (2, Term(field=0, type=Str, \"t\")), (3, Term(field=0, type=Str, \"want\")), (4, Term(field=0, type=Str, \"to\")), (5, Term(field=0, type=Str, \"be\")), (6, Term(field=0, type=Str, \"me\"))], slop: 0 })""
+            "Ok(PhraseQuery { field: Field(0), phrase_terms: [(0, Term(field=0, type=Str, \"i\")), (1, Term(field=0, type=Str, \"don\")), (2, Term(field=0, type=Str, \"t\")), (3, Term(field=0, type=Str, \"want\")), (4, Term(field=0, type=Str, \"to\")), (5, Term(field=0, type=Str, \"be\")), (6, Term(field=0, type=Str, \"me\"))], slop: 0 })"
         );
     }
 
