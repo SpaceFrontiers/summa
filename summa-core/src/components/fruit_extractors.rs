@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use rustc_hash::FxHashMap;
 use summa_proto::proto;
 use tantivy::aggregation::agg_result::AggregationResults;
@@ -262,12 +264,16 @@ pub struct ReservoirSampling {
 
 impl FruitExtractor for ReservoirSampling {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit) -> SummaResult<IntermediateExtractionResult> {
+        let mut rng = SmallRng::from_entropy();
         Ok(IntermediateExtractionResult::PreparedDocumentReferences(PreparedDocumentReferences {
             scored_doc_addresses: self
                 .handle
                 .extract(multi_fruit)
                 .into_iter()
-                .map(|doc_address| ScoredDocAddress { doc_address, score: None })
+                .map(|doc_address| ScoredDocAddress {
+                    doc_address,
+                    score: Some(rng.gen::<f64>().into()),
+                })
                 .collect(),
             index_alias: self.index_alias,
             has_next: false,
