@@ -545,7 +545,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def search(
             self,
-            index_queries: List[dict],
+            search_request: dict,
             tags: Optional[Dict[str, str]] = None,
             ignore_not_found: bool = False,
             request_id: Optional[str] = None,
@@ -554,20 +554,17 @@ class SummaClient(BaseGrpcClient):
         """Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
 
         Args:
-            index_queries: index queries
+            search_request:
             tags: extra dict for logging purposes
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id
         """
         try:
-            search_request = search_service_pb.SearchRequest(tags=tags)
-            for index_query in index_queries:
-                if isinstance(index_query, Dict):
-                    dict_index_query = index_query
-                    index_query = search_service_pb.IndexQuery()
-                    ParseDict(dict_index_query, index_query)
-                search_request.index_queries.append(index_query)
+            if isinstance(search_request, Dict):
+                dict_search_request = search_request
+                search_request = search_service_pb.SearchRequest()
+                ParseDict(dict_search_request, search_request)
             return await self.stubs['search_api'].search(
                 search_request,
                 metadata=setup_metadata(session_id, request_id),

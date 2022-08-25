@@ -31,8 +31,10 @@ export const summa = $root.summa = (() => {
              * Properties of a SearchRequest.
              * @memberof summa.proto
              * @interface ISearchRequest
-             * @property {Array.<summa.proto.IIndexQuery>|null} [index_queries] SearchRequest index_queries
-             * @property {Object.<string,string>|null} [tags] SearchRequest tags
+             * @property {string|null} [index_alias] SearchRequest index_alias
+             * @property {summa.proto.IQuery|null} [query] SearchRequest query
+             * @property {Array.<summa.proto.ICollector>|null} [collectors] SearchRequest collectors
+             * @property {boolean|null} [is_fieldnorms_scoring_enabled] SearchRequest is_fieldnorms_scoring_enabled
              */
 
             /**
@@ -44,8 +46,7 @@ export const summa = $root.summa = (() => {
              * @param {summa.proto.ISearchRequest=} [properties] Properties to set
              */
             function SearchRequest(properties) {
-                this.index_queries = [];
-                this.tags = {};
+                this.collectors = [];
                 if (properties)
                     for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
                         if (properties[keys[i]] != null)
@@ -53,20 +54,50 @@ export const summa = $root.summa = (() => {
             }
 
             /**
-             * SearchRequest index_queries.
-             * @member {Array.<summa.proto.IIndexQuery>} index_queries
+             * SearchRequest index_alias.
+             * @member {string} index_alias
              * @memberof summa.proto.SearchRequest
              * @instance
              */
-            SearchRequest.prototype.index_queries = $util.emptyArray;
+            SearchRequest.prototype.index_alias = "";
 
             /**
-             * SearchRequest tags.
-             * @member {Object.<string,string>} tags
+             * SearchRequest query.
+             * @member {summa.proto.IQuery|null|undefined} query
              * @memberof summa.proto.SearchRequest
              * @instance
              */
-            SearchRequest.prototype.tags = $util.emptyObject;
+            SearchRequest.prototype.query = null;
+
+            /**
+             * SearchRequest collectors.
+             * @member {Array.<summa.proto.ICollector>} collectors
+             * @memberof summa.proto.SearchRequest
+             * @instance
+             */
+            SearchRequest.prototype.collectors = $util.emptyArray;
+
+            /**
+             * SearchRequest is_fieldnorms_scoring_enabled.
+             * @member {boolean|null|undefined} is_fieldnorms_scoring_enabled
+             * @memberof summa.proto.SearchRequest
+             * @instance
+             */
+            SearchRequest.prototype.is_fieldnorms_scoring_enabled = null;
+
+            // OneOf field names bound to virtual getters and setters
+            let $oneOfFields;
+
+            /**
+             * SearchRequest _is_fieldnorms_scoring_enabled.
+             * @member {"is_fieldnorms_scoring_enabled"|undefined} _is_fieldnorms_scoring_enabled
+             * @memberof summa.proto.SearchRequest
+             * @instance
+             */
+            Object.defineProperty(SearchRequest.prototype, "_is_fieldnorms_scoring_enabled", {
+                get: $util.oneOfGetter($oneOfFields = ["is_fieldnorms_scoring_enabled"]),
+                set: $util.oneOfSetter($oneOfFields)
+            });
 
             /**
              * Creates a new SearchRequest instance using the specified properties.
@@ -81,95 +112,6 @@ export const summa = $root.summa = (() => {
             };
 
             return SearchRequest;
-        })();
-
-        proto.IndexQuery = (function() {
-
-            /**
-             * Properties of an IndexQuery.
-             * @memberof summa.proto
-             * @interface IIndexQuery
-             * @property {string|null} [index_alias] IndexQuery index_alias
-             * @property {summa.proto.IQuery|null} [query] IndexQuery query
-             * @property {Array.<summa.proto.ICollector>|null} [collectors] IndexQuery collectors
-             * @property {boolean|null} [is_fieldnorms_scoring_enabled] IndexQuery is_fieldnorms_scoring_enabled
-             */
-
-            /**
-             * Constructs a new IndexQuery.
-             * @memberof summa.proto
-             * @classdesc Represents an IndexQuery.
-             * @implements IIndexQuery
-             * @constructor
-             * @param {summa.proto.IIndexQuery=} [properties] Properties to set
-             */
-            function IndexQuery(properties) {
-                this.collectors = [];
-                if (properties)
-                    for (let keys = Object.keys(properties), i = 0; i < keys.length; ++i)
-                        if (properties[keys[i]] != null)
-                            this[keys[i]] = properties[keys[i]];
-            }
-
-            /**
-             * IndexQuery index_alias.
-             * @member {string} index_alias
-             * @memberof summa.proto.IndexQuery
-             * @instance
-             */
-            IndexQuery.prototype.index_alias = "";
-
-            /**
-             * IndexQuery query.
-             * @member {summa.proto.IQuery|null|undefined} query
-             * @memberof summa.proto.IndexQuery
-             * @instance
-             */
-            IndexQuery.prototype.query = null;
-
-            /**
-             * IndexQuery collectors.
-             * @member {Array.<summa.proto.ICollector>} collectors
-             * @memberof summa.proto.IndexQuery
-             * @instance
-             */
-            IndexQuery.prototype.collectors = $util.emptyArray;
-
-            /**
-             * IndexQuery is_fieldnorms_scoring_enabled.
-             * @member {boolean|null|undefined} is_fieldnorms_scoring_enabled
-             * @memberof summa.proto.IndexQuery
-             * @instance
-             */
-            IndexQuery.prototype.is_fieldnorms_scoring_enabled = null;
-
-            // OneOf field names bound to virtual getters and setters
-            let $oneOfFields;
-
-            /**
-             * IndexQuery _is_fieldnorms_scoring_enabled.
-             * @member {"is_fieldnorms_scoring_enabled"|undefined} _is_fieldnorms_scoring_enabled
-             * @memberof summa.proto.IndexQuery
-             * @instance
-             */
-            Object.defineProperty(IndexQuery.prototype, "_is_fieldnorms_scoring_enabled", {
-                get: $util.oneOfGetter($oneOfFields = ["is_fieldnorms_scoring_enabled"]),
-                set: $util.oneOfSetter($oneOfFields)
-            });
-
-            /**
-             * Creates a new IndexQuery instance using the specified properties.
-             * @function create
-             * @memberof summa.proto.IndexQuery
-             * @static
-             * @param {summa.proto.IIndexQuery=} [properties] Properties to set
-             * @returns {summa.proto.IndexQuery} IndexQuery instance
-             */
-            IndexQuery.create = function create(properties) {
-                return new IndexQuery(properties);
-            };
-
-            return IndexQuery;
         })();
 
         proto.TermFieldMapperConfig = (function() {

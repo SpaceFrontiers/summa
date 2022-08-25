@@ -6,12 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_broadcast::Receiver;
-use futures_util::future::join_all;
 use summa_core::components::{cleanup_index, IndexHolder, IndexRegistry};
 use summa_core::configs::ConfigProxy;
 use summa_core::configs::PartialProxy;
 use summa_core::directories::DefaultExternalRequestGenerator;
-use summa_core::errors::SummaResult;
 use summa_core::hyper_external_request::HyperExternalRequest;
 use summa_core::proto_traits::Wrapper;
 use summa_core::utils::sync::{Handler, OwningHandler};
@@ -585,11 +583,18 @@ impl Index {
 
     /// Search documents
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
-        let futures = self.index_registry.search_futures(search_request.index_queries)?;
-        let collector_outputs = join_all(futures.into_iter().map(tokio::spawn))
-            .await
-            .into_iter()
-            .collect::<Result<SummaResult<Vec<_>>, _>>()??;
+        let index_holder = self.index_registry.get_index_holder(&search_request.index_alias).await?;
+        let collector_outputs = index_holder
+            .search(
+                &search_request.index_alias,
+                search_request
+                    .query
+                    .and_then(|query| query.query)
+                    .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {})),
+                search_request.collectors,
+                search_request.is_fieldnorms_scoring_enabled,
+            )
+            .await?;
         Ok(self.index_registry.finalize_extraction(collector_outputs).await?)
     }
 

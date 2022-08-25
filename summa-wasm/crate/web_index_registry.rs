@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use futures::future::join_all;
 use serde::Serialize;
 use serde_wasm_bindgen::Serializer;
 use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
@@ -53,22 +52,28 @@ impl WrappedIndexRegistry {
 
     /// Do pooled search
     #[wasm_bindgen]
-    pub async fn search(&self, index_queries: JsValue) -> Result<JsValue, JsValue> {
-        let index_queries: Vec<proto::IndexQuery> = serde_wasm_bindgen::from_value(index_queries)?;
+    pub async fn search(&self, search_request: JsValue) -> Result<JsValue, JsValue> {
+        let search_request: proto::SearchRequest = serde_wasm_bindgen::from_value(search_request)?;
         let serializer = Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true);
-        Ok(self.search_internal(index_queries).await.map_err(Error::from)?.serialize(&serializer)?)
+        Ok(self.search_internal(search_request).await.map_err(Error::from)?.serialize(&serializer)?)
     }
 
-    async fn search_internal(&self, index_queries: Vec<proto::IndexQuery>) -> SummaResult<Vec<proto::CollectorOutput>> {
-        info!(action = "search", index_queries = ?index_queries);
-        let futures = self.index_registry.search_futures(index_queries)?;
-        let extraction_results = join_all(futures.into_iter().map(|f| self.thread_pool().spawn(f)))
-            .await
-            .into_iter()
-            .map(|r| r.expect("cannot receive"))
-            .collect::<SummaResult<Vec<_>>>()?;
+    async fn search_internal(&self, search_request: proto::SearchRequest) -> SummaResult<Vec<proto::CollectorOutput>> {
+        info!(action = "search", search_request = ?search_request);
+        let index_holder = self.index_registry.get_index_holder(&search_request.index_alias).await?;
+        let collector_outputs = index_holder
+            .search(
+                &search_request.index_alias,
+                search_request
+                    .query
+                    .and_then(|query| query.query)
+                    .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {})),
+                search_request.collectors,
+                search_request.is_fieldnorms_scoring_enabled,
+            )
+            .await?;
         trace!(action = "searched");
-        self.index_registry.finalize_extraction(extraction_results).await
+        self.index_registry.finalize_extraction(collector_outputs).await
     }
 
     /// Add new index to `WrappedIndexRegistry`
@@ -140,16 +145,16 @@ impl WrappedIndexRegistry {
         Ok(())
     }
 
-    async fn commit_internal(&self, index_name: &str) -> SummaResult<()> {
-        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await?;
-        index_holder.index_writer_holder()?.write().await.commit()?;
-        Ok(())
-    }
-
     /// Make commit
     #[wasm_bindgen]
     pub async fn commit(&self, index_name: &str) -> Result<(), JsValue> {
         Ok(self.commit_internal(index_name).await.map_err(Error::from)?)
+    }
+
+    async fn commit_internal(&self, index_name: &str) -> SummaResult<()> {
+        let index_holder = self.index_registry.get_index_holder_by_name(index_name).await?;
+        index_holder.index_writer_holder()?.write().await.commit()?;
+        Ok(())
     }
 
     pub(crate) fn thread_pool(&self) -> &ThreadPool {

@@ -11,13 +11,6 @@ service SearchApi {
 }
 
 message SearchRequest {
-  // List of index queries. Multiple queries will be merged into a single list
-  repeated IndexQuery index_queries = 1;
-  // Tags for logging purposes
-  map<string, string> tags = 2;
-}
-
-message IndexQuery {
   // The index name or alias
   string index_alias = 1;
   // Query DSL. Use `MatchQuery` to pass a free-form query

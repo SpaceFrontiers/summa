@@ -28,11 +28,10 @@ impl proto::search_api_server::SearchApi for SearchApiImpl {
     async fn search(&self, proto_request: Request<proto::SearchRequest>) -> Result<Response<proto::SearchResponse>, Status> {
         let proto_request = proto_request.into_inner();
         let now = Instant::now();
-        let tags = proto_request.tags.clone();
         let collector_outputs = self
             .index_service
             .search(proto_request)
-            .instrument(info_span!("search", tags = ?tags))
+            .instrument(info_span!("search"))
             .await
             .map_err(crate::errors::Error::from)?;
 

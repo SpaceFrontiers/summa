@@ -174,9 +174,7 @@ parent: APIs
 - [search_service.proto](#search_service-proto)
     - [SearchApi](#summa-proto-SearchApi)
   
-    - [IndexQuery](#summa-proto-IndexQuery)
     - [SearchRequest](#summa-proto-SearchRequest)
-    - [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry)
   
 - [unixfs.proto](#unixfs-proto)
     - [Data](#unixfs-Data)
@@ -2695,9 +2693,9 @@ Analyzes indices
 
 
 
-<a name="summa-proto-IndexQuery"></a>
+<a name="summa-proto-SearchRequest"></a>
 
-### IndexQuery
+### SearchRequest
 
 
 
@@ -2707,38 +2705,6 @@ Analyzes indices
 | query | [Query](#summa-proto-Query) |  | Query DSL. Use `MatchQuery` to pass a free-form query |
 | collectors | [Collector](#summa-proto-Collector) | repeated | Every collector is responsible of processing and storing documents and/or their derivatives (like counters) to return them to the caller |
 | is_fieldnorms_scoring_enabled | [bool](#bool) | optional | Is requiring fieldnorms needed for the query? |
-
-
-
-
-
-
-<a name="summa-proto-SearchRequest"></a>
-
-### SearchRequest
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| index_queries | [IndexQuery](#summa-proto-IndexQuery) | repeated | List of index queries. Multiple queries will be merged into a single list |
-| tags | [SearchRequest.TagsEntry](#summa-proto-SearchRequest-TagsEntry) | repeated | Tags for logging purposes |
-
-
-
-
-
-
-<a name="summa-proto-SearchRequest-TagsEntry"></a>
-
-### SearchRequest.TagsEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [string](#string) |  |  |
-| value | [string](#string) |  |  |
 
 
 

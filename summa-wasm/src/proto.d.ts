@@ -9,11 +9,17 @@ export namespace summa {
         /** Properties of a SearchRequest. */
         interface ISearchRequest {
 
-            /** SearchRequest index_queries */
-            index_queries?: (summa.proto.IIndexQuery[]|null);
+            /** SearchRequest index_alias */
+            index_alias?: (string|null);
 
-            /** SearchRequest tags */
-            tags?: ({ [k: string]: string }|null);
+            /** SearchRequest query */
+            query?: (summa.proto.IQuery|null);
+
+            /** SearchRequest collectors */
+            collectors?: (summa.proto.ICollector[]|null);
+
+            /** SearchRequest is_fieldnorms_scoring_enabled */
+            is_fieldnorms_scoring_enabled?: (boolean|null);
         }
 
         /** Represents a SearchRequest. */
@@ -25,11 +31,20 @@ export namespace summa {
              */
             constructor(properties?: summa.proto.ISearchRequest);
 
-            /** SearchRequest index_queries. */
-            public index_queries: summa.proto.IIndexQuery[];
+            /** SearchRequest index_alias. */
+            public index_alias: string;
 
-            /** SearchRequest tags. */
-            public tags: { [k: string]: string };
+            /** SearchRequest query. */
+            public query?: (summa.proto.IQuery|null);
+
+            /** SearchRequest collectors. */
+            public collectors: summa.proto.ICollector[];
+
+            /** SearchRequest is_fieldnorms_scoring_enabled. */
+            public is_fieldnorms_scoring_enabled?: (boolean|null);
+
+            /** SearchRequest _is_fieldnorms_scoring_enabled. */
+            public _is_fieldnorms_scoring_enabled?: "is_fieldnorms_scoring_enabled";
 
             /**
              * Creates a new SearchRequest instance using the specified properties.
@@ -37,54 +52,6 @@ export namespace summa {
              * @returns SearchRequest instance
              */
             public static create(properties?: summa.proto.ISearchRequest): summa.proto.SearchRequest;
-        }
-
-        /** Properties of an IndexQuery. */
-        interface IIndexQuery {
-
-            /** IndexQuery index_alias */
-            index_alias?: (string|null);
-
-            /** IndexQuery query */
-            query?: (summa.proto.IQuery|null);
-
-            /** IndexQuery collectors */
-            collectors?: (summa.proto.ICollector[]|null);
-
-            /** IndexQuery is_fieldnorms_scoring_enabled */
-            is_fieldnorms_scoring_enabled?: (boolean|null);
-        }
-
-        /** Represents an IndexQuery. */
-        class IndexQuery implements IIndexQuery {
-
-            /**
-             * Constructs a new IndexQuery.
-             * @param [properties] Properties to set
-             */
-            constructor(properties?: summa.proto.IIndexQuery);
-
-            /** IndexQuery index_alias. */
-            public index_alias: string;
-
-            /** IndexQuery query. */
-            public query?: (summa.proto.IQuery|null);
-
-            /** IndexQuery collectors. */
-            public collectors: summa.proto.ICollector[];
-
-            /** IndexQuery is_fieldnorms_scoring_enabled. */
-            public is_fieldnorms_scoring_enabled?: (boolean|null);
-
-            /** IndexQuery _is_fieldnorms_scoring_enabled. */
-            public _is_fieldnorms_scoring_enabled?: "is_fieldnorms_scoring_enabled";
-
-            /**
-             * Creates a new IndexQuery instance using the specified properties.
-             * @param [properties] Properties to set
-             * @returns IndexQuery instance
-             */
-            public static create(properties?: summa.proto.IIndexQuery): summa.proto.IndexQuery;
         }
 
         /** Properties of a TermFieldMapperConfig. */
