@@ -139,10 +139,9 @@ pub fn build_fruit_extractor(
                     scorer: Some(proto::scorer::Scorer::EvalExpr(ref eval_expr)),
                 }) => {
                     let eval_scorer_seed = EvalScorer::new(eval_expr, searcher.schema())?;
-                    let top_docs_collector =
-                        tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
-                            .and_offset(top_docs_collector_proto.offset as usize)
-                            .tweak_score(EvalScorerTweaker::new(eval_scorer_seed));
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
+                        .and_offset(top_docs_collector_proto.offset as usize)
+                        .tweak_score(EvalScorerTweaker::new(eval_scorer_seed));
                     Box::new(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))

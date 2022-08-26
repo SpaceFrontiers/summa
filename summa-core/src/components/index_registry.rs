@@ -159,47 +159,42 @@ impl IndexRegistry {
                         let extraction_tooling_ref = &extraction_tooling;
                         let snippet_generator_ref = &snippet_generator;
 
-                        let scored_documents = join_all(
-                            scored_doc_address_refs
-                                .into_iter()
-                                .enumerate()
-                                .map(|(position, scored_doc_address_ref)| {
-                                    let doc_address = scored_doc_address_ref.doc_address();
-                                    let searcher = extraction_tooling_ref.searcher.clone();
-                                    async move {
-                                        #[cfg(feature = "tokio-rt")]
-                                        let document = tokio::task::spawn_blocking(move || searcher.doc(doc_address)).await??;
-                                        #[cfg(not(feature = "tokio-rt"))]
-                                        let document = searcher.doc_async(doc_address).await?;
-                                        Ok(proto::ScoredDocument {
-                                            document: NamedFieldDocument::from_document(
-                                                extraction_tooling.searcher.schema(),
-                                                &extraction_tooling.query_fields,
-                                                &extraction_tooling.multi_fields,
-                                                &document,
-                                            )
-                                            .to_json_string(),
-                                            score: scored_doc_address_ref.score().clone(),
-                                            position: position as u32,
-                                            snippets: snippet_generator_ref
-                                                .as_ref()
-                                                .map(|snippet_generator_ref| {
-                                                    snippet_generator_ref
-                                                        .iter()
-                                                        .map(|(field_name, snippet_generator)| {
-                                                            (
-                                                                field_name.to_string(),
-                                                                Wrapper::from(snippet_generator.snippet_from_doc(&document)).into_inner(),
-                                                            )
-                                                        })
-                                                        .collect()
+                        let scored_documents = join_all(scored_doc_address_refs.into_iter().enumerate().map(|(position, scored_doc_address_ref)| {
+                            let doc_address = scored_doc_address_ref.doc_address();
+                            let searcher = extraction_tooling_ref.searcher.clone();
+                            async move {
+                                #[cfg(feature = "tokio-rt")]
+                                let document = tokio::task::spawn_blocking(move || searcher.doc(doc_address)).await??;
+                                #[cfg(not(feature = "tokio-rt"))]
+                                let document = searcher.doc_async(doc_address).await?;
+                                Ok(proto::ScoredDocument {
+                                    document: NamedFieldDocument::from_document(
+                                        extraction_tooling.searcher.schema(),
+                                        &extraction_tooling.query_fields,
+                                        &extraction_tooling.multi_fields,
+                                        &document,
+                                    )
+                                    .to_json_string(),
+                                    score: scored_doc_address_ref.score().clone(),
+                                    position: position as u32,
+                                    snippets: snippet_generator_ref
+                                        .as_ref()
+                                        .map(|snippet_generator_ref| {
+                                            snippet_generator_ref
+                                                .iter()
+                                                .map(|(field_name, snippet_generator)| {
+                                                    (
+                                                        field_name.to_string(),
+                                                        Wrapper::from(snippet_generator.snippet_from_doc(&document)).into_inner(),
+                                                    )
                                                 })
-                                                .unwrap_or_default(),
-                                            index_alias: scored_doc_address_ref.index_alias.to_string(),
+                                                .collect()
                                         })
-                                    }
-                                }),
-                        )
+                                        .unwrap_or_default(),
+                                    index_alias: scored_doc_address_ref.index_alias.to_string(),
+                                })
+                            }
+                        }))
                         .await
                         .into_iter()
                         .collect::<SummaResult<Vec<_>>>()?;
