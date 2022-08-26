@@ -73,12 +73,12 @@ await remote_index_registry.add(remote_engine_config, "test_index");
 Then, when you will do a search:
 ```js
 // All types of queries are supported
-const index_query = {
+const search_request = {
     index_alias: "test_index",
     query: {query: {match: {value: "Game of Thrones"}}},
     collectors: [{collector: {top_docs: {limit: 5}}}],
 }
-const response = await remote_index_registry.search([ index_query ]);
+const response = await remote_index_registry.search(search_request);
 ```
 `summa-wasm` will emit a pack of network requests for receiving only needed parts of the search index.
 

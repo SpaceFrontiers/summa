@@ -699,11 +699,11 @@ class SummaClient(BaseGrpcClient):
         )
 
     async def get_one_by_field_value(self, index_alias, field, value):
-        response = await self.search([{
+        response = await self.search({
             'index_alias': index_alias,
             'query': {'term': {'field': field, 'value': value}},
             'collectors': [{'top_docs': {'limit': 1}}],
-        }])
+        })
         if response.collector_outputs[0].documents.scored_documents:
             return json.loads(response.collector_outputs[0].documents.scored_documents[0].document)
 
