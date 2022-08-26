@@ -29,7 +29,7 @@ fn tokenize_value(schema: &Schema, field: &Field, full_path: &str, value: &str, 
             field,
             full_path,
             schema.get_field_entry(*field).field_type(),
-            &value.replace('-', ""),
+            &value,
             true,
         )),
     };

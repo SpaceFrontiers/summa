@@ -917,6 +917,10 @@ mod tests {
             "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/cbo123\")))"
         );
         assert_eq!(
+            format!("{:?}", query_parser.parse_query("10.1515/12-23")),
+            "Ok(TermQuery(Term(field=3, type=Str, \"10.1515/12-23\")))"
+        );
+        assert_eq!(
             format!("{:?}", query_parser.parse_query("doi.org/10.0000/abcd.0123")),
             "Ok(TermQuery(Term(field=3, type=Str, \"10.0000/abcd.0123\")))"
         );
