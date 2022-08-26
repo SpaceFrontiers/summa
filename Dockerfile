@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM rust as builder
+FROM --platform=$BUILDPLATFORM rust:1.71 as builder
 RUN apt-get update && apt-get install -y \
     g++-x86-64-linux-gnu libc6-dev-amd64-cross \
     g++-aarch64-linux-gnu libc6-dev-arm64-cross \
@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
 RUN rustup target add \
     x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf
 RUN rustup toolchain install \
-    stable-x86_64-unknown-linux-gnu stable-aarch64-unknown-linux-gnu stable-armv7-unknown-linux-gnueabihf
+    1.71-x86_64-unknown-linux-gnu 1.71-aarch64-unknown-linux-gnu 1.71-armv7-unknown-linux-gnueabihf
 RUN rustup component add rustfmt
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \

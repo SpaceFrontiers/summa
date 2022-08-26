@@ -12,21 +12,6 @@ from google.protobuf.internal import containers as _containers
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class SearchRequest(_message.Message):
-    __slots__ = ["index_queries", "tags"]
-    class TagsEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: str
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
-    INDEX_QUERIES_FIELD_NUMBER: _ClassVar[int]
-    TAGS_FIELD_NUMBER: _ClassVar[int]
-    index_queries: _containers.RepeatedCompositeFieldContainer[IndexQuery]
-    tags: _containers.ScalarMap[str, str]
-    def __init__(self, index_queries: _Optional[_Iterable[_Union[IndexQuery, _Mapping]]] = ..., tags: _Optional[_Mapping[str, str]] = ...) -> None: ...
-
-class IndexQuery(_message.Message):
     __slots__ = ["index_alias", "query", "collectors", "is_fieldnorms_scoring_enabled"]
     INDEX_ALIAS_FIELD_NUMBER: _ClassVar[int]
     QUERY_FIELD_NUMBER: _ClassVar[int]

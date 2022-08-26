@@ -1,21 +1,10 @@
 import asyncio
 import sys
-from typing import (
-    AsyncIterator,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import AsyncIterator, Dict, Iterable, List, Optional, Tuple, Union
 
 import grpc
 import orjson as json
-from aiogrpcclient import (
-    BaseGrpcClient,
-    expose,
-)
+from aiogrpcclient import BaseGrpcClient, expose
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
@@ -29,10 +18,7 @@ from .proto.consumer_service_pb2_grpc import ConsumerApiStub
 from .proto.index_service_pb2_grpc import IndexApiStub
 from .proto.reflection_service_pb2_grpc import ReflectionApiStub
 from .proto.search_service_pb2_grpc import SearchApiStub
-from .proto.utils_pb2 import (  # noqa
-    Asc,
-    Desc,
-)
+from .proto.utils_pb2 import Asc, Desc  # noqa
 
 
 def setup_metadata(session_id, request_id):
@@ -577,7 +563,7 @@ class SummaClient(BaseGrpcClient):
     @expose
     async def search_documents(
             self,
-            index_queries: List[dict],
+            search_request: dict,
             tags: Optional[Dict[str, str]] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
@@ -585,12 +571,12 @@ class SummaClient(BaseGrpcClient):
         """Send search request and interprets first collector as, thus parse returned documents as json.
 
         Args:
-            index_queries: index queries
+            search_request: index queries
             tags: extra dict for logging purposes
             request_id: request id
             session_id: session id
         """
-        search_results = await self.search(index_queries=index_queries, tags=tags, request_id=request_id, session_id=session_id)
+        search_results = await self.search(search_request=search_request, tags=tags, request_id=request_id, session_id=session_id)
         return [
             json.loads(scored_document.document)
             for scored_document in search_results.collector_outputs[0].documents.scored_documents
