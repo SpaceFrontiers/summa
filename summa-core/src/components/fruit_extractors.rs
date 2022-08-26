@@ -140,7 +140,8 @@ pub fn build_fruit_extractor(
                 }) => {
                     let eval_scorer_seed = EvalScorer::new(eval_expr, searcher.schema())?;
                     let top_docs_collector =
-                        tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
+                        tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
+                            .and_offset(top_docs_collector_proto.offset as usize)
                             .tweak_score(EvalScorerTweaker::new(eval_scorer_seed));
                     Box::new(
                         TopDocsBuilder::default()
@@ -232,7 +233,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
         let length = fruit.len();
         let doc_addresses = fruit
             .into_iter()
-            .take(std::cmp::min((self.offset + self.limit) as usize, length))
+            .take(std::cmp::min(self.limit as usize, length))
             .map(|(score, doc_address)| ScoredDocAddress {
                 doc_address,
                 score: Some(score.into()),
@@ -243,7 +244,7 @@ impl<T: 'static + Copy + Into<proto::Score> + Sync + Send> FruitExtractor for To
             extraction_tooling: ExtractionTooling::new(self.searcher.clone(), self.query_fields, self.multi_fields),
             snippet_generator_config: Some(SnippetGeneratorConfig::new(self.searcher, self.query, self.snippet_configs)),
             scored_doc_addresses: doc_addresses,
-            has_next: length > (self.offset + self.limit) as usize,
+            has_next: length > self.limit as usize,
             limit: self.limit,
             offset: self.offset,
         }))

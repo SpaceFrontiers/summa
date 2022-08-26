@@ -148,7 +148,7 @@ impl IndexRegistry {
                             None
                         };
 
-                        let merged_scored_doc_address_refs =
+                        let scored_doc_address_refs =
                             prepared_document_references
                                 .scored_doc_addresses
                                 .iter()
@@ -160,7 +160,7 @@ impl IndexRegistry {
                         let snippet_generator_ref = &snippet_generator;
 
                         let scored_documents = join_all(
-                            merged_scored_doc_address_refs
+                            scored_doc_address_refs
                                 .into_iter()
                                 .enumerate()
                                 .map(|(position, scored_doc_address_ref)| {
