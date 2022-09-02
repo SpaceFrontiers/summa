@@ -263,16 +263,42 @@ mod tests {
                         ..Default::default()
                     })),
                 }),
-                collectors: vec![proto::Collector {
-                    collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
-                        limit: 1,
-                        offset: 0,
-                        scorer: None,
-                        snippet_configs: Default::default(),
-                        explain: false,
-                        fields: vec![],
-                    })),
-                }],
+                collectors: vec![
+                    proto::Collector {
+                        collector: Some(proto::collector::Collector::TopDocs(proto::TopDocsCollector {
+                            limit: 1,
+                            offset: 0,
+                            scorer: None,
+                            snippet_configs: Default::default(),
+                            explain: false,
+                            fields: vec![],
+                        })),
+                    },
+                    proto::Collector {
+                        collector: Some(proto::collector::Collector::Aggregation(proto::AggregationCollector {
+                            aggregations: r#"{
+                              "average": {
+                                "avg": { "field": "score" }
+                              },
+                              "range": {
+                                "range": {
+                                  "field": "score",
+                                  "ranges": [
+                                    { "to": 3.0 },
+                                    { "from": 3.0, "to": 7.0 },
+                                    { "from": 7.0, "to": 20.0 },
+                                    { "from": 20.0 }
+                                  ]
+                                },
+                                "aggs": {
+                                  "average_in_range": { "avg": { "field": "score" } }
+                                }
+                              }
+                            }"#
+                            .to_string(),
+                        })),
+                    },
+                ],
                 is_fieldnorms_scoring_enabled: None,
             }))
             .await

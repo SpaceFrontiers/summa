@@ -1,4 +1,3 @@
-pub mod aggregation;
 pub mod compression;
 pub mod merge_policy;
 pub mod order;

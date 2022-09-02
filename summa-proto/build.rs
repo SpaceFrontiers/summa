@@ -13,15 +13,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serde_default_structs = &[
         "dag_pb.PBNode",
         "dag_pb.PBLink",
-        "summa.proto.HistogramAggregation",
         "summa.proto.IndexAttributes",
-        "summa.proto.InflectionConfig",
         "summa.proto.MoreLikeThisQuery",
         "summa.proto.NerMatchConfig",
         "summa.proto.PhraseQuery",
         "summa.proto.QueryParserConfig",
         "summa.proto.ReservoirSamplingCollector",
-        "summa.proto.TermsAggregation",
         "summa.proto.TopDocsCollector",
         "unixfs.Data",
     ];

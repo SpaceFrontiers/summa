@@ -29,7 +29,6 @@ use crate::metrics::ToLabel;
 #[derive(Clone)]
 pub struct ProtoQueryParser {
     index: Index,
-    index_name: String,
     cached_schema: Schema,
     // Counters
     #[cfg(feature = "metrics")]
@@ -71,7 +70,7 @@ fn cast_value_to_bound_term(field: &Field, full_path: &str, field_type: &FieldTy
 }
 
 impl ProtoQueryParser {
-    pub fn for_index(index_name: &str, index: &Index, query_parser_config: proto::QueryParserConfig) -> SummaResult<ProtoQueryParser> {
+    pub fn for_index(index: &Index, query_parser_config: proto::QueryParserConfig) -> SummaResult<ProtoQueryParser> {
         #[cfg(feature = "metrics")]
         let query_counter = global::meter("summa").u64_counter("query_counter").with_description("Queries counter").init();
         #[cfg(feature = "metrics")]
@@ -82,7 +81,6 @@ impl ProtoQueryParser {
 
         Ok(ProtoQueryParser {
             index: index.clone(),
-            index_name: index_name.to_string(),
             cached_schema: index.schema(),
             #[cfg(feature = "metrics")]
             query_counter,
@@ -115,14 +113,7 @@ impl ProtoQueryParser {
 
     fn parse_subquery(&self, query: proto::query::Query) -> SummaResult<Box<dyn Query>> {
         #[cfg(feature = "metrics")]
-        self.subquery_counter.add(
-            &Context::current(),
-            1,
-            &[
-                KeyValue::new("index_name", self.index_name.to_owned()),
-                KeyValue::new("query", query.to_label()),
-            ],
-        );
+        self.subquery_counter.add(&Context::current(), 1, &[KeyValue::new("query", query.to_label())]);
         Ok(match query {
             proto::query::Query::All(_) => Box::new(AllQuery),
             proto::query::Query::Empty(_) => Box::new(EmptyQuery),
@@ -211,8 +202,9 @@ impl ProtoQueryParser {
             }
             proto::query::Query::Term(term_query_proto) => {
                 let (field, full_path, field_entry) = self.field_and_field_entry(&term_query_proto.field)?;
+                let value = term_query_proto.value.to_lowercase();
                 Box::new(TermQuery::new(
-                    cast_field_to_typed_term(&field, full_path, field_entry.field_type(), &term_query_proto.value)?,
+                    cast_field_to_typed_term(&field, full_path, field_entry.field_type(), &value)?,
                     field_entry.field_type().index_record_option().unwrap_or(IndexRecordOption::Basic),
                 ))
             }
@@ -265,14 +257,7 @@ impl ProtoQueryParser {
 
     pub fn parse_query(&self, query: proto::query::Query) -> SummaResult<Box<dyn Query>> {
         #[cfg(feature = "metrics")]
-        self.query_counter.add(
-            &Context::current(),
-            1,
-            &[
-                KeyValue::new("index_name", self.index_name.to_owned()),
-                KeyValue::new("query", query.to_label()),
-            ],
-        );
+        self.query_counter.add(&Context::current(), 1, &[KeyValue::new("query", query.to_label())]);
         self.parse_subquery(query)
     }
 }

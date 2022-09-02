@@ -652,7 +652,7 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicI64;
 
     use rand::rngs::SmallRng;
-    use rand::{Rng, SeedableRng};
+    use rand::SeedableRng;
     use summa_core::components::test_utils::create_test_schema;
     use summa_core::components::test_utils::{generate_documents, generate_documents_with_doc_id_gen_and_rng, generate_unique_document};
     use summa_core::configs::DirectProxy;

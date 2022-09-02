@@ -532,7 +532,6 @@ class SummaClient(BaseGrpcClient):
     async def search(
             self,
             search_request: dict,
-            tags: Optional[Dict[str, str]] = None,
             ignore_not_found: bool = False,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
@@ -541,7 +540,6 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             search_request:
-            tags: extra dict for logging purposes
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id

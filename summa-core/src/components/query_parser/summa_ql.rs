@@ -639,7 +639,7 @@ impl QueryParser {
                                     .0
                                     .removed_fields
                                     .iter()
-                                    .any(|x| x == field_name.as_str() || Some(x.as_str()) == field_name.as_str().split(".").next())
+                                    .any(|x| x == field_name.as_str() || Some(x.as_str()) == field_name.as_str().split('.').next())
                                 {
                                     Ok(Box::new(EmptyQuery {}) as Box<dyn Query>)
                                 } else {

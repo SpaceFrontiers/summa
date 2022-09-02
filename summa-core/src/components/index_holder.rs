@@ -181,7 +181,7 @@ impl IndexHolder {
             .transpose()?
             .unwrap_or_default();
 
-        let query_parser = ProtoQueryParser::for_index(index_name, &index, query_parser_config)?;
+        let query_parser = ProtoQueryParser::for_index(&index, query_parser_config)?;
         let index_reader = index
             .reader_builder()
             .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)

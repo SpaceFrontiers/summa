@@ -5,7 +5,6 @@ use std::str::CharIndices;
 pub struct Tokenizer;
 
 pub struct TokenStream<'a> {
-    text: &'a str,
     skip_list: Option<Vec<(usize, usize)>>,
     skip_iter: usize,
     chars: CharIndices<'a>,
@@ -27,7 +26,6 @@ pub fn accept_char(token: &mut tantivy::tokenizer::Token, c: char, offset: usize
 impl<'a> TokenStream<'a> {
     pub fn new(text: &'a str) -> TokenStream<'a> {
         TokenStream {
-            text,
             skip_list: None,
             skip_iter: 0,
             chars: text.char_indices(),
@@ -43,7 +41,6 @@ impl<'a> TokenStream<'a> {
             ..Default::default()
         };
         TokenStream {
-            text,
             skip_list,
             skip_iter: 0,
             chars: text.char_indices(),

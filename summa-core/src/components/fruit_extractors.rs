@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use rustc_hash::FxHashMap;
 use summa_proto::proto;
+use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::agg_result::AggregationResults;
+use tantivy::aggregation::AggregationLimits;
 use tantivy::collector::{FacetCounts, FruitHandle, MultiCollector, MultiFruit};
 use tantivy::query::Query;
 use tantivy::schema::Field;
@@ -12,8 +13,7 @@ use tantivy::{Order, Searcher};
 
 use crate::components::snippet_generator::SnippetGeneratorConfig;
 use crate::components::IndexHolder;
-use crate::errors::{BuilderError, Error, SummaResult};
-use crate::proto_traits::Wrapper;
+use crate::errors::{BuilderError, SummaResult};
 use crate::scorers::eval_scorer_tweaker::EvalScorerTweaker;
 use crate::scorers::EvalScorer;
 use crate::{collectors, validators};
@@ -83,28 +83,6 @@ impl IntermediateExtractionResult {
 #[async_trait]
 pub trait FruitExtractor: Sync + Send {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit) -> SummaResult<IntermediateExtractionResult>;
-}
-
-pub fn parse_aggregations(aggregations: HashMap<String, proto::Aggregation>) -> SummaResult<HashMap<String, tantivy::aggregation::agg_req::Aggregation>> {
-    aggregations
-        .into_iter()
-        .map(|(name, aggregation)| {
-            let aggregation = match aggregation.aggregation {
-                None => Err(Error::InvalidAggregation),
-                Some(aggregation) => Wrapper::from(aggregation).try_into(),
-            }?;
-            Ok((name, aggregation))
-        })
-        .collect::<SummaResult<HashMap<_, _>>>()
-}
-
-fn parse_aggregation_results(
-    aggregation_results: FxHashMap<String, tantivy::aggregation::agg_result::AggregationResult>,
-) -> HashMap<String, proto::AggregationResult> {
-    aggregation_results
-        .into_iter()
-        .map(|(name, aggregation_result)| (name, Wrapper::from(aggregation_result).into_inner()))
-        .collect()
 }
 
 pub fn build_fruit_extractor(
@@ -202,8 +180,9 @@ pub fn build_fruit_extractor(
             Ok(Box::new(Facet(multi_collector.add_collector(facet_collector))) as Box<dyn FruitExtractor>)
         }
         Some(proto::collector::Collector::Aggregation(aggregation_collector_proto)) => {
+            let agg_req: Aggregations = serde_json::from_str(&aggregation_collector_proto.aggregations)?;
             let aggregation_collector =
-                tantivy::aggregation::AggregationCollector::from_aggs(parse_aggregations(aggregation_collector_proto.aggregations)?, Default::default());
+                tantivy::aggregation::AggregationCollector::from_aggs(agg_req, AggregationLimits::new(Some(16_000_000_000), Some(100_000_000)));
             Ok(Box::new(Aggregation(multi_collector.add_collector(aggregation_collector))) as Box<dyn FruitExtractor>)
         }
         None => Ok(Box::new(Count(multi_collector.add_collector(tantivy::collector::Count))) as Box<dyn FruitExtractor>),
@@ -311,7 +290,7 @@ impl FruitExtractor for Aggregation {
     fn extract(self: Box<Self>, multi_fruit: &mut MultiFruit) -> SummaResult<IntermediateExtractionResult> {
         Ok(IntermediateExtractionResult::Ready(ReadyCollectorOutput::Aggregation(
             proto::AggregationCollectorOutput {
-                aggregation_results: parse_aggregation_results(self.0.extract(multi_fruit).0),
+                aggregation_results: serde_json::to_string(&self.0.extract(multi_fruit).0)?,
             },
         )))
     }

@@ -157,12 +157,6 @@ impl WrappedIndexRegistry {
         Ok(())
     }
 
-    pub(crate) fn thread_pool(&self) -> &ThreadPool {
-        self.thread_pool
-            .as_ref()
-            .expect("thread_pool should be initialized through `setup` call before use")
-    }
-
     #[wasm_bindgen]
     pub async fn get_index_field_names(&self, index_name: &str) -> Result<JsValue, JsValue> {
         let index_holder = self.index_registry.get_index_holder(index_name).await.map_err(Error::from)?;

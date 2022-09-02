@@ -5,7 +5,7 @@ use prost::encoding::bool;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::schema::{Field, FieldType};
 use tantivy::Term;
-use tantivy_common::{DateTime, HasLen};
+use tantivy_common::DateTime;
 
 use crate::errors::SummaResult;
 use crate::Error;

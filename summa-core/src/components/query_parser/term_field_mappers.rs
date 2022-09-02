@@ -25,13 +25,7 @@ fn tokenize_value(schema: &Schema, field: &Field, full_path: &str, value: &str, 
                 terms.push(term);
             });
         }
-        _ => terms.push(cast_field_to_term(
-            field,
-            full_path,
-            schema.get_field_entry(*field).field_type(),
-            &value,
-            true,
-        )),
+        _ => terms.push(cast_field_to_term(field, full_path, schema.get_field_entry(*field).field_type(), value, true)),
     };
     terms
 }
