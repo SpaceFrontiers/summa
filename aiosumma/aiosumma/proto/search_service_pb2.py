@@ -6,13 +6,13 @@ from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
-
 # @@protoc_insertion_point(imports)
 
 _sym_db = _symbol_database.Default()
 
 
 from . import query_pb2 as query__pb2
+
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14search_service.proto\x12\x0bsumma.proto\x1a\x0bquery.proto\"\xc1\x01\n\rSearchRequest\x12\x13\n\x0bindex_alias\x18\x01 \x01(\t\x12!\n\x05query\x18\x02 \x01(\x0b\x32\x12.summa.proto.Query\x12*\n\ncollectors\x18\x03 \x03(\x0b\x32\x16.summa.proto.Collector\x12*\n\x1dis_fieldnorms_scoring_enabled\x18\x04 \x01(\x08H\x00\x88\x01\x01\x42 \n\x1e_is_fieldnorms_scoring_enabled2P\n\tSearchApi\x12\x43\n\x06search\x12\x1a.summa.proto.SearchRequest\x1a\x1b.summa.proto.SearchResponse\"\x00\x62\x06proto3')
 

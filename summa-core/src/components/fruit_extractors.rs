@@ -100,9 +100,12 @@ pub fn build_fruit_extractor(
             Ok(match top_docs_collector_proto.scorer {
                 None | Some(proto::Scorer { scorer: None }) => Box::new(
                     TopDocsBuilder::default()
-                        .handle(multi_collector.add_collector(tantivy::collector::TopDocs::with_limit(
-                            (top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize,
-                        )))
+                        .handle(
+                            multi_collector.add_collector(
+                                tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
+                                    .and_offset(top_docs_collector_proto.offset as usize),
+                            ),
+                        )
                         .index_alias(index_alias.to_string())
                         .searcher(searcher)
                         .query(query.box_clone())

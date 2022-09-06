@@ -259,92 +259,6 @@ class ExistsQuery(_message.Message):
     field: str
     def __init__(self, field: _Optional[str] = ...) -> None: ...
 
-class Aggregation(_message.Message):
-    __slots__ = ["bucket", "metric"]
-    BUCKET_FIELD_NUMBER: _ClassVar[int]
-    METRIC_FIELD_NUMBER: _ClassVar[int]
-    bucket: BucketAggregation
-    metric: MetricAggregation
-    def __init__(self, bucket: _Optional[_Union[BucketAggregation, _Mapping]] = ..., metric: _Optional[_Union[MetricAggregation, _Mapping]] = ...) -> None: ...
-
-class BucketAggregation(_message.Message):
-    __slots__ = ["range", "histogram", "terms", "sub_aggregation"]
-    class SubAggregationEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: Aggregation
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[Aggregation, _Mapping]] = ...) -> None: ...
-    RANGE_FIELD_NUMBER: _ClassVar[int]
-    HISTOGRAM_FIELD_NUMBER: _ClassVar[int]
-    TERMS_FIELD_NUMBER: _ClassVar[int]
-    SUB_AGGREGATION_FIELD_NUMBER: _ClassVar[int]
-    range: RangeAggregation
-    histogram: HistogramAggregation
-    terms: TermsAggregation
-    sub_aggregation: _containers.MessageMap[str, Aggregation]
-    def __init__(self, range: _Optional[_Union[RangeAggregation, _Mapping]] = ..., histogram: _Optional[_Union[HistogramAggregation, _Mapping]] = ..., terms: _Optional[_Union[TermsAggregation, _Mapping]] = ..., sub_aggregation: _Optional[_Mapping[str, Aggregation]] = ...) -> None: ...
-
-class RangeAggregation(_message.Message):
-    __slots__ = ["field", "ranges"]
-    FIELD_FIELD_NUMBER: _ClassVar[int]
-    RANGES_FIELD_NUMBER: _ClassVar[int]
-    field: str
-    ranges: _containers.RepeatedCompositeFieldContainer[RangeAggregationRange]
-    def __init__(self, field: _Optional[str] = ..., ranges: _Optional[_Iterable[_Union[RangeAggregationRange, _Mapping]]] = ...) -> None: ...
-
-class RangeAggregationRange(_message.Message):
-    __slots__ = ["to", "key"]
-    FROM_FIELD_NUMBER: _ClassVar[int]
-    TO_FIELD_NUMBER: _ClassVar[int]
-    KEY_FIELD_NUMBER: _ClassVar[int]
-    to: float
-    key: str
-    def __init__(self, to: _Optional[float] = ..., key: _Optional[str] = ..., **kwargs) -> None: ...
-
-class HistogramAggregation(_message.Message):
-    __slots__ = ["field", "interval", "offset", "min_doc_count", "hard_bounds", "extended_bounds"]
-    FIELD_FIELD_NUMBER: _ClassVar[int]
-    INTERVAL_FIELD_NUMBER: _ClassVar[int]
-    OFFSET_FIELD_NUMBER: _ClassVar[int]
-    MIN_DOC_COUNT_FIELD_NUMBER: _ClassVar[int]
-    HARD_BOUNDS_FIELD_NUMBER: _ClassVar[int]
-    EXTENDED_BOUNDS_FIELD_NUMBER: _ClassVar[int]
-    field: str
-    interval: float
-    offset: float
-    min_doc_count: int
-    hard_bounds: HistogramBounds
-    extended_bounds: HistogramBounds
-    def __init__(self, field: _Optional[str] = ..., interval: _Optional[float] = ..., offset: _Optional[float] = ..., min_doc_count: _Optional[int] = ..., hard_bounds: _Optional[_Union[HistogramBounds, _Mapping]] = ..., extended_bounds: _Optional[_Union[HistogramBounds, _Mapping]] = ...) -> None: ...
-
-class HistogramBounds(_message.Message):
-    __slots__ = ["min", "max"]
-    MIN_FIELD_NUMBER: _ClassVar[int]
-    MAX_FIELD_NUMBER: _ClassVar[int]
-    min: float
-    max: float
-    def __init__(self, min: _Optional[float] = ..., max: _Optional[float] = ...) -> None: ...
-
-class TermsAggregation(_message.Message):
-    __slots__ = ["field", "size", "split_size", "segment_size", "show_term_doc_count_error", "min_doc_count", "order"]
-    FIELD_FIELD_NUMBER: _ClassVar[int]
-    SIZE_FIELD_NUMBER: _ClassVar[int]
-    SPLIT_SIZE_FIELD_NUMBER: _ClassVar[int]
-    SEGMENT_SIZE_FIELD_NUMBER: _ClassVar[int]
-    SHOW_TERM_DOC_COUNT_ERROR_FIELD_NUMBER: _ClassVar[int]
-    MIN_DOC_COUNT_FIELD_NUMBER: _ClassVar[int]
-    ORDER_FIELD_NUMBER: _ClassVar[int]
-    field: str
-    size: int
-    split_size: int
-    segment_size: int
-    show_term_doc_count_error: bool
-    min_doc_count: int
-    order: CustomOrder
-    def __init__(self, field: _Optional[str] = ..., size: _Optional[int] = ..., split_size: _Optional[int] = ..., segment_size: _Optional[int] = ..., show_term_doc_count_error: bool = ..., min_doc_count: _Optional[int] = ..., order: _Optional[_Union[CustomOrder, _Mapping]] = ...) -> None: ...
-
 class CustomOrder(_message.Message):
     __slots__ = ["key", "count", "sub_aggregation", "order"]
     KEY_FIELD_NUMBER: _ClassVar[int]
@@ -356,43 +270,6 @@ class CustomOrder(_message.Message):
     sub_aggregation: str
     order: _utils_pb2.Order
     def __init__(self, key: _Optional[_Union[_utils_pb2.Empty, _Mapping]] = ..., count: _Optional[_Union[_utils_pb2.Empty, _Mapping]] = ..., sub_aggregation: _Optional[str] = ..., order: _Optional[_Union[_utils_pb2.Order, str]] = ...) -> None: ...
-
-class MetricAggregation(_message.Message):
-    __slots__ = ["average", "stats"]
-    AVERAGE_FIELD_NUMBER: _ClassVar[int]
-    STATS_FIELD_NUMBER: _ClassVar[int]
-    average: AverageAggregation
-    stats: StatsAggregation
-    def __init__(self, average: _Optional[_Union[AverageAggregation, _Mapping]] = ..., stats: _Optional[_Union[StatsAggregation, _Mapping]] = ...) -> None: ...
-
-class AverageAggregation(_message.Message):
-    __slots__ = ["field"]
-    FIELD_FIELD_NUMBER: _ClassVar[int]
-    field: str
-    def __init__(self, field: _Optional[str] = ...) -> None: ...
-
-class StatsAggregation(_message.Message):
-    __slots__ = ["field"]
-    FIELD_FIELD_NUMBER: _ClassVar[int]
-    field: str
-    def __init__(self, field: _Optional[str] = ...) -> None: ...
-
-class BucketEntry(_message.Message):
-    __slots__ = ["key", "doc_count", "sub_aggregation"]
-    class SubAggregationEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: AggregationResult
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[AggregationResult, _Mapping]] = ...) -> None: ...
-    KEY_FIELD_NUMBER: _ClassVar[int]
-    DOC_COUNT_FIELD_NUMBER: _ClassVar[int]
-    SUB_AGGREGATION_FIELD_NUMBER: _ClassVar[int]
-    key: Key
-    doc_count: int
-    sub_aggregation: _containers.MessageMap[str, AggregationResult]
-    def __init__(self, key: _Optional[_Union[Key, _Mapping]] = ..., doc_count: _Optional[int] = ..., sub_aggregation: _Optional[_Mapping[str, AggregationResult]] = ...) -> None: ...
 
 class Key(_message.Message):
     __slots__ = ["str", "f64"]
@@ -413,26 +290,6 @@ class Range(_message.Message):
     including_left: bool
     including_right: bool
     def __init__(self, left: _Optional[str] = ..., right: _Optional[str] = ..., including_left: bool = ..., including_right: bool = ...) -> None: ...
-
-class RangeBucketEntry(_message.Message):
-    __slots__ = ["key", "doc_count", "sub_aggregation", "to"]
-    class SubAggregationEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: AggregationResult
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[AggregationResult, _Mapping]] = ...) -> None: ...
-    KEY_FIELD_NUMBER: _ClassVar[int]
-    DOC_COUNT_FIELD_NUMBER: _ClassVar[int]
-    SUB_AGGREGATION_FIELD_NUMBER: _ClassVar[int]
-    FROM_FIELD_NUMBER: _ClassVar[int]
-    TO_FIELD_NUMBER: _ClassVar[int]
-    key: Key
-    doc_count: int
-    sub_aggregation: _containers.MessageMap[str, AggregationResult]
-    to: float
-    def __init__(self, key: _Optional[_Union[Key, _Mapping]] = ..., doc_count: _Optional[int] = ..., sub_aggregation: _Optional[_Mapping[str, AggregationResult]] = ..., to: _Optional[float] = ..., **kwargs) -> None: ...
 
 class Score(_message.Message):
     __slots__ = ["f64_score", "u64_score"]
@@ -602,94 +459,12 @@ class DocumentsCollectorOutput(_message.Message):
 
 class AggregationCollector(_message.Message):
     __slots__ = ["aggregations"]
-    class AggregationsEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: Aggregation
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[Aggregation, _Mapping]] = ...) -> None: ...
     AGGREGATIONS_FIELD_NUMBER: _ClassVar[int]
-    aggregations: _containers.MessageMap[str, Aggregation]
-    def __init__(self, aggregations: _Optional[_Mapping[str, Aggregation]] = ...) -> None: ...
+    aggregations: str
+    def __init__(self, aggregations: _Optional[str] = ...) -> None: ...
 
 class AggregationCollectorOutput(_message.Message):
     __slots__ = ["aggregation_results"]
-    class AggregationResultsEntry(_message.Message):
-        __slots__ = ["key", "value"]
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: AggregationResult
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[AggregationResult, _Mapping]] = ...) -> None: ...
     AGGREGATION_RESULTS_FIELD_NUMBER: _ClassVar[int]
-    aggregation_results: _containers.MessageMap[str, AggregationResult]
-    def __init__(self, aggregation_results: _Optional[_Mapping[str, AggregationResult]] = ...) -> None: ...
-
-class AggregationResult(_message.Message):
-    __slots__ = ["bucket", "metric"]
-    BUCKET_FIELD_NUMBER: _ClassVar[int]
-    METRIC_FIELD_NUMBER: _ClassVar[int]
-    bucket: BucketResult
-    metric: MetricResult
-    def __init__(self, bucket: _Optional[_Union[BucketResult, _Mapping]] = ..., metric: _Optional[_Union[MetricResult, _Mapping]] = ...) -> None: ...
-
-class BucketResult(_message.Message):
-    __slots__ = ["range", "histogram", "terms"]
-    RANGE_FIELD_NUMBER: _ClassVar[int]
-    HISTOGRAM_FIELD_NUMBER: _ClassVar[int]
-    TERMS_FIELD_NUMBER: _ClassVar[int]
-    range: RangeResult
-    histogram: HistogramResult
-    terms: TermsResult
-    def __init__(self, range: _Optional[_Union[RangeResult, _Mapping]] = ..., histogram: _Optional[_Union[HistogramResult, _Mapping]] = ..., terms: _Optional[_Union[TermsResult, _Mapping]] = ...) -> None: ...
-
-class RangeResult(_message.Message):
-    __slots__ = ["buckets"]
-    BUCKETS_FIELD_NUMBER: _ClassVar[int]
-    buckets: _containers.RepeatedCompositeFieldContainer[RangeBucketEntry]
-    def __init__(self, buckets: _Optional[_Iterable[_Union[RangeBucketEntry, _Mapping]]] = ...) -> None: ...
-
-class HistogramResult(_message.Message):
-    __slots__ = ["buckets"]
-    BUCKETS_FIELD_NUMBER: _ClassVar[int]
-    buckets: _containers.RepeatedCompositeFieldContainer[BucketEntry]
-    def __init__(self, buckets: _Optional[_Iterable[_Union[BucketEntry, _Mapping]]] = ...) -> None: ...
-
-class TermsResult(_message.Message):
-    __slots__ = ["buckets", "sum_other_doc_count", "doc_count_error_upper_bound"]
-    BUCKETS_FIELD_NUMBER: _ClassVar[int]
-    SUM_OTHER_DOC_COUNT_FIELD_NUMBER: _ClassVar[int]
-    DOC_COUNT_ERROR_UPPER_BOUND_FIELD_NUMBER: _ClassVar[int]
-    buckets: _containers.RepeatedCompositeFieldContainer[BucketEntry]
-    sum_other_doc_count: int
-    doc_count_error_upper_bound: int
-    def __init__(self, buckets: _Optional[_Iterable[_Union[BucketEntry, _Mapping]]] = ..., sum_other_doc_count: _Optional[int] = ..., doc_count_error_upper_bound: _Optional[int] = ...) -> None: ...
-
-class MetricResult(_message.Message):
-    __slots__ = ["single_metric", "stats"]
-    SINGLE_METRIC_FIELD_NUMBER: _ClassVar[int]
-    STATS_FIELD_NUMBER: _ClassVar[int]
-    single_metric: SingleMetricResult
-    stats: StatsResult
-    def __init__(self, single_metric: _Optional[_Union[SingleMetricResult, _Mapping]] = ..., stats: _Optional[_Union[StatsResult, _Mapping]] = ...) -> None: ...
-
-class SingleMetricResult(_message.Message):
-    __slots__ = ["value"]
-    VALUE_FIELD_NUMBER: _ClassVar[int]
-    value: float
-    def __init__(self, value: _Optional[float] = ...) -> None: ...
-
-class StatsResult(_message.Message):
-    __slots__ = ["count", "sum", "min", "max", "avg"]
-    COUNT_FIELD_NUMBER: _ClassVar[int]
-    SUM_FIELD_NUMBER: _ClassVar[int]
-    MIN_FIELD_NUMBER: _ClassVar[int]
-    MAX_FIELD_NUMBER: _ClassVar[int]
-    AVG_FIELD_NUMBER: _ClassVar[int]
-    count: int
-    sum: float
-    min: float
-    max: float
-    avg: float
-    def __init__(self, count: _Optional[int] = ..., sum: _Optional[float] = ..., min: _Optional[float] = ..., max: _Optional[float] = ..., avg: _Optional[float] = ...) -> None: ...
+    aggregation_results: str
+    def __init__(self, aggregation_results: _Optional[str] = ...) -> None: ...
