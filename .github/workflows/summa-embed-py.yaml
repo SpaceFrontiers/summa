@@ -78,7 +78,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: auto
           args: -i ${{ matrix.python-version }} --release --out dist -m ${{ matrix.package }}/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v3
@@ -102,7 +101,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: auto
           args: -i ${{ matrix.python-version }} --release --out dist -m ${{ matrix.package }}/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v3
