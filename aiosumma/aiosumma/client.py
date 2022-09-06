@@ -445,6 +445,7 @@ class SummaClient(BaseGrpcClient):
     async def documents(
             self,
             index_name: str,
+            fields: Optional[List[str]] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
@@ -458,7 +459,10 @@ class SummaClient(BaseGrpcClient):
         """
         # asyncfor is buggy: https://github.com/grpc/grpc/issues/32005
         streaming_call = self.stubs['index_api'].documents(
-            index_service_pb.DocumentsRequest(index_name=index_name),
+            index_service_pb.DocumentsRequest(
+                index_name=index_name,
+                fields=fields,
+            ),
             metadata=setup_metadata(session_id, request_id),
         )
         while True:

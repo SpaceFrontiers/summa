@@ -84,22 +84,12 @@ parent: APIs
     - [ConflictStrategy](#summa-proto-ConflictStrategy)
   
 - [query.proto](#query-proto)
-    - [Aggregation](#summa-proto-Aggregation)
     - [AggregationCollector](#summa-proto-AggregationCollector)
-    - [AggregationCollector.AggregationsEntry](#summa-proto-AggregationCollector-AggregationsEntry)
     - [AggregationCollectorOutput](#summa-proto-AggregationCollectorOutput)
-    - [AggregationCollectorOutput.AggregationResultsEntry](#summa-proto-AggregationCollectorOutput-AggregationResultsEntry)
-    - [AggregationResult](#summa-proto-AggregationResult)
     - [AllQuery](#summa-proto-AllQuery)
-    - [AverageAggregation](#summa-proto-AverageAggregation)
     - [BooleanQuery](#summa-proto-BooleanQuery)
     - [BooleanSubquery](#summa-proto-BooleanSubquery)
     - [BoostQuery](#summa-proto-BoostQuery)
-    - [BucketAggregation](#summa-proto-BucketAggregation)
-    - [BucketAggregation.SubAggregationEntry](#summa-proto-BucketAggregation-SubAggregationEntry)
-    - [BucketEntry](#summa-proto-BucketEntry)
-    - [BucketEntry.SubAggregationEntry](#summa-proto-BucketEntry-SubAggregationEntry)
-    - [BucketResult](#summa-proto-BucketResult)
     - [Collector](#summa-proto-Collector)
     - [CollectorOutput](#summa-proto-CollectorOutput)
     - [CountCollector](#summa-proto-CountCollector)
@@ -114,15 +104,10 @@ parent: APIs
     - [FacetCollectorOutput](#summa-proto-FacetCollectorOutput)
     - [FacetCollectorOutput.FacetCountsEntry](#summa-proto-FacetCollectorOutput-FacetCountsEntry)
     - [Highlight](#summa-proto-Highlight)
-    - [HistogramAggregation](#summa-proto-HistogramAggregation)
-    - [HistogramBounds](#summa-proto-HistogramBounds)
-    - [HistogramResult](#summa-proto-HistogramResult)
     - [Key](#summa-proto-Key)
     - [MatchQuery](#summa-proto-MatchQuery)
     - [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode)
     - [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode)
-    - [MetricAggregation](#summa-proto-MetricAggregation)
-    - [MetricResult](#summa-proto-MetricResult)
     - [MoreLikeThisQuery](#summa-proto-MoreLikeThisQuery)
     - [MorphologyConfig](#summa-proto-MorphologyConfig)
     - [NerMatchesPromoter](#summa-proto-NerMatchesPromoter)
@@ -135,12 +120,7 @@ parent: APIs
     - [QueryParserConfig.TermFieldMapperConfigsEntry](#summa-proto-QueryParserConfig-TermFieldMapperConfigsEntry)
     - [RandomDocument](#summa-proto-RandomDocument)
     - [Range](#summa-proto-Range)
-    - [RangeAggregation](#summa-proto-RangeAggregation)
-    - [RangeAggregationRange](#summa-proto-RangeAggregationRange)
-    - [RangeBucketEntry](#summa-proto-RangeBucketEntry)
-    - [RangeBucketEntry.SubAggregationEntry](#summa-proto-RangeBucketEntry-SubAggregationEntry)
     - [RangeQuery](#summa-proto-RangeQuery)
-    - [RangeResult](#summa-proto-RangeResult)
     - [RegexQuery](#summa-proto-RegexQuery)
     - [ReservoirSamplingCollector](#summa-proto-ReservoirSamplingCollector)
     - [ReservoirSamplingCollectorOutput](#summa-proto-ReservoirSamplingCollectorOutput)
@@ -149,14 +129,9 @@ parent: APIs
     - [ScoredDocument.SnippetsEntry](#summa-proto-ScoredDocument-SnippetsEntry)
     - [Scorer](#summa-proto-Scorer)
     - [SearchResponse](#summa-proto-SearchResponse)
-    - [SingleMetricResult](#summa-proto-SingleMetricResult)
     - [Snippet](#summa-proto-Snippet)
-    - [StatsAggregation](#summa-proto-StatsAggregation)
-    - [StatsResult](#summa-proto-StatsResult)
     - [TermFieldMapperConfig](#summa-proto-TermFieldMapperConfig)
     - [TermQuery](#summa-proto-TermQuery)
-    - [TermsAggregation](#summa-proto-TermsAggregation)
-    - [TermsResult](#summa-proto-TermsResult)
     - [TopDocsCollector](#summa-proto-TopDocsCollector)
     - [TopDocsCollector.SnippetConfigsEntry](#summa-proto-TopDocsCollector-SnippetConfigsEntry)
   
@@ -1333,22 +1308,6 @@ Manages indices
 
 
 
-<a name="summa-proto-Aggregation"></a>
-
-### Aggregation
-Aggregation
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| bucket | [BucketAggregation](#summa-proto-BucketAggregation) |  |  |
-| metric | [MetricAggregation](#summa-proto-MetricAggregation) |  |  |
-
-
-
-
-
-
 <a name="summa-proto-AggregationCollector"></a>
 
 ### AggregationCollector
@@ -1357,23 +1316,7 @@ Aggregation
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| aggregations | [AggregationCollector.AggregationsEntry](#summa-proto-AggregationCollector-AggregationsEntry) | repeated |  |
-
-
-
-
-
-
-<a name="summa-proto-AggregationCollector-AggregationsEntry"></a>
-
-### AggregationCollector.AggregationsEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [string](#string) |  |  |
-| value | [Aggregation](#summa-proto-Aggregation) |  |  |
+| aggregations | [string](#string) |  |  |
 
 
 
@@ -1388,39 +1331,7 @@ Aggregation
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| aggregation_results | [AggregationCollectorOutput.AggregationResultsEntry](#summa-proto-AggregationCollectorOutput-AggregationResultsEntry) | repeated |  |
-
-
-
-
-
-
-<a name="summa-proto-AggregationCollectorOutput-AggregationResultsEntry"></a>
-
-### AggregationCollectorOutput.AggregationResultsEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [string](#string) |  |  |
-| value | [AggregationResult](#summa-proto-AggregationResult) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-AggregationResult"></a>
-
-### AggregationResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| bucket | [BucketResult](#summa-proto-BucketResult) |  |  |
-| metric | [MetricResult](#summa-proto-MetricResult) |  |  |
+| aggregation_results | [string](#string) |  |  |
 
 
 
@@ -1431,21 +1342,6 @@ Aggregation
 
 ### AllQuery
 
-
-
-
-
-
-
-<a name="summa-proto-AverageAggregation"></a>
-
-### AverageAggregation
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| field | [string](#string) |  |  |
 
 
 
@@ -1493,90 +1389,6 @@ Aggregation
 | ----- | ---- | ----- | ----------- |
 | query | [Query](#summa-proto-Query) |  |  |
 | score | [string](#string) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-BucketAggregation"></a>
-
-### BucketAggregation
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| range | [RangeAggregation](#summa-proto-RangeAggregation) |  |  |
-| histogram | [HistogramAggregation](#summa-proto-HistogramAggregation) |  |  |
-| terms | [TermsAggregation](#summa-proto-TermsAggregation) |  |  |
-| sub_aggregation | [BucketAggregation.SubAggregationEntry](#summa-proto-BucketAggregation-SubAggregationEntry) | repeated |  |
-
-
-
-
-
-
-<a name="summa-proto-BucketAggregation-SubAggregationEntry"></a>
-
-### BucketAggregation.SubAggregationEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [string](#string) |  |  |
-| value | [Aggregation](#summa-proto-Aggregation) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-BucketEntry"></a>
-
-### BucketEntry
-Extra structures
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [Key](#summa-proto-Key) |  |  |
-| doc_count | [uint64](#uint64) |  |  |
-| sub_aggregation | [BucketEntry.SubAggregationEntry](#summa-proto-BucketEntry-SubAggregationEntry) | repeated |  |
-
-
-
-
-
-
-<a name="summa-proto-BucketEntry-SubAggregationEntry"></a>
-
-### BucketEntry.SubAggregationEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [string](#string) |  |  |
-| value | [AggregationResult](#summa-proto-AggregationResult) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-BucketResult"></a>
-
-### BucketResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| range | [RangeResult](#summa-proto-RangeResult) |  |  |
-| histogram | [HistogramResult](#summa-proto-HistogramResult) |  |  |
-| terms | [TermsResult](#summa-proto-TermsResult) |  |  |
 
 
 
@@ -1800,57 +1612,6 @@ Collectors and CollectorOutputs
 
 
 
-<a name="summa-proto-HistogramAggregation"></a>
-
-### HistogramAggregation
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| field | [string](#string) |  |  |
-| interval | [double](#double) |  |  |
-| offset | [double](#double) | optional |  |
-| min_doc_count | [uint64](#uint64) | optional |  |
-| hard_bounds | [HistogramBounds](#summa-proto-HistogramBounds) | optional |  |
-| extended_bounds | [HistogramBounds](#summa-proto-HistogramBounds) | optional |  |
-
-
-
-
-
-
-<a name="summa-proto-HistogramBounds"></a>
-
-### HistogramBounds
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| min | [double](#double) |  |  |
-| max | [double](#double) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-HistogramResult"></a>
-
-### HistogramResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| buckets | [BucketEntry](#summa-proto-BucketEntry) | repeated |  |
-
-
-
-
-
-
 <a name="summa-proto-Key"></a>
 
 ### Key
@@ -1902,38 +1663,6 @@ Collectors and CollectorOutputs
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | tie_breaker | [float](#float) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-MetricAggregation"></a>
-
-### MetricAggregation
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| average | [AverageAggregation](#summa-proto-AverageAggregation) |  |  |
-| stats | [StatsAggregation](#summa-proto-StatsAggregation) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-MetricResult"></a>
-
-### MetricResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| single_metric | [SingleMetricResult](#summa-proto-SingleMetricResult) |  |  |
-| stats | [StatsResult](#summa-proto-StatsResult) |  |  |
 
 
 
@@ -2161,74 +1890,6 @@ Recursive query DSL
 
 
 
-<a name="summa-proto-RangeAggregation"></a>
-
-### RangeAggregation
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| field | [string](#string) |  |  |
-| ranges | [RangeAggregationRange](#summa-proto-RangeAggregationRange) | repeated |  |
-
-
-
-
-
-
-<a name="summa-proto-RangeAggregationRange"></a>
-
-### RangeAggregationRange
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| from | [double](#double) | optional |  |
-| to | [double](#double) | optional |  |
-| key | [string](#string) | optional |  |
-
-
-
-
-
-
-<a name="summa-proto-RangeBucketEntry"></a>
-
-### RangeBucketEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [Key](#summa-proto-Key) |  |  |
-| doc_count | [uint64](#uint64) |  |  |
-| sub_aggregation | [RangeBucketEntry.SubAggregationEntry](#summa-proto-RangeBucketEntry-SubAggregationEntry) | repeated |  |
-| from | [double](#double) | optional |  |
-| to | [double](#double) | optional |  |
-
-
-
-
-
-
-<a name="summa-proto-RangeBucketEntry-SubAggregationEntry"></a>
-
-### RangeBucketEntry.SubAggregationEntry
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [string](#string) |  |  |
-| value | [AggregationResult](#summa-proto-AggregationResult) |  |  |
-
-
-
-
-
-
 <a name="summa-proto-RangeQuery"></a>
 
 ### RangeQuery
@@ -2239,21 +1900,6 @@ Recursive query DSL
 | ----- | ---- | ----- | ----------- |
 | field | [string](#string) |  |  |
 | value | [Range](#summa-proto-Range) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-RangeResult"></a>
-
-### RangeResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| buckets | [RangeBucketEntry](#summa-proto-RangeBucketEntry) | repeated |  |
 
 
 
@@ -2390,21 +2036,6 @@ Recursive query DSL
 
 
 
-<a name="summa-proto-SingleMetricResult"></a>
-
-### SingleMetricResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| value | [double](#double) | optional |  |
-
-
-
-
-
-
 <a name="summa-proto-Snippet"></a>
 
 ### Snippet
@@ -2416,40 +2047,6 @@ Recursive query DSL
 | fragment | [bytes](#bytes) |  |  |
 | highlights | [Highlight](#summa-proto-Highlight) | repeated |  |
 | html | [string](#string) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-StatsAggregation"></a>
-
-### StatsAggregation
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| field | [string](#string) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-StatsResult"></a>
-
-### StatsResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| count | [uint64](#uint64) |  |  |
-| sum | [double](#double) |  |  |
-| min | [double](#double) | optional |  |
-| max | [double](#double) | optional |  |
-| avg | [double](#double) | optional |  |
 
 
 
@@ -2481,44 +2078,6 @@ Recursive query DSL
 | ----- | ---- | ----- | ----------- |
 | field | [string](#string) |  |  |
 | value | [string](#string) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-TermsAggregation"></a>
-
-### TermsAggregation
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| field | [string](#string) |  |  |
-| size | [uint32](#uint32) | optional |  |
-| split_size | [uint32](#uint32) | optional |  |
-| segment_size | [uint32](#uint32) | optional |  |
-| show_term_doc_count_error | [bool](#bool) | optional |  |
-| min_doc_count | [uint64](#uint64) | optional |  |
-| order | [CustomOrder](#summa-proto-CustomOrder) | optional |  |
-
-
-
-
-
-
-<a name="summa-proto-TermsResult"></a>
-
-### TermsResult
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| buckets | [BucketEntry](#summa-proto-BucketEntry) | repeated |  |
-| sum_other_doc_count | [uint64](#uint64) |  |  |
-| doc_count_error_upper_bound | [uint64](#uint64) | optional |  |
 
 
 
