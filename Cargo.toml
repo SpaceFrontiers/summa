@@ -42,9 +42,9 @@ serde_yaml = { version = "0.8" }
 strfmt = "0.2"
 summa-proto = { version = "0.31.0", path = "./summa-proto", default_features = false }
 take_mut = "0.2"
-tantivy = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa", default_features = false, features = ["quickwit", "zstd-compression"] }
-tantivy-common = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa" }
-tantivy-query-grammar = { git = "https://github.com/izihawa/tantivy", branch = "feature/summa" }
+tantivy = { package = "izihawa-tantivy", version = "0.20.2", default_features = false, features = ["quickwit", "zstd-compression"] }
+tantivy-common = { package = "izihawa-tantivy-common", version = "0.5.0" }
+tantivy-query-grammar = { package = "izihawa-tantivy-query-grammar", version = "0.20.0" }
 thiserror = "1.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
 tokio = { version = "1.25", default_features = false }

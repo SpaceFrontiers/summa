@@ -5,7 +5,7 @@ authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
 description = "Summa Core library"
-include = ["resources/**/*"]
+include = ["src/**/*", "resources/**/*", "LICENSE"]
 
 [lib]
 name = "summa_core"
