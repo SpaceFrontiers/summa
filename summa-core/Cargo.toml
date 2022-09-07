@@ -40,6 +40,7 @@ instant = { workspace = true }
 itertools = { workspace = true }
 lru = { workspace = true }
 oneshot = { workspace = true }
+openssl-sys = { workspace = true }
 opentelemetry = { version = "0.19", features = ["metrics", "rt-tokio"], optional = true }
 parking_lot = { workspace = true }
 pest = { workspace = true }
