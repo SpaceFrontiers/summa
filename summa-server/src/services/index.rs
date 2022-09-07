@@ -263,7 +263,7 @@ impl Index {
             .unwrap_or(target_index_holder.conflict_strategy());
         let source_index_holder = self.get_index_holder(&copy_documents_request.source_index_name).await?;
         let searcher = source_index_holder.index_reader().searcher();
-        let mut source_documents_receiver = source_index_holder.documents(&searcher, Some)?;
+        let mut source_documents_receiver = source_index_holder.documents(&searcher, &None, Some)?;
         let mut documents = 0u32;
         while let Some(document) = source_documents_receiver.recv().await {
             target_index_writer

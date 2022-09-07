@@ -339,12 +339,14 @@ class SetIndexAliasResponse(_message.Message):
     def __init__(self, old_index_name: _Optional[str] = ...) -> None: ...
 
 class DocumentsRequest(_message.Message):
-    __slots__ = ["index_name", "fields"]
+    __slots__ = ["index_name", "fields", "query_filter"]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     FIELDS_FIELD_NUMBER: _ClassVar[int]
+    QUERY_FILTER_FIELD_NUMBER: _ClassVar[int]
     index_name: str
     fields: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, index_name: _Optional[str] = ..., fields: _Optional[_Iterable[str]] = ...) -> None: ...
+    query_filter: _query_pb2.Query
+    def __init__(self, index_name: _Optional[str] = ..., fields: _Optional[_Iterable[str]] = ..., query_filter: _Optional[_Union[_query_pb2.Query, _Mapping]] = ...) -> None: ...
 
 class DocumentsResponse(_message.Message):
     __slots__ = ["document"]

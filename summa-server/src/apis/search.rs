@@ -5,7 +5,6 @@
 use std::time::Instant;
 
 use summa_proto::proto;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info_span, Instrument};
 
@@ -27,25 +26,6 @@ impl SearchApiImpl {
 #[tonic::async_trait]
 impl proto::search_api_server::SearchApi for SearchApiImpl {
     async fn search(&self, proto_request: Request<proto::SearchRequest>) -> Result<Response<proto::SearchResponse>, Status> {
-        let proto_request = proto_request.into_inner();
-        let now = Instant::now();
-        let collector_outputs = self
-            .index_service
-            .search(proto_request)
-            .instrument(info_span!("search"))
-            .await
-            .map_err(crate::errors::Error::from)?;
-
-        let elapsed_secs = now.elapsed().as_secs_f64();
-        Ok(Response::new(proto::SearchResponse {
-            collector_outputs,
-            elapsed_secs,
-        }))
-    }
-
-    type searchStream = ReceiverStream<Result<proto::SearchResponse, Status>>;
-
-    async fn search_stream(&self, proto_request: Request<proto::DocumentsRequest>) -> Result<Response<Self::searchStream>, Status> {
         let proto_request = proto_request.into_inner();
         let now = Instant::now();
         let collector_outputs = self

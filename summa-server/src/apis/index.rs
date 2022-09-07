@@ -153,7 +153,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter().map(|x| x.0)));
 
         let documents_receiver = index_holder
-            .documents(&searcher, move |document| {
+            .documents(&searcher, &proto_request.query_filter, move |document| {
                 let document = NamedFieldDocument::from_document(&schema, &query_fields, &multi_fields, &document).to_json_string();
                 Some(Ok(DocumentsResponse { document }))
             })

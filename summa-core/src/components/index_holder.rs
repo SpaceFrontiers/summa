@@ -16,7 +16,7 @@ use opentelemetry::{
 use serde::Deserialize;
 use summa_proto::proto;
 use summa_proto::proto::IndexAttributes;
-use tantivy::collector::{Collector, MultiCollector, MultiFruit};
+use tantivy::collector::{Collector, DocSetCollector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
@@ -509,35 +509,77 @@ impl IndexHolder {
     pub fn documents<O: Send + 'static>(
         &self,
         searcher: &Searcher,
+        query_filter: &Option<proto::Query>,
         documents_modifier: impl Fn(tantivy::schema::Document) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
-        let segment_readers = searcher.segment_readers();
-        let (tx, rx) = tokio::sync::mpsc::channel(segment_readers.len() * 2 + 1);
-        for segment_reader in segment_readers {
-            let documents_modifier = documents_modifier.clone();
-            let tx = tx.clone();
-            let segment_reader = segment_reader.clone();
-            let span = tracing::Span::current();
-            tokio::task::spawn_blocking(move || {
-                span.in_scope(|| {
-                    let store_reader = segment_reader.get_store_reader(1)?;
-                    for document in store_reader.iter(segment_reader.alive_bitset()) {
-                        let Ok(document) = document
+        match query_filter {
+            None | Some(proto::Query { query: None }) => {
+                let segment_readers = searcher.segment_readers();
+                let (tx, rx) = tokio::sync::mpsc::channel(segment_readers.len() * 2 + 1);
+                for segment_reader in segment_readers {
+                    let documents_modifier = documents_modifier.clone();
+                    let tx = tx.clone();
+                    let segment_reader = segment_reader.clone();
+                    let span = tracing::Span::current();
+                    tokio::task::spawn_blocking(move || {
+                        span.in_scope(|| {
+                            let store_reader = segment_reader.get_store_reader(1)?;
+                            for document in store_reader.iter(segment_reader.alive_bitset()) {
+                                let Ok(document) = document
                         else {
                             info!(action = "broken_document", document = ?document);
                             return Ok::<_, Error>(());
                         };
-                        if let Some(document) = documents_modifier(document) {
-                            if tx.blocking_send(document).is_err() {
-                                info!(action = "documents_client_dropped");
-                                return Ok::<_, Error>(());
+                                if let Some(document) = documents_modifier(document) {
+                                    if tx.blocking_send(document).is_err() {
+                                        info!(action = "documents_client_dropped");
+                                        return Ok::<_, Error>(());
+                                    }
+                                }
                             }
+                            Ok(())
+                        })
+                    });
+                }
+                Ok(rx)
+            }
+            Some(proto::Query { query: Some(query_filter) }) => self.filtered_documents(searcher, query_filter, documents_modifier),
+        }
+    }
+
+    #[cfg(feature = "tokio-rt")]
+    fn filtered_documents<O: Send + 'static>(
+        &self,
+        searcher: &Searcher,
+        query: &proto::query::Query,
+        documents_modifier: impl Fn(tantivy::schema::Document) -> Option<O> + Clone + Send + Sync + 'static,
+    ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
+        let parsed_query = self.query_parser.parse_query(query.clone())?;
+        let docs = searcher.search(&parsed_query, &DocSetCollector)?;
+
+        let segment_readers = searcher.segment_readers();
+        let (tx, rx) = tokio::sync::mpsc::channel(segment_readers.len() * 2 + 1);
+        let span = tracing::Span::current();
+        let searcher = searcher.clone();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                for doc_address in docs {
+                    let document = searcher.doc(doc_address);
+                    let Ok(document) = document
+                        else {
+                            info!(action = "broken_document", document = ?document);
+                            return Ok::<_, Error>(());
+                        };
+                    if let Some(document) = documents_modifier(document) {
+                        if tx.blocking_send(document).is_err() {
+                            info!(action = "documents_client_dropped");
+                            return Ok::<_, Error>(());
                         }
                     }
-                    Ok(())
-                })
-            });
-        }
+                }
+                Ok(())
+            })
+        });
         Ok(rx)
     }
 
@@ -556,7 +598,7 @@ pub mod tests {
     use serde_json::json;
     use summa_proto::proto;
     use summa_proto::proto::ConflictStrategy;
-    use tantivy::collector::{Count, TopDocs};
+    use tantivy::collector::Count;
     use tantivy::query::{AllQuery, TermQuery};
     use tantivy::schema::IndexRecordOption;
     use tantivy::{doc, Document, IndexBuilder, Term};

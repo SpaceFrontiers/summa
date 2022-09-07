@@ -1,21 +1,10 @@
 import asyncio
 import sys
-from typing import (
-    AsyncIterator,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import AsyncIterator, Dict, Iterable, List, Optional, Tuple, Union
 
 import grpc
 import orjson as json
-from aiogrpcclient import (
-    BaseGrpcClient,
-    expose,
-)
+from aiogrpcclient import BaseGrpcClient, expose
 from grpc import StatusCode
 from grpc.experimental.aio import AioRpcError
 from izihawa_utils.pb_to_json import ParseDict
@@ -29,10 +18,7 @@ from .proto.consumer_service_pb2_grpc import ConsumerApiStub
 from .proto.index_service_pb2_grpc import IndexApiStub
 from .proto.reflection_service_pb2_grpc import ReflectionApiStub
 from .proto.search_service_pb2_grpc import SearchApiStub
-from .proto.utils_pb2 import (  # noqa
-    Asc,
-    Desc,
-)
+from .proto.utils_pb2 import Asc, Desc  # noqa
 
 
 def setup_metadata(session_id, request_id):
@@ -42,6 +28,22 @@ def setup_metadata(session_id, request_id):
     if request_id:
         metadata.append(('request-id', request_id))
     return metadata
+
+
+def prepare_search_request(search_request):
+    if isinstance(search_request, Dict):
+        dict_search_request = search_request
+        search_request = search_service_pb.SearchRequest()
+        ParseDict(dict_search_request, search_request)
+    return search_request
+
+
+def prepare_query(query):
+    if isinstance(query, Dict):
+        dict_query = query
+        query = query_pb.Query()
+        ParseDict(dict_query, query)
+    return query
 
 
 def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int, conflict_strategy: Optional[str] = None):
@@ -459,6 +461,7 @@ class SummaClient(BaseGrpcClient):
     async def documents(
             self,
             index_name: str,
+            query_filter: Optional[dict] = None,
             fields: Optional[List[str]] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
@@ -475,6 +478,7 @@ class SummaClient(BaseGrpcClient):
         streaming_call = self.stubs['index_api'].documents(
             index_service_pb.DocumentsRequest(
                 index_name=index_name,
+                query_filter=prepare_query(query_filter),
                 fields=fields,
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -563,12 +567,8 @@ class SummaClient(BaseGrpcClient):
             session_id: session id
         """
         try:
-            if isinstance(search_request, Dict):
-                dict_search_request = search_request
-                search_request = search_service_pb.SearchRequest()
-                ParseDict(dict_search_request, search_request)
             return await self.stubs['search_api'].search(
-                search_request,
+                prepare_search_request(search_request),
                 metadata=setup_metadata(session_id, request_id),
             )
         except AioRpcError as e:

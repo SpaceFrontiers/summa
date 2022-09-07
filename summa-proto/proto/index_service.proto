@@ -270,6 +270,7 @@ message SetIndexAliasResponse {
 message DocumentsRequest {
   string index_name = 1;
   repeated string fields = 2;
+  optional Query query_filter = 3;
 }
 
 // Single document from the index
