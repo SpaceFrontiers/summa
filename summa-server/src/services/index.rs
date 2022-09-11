@@ -413,7 +413,7 @@ impl Index {
         drop(server_config);
         let index_holder = self.consumer_manager.read().await.find_index_holder_for(&delete_consumer_request.consumer_name);
         if let Some(index_holder) = index_holder {
-            let prepared_consumption = self.commit(&index_holder).await?;
+            let prepared_consumption = self.commit(&index_holder, false).await?;
             if let Some(prepared_consumption) = prepared_consumption {
                 prepared_consumption.on_delete().await?;
             }
@@ -429,7 +429,7 @@ impl Index {
         if !force {
             self.consumer_manager.write().await.stop().await?;
             for index_holder in self.index_registry.index_holders_cloned().await.values() {
-                self.commit(index_holder).await?;
+                self.commit(index_holder, false).await?;
             }
         }
         Ok(())
@@ -441,8 +441,8 @@ impl Index {
     }
 
     /// Commits all and restarts consuming threads
-    pub async fn commit_and_restart_consumption(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<()> {
-        let prepared_consumption = self.commit(index_holder).await?;
+    pub async fn commit_and_restart_consumption(&self, index_holder: &Handler<IndexHolder>, with_hotcache: bool) -> SummaServerResult<()> {
+        let prepared_consumption = self.commit(index_holder, with_hotcache).await?;
         if let Some(prepared_consumption) = prepared_consumption {
             self.consumer_manager.write().await.start_consuming(index_holder, prepared_consumption).await?;
         }
@@ -460,7 +460,7 @@ impl Index {
 
     /// Commits all without restarting consuming threads
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
-    pub async fn commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
+    pub async fn commit(&self, index_holder: &Handler<IndexHolder>, with_hotcache: bool) -> SummaServerResult<Option<PreparedConsumption>> {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         let mut index_writer = index_holder.index_writer_holder()?.clone().write_owned().await;
         let index_holder = index_holder.clone();
@@ -468,7 +468,7 @@ impl Index {
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                index_writer.commit_and_prepare(true)?;
+                index_writer.commit_and_prepare(with_hotcache)?;
                 index_holder.index_reader().reload()?;
                 Ok::<_, crate::errors::Error>(())
             })
@@ -498,7 +498,7 @@ impl Index {
         let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         let span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit_and_prepare(true))).await??;
+        tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit_and_prepare(false))).await??;
         Ok(match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
@@ -790,7 +790,7 @@ pub(crate) mod tests {
         index_holder
             .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
             .await?;
-        index_service.commit(&index_holder).await?;
+        index_service.commit(&index_holder, false).await?;
 
         let search_response = index_holder
             .search(
@@ -832,7 +832,7 @@ pub(crate) mod tests {
             for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 300) {
                 index_holder.index_document(d).await?;
             }
-            index_service.commit(&index_holder).await?;
+            index_service.commit(&index_holder, false).await?;
         }
         let index_holder_clone = index_holder.clone();
         let index_writer = index_holder.index_writer_holder().unwrap().clone().write_owned().await;

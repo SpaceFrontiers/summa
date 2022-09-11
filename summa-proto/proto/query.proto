@@ -1,8 +1,6 @@
 syntax = "proto3";
 package summa.proto;
 
-import "utils.proto";
-
 message TermFieldMapperConfig {
   repeated string fields = 1;
 }
@@ -129,22 +127,6 @@ message TermQuery {
 
 message ExistsQuery {
   string field = 1;
-}
-
-message CustomOrder {
-    oneof order_target {
-      Empty key = 1;
-      Empty count = 2;
-      string sub_aggregation = 3;
-    };
-    Order order = 4;
-}
-
-message Key {
-  oneof key {
-    string str = 1;
-    double f64 = 2;
-  }
 }
 
 enum Occur {

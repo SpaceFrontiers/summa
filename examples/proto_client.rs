@@ -83,6 +83,7 @@ async fn main() -> Result<(), tonic::Status> {
     index_api_client
         .commit_index(proto::CommitIndexRequest {
             index_name: "test_index".to_string(),
+            with_hotcache: false,
         })
         .await?;
     let search_response = search_api_client

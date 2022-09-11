@@ -84,8 +84,11 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
 
     async fn commit_index(&self, proto_request: Request<proto::CommitIndexRequest>) -> Result<Response<proto::CommitIndexResponse>, Status> {
         let now = Instant::now();
-        let index_holder = self.index_service.get_index_holder(&proto_request.into_inner().index_name).await?;
-        self.index_service.commit_and_restart_consumption(&index_holder).await?;
+        let proto_request = proto_request.into_inner();
+        let index_holder = self.index_service.get_index_holder(&proto_request.index_name).await?;
+        self.index_service
+            .commit_and_restart_consumption(&index_holder, proto_request.with_hotcache)
+            .await?;
         Ok(Response::new(proto::CommitIndexResponse {
             elapsed_secs: now.elapsed().as_secs_f64(),
         }))

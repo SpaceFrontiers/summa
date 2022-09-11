@@ -272,7 +272,7 @@ impl IndexWriterHolder {
     }
 
     /// Delete index by its unique fields
-    pub(super) fn resolve_conflicts(&self, document: &mut Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<Option<u64>> {
+    pub(super) fn resolve_conflicts(&self, document: &Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<Option<u64>> {
         if self.unique_fields.is_empty() || matches!(conflict_strategy, proto::ConflictStrategy::DoNothing) {
             return Ok(None);
         }
@@ -460,28 +460,5 @@ impl IndexWriterHolder {
             directory.atomic_write(Path::new(&format!("hotcache.{}.bin", opstamp)), &hotcache_bytes)?;
         }
         Ok(opstamp)
-    }
-
-    pub fn lock_files(&mut self, with_hotcache: bool) -> SummaResult<Vec<String>> {
-        let mut segment_files = vec![".managed.json".to_string(), "meta.json".to_string()];
-        let opstamp = self.commit_and_prepare(with_hotcache)?;
-        if with_hotcache {
-            segment_files.push(format!("hotcache.{}.bin", opstamp))
-        }
-        segment_files.extend(self.get_index_files()?);
-        Ok(segment_files)
-    }
-
-    /// Get segments
-    fn get_index_files(&self) -> SummaResult<impl Iterator<Item = String> + '_> {
-        Ok(self.index().searchable_segments()?.into_iter().flat_map(|segment| {
-            tantivy::SegmentComponent::iterator()
-                .filter_map(|segment_component| {
-                    let filepath = segment.meta().relative_path(*segment_component);
-                    let file_name = filepath.to_string_lossy().to_string();
-                    self.index().directory().exists(&filepath).expect("cannot parse").then_some(file_name)
-                })
-                .collect::<Vec<_>>()
-        }))
     }
 }

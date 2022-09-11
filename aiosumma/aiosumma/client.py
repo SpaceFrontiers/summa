@@ -110,6 +110,7 @@ class SummaClient(BaseGrpcClient):
     async def commit_index(
             self,
             index_name: str,
+            with_hotcache: bool,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.CommitIndexResponse:
@@ -120,6 +121,7 @@ class SummaClient(BaseGrpcClient):
 
         Args:
             index_name: index name
+            with_hotcache: create hot cache after commit that improves startup performance but makes committing slower
             request_id: request id
             session_id: session id
         Returns:
@@ -128,6 +130,7 @@ class SummaClient(BaseGrpcClient):
         return await self.stubs['index_api'].commit_index(
             index_service_pb.CommitIndexRequest(
                 index_name=index_name,
+                with_hotcache=with_hotcache,
             ),
             metadata=setup_metadata(session_id, request_id),
         )

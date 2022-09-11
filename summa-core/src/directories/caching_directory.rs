@@ -51,7 +51,7 @@ impl FileStats {
 
     pub fn inc_gen(&self, path: &Path, new_len: Option<u64>) -> RwLockWriteGuard<'_, RawRwLock, HashMap<PathBuf, FileStat>> {
         let mut write_lock = self.0.write();
-        write_lock.entry(path.to_path_buf()).or_insert_with(Default::default).inc_gen(new_len);
+        write_lock.entry(path.to_path_buf()).or_default().inc_gen(new_len);
         write_lock
     }
 

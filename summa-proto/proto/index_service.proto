@@ -42,14 +42,6 @@ service IndexApi {
   rpc warmup_index (WarmupIndexRequest) returns (WarmupIndexResponse) {}
 }
 
-// Possible primary keys
-message PrimaryKey {
-  oneof value {
-    string str = 1;
-    int64 i64 = 2;
-  }
-}
-
 // Merge policy that describes how to merge committed segments
 message MergePolicy {
   oneof merge_policy {
@@ -87,6 +79,7 @@ message AttachIndexResponse {
 // Store the state of index to the storage
 message CommitIndexRequest {
   string index_name = 1;
+  bool with_hotcache = 2;
 }
 
 // Returned data from the commit command

@@ -525,11 +525,10 @@ impl IndexHolder {
                         span.in_scope(|| {
                             let store_reader = segment_reader.get_store_reader(1)?;
                             for document in store_reader.iter(segment_reader.alive_bitset()) {
-                                let Ok(document) = document
-                        else {
-                            info!(action = "broken_document", document = ?document);
-                            return Ok::<_, Error>(());
-                        };
+                                let Ok(document) = document else {
+                                    info!(action = "broken_document", document = ?document);
+                                    return Ok::<_, Error>(());
+                                };
                                 if let Some(document) = documents_modifier(document) {
                                     if tx.blocking_send(document).is_err() {
                                         info!(action = "documents_client_dropped");
@@ -565,11 +564,10 @@ impl IndexHolder {
             span.in_scope(|| {
                 for doc_address in docs {
                     let document = searcher.doc(doc_address);
-                    let Ok(document) = document
-                        else {
-                            info!(action = "broken_document", document = ?document);
-                            return Ok::<_, Error>(());
-                        };
+                    let Ok(document) = document else {
+                        info!(action = "broken_document", document = ?document);
+                        return Ok::<_, Error>(());
+                    };
                     if let Some(document) = documents_modifier(document) {
                         if tx.blocking_send(document).is_err() {
                             info!(action = "documents_client_dropped");
@@ -598,7 +596,7 @@ pub mod tests {
     use serde_json::json;
     use summa_proto::proto;
     use summa_proto::proto::ConflictStrategy;
-    use tantivy::collector::Count;
+    use tantivy::collector::{Count, TopDocs};
     use tantivy::query::{AllQuery, TermQuery};
     use tantivy::schema::IndexRecordOption;
     use tantivy::{doc, Document, IndexBuilder, Term};

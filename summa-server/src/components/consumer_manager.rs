@@ -95,7 +95,7 @@ impl ConsumerManager {
             consumer_thread.stop().await?;
             let stopped_consumption = StoppedConsumption { consumer_thread };
             let mut index_writer_holder = index_holder.index_writer_holder()?.clone().write_owned().await;
-            tokio::task::spawn_blocking(move || index_writer_holder.commit_and_prepare(true)).await??;
+            tokio::task::spawn_blocking(move || index_writer_holder.commit_and_prepare(false)).await??;
             stopped_consumption.commit_offsets().await?;
             Ok(())
         }))

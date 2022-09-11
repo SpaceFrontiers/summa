@@ -322,11 +322,7 @@ impl QueryParser {
         }
 
         if field_type.value_type() != Type::Json && !full_path.is_empty() {
-            return Err(QueryParserError::NonJsonFieldWithPath(format!(
-                "{}.{}",
-                field_entry.name().to_string(),
-                full_path
-            )));
+            return Err(QueryParserError::NonJsonFieldWithPath(format!("{}.{}", field_entry.name(), full_path)));
         }
 
         if !(field_type.is_indexed() || matches!(pre_term.as_rule(), Rule::range) && field_type.is_fast()) {
@@ -713,9 +709,7 @@ impl QueryParser {
                             let field_boost = self.query_parser_config.0.field_boosts.get(field_entry.name()).copied();
                             match field_entry.field_type() {
                                 FieldType::Str(ref str_option) => {
-                                    let Some(option) = str_option.get_indexing_options() else {
-                                        return None
-                                    };
+                                    let option = str_option.get_indexing_options()?;
                                     let terms = match self.parse_words(field, full_path, option, &top_level_phrase) {
                                         Ok(terms) => terms,
                                         Err(err) => return Some(Err(err)),
@@ -726,9 +720,7 @@ impl QueryParser {
                                     })
                                 }
                                 FieldType::JsonObject(ref json_option) => {
-                                    let Some(option) = json_option.get_text_indexing_options() else {
-                                        return None
-                                    };
+                                    let option = str_option.get_indexing_options()?;
                                     let terms = match self.parse_words(field, full_path, option, &top_level_phrase) {
                                         Ok(terms) => terms,
                                         Err(err) => return Some(Err(err)),

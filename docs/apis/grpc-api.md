@@ -68,7 +68,6 @@ parent: APIs
     - [MergePolicy](#summa-proto-MergePolicy)
     - [MergeSegmentsRequest](#summa-proto-MergeSegmentsRequest)
     - [MergeSegmentsResponse](#summa-proto-MergeSegmentsResponse)
-    - [PrimaryKey](#summa-proto-PrimaryKey)
     - [RemoteEngineConfig](#summa-proto-RemoteEngineConfig)
     - [RemoteEngineConfig.HeadersTemplateEntry](#summa-proto-RemoteEngineConfig-HeadersTemplateEntry)
     - [SetIndexAliasRequest](#summa-proto-SetIndexAliasRequest)
@@ -94,7 +93,6 @@ parent: APIs
     - [CollectorOutput](#summa-proto-CollectorOutput)
     - [CountCollector](#summa-proto-CountCollector)
     - [CountCollectorOutput](#summa-proto-CountCollectorOutput)
-    - [CustomOrder](#summa-proto-CustomOrder)
     - [DisjunctionMaxQuery](#summa-proto-DisjunctionMaxQuery)
     - [DocumentsCollectorOutput](#summa-proto-DocumentsCollectorOutput)
     - [EmptyQuery](#summa-proto-EmptyQuery)
@@ -104,7 +102,6 @@ parent: APIs
     - [FacetCollectorOutput](#summa-proto-FacetCollectorOutput)
     - [FacetCollectorOutput.FacetCountsEntry](#summa-proto-FacetCollectorOutput-FacetCountsEntry)
     - [Highlight](#summa-proto-Highlight)
-    - [Key](#summa-proto-Key)
     - [MatchQuery](#summa-proto-MatchQuery)
     - [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode)
     - [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode)
@@ -466,6 +463,7 @@ Store the state of index to the storage
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
+| with_hotcache | [bool](#bool) |  |  |
 
 
 
@@ -684,6 +682,7 @@ Request a stream of all documents from the index
 | ----- | ---- | ----- | ----------- |
 | index_name | [string](#string) |  |  |
 | fields | [string](#string) | repeated |  |
+| query_filter | [Query](#summa-proto-Query) | optional |  |
 
 
 
@@ -1052,22 +1051,6 @@ Merge policy that describes how to merge committed segments
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | segment_id | [string](#string) | optional |  |
-
-
-
-
-
-
-<a name="summa-proto-PrimaryKey"></a>
-
-### PrimaryKey
-Possible primary keys
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| str | [string](#string) |  |  |
-| i64 | [int64](#int64) |  |  |
 
 
 
@@ -1457,24 +1440,6 @@ Collectors and CollectorOutputs
 
 
 
-<a name="summa-proto-CustomOrder"></a>
-
-### CustomOrder
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| key | [Empty](#summa-proto-Empty) |  |  |
-| count | [Empty](#summa-proto-Empty) |  |  |
-| sub_aggregation | [string](#string) |  |  |
-| order | [Order](#summa-proto-Order) |  |  |
-
-
-
-
-
-
 <a name="summa-proto-DisjunctionMaxQuery"></a>
 
 ### DisjunctionMaxQuery
@@ -1606,22 +1571,6 @@ Collectors and CollectorOutputs
 | ----- | ---- | ----- | ----------- |
 | from | [uint32](#uint32) |  |  |
 | to | [uint32](#uint32) |  |  |
-
-
-
-
-
-
-<a name="summa-proto-Key"></a>
-
-### Key
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| str | [string](#string) |  |  |
-| f64 | [double](#double) |  |  |
 
 
 

@@ -207,6 +207,7 @@ mod tests {
         index_api_client
             .commit_index(proto::CommitIndexRequest {
                 index_name: "test_index".to_string(),
+                with_hotcache: false,
             })
             .await?;
         index_api_client
@@ -218,6 +219,7 @@ mod tests {
         index_api_client
             .commit_index(proto::CommitIndexRequest {
                 index_name: "test_index".to_string(),
+                with_hotcache: false,
             })
             .await?;
         Ok(r)
