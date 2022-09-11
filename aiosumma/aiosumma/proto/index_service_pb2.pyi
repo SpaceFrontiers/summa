@@ -47,14 +47,6 @@ Zstd14: Compression
 Zstd19: Compression
 Zstd22: Compression
 
-class PrimaryKey(_message.Message):
-    __slots__ = ["str", "i64"]
-    STR_FIELD_NUMBER: _ClassVar[int]
-    I64_FIELD_NUMBER: _ClassVar[int]
-    str: str
-    i64: int
-    def __init__(self, str: _Optional[str] = ..., i64: _Optional[int] = ...) -> None: ...
-
 class MergePolicy(_message.Message):
     __slots__ = ["log", "temporal"]
     LOG_FIELD_NUMBER: _ClassVar[int]
@@ -94,10 +86,12 @@ class AttachIndexResponse(_message.Message):
     def __init__(self, index: _Optional[_Union[IndexDescription, _Mapping]] = ...) -> None: ...
 
 class CommitIndexRequest(_message.Message):
-    __slots__ = ["index_name"]
+    __slots__ = ["index_name", "with_hotcache"]
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
+    WITH_HOTCACHE_FIELD_NUMBER: _ClassVar[int]
     index_name: str
-    def __init__(self, index_name: _Optional[str] = ...) -> None: ...
+    with_hotcache: bool
+    def __init__(self, index_name: _Optional[str] = ..., with_hotcache: bool = ...) -> None: ...
 
 class CommitIndexResponse(_message.Message):
     __slots__ = ["elapsed_secs"]

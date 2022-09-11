@@ -720,7 +720,7 @@ impl QueryParser {
                                     })
                                 }
                                 FieldType::JsonObject(ref json_option) => {
-                                    let option = str_option.get_indexing_options()?;
+                                    let option = json_option.get_indexing_options()?;
                                     let terms = match self.parse_words(field, full_path, option, &top_level_phrase) {
                                         Ok(terms) => terms,
                                         Err(err) => return Some(Err(err)),
