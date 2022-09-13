@@ -110,7 +110,7 @@ class SummaClient(BaseGrpcClient):
     async def commit_index(
             self,
             index_name: str,
-            with_hotcache: bool,
+            with_hotcache: bool = False,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.CommitIndexResponse:
@@ -720,6 +720,7 @@ class SummaClient(BaseGrpcClient):
             'index_alias': index_alias,
             'query': {'term': {'field': field, 'value': value}},
             'collectors': [{'top_docs': {'limit': 1}}],
+            'is_fieldnorms_scoring_enabled': False,
         })
         if response.collector_outputs[0].documents.scored_documents:
             return json.loads(response.collector_outputs[0].documents.scored_documents[0].document)

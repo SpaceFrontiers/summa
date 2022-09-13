@@ -140,9 +140,9 @@ pub fn build_fruit_extractor(
                 Some(proto::Scorer {
                     scorer: Some(proto::scorer::Scorer::OrderBy(field_name)),
                 }) => {
-                    let top_docs_collector =
-                        tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.offset + top_docs_collector_proto.limit + 1) as usize)
-                            .order_by_fast_field(field_name, Order::Desc);
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit((top_docs_collector_proto.limit + 1) as usize)
+                        .and_offset(top_docs_collector_proto.offset)
+                        .order_by_fast_field(field_name, Order::Desc);
                     Box::<TopDocs<u64>>::new(
                         TopDocsBuilder::default()
                             .handle(multi_collector.add_collector(top_docs_collector))

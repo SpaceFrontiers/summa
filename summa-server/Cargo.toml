@@ -46,7 +46,6 @@ headers = "0.3"
 hyper = { workspace = true }
 itertools = { workspace = true }
 libz-sys = { workspace = true }
-openssl-sys = { workspace = true }
 opentelemetry = { version = "0.19", features = ["metrics", "rt-tokio"], optional = true }
 opentelemetry-prometheus = { version = "0.12", optional = true }
 path-absolutize = "3.0"

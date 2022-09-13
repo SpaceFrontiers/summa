@@ -28,6 +28,6 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo publish -p summa-proto && cargo publish -p summa-core && cargo publish -p summa-server
+      - run: cargo publish -p summa-proto || cargo publish -p summa-core || cargo publish -p summa-server || /bin/true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
