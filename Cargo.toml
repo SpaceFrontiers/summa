@@ -21,12 +21,15 @@ futures = "0.3"
 hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
 hyper-tls = { version = "0.5.0", features = ["vendored"] }
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
-itertools = "0.10"
+itertools = "0.11.0"
 kanal = "0.1.0-pre8"
 lazy_static = "1.4"
 libz-sys = { version = "1.1", features = ["static"] }
-lru = "0.10.0"
+lru = "0.11.1"
 oneshot = "0.1"
+openssl = { version = "=0.10.55", features = ["vendored"] }
+openssl-src = { version = "=111" }
+openssl-sys = { version = "=0.9.89" }
 parking_lot = { version = "0.12", features = ["send_guard"] }
 pest = "2.5"
 pest_derive = "2.5"
