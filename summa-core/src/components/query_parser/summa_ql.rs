@@ -589,11 +589,11 @@ impl QueryParser {
 
     fn parse_statement(&self, pair: Pair<Rule>) -> Result<Box<dyn Query>, QueryParserError> {
         let mut statement_pairs = pair.into_inner();
-        let isbn_doi_or_search_group_or_term = statement_pairs.next().expect("grammar failure");
+        let isbn_doi_or_search_group_or_grouping_or_term = statement_pairs.next().expect("grammar failure");
         let statement_boost = statement_pairs.next().map(|boost| f32::from_str(boost.as_str()).expect("grammar failure"));
-        let statement_result = match isbn_doi_or_search_group_or_term.as_rule() {
+        let statement_result = match isbn_doi_or_search_group_or_grouping_or_term.as_rule() {
             Rule::search_group => {
-                let mut search_group = isbn_doi_or_search_group_or_term.into_inner();
+                let mut search_group = isbn_doi_or_search_group_or_grouping_or_term.into_inner();
                 let field_name = search_group.next().expect("grammar failure");
                 let grouping_or_term = search_group.next().expect("grammar failure");
                 match grouping_or_term.as_rule() {
@@ -656,7 +656,8 @@ impl QueryParser {
                 for term_field_mapper_name in ["doi", "doi_isbn"] {
                     if let Some(term_field_mapper_config) = self.query_parser_config.0.term_field_mapper_configs.get(term_field_mapper_name) {
                         if let Some(term_field_mapper) = self.term_field_mappers_manager.get(term_field_mapper_name) {
-                            if let Some(query) = term_field_mapper.map(isbn_doi_or_search_group_or_term.as_str(), &term_field_mapper_config.fields) {
+                            if let Some(query) = term_field_mapper.map(isbn_doi_or_search_group_or_grouping_or_term.as_str(), &term_field_mapper_config.fields)
+                            {
                                 queries.push((Occur::Should, query));
                             }
                         }
@@ -671,7 +672,8 @@ impl QueryParser {
                 for term_field_mapper_name in ["isbn"] {
                     if let Some(term_field_mapper_config) = self.query_parser_config.0.term_field_mapper_configs.get(term_field_mapper_name) {
                         if let Some(term_field_mapper) = self.term_field_mappers_manager.get(term_field_mapper_name) {
-                            if let Some(query) = term_field_mapper.map(isbn_doi_or_search_group_or_term.as_str(), &term_field_mapper_config.fields) {
+                            if let Some(query) = term_field_mapper.map(isbn_doi_or_search_group_or_grouping_or_term.as_str(), &term_field_mapper_config.fields)
+                            {
                                 queries.push((Occur::Should, query));
                             }
                         }
@@ -680,7 +682,21 @@ impl QueryParser {
 
                 Ok(Box::new(BooleanQuery::new(queries)) as Box<dyn Query>)
             }
-            Rule::term => self.default_field_queries(isbn_doi_or_search_group_or_term, statement_boost),
+            Rule::term => self.default_field_queries(isbn_doi_or_search_group_or_grouping_or_term, statement_boost),
+            Rule::grouping => {
+                let grouping = isbn_doi_or_search_group_or_grouping_or_term.into_inner().next().expect("grammar failure");
+                let occur = self.parse_occur(&grouping);
+                let mut intermediate_results = vec![];
+                for term in grouping.into_inner() {
+                    intermediate_results.push(self.default_field_queries(term, statement_boost)?)
+                }
+                let group_query = Box::new(BooleanQuery::new(intermediate_results.into_iter().map(|q| (Occur::Should, q)).collect())) as Box<dyn Query>;
+                match occur {
+                    Occur::Should => Ok(group_query),
+                    Occur::Must => Ok(Box::new(BooleanQuery::new(vec![(Occur::Must, group_query)])) as Box<dyn Query>),
+                    Occur::MustNot => Ok(Box::new(BooleanQuery::new(vec![(Occur::MustNot, group_query)])) as Box<dyn Query>),
+                }
+            }
             e => panic!("{e:?}"),
         }?;
         Ok(statement_result)
@@ -1168,5 +1184,12 @@ mod tests {
         assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"red1\"))), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"search\")), TermQuery(Term(field=0, type=Str, \"searches\"))], tie_breaker: 0.3 }), (Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"engine\")), TermQuery(Term(field=0, type=Str, \"engines\"))], tie_breaker: 0.3 }), (Should, TermQuery(Term(field=0, type=Str, \"going\")))] })");
         let query = query_parser.parse_query("iso 34-1:2022");
         assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, DisjunctionMaxQuery { disjuncts: [TermQuery(Term(field=0, type=Str, \"iso\")), TermQuery(Term(field=0, type=Str, \"isos\"))], tie_breaker: 0.3 }), (Should, TermQuery(Term(field=0, type=Str, \"34\"))), (Should, TermQuery(Term(field=0, type=Str, \"1\")))] })");
+    }
+
+    #[test]
+    pub fn test_root_grouping() {
+        let query_parser = create_query_parser();
+        let query = query_parser.parse_query("(test1 test2) -(test3) +(test4 test5)");
+        assert_eq!(format!("{:?}", query), "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"test1\"))), (Should, TermQuery(Term(field=0, type=Str, \"test2\"))), (MustNot, TermQuery(Term(field=0, type=Str, \"test3\"))), (Must, BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"test4\"))), (Should, TermQuery(Term(field=0, type=Str, \"test5\")))] })] })");
     }
 }
