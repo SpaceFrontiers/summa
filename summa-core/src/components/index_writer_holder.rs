@@ -364,7 +364,7 @@ impl IndexWriterHolder {
     /// Put document to the index. Before comes searchable it must be committed
     pub fn index_document(&self, mut document: Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
         self.process_dynamic_fields(&mut document)?;
-        self.resolve_conflicts(&mut document, conflict_strategy)?;
+        self.resolve_conflicts(&document, conflict_strategy)?;
         self.index_writer.add_document(document)?;
         Ok(())
     }

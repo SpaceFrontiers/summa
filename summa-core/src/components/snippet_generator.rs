@@ -1,13 +1,23 @@
 use std::collections::HashMap;
 
 use futures::future::join_all;
-use tantivy::query::Query;
+use tantivy::query::{Query, QueryClone};
 use tantivy::Searcher;
 
 pub struct SnippetGeneratorConfig {
     searcher: Searcher,
     query: Box<dyn Query>,
     snippet_configs: HashMap<String, u32>,
+}
+
+impl Clone for SnippetGeneratorConfig {
+    fn clone(&self) -> Self {
+        SnippetGeneratorConfig {
+            searcher: self.searcher.clone(),
+            query: self.query.box_clone(),
+            snippet_configs: self.snippet_configs.clone(),
+        }
+    }
 }
 
 impl SnippetGeneratorConfig {

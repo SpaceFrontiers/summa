@@ -70,6 +70,7 @@ impl WrappedIndexRegistry {
                     .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {})),
                 search_request.collectors,
                 search_request.is_fieldnorms_scoring_enabled,
+                search_request.use_cache,
             )
             .await?;
         trace!(action = "searched");

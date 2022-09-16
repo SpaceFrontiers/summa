@@ -41,6 +41,7 @@ pub mod proto_traits;
 ///                 }
 ///             ],
 ///             is_fieldnorms_scoring_enabled: None,
+///             use_cache: None,
 ///         })
 ///         .await
 ///         .expect("cannot search");

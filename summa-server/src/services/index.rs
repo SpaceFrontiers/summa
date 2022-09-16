@@ -584,15 +584,17 @@ impl Index {
     /// Search documents
     pub async fn search(&self, search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
         let index_holder = self.index_registry.get_index_holder(&search_request.index_alias).await?;
+        let query = search_request
+            .query
+            .and_then(|query| query.query)
+            .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {}));
         let collector_outputs = index_holder
             .search(
                 &search_request.index_alias,
-                search_request
-                    .query
-                    .and_then(|query| query.query)
-                    .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {})),
+                query,
                 search_request.collectors,
                 search_request.is_fieldnorms_scoring_enabled,
+                search_request.use_cache,
             )
             .await?;
         Ok(self.index_registry.finalize_extraction(collector_outputs).await?)
@@ -798,6 +800,7 @@ pub(crate) mod tests {
                 match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
                 vec![top_docs_collector(10)],
                 None,
+                None,
             )
             .await?;
         assert_eq!(search_response.len(), 1);
@@ -847,7 +850,8 @@ pub(crate) mod tests {
                 "test_index",
                 match_query("title1", vec!["title".to_string(), "body".to_string()]),
                 vec![top_docs_collector_with_eval_expr(1, "issued_at")],
-                None
+                None,
+                None,
             )
             .await
             .is_ok());

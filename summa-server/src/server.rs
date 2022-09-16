@@ -302,6 +302,7 @@ mod tests {
                     },
                 ],
                 is_fieldnorms_scoring_enabled: None,
+                use_cache: None,
             }))
             .await
             .unwrap()
@@ -345,6 +346,7 @@ mod tests {
                     })),
                 }],
                 is_fieldnorms_scoring_enabled: None,
+                use_cache: None,
             }))
             .await
             .unwrap()

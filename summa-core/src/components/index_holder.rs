@@ -1,18 +1,21 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
 use futures::future::{join_all, try_join_all};
 #[cfg(feature = "metrics")]
 use instant::Instant;
+use lru::LruCache;
 #[cfg(feature = "metrics")]
 use opentelemetry::{
     global,
     metrics::{Histogram, Unit},
     Context, KeyValue,
 };
+use parking_lot::Mutex;
 use serde::Deserialize;
 use summa_proto::proto;
 use summa_proto::proto::IndexAttributes;
@@ -37,6 +40,108 @@ use crate::errors::{SummaResult, ValidationError};
 use crate::proto_traits::Wrapper;
 use crate::Error;
 
+pub struct CollectorCache {
+    cache: LruCache<String, IntermediateExtractionResult>,
+    block_size: u32,
+}
+
+pub enum CacheResponse {
+    Result(IntermediateExtractionResult),
+    AdjustedCollector(proto::Collector),
+}
+
+impl CollectorCache {
+    pub fn new() -> Self {
+        CollectorCache {
+            cache: LruCache::new(NonZeroUsize::new(10000).expect("unreachable")),
+            block_size: 100,
+        }
+    }
+
+    fn caching_key(&self, caching_key: &str, collector: &proto::Collector) -> String {
+        format!("{}|{:?}", caching_key, collector)
+    }
+
+    fn adjust_result(result: &IntermediateExtractionResult, collector: &proto::Collector, block_size: u32) -> IntermediateExtractionResult {
+        match result {
+            IntermediateExtractionResult::Ready(r) => IntermediateExtractionResult::Ready(r.clone()),
+            IntermediateExtractionResult::PreparedDocumentReferences(prepared_document_references) => {
+                let mut prepared_document_references = prepared_document_references.clone();
+                match &collector.collector {
+                    Some(proto::collector::Collector::TopDocs(top_docs_collector)) => {
+                        prepared_document_references.has_next = prepared_document_references.has_next
+                            || prepared_document_references.scored_doc_addresses.len()
+                                > ((top_docs_collector.offset + top_docs_collector.limit) % block_size) as usize;
+                        prepared_document_references.scored_doc_addresses = prepared_document_references
+                            .scored_doc_addresses
+                            .into_iter()
+                            .skip((top_docs_collector.offset % block_size) as usize)
+                            .take((((top_docs_collector.limit - 1) % block_size) + 1) as usize)
+                            .collect()
+                    }
+                    _other => {}
+                }
+                IntermediateExtractionResult::PreparedDocumentReferences(prepared_document_references)
+            }
+        }
+    }
+
+    fn is_caching_enabled(&self, collector: &proto::Collector) -> bool {
+        match collector {
+            proto::Collector {
+                collector: Some(proto::collector::Collector::TopDocs(top_docs)),
+            } => {
+                let left_bound = top_docs.offset;
+                let right_bound = left_bound + top_docs.limit;
+
+                let left_block_bound = top_docs.offset % self.block_size;
+                let right_block_bound = left_block_bound + self.block_size;
+
+                left_block_bound <= left_bound && right_bound < right_block_bound
+            }
+            proto::Collector {
+                collector: Some(proto::collector::Collector::ReservoirSampling(_)),
+            } => false,
+            _ => true,
+        }
+    }
+
+    fn adjust_collector(&self, collector: &proto::Collector) -> proto::Collector {
+        match collector {
+            proto::Collector {
+                collector: Some(proto::collector::Collector::TopDocs(top_docs)),
+            } => {
+                let mut top_docs = top_docs.clone();
+                top_docs.offset -= top_docs.offset % self.block_size;
+                top_docs.limit = self.block_size;
+                proto::Collector {
+                    collector: Some(proto::collector::Collector::TopDocs(top_docs)),
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    pub fn get(&mut self, caching_key: &str, collector: &proto::Collector) -> CacheResponse {
+        let adjusted_collector = self.adjust_collector(collector);
+
+        let caching_key = self.caching_key(caching_key, &adjusted_collector);
+        let cached_value = self.cache.get(&caching_key);
+
+        match cached_value {
+            Some(cache_value) => CacheResponse::Result(Self::adjust_result(cache_value, collector, self.block_size)),
+            None => CacheResponse::AdjustedCollector(adjusted_collector),
+        }
+    }
+
+    pub fn put(&mut self, caching_key: &str, collector: &proto::Collector, value: IntermediateExtractionResult) -> IntermediateExtractionResult {
+        let adjusted_value = Self::adjust_result(&value, collector, self.block_size);
+        let caching_key = self.caching_key(caching_key, collector);
+        self.cache.put(caching_key.clone(), value.clone());
+        adjusted_value
+    }
+}
+
 pub struct IndexHolder {
     index_engine_config: Arc<dyn ConfigProxy<proto::IndexEngineConfig>>,
     index_name: String,
@@ -50,6 +155,7 @@ pub struct IndexHolder {
     /// Counters
     #[cfg(feature = "metrics")]
     search_times_meter: Histogram<f64>,
+    cache: Mutex<CollectorCache>,
 }
 
 impl Hash for IndexHolder {
@@ -218,6 +324,7 @@ impl IndexHolder {
                 .with_unit(Unit::new("seconds"))
                 .with_description("Search times")
                 .init(),
+            cache: Mutex::new(CollectorCache::new()),
         })
     }
 
@@ -422,7 +529,41 @@ impl IndexHolder {
         query: proto::query::Query,
         collectors: Vec<proto::Collector>,
         is_fieldnorms_scoring_enabled: Option<bool>,
+        use_cache: Option<bool>,
     ) -> SummaResult<Vec<IntermediateExtractionResult>> {
+        let mut missed_collector_indices = Vec::with_capacity(collectors.len());
+        let mut collector_outputs = vec![None; collectors.len()];
+        let mut left_collectors = Vec::with_capacity(collectors.len());
+        let use_cache = use_cache.unwrap_or(false);
+
+        let caching_key = format!("{:?}|{:?}", query, is_fieldnorms_scoring_enabled);
+
+        if use_cache {
+            let mut cache = self.cache.lock();
+            for (i, collector) in collectors.into_iter().enumerate() {
+                let is_caching_enabled = cache.is_caching_enabled(&collector);
+                if is_caching_enabled {
+                    match cache.get(&caching_key, &collector) {
+                        CacheResponse::Result(cached_value) => collector_outputs[i] = Some(cached_value),
+                        CacheResponse::AdjustedCollector(collector) => {
+                            left_collectors.push(collector);
+                            missed_collector_indices.push(i)
+                        }
+                    }
+                } else {
+                    left_collectors.push(collector);
+                    missed_collector_indices.push(i)
+                }
+            }
+            drop(cache);
+        } else {
+            left_collectors = collectors;
+            missed_collector_indices = (0..left_collectors.len()).collect();
+        }
+
+        if left_collectors.is_empty() {
+            return Ok(collector_outputs.into_iter().map(Option::unwrap).collect());
+        }
         let searcher = self.index_reader().searcher();
         trace!(action = "parse_query", index_name = ?self.index_name, query = ?query);
         #[cfg(feature = "tokio-rt")]
@@ -434,9 +575,18 @@ impl IndexHolder {
         let parsed_query = self.query_parser.parse_query(query)?;
         let mut multi_collector = MultiCollector::new();
         trace!(action = "build_extractors", index_name = ?self.index_name);
-        let extractors: Vec<Box<dyn FruitExtractor>> = collectors
-            .into_iter()
-            .map(|collector_proto| build_fruit_extractor(self, index_alias, searcher.clone(), collector_proto, &parsed_query, &mut multi_collector))
+        let extractors: Vec<Box<dyn FruitExtractor>> = left_collectors
+            .iter()
+            .map(|collector_proto| {
+                build_fruit_extractor(
+                    self,
+                    index_alias,
+                    searcher.clone(),
+                    collector_proto.clone(),
+                    &parsed_query,
+                    &mut multi_collector,
+                )
+            })
             .collect::<SummaResult<_>>()?;
         trace!(
             target: "query",
@@ -455,13 +605,31 @@ impl IndexHolder {
             start_time.elapsed().as_secs_f64(),
             &[KeyValue::new("index_name", self.index_name.to_owned())],
         );
-        let mut collector_outputs = Vec::with_capacity(extractors.len());
         trace!(action = "extract");
-        for extractor in extractors.into_iter() {
-            collector_outputs.push(extractor.extract(&mut multi_fruit)?)
+        if use_cache {
+            let mut cache = self.cache.lock();
+            for ((extractor, i), collector) in extractors
+                .into_iter()
+                .zip(missed_collector_indices.into_iter())
+                .zip(left_collectors.into_iter())
+            {
+                let extracted_result = extractor.extract(&mut multi_fruit)?;
+                if cache.is_caching_enabled(&collector) {
+                    let adjusted_extracted_result = cache.put(&caching_key, &collector, extracted_result);
+                    collector_outputs[i] = Some(adjusted_extracted_result)
+                } else {
+                    collector_outputs[i] = Some(extracted_result)
+                }
+            }
+            drop(cache);
+        } else {
+            for (i, extractor) in extractors.into_iter().enumerate() {
+                collector_outputs[i] = Some(extractor.extract(&mut multi_fruit)?);
+            }
         }
+
         trace!(action = "extracted");
-        Ok(collector_outputs)
+        Ok(collector_outputs.into_iter().map(Option::unwrap).collect())
     }
 
     /// Delete `SummaDocument` by `unq`

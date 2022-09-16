@@ -18,6 +18,7 @@ use crate::scorers::eval_scorer_tweaker::EvalScorerTweaker;
 use crate::scorers::EvalScorer;
 use crate::{collectors, validators};
 
+#[derive(Clone)]
 pub struct ScoredDocAddress {
     pub doc_address: tantivy::DocAddress,
     pub score: Option<proto::Score>,
@@ -40,6 +41,7 @@ impl ExtractionTooling {
     }
 }
 
+#[derive(Clone)]
 pub struct PreparedDocumentReferences {
     pub index_alias: String,
     pub extraction_tooling: ExtractionTooling,
@@ -50,12 +52,14 @@ pub struct PreparedDocumentReferences {
     pub offset: u32,
 }
 
+#[derive(Clone)]
 pub enum ReadyCollectorOutput {
     Aggregation(proto::AggregationCollectorOutput),
     Count(proto::CountCollectorOutput),
     Facet(proto::FacetCollectorOutput),
 }
 
+#[derive(Clone)]
 pub enum IntermediateExtractionResult {
     Ready(ReadyCollectorOutput),
     PreparedDocumentReferences(PreparedDocumentReferences),
