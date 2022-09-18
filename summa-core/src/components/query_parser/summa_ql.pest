@@ -36,7 +36,7 @@ default_grouping = ${ pre_grouping }
 
 term = { positive_term | negative_term | default_term }
 grouping = { positive_grouping | negative_grouping | default_grouping }
-search_group = ${ field_name ~ ":" ~ (grouping | term) }
+search_group = ${ field_name ~ ":" ~ (grouping | star | term) }
 
 statement = ${ (isbn | wrapped_doi | search_group | grouping | term) ~ ("^" ~ boost)? }
 statements = _{ statement_sep* ~ statement? ~ (statement_sep+ ~ statement)* ~ statement_sep* }

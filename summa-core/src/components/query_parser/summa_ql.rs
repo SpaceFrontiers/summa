@@ -14,6 +14,7 @@ use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 use tantivy::{Index, Term};
 use tantivy_query_grammar::Occur;
 
+use crate::components::queries::ExistsQuery;
 use crate::components::query_parser::morphology::MorphologyManager;
 use crate::components::query_parser::proto_query_parser::QueryParserDefaultMode;
 use crate::components::query_parser::term_field_mappers::TermFieldMappersManager;
@@ -643,6 +644,25 @@ impl QueryParser {
                                         (Occur::Should, self.default_field_queries(field_name, statement_boost)?),
                                         (Occur::Should, self.default_field_queries(grouping_or_term, statement_boost)?),
                                     ])) as Box<dyn Query>)
+                                }
+                            }
+                        }
+                    }
+                    Rule::star => {
+                        let resolved_field_name = self.resolve_field_name(field_name.as_str());
+                        match self.schema.find_field(resolved_field_name) {
+                            Some((field, full_path)) => Ok(Box::new(ExistsQuery::new(field, full_path)) as Box<dyn Query>),
+                            None => {
+                                if self
+                                    .query_parser_config
+                                    .0
+                                    .removed_fields
+                                    .iter()
+                                    .any(|x| x == field_name.as_str() || Some(x.as_str()) == field_name.as_str().split('.').next())
+                                {
+                                    Ok(Box::new(EmptyQuery {}) as Box<dyn Query>)
+                                } else {
+                                    Ok(self.default_field_queries(field_name, statement_boost)?)
                                 }
                             }
                         }
