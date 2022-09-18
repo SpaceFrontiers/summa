@@ -1,3 +1,4 @@
+mod collector_cache;
 mod custom_serializer;
 mod default_tokenizers;
 mod fruit_extractors;

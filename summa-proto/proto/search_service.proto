@@ -20,5 +20,6 @@ message SearchRequest {
   repeated Collector collectors = 3;
   // Is requiring fieldnorms needed for the query?
   optional bool is_fieldnorms_scoring_enabled = 4;
-  optional bool use_cache = 5;
+  optional bool load_cache = 5;
+  optional bool store_cache = 6;
 }

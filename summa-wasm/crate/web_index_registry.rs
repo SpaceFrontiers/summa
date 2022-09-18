@@ -62,7 +62,7 @@ impl WrappedIndexRegistry {
         info!(action = "search", search_request = ?search_request);
         let index_holder = self.index_registry.get_index_holder(&search_request.index_alias).await?;
         let collector_outputs = index_holder
-            .search(
+            .custom_search(
                 &search_request.index_alias,
                 search_request
                     .query
@@ -70,7 +70,8 @@ impl WrappedIndexRegistry {
                     .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {})),
                 search_request.collectors,
                 search_request.is_fieldnorms_scoring_enabled,
-                search_request.use_cache,
+                search_request.load_cache,
+                search_request.store_cache,
             )
             .await?;
         trace!(action = "searched");

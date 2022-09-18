@@ -111,7 +111,8 @@ async fn main() -> Result<(), tonic::Status> {
                 },
             ],
             is_fieldnorms_scoring_enabled: None,
-            use_cache: None,
+            load_cache: None,
+            store_cache: None,
         })
         .await?;
     println!("{:?}", search_response);

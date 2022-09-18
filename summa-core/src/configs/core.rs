@@ -32,11 +32,31 @@ impl WriterThreads {
 
 #[derive(Builder, Clone, Debug, Serialize, Deserialize)]
 #[builder(default, build_fn(error = "BuilderError"))]
+pub struct CollectorCacheConfig {
+    #[builder(default = "Some(120000)")]
+    pub ttl_interval_ms: Option<u64>,
+    #[builder(default = "128")]
+    pub size: usize,
+}
+
+impl Default for CollectorCacheConfig {
+    fn default() -> Self {
+        CollectorCacheConfig {
+            ttl_interval_ms: Some(120000),
+            size: 128,
+        }
+    }
+}
+
+#[derive(Builder, Clone, Debug, Serialize, Deserialize)]
+#[builder(default, build_fn(error = "BuilderError"))]
 pub struct Config {
     #[serde(default = "HashMap::new")]
     pub aliases: HashMap<String, String>,
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
+    #[builder(default = "CollectorCacheConfig::default()")]
+    pub collector_cache: CollectorCacheConfig,
     #[builder(default = "1")]
     #[serde(default = "return_1")]
     pub doc_store_compress_threads: usize,
@@ -56,6 +76,7 @@ impl Default for Config {
         Config {
             aliases: HashMap::new(),
             autocommit_interval_ms: None,
+            collector_cache: CollectorCacheConfig::default(),
             doc_store_compress_threads: 1,
             indices: HashMap::new(),
             writer_heap_size_bytes: 1024 * 1024 * 1024,

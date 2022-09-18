@@ -33,6 +33,7 @@ pub struct Index {
     consumer_manager: Arc<RwLock<ConsumerManager>>,
     should_terminate: Arc<AtomicBool>,
     autocommit_thread: Arc<RwLock<Option<ThreadHandler<SummaServerResult<()>>>>>,
+    service_thread: Arc<RwLock<Option<ThreadHandler<SummaServerResult<()>>>>>,
 }
 
 #[derive(Default)]
@@ -94,6 +95,7 @@ impl Index {
             consumer_manager: Arc::default(),
             should_terminate: Arc::default(),
             autocommit_thread: Arc::default(),
+            service_thread: Arc::default(),
         })
     }
 
@@ -158,8 +160,9 @@ impl Index {
         mut terminator: Receiver<ControlMessage>,
     ) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
         self.setup_indices().await?;
-        let this = self.clone();
+        let mut this = self.clone();
         Ok(async move {
+            this.start_threads().await;
             let signal_result = terminator.recv().await;
             info!(action = "sigterm_received", received = ?signal_result);
             let force = matches!(signal_result, Ok(ControlMessage::ForceShutdown));
@@ -424,7 +427,8 @@ impl Index {
     }
 
     /// Stopping index holders
-    pub async fn stop(&self, force: bool) -> SummaServerResult<()> {
+    pub async fn stop(&mut self, force: bool) -> SummaServerResult<()> {
+        self.stop_threads().await?;
         self.should_terminate.store(true, Ordering::Relaxed);
         if !force {
             self.consumer_manager.write().await.stop().await?;
@@ -464,7 +468,6 @@ impl Index {
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         let mut index_writer = index_holder.index_writer_holder()?.clone().write_owned().await;
         let index_holder = index_holder.clone();
-
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
@@ -474,7 +477,6 @@ impl Index {
             })
         })
         .await??;
-
         let prepared_consumption = match stopped_consumption {
             Some(stopped_consumption) => Some(stopped_consumption.commit_offsets().await?),
             None => None,
@@ -547,17 +549,61 @@ impl Index {
         ));
     }
 
+    async fn setup_service_thread(&mut self) {
+        let collector_cache_config = self.server_config.read().await.get().core.collector_cache.clone();
+        let ttl_interval_ms = match collector_cache_config.ttl_interval_ms {
+            Some(ttl_interval_ms) => ttl_interval_ms,
+            None => return,
+        };
+
+        let index_service = self.clone();
+        let (shutdown_trigger, mut shutdown_tripwire) = async_broadcast::broadcast(1);
+        let mut tick_task = tokio::time::interval(Duration::from_millis(ttl_interval_ms));
+
+        *self.service_thread.write().await = Some(ThreadHandler::new(
+            tokio::spawn(
+                async move {
+                    info!(action = "spawning_service_thread", ttl_interval_ms = ttl_interval_ms);
+                    // The first tick ticks immediately so we skip it
+                    tick_task.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = tick_task.tick() => {
+                                info!(action = "service_thread_tick");
+                                let index_holders = index_service.index_registry.index_holders_cloned().await;
+                                for index_holder in index_holders.into_values() {
+                                    index_holder.clear_collector_cache()
+                                }
+                            }
+                            _ = &mut shutdown_tripwire.recv() => {
+                                info!(action = "shutdown_service_thread");
+                                break;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                .instrument(info_span!(parent: None, "service_thread")),
+            ),
+            shutdown_trigger,
+        ));
+    }
+
     /// Starts autocommitting thread
     #[instrument(skip(self))]
-    pub async fn start_autocommit_thread(&mut self) {
+    pub async fn start_threads(&mut self) {
         self.setup_autocommit_thread().await;
+        self.setup_service_thread().await;
     }
 
     /// Stops autocommitting thread
     #[instrument(skip(self))]
-    pub async fn stop_autocommit_thread(&mut self) -> SummaServerResult<()> {
+    pub async fn stop_threads(&mut self) -> SummaServerResult<()> {
         if let Some(autocommit_thread) = self.autocommit_thread.write().await.take() {
             autocommit_thread.stop().await??;
+        }
+        if let Some(service_thread) = self.service_thread.write().await.take() {
+            service_thread.stop().await??;
         }
         Ok(())
     }
@@ -589,12 +635,13 @@ impl Index {
             .and_then(|query| query.query)
             .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {}));
         let collector_outputs = index_holder
-            .search(
+            .custom_search(
                 &search_request.index_alias,
                 query,
                 search_request.collectors,
                 search_request.is_fieldnorms_scoring_enabled,
-                search_request.use_cache,
+                search_request.load_cache,
+                search_request.store_cache,
             )
             .await?;
         Ok(self.index_registry.finalize_extraction(collector_outputs).await?)
@@ -799,8 +846,6 @@ pub(crate) mod tests {
                 "index",
                 match_query("testtitle", vec!["title".to_string(), "body".to_string()]),
                 vec![top_docs_collector(10)],
-                None,
-                None,
             )
             .await?;
         assert_eq!(search_response.len(), 1);
@@ -850,8 +895,6 @@ pub(crate) mod tests {
                 "test_index",
                 match_query("title1", vec!["title".to_string(), "body".to_string()]),
                 vec![top_docs_collector_with_eval_expr(1, "issued_at")],
-                None,
-                None,
             )
             .await
             .is_ok());
