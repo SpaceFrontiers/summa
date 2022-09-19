@@ -1089,6 +1089,15 @@ mod tests {
     }
 
     #[test]
+    pub fn test_punct() {
+        let query_parser = create_query_parser();
+        assert_eq!(
+            format!("{:?}", query_parser.parse_query("a + b - c")),
+            "Ok(BooleanQuery { subqueries: [(Should, TermQuery(Term(field=0, type=Str, \"a\"))), (Should, TermQuery(Term(field=0, type=Str, \"b\"))), (Should, TermQuery(Term(field=0, type=Str, \"c\")))] })"
+        );
+    }
+
+    #[test]
     pub fn test_plus_minus() {
         let query_parser = create_query_parser();
         assert_eq!(

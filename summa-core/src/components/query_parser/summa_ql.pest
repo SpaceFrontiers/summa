@@ -1,6 +1,6 @@
 quote = _{ "\"" | "'" | "`" | "'" | "“" | "”" | "‘" | "«" | "»" | "„" | "`"}
 star = { "*" }
-statement_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE) | "(" | ")" | "/" }
+statement_sep = _{ WHITE_SPACE | "," | "." | ";" | "!" | "?" | (":" ~ WHITE_SPACE) | "(" | ")" | "/" | ("-" ~ WHITE_SPACE) | ("+" ~ WHITE_SPACE) }
 allowed_chars = _{"_" | "+" | "#" | "-"}
 url_end = _{ WHITE_SPACE | "," }
 
