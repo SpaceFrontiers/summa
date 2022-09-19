@@ -602,7 +602,7 @@ impl IndexHolder {
     }
 
     #[cfg(feature = "tokio-rt")]
-    pub fn documents<O: Send + 'static>(
+    pub async fn documents<O: Send + 'static>(
         &self,
         searcher: &Searcher,
         query_filter: &Option<proto::Query>,
@@ -638,21 +638,31 @@ impl IndexHolder {
                 }
                 Ok(rx)
             }
-            Some(proto::Query { query: Some(query_filter) }) => self.filtered_documents(searcher, query_filter, documents_modifier),
+            Some(proto::Query { query: Some(query_filter) }) => self.filtered_documents(searcher, query_filter, documents_modifier).await,
         }
     }
 
     #[cfg(feature = "tokio-rt")]
-    fn filtered_documents<O: Send + 'static>(
+    async fn filtered_documents<O: Send + 'static>(
         &self,
         searcher: &Searcher,
         query: &proto::query::Query,
         documents_modifier: impl Fn(tantivy::schema::Document) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         let parsed_query = self.query_parser.parse_query(query.clone())?;
-        let docs = searcher.search(&parsed_query, &DocSetCollector)?;
-
+        let collector = DocSetCollector;
         let segment_readers = searcher.segment_readers();
+        let weight = parsed_query.weight_async(EnableScoring::disabled_from_searcher(searcher)).await?;
+
+        let fruits = join_all(segment_readers.iter().enumerate().map(|(segment_ord, segment_reader)| {
+            let weight_ref = weight.as_ref();
+            collector.collect_segment_async(weight_ref, segment_ord as u32, segment_reader)
+        }))
+        .await
+        .into_iter()
+        .collect::<tantivy::Result<Vec<_>>>()?;
+        let docs = collector.merge_fruits(fruits)?;
+
         let (tx, rx) = tokio::sync::mpsc::channel(segment_readers.len() * 2 + 1);
         let span = tracing::Span::current();
         let searcher = searcher.clone();

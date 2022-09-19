@@ -160,6 +160,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
                 let document = NamedFieldDocument::from_document(&schema, &query_fields, &multi_fields, &document).to_json_string();
                 Some(Ok(DocumentsResponse { document }))
             })
+            .await
             .map_err(crate::errors::Error::from)?;
         Ok(Response::new(ReceiverStream::new(documents_receiver)))
     }
