@@ -56,6 +56,7 @@ pub struct Config {
     #[builder(default = "None")]
     pub autocommit_interval_ms: Option<u64>,
     #[builder(default = "CollectorCacheConfig::default()")]
+    #[serde(default = "CollectorCacheConfig::default")]
     pub collector_cache: CollectorCacheConfig,
     #[builder(default = "1")]
     #[serde(default = "return_1")]
