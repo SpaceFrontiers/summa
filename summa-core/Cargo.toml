@@ -1,6 +1,6 @@
 [package]
 name = "summa-core"
-version = "0.20.0"
+version = "0.20.1"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
