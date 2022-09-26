@@ -41,8 +41,12 @@ def prepare_search_request(search_request):
 def prepare_query(query):
     if isinstance(query, Dict):
         dict_query = query
-        query = query_pb.Query()
-        ParseDict(dict_query, query)
+    elif isinstance(query, str):
+        dict_query = {'match': {'value': query}}
+    else:
+        raise ValueError("Unknown type of `query` argument, should be either `dict` or `str`")
+    query = query_pb.Query()
+    ParseDict(dict_query, query)
     return query
 
 
@@ -464,7 +468,7 @@ class SummaClient(BaseGrpcClient):
     async def documents(
             self,
             index_name: str,
-            query_filter: Optional[dict] = None,
+            query_filter: Optional[Union[dict, str]] = None,
             fields: Optional[List[str]] = None,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
@@ -478,10 +482,12 @@ class SummaClient(BaseGrpcClient):
             session_id: session id
         """
         # asyncfor is buggy: https://github.com/grpc/grpc/issues/32005
+        if query_filter:
+            query_filter = prepare_query(query_filter)
         streaming_call = self.stubs['index_api'].documents(
             index_service_pb.DocumentsRequest(
                 index_name=index_name,
-                query_filter=prepare_query(query_filter),
+                query_filter=query_filter,
                 fields=fields,
             ),
             metadata=setup_metadata(session_id, request_id),
@@ -561,10 +567,11 @@ class SummaClient(BaseGrpcClient):
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> query_pb.SearchResponse:
-        """Send search request. `Query` object can be created manually or by using `aiosumma.parser` module.
+        """
+        Send search request
 
         Args:
-            search_request:
+            search_request: search request
             ignore_not_found: do not raise `StatusCode.NOT_FOUND` and return empty SearchResponse
             request_id: request id
             session_id: session id
@@ -586,14 +593,14 @@ class SummaClient(BaseGrpcClient):
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> List[dict]:
-        """Send search request and interprets first collector as, thus parse returned documents as json.
+        """Send search request, suppose the first collector is documents one thus parse returned documents as json.
 
         Args:
-            search_request: index queries
+            search_request: search request
             request_id: request id
             session_id: session id
         """
-        search_results = await self.search(search_request=search_request, request_id=request_id, session_id=session_id)
+        search_results = await self.search(search_request=prepare_search_request(search_request), request_id=request_id, session_id=session_id)
         return [
             json.loads(scored_document.document)
             for scored_document in search_results.collector_outputs[0].documents.scored_documents

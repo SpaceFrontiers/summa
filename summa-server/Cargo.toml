@@ -27,7 +27,7 @@ metrics = ["opentelemetry", "opentelemetry-prometheus", "prometheus", "summa-cor
 maintenance = { status = "actively-developed" }
 
 [build-dependencies]
-tonic-build = { version = "0.9.1", default-features = false, features = ["prost", "transport"] }
+tonic-build = { version = "0.10", default-features = false, features = ["prost", "transport"] }
 
 [dev-dependencies]
 summa-core = { version = "0.20.2", path = "../summa-core", features = ["fs", "hyper-external-request", "tokio-rt"] }
@@ -46,15 +46,15 @@ headers = "0.3"
 hyper = { workspace = true }
 itertools = { workspace = true }
 libz-sys = { workspace = true }
-opentelemetry = { version = "0.19", features = ["metrics", "rt-tokio"], optional = true }
-opentelemetry-prometheus = { version = "0.12", optional = true }
+opentelemetry = { version = "0.20", features = ["metrics", "rt-tokio"], optional = true }
+opentelemetry-prometheus = { version = "0.13", optional = true }
 path-absolutize = "3.0"
 prometheus = { version = "0.13", optional = true }
 prost = { workspace = true }
-prost-types = "0.11"
+prost-types = "0.12"
 rand = { workspace = true }
-rdkafka = { version = "0.29", optional = true }
-rlimit = "0.9"
+rdkafka = { version = "0.34", optional = true }
+rlimit = "0.10"
 serde = { workspace = true }
 serde_derive = "1.0"
 serde_json = { workspace = true }
@@ -69,9 +69,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["compat"] }
-tonic = { version = "0.9", features = ["gzip"] }
-tonic-reflection = "0.9"
-tonic-web = { version = "0.9" }
+tonic = { version = "0.10", features = ["gzip"] }
+tonic-reflection = "0.10"
+tonic-web = { version = "0.10" }
 tower = "0.4"
 tower-http = { version = "0.4", features = ["set-header", "trace"] }
 tracing = { workspace = true }

@@ -5,14 +5,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use futures::future::{join_all, try_join_all};
-#[cfg(feature = "metrics")]
-use instant::Instant;
-#[cfg(feature = "metrics")]
-use opentelemetry::{
-    global,
-    metrics::{Histogram, Unit},
-    Context, KeyValue,
-};
 use serde::Deserialize;
 use summa_proto::proto;
 use summa_proto::proto::IndexAttributes;
@@ -48,8 +40,6 @@ pub struct IndexHolder {
     index_writer_holder: Option<Arc<RwLock<IndexWriterHolder>>>,
     query_parser: ProtoQueryParser,
     /// Counters
-    #[cfg(feature = "metrics")]
-    search_times_meter: Histogram<f64>,
     collector_cache: parking_lot::Mutex<CollectorCache>,
 }
 
@@ -213,12 +203,6 @@ impl IndexHolder {
             cached_multi_fields,
             index_reader,
             index_writer_holder,
-            #[cfg(feature = "metrics")]
-            search_times_meter: global::meter("summa")
-                .f64_histogram("search_times")
-                .with_unit(Unit::new("seconds"))
-                .with_description("Search times")
-                .init(),
             collector_cache: parking_lot::Mutex::new(CollectorCache::new(&core_config.collector_cache)),
         })
     }
@@ -520,17 +504,9 @@ impl IndexHolder {
             parsed_query = ?parsed_query,
             is_fieldnorms_scoring_enabled = is_fieldnorms_scoring_enabled,
         );
-        #[cfg(feature = "metrics")]
-        let start_time = Instant::now();
         let mut multi_fruit = self
             .search_in_segments(&searcher, &parsed_query, &multi_collector, is_fieldnorms_scoring_enabled)
             .await?;
-        #[cfg(feature = "metrics")]
-        self.search_times_meter.record(
-            &Context::current(),
-            start_time.elapsed().as_secs_f64(),
-            &[KeyValue::new("index_name", self.index_name.to_owned())],
-        );
         if load_cache || store_cache {
             let mut cache = self.collector_cache.lock();
             for (((extractor, i), original_collector), adjusted_collector) in extractors

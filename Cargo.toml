@@ -22,7 +22,6 @@ hyper = { version = "0.14", default_features = false, features = ["client", "htt
 hyper-tls = { version = "0.5.0", features = ["vendored"] }
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
 itertools = "0.11.0"
-kanal = "0.1.0-pre8"
 lazy_static = "1.4"
 libz-sys = { version = "1.1", features = ["static"] }
 lru = "0.11.1"
@@ -33,7 +32,7 @@ openssl-sys = { version = "=0.9.89" }
 parking_lot = { version = "0.12", features = ["send_guard"] }
 pest = "2.5"
 pest_derive = "2.5"
-prost = "0.11"
+prost = "0.12"
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.6.1"
 regex = "1.8"
@@ -43,13 +42,13 @@ serde_cbor = "0.11"
 serde_json = { version = "1.0" }
 serde_yaml = { version = "0.8" }
 strfmt = "0.2"
-summa-proto = { version = "0.33.0", path = "./summa-proto", default_features = false }
+summa-proto = { version = "0.34.0", path = "./summa-proto", default_features = false }
 take_mut = "0.2"
 tantivy = { package = "izihawa-tantivy", version = "0.20.2", default_features = false, features = ["quickwit", "zstd-compression"] }
 tantivy-common = { package = "izihawa-tantivy-common", version = "0.5.0" }
 tantivy-query-grammar = { package = "izihawa-tantivy-query-grammar", version = "0.20.0" }
 thiserror = "1.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
-tokio = { version = "1.25", default_features = false }
+tokio = { version = "1.32", default_features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

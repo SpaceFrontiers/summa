@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiosumma"
-version = "2.46.8"
+version = "2.46.10"
 authors = [{ name = "Pasha Podolsky", email = "ppodolsky@me.com" }]
 description = "Async client for Summa Search"
 readme = "README.md"

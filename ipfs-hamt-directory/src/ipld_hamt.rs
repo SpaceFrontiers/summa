@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use bitvec::prelude::*;
+use cid::multihash::{Code, MultihashDigest};
 use cid::Cid;
-use multihash::{Code, MultihashDigest};
 use prost::Message;
 use sled::Tree;
 

@@ -1,6 +1,6 @@
 [package]
 name = "summa-proto"
-version = "0.33.0"
+version = "0.34.0"
 authors = ["Pasha Podolsky <ppodolsky@me.com>"]
 edition = "2021"
 license-file = "LICENSE"
@@ -19,14 +19,14 @@ grpc = ["tonic", "tonic-build", "tonic-reflection"]
 tokio = { workspace = true }
 
 [build-dependencies]
-prost-build = { version = "0.11.0" }
+prost-build = { version = "0.12" }
 protoc-bin-vendored = "3.0.0"
-tonic-build = { version = "0.9", default-features = false, features = ["prost", "transport"], optional = true }
+tonic-build = { version = "0.10", default-features = false, features = ["prost", "transport"], optional = true }
 
 [dependencies]
-prost = "0.11.0"
-prost-types = "0.11.0"
+prost = "0.12"
+prost-types = "0.12"
 serde = { workspace = true }
-tonic = { version = "0.9", features = ["gzip"], optional = true }
-tonic-build = { version = "0.9", default-features = false, features = ["prost", "transport"], optional = true }
-tonic-reflection = { version = "0.9", optional = true }
+tonic = { version = "0.10", features = ["gzip"], optional = true }
+tonic-build = { version = "0.10", default-features = false, features = ["prost", "transport"], optional = true }
+tonic-reflection = { version = "0.10", optional = true }

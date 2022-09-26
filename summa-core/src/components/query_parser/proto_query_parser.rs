@@ -5,8 +5,6 @@ use std::str::FromStr;
 #[cfg(feature = "metrics")]
 use opentelemetry::metrics::Counter;
 #[cfg(feature = "metrics")]
-use opentelemetry::Context;
-#[cfg(feature = "metrics")]
 use opentelemetry::{global, KeyValue};
 use summa_proto::proto;
 use tantivy::query::{
@@ -113,7 +111,7 @@ impl ProtoQueryParser {
 
     fn parse_subquery(&self, query: proto::query::Query) -> SummaResult<Box<dyn Query>> {
         #[cfg(feature = "metrics")]
-        self.subquery_counter.add(&Context::current(), 1, &[KeyValue::new("query", query.to_label())]);
+        self.subquery_counter.add(1, &[KeyValue::new("query", query.to_label())]);
         Ok(match query {
             proto::query::Query::All(_) => Box::new(AllQuery),
             proto::query::Query::Empty(_) => Box::new(EmptyQuery),
@@ -257,7 +255,7 @@ impl ProtoQueryParser {
 
     pub fn parse_query(&self, query: proto::query::Query) -> SummaResult<Box<dyn Query>> {
         #[cfg(feature = "metrics")]
-        self.query_counter.add(&Context::current(), 1, &[KeyValue::new("query", query.to_label())]);
+        self.query_counter.add(1, &[KeyValue::new("query", query.to_label())]);
         self.parse_subquery(query)
     }
 }

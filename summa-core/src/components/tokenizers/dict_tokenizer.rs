@@ -37,7 +37,8 @@ impl DictTokenizer {
         let ac = aho_corasick::AhoCorasickBuilder::new()
             .ascii_case_insensitive(true)
             .match_kind(MatchKind::LeftmostLongest)
-            .build(words.iter());
+            .build(words.iter())
+            .expect("internal error");
         DictTokenizer { ac, words, dict }
     }
 }
@@ -52,7 +53,7 @@ pub struct DictTokenStream<'a> {
     text: &'a str,
     words: &'a Vec<String>,
     dict: &'a Vec<usize>,
-    ah_iter: aho_corasick::FindIter<'a, 'a, usize>,
+    ah_iter: aho_corasick::FindIter<'a, 'a>,
     token: Token,
 }
 

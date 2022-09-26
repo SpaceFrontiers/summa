@@ -11,12 +11,10 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Request, Response, Server,
 };
-use opentelemetry::sdk::export::metrics::{aggregation, AggregatorSelector};
-use opentelemetry::sdk::metrics::aggregators::Aggregator;
-use opentelemetry::sdk::metrics::sdk_api::{Descriptor, InstrumentKind};
-use opentelemetry::sdk::metrics::{aggregators, controllers, processors};
-use opentelemetry_prometheus::PrometheusExporter;
-use prometheus::{Encoder, TextEncoder};
+use opentelemetry::metrics::MeterProvider;
+use opentelemetry::sdk::metrics::reader::AggregationSelector;
+use opentelemetry::sdk::metrics::{Aggregation, InstrumentKind};
+use prometheus::{Encoder, Registry, TextEncoder};
 use tracing::{info, info_span, instrument};
 use tracing_futures::Instrument;
 
@@ -28,40 +26,37 @@ use crate::utils::thread_handler::ControlMessage;
 #[derive(Clone)]
 pub struct Metrics {
     config: crate::configs::metrics::Config,
-    exporter: PrometheusExporter,
+    registry: Registry,
 }
 
 struct AppState {
-    exporter: PrometheusExporter,
     index_service: Index,
     index_meter: IndexMeter,
+    registry: Registry,
 }
 
 #[derive(Debug)]
 struct CustomAgg;
 
-impl AggregatorSelector for CustomAgg {
-    fn aggregator_for(&self, descriptor: &Descriptor) -> Option<Arc<dyn Aggregator + Send + Sync>> {
-        match descriptor.instrument_kind() {
-            InstrumentKind::Counter => Some(Arc::new(aggregators::sum())),
-            _ => match descriptor.unit() {
-                Some("bytes") => Some(Arc::new(aggregators::last_value())),
-                Some("seconds") => Some(Arc::new(aggregators::histogram(&[
-                    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
-                ]))),
-                _ => Some(Arc::new(aggregators::last_value())),
+impl AggregationSelector for CustomAgg {
+    fn aggregation(&self, kind: InstrumentKind) -> Aggregation {
+        match kind {
+            InstrumentKind::Counter => Aggregation::Sum,
+            InstrumentKind::Histogram => Aggregation::ExplicitBucketHistogram {
+                boundaries: vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+                record_min_max: false,
             },
+            _ => Aggregation::LastValue,
         }
     }
 }
 
 impl Metrics {
     pub fn new(config: &crate::configs::metrics::Config) -> SummaServerResult<Metrics> {
-        let controller = controllers::basic(processors::factory(CustomAgg, aggregation::cumulative_temporality_selector())).build();
-        let exporter = opentelemetry_prometheus::exporter(controller).init();
+        let registry = Registry::new();
         Ok(Metrics {
             config: config.clone(),
-            exporter,
+            registry,
         })
     }
 
@@ -85,7 +80,7 @@ impl Metrics {
 
                 let mut buffer = vec![];
                 let encoder = TextEncoder::new();
-                let metric_families = state.exporter.registry().gather();
+                let metric_families = state.registry.gather();
                 encoder.encode(&metric_families[..], &mut buffer).expect("prometheus failed");
                 Response::builder()
                     .status(200)
@@ -104,10 +99,18 @@ impl Metrics {
         index_service: &Index,
         mut terminator: Receiver<ControlMessage>,
     ) -> SummaServerResult<impl Future<Output = SummaServerResult<()>>> {
+        let exporter = opentelemetry_prometheus::exporter()
+            .with_registry(self.registry.clone())
+            .with_aggregation_selector(CustomAgg)
+            .build()
+            .expect("internal error");
+        let provider = opentelemetry::sdk::metrics::MeterProvider::builder().with_reader(exporter).build();
+        let meter = provider.meter("summa");
+
         let state = Arc::new(AppState {
-            exporter: self.exporter.clone(),
             index_service: index_service.clone(),
-            index_meter: IndexMeter::new(),
+            index_meter: IndexMeter::new(meter),
+            registry: self.registry.clone(),
         });
         let service = make_service_fn(move |_conn| {
             let state = state.clone();

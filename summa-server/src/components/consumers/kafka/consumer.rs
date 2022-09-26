@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use opentelemetry::{global, Context, KeyValue};
+use opentelemetry::{global, KeyValue};
 use rdkafka::admin::{AdminClient, AdminOptions, AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::config::{ClientConfig, FromClientConfig};
 use rdkafka::consumer::{CommitMode, Consumer as KafkaConsumer, StreamConsumer as KafkaStreamConsumer, StreamConsumer};
@@ -158,7 +158,6 @@ impl ConsumerThread for KafkaConsumerThread {
                 info!(action = "start");
                 let (shutdown_trigger, mut shutdown_tripwire) = async_broadcast::broadcast(1);
                 let consumer_name = self.consumer_name.clone();
-                let context = Context::current();
                 let stream_processor = {
                     async move {
                         let stream = stream_consumer.stream();
@@ -170,18 +169,10 @@ impl ConsumerThread for KafkaConsumerThread {
                             match terminatable_stream.next().await {
                                 Some(message) => {
                                     match process_message(&index_writer_holder, conflict_strategy, &schema, message) {
-                                        Ok(_) => counter.add(
-                                            &context,
-                                            1,
-                                            &[KeyValue::new("status", "ok"), KeyValue::new("consumer_name", consumer_name.clone())],
-                                        ),
+                                        Ok(_) => counter.add(1, &[KeyValue::new("status", "ok"), KeyValue::new("consumer_name", consumer_name.clone())]),
                                         Err(error) => {
                                             warn!(action = "error", error = ?error);
-                                            counter.add(
-                                                &context,
-                                                1,
-                                                &[KeyValue::new("status", "error"), KeyValue::new("consumer_name", consumer_name.clone())],
-                                            );
+                                            counter.add(1, &[KeyValue::new("status", "error"), KeyValue::new("consumer_name", consumer_name.clone())]);
                                         }
                                     };
                                 }

@@ -2,8 +2,8 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use cid::multihash::{Code, MultihashDigest};
 use cid::Cid;
-use multihash::{Code, MultihashDigest};
 use prost::Message;
 use rayon::prelude::*;
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::{io, iter};
 
-use opentelemetry::metrics::{Histogram, Unit};
-use opentelemetry::{global, Context, KeyValue};
+use opentelemetry::metrics::{Histogram, Meter, Unit};
+use opentelemetry::KeyValue;
 use summa_core::components::IndexHolder;
 
 #[derive(Clone)]
@@ -14,8 +14,7 @@ pub struct IndexMeter {
     fields_memory_usage: Histogram<u64>,
 }
 impl IndexMeter {
-    pub fn new() -> IndexMeter {
-        let meter = global::meter("summa");
+    pub fn new(meter: Meter) -> IndexMeter {
         IndexMeter {
             documents_count: meter.u64_histogram("documents_count").with_description("Documents count").init(),
             deleted_documents_count: meter
@@ -45,7 +44,6 @@ impl IndexMeter {
         let searcher = index_holder.index_reader().searcher();
         let segment_readers = searcher.segment_readers();
         let mut per_fields = HashMap::new();
-        let context = Context::current();
         for segment_reader in segment_readers {
             let segment_id = segment_reader.segment_id().uuid_string();
             let segment_space_usage = segment_reader.space_usage()?;
@@ -64,20 +62,17 @@ impl IndexMeter {
                 KeyValue::new("segment_id", segment_id.to_string()),
                 KeyValue::new("service.name", "summa-server"),
             ];
-            self.documents_count.record(&context, segment_reader.num_docs() as u64, segment_keys);
-            self.deleted_documents_count
-                .record(&context, segment_reader.num_deleted_docs() as u64, segment_keys);
-            self.deleted_memory_usage
-                .record(&context, segment_space_usage.deletes().get_bytes(), segment_keys);
-            self.store_memory_usage
-                .record(&context, segment_space_usage.store().total().get_bytes(), segment_keys);
+            self.documents_count.record(segment_reader.num_docs() as u64, segment_keys);
+            self.deleted_documents_count.record(segment_reader.num_deleted_docs() as u64, segment_keys);
+            self.deleted_memory_usage.record(segment_space_usage.deletes().get_bytes(), segment_keys);
+            self.store_memory_usage.record(segment_space_usage.store().total().get_bytes(), segment_keys);
         }
         for (field_name, memory_usage) in &per_fields {
             let field_keys = &[
                 KeyValue::new("index_name", index_holder.index_name().to_string()),
                 KeyValue::new("field_name", field_name.to_string()),
             ];
-            self.fields_memory_usage.record(&context, *memory_usage, field_keys);
+            self.fields_memory_usage.record(*memory_usage, field_keys);
         }
         Ok(())
     }
