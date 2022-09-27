@@ -1,4 +1,4 @@
-use lru_time_cache::LruCache;
+use izihawa_ttl_cache::TtlCache;
 use summa_proto::proto;
 
 use crate::components::IntermediateExtractionResult;
@@ -7,23 +7,20 @@ use crate::configs::core::CollectorCacheConfig;
 const BLOCK_SIZE: u32 = 100;
 
 pub struct CollectorCache {
-    cache: LruCache<String, IntermediateExtractionResult>,
+    cache: TtlCache<String, IntermediateExtractionResult>,
+    ttl_interval_ms: instant::Duration,
 }
 
 impl CollectorCache {
     pub fn new(config: &CollectorCacheConfig) -> Self {
-        match config.ttl_interval_ms {
-            Some(ttl_interval_ms) => CollectorCache {
-                cache: LruCache::with_expiry_duration_and_capacity(std::time::Duration::from_millis(ttl_interval_ms), config.size),
-            },
-            None => CollectorCache {
-                cache: LruCache::with_capacity(config.size),
-            },
+        CollectorCache {
+            ttl_interval_ms: instant::Duration::from_millis(config.ttl_interval_ms.unwrap_or(120000)),
+            cache: TtlCache::new(config.size),
         }
     }
 
     pub fn remove_expired(&mut self) {
-        self.cache.iter();
+        self.cache.remove_expired();
     }
 
     pub fn caching_key(&self, caching_key: &str, collector: &proto::Collector) -> String {
@@ -107,6 +104,6 @@ impl CollectorCache {
 
     pub fn put(&mut self, caching_key: &str, collector: &proto::Collector, value: IntermediateExtractionResult) {
         let caching_key = self.caching_key(caching_key, collector);
-        self.cache.insert(caching_key.clone(), value.clone());
+        self.cache.insert(caching_key.clone(), value.clone(), self.ttl_interval_ms);
     }
 }

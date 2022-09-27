@@ -3,10 +3,10 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 use std::{fmt, io, mem};
 
 use async_trait::async_trait;
+use instant::{Duration, Instant};
 use tantivy::directory::error::{LockError, OpenReadError};
 use tantivy::directory::{DirectoryLock, FileHandle, Lock, OwnedBytes};
 use tantivy::{Directory, HasLen};
