@@ -32,7 +32,7 @@ function is_mobile() {
 export const default_options: IndexRegistryOptions = {
   num_threads: Math.ceil(navigator.hardwareConcurrency / 2),
   logging_level: "info",
-  memory_config: is_mobile() ? { initial: 1024, maximum: 8192, shared: true } : { initial: 8192, maximum: 65536, shared: true }
+  memory_config: is_mobile() ? { initial: 1024, maximum: 8192, shared: true } : { initial: 2048, maximum: 65536, shared: true }
 }
 
 export class IndexRegistry implements IIndexRegistry {
@@ -46,9 +46,7 @@ export class IndexRegistry implements IIndexRegistry {
     console.log('Memory config:', actual_options.memory_config);
     await init(init_url, new WebAssembly.Memory(actual_options.memory_config!));
     await setup_logging(actual_options.logging_level!);
-
     this.registry = new WrappedIndexRegistry();
-    await this.registry.setup(actual_options.num_threads!);
   }
 
   async add(index_name: string, index_engine_config: summa.proto.IndexEngineConfig): Promise<summa.proto.IndexAttributes> {

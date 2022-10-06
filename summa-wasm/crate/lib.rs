@@ -27,8 +27,6 @@ mod js_requests;
 mod web_index_registry;
 mod worker_helper;
 
-pub use worker_helper::{worker_entry_point, ThreadPool};
-
 #[wasm_bindgen]
 pub fn setup_logging(max_level: String) {
     console_error_panic_hook::set_once();

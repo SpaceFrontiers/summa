@@ -14,7 +14,6 @@ use wasm_bindgen::JsValue;
 
 use crate::errors::{Error, SummaWasmResult};
 use crate::js_requests::JsExternalRequest;
-use crate::ThreadPool;
 
 /// Hold `IndexRegistry` and wrap it for making WASM-compatible
 #[wasm_bindgen]
@@ -22,7 +21,6 @@ use crate::ThreadPool;
 pub struct WrappedIndexRegistry {
     index_registry: IndexRegistry,
     core_config: Arc<dyn ConfigProxy<summa_core::configs::core::Config>>,
-    thread_pool: Option<ThreadPool>,
 }
 
 #[wasm_bindgen]
@@ -39,15 +37,7 @@ impl WrappedIndexRegistry {
         WrappedIndexRegistry {
             index_registry: IndexRegistry::new(&core_config),
             core_config,
-            thread_pool: None,
         }
-    }
-
-    /// Configures WASM-pool for executing queries to different indices
-    #[wasm_bindgen]
-    pub async fn setup(&mut self, threads: usize) -> Result<(), JsValue> {
-        self.thread_pool = Some(ThreadPool::new(threads).await?);
-        Ok(())
     }
 
     /// Do pooled search

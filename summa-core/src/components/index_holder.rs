@@ -8,7 +8,7 @@ use futures::future::{join_all, try_join_all};
 use serde::Deserialize;
 use summa_proto::proto;
 use summa_proto::proto::IndexAttributes;
-use tantivy::collector::{Collector, DocSetCollector, MultiCollector, MultiFruit};
+use tantivy::collector::{Collector, MultiCollector, MultiFruit};
 use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
@@ -626,7 +626,7 @@ impl IndexHolder {
         documents_modifier: impl Fn(tantivy::schema::Document) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         let parsed_query = self.query_parser.parse_query(query.clone())?;
-        let collector = DocSetCollector;
+        let collector = tantivy::collector::DocSetCollector;
         let segment_readers = searcher.segment_readers();
         let weight = parsed_query.weight_async(EnableScoring::disabled_from_searcher(searcher)).await?;
 
