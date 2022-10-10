@@ -10,9 +10,7 @@ Summa is a full-text IPFS-friendly search engine that may be launched on both la
 
 <img src="docs/assets/gear-logo-removebg.png" width=256 height=256>
 
-Thanks to embedded IPFS daemon, your data can be replicated and published through P2P, allowing for a truly distributed and
-uncensorable search experience. And, thanks to compatibility with WASM, Summa can be launched entirely
-inside your browser, enabling you to search in network published indices without ever having to execute search queries
+Summa can be launched entirely inside your browser, enabling you to search in network published indices without ever having to execute search queries
 on remote servers.
 
 If you're ready to start, be sure to check out our docs:

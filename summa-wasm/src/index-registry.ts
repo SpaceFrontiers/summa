@@ -12,7 +12,6 @@ export interface IIndexRegistry {
 }
 
 export type IndexRegistryOptions = {
-  num_threads?: number,
   logging_level?: string
   memory_config?: WebAssembly.MemoryDescriptor
 }
@@ -30,7 +29,6 @@ function is_mobile() {
 }
 
 export const default_options: IndexRegistryOptions = {
-  num_threads: Math.ceil(navigator.hardwareConcurrency / 2),
   logging_level: "info",
   memory_config: is_mobile() ? { initial: 1024, maximum: 8192, shared: true } : { initial: 2048, maximum: 65536, shared: true }
 }
