@@ -294,9 +294,6 @@ message WarmupIndexResponse {
 // Compression library for store, implies on both performance and occupied disk space
 enum Compression {
   None = 0;
-  Brotli = 1;
-  Lz4 = 2;
-  Snappy = 3;
   Zstd = 4;
   Zstd7 = 5;
   Zstd9 = 6;

@@ -1,5 +1,5 @@
 use std::collections::hash_map::RandomState;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -8,8 +8,8 @@ use summa_proto::proto;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::merge_policy::MergePolicy;
 use tantivy::query::Query;
-use tantivy::schema::{Field, Value};
-use tantivy::{Directory, Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, SingleSegmentIndexWriter, Term};
+use tantivy::schema::{Field, NamedFieldDocument, OwnedValue, Value};
+use tantivy::{Directory, Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, SingleSegmentIndexWriter, TantivyDocument, Term};
 use tracing::info;
 
 use super::SummaSegmentAttributes;
@@ -17,16 +17,16 @@ use crate::configs::core::WriterThreads;
 use crate::errors::{SummaResult, ValidationError};
 use crate::Error;
 
-fn extract_flatten<T: AsRef<str>>(v: &serde_json::Value, parts: &[T], buffer: &mut Vec<String>) {
+fn extract_flatten<T: AsRef<str>>(v: &OwnedValue, parts: &[T], buffer: &mut Vec<String>) {
     let mut current = v;
     for (i, part) in parts.iter().enumerate() {
         match current {
-            serde_json::value::Value::Object(m) => {
+            OwnedValue::Object(m) => {
                 if let Some(next) = m.get(part.as_ref()) {
                     current = next
                 }
             }
-            serde_json::value::Value::Array(a) => {
+            OwnedValue::Array(a) => {
                 for child in a {
                     extract_flatten(child, &parts[i..], buffer)
                 }
@@ -34,16 +34,16 @@ fn extract_flatten<T: AsRef<str>>(v: &serde_json::Value, parts: &[T], buffer: &m
             _ => break,
         }
     }
-    if let serde_json::Value::String(last_value) = &current {
+    if let OwnedValue::Str(last_value) = current {
         buffer.push(last_value.to_string())
     }
 }
 
-fn extract_flatten_from_map<T: AsRef<str>>(m: &serde_json::value::Map<String, serde_json::Value>, parts: &[T], buffer: &mut Vec<String>) {
+fn extract_flatten_from_map<T: AsRef<str>>(m: &BTreeMap<String, OwnedValue>, parts: &[T], buffer: &mut Vec<String>) {
     for (i, part) in parts.iter().enumerate() {
         match m.get(part.as_ref()) {
             Some(v) => match v {
-                serde_json::value::Value::Array(a) => {
+                OwnedValue::Array(a) => {
                     for child in a {
                         extract_flatten(child, &parts[i..], buffer)
                     }
@@ -55,20 +55,26 @@ fn extract_flatten_from_map<T: AsRef<str>>(m: &serde_json::value::Map<String, se
     }
 }
 
-fn cast_to_term(unique_field: &Field, full_path: &str, value: &serde_json::Value) -> Vec<Term> {
+fn cast_to_term(unique_field: &Field, full_path: &str, value: &OwnedValue) -> Vec<Term> {
     let mut term = Term::with_capacity(128);
     let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*unique_field, full_path, true, &mut term);
     match value {
-        serde_json::Value::Number(n) => {
+        OwnedValue::I64(n) => {
             vec![convert_to_fast_value_and_get_term(&mut json_term_writer, &n.to_string()).expect("incorrect json type")]
         }
-        serde_json::Value::String(s) => {
+        OwnedValue::U64(n) => {
+            vec![convert_to_fast_value_and_get_term(&mut json_term_writer, &n.to_string()).expect("incorrect json type")]
+        }
+        OwnedValue::F64(n) => {
+            vec![convert_to_fast_value_and_get_term(&mut json_term_writer, &n.to_string()).expect("incorrect json type")]
+        }
+        OwnedValue::Str(s) => {
             let mut term = Term::with_capacity(128);
             let mut json_term_writer = JsonTermWriter::from_field_and_json_path(*unique_field, full_path, true, &mut term);
             json_term_writer.set_str(s);
             vec![json_term_writer.term().clone()]
         }
-        serde_json::Value::Array(v) => v.iter().flat_map(|e| cast_to_term(unique_field, full_path, e)).collect(),
+        OwnedValue::Array(v) => v.iter().flat_map(|e| cast_to_term(unique_field, full_path, e)).collect(),
         _ => unreachable!(),
     }
 }
@@ -116,7 +122,7 @@ impl IndexWriterImpl {
         }
     }
 
-    pub fn add_document(&self, document: Document) -> SummaResult<()> {
+    pub fn add_document(&self, document: TantivyDocument) -> SummaResult<()> {
         match self {
             IndexWriterImpl::SameThread(writer) => {
                 writer.index_writer.write().expect("poisoned").add_document(document)?;
@@ -272,7 +278,7 @@ impl IndexWriterHolder {
     }
 
     /// Delete index by its unique fields
-    pub(super) fn resolve_conflicts(&self, document: &Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<Option<u64>> {
+    pub(super) fn resolve_conflicts(&self, document: &TantivyDocument, conflict_strategy: proto::ConflictStrategy) -> SummaResult<Option<u64>> {
         if self.unique_fields.is_empty() || matches!(conflict_strategy, proto::ConflictStrategy::DoNothing) {
             return Ok(None);
         }
@@ -282,11 +288,11 @@ impl IndexWriterHolder {
             .iter()
             .filter_map(|(unique_field, full_path)| {
                 document.get_first(*unique_field).and_then(|value| match value {
-                    Value::Str(s) => Some(Ok(vec![Term::from_field_text(*unique_field, s)])),
-                    Value::JsonObject(i) => i.get(full_path).map(|value| Ok(cast_to_term(unique_field, full_path, value))),
-                    Value::I64(i) => Some(Ok(vec![Term::from_field_i64(*unique_field, *i)])),
-                    Value::U64(i) => Some(Ok(vec![Term::from_field_u64(*unique_field, *i)])),
-                    Value::F64(i) => Some(Ok(vec![Term::from_field_f64(*unique_field, *i)])),
+                    OwnedValue::Str(s) => Some(Ok(vec![Term::from_field_text(*unique_field, s)])),
+                    OwnedValue::Object(i) => i.get(full_path).map(|value| Ok(cast_to_term(unique_field, full_path, value))),
+                    OwnedValue::I64(i) => Some(Ok(vec![Term::from_field_i64(*unique_field, *i)])),
+                    OwnedValue::U64(i) => Some(Ok(vec![Term::from_field_u64(*unique_field, *i)])),
+                    OwnedValue::F64(i) => Some(Ok(vec![Term::from_field_f64(*unique_field, *i)])),
                     _ => {
                         let schema = self.index_writer.index().schema();
                         let field_type = schema.get_field_entry(*unique_field).field_type();
@@ -302,7 +308,7 @@ impl IndexWriterHolder {
         if unique_terms.is_empty() {
             Err(ValidationError::MissingUniqueField(format!(
                 "{:?}",
-                self.index_writer.index().schema().to_named_doc(document)
+                document.to_named_doc(&self.index_writer.index().schema()),
             )))?
         }
 
@@ -330,7 +336,7 @@ impl IndexWriterHolder {
     }
 
     #[inline]
-    fn process_dynamic_fields(&self, document: &mut Document) -> SummaResult<()> {
+    fn process_dynamic_fields(&self, document: &mut TantivyDocument) -> SummaResult<()> {
         if let Some((extra_field, issued_at_field)) = self.extra_year_field {
             if let Some(issued_at_value) = document.get_first(issued_at_field) {
                 if let Some(issued_at_value) = issued_at_value.as_i64() {
@@ -346,8 +352,8 @@ impl IndexWriterHolder {
         for ((source_field, source_full_path), target_field) in &self.mapped_fields {
             for value in document.get_all(*source_field) {
                 match value {
-                    Value::Str(s) => buffer.push(s.to_string()),
-                    Value::JsonObject(m) => {
+                    OwnedValue::Str(s) => buffer.push(s.to_string()),
+                    OwnedValue::Object(m) => {
                         extract_flatten_from_map(m, source_full_path, &mut buffer);
                     }
                     _ => unimplemented!(),
@@ -362,7 +368,7 @@ impl IndexWriterHolder {
     }
 
     /// Put document to the index. Before comes searchable it must be committed
-    pub fn index_document(&self, mut document: Document, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
+    pub fn index_document(&self, mut document: TantivyDocument, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
         self.process_dynamic_fields(&mut document)?;
         self.resolve_conflicts(&document, conflict_strategy)?;
         self.index_writer.add_document(document)?;

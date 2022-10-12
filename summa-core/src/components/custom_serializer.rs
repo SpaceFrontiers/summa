@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Serialize, Serializer};
-use tantivy::schema::{Field, Schema};
-use tantivy::Document;
+use tantivy::schema::{Field, OwnedValue, Schema};
+use tantivy::{Document, TantivyDocument};
 
 /// `Value` is used for representing singular or multi-values of `tantivy::Document`
 ///
 /// Required because Tantivy operates with multi-values only and Summa provides an abstraction of singular fields
 pub enum Value<'a> {
-    SingleValue(Option<&'a tantivy::schema::Value>),
-    MultipleValue(Vec<&'a tantivy::schema::Value>),
+    SingleValue(Option<&'a OwnedValue>),
+    MultipleValue(Vec<&'a OwnedValue>),
 }
 
 /// Internal representation of a document used for JSON
@@ -22,7 +22,7 @@ pub enum Value<'a> {
 pub struct NamedFieldDocument<'a>(pub BTreeMap<&'a str, Value<'a>>);
 
 impl<'a> NamedFieldDocument<'a> {
-    pub fn from_document(schema: &'a Schema, fields: &Option<HashSet<Field>>, multi_fields: &HashSet<Field>, document: &'a Document) -> Self {
+    pub fn from_document(schema: &'a Schema, fields: &Option<HashSet<Field>>, multi_fields: &HashSet<Field>, document: &'a TantivyDocument) -> Self {
         let mut field_map = BTreeMap::new();
         for (field, field_values) in document.get_sorted_field_values() {
             let field_name = schema.get_field_name(field);

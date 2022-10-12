@@ -1,11 +1,12 @@
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::str::{from_utf8, FromStr};
 
 use base64::Engine;
 use serde_json::{json, Value as JsonValue};
-use tantivy::schema::{Facet, FieldType, IntoIpv6Addr, Schema, Value};
+use tantivy::schema::{Facet, FieldType, IntoIpv6Addr, OwnedValue, Schema, Value};
 use tantivy::tokenizer::PreTokenizedString;
-use tantivy::{DateTime, Document};
+use tantivy::{DateTime, TantivyDocument};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -17,7 +18,7 @@ use crate::utils::current_time;
 pub enum SummaDocument<'a> {
     BoundJsonBytes((&'a Schema, &'a [u8])),
     UnboundJsonBytes(&'a [u8]),
-    TantivyDocument(Document),
+    TantivyDocument(TantivyDocument),
 }
 
 /// Possible error that may occur while parsing a field value
@@ -72,7 +73,7 @@ impl<'a> SummaDocument<'a> {
 
     /// Parse single json value
     #[inline]
-    pub fn value_from_json(&self, field_type: &FieldType, json: JsonValue) -> Result<Value, ValueParsingError> {
+    pub fn value_from_json(&self, field_type: &FieldType, json: JsonValue) -> Result<OwnedValue, ValueParsingError> {
         match json {
             JsonValue::String(field_text) => match *field_type {
                 FieldType::Date(_) => {
@@ -82,7 +83,7 @@ impl<'a> SummaDocument<'a> {
                     })?;
                     Ok(DateTime::from_utc(dt_with_fixed_tz).into())
                 }
-                FieldType::Str(_) => Ok(Value::Str(field_text)),
+                FieldType::Str(_) => Ok(OwnedValue::Str(field_text)),
                 FieldType::U64(_) | FieldType::I64(_) | FieldType::F64(_) => Err(ValueParsingError::TypeError {
                     expected: "an integer",
                     json: JsonValue::String(field_text),
@@ -91,10 +92,10 @@ impl<'a> SummaDocument<'a> {
                     expected: "a boolean",
                     json: JsonValue::String(field_text),
                 }),
-                FieldType::Facet(_) => Ok(Value::Facet(Facet::from(&field_text))),
+                FieldType::Facet(_) => Ok(OwnedValue::Facet(Facet::from(&field_text))),
                 FieldType::Bytes(_) => base64::engine::general_purpose::STANDARD
                     .decode(&field_text)
-                    .map(Value::Bytes)
+                    .map(OwnedValue::Bytes)
                     .map_err(|_| ValueParsingError::InvalidBase64 { base64: field_text }),
                 FieldType::JsonObject(_) => Err(ValueParsingError::TypeError {
                     expected: "a json object",
@@ -105,13 +106,13 @@ impl<'a> SummaDocument<'a> {
                         error: err.to_string(),
                         json: JsonValue::String(field_text),
                     })?;
-                    Ok(Value::IpAddr(ip_addr.into_ipv6_addr()))
+                    Ok(OwnedValue::IpAddr(ip_addr.into_ipv6_addr()))
                 }
             },
             JsonValue::Number(field_val_num) => match field_type {
                 FieldType::I64(_) | FieldType::Date(_) => {
                     if let Some(field_val_i64) = field_val_num.as_i64() {
-                        Ok(Value::I64(field_val_i64))
+                        Ok(OwnedValue::I64(field_val_i64))
                     } else {
                         Err(ValueParsingError::OverflowError {
                             expected: "an i64 int",
@@ -121,7 +122,7 @@ impl<'a> SummaDocument<'a> {
                 }
                 FieldType::U64(_) => {
                     if let Some(field_val_u64) = field_val_num.as_u64() {
-                        Ok(Value::U64(field_val_u64))
+                        Ok(OwnedValue::U64(field_val_u64))
                     } else {
                         Err(ValueParsingError::OverflowError {
                             expected: "u64",
@@ -131,7 +132,7 @@ impl<'a> SummaDocument<'a> {
                 }
                 FieldType::F64(_) => {
                     if let Some(field_val_f64) = field_val_num.as_f64() {
-                        Ok(Value::F64(field_val_f64))
+                        Ok(OwnedValue::F64(field_val_f64))
                     } else {
                         Err(ValueParsingError::OverflowError {
                             expected: "a f64",
@@ -159,7 +160,7 @@ impl<'a> SummaDocument<'a> {
             JsonValue::Object(json_map) => match field_type {
                 FieldType::Str(_) => {
                     if let Ok(tok_str_val) = serde_json::from_value::<PreTokenizedString>(serde_json::Value::Object(json_map.clone())) {
-                        Ok(Value::PreTokStr(tok_str_val))
+                        Ok(OwnedValue::PreTokStr(tok_str_val))
                     } else {
                         Err(ValueParsingError::TypeError {
                             expected: "a string or an pretokenized string",
@@ -167,14 +168,16 @@ impl<'a> SummaDocument<'a> {
                         })
                     }
                 }
-                FieldType::JsonObject(_) => Ok(Value::JsonObject(json_map)),
+                FieldType::JsonObject(_) => Ok(OwnedValue::Object(BTreeMap::from_iter(
+                    json_map.into_iter().map(|(k, v)| (k, self.value_from_json(field_type, v).unwrap())),
+                ))),
                 _ => Err(ValueParsingError::TypeError {
                     expected: field_type.value_type().name(),
                     json: JsonValue::Object(json_map),
                 }),
             },
             JsonValue::Bool(json_bool_val) => match field_type {
-                FieldType::Bool(_) => Ok(Value::Bool(json_bool_val)),
+                FieldType::Bool(_) => Ok(OwnedValue::Bool(json_bool_val)),
                 _ => Err(ValueParsingError::TypeError {
                     expected: field_type.value_type().name(),
                     json: JsonValue::Bool(json_bool_val),
@@ -189,7 +192,7 @@ impl<'a> SummaDocument<'a> {
     }
 
     /// Build a document object from a json-object.
-    pub fn parse_and_setup_document(&self, schema: &Schema, doc_json: &str) -> SummaResult<Document> {
+    pub fn parse_and_setup_document(&self, schema: &Schema, doc_json: &str) -> SummaResult<TantivyDocument> {
         let mut json_obj: serde_json::Map<String, JsonValue> =
             serde_json::from_str(doc_json).map_err(|_| DocumentParsingError::InvalidJson(doc_json.to_owned()))?;
         process_dynamic_fields(schema, &mut json_obj);
@@ -197,8 +200,8 @@ impl<'a> SummaDocument<'a> {
     }
 
     /// Build a document object from a json-object.
-    pub fn json_object_to_doc(&self, schema: &Schema, json_obj: serde_json::Map<String, JsonValue>) -> SummaResult<Document> {
-        let mut doc = Document::default();
+    pub fn json_object_to_doc(&self, schema: &Schema, json_obj: serde_json::Map<String, JsonValue>) -> SummaResult<TantivyDocument> {
+        let mut doc = TantivyDocument::default();
         for (field_name, json_value) in json_obj {
             if let Ok(field) = schema.get_field(&field_name) {
                 let field_entry = schema.get_field_entry(field);
@@ -225,10 +228,10 @@ impl<'a> SummaDocument<'a> {
     }
 }
 
-impl<'a> TryInto<Document> for SummaDocument<'a> {
+impl<'a> TryInto<TantivyDocument> for SummaDocument<'a> {
     type Error = Error;
 
-    fn try_into(self) -> SummaResult<Document> {
+    fn try_into(self) -> SummaResult<TantivyDocument> {
         match self {
             SummaDocument::BoundJsonBytes((schema, json_bytes)) => {
                 let text_document = from_utf8(json_bytes).map_err(ValidationError::Utf8)?;

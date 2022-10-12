@@ -11,7 +11,7 @@ use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, DisjunctionMaxQuery, EmptyQuery, MoreLikeThisQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
 use tantivy::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
-use tantivy::{Index, Score, Term};
+use tantivy::{Document, Index, Score, TantivyDocument, Term};
 use tracing::info;
 
 use crate::components::queries::ExistsQuery;
@@ -207,9 +207,7 @@ impl ProtoQueryParser {
                 ))
             }
             proto::query::Query::MoreLikeThis(more_like_this_query_proto) => {
-                let document = self
-                    .cached_schema
-                    .parse_document(&more_like_this_query_proto.document)
+                let document = TantivyDocument::parse_json(&self.cached_schema, &more_like_this_query_proto.document)
                     .map_err(|_e| Error::InvalidSyntax("bad document".to_owned()))?;
                 let field_values = document
                     .get_sorted_field_values()

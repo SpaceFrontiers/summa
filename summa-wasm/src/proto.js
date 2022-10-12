@@ -7269,9 +7269,6 @@ export const summa = $root.summa = (() => {
         proto.Compression = (function() {
             const valuesById = {}, values = Object.create(valuesById);
             values[valuesById[0] = "None"] = 0;
-            values[valuesById[1] = "Brotli"] = 1;
-            values[valuesById[2] = "Lz4"] = 2;
-            values[valuesById[3] = "Snappy"] = 3;
             values[valuesById[4] = "Zstd"] = 4;
             values[valuesById[5] = "Zstd7"] = 5;
             values[valuesById[6] = "Zstd9"] = 6;

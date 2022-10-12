@@ -3984,9 +3984,6 @@ export namespace summa {
         /** Compression enum. */
         enum Compression {
             None = 0,
-            Brotli = 1,
-            Lz4 = 2,
-            Snappy = 3,
             Zstd = 4,
             Zstd7 = 5,
             Zstd9 = 6,

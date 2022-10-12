@@ -134,7 +134,7 @@ Modifies scores produced by a nested query. Useful in `BooleanQuery` to penalize
 ```
 
 ## MatchQuery
-`MatchQuery` is a special query. Summa takes the value of this query, parses it and produces other kind of queries.
+`MatchQuery` is a special query. Summa takes the value written in SummaQL format, parses it and produces tree of queries that may be executed by search engine.
 `MatchQuery` may be used for parsing queries written in natural language. For example, following query
 ```json
 {
@@ -175,6 +175,10 @@ will be parsed into
   }
 }
 ```
+
+SummaQL supports 
+- `RegexQuery`: `phone_number://7916.*//`
+- `ExistsQuery`: `phone_number:*`
 
 ## PhraseQuery
 Documents containing exact occurrence of the phrase

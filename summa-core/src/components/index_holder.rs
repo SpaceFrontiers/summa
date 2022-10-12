@@ -13,7 +13,7 @@ use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
 use tantivy::space_usage::SearcherSpaceUsage;
-use tantivy::{Directory, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
+use tantivy::{Directory, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher, TantivyDocument};
 use tokio::sync::RwLock;
 use tracing::{error, info, instrument, trace, warn};
 
@@ -582,7 +582,7 @@ impl IndexHolder {
         &self,
         searcher: &Searcher,
         query_filter: &Option<proto::Query>,
-        documents_modifier: impl Fn(tantivy::schema::Document) -> Option<O> + Clone + Send + Sync + 'static,
+        documents_modifier: impl Fn(TantivyDocument) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         match query_filter {
             None | Some(proto::Query { query: None }) => {
@@ -623,7 +623,7 @@ impl IndexHolder {
         &self,
         searcher: &Searcher,
         query: &proto::query::Query,
-        documents_modifier: impl Fn(tantivy::schema::Document) -> Option<O> + Clone + Send + Sync + 'static,
+        documents_modifier: impl Fn(TantivyDocument) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         let parsed_query = self.query_parser.parse_query(query.clone())?;
         let collector = tantivy::collector::DocSetCollector;
@@ -684,8 +684,8 @@ pub mod tests {
     use summa_proto::proto::ConflictStrategy;
     use tantivy::collector::{Count, TopDocs};
     use tantivy::query::{AllQuery, TermQuery};
-    use tantivy::schema::IndexRecordOption;
-    use tantivy::{doc, Document, IndexBuilder, Term};
+    use tantivy::schema::{IndexRecordOption, Value};
+    use tantivy::{doc, IndexBuilder, TantivyDocument, Term};
 
     use crate::components::index_holder::register_default_tokenizers;
     use crate::components::test_utils::{create_test_schema, generate_documents};
@@ -711,7 +711,7 @@ pub mod tests {
         )?;
         let mut last_document = None;
         for document in generate_documents(&schema, 10000) {
-            let document: Document = document.bound_with(&schema).try_into()?;
+            let document: TantivyDocument = document.bound_with(&schema).try_into()?;
             last_document = Some(document.clone());
             index_writer_holder.index_document(document, ConflictStrategy::Merge)?;
         }
@@ -802,11 +802,11 @@ pub mod tests {
             .into_iter()
             .map(|x| {
                 searcher
-                    .doc(x.1)
+                    .doc::<TantivyDocument>(x.1)
                     .unwrap()
                     .get_first(title_field)
                     .unwrap()
-                    .as_text()
+                    .as_str()
                     .map(|x| x.to_string())
                     .unwrap()
             })
@@ -820,11 +820,11 @@ pub mod tests {
             .into_iter()
             .map(|x| {
                 searcher
-                    .doc(x.1)
+                    .doc::<TantivyDocument>(x.1)
                     .unwrap()
                     .get_first(title_field)
                     .unwrap()
-                    .as_text()
+                    .as_str()
                     .map(|x| x.to_string())
                     .unwrap()
             })
@@ -873,11 +873,11 @@ pub mod tests {
             .into_iter()
             .map(|x| {
                 searcher
-                    .doc(x.1)
+                    .doc::<TantivyDocument>(x.1)
                     .unwrap()
                     .get_first(title_field)
                     .unwrap()
-                    .as_text()
+                    .as_str()
                     .map(|x| x.to_string())
                     .unwrap()
             })
