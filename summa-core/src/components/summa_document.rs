@@ -159,9 +159,7 @@ pub fn value_from_json(field_type: &FieldType, json: JsonValue) -> Result<OwnedV
                     })
                 }
             }
-            FieldType::JsonObject(_) => Ok(OwnedValue::Object(BTreeMap::from_iter(
-                json_map.into_iter().map(|(k, v)| (k, value_from_json(field_type, v).expect("unparsable json"))),
-            ))),
+            FieldType::JsonObject(_) => Ok(OwnedValue::from(json_map)),
             _ => Err(ValueParsingError::TypeError {
                 expected: field_type.value_type().name(),
                 json: JsonValue::Object(json_map),
