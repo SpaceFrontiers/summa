@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM rust:1.71 as builder
+FROM --platform=$BUILDPLATFORM rust:1.73 as builder
 RUN apt-get update && apt-get install -y \
     g++-x86-64-linux-gnu libc6-dev-amd64-cross \
     g++-aarch64-linux-gnu libc6-dev-arm64-cross \
@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
 RUN rustup target add \
     x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf
 RUN rustup toolchain install \
-    1.71-x86_64-unknown-linux-gnu 1.71-aarch64-unknown-linux-gnu 1.71-armv7-unknown-linux-gnueabihf
+    1.73-x86_64-unknown-linux-gnu 1.73-aarch64-unknown-linux-gnu 1.73-armv7-unknown-linux-gnueabihf
 RUN rustup component add rustfmt
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
@@ -50,13 +50,13 @@ RUN CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++ cargo build --profile
 RUN mv target/armv7-unknown-linux-gnueabihf/release/summa-server-bin /bin/summa-server
 
 # Final arch images ----------------------
-FROM --platform=amd64 gcr.io/distroless/cc AS final-amd64
+FROM --platform=amd64 gcr.io/distroless/cc-debian12 AS final-amd64
 COPY --from=build-amd64 /bin/summa-server /bin/summa-server
 
-FROM --platform=arm64 gcr.io/distroless/cc:latest-arm64 AS final-arm64
+FROM --platform=arm64 gcr.io/distroless/cc-debian12:latest-arm64 AS final-arm64
 COPY --from=build-arm64 /bin/summa-server /bin/summa-server
 
-FROM --platform=arm/v7 gcr.io/distroless/cc:latest-arm AS final-arm
+FROM --platform=arm/v7 gcr.io/distroless/cc-debian12:latest-arm AS final-arm
 COPY --from=build-arm /bin/summa-server /bin/summa-server
 
 # Final image ----------------------------
