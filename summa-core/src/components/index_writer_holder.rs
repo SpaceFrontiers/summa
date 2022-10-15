@@ -8,7 +8,7 @@ use summa_proto::proto;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::merge_policy::MergePolicy;
 use tantivy::query::Query;
-use tantivy::schema::{Field, NamedFieldDocument, OwnedValue, Value};
+use tantivy::schema::{Field, OwnedValue, Value};
 use tantivy::{Directory, Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, SingleSegmentIndexWriter, TantivyDocument, Term};
 use tracing::info;
 

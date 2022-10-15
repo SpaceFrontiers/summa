@@ -1,11 +1,39 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use regex::RegexSet;
 
 use crate::components::query_parser::morphology::Morphology;
 
-#[derive(Default, Clone)]
-pub struct EnglishMorphology {}
+#[derive(Clone)]
+pub struct EnglishMorphology {
+    spelling_dict: HashMap<String, String>,
+}
+
+impl EnglishMorphology {
+    pub fn new() -> Self {
+        let mut spelling_set = vec![];
+        let mut csv_reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(include_bytes!("../../../../resources/spelling.csv").as_slice());
+        for record in csv_reader.records() {
+            let record = record.expect("incorrect record");
+            let v1 = record[0].to_string();
+            let v2 = record[1].to_string();
+            spelling_set.push((v1.to_string(), v2.to_string()));
+            spelling_set.push((v2, v1));
+        }
+        EnglishMorphology {
+            spelling_dict: HashMap::from_iter(spelling_set),
+        }
+    }
+}
+
+impl Default for EnglishMorphology {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Morphology for EnglishMorphology {
     fn derive_tenses(&self, word: &str) -> Option<String> {
@@ -29,6 +57,10 @@ impl Morphology for EnglishMorphology {
                 None
             }
         })
+    }
+
+    fn derive_spelling(&self, word: &str) -> Option<String> {
+        self.spelling_dict.get(word).cloned()
     }
 
     fn detect_ners(&self, _: &str) -> Vec<String> {

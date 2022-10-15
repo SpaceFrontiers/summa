@@ -338,7 +338,13 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 7] {
         .build();
     let summa_dict_tokenizer = TextAnalyzer::builder(DictTokenizer::new()).build();
     let summa_html_tokenizer = TextAnalyzer::builder(HtmlTokenizer::new(
-        HashSet::from_iter(vec!["formula".to_string(), "figure".to_string(), "math".to_string(), "ref".to_string()]),
+        HashSet::from_iter(vec![
+            "formula".to_string(),
+            "figure".to_string(),
+            "math".to_string(),
+            "ref".to_string(),
+            "table".to_string(),
+        ]),
         HashSet::from_iter(vec![
             "sup".to_string(),
             "sub".to_string(),
