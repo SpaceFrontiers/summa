@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use regex::RegexSet;
+use tracing::info;
 
 use crate::components::query_parser::morphology::Morphology;
 
@@ -23,6 +24,11 @@ impl EnglishMorphology {
             spelling_set.push((v1.to_string(), v2.to_string()));
             spelling_set.push((v2, v1));
         }
+        info!(
+            action = "loaded_spelling_dictionary",
+            size = spelling_set.len(),
+            header = ?spelling_set[..10].iter().collect::<Vec<_>>()
+        );
         EnglishMorphology {
             spelling_dict: HashMap::from_iter(spelling_set),
         }
