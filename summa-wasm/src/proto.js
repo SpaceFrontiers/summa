@@ -158,7 +158,6 @@ export const summa = $root.summa = (() => {
             TermFieldMapperConfig.create = function create(properties) {
                 return new TermFieldMapperConfig(properties);
             };
-
             return TermFieldMapperConfig;
         })();
 
