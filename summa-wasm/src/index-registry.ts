@@ -1,10 +1,11 @@
 import init, {setup_logging, WrappedIndexRegistry} from "../pkg";
-import { summa } from "./proto"
+import {IndexAttributes, IndexEngineConfig} from "./grpc-web/index_service";
+import {SearchRequest} from "./grpc-web/search_service";
 
 export interface IIndexRegistry {
-  add(index_name: string, index_engine_config: summa.proto.IndexEngineConfig): Promise<summa.proto.IndexAttributes>;
+  add(index_name: string, index_engine_config: IndexEngineConfig): Promise<IndexAttributes>;
   delete(index_name: string): Promise<void>;
-  search(search_request: summa.proto.SearchRequest): Promise<object[]>;
+  search(search_request: SearchRequest): Promise<object[]>;
   warmup(index_name: string): Promise<void>;
   index_document(index_name: string, document: string): Promise<void>;
   commit(index_name: string): Promise<void>;
@@ -47,13 +48,13 @@ export class IndexRegistry implements IIndexRegistry {
     this.registry = new WrappedIndexRegistry();
   }
 
-  async add(index_name: string, index_engine_config: summa.proto.IndexEngineConfig): Promise<summa.proto.IndexAttributes> {
+  async add(index_name: string, index_engine_config: IndexEngineConfig): Promise<IndexAttributes> {
     return await this.registry!.add(index_name, index_engine_config);
   }
   async delete(index_name: string) {
     return await this.registry!.delete(index_name)
   }
-  async search(search_request: summa.proto.SearchRequest): Promise<object[]> {
+  async search(search_request: SearchRequest): Promise<object[]> {
     return await this.registry!.search(search_request);
   }
   async warmup(index_name: string) {

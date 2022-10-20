@@ -15,7 +15,6 @@ use summa_proto::proto;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Server;
-use tonic_web::GrpcWebLayer;
 use tower::ServiceBuilder;
 use tower_http::classify::GrpcFailureClass;
 use tower_http::set_header::SetRequestHeaderLayer;
@@ -146,10 +145,7 @@ impl Api {
         }));
 
         if let Some(http_endpoint) = api_config.http_endpoint {
-            let http_router = Server::builder()
-                .accept_http1(true)
-                .layer(GrpcWebLayer::new())
-                .add_service(search_service);
+            let http_router = Server::builder().accept_http1(true).add_service(tonic_web::enable(search_service));
             let http_listener = Api::set_listener(&http_endpoint)?;
             let mut http_terminator = terminator.clone();
             futures.push(Box::new(async move {

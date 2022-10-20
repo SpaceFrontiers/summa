@@ -8,4 +8,3 @@ export {
 } from "./remote-index-registry";
 export * as seeds from "./seeds";
 export * as utils from "./utils";
-export { summa } from "./proto"

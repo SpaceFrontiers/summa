@@ -13,7 +13,7 @@ use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
 use tantivy::space_usage::SearcherSpaceUsage;
-use tantivy::{Directory, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher, TantivyDocument};
+use tantivy::{Directory, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
 use tracing::{error, info, instrument, trace, warn};
 
@@ -582,7 +582,7 @@ impl IndexHolder {
         &self,
         searcher: &Searcher,
         query_filter: &Option<proto::Query>,
-        documents_modifier: impl Fn(TantivyDocument) -> Option<O> + Clone + Send + Sync + 'static,
+        documents_modifier: impl Fn(tantivy::TantivyDocument) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         match query_filter {
             None | Some(proto::Query { query: None }) => {
@@ -623,7 +623,7 @@ impl IndexHolder {
         &self,
         searcher: &Searcher,
         query: &proto::query::Query,
-        documents_modifier: impl Fn(TantivyDocument) -> Option<O> + Clone + Send + Sync + 'static,
+        documents_modifier: impl Fn(tantivy::TantivyDocument) -> Option<O> + Clone + Send + Sync + 'static,
     ) -> SummaResult<tokio::sync::mpsc::Receiver<O>> {
         let parsed_query = self.query_parser.parse_query(query.clone())?;
         let collector = tantivy::collector::DocSetCollector;

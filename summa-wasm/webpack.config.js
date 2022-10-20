@@ -10,7 +10,8 @@ export default {
         'main': './src/index.ts',
         'root-worker': './src/root-worker.ts',
         'service-worker': './src/service-worker.ts',
-        'service-worker-register': './src/service-worker-register.ts'
+        'service-worker-register': './src/service-worker-register.ts',
+        'search-service-grpc-web': './src/grpc-web/search_service.client',
     },
     target: "web",
     output: {

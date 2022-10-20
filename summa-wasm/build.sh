@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 
-#./node_modules/protobufjs-cli/bin/pbjs --filter proto.filter.json --es6 --no-encode --no-decode --no-verify --no-convert --no-delimited --no-typeurl --no-service  -w es6 --keep-case -t static-module -o ./src/proto.js -p ../summa-proto/proto/ ../summa-proto/proto/search_service.proto ../summa-proto/proto/index_service.proto
-#./node_modules/protobufjs-cli/bin/pbts src/proto.js -o src/proto.d.ts
+npx protoc \
+  --ts_out src/grpc-web/ \
+  --ts_opt long_type_string \
+  --ts_opt use_proto_field_name \
+  --proto_path ../summa-proto/proto \
+  ../summa-proto/proto/*.proto
 
 
 PATH="/usr/local/opt/llvm/bin/:$PATH" CC=/usr/local/opt/llvm/bin/clang AR=/usr/local/opt/llvm/bin/llvm-ar npm run build

@@ -1,6 +1,7 @@
 import * as Comlink from "comlink";
 import { IndexRegistry, IIndexRegistry, IndexRegistryOptions } from "./index-registry";
-import { summa } from "./proto"
+import { IndexAttributes, IndexEngineConfig } from "./grpc-web/index_service";
+import { SearchRequest } from "./grpc-web/search_service";
 
 export class RemoteIndexRegistry implements IIndexRegistry {
     init_guard: Promise<void>;
@@ -16,7 +17,7 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         this.init_guard = this.setup(wasm_url, options);
     }
 
-    add(index_name: string, index_engine_config: summa.proto.IndexEngineConfig): Promise<summa.proto.IndexAttributes> {
+    add(index_name: string, index_engine_config: IndexEngineConfig): Promise<IndexAttributes> {
         return this.index_registry.add(index_name, index_engine_config);
     }
 
@@ -24,7 +25,7 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         return this.index_registry.delete(index_name);
     }
 
-    search(search_request: summa.proto.SearchRequest): Promise<object[]> {
+    search(search_request: SearchRequest): Promise<object[]> {
         return this.index_registry.search(search_request)
     }
 
