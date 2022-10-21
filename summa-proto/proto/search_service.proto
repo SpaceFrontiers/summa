@@ -9,17 +9,3 @@ service SearchApi {
   // Make search in Summa
   rpc search (SearchRequest) returns (SearchResponse) {}
 }
-
-message SearchRequest {
-  // The index name or alias
-  string index_alias = 1;
-  // Query DSL. Use `MatchQuery` to pass a free-form query
-  Query query = 2;
-  // Every collector is responsible of processing and storing documents and/or their derivatives (like counters)
-  // to return them to the caller
-  repeated Collector collectors = 3;
-  // Is requiring fieldnorms needed for the query?
-  optional bool is_fieldnorms_scoring_enabled = 4;
-  optional bool load_cache = 5;
-  optional bool store_cache = 6;
-}

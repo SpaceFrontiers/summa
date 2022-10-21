@@ -6,7 +6,7 @@ import type { ServiceInfo } from "@protobuf-ts/runtime-rpc";
 import { SearchApi } from "./search_service";
 import { stackIntercept } from "@protobuf-ts/runtime-rpc";
 import type { SearchResponse } from "./query";
-import type { SearchRequest } from "./search_service";
+import type { SearchRequest } from "./query";
 import type { UnaryCall } from "@protobuf-ts/runtime-rpc";
 import type { RpcOptions } from "@protobuf-ts/runtime-rpc";
 /**

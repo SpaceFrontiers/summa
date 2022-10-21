@@ -1,6 +1,6 @@
 import init, {setup_logging, WrappedIndexRegistry} from "../pkg";
 import {IndexAttributes, IndexEngineConfig} from "./grpc-web/index_service";
-import {SearchRequest} from "./grpc-web/search_service";
+import {SearchRequest} from "./grpc-web/query";
 
 export interface IIndexRegistry {
   add(index_name: string, index_engine_config: IndexEngineConfig): Promise<IndexAttributes>;
@@ -44,7 +44,11 @@ export class IndexRegistry implements IIndexRegistry {
   ) {
     let actual_options = Object.assign({}, default_options, options);
     console.log('Memory config:', actual_options.memory_config);
-    await init(init_url, new WebAssembly.Memory(actual_options.memory_config!));
+    try {
+      await init(init_url, new WebAssembly.Memory(actual_options.memory_config!));
+    } catch (e) {
+      await init(init_url + "?force", new WebAssembly.Memory(actual_options.memory_config!));
+    }
     await setup_logging(actual_options.logging_level!);
     this.registry = new WrappedIndexRegistry();
   }

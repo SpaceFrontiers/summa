@@ -655,6 +655,9 @@ impl Index {
             .and_then(|query| query.query)
             .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {}));
 
+        if search_request.collectors.len() > 2 {
+            return Err(crate::errors::Error::NotAllowed);
+        }
         for collector in &mut search_request.collectors {
             match &mut collector.collector {
                 Some(proto::collector::Collector::TopDocs(top_docs)) => {
@@ -667,7 +670,7 @@ impl Index {
                     reservoir_sampling.removed_fields = vec!["content".to_string()];
                 }
                 Some(proto::collector::Collector::Count(_)) => {}
-                _ => panic!("Not allowed"),
+                _ => return Err(crate::errors::Error::NotAllowed),
             }
         }
 
@@ -676,9 +679,9 @@ impl Index {
                 &search_request.index_alias,
                 query,
                 search_request.collectors,
-                search_request.is_fieldnorms_scoring_enabled,
-                search_request.load_cache,
-                search_request.store_cache,
+                Some(true),
+                Some(true),
+                Some(true),
             )
             .await?;
         Ok(self.index_registry.finalize_extraction(collector_outputs).await?)

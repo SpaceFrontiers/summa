@@ -66,7 +66,8 @@ async function handle_request(event: FetchEvent) {
   let filename = request.url;
   let url = request.url;
   let is_development = (new URL(request.url)).host == "localhost:5173"
-  let is_api_request = request.url.endsWith('/summa.proto.SearchApi/search');
+  let is_api_request = request.url.endsWith('/summa.proto.PublicApi/search');
+  let is_force = request.url.endsWith("?force");
 
   if (is_api_request) {
     return fetch(event.request)
@@ -113,7 +114,7 @@ async function handle_request(event: FetchEvent) {
 
   const cache = await caches.open("cache_v2");
   let response = undefined;
-  if (caching_enabled) {
+  if (caching_enabled && !is_force) {
       response = await cache.match(url);
   }
   if (response === undefined) {

@@ -1,7 +1,7 @@
 import * as Comlink from "comlink";
 import { IndexRegistry, IIndexRegistry, IndexRegistryOptions } from "./index-registry";
 import { IndexAttributes, IndexEngineConfig } from "./grpc-web/index_service";
-import { SearchRequest } from "./grpc-web/search_service";
+import {SearchRequest} from "./grpc-web/query";
 
 export class RemoteIndexRegistry implements IIndexRegistry {
     init_guard: Promise<void>;

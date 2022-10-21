@@ -49,6 +49,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("lock_error: {0}")]
     Lock(#[from] tokio::sync::TryLockError),
+    #[error("not_allowed_error")]
+    NotAllowed,
     #[error("tantivy_error: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
     #[error("timeout_error: {0}")]
@@ -94,6 +96,7 @@ impl From<Error> for tonic::Status {
                 },
                 Error::Validation(ValidationError::MissingIndex(_)) => tonic::Code::NotFound,
                 Error::Validation(_) => tonic::Code::InvalidArgument,
+                Error::NotAllowed => tonic::Code::PermissionDenied,
                 Error::Lock(_) => tonic::Code::FailedPrecondition,
                 _ => tonic::Code::Internal,
             },

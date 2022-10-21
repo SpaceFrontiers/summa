@@ -135,6 +135,7 @@ impl Api {
             .add_service(grpc_reflection_service)
             .add_service(consumer_service.clone())
             .add_service(index_service.clone())
+            .add_service(public_service.clone())
             .add_service(reflection_service.clone())
             .add_service(search_service.clone());
         let grpc_listener = Api::set_listener(&api_config.grpc_endpoint)?;

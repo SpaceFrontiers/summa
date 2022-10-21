@@ -2,7 +2,7 @@
 // @generated from protobuf file "public_service.proto" (package "summa.proto", syntax proto3)
 // tslint:disable
 import { SearchResponse } from "./query";
-import { SearchRequest } from "./search_service";
+import { SearchRequest } from "./query";
 import { ServiceType } from "@protobuf-ts/runtime-rpc";
 /**
  * @generated ServiceType for protobuf service summa.proto.PublicApi

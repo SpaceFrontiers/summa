@@ -141,6 +141,44 @@ export interface QueryParserConfig {
     query_language?: string;
 }
 /**
+ * @generated from protobuf message summa.proto.SearchRequest
+ */
+export interface SearchRequest {
+    /**
+     * The index name or alias
+     *
+     * @generated from protobuf field: string index_alias = 1;
+     */
+    index_alias: string;
+    /**
+     * Query DSL. Use `MatchQuery` to pass a free-form query
+     *
+     * @generated from protobuf field: summa.proto.Query query = 2;
+     */
+    query?: Query;
+    /**
+     * Every collector is responsible of processing and storing documents and/or their derivatives (like counters)
+     * to return them to the caller
+     *
+     * @generated from protobuf field: repeated summa.proto.Collector collectors = 3;
+     */
+    collectors: Collector[];
+    /**
+     * Is requiring fieldnorms needed for the query?
+     *
+     * @generated from protobuf field: optional bool is_fieldnorms_scoring_enabled = 4;
+     */
+    is_fieldnorms_scoring_enabled?: boolean;
+    /**
+     * @generated from protobuf field: optional bool load_cache = 5;
+     */
+    load_cache?: boolean;
+    /**
+     * @generated from protobuf field: optional bool store_cache = 6;
+     */
+    store_cache?: boolean;
+}
+/**
  * @generated from protobuf message summa.proto.SearchResponse
  */
 export interface SearchResponse {
@@ -1262,6 +1300,88 @@ class QueryParserConfig$Type extends MessageType<QueryParserConfig> {
  * @generated MessageType for protobuf message summa.proto.QueryParserConfig
  */
 export const QueryParserConfig = new QueryParserConfig$Type();
+// @generated message type with reflection information, may provide speed optimized methods
+class SearchRequest$Type extends MessageType<SearchRequest> {
+    constructor() {
+        super("summa.proto.SearchRequest", [
+            { no: 1, name: "index_alias", kind: "scalar", localName: "index_alias", T: 9 /*ScalarType.STRING*/ },
+            { no: 2, name: "query", kind: "message", T: () => Query },
+            { no: 3, name: "collectors", kind: "message", repeat: 1 /*RepeatType.PACKED*/, T: () => Collector },
+            { no: 4, name: "is_fieldnorms_scoring_enabled", kind: "scalar", localName: "is_fieldnorms_scoring_enabled", opt: true, T: 8 /*ScalarType.BOOL*/ },
+            { no: 5, name: "load_cache", kind: "scalar", localName: "load_cache", opt: true, T: 8 /*ScalarType.BOOL*/ },
+            { no: 6, name: "store_cache", kind: "scalar", localName: "store_cache", opt: true, T: 8 /*ScalarType.BOOL*/ }
+        ]);
+    }
+    create(value?: PartialMessage<SearchRequest>): SearchRequest {
+        const message = { index_alias: "", collectors: [] };
+        globalThis.Object.defineProperty(message, MESSAGE_TYPE, { enumerable: false, value: this });
+        if (value !== undefined)
+            reflectionMergePartial<SearchRequest>(this, message, value);
+        return message;
+    }
+    internalBinaryRead(reader: IBinaryReader, length: number, options: BinaryReadOptions, target?: SearchRequest): SearchRequest {
+        let message = target ?? this.create(), end = reader.pos + length;
+        while (reader.pos < end) {
+            let [fieldNo, wireType] = reader.tag();
+            switch (fieldNo) {
+                case /* string index_alias */ 1:
+                    message.index_alias = reader.string();
+                    break;
+                case /* summa.proto.Query query */ 2:
+                    message.query = Query.internalBinaryRead(reader, reader.uint32(), options, message.query);
+                    break;
+                case /* repeated summa.proto.Collector collectors */ 3:
+                    message.collectors.push(Collector.internalBinaryRead(reader, reader.uint32(), options));
+                    break;
+                case /* optional bool is_fieldnorms_scoring_enabled */ 4:
+                    message.is_fieldnorms_scoring_enabled = reader.bool();
+                    break;
+                case /* optional bool load_cache */ 5:
+                    message.load_cache = reader.bool();
+                    break;
+                case /* optional bool store_cache */ 6:
+                    message.store_cache = reader.bool();
+                    break;
+                default:
+                    let u = options.readUnknownField;
+                    if (u === "throw")
+                        throw new globalThis.Error(`Unknown field ${fieldNo} (wire type ${wireType}) for ${this.typeName}`);
+                    let d = reader.skip(wireType);
+                    if (u !== false)
+                        (u === true ? UnknownFieldHandler.onRead : u)(this.typeName, message, fieldNo, wireType, d);
+            }
+        }
+        return message;
+    }
+    internalBinaryWrite(message: SearchRequest, writer: IBinaryWriter, options: BinaryWriteOptions): IBinaryWriter {
+        /* string index_alias = 1; */
+        if (message.index_alias !== "")
+            writer.tag(1, WireType.LengthDelimited).string(message.index_alias);
+        /* summa.proto.Query query = 2; */
+        if (message.query)
+            Query.internalBinaryWrite(message.query, writer.tag(2, WireType.LengthDelimited).fork(), options).join();
+        /* repeated summa.proto.Collector collectors = 3; */
+        for (let i = 0; i < message.collectors.length; i++)
+            Collector.internalBinaryWrite(message.collectors[i], writer.tag(3, WireType.LengthDelimited).fork(), options).join();
+        /* optional bool is_fieldnorms_scoring_enabled = 4; */
+        if (message.is_fieldnorms_scoring_enabled !== undefined)
+            writer.tag(4, WireType.Varint).bool(message.is_fieldnorms_scoring_enabled);
+        /* optional bool load_cache = 5; */
+        if (message.load_cache !== undefined)
+            writer.tag(5, WireType.Varint).bool(message.load_cache);
+        /* optional bool store_cache = 6; */
+        if (message.store_cache !== undefined)
+            writer.tag(6, WireType.Varint).bool(message.store_cache);
+        let u = options.writeUnknownFields;
+        if (u !== false)
+            (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
+        return writer;
+    }
+}
+/**
+ * @generated MessageType for protobuf message summa.proto.SearchRequest
+ */
+export const SearchRequest = new SearchRequest$Type();
 // @generated message type with reflection information, may provide speed optimized methods
 class SearchResponse$Type extends MessageType<SearchResponse> {
     constructor() {

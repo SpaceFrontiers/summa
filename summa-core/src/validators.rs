@@ -15,10 +15,16 @@ pub fn parse_fields<'a>(schema: &'a Schema, fields: &'a [String], removed_fields
     } else if fields.is_empty() {
         Ok(schema
             .fields()
-            .map(|(_, field_entry)| {
-                schema
-                    .find_field(field_entry.name())
-                    .ok_or_else(|| ValidationError::MissingField(field_entry.name().to_string()))
+            .filter_map(|(_, field_entry)| {
+                if removed_fields.iter().any(|e| e == field_entry.name()) {
+                    None
+                } else {
+                    Some(
+                        schema
+                            .find_field(field_entry.name())
+                            .ok_or_else(|| ValidationError::MissingField(field_entry.name().to_string())),
+                    )
+                }
             })
             .collect::<Result<_, _>>()?)
     } else {
