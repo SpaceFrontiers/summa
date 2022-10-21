@@ -152,7 +152,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         let schema = index_holder.schema().clone();
         let multi_fields = index_holder.multi_fields().clone();
 
-        let query_fields = validators::parse_fields(searcher.schema(), &proto_request.fields).map_err(crate::errors::Error::from)?;
+        let query_fields = validators::parse_fields(searcher.schema(), &proto_request.fields, &[]).map_err(crate::errors::Error::from)?;
         let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter().map(|x| x.0)));
 
         let documents_receiver = index_holder

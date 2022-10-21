@@ -29,6 +29,10 @@ export class RemoteIndexRegistry implements IIndexRegistry {
         return this.index_registry.search(search_request)
     }
 
+    search_by_binary_proto(search_request_proto_bytes: Uint8Array): Promise<object[]> {
+        return this.index_registry.search_by_binary_proto(search_request_proto_bytes)
+    }
+
     warmup(index_name: string): Promise<void> {
         return this.index_registry.warmup(index_name);
     }

@@ -190,7 +190,7 @@ impl QueryParser {
         morphology_manager: &MorphologyManager,
         tokenizer_manager: &TokenizerManager,
     ) -> SummaResult<QueryParser> {
-        validators::parse_fields(&schema, &query_parser_config.0.default_fields)?;
+        validators::parse_fields(&schema, &query_parser_config.0.default_fields, &[])?;
         Ok(QueryParser {
             term_field_mappers_manager: TermFieldMappersManager::new(&schema, tokenizer_manager),
             morphology_manager: morphology_manager.clone(),

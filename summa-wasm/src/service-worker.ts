@@ -66,6 +66,11 @@ async function handle_request(event: FetchEvent) {
   let filename = request.url;
   let url = request.url;
   let is_development = (new URL(request.url)).host == "localhost:5173"
+  let is_api_request = request.url.endsWith('/summa.proto.SearchApi/search');
+
+  if (is_api_request) {
+    return fetch(event.request)
+  }
 
   let is_immutable_file = filename.endsWith(".fast") ||
       filename.endsWith(".term") ||

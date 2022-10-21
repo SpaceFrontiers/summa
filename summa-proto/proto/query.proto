@@ -211,6 +211,7 @@ message FacetCollectorOutput {
 message ReservoirSamplingCollector {
   uint32 limit = 1;
   repeated string fields = 2;
+  repeated string removed_fields = 3;
 }
 
 message RandomDocument {
@@ -230,6 +231,7 @@ message TopDocsCollector {
   map<string, uint32> snippet_configs = 4;
   bool explain = 5;
   repeated string fields = 6;
+  repeated string removed_fields = 7;
 }
 
 message DocumentsCollectorOutput {

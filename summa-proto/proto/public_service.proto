@@ -1,0 +1,12 @@
+syntax = "proto3";
+package summa.proto;
+
+import "search_service.proto";
+import "query.proto";
+
+
+// Searches documents in the stored indices
+service PublicApi {
+  // Make search in Summa
+  rpc search (SearchRequest) returns (SearchResponse) {}
+}

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use js_sys::Uint8Array;
+use prost::Message;
 use serde::Serialize;
 use serde_wasm_bindgen::Serializer;
 use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
@@ -44,6 +46,14 @@ impl WrappedIndexRegistry {
     #[wasm_bindgen]
     pub async fn search(&self, search_request: JsValue) -> Result<JsValue, JsValue> {
         let search_request: proto::SearchRequest = serde_wasm_bindgen::from_value(search_request)?;
+        let serializer = Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true);
+        Ok(self.search_internal(search_request).await.map_err(Error::from)?.serialize(&serializer)?)
+    }
+
+    /// Do pooled search
+    #[wasm_bindgen]
+    pub async fn search_by_binary_proto(&self, search_request: Uint8Array) -> Result<JsValue, JsValue> {
+        let search_request: proto::SearchRequest = proto::SearchRequest::decode(search_request.to_vec().as_slice()).expect("cannot decode proto");
         let serializer = Serializer::new().serialize_maps_as_objects(true).serialize_large_number_types_as_bigints(true);
         Ok(self.search_internal(search_request).await.map_err(Error::from)?.serialize(&serializer)?)
     }

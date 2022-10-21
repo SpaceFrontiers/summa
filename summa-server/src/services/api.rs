@@ -7,6 +7,7 @@ use futures_util::future::try_join_all;
 use hyper::header::{HeaderName, HeaderValue};
 use proto::consumer_api_server::ConsumerApiServer;
 use proto::index_api_server::IndexApiServer;
+use proto::public_api_server::PublicApiServer;
 use proto::reflection_api_server::ReflectionApiServer;
 use proto::search_api_server::SearchApiServer;
 use summa_core::configs::ConfigProxy;
@@ -23,6 +24,7 @@ use tracing::{info, info_span, instrument, warn, Instrument, Span};
 
 use crate::apis::consumer::ConsumerApiImpl;
 use crate::apis::index::IndexApiImpl;
+use crate::apis::public::PublicApiImpl;
 use crate::apis::reflection::ReflectionApiImpl;
 use crate::apis::search::SearchApiImpl;
 use crate::errors::SummaServerResult;
@@ -77,6 +79,8 @@ impl Api {
         let index_api = IndexApiImpl::new(&self.server_config_holder, &index_service)?;
         let reflection_api = ReflectionApiImpl::new(&index_service)?;
         let search_api = SearchApiImpl::new(&index_service)?;
+        let public_api = PublicApiImpl::new(&index_service)?;
+
         let grpc_reflection_service = tonic_reflection::server::Builder::configure()
             .include_reflection_service(false)
             .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
@@ -121,6 +125,10 @@ impl Api {
                 .max_encoding_message_size(max_from_size_bytes as usize);
         }
 
+        let public_service = PublicApiServer::new(public_api)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Gzip);
+
         let grpc_router = Server::builder()
             .layer(layer)
             .max_frame_size(api_config.max_frame_size_bytes.map(|x| x / 256))
@@ -145,7 +153,7 @@ impl Api {
         }));
 
         if let Some(http_endpoint) = api_config.http_endpoint {
-            let http_router = Server::builder().accept_http1(true).add_service(tonic_web::enable(search_service));
+            let http_router = Server::builder().accept_http1(true).add_service(tonic_web::enable(public_service));
             let http_listener = Api::set_listener(&http_endpoint)?;
             let mut http_terminator = terminator.clone();
             futures.push(Box::new(async move {

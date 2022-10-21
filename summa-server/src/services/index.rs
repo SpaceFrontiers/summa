@@ -292,9 +292,9 @@ impl Index {
         let mut index_attributes = create_index_request.index_attributes.unwrap_or_default();
         let query_parser_config = create_index_request.query_parser_config;
         let default_fields = query_parser_config.as_ref().map(|q| q.default_fields.clone()).unwrap_or_default();
-        validators::parse_fields(&schema, &default_fields)?;
-        validators::parse_fields(&schema, &index_attributes.multi_fields)?;
-        validators::parse_fields(&schema, &index_attributes.unique_fields)?;
+        validators::parse_fields(&schema, &default_fields, &[])?;
+        validators::parse_fields(&schema, &index_attributes.multi_fields, &[])?;
+        validators::parse_fields(&schema, &index_attributes.unique_fields, &[])?;
 
         index_attributes.created_at = SystemTime::now().duration_since(UNIX_EPOCH).expect("cannot retrieve time").as_secs();
 
@@ -634,6 +634,43 @@ impl Index {
             .query
             .and_then(|query| query.query)
             .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {}));
+        let collector_outputs = index_holder
+            .custom_search(
+                &search_request.index_alias,
+                query,
+                search_request.collectors,
+                search_request.is_fieldnorms_scoring_enabled,
+                search_request.load_cache,
+                search_request.store_cache,
+            )
+            .await?;
+        Ok(self.index_registry.finalize_extraction(collector_outputs).await?)
+    }
+
+    /// Search documents
+    pub async fn constrained_search(&self, mut search_request: proto::SearchRequest) -> SummaServerResult<Vec<proto::CollectorOutput>> {
+        let index_holder = self.index_registry.get_index_holder(&search_request.index_alias).await?;
+        let query = search_request
+            .query
+            .and_then(|query| query.query)
+            .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {}));
+
+        for collector in &mut search_request.collectors {
+            match &mut collector.collector {
+                Some(proto::collector::Collector::TopDocs(top_docs)) => {
+                    top_docs.limit = std::cmp::min(top_docs.limit, 10);
+                    top_docs.offset = std::cmp::min(top_docs.offset, 100);
+                    top_docs.removed_fields = vec!["content".to_string()];
+                }
+                Some(proto::collector::Collector::ReservoirSampling(reservoir_sampling)) => {
+                    reservoir_sampling.limit = std::cmp::min(reservoir_sampling.limit, 10);
+                    reservoir_sampling.removed_fields = vec!["content".to_string()];
+                }
+                Some(proto::collector::Collector::Count(_)) => {}
+                _ => panic!("Not allowed"),
+            }
+        }
+
         let collector_outputs = index_holder
             .custom_search(
                 &search_request.index_alias,

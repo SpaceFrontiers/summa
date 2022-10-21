@@ -6,6 +6,7 @@ export interface IIndexRegistry {
   add(index_name: string, index_engine_config: IndexEngineConfig): Promise<IndexAttributes>;
   delete(index_name: string): Promise<void>;
   search(search_request: SearchRequest): Promise<object[]>;
+  search_by_binary_proto(search_request_proto_bytes: Uint8Array): Promise<object[]>;
   warmup(index_name: string): Promise<void>;
   index_document(index_name: string, document: string): Promise<void>;
   commit(index_name: string): Promise<void>;
@@ -56,6 +57,9 @@ export class IndexRegistry implements IIndexRegistry {
   }
   async search(search_request: SearchRequest): Promise<object[]> {
     return await this.registry!.search(search_request);
+  }
+  async search_by_binary_proto(search_request_bytes_proto: Uint8Array): Promise<object[]> {
+    return await this.registry!.search_by_binary_proto(search_request_bytes_proto);
   }
   async warmup(index_name: string) {
     return await this.registry!.warmup(index_name);

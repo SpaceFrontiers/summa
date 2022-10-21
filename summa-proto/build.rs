@@ -5,6 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/dag_pb.proto",
         "proto/index_service.proto",
         "proto/query.proto",
+        "proto/public_service.proto",
         "proto/reflection_service.proto",
         "proto/search_service.proto",
         "proto/unixfs.proto",
