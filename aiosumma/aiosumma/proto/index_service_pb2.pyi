@@ -18,9 +18,6 @@ class ConflictStrategy(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
 class Compression(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = []
     None: _ClassVar[Compression]
-    Brotli: _ClassVar[Compression]
-    Lz4: _ClassVar[Compression]
-    Snappy: _ClassVar[Compression]
     Zstd: _ClassVar[Compression]
     Zstd7: _ClassVar[Compression]
     Zstd9: _ClassVar[Compression]
@@ -32,9 +29,6 @@ OVERWRITE_ALWAYS: ConflictStrategy
 OVERWRITE: ConflictStrategy
 MERGE: ConflictStrategy
 None: Compression
-Brotli: Compression
-Lz4: Compression
-Snappy: Compression
 Zstd: Compression
 Zstd7: Compression
 Zstd9: Compression

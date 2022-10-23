@@ -82,6 +82,9 @@ parent: APIs
     - [Compression](#summa-proto-Compression)
     - [ConflictStrategy](#summa-proto-ConflictStrategy)
   
+- [public_service.proto](#public_service-proto)
+    - [PublicApi](#summa-proto-PublicApi)
+  
 - [query.proto](#query-proto)
     - [AggregationCollector](#summa-proto-AggregationCollector)
     - [AggregationCollectorOutput](#summa-proto-AggregationCollectorOutput)
@@ -125,6 +128,7 @@ parent: APIs
     - [ScoredDocument](#summa-proto-ScoredDocument)
     - [ScoredDocument.SnippetsEntry](#summa-proto-ScoredDocument-SnippetsEntry)
     - [Scorer](#summa-proto-Scorer)
+    - [SearchRequest](#summa-proto-SearchRequest)
     - [SearchResponse](#summa-proto-SearchResponse)
     - [Snippet](#summa-proto-Snippet)
     - [TermFieldMapperConfig](#summa-proto-TermFieldMapperConfig)
@@ -145,8 +149,6 @@ parent: APIs
   
 - [search_service.proto](#search_service-proto)
     - [SearchApi](#summa-proto-SearchApi)
-  
-    - [SearchRequest](#summa-proto-SearchRequest)
   
 - [unixfs.proto](#unixfs-proto)
     - [Data](#unixfs-Data)
@@ -1226,9 +1228,6 @@ Compression library for store, implies on both performance and occupied disk spa
 | Name | Number | Description |
 | ---- | ------ | ----------- |
 | None | 0 |  |
-| Brotli | 1 |  |
-| Lz4 | 2 |  |
-| Snappy | 3 |  |
 | Zstd | 4 |  |
 | Zstd7 | 5 |  |
 | Zstd9 | 6 |  |
@@ -1280,6 +1279,31 @@ Manages indices
 | set_index_alias | [SetIndexAliasRequest](#summa-proto-SetIndexAliasRequest) | [SetIndexAliasResponse](#summa-proto-SetIndexAliasResponse) | Sets or replaces existing index alias |
 | vacuum_index | [VacuumIndexRequest](#summa-proto-VacuumIndexRequest) | [VacuumIndexResponse](#summa-proto-VacuumIndexResponse) | Removes deletions from all segments |
 | warmup_index | [WarmupIndexRequest](#summa-proto-WarmupIndexRequest) | [WarmupIndexResponse](#summa-proto-WarmupIndexResponse) | Loads all hot parts of the index into the memory |
+
+ <!-- end services -->
+
+
+
+<a name="public_service-proto"></a>
+
+## public_service.proto
+
+
+ <!-- end messages -->
+
+ <!-- end enums -->
+
+ <!-- end HasExtensions -->
+
+
+<a name="summa-proto-PublicApi"></a>
+
+### PublicApi
+Searches documents in the stored indices
+
+| Method Name | Request Type | Response Type | Description |
+| ----------- | ------------ | ------------- | ------------|
+| search | [SearchRequest](#summa-proto-SearchRequest) | [SearchResponse](#summa-proto-SearchResponse) | Make search in Summa |
 
  <!-- end services -->
 
@@ -1721,19 +1745,19 @@ Recursive query DSL
 
 
 
-| Field                     | Type | Label | Description |
-|---------------------------| ---- | ----- | ----------- |
-| field_aliases             | [QueryParserConfig.FieldAliasesEntry](#summa-proto-QueryParserConfig-FieldAliasesEntry) | repeated |  |
-| field_boosts              | [QueryParserConfig.FieldBoostsEntry](#summa-proto-QueryParserConfig-FieldBoostsEntry) | repeated |  |
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| field_aliases | [QueryParserConfig.FieldAliasesEntry](#summa-proto-QueryParserConfig-FieldAliasesEntry) | repeated |  |
+| field_boosts | [QueryParserConfig.FieldBoostsEntry](#summa-proto-QueryParserConfig-FieldBoostsEntry) | repeated |  |
 | term_field_mapper_configs | [QueryParserConfig.TermFieldMapperConfigsEntry](#summa-proto-QueryParserConfig-TermFieldMapperConfigsEntry) | repeated |  |
-| term_limit                | [uint32](#uint32) |  |  |
-| default_fields            | [string](#string) | repeated |  |
-| boolean_should_mode       | [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode) |  |  |
-| disjuction_max_mode       | [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode) |  |  |
-| exact_matches_promoter    | [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter) |  |  |
-| excluded_fields           | [string](#string) | repeated |  |
-| morphology_configs        | [QueryParserConfig.MorphologyConfigsEntry](#summa-proto-QueryParserConfig-MorphologyConfigsEntry) | repeated |  |
-| query_language            | [string](#string) | optional |  |
+| term_limit | [uint32](#uint32) |  |  |
+| default_fields | [string](#string) | repeated |  |
+| boolean_should_mode | [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode) |  |  |
+| disjuction_max_mode | [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode) |  |  |
+| exact_matches_promoter | [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter) |  |  |
+| excluded_fields | [string](#string) | repeated |  |
+| morphology_configs | [QueryParserConfig.MorphologyConfigsEntry](#summa-proto-QueryParserConfig-MorphologyConfigsEntry) | repeated |  |
+| query_language | [string](#string) | optional |  |
 
 
 
@@ -1881,6 +1905,7 @@ Recursive query DSL
 | ----- | ---- | ----- | ----------- |
 | limit | [uint32](#uint32) |  |  |
 | fields | [string](#string) | repeated |  |
+| excluded_fields | [string](#string) | repeated |  |
 
 
 
@@ -1969,6 +1994,26 @@ Recursive query DSL
 
 
 
+<a name="summa-proto-SearchRequest"></a>
+
+### SearchRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| index_alias | [string](#string) |  | The index name or alias |
+| query | [Query](#summa-proto-Query) |  | Query DSL. Use `MatchQuery` to pass a free-form query |
+| collectors | [Collector](#summa-proto-Collector) | repeated | Every collector is responsible of processing and storing documents and/or their derivatives (like counters) to return them to the caller |
+| is_fieldnorms_scoring_enabled | [bool](#bool) | optional | Is requiring fieldnorms needed for the query? |
+| load_cache | [bool](#bool) | optional |  |
+| store_cache | [bool](#bool) | optional |  |
+
+
+
+
+
+
 <a name="summa-proto-SearchResponse"></a>
 
 ### SearchResponse
@@ -2047,6 +2092,7 @@ Recursive query DSL
 | snippet_configs | [TopDocsCollector.SnippetConfigsEntry](#summa-proto-TopDocsCollector-SnippetConfigsEntry) | repeated |  |
 | explain | [bool](#bool) |  |  |
 | fields | [string](#string) | repeated |  |
+| excluded_fields | [string](#string) | repeated |  |
 
 
 
@@ -2198,24 +2244,6 @@ Analyzes indices
 <a name="search_service-proto"></a>
 
 ## search_service.proto
-
-
-
-<a name="summa-proto-SearchRequest"></a>
-
-### SearchRequest
-
-
-
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| index_alias | [string](#string) |  | The index name or alias |
-| query | [Query](#summa-proto-Query) |  | Query DSL. Use `MatchQuery` to pass a free-form query |
-| collectors | [Collector](#summa-proto-Collector) | repeated | Every collector is responsible of processing and storing documents and/or their derivatives (like counters) to return them to the caller |
-| is_fieldnorms_scoring_enabled | [bool](#bool) | optional | Is requiring fieldnorms needed for the query? |
-
-
-
 
 
  <!-- end messages -->

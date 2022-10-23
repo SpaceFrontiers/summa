@@ -3,7 +3,6 @@
 import grpc
 
 from . import query_pb2 as query__pb2
-from . import search_service_pb2 as search__service__pb2
 
 
 class SearchApiStub(object):
@@ -18,7 +17,7 @@ class SearchApiStub(object):
         """
         self.search = channel.unary_unary(
                 '/summa.proto.SearchApi/search',
-                request_serializer=search__service__pb2.SearchRequest.SerializeToString,
+                request_serializer=query__pb2.SearchRequest.SerializeToString,
                 response_deserializer=query__pb2.SearchResponse.FromString,
                 )
 
@@ -39,7 +38,7 @@ def add_SearchApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'search': grpc.unary_unary_rpc_method_handler(
                     servicer.search,
-                    request_deserializer=search__service__pb2.SearchRequest.FromString,
+                    request_deserializer=query__pb2.SearchRequest.FromString,
                     response_serializer=query__pb2.SearchResponse.SerializeToString,
             ),
     }
@@ -65,7 +64,7 @@ class SearchApi(object):
             timeout=None,
             metadata=None):
         return grpc.experimental.unary_unary(request, target, '/summa.proto.SearchApi/search',
-            search__service__pb2.SearchRequest.SerializeToString,
+            query__pb2.SearchRequest.SerializeToString,
             query__pb2.SearchResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

@@ -771,9 +771,9 @@ export interface TopDocsCollector {
      */
     fields: string[];
     /**
-     * @generated from protobuf field: repeated string removed_fields = 7;
+     * @generated from protobuf field: repeated string excluded_fields = 7;
      */
-    removed_fields: string[];
+    excluded_fields: string[];
 }
 /**
  * @generated from protobuf message summa.proto.DocumentsCollectorOutput
@@ -1117,13 +1117,13 @@ class QueryParserConfig$Type extends MessageType<QueryParserConfig> {
             { no: 6, name: "boolean_should_mode", kind: "message", localName: "boolean_should_mode", oneof: "default_mode", T: () => MatchQueryBooleanShouldMode },
             { no: 7, name: "disjuction_max_mode", kind: "message", localName: "disjuction_max_mode", oneof: "default_mode", T: () => MatchQueryDisjuctionMaxMode },
             { no: 8, name: "exact_matches_promoter", kind: "message", localName: "exact_matches_promoter", T: () => ExactMatchesPromoter },
-            { no: 9, name: "removed_fields", kind: "scalar", localName: "removed_fields", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ },
+            { no: 9, name: "excluded_fields", kind: "scalar", localName: "excluded_fields", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ },
             { no: 10, name: "morphology_configs", kind: "map", localName: "morphology_configs", K: 9 /*ScalarType.STRING*/, V: { kind: "message", T: () => MorphologyConfig } },
             { no: 11, name: "query_language", kind: "scalar", localName: "query_language", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<QueryParserConfig>): QueryParserConfig {
-        const message = { field_aliases: {}, field_boosts: {}, term_field_mapper_configs: {}, term_limit: 0, default_fields: [], default_mode: { oneofKind: undefined }, removed_fields: [], morphology_configs: {} };
+        const message = { field_aliases: {}, field_boosts: {}, term_field_mapper_configs: {}, term_limit: 0, default_fields: [], default_mode: { oneofKind: undefined }, excluded_fields: [], morphology_configs: {} };
         globalThis.Object.defineProperty(message, MESSAGE_TYPE, { enumerable: false, value: this });
         if (value !== undefined)
             reflectionMergePartial<QueryParserConfig>(this, message, value);
@@ -1164,8 +1164,8 @@ class QueryParserConfig$Type extends MessageType<QueryParserConfig> {
                 case /* summa.proto.ExactMatchesPromoter exact_matches_promoter */ 8:
                     message.exact_matches_promoter = ExactMatchesPromoter.internalBinaryRead(reader, reader.uint32(), options, message.exact_matches_promoter);
                     break;
-                case /* repeated string removed_fields */ 9:
-                    message.removed_fields.push(reader.string());
+                case /* repeated string excluded_fields */ 9:
+                    message.excluded_fields.push(reader.string());
                     break;
                 case /* map<string, summa.proto.MorphologyConfig> morphology_configs */ 10:
                     this.binaryReadMap10(message.morphology_configs, reader, options);
@@ -1277,9 +1277,9 @@ class QueryParserConfig$Type extends MessageType<QueryParserConfig> {
         /* summa.proto.ExactMatchesPromoter exact_matches_promoter = 8; */
         if (message.exact_matches_promoter)
             ExactMatchesPromoter.internalBinaryWrite(message.exact_matches_promoter, writer.tag(8, WireType.LengthDelimited).fork(), options).join();
-        /* repeated string removed_fields = 9; */
-        for (let i = 0; i < message.removed_fields.length; i++)
-            writer.tag(9, WireType.LengthDelimited).string(message.removed_fields[i]);
+        /* repeated string excluded_fields = 9; */
+        for (let i = 0; i < message.excluded_fields.length; i++)
+            writer.tag(9, WireType.LengthDelimited).string(message.excluded_fields[i]);
         /* map<string, summa.proto.MorphologyConfig> morphology_configs = 10; */
         for (let k of Object.keys(message.morphology_configs)) {
             writer.tag(10, WireType.LengthDelimited).fork().tag(1, WireType.LengthDelimited).string(k);
@@ -3048,11 +3048,11 @@ class ReservoirSamplingCollector$Type extends MessageType<ReservoirSamplingColle
         super("summa.proto.ReservoirSamplingCollector", [
             { no: 1, name: "limit", kind: "scalar", T: 13 /*ScalarType.UINT32*/ },
             { no: 2, name: "fields", kind: "scalar", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ },
-            { no: 3, name: "removed_fields", kind: "scalar", localName: "removed_fields", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ }
+            { no: 3, name: "excluded_fields", kind: "scalar", localName: "excluded_fields", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<ReservoirSamplingCollector>): ReservoirSamplingCollector {
-        const message = { limit: 0, fields: [], removed_fields: [] };
+        const message = { limit: 0, fields: [], excluded_fields: [] };
         globalThis.Object.defineProperty(message, MESSAGE_TYPE, { enumerable: false, value: this });
         if (value !== undefined)
             reflectionMergePartial<ReservoirSamplingCollector>(this, message, value);
@@ -3069,8 +3069,8 @@ class ReservoirSamplingCollector$Type extends MessageType<ReservoirSamplingColle
                 case /* repeated string fields */ 2:
                     message.fields.push(reader.string());
                     break;
-                case /* repeated string removed_fields */ 3:
-                    message.removed_fields.push(reader.string());
+                case /* repeated string excluded_fields */ 3:
+                    message.excluded_fields.push(reader.string());
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3090,9 +3090,9 @@ class ReservoirSamplingCollector$Type extends MessageType<ReservoirSamplingColle
         /* repeated string fields = 2; */
         for (let i = 0; i < message.fields.length; i++)
             writer.tag(2, WireType.LengthDelimited).string(message.fields[i]);
-        /* repeated string removed_fields = 3; */
-        for (let i = 0; i < message.removed_fields.length; i++)
-            writer.tag(3, WireType.LengthDelimited).string(message.removed_fields[i]);
+        /* repeated string excluded_fields = 3; */
+        for (let i = 0; i < message.excluded_fields.length; i++)
+            writer.tag(3, WireType.LengthDelimited).string(message.excluded_fields[i]);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -3221,11 +3221,11 @@ class TopDocsCollector$Type extends MessageType<TopDocsCollector> {
             { no: 4, name: "snippet_configs", kind: "map", localName: "snippet_configs", K: 9 /*ScalarType.STRING*/, V: { kind: "scalar", T: 13 /*ScalarType.UINT32*/ } },
             { no: 5, name: "explain", kind: "scalar", T: 8 /*ScalarType.BOOL*/ },
             { no: 6, name: "fields", kind: "scalar", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ },
-            { no: 7, name: "removed_fields", kind: "scalar", localName: "removed_fields", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ }
+            { no: 7, name: "excluded_fields", kind: "scalar", localName: "excluded_fields", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<TopDocsCollector>): TopDocsCollector {
-        const message = { limit: 0, offset: 0, snippet_configs: {}, explain: false, fields: [], removed_fields: [] };
+        const message = { limit: 0, offset: 0, snippet_configs: {}, explain: false, fields: [], excluded_fields: [] };
         globalThis.Object.defineProperty(message, MESSAGE_TYPE, { enumerable: false, value: this });
         if (value !== undefined)
             reflectionMergePartial<TopDocsCollector>(this, message, value);
@@ -3254,8 +3254,8 @@ class TopDocsCollector$Type extends MessageType<TopDocsCollector> {
                 case /* repeated string fields */ 6:
                     message.fields.push(reader.string());
                     break;
-                case /* repeated string removed_fields */ 7:
-                    message.removed_fields.push(reader.string());
+                case /* repeated string excluded_fields */ 7:
+                    message.excluded_fields.push(reader.string());
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -3303,7 +3303,7 @@ class TopDocsCollector$Type extends MessageType<TopDocsCollector> {
         /* repeated string fields = 6; */
         for (let i = 0; i < message.fields.length; i++)
             writer.tag(6, WireType.LengthDelimited).string(message.fields[i]);
-        /* repeated string removed_fields = 7; */
+        /* repeated string excluded_fields = 7; */
         for (let i = 0; i < message.excluded_fields.length; i++)
             writer.tag(7, WireType.LengthDelimited).string(message.excluded_fields[i]);
         let u = options.writeUnknownFields;

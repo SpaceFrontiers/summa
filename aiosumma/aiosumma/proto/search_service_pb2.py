@@ -14,16 +14,13 @@ _sym_db = _symbol_database.Default()
 from . import query_pb2 as query__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14search_service.proto\x12\x0bsumma.proto\x1a\x0bquery.proto\"\x93\x02\n\rSearchRequest\x12\x13\n\x0bindex_alias\x18\x01 \x01(\t\x12!\n\x05query\x18\x02 \x01(\x0b\x32\x12.summa.proto.Query\x12*\n\ncollectors\x18\x03 \x03(\x0b\x32\x16.summa.proto.Collector\x12*\n\x1dis_fieldnorms_scoring_enabled\x18\x04 \x01(\x08H\x00\x88\x01\x01\x12\x17\n\nload_cache\x18\x05 \x01(\x08H\x01\x88\x01\x01\x12\x18\n\x0bstore_cache\x18\x06 \x01(\x08H\x02\x88\x01\x01\x42 \n\x1e_is_fieldnorms_scoring_enabledB\r\n\x0b_load_cacheB\x0e\n\x0c_store_cache2P\n\tSearchApi\x12\x43\n\x06search\x12\x1a.summa.proto.SearchRequest\x1a\x1b.summa.proto.SearchResponse\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14search_service.proto\x12\x0bsumma.proto\x1a\x0bquery.proto2P\n\tSearchApi\x12\x43\n\x06search\x12\x1a.summa.proto.SearchRequest\x1a\x1b.summa.proto.SearchResponse\"\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'search_service_pb2', _globals)
 if _descriptor._USE_C_DESCRIPTORS == False:
-
   DESCRIPTOR._options = None
-  _globals['_SEARCHREQUEST']._serialized_start=51
-  _globals['_SEARCHREQUEST']._serialized_end=326
-  _globals['_SEARCHAPI']._serialized_start=328
-  _globals['_SEARCHAPI']._serialized_end=408
+  _globals['_SEARCHAPI']._serialized_start=50
+  _globals['_SEARCHAPI']._serialized_end=130
 # @@protoc_insertion_point(module_scope)
