@@ -154,7 +154,10 @@ impl Api {
         }));
 
         if let Some(http_endpoint) = api_config.http_endpoint {
-            let http_router = Server::builder().accept_http1(true).add_service(tonic_web::enable(public_service));
+            let http_router = Server::builder()
+                .accept_http1(true)
+                .add_service(tonic_web::enable(search_service))
+                .add_service(tonic_web::enable(public_service));
             let http_listener = Api::set_listener(&http_endpoint)?;
             let mut http_terminator = terminator.clone();
             futures.push(Box::new(async move {

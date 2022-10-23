@@ -126,9 +126,9 @@ export interface QueryParserConfig {
      */
     exact_matches_promoter?: ExactMatchesPromoter;
     /**
-     * @generated from protobuf field: repeated string removed_fields = 9;
+     * @generated from protobuf field: repeated string excluded_fields = 9;
      */
-    removed_fields: string[];
+    excluded_fields: string[];
     /**
      * @generated from protobuf field: map<string, summa.proto.MorphologyConfig> morphology_configs = 10;
      */
@@ -710,9 +710,9 @@ export interface ReservoirSamplingCollector {
      */
     fields: string[];
     /**
-     * @generated from protobuf field: repeated string removed_fields = 3;
+     * @generated from protobuf field: repeated string excluded_fields = 3;
      */
-    removed_fields: string[];
+    excluded_fields: string[];
 }
 /**
  * @generated from protobuf message summa.proto.RandomDocument
@@ -3304,8 +3304,8 @@ class TopDocsCollector$Type extends MessageType<TopDocsCollector> {
         for (let i = 0; i < message.fields.length; i++)
             writer.tag(6, WireType.LengthDelimited).string(message.fields[i]);
         /* repeated string removed_fields = 7; */
-        for (let i = 0; i < message.removed_fields.length; i++)
-            writer.tag(7, WireType.LengthDelimited).string(message.removed_fields[i]);
+        for (let i = 0; i < message.excluded_fields.length; i++)
+            writer.tag(7, WireType.LengthDelimited).string(message.excluded_fields[i]);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);

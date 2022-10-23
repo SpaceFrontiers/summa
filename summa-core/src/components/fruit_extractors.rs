@@ -99,7 +99,7 @@ pub fn build_fruit_extractor(
 ) -> SummaResult<Box<dyn FruitExtractor>> {
     match collector_proto.collector {
         Some(proto::collector::Collector::TopDocs(top_docs_collector_proto)) => {
-            let query_fields = validators::parse_fields(searcher.schema(), &top_docs_collector_proto.fields, &top_docs_collector_proto.removed_fields)?;
+            let query_fields = validators::parse_fields(searcher.schema(), &top_docs_collector_proto.fields, &top_docs_collector_proto.excluded_fields)?;
             let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter().map(|x| x.0)));
             Ok(match top_docs_collector_proto.scorer {
                 None | Some(proto::Scorer { scorer: None }) => Box::new(
@@ -167,7 +167,7 @@ pub fn build_fruit_extractor(
             let query_fields = validators::parse_fields(
                 searcher.schema(),
                 &reservoir_sampling_collector_proto.fields,
-                &reservoir_sampling_collector_proto.removed_fields,
+                &reservoir_sampling_collector_proto.excluded_fields,
             )?;
             let query_fields = (!query_fields.is_empty()).then(|| HashSet::from_iter(query_fields.into_iter().map(|x| x.0)));
             let reservoir_sampling_collector = collectors::ReservoirSampling::with_limit(reservoir_sampling_collector_proto.limit as usize);

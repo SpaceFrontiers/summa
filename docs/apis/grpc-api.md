@@ -1721,19 +1721,19 @@ Recursive query DSL
 
 
 
-| Field | Type | Label | Description |
-| ----- | ---- | ----- | ----------- |
-| field_aliases | [QueryParserConfig.FieldAliasesEntry](#summa-proto-QueryParserConfig-FieldAliasesEntry) | repeated |  |
-| field_boosts | [QueryParserConfig.FieldBoostsEntry](#summa-proto-QueryParserConfig-FieldBoostsEntry) | repeated |  |
+| Field                     | Type | Label | Description |
+|---------------------------| ---- | ----- | ----------- |
+| field_aliases             | [QueryParserConfig.FieldAliasesEntry](#summa-proto-QueryParserConfig-FieldAliasesEntry) | repeated |  |
+| field_boosts              | [QueryParserConfig.FieldBoostsEntry](#summa-proto-QueryParserConfig-FieldBoostsEntry) | repeated |  |
 | term_field_mapper_configs | [QueryParserConfig.TermFieldMapperConfigsEntry](#summa-proto-QueryParserConfig-TermFieldMapperConfigsEntry) | repeated |  |
-| term_limit | [uint32](#uint32) |  |  |
-| default_fields | [string](#string) | repeated |  |
-| boolean_should_mode | [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode) |  |  |
-| disjuction_max_mode | [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode) |  |  |
-| exact_matches_promoter | [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter) |  |  |
-| removed_fields | [string](#string) | repeated |  |
-| morphology_configs | [QueryParserConfig.MorphologyConfigsEntry](#summa-proto-QueryParserConfig-MorphologyConfigsEntry) | repeated |  |
-| query_language | [string](#string) | optional |  |
+| term_limit                | [uint32](#uint32) |  |  |
+| default_fields            | [string](#string) | repeated |  |
+| boolean_should_mode       | [MatchQueryBooleanShouldMode](#summa-proto-MatchQueryBooleanShouldMode) |  |  |
+| disjuction_max_mode       | [MatchQueryDisjuctionMaxMode](#summa-proto-MatchQueryDisjuctionMaxMode) |  |  |
+| exact_matches_promoter    | [ExactMatchesPromoter](#summa-proto-ExactMatchesPromoter) |  |  |
+| excluded_fields           | [string](#string) | repeated |  |
+| morphology_configs        | [QueryParserConfig.MorphologyConfigsEntry](#summa-proto-QueryParserConfig-MorphologyConfigsEntry) | repeated |  |
+| query_language            | [string](#string) | optional |  |
 
 
 

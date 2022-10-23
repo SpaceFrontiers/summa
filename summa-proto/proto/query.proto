@@ -35,7 +35,7 @@ message QueryParserConfig {
     MatchQueryDisjuctionMaxMode disjuction_max_mode = 7;
   }
   ExactMatchesPromoter exact_matches_promoter = 8;
-  repeated string removed_fields = 9;
+  repeated string excluded_fields = 9;
   map<string, MorphologyConfig> morphology_configs = 10;
   optional string query_language = 11;
 }
@@ -225,7 +225,7 @@ message FacetCollectorOutput {
 message ReservoirSamplingCollector {
   uint32 limit = 1;
   repeated string fields = 2;
-  repeated string removed_fields = 3;
+  repeated string excluded_fields = 3;
 }
 
 message RandomDocument {
@@ -245,7 +245,7 @@ message TopDocsCollector {
   map<string, uint32> snippet_configs = 4;
   bool explain = 5;
   repeated string fields = 6;
-  repeated string removed_fields = 7;
+  repeated string excluded_fields = 7;
 }
 
 message DocumentsCollectorOutput {

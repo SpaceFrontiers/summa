@@ -663,11 +663,15 @@ impl Index {
                 Some(proto::collector::Collector::TopDocs(top_docs)) => {
                     top_docs.limit = std::cmp::min(top_docs.limit, 10);
                     top_docs.offset = std::cmp::min(top_docs.offset, 100);
-                    top_docs.removed_fields = vec!["content".to_string()];
+                    if top_docs.limit > 1 {
+                        top_docs.excluded_fields = vec!["content".to_string()]
+                    }
                 }
                 Some(proto::collector::Collector::ReservoirSampling(reservoir_sampling)) => {
                     reservoir_sampling.limit = std::cmp::min(reservoir_sampling.limit, 10);
-                    reservoir_sampling.removed_fields = vec!["content".to_string()];
+                    if reservoir_sampling.limit > 1 {
+                        reservoir_sampling.excluded_fields = vec!["content".to_string()];
+                    }
                 }
                 Some(proto::collector::Collector::Count(_)) => {}
                 _ => return Err(crate::errors::Error::NotAllowed),
@@ -679,7 +683,7 @@ impl Index {
                 &search_request.index_alias,
                 query,
                 search_request.collectors,
-                Some(true),
+                search_request.is_fieldnorms_scoring_enabled,
                 Some(true),
                 Some(true),
             )

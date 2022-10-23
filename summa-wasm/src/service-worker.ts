@@ -66,7 +66,7 @@ async function handle_request(event: FetchEvent) {
   let filename = request.url;
   let url = request.url;
   let is_development = (new URL(request.url)).host == "localhost:5173"
-  let is_api_request = request.url.endsWith('/summa.proto.PublicApi/search');
+  let is_api_request = request.url.endsWith('/search');
   let is_force = request.url.endsWith("?force");
 
   if (is_api_request) {
@@ -124,7 +124,7 @@ async function handle_request(event: FetchEvent) {
         method: request.method,
         headers: request.headers,
       },
-      5,
+      3,
         1000,
     );
     response = new Response(response.body, {

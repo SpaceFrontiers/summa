@@ -610,7 +610,7 @@ impl QueryParser {
                                 }
                             }
                             None => {
-                                if self.query_parser_config.0.removed_fields.iter().any(|x| x == field_name.as_str()) {
+                                if self.query_parser_config.0.excluded_fields.iter().any(|x| x == field_name.as_str()) {
                                     return Ok(Box::new(EmptyQuery {}));
                                 }
                                 intermediate_results.push(self.default_field_queries(field_name, statement_boost)?);
@@ -634,7 +634,7 @@ impl QueryParser {
                                 if self
                                     .query_parser_config
                                     .0
-                                    .removed_fields
+                                    .excluded_fields
                                     .iter()
                                     .any(|x| x == field_name.as_str() || Some(x.as_str()) == field_name.as_str().split('.').next())
                                 {
@@ -656,7 +656,7 @@ impl QueryParser {
                                 if self
                                     .query_parser_config
                                     .0
-                                    .removed_fields
+                                    .excluded_fields
                                     .iter()
                                     .any(|x| x == field_name.as_str() || Some(x.as_str()) == field_name.as_str().split('.').next())
                                 {

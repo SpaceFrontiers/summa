@@ -42,7 +42,7 @@ pub mod shortcuts {
                 snippet_configs: HashMap::new(),
                 explain: false,
                 fields: Vec::new(),
-                removed_fields: Vec::new(),
+                excluded_fields: Vec::new(),
             })),
         }
     }
@@ -58,7 +58,7 @@ pub mod shortcuts {
                 snippet_configs: HashMap::new(),
                 explain: false,
                 fields: Vec::new(),
-                removed_fields: Vec::new(),
+                excluded_fields: Vec::new(),
             })),
         }
     }

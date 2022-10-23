@@ -6,8 +6,8 @@ pub fn parse_schema(schema: &str) -> SummaResult<Schema> {
     serde_yaml::from_str(schema).map_err(|_| Error::Validation(Box::new(ValidationError::InvalidSchema(schema.to_owned()))))
 }
 
-pub fn parse_fields<'a>(schema: &'a Schema, fields: &'a [String], removed_fields: &'a [String]) -> SummaResult<Vec<(Field, &'a str)>> {
-    if removed_fields.is_empty() {
+pub fn parse_fields<'a>(schema: &'a Schema, fields: &'a [String], excluded_fields: &'a [String]) -> SummaResult<Vec<(Field, &'a str)>> {
+    if excluded_fields.is_empty() {
         Ok(fields
             .iter()
             .map(|f| schema.find_field(f).ok_or_else(|| ValidationError::MissingField(f.to_string())))
@@ -16,7 +16,7 @@ pub fn parse_fields<'a>(schema: &'a Schema, fields: &'a [String], removed_fields
         Ok(schema
             .fields()
             .filter_map(|(_, field_entry)| {
-                if removed_fields.iter().any(|e| e == field_entry.name()) {
+                if excluded_fields.iter().any(|e| e == field_entry.name()) {
                     None
                 } else {
                     Some(
