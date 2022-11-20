@@ -33,7 +33,7 @@ def setup_metadata(session_id, request_id):
 def prepare_search_request(search_request):
     if isinstance(search_request, Dict):
         dict_search_request = search_request
-        search_request = search_service_pb.SearchRequest()
+        search_request = query_pb.SearchRequest()
         ParseDict(dict_search_request, search_request)
     return search_request
 

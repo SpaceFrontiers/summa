@@ -65,13 +65,9 @@ async function handle_request(event: FetchEvent) {
   const request = event.request
   let filename = request.url;
   let url = request.url;
-  let is_development = (new URL(request.url)).host == "localhost:5173"
-  let is_api_request = request.url.endsWith('/search');
+  let host = (new URL(request.url)).host;
+  let is_development = host == "localhost:5173"
   let is_force = request.url.endsWith("?force");
-
-  if (is_api_request) {
-    return fetch(event.request)
-  }
 
   let is_immutable_file = filename.endsWith(".fast") ||
       filename.endsWith(".term") ||
@@ -173,6 +169,11 @@ self.addEventListener("fetch", (event) => {
     event.request.cache === "only-if-cached" &&
     event.request.mode !== "same-origin"
   ) {
+    return;
+  }
+  let host = (new URL(event.request.url)).host;
+  let is_api_request = event.request.url.indexOf('/embed/view') !== -1 || event.request.url.endsWith('/search') || host === "comments.app" || host === "tg.dev" ;
+  if (is_api_request) {
     return;
   }
   event.respondWith(handle_request(event));

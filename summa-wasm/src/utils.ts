@@ -1,20 +1,24 @@
 export function get_ipfs_hostname() {
-  let ipfs_url: string;
-  const hostname_parts = window.location.hostname.split(".");
-  if (hostname_parts[-1] === "localhost") {
-    ipfs_url = "http://localhost";
-  } else if (window.location.hostname === "ipfs.io") {
-    ipfs_url = "https://ipfs.io";
+  let hostname: string = window.location.hostname;
+  let protocol: string = window.location.protocol;
+  const hostname_parts = hostname.split(".");
+  if (hostname_parts[hostname_parts.length - 1] === "localhost") {
+    hostname = "localhost";
+    protocol = "http:";
+  } else if (hostname === "ipfs.io") {
+    hostname = "ipfs.io";
+    protocol = "https:";
   } else {
     const ipfs_domain_index = hostname_parts.findIndex(
       (el) => el === "ipfs" || el === "ipns"
     );
-    if (ipfs_domain_index !== undefined) {
-      ipfs_url = `${window.location.protocol}//${hostname_parts
+    if (ipfs_domain_index !== -1) {
+      hostname = hostname_parts
         .slice(ipfs_domain_index + 1)
-        .join(".")}`;
+        .join(".");
     } else {
-      ipfs_url = "https://ipfs.io";
+      hostname = "ipfs.io";
+      protocol = "https:";
     }
   }
   if (
@@ -23,10 +27,10 @@ export function get_ipfs_hostname() {
     window.location.port !== "80"
   ) {
     if (window.location.port !== "5173") {
-      ipfs_url = `${ipfs_url}:${window.location.port}`;
+      hostname = `${hostname}:${window.location.port}`;
     } else {
-      ipfs_url = `${ipfs_url}:8080`;
+      hostname = `${hostname}:8080`;
     }
   }
-  return ipfs_url;
+  return { ipfs_hostname: hostname, ipfs_protocol: protocol };
 }
