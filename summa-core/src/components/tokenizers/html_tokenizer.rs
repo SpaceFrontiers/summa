@@ -235,10 +235,11 @@ impl<'a> tantivy::tokenizer::TokenStream for HtmlTokenStream<'a> {
 pub mod tests {
     use std::collections::HashSet;
 
-    use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenizerManager};
+    use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, StopWordFilter, TextAnalyzer, Token, TokenizerManager};
 
     use super::HtmlTokenizer;
     use crate::components::tokenizers::tokenizer::tests::assert_tokenization;
+    use crate::components::STOP_WORDS;
 
     #[test]
     fn test_html_tokenization() {
@@ -251,6 +252,7 @@ pub mod tests {
             ))
             .filter(RemoveLongFilter::limit(40))
             .filter(LowerCaser)
+            .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
             .build(),
         );
         let mut tokenizer = tokenizer_manager.get("tokenizer").unwrap();

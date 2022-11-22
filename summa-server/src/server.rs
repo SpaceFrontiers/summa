@@ -274,6 +274,7 @@ mod tests {
                             snippet_configs: Default::default(),
                             explain: false,
                             fields: vec![],
+                            excluded_fields: vec![],
                         })),
                     },
                     proto::Collector {
