@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use tantivy::tokenizer::{LowerCaser, RawTokenizer, RemoveLongFilter, SimpleTokenizer, StopWordFilter, TextAnalyzer, WhitespaceTokenizer};
 
 use super::tokenizers::{DictTokenizer, HtmlTokenizer, Tokenizer};
+use crate::components::tokenizers::MmdTokenizer;
 
 /// List of stop words mixed for multiple languages
 pub const STOP_WORDS: [&str; 321] = [
@@ -330,7 +331,7 @@ pub const STOP_WORDS: [&str; 321] = [
 ];
 
 /// Instantiate default tokenizers
-pub fn default_tokenizers() -> [(String, TextAnalyzer); 7] {
+pub fn default_tokenizers() -> [(String, TextAnalyzer); 8] {
     let summa_tokenizer = TextAnalyzer::builder(Tokenizer)
         .filter(RemoveLongFilter::limit(100))
         .filter(LowerCaser)
@@ -359,6 +360,11 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 7] {
     .filter(LowerCaser)
     .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
     .build();
+    let summa_mmd_tokenizer = TextAnalyzer::builder(MmdTokenizer::default())
+        .filter(RemoveLongFilter::limit(100))
+        .filter(LowerCaser)
+        .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
+        .build();
     let summa_without_stop_words_tokenizer = TextAnalyzer::builder(Tokenizer).filter(RemoveLongFilter::limit(100)).filter(LowerCaser).build();
     let default_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(100))
@@ -371,6 +377,7 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 7] {
         ("summa".to_owned(), summa_tokenizer),
         ("summa_dict".to_owned(), summa_dict_tokenizer),
         ("summa_html".to_owned(), summa_html_tokenizer),
+        ("summa_mmd".to_owned(), summa_mmd_tokenizer),
         ("summa_without_stop_words".to_owned(), summa_without_stop_words_tokenizer),
         ("default".to_owned(), default_tokenizer),
         ("raw".to_owned(), raw_tokenizer),
