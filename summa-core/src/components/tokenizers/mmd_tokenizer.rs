@@ -95,6 +95,7 @@ pub struct MmdTokenStream<'a> {
     drop_commands: &'a HashSet<&'static str>,
     known_commands: &'a HashSet<&'static str>,
     base_offset: usize,
+    maybe_link: bool,
 }
 
 #[inline]
@@ -125,6 +126,7 @@ impl<'a> MmdTokenStream<'a> {
             drop_commands,
             known_commands,
             base_offset: 0,
+            maybe_link: false,
         }
     }
 
@@ -153,6 +155,7 @@ impl<'a> MmdTokenStream<'a> {
             drop_commands,
             known_commands,
             base_offset: offset,
+            maybe_link: false,
         }
     }
 
@@ -172,6 +175,10 @@ impl<'a> MmdTokenStream<'a> {
         self.token.offset_from = usize::MAX;
         let mut is_command = false;
         let mut spec_counter = 0;
+        let mut start_skipping_round_bracket = false;
+        let mut skipped_round_bracket = 0;
+        let mut start_skipping_figure_bracket = false;
+        let mut skipped_figure_bracket = 0;
 
         if let Some((stacked_char, stacked_offset)) = self.stacked_char.take() {
             accept_char(&mut self.token, stacked_char, self.base_offset + stacked_offset);
@@ -181,15 +188,49 @@ impl<'a> MmdTokenStream<'a> {
             if stacked_char == '\\' {
                 is_command = true;
             }
+            if stacked_char == '[' {
+                self.maybe_link = true;
+            }
         }
 
         for (offset, c) in &mut self.chars {
+            eprintln!("status {} {} {}", c, is_command, spec_counter);
             let real_offset = self.base_offset + offset;
+
             if let Some(skip_list) = &self.skip_list {
                 while self.skip_iter < skip_list.len() && skip_list[self.skip_iter].1 <= real_offset {
                     self.skip_iter += 1;
                 }
                 if self.skip_iter < skip_list.len() && skip_list[self.skip_iter].0 <= real_offset && real_offset < skip_list[self.skip_iter].1 {
+                    continue;
+                }
+            }
+
+            if start_skipping_round_bracket || skipped_round_bracket > 0 {
+                start_skipping_round_bracket = false;
+                if c == '(' {
+                    skipped_round_bracket += 1;
+                    continue;
+                } else if c == ')' {
+                    skipped_round_bracket -= 1;
+                    if skipped_round_bracket == 0 {
+                        start_skipping_figure_bracket = true;
+                    }
+                    continue;
+                } else if skipped_round_bracket > 0 {
+                    continue;
+                }
+            }
+
+            if start_skipping_figure_bracket || skipped_figure_bracket > 0 {
+                start_skipping_figure_bracket = false;
+                if c == '{' {
+                    skipped_figure_bracket += 1;
+                    continue;
+                } else if c == '}' {
+                    skipped_figure_bracket -= 1;
+                    continue;
+                } else if skipped_figure_bracket > 0 {
                     continue;
                 }
             }
@@ -202,6 +243,7 @@ impl<'a> MmdTokenStream<'a> {
                 accept_char(&mut self.token, c, real_offset);
                 return true;
             }
+
             if c == '\\' {
                 if !self.token.text.is_empty() {
                     self.stacked_char = Some((c, offset));
@@ -209,13 +251,19 @@ impl<'a> MmdTokenStream<'a> {
                 }
                 is_command = true;
                 accept_char(&mut self.token, c, real_offset);
-                continue;
+            } else if c == '[' && !is_command {
+                if !self.token.text.is_empty() {
+                    self.stacked_char = Some((c, offset));
+                    return true;
+                }
+                self.maybe_link = true;
+            } else if c == ']' && self.maybe_link && !is_command {
+                self.maybe_link = false;
+                start_skipping_round_bracket = true;
             } else if c == '^' || c == '~' {
                 self.token.offset_to += 1;
-                continue;
             } else if c == '*' || c == '_' {
                 spec_counter += 1;
-                continue;
             } else if c.is_alphanumeric() || c == '#' || c == '+' {
                 if spec_counter == 1 {
                     self.stacked_char = Some((c, offset));
@@ -225,11 +273,10 @@ impl<'a> MmdTokenStream<'a> {
                     spec_counter = 0;
                 };
                 accept_char(&mut self.token, c, real_offset);
-                continue;
             } else if is_command && (c == '(' || c == ')' || c == '[' || c == ']') && self.token.text.len() == 1 {
                 accept_char(&mut self.token, c, real_offset);
                 break;
-            } else if (c == '{' || c == '}') && is_command {
+            } else if is_command && (c == '{' || c == '}') {
                 if self.drop_commands.contains(&self.token.text.as_str()) {
                     is_command = false;
                     self.token.text.clear();
@@ -242,7 +289,6 @@ impl<'a> MmdTokenStream<'a> {
                 if c == '}' {
                     break;
                 }
-                continue;
             } else if !self.token.text.is_empty() {
                 break;
             }
@@ -284,7 +330,11 @@ impl<'a> tantivy::tokenizer::TokenStream for MmdTokenStream<'a> {
                     self.token.offset_from += 1;
                     self.token.text = self.token.text[1..].to_string()
                 }
-                break;
+                if self.token.text == "]" || self.token.text == "}" || self.token.text == ")" {
+                    result = self.advance_token(false);
+                } else {
+                    break;
+                }
             }
         }
         result
@@ -611,6 +661,101 @@ pub mod tests {
                     offset_to: 13,
                     position: 3,
                     text: "x2".to_string(),
+                    position_length: 1,
+                },
+            ],
+        );
+        assert_tokenization(&mut tokenizer, "![]()", &[]);
+        assert_tokenization(
+            &mut tokenizer,
+            "![image text](https://example.com/image.jpg){width=1}",
+            &[
+                Token {
+                    offset_from: 2,
+                    offset_to: 7,
+                    position: 0,
+                    text: "image".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 8,
+                    offset_to: 12,
+                    position: 1,
+                    text: "text".to_string(),
+                    position_length: 1,
+                },
+            ],
+        );
+        assert_tokenization(
+            &mut tokenizer,
+            "[ref] (author)",
+            &[
+                Token {
+                    offset_from: 1,
+                    offset_to: 4,
+                    position: 0,
+                    text: "ref".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 7,
+                    offset_to: 13,
+                    position: 1,
+                    text: "author".to_string(),
+                    position_length: 1,
+                },
+            ],
+        );
+        assert_tokenization(
+            &mut tokenizer,
+            "[ref]test [ref](l)test",
+            &[
+                Token {
+                    offset_from: 1,
+                    offset_to: 9,
+                    position: 0,
+                    text: "reftest".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 11,
+                    offset_to: 22,
+                    position: 1,
+                    text: "reftest".to_string(),
+                    position_length: 1,
+                },
+            ],
+        );
+        assert_tokenization(
+            &mut tokenizer,
+            "![ref](hehe)-abc{} \\[34\\] \\] \\) \\} 1 ### abc \\(",
+            &[
+                Token {
+                    offset_from: 2,
+                    offset_to: 5,
+                    position: 0,
+                    text: "ref".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 13,
+                    offset_to: 16,
+                    position: 1,
+                    text: "abc".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 35,
+                    offset_to: 36,
+                    position: 2,
+                    text: "1".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 41,
+                    offset_to: 44,
+                    position: 3,
+                    text: "abc".to_string(),
                     position_length: 1,
                 },
             ],
