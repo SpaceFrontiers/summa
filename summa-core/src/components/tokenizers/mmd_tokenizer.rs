@@ -194,7 +194,6 @@ impl<'a> MmdTokenStream<'a> {
         }
 
         for (offset, c) in &mut self.chars {
-            eprintln!("status {} {} {}", c, is_command, spec_counter);
             let real_offset = self.base_offset + offset;
 
             if let Some(skip_list) = &self.skip_list {
