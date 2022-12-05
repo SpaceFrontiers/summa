@@ -154,6 +154,7 @@ message IndexAttributes {
   optional string description = 6;
   ConflictStrategy conflict_strategy = 8;
   repeated MappedField mapped_fields = 9;
+  optional string auto_id_field = 10;
 }
 
 // Request for index creation

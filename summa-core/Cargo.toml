@@ -25,6 +25,7 @@ matches = "0.1"
 aho-corasick = "1.0"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base36 = "0.0.1"
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = "0.4"

@@ -4,11 +4,12 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
+use rand::RngCore;
 use summa_proto::proto;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
 use tantivy::merge_policy::MergePolicy;
 use tantivy::query::Query;
-use tantivy::schema::{Field, OwnedValue, Value};
+use tantivy::schema::{Field, FieldType, OwnedValue, Value};
 use tantivy::{Directory, Document, Index, IndexWriter, Opstamp, SegmentId, SegmentMeta, SingleSegmentIndexWriter, TantivyDocument, Term};
 use tracing::info;
 
@@ -77,6 +78,13 @@ fn cast_to_term(unique_field: &Field, full_path: &str, value: &OwnedValue) -> Ve
         OwnedValue::Array(v) => v.iter().flat_map(|e| cast_to_term(unique_field, full_path, e)).collect(),
         _ => unreachable!(),
     }
+}
+
+#[inline]
+fn generate_id() -> String {
+    let mut data = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut data);
+    base36::encode(&data)
 }
 
 /// Wrap `tantivy::SingleSegmentIndexWriter` and allows to recreate it
@@ -189,6 +197,7 @@ pub struct IndexWriterHolder {
     index_writer: IndexWriterImpl,
     merge_policy: Arc<dyn MergePolicy>,
     unique_fields: Vec<(Field, String)>,
+    auto_id_field: Option<(Field, String)>,
     writer_threads: WriterThreads,
     writer_heap_size_bytes: usize,
 
@@ -206,6 +215,7 @@ impl IndexWriterHolder {
         index_writer: IndexWriterImpl,
         merge_policy: Arc<dyn MergePolicy>,
         unique_fields: Vec<(Field, String)>,
+        auto_id_field: Option<(Field, String)>,
         mapped_fields: Vec<((Field, Vec<String>), Field)>,
         writer_threads: WriterThreads,
         writer_heap_size_bytes: usize,
@@ -220,6 +230,7 @@ impl IndexWriterHolder {
             index_writer,
             merge_policy,
             unique_fields,
+            auto_id_field,
             writer_threads,
             writer_heap_size_bytes,
             extra_year_field,
@@ -274,7 +285,26 @@ impl IndexWriterHolder {
             })
             .transpose()?
             .unwrap_or_default();
-        IndexWriterHolder::new(index_writer, merge_policy, unique_fields, mapped_fields, writer_threads, writer_heap_size_bytes)
+        let auto_id_field = metas
+            .index_attributes()?
+            .and_then(|attributes: proto::IndexAttributes| {
+                attributes.auto_id_field.map(|auto_id_field| {
+                    schema
+                        .find_field(&auto_id_field)
+                        .ok_or_else(|| ValidationError::MissingField(auto_id_field.to_string()))
+                        .map(|x| (x.0, x.1.to_string()))
+                })
+            })
+            .transpose()?;
+        IndexWriterHolder::new(
+            index_writer,
+            merge_policy,
+            unique_fields,
+            auto_id_field,
+            mapped_fields,
+            writer_threads,
+            writer_heap_size_bytes,
+        )
     }
 
     /// Delete index by its unique fields
@@ -367,9 +397,36 @@ impl IndexWriterHolder {
         Ok(())
     }
 
+    #[inline]
+    fn setup_id_field(&self, document: &mut TantivyDocument) -> SummaResult<()> {
+        if let Some((auto_id_field, full_path)) = &self.auto_id_field {
+            let schema = self.index_writer.index().schema();
+            match schema.get_field_entry(*auto_id_field).field_type() {
+                FieldType::Str(_) => match document.get_first(*auto_id_field) {
+                    Some(_) => {}
+                    None => document.add_text(*auto_id_field, generate_id()),
+                },
+                FieldType::JsonObject(_) => match document.get_first_mut(*auto_id_field) {
+                    Some(OwnedValue::Object(ref mut obj)) => {
+                        obj.entry(full_path.to_string()).or_insert_with(|| OwnedValue::Str(generate_id()));
+                    }
+                    None => {
+                        let mut new_unique_field_value = BTreeMap::new();
+                        new_unique_field_value.insert(full_path.to_string(), OwnedValue::Str(generate_id()));
+                        document.add_object(*auto_id_field, new_unique_field_value)
+                    }
+                    Some(_) => unreachable!(),
+                },
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
     /// Put document to the index. Before comes searchable it must be committed
     pub fn index_document(&self, mut document: TantivyDocument, conflict_strategy: proto::ConflictStrategy) -> SummaResult<()> {
         self.process_dynamic_fields(&mut document)?;
+        self.setup_id_field(&mut document)?;
         self.resolve_conflicts(&document, conflict_strategy)?;
         self.index_writer.add_document(document)?;
         Ok(())

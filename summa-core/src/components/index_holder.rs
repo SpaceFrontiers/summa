@@ -676,6 +676,7 @@ impl IndexHolder {
 
 #[cfg(test)]
 pub mod tests {
+    use serde::Serialize;
     use std::error::Error;
     use std::sync::Arc;
 
@@ -685,7 +686,7 @@ pub mod tests {
     use tantivy::collector::{Count, TopDocs};
     use tantivy::query::{AllQuery, TermQuery};
     use tantivy::schema::{IndexRecordOption, Value};
-    use tantivy::{doc, IndexBuilder, TantivyDocument, Term};
+    use tantivy::{doc, Document, IndexBuilder, TantivyDocument, Term};
 
     use crate::components::index_holder::register_default_tokenizers;
     use crate::components::test_utils::{create_test_schema, generate_documents};
