@@ -8,7 +8,7 @@ strip = "debuginfo"
 
 [workspace.dependencies]
 anyhow = "1.0"
-async-broadcast = "0.5"
+async-broadcast = "0.6.0"
 async-trait = "0.1"
 base64 = "0.21"
 bytes = "1.3"
@@ -21,10 +21,10 @@ futures = "0.3"
 hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
 hyper-tls = { version = "0.5.0", features = ["vendored"] }
 instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
-itertools = "0.11.0"
+itertools = "0.12.0"
 lazy_static = "1.4"
 libz-sys = { version = "1.1", features = ["static"] }
-lru = "0.11.1"
+lru = "0.12.1"
 oneshot = "0.1"
 openssl = { version = "=0.10.55", features = ["vendored"] }
 openssl-src = { version = "=111" }
