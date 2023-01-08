@@ -676,10 +676,10 @@ impl IndexHolder {
 
 #[cfg(test)]
 pub mod tests {
-    use serde::Serialize;
     use std::error::Error;
     use std::sync::Arc;
 
+    use serde::Serialize;
     use serde_json::json;
     use summa_proto::proto;
     use summa_proto::proto::ConflictStrategy;

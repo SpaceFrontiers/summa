@@ -727,6 +727,103 @@ pub mod tests {
         );
         assert_tokenization(
             &mut tokenizer,
+            "\\title{This is title}\n\\author{Author}\n\\section{Section 1}\n\\subsection{Section 1.1}\n\\subsubsection{Section 1.1.1}",
+            &[
+                Token {
+                    offset_from: 7,
+                    offset_to: 11,
+                    position: 0,
+                    text: "this".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 12,
+                    offset_to: 14,
+                    position: 1,
+                    text: "is".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 15,
+                    offset_to: 20,
+                    position: 2,
+                    text: "title".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 30,
+                    offset_to: 36,
+                    position: 3,
+                    text: "author".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 47,
+                    offset_to: 54,
+                    position: 4,
+                    text: "section".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 55,
+                    offset_to: 56,
+                    position: 5,
+                    text: "1".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 70,
+                    offset_to: 77,
+                    position: 6,
+                    text: "section".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 78,
+                    offset_to: 79,
+                    position: 7,
+                    text: "1".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 80,
+                    offset_to: 81,
+                    position: 8,
+                    text: "1".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 98,
+                    offset_to: 105,
+                    position: 9,
+                    text: "section".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 106,
+                    offset_to: 107,
+                    position: 10,
+                    text: "1".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 108,
+                    offset_to: 109,
+                    position: 11,
+                    text: "1".to_string(),
+                    position_length: 1,
+                },
+                Token {
+                    offset_from: 110,
+                    offset_to: 111,
+                    position: 12,
+                    text: "1".to_string(),
+                    position_length: 1,
+                },
+            ],
+        );
+        assert_tokenization(
+            &mut tokenizer,
             "![ref](hehe)-abc{} \\[34\\] \\] \\) \\} 1 ### abc \\(",
             &[
                 Token {
