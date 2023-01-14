@@ -176,7 +176,7 @@ impl IndexHolder {
         let index_reader = index
             .reader_builder()
             .doc_store_cache_num_blocks(core_config.doc_store_cache_num_blocks)
-            .reload_policy(ReloadPolicy::OnCommit)
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
         index_reader.reload()?;
 

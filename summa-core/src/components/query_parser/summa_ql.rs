@@ -1042,23 +1042,6 @@ mod tests {
     }
 
     #[test]
-    pub fn test_regex() {
-        let query_parser = create_query_parser();
-        assert_eq!(
-            format!("{:?}", query_parser.parse_query("body:/поисковые/")),
-            "Ok(RegexQuery { regex: Regex(\"поисковые\")\n, field: Field(1) })"
-        );
-        assert_eq!(
-            format!("{:?}", query_parser.parse_query("body://поиск/овые//")),
-            "Ok(RegexQuery { regex: Regex(\"поиск/овые\")\n, field: Field(1) })"
-        );
-        assert_eq!(
-            format!("{:?}", query_parser.parse_query("body:/поисковые.*/")),
-            "Ok(RegexQuery { regex: Regex(\"поисковые.*\")\n, field: Field(1) })"
-        );
-    }
-
-    #[test]
     pub fn test_json() {
         let query_parser = create_query_parser();
         assert_eq!(

@@ -127,6 +127,20 @@ impl SegmentEvalScorer {
         })
     }
 
+    pub(crate) fn score(&mut self, doc_id: DocId, original_score: f32) -> f64 {
+        *self.boxed_original_score = original_score as f64;
+        for fast_field_iterator in self.fast_fields_iterators.iter_mut() {
+            fast_field_iterator.advance(doc_id)
+        }
+        if let fasteval2::IUnsafeVar { ptr, .. } = self.compiled {
+            unsafe { *ptr }
+        } else {
+            self.compiled.eval(&self.slab, &mut self.namespace).expect("undefined variable")
+        }
+    }
+}
+
+impl SegmentEvalScorer {
     #[inline]
     pub async fn for_segment_async(
         segment_reader: &SegmentReader,
@@ -184,17 +198,5 @@ impl SegmentEvalScorer {
             fast_fields_iterators,
             namespace,
         })
-    }
-
-    pub(crate) fn score(&mut self, doc_id: DocId, original_score: f32) -> f64 {
-        *self.boxed_original_score = original_score as f64;
-        for fast_field_iterator in self.fast_fields_iterators.iter_mut() {
-            fast_field_iterator.advance(doc_id)
-        }
-        if let fasteval2::IUnsafeVar { ptr, .. } = self.compiled {
-            unsafe { *ptr }
-        } else {
-            self.compiled.eval(&self.slab, &mut self.namespace).expect("undefined variable")
-        }
     }
 }

@@ -67,7 +67,6 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
             Err(e) => panic!("{:?}", e),
         }
     }
-
     async fn atomic_read_async(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
         let file_handle = self.get_network_file_handle(path);
         info!(action = "atomic_read_async", path = ?path);

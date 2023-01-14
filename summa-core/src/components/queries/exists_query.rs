@@ -99,7 +99,6 @@ impl ExistsWeight {
         self.get_json_term(&start_term_str)..=self.get_json_term(&end_term_str)
     }
 }
-
 #[async_trait]
 impl Weight for ExistsWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
@@ -138,6 +137,14 @@ impl Weight for ExistsWeight {
 
         let doc_bitset = BitSetDocSet::from(doc_bitset);
         Ok(Box::new(ConstScorer::new(doc_bitset, boost)))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if scorer.seek(doc) != doc {
+            return Err(TantivyError::InvalidArgument(format!("Document #({}) does not match", doc)));
+        }
+        Ok(Explanation::new("ExistsQuery", 1.0))
     }
 
     async fn scorer_async(&self, reader: &SegmentReader, boost: Score) -> Result<Box<dyn Scorer>> {
@@ -179,13 +186,5 @@ impl Weight for ExistsWeight {
 
         let doc_bitset = BitSetDocSet::from(doc_bitset);
         Ok(Box::new(ConstScorer::new(doc_bitset, boost)))
-    }
-
-    fn explain(&self, reader: &SegmentReader, doc: DocId) -> Result<Explanation> {
-        let mut scorer = self.scorer(reader, 1.0)?;
-        if scorer.seek(doc) != doc {
-            return Err(TantivyError::InvalidArgument(format!("Document #({}) does not match", doc)));
-        }
-        Ok(Explanation::new("ExistsQuery", 1.0))
     }
 }
