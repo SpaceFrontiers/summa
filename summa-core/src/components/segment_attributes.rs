@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tantivy::SegmentAttributesMerger;
+use tantivy::index::SegmentAttributesMerger;
 
 use crate::utils::current_time;
 

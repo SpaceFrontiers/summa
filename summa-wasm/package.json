@@ -1,7 +1,7 @@
 {
   "name": "summa-wasm",
   "description": "WASM-bindings for Summa",
-  "version": "0.135.7",
+  "version": "0.136.0",
   "keywords": [
     "search",
     "database",
