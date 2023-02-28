@@ -6,7 +6,7 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Map
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class GetTopTermsRequest(_message.Message):
-    __slots__ = ["index_name", "field_name", "top_k"]
+    __slots__ = ("index_name", "field_name", "top_k")
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     FIELD_NAME_FIELD_NUMBER: _ClassVar[int]
     TOP_K_FIELD_NUMBER: _ClassVar[int]
@@ -16,9 +16,9 @@ class GetTopTermsRequest(_message.Message):
     def __init__(self, index_name: _Optional[str] = ..., field_name: _Optional[str] = ..., top_k: _Optional[int] = ...) -> None: ...
 
 class GetTopTermsResponse(_message.Message):
-    __slots__ = ["per_segment"]
+    __slots__ = ("per_segment",)
     class PerSegmentEntry(_message.Message):
-        __slots__ = ["key", "value"]
+        __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
         VALUE_FIELD_NUMBER: _ClassVar[int]
         key: str
@@ -29,13 +29,13 @@ class GetTopTermsResponse(_message.Message):
     def __init__(self, per_segment: _Optional[_Mapping[str, SegmentTerms]] = ...) -> None: ...
 
 class SegmentTerms(_message.Message):
-    __slots__ = ["term_infos"]
+    __slots__ = ("term_infos",)
     TERM_INFOS_FIELD_NUMBER: _ClassVar[int]
     term_infos: _containers.RepeatedCompositeFieldContainer[TermInfo]
     def __init__(self, term_infos: _Optional[_Iterable[_Union[TermInfo, _Mapping]]] = ...) -> None: ...
 
 class TermInfo(_message.Message):
-    __slots__ = ["key", "doc_freq"]
+    __slots__ = ("key", "doc_freq")
     KEY_FIELD_NUMBER: _ClassVar[int]
     DOC_FREQ_FIELD_NUMBER: _ClassVar[int]
     key: bytes

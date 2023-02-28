@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+ #!/usr/bin/env bash
 
 pip3 install -U build grpcio-tools twine
 rm -rf aiosumma/proto/*

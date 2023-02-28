@@ -6,7 +6,7 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Map
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class PBLink(_message.Message):
-    __slots__ = ["hash", "name", "t_size"]
+    __slots__ = ("hash", "name", "t_size")
     HASH_FIELD_NUMBER: _ClassVar[int]
     NAME_FIELD_NUMBER: _ClassVar[int]
     T_SIZE_FIELD_NUMBER: _ClassVar[int]
@@ -16,7 +16,7 @@ class PBLink(_message.Message):
     def __init__(self, hash: _Optional[bytes] = ..., name: _Optional[str] = ..., t_size: _Optional[int] = ...) -> None: ...
 
 class PBNode(_message.Message):
-    __slots__ = ["links", "data"]
+    __slots__ = ("links", "data")
     LINKS_FIELD_NUMBER: _ClassVar[int]
     DATA_FIELD_NUMBER: _ClassVar[int]
     links: _containers.RepeatedCompositeFieldContainer[PBLink]

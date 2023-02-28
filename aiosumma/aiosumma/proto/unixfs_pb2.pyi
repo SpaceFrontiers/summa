@@ -7,9 +7,9 @@ from typing import ClassVar as _ClassVar, Iterable as _Iterable, Optional as _Op
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class Data(_message.Message):
-    __slots__ = ["type", "data", "filesize", "blocksizes", "hashType", "fanout"]
+    __slots__ = ("type", "data", "filesize", "blocksizes", "hashType", "fanout")
     class DataType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-        __slots__ = []
+        __slots__ = ()
         Raw: _ClassVar[Data.DataType]
         Directory: _ClassVar[Data.DataType]
         File: _ClassVar[Data.DataType]
@@ -37,7 +37,7 @@ class Data(_message.Message):
     def __init__(self, type: _Optional[_Union[Data.DataType, str]] = ..., data: _Optional[bytes] = ..., filesize: _Optional[int] = ..., blocksizes: _Optional[_Iterable[int]] = ..., hashType: _Optional[int] = ..., fanout: _Optional[int] = ...) -> None: ...
 
 class Metadata(_message.Message):
-    __slots__ = ["MimeType"]
+    __slots__ = ("MimeType",)
     MIMETYPE_FIELD_NUMBER: _ClassVar[int]
     MimeType: str
     def __init__(self, MimeType: _Optional[str] = ...) -> None: ...
