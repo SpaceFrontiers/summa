@@ -56,6 +56,9 @@ pub fn process_dynamic_fields(schema: &Schema, json_object: &mut serde_json::Map
             }
         }
     }
+    if schema.get_field("updated_at").is_ok() {
+        json_object.insert("updated_at".to_string(), json!(current_time()));
+    }
 }
 
 /// Parse single json value
