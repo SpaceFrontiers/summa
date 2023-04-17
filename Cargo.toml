@@ -13,8 +13,8 @@ async-trait = "0.1"
 base64 = "0.22"
 bytes = "1.3"
 clap = { version = "4.0", features = ["cargo"] }
-config = "0.13"
-derive_builder = "0.12"
+config = "0.14.0"
+derive_builder = "0.20.0"
 downcast-rs = "1.2"
 fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
 futures = "0.3"
