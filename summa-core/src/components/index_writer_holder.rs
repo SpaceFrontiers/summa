@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike};
 use rand::RngCore;
 use summa_proto::proto;
 use tantivy::json_utils::{convert_to_fast_value_and_get_term, JsonTermWriter};
@@ -372,9 +372,8 @@ impl IndexWriterHolder {
         if let Some((extra_field, issued_at_field)) = self.extra_year_field {
             if let Some(issued_at_value) = document.get_first(issued_at_field) {
                 if let Some(issued_at_value) = issued_at_value.as_i64() {
-                    if let Some(correct_timestamp) = NaiveDateTime::from_timestamp_opt(issued_at_value, 0) {
-                        let datetime: DateTime<Utc> = DateTime::from_utc(correct_timestamp, Utc);
-                        document.add_text(extra_field, datetime.year().to_string())
+                    if let Some(correct_timestamp) = DateTime::from_timestamp(issued_at_value, 0) {
+                        document.add_text(extra_field, correct_timestamp.year().to_string())
                     }
                 }
             }
