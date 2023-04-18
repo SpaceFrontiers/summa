@@ -8,7 +8,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Instant;
 
-use summa_core::components::{IndexHolder, NamedFieldDocument, SummaDocument};
+use summa_core::components::{IndexHolder, NamedFieldDocument};
 use summa_core::configs::ConfigProxy;
 use summa_core::utils::sync::Handler;
 use summa_core::validators;
@@ -236,7 +236,7 @@ impl proto::index_api_server::IndexApi for IndexApiImpl {
         self.index_service
             .get_index_holder(&proto_request.index_name)
             .await?
-            .index_document(SummaDocument::UnboundJsonBytes(&proto_request.document), proto_request.skip_updated_at_modification)
+            .index_document(&proto_request.document, proto_request.skip_updated_at_modification)
             .await
             .map_err(crate::errors::Error::from)?;
         let response = proto::IndexDocumentResponse {};

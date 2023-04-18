@@ -551,8 +551,8 @@ impl IndexHolder {
     /// Index generic `SummaDocument`
     ///
     /// `IndexUpdater` bounds unbounded `SummaDocument` inside
-    pub async fn index_document(&self, document: SummaDocument<'_>, skip_updated_at_modification: bool) -> SummaResult<()> {
-        let document = document.bound_with(&self.index.schema()).try_into()?;
+    pub async fn index_document(&self, document_bytes: &[u8], skip_updated_at_modification: bool) -> SummaResult<()> {
+        let document = SummaDocument::parse_json_bytes(&self.index.schema(), document_bytes, skip_updated_at_modification)?;
         self.index_writer_holder()?.read().await.index_document(document, self.conflict_strategy())
     }
 
@@ -679,18 +679,17 @@ pub mod tests {
     use std::error::Error;
     use std::sync::Arc;
 
-    use serde::Serialize;
     use serde_json::json;
     use summa_proto::proto;
     use summa_proto::proto::ConflictStrategy;
     use tantivy::collector::{Count, TopDocs};
     use tantivy::query::{AllQuery, TermQuery};
     use tantivy::schema::{IndexRecordOption, Value};
-    use tantivy::{doc, Document, IndexBuilder, TantivyDocument, Term};
+    use tantivy::{doc, IndexBuilder, TantivyDocument, Term};
 
     use crate::components::index_holder::register_default_tokenizers;
     use crate::components::test_utils::{create_test_schema, generate_documents};
-    use crate::components::IndexWriterHolder;
+    use crate::components::{IndexWriterHolder, SummaDocument};
     use crate::configs::core::WriterThreads;
 
     #[test]
@@ -712,7 +711,7 @@ pub mod tests {
         )?;
         let mut last_document = None;
         for document in generate_documents(&schema, 10000) {
-            let document: TantivyDocument = document.bound_with(&schema).try_into()?;
+            let document: TantivyDocument = SummaDocument::parse_json_bytes(&schema, document.as_bytes(), false)?;
             last_document = Some(document.clone());
             index_writer_holder.index_document(document, ConflictStrategy::Merge)?;
         }
@@ -724,7 +723,7 @@ pub mod tests {
         );
         index_writer_holder.commit()?;
         for document in generate_documents(&schema, 1000) {
-            let document = document.bound_with(&schema).try_into()?;
+            let document = SummaDocument::parse_json_bytes(&schema, document.as_bytes(), false)?;
             index_writer_holder.index_document(modified_last_document.clone(), ConflictStrategy::Merge)?;
             index_writer_holder.index_document(document, ConflictStrategy::Merge)?;
         }

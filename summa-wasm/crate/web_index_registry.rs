@@ -4,7 +4,7 @@ use js_sys::Uint8Array;
 use prost::Message;
 use serde::Serialize;
 use serde_wasm_bindgen::Serializer;
-use summa_core::components::{IndexHolder, IndexRegistry, SummaDocument};
+use summa_core::components::{IndexHolder, IndexRegistry};
 use summa_core::configs::{ConfigProxy, DirectProxy};
 use summa_core::directories::DefaultExternalRequestGenerator;
 use summa_core::errors::SummaResult;
@@ -140,10 +140,7 @@ impl WrappedIndexRegistry {
     #[wasm_bindgen]
     pub async fn index_document(&self, index_name: &str, document: &str) -> Result<(), JsValue> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
-        index_holder
-            .index_document(SummaDocument::UnboundJsonBytes(document.as_bytes()), false)
-            .await
-            .map_err(Error::from)?;
+        index_holder.index_document(document.as_bytes(), false).await.map_err(Error::from)?;
         Ok(())
     }
 
