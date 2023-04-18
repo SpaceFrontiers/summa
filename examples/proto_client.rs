@@ -60,6 +60,7 @@ async fn main() -> Result<(), tonic::Status> {
                 "#,
             }))
             .unwrap(),
+            skip_updated_at_modification: false,
         })
         .await?;
     index_api_client
@@ -77,6 +78,7 @@ async fn main() -> Result<(), tonic::Status> {
                 to September 29, 2013, consisting of five seasons for a total of 62 episodes."#,
             }))
             .unwrap(),
+            skip_updated_at_modification: false,
         })
         .await?;
 

@@ -196,12 +196,14 @@ mod tests {
             .index_document(proto::IndexDocumentRequest {
                 index_name: "test_index".to_string(),
                 document: json!({"title": "title1", "body": "body1"}).to_string().as_bytes().to_vec(),
+                skip_updated_at_modification: false,
             })
             .await?;
         index_api_client
             .index_document(proto::IndexDocumentRequest {
                 index_name: "test_index".to_string(),
                 document: json!({"title": "title2", "body": "body2"}).to_string().as_bytes().to_vec(),
+                skip_updated_at_modification: false,
             })
             .await?;
         index_api_client
@@ -214,6 +216,7 @@ mod tests {
             .index_document(proto::IndexDocumentRequest {
                 index_name: "test_index".to_string(),
                 document: json!({"title": "title3", "body": "body3"}).to_string().as_bytes().to_vec(),
+                skip_updated_at_modification: false,
             })
             .await?;
         index_api_client
