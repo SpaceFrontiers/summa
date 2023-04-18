@@ -264,14 +264,16 @@ class GetIndicesResponse(_message.Message):
     def __init__(self, index_names: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class IndexDocumentStreamRequest(_message.Message):
-    __slots__ = ("index_name", "documents", "conflict_strategy")
+    __slots__ = ("index_name", "documents", "conflict_strategy", "skip_updated_at_modification")
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
     CONFLICT_STRATEGY_FIELD_NUMBER: _ClassVar[int]
+    SKIP_UPDATED_AT_MODIFICATION_FIELD_NUMBER: _ClassVar[int]
     index_name: str
     documents: _containers.RepeatedScalarFieldContainer[bytes]
     conflict_strategy: ConflictStrategy
-    def __init__(self, index_name: _Optional[str] = ..., documents: _Optional[_Iterable[bytes]] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ...) -> None: ...
+    skip_updated_at_modification: bool
+    def __init__(self, index_name: _Optional[str] = ..., documents: _Optional[_Iterable[bytes]] = ..., conflict_strategy: _Optional[_Union[ConflictStrategy, str]] = ..., skip_updated_at_modification: bool = ...) -> None: ...
 
 class IndexDocumentStreamResponse(_message.Message):
     __slots__ = ("elapsed_secs", "success_docs", "failed_docs")
@@ -284,12 +286,14 @@ class IndexDocumentStreamResponse(_message.Message):
     def __init__(self, elapsed_secs: _Optional[float] = ..., success_docs: _Optional[int] = ..., failed_docs: _Optional[int] = ...) -> None: ...
 
 class IndexDocumentRequest(_message.Message):
-    __slots__ = ("index_name", "document")
+    __slots__ = ("index_name", "document", "skip_updated_at_modification")
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     DOCUMENT_FIELD_NUMBER: _ClassVar[int]
+    SKIP_UPDATED_AT_MODIFICATION_FIELD_NUMBER: _ClassVar[int]
     index_name: str
     document: bytes
-    def __init__(self, index_name: _Optional[str] = ..., document: _Optional[bytes] = ...) -> None: ...
+    skip_updated_at_modification: bool
+    def __init__(self, index_name: _Optional[str] = ..., document: _Optional[bytes] = ..., skip_updated_at_modification: bool = ...) -> None: ...
 
 class IndexDocumentResponse(_message.Message):
     __slots__ = ()
