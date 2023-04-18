@@ -141,7 +141,7 @@ impl WrappedIndexRegistry {
     pub async fn index_document(&self, index_name: &str, document: &str) -> Result<(), JsValue> {
         let index_holder = self.index_registry.get_index_holder_by_name(index_name).await.map_err(Error::from)?;
         index_holder
-            .index_document(SummaDocument::UnboundJsonBytes(document.as_bytes()))
+            .index_document(SummaDocument::UnboundJsonBytes(document.as_bytes()), false)
             .await
             .map_err(Error::from)?;
         Ok(())

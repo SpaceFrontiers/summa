@@ -50,7 +50,13 @@ def prepare_query(query):
     return query
 
 
-def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int, conflict_strategy: Optional[str] = None):
+def documents_portion_iter(
+    index_name: str,
+    documents: Iterable,
+    bulk_size: int,
+    conflict_strategy: Optional[str] = None,
+    skip_updated_at_modification: bool = False,
+):
     documents_portion = []
     for document in documents:
         documents_portion.append(document)
@@ -59,6 +65,7 @@ def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int,
                 index_name=index_name,
                 documents=documents_portion,
                 conflict_strategy=conflict_strategy,
+                skip_updated_at_modification=skip_updated_at_modification,
             )
             documents_portion = []
     if documents_portion:
@@ -66,6 +73,7 @@ def documents_portion_iter(index_name: str, documents: Iterable, bulk_size: int,
             index_name=index_name,
             documents=documents_portion,
             conflict_strategy=conflict_strategy,
+            skip_updated_at_modification=skip_updated_at_modification,
         )
 
 class SummaClient(BaseGrpcClient):
@@ -505,6 +513,7 @@ class SummaClient(BaseGrpcClient):
             documents: Union[Iterable[str], str] = None,
             conflict_strategy: Optional[str] = None,
             bulk_size: int = 100,
+            skip_updated_at_modification: bool = False,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentStreamResponse:
@@ -516,6 +525,7 @@ class SummaClient(BaseGrpcClient):
             documents: list of bytes
             conflict_strategy: recommended to set to DoNothing for large updates and maintain uniqueness in your application
             bulk_size: document portion size to send
+            skip_updated_at_modification: skip modifying of updated at attribute of document
             request_id: request id
             session_id: session id
         """
@@ -530,7 +540,13 @@ class SummaClient(BaseGrpcClient):
             documents = documents_iter()
 
         return await self.stubs['index_api'].index_document_stream(
-            documents_portion_iter(index_name, documents, bulk_size, conflict_strategy=conflict_strategy),
+            documents_portion_iter(
+                index_name,
+                documents,
+                bulk_size,
+                conflict_strategy=conflict_strategy,
+                skip_updated_at_modification=skip_updated_at_modification,
+            ),
             metadata=setup_metadata(session_id, request_id),
         )
 
@@ -539,6 +555,7 @@ class SummaClient(BaseGrpcClient):
             self,
             index_name: str,
             document: Union[dict, bytes, str],
+            skip_updated_at_modification: bool = False,
             request_id: Optional[str] = None,
             session_id: Optional[str] = None,
     ) -> index_service_pb.IndexDocumentResponse:
@@ -548,6 +565,7 @@ class SummaClient(BaseGrpcClient):
         Args:
             index_name: index name
             document: bytes
+            skip_updated_at_modification: bool
             request_id: request id
             session_id: session id
         """
@@ -555,6 +573,7 @@ class SummaClient(BaseGrpcClient):
             index_service_pb.IndexDocumentRequest(
                 index_name=index_name,
                 document=json.dumps(document) if isinstance(document, dict) else document,
+                skip_updated_at_modification=skip_updated_at_modification,
             ),
             metadata=setup_metadata(session_id, request_id),
         )

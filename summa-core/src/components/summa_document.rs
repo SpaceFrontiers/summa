@@ -48,7 +48,7 @@ pub enum DocumentParsingError {
     ValueError(String, ValueParsingError),
 }
 
-pub fn process_dynamic_fields(schema: &Schema, json_object: &mut serde_json::Map<String, JsonValue>) {
+pub fn process_dynamic_fields(schema: &Schema, json_object: &mut serde_json::Map<String, JsonValue>, skip_updated_at_modification: bool) {
     if schema.get_field("page_rank").is_ok() && schema.get_field("quantized_page_rank").is_ok() {
         if let Some(page_rank_value) = json_object.get_mut("page_rank") {
             if let Some(v) = page_rank_value.as_f64() {
@@ -56,7 +56,7 @@ pub fn process_dynamic_fields(schema: &Schema, json_object: &mut serde_json::Map
             }
         }
     }
-    if schema.get_field("updated_at").is_ok() {
+    if schema.get_field("updated_at").is_ok() && !skip_updated_at_modification {
         json_object.insert("updated_at".to_string(), json!(current_time()));
     }
 }
@@ -189,10 +189,10 @@ impl<'a> SummaDocument<'a> {
     }
 
     /// Build a document object from a json-object.
-    pub fn parse_and_setup_document(&self, schema: &Schema, doc_json: &str) -> SummaResult<TantivyDocument> {
+    pub fn parse_and_setup_document(&self, schema: &Schema, doc_json: &str, skip_updated_at_modification: bool) -> SummaResult<TantivyDocument> {
         let mut json_obj: serde_json::Map<String, JsonValue> =
             serde_json::from_str(doc_json).map_err(|_| DocumentParsingError::InvalidJson(doc_json.to_owned()))?;
-        process_dynamic_fields(schema, &mut json_obj);
+        process_dynamic_fields(schema, &mut json_obj, skip_updated_at_modification);
         self.json_object_to_doc(schema, json_obj)
     }
 
@@ -223,6 +223,12 @@ impl<'a> SummaDocument<'a> {
         }
         Ok(doc)
     }
+
+    pub fn parse_json_bytes(&self, schema: &Schema, json_bytes: &[u8], skip_updated_at_modification: bool) -> SummaResult<TantivyDocument> {
+        let text_document = from_utf8(json_bytes).map_err(ValidationError::Utf8)?;
+        let parsed_document = self.parse_and_setup_document(schema, text_document, skip_updated_at_modification)?;
+        Ok(parsed_document)
+    }
 }
 
 impl<'a> TryInto<TantivyDocument> for SummaDocument<'a> {
@@ -230,11 +236,7 @@ impl<'a> TryInto<TantivyDocument> for SummaDocument<'a> {
 
     fn try_into(self) -> SummaResult<TantivyDocument> {
         match self {
-            SummaDocument::BoundJsonBytes((schema, json_bytes)) => {
-                let text_document = from_utf8(json_bytes).map_err(ValidationError::Utf8)?;
-                let parsed_document = self.parse_and_setup_document(schema, text_document)?;
-                Ok(parsed_document)
-            }
+            SummaDocument::BoundJsonBytes((schema, json_bytes)) => self.parse_json_bytes(schema, json_bytes, false),
             SummaDocument::UnboundJsonBytes(_) => Err(Error::UnboundDocument),
             SummaDocument::TantivyDocument(document) => Ok(document),
         }

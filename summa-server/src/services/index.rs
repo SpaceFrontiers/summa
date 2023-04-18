@@ -878,10 +878,10 @@ pub(crate) mod tests {
         .await?;
 
         for d in generate_documents(index_holder.schema(), 1000) {
-            index_holder.index_document(d).await?;
+            index_holder.index_document(d, false).await?;
         }
         index_holder
-            .index_document(generate_unique_document(index_holder.schema(), "testtitle"))
+            .index_document(generate_unique_document(index_holder.schema(), "testtitle"), false)
             .await?;
         index_service.commit(&index_holder, false).await?;
 
@@ -922,7 +922,7 @@ pub(crate) mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
         for _ in 0..4 {
             for d in generate_documents_with_doc_id_gen_and_rng(AtomicI64::new(1), &mut rng, &schema, 300) {
-                index_holder.index_document(d).await?;
+                index_holder.index_document(d, false).await?;
             }
             index_service.commit(&index_holder, false).await?;
         }

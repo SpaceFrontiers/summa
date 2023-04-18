@@ -551,7 +551,7 @@ impl IndexHolder {
     /// Index generic `SummaDocument`
     ///
     /// `IndexUpdater` bounds unbounded `SummaDocument` inside
-    pub async fn index_document(&self, document: SummaDocument<'_>) -> SummaResult<()> {
+    pub async fn index_document(&self, document: SummaDocument<'_>, skip_updated_at_modification: bool) -> SummaResult<()> {
         let document = document.bound_with(&self.index.schema()).try_into()?;
         self.index_writer_holder()?.read().await.index_document(document, self.conflict_strategy())
     }
