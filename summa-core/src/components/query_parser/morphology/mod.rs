@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use summa_proto::proto;
 use tantivy::query::{DisjunctionMaxQuery, Query, TermQuery};
 use tantivy::schema::{Field, FieldType, IndexRecordOption};
@@ -11,7 +10,7 @@ pub use manager::MorphologyManager;
 use crate::components::query_parser::utils::cast_field_to_term;
 
 pub trait Morphology: MorphologyClone + Send + Sync {
-    fn derive_tenses(&self, word: &str) -> Option<String>;
+    fn derive_tenses(&self, word: &str) -> Option<(String, String)>;
     fn derive_spelling(&self, word: &str) -> Option<String>;
 
     fn derive_query(&self, config: proto::MorphologyConfig, field: &Field, full_path: &str, field_type: &FieldType, text: &str) -> Box<dyn Query> {
@@ -21,14 +20,21 @@ pub trait Morphology: MorphologyClone + Send + Sync {
             let term = cast_field_to_term(field, full_path, field_type, text, false);
             return Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
         };
-        let mut terms = HashSet::new();
-        terms.insert(text.to_string());
-        if let Some(other_tense_text) = self.derive_tenses(text) {
-            terms.insert(other_tense_text);
+        let mut terms = vec![];
+        if let Some((singular, plural)) = self.derive_tenses(text) {
+            terms.push(singular);
+            terms.push(plural);
+        } else {
+            terms.push(text.to_string());
         }
-        terms.extend(terms.iter().filter_map(|t| self.derive_spelling(t)).collect::<Vec<_>>());
-        terms.extend(terms.iter().filter_map(|t| self.derive_tenses(t)).collect::<Vec<_>>());
-        let terms = Vec::from_iter(terms.into_iter());
+        if let Some(spelling) = self.derive_spelling(&terms[0]) {
+            if let Some((spelling_tense_singular, spelling_tense_plural)) = self.derive_tenses(&spelling) {
+                terms.push(spelling_tense_singular);
+                terms.push(spelling_tense_plural);
+            } else {
+                terms.push(spelling);
+            }
+        }
         if terms.len() == 1 {
             Box::new(TermQuery::new(
                 cast_field_to_term(field, full_path, field_type, &terms[0], false),

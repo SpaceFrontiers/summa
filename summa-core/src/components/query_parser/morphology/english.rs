@@ -42,7 +42,7 @@ impl Default for EnglishMorphology {
 }
 
 impl Morphology for EnglishMorphology {
-    fn derive_tenses(&self, word: &str) -> Option<String> {
+    fn derive_tenses(&self, word: &str) -> Option<(String, String)> {
         thread_local! {
             static NOT_A_NOUN: (RegexSet, HashSet<&'static str>) = (RegexSet::new([
                 r"\d$",
@@ -56,9 +56,9 @@ impl Morphology for EnglishMorphology {
             let is_singular = pluralize_rs::is_singular(word);
             let is_plural = pluralize_rs::is_plural(word);
             if is_singular {
-                Some(pluralize_rs::to_plural(word))
+                Some((word.to_string(), pluralize_rs::to_plural(word)))
             } else if is_plural {
-                Some(pluralize_rs::to_singular(word))
+                Some((pluralize_rs::to_singular(word), word.to_string()))
             } else {
                 None
             }
