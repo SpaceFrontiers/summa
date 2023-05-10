@@ -13,7 +13,6 @@ from .proto import consumer_service_pb2 as consumer_service_pb
 from .proto import index_service_pb2 as index_service_pb
 from .proto import query_pb2 as query_pb
 from .proto import reflection_service_pb2 as reflection_service_pb
-from .proto import search_service_pb2 as search_service_pb
 from .proto.consumer_service_pb2_grpc import ConsumerApiStub
 from .proto.index_service_pb2_grpc import IndexApiStub
 from .proto.reflection_service_pb2_grpc import ReflectionApiStub

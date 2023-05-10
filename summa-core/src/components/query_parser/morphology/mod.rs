@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use summa_proto::proto;
 use tantivy::query::{DisjunctionMaxQuery, Query, TermQuery};
 use tantivy::schema::{Field, FieldType, IndexRecordOption};
@@ -20,12 +21,14 @@ pub trait Morphology: MorphologyClone + Send + Sync {
             let term = cast_field_to_term(field, full_path, field_type, text, false);
             return Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>;
         };
-        let mut terms = vec![text.to_string()];
+        let mut terms = HashSet::new();
+        terms.insert(text.to_string());
         if let Some(other_tense_text) = self.derive_tenses(text) {
-            terms.push(other_tense_text);
+            terms.insert(other_tense_text);
         }
-        let corrected_spellings: Vec<_> = terms.iter().filter_map(|t| self.derive_spelling(t)).collect();
-        terms.extend(corrected_spellings);
+        terms.extend(terms.iter().filter_map(|t| self.derive_spelling(t)).collect::<Vec<_>>());
+        terms.extend(terms.iter().filter_map(|t| self.derive_tenses(t)).collect::<Vec<_>>());
+        let terms = Vec::from_iter(terms.into_iter());
         if terms.len() == 1 {
             Box::new(TermQuery::new(
                 cast_field_to_term(field, full_path, field_type, &terms[0], false),
