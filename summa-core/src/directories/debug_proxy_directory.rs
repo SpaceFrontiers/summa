@@ -208,7 +208,7 @@ impl Directory for DebugProxyDirectory {
     }
 
     fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
-        Ok(tantivy::directory::DirectoryLock::from(Box::new(|| {})))
+        Ok(DirectoryLock::from(Box::new(|| {})))
     }
     fn as_any(&self) -> &dyn Any {
         self

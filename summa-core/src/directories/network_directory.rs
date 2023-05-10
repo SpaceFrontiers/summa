@@ -79,7 +79,7 @@ impl<TExternalRequest: ExternalRequest + 'static> Directory for NetworkDirectory
     }
 
     fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
-        Ok(tantivy::directory::DirectoryLock::from(Box::new(|| {})))
+        Ok(DirectoryLock::from(Box::new(|| {})))
     }
 
     fn watch(&self, _: WatchCallback) -> tantivy::Result<WatchHandle> {
