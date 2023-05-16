@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["examples", "ipfs-hamt-directory", "ipfs-hamt-directory-py", "summa-core", "summa-proto", "summa-embed-py", "summa-server", "summa-wasm"]
+members = ["examples", "summa-core", "summa-proto", "summa-embed-py", "summa-server", "summa-wasm"]
 
 [profile.release]
 lto = true

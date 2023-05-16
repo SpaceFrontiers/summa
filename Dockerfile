@@ -24,8 +24,6 @@ FROM --platform=$BUILDPLATFORM builder AS base-dir
 WORKDIR /app
 COPY .cargo .cargo
 COPY examples examples
-COPY ipfs-hamt-directory ipfs-hamt-directory
-COPY ipfs-hamt-directory-py ipfs-hamt-directory-py
 COPY summa-core summa-core
 COPY summa-embed-py summa-embed-py
 COPY summa-proto summa-proto
