@@ -6,6 +6,7 @@ npx protoc \
   --proto_path ../summa-proto/proto \
   ../summa-proto/proto/*.proto
 
+
 npm run build
 sed -i '' 's/document.baseURI ||//g' dist/root-worker.js
 sed -i '' 's/document.baseURI||//g' dist/root-worker.js

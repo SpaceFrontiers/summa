@@ -33,9 +33,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true, default-features = false, features = ["sync"] }
 tracing = { workspace = true }
 tracing-wasm = "0.2"
-wasm-bindgen = "0.2.83"
-wasm-bindgen-futures = "0.4.33"
-web-sys = { version = "0.3.60", features = ["console", "DedicatedWorkerGlobalScope", "WorkerOptions", "WorkerType"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["console", "DedicatedWorkerGlobalScope", "WorkerOptions", "WorkerType"] }
+zstd-safe = "=7.0.0"
+zstd-sys = "=2.0.9"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-O4", "--enable-bulk-memory", "--enable-mutable-globals"]
