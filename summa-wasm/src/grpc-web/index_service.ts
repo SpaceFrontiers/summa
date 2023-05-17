@@ -300,6 +300,10 @@ export interface IndexAttributes {
      * @generated from protobuf field: repeated summa.proto.MappedField mapped_fields = 9;
      */
     mapped_fields: MappedField[];
+    /**
+     * @generated from protobuf field: optional string auto_id_field = 10;
+     */
+    auto_id_field?: string;
 }
 /**
  * Request for index creation
@@ -485,6 +489,10 @@ export interface IndexDocumentStreamRequest {
      * @generated from protobuf field: optional summa.proto.ConflictStrategy conflict_strategy = 3;
      */
     conflict_strategy?: ConflictStrategy;
+    /**
+     * @generated from protobuf field: bool skip_updated_at_modification = 4;
+     */
+    skip_updated_at_modification: boolean;
 }
 /**
  * @generated from protobuf message summa.proto.IndexDocumentStreamResponse
@@ -515,6 +523,10 @@ export interface IndexDocumentRequest {
      * @generated from protobuf field: bytes document = 2;
      */
     document: Uint8Array;
+    /**
+     * @generated from protobuf field: bool skip_updated_at_modification = 3;
+     */
+    skip_updated_at_modification: boolean;
 }
 /**
  * @generated from protobuf message summa.proto.IndexDocumentResponse
@@ -1679,7 +1691,8 @@ class IndexAttributes$Type extends MessageType<IndexAttributes> {
             { no: 4, name: "multi_fields", kind: "scalar", localName: "multi_fields", repeat: 2 /*RepeatType.UNPACKED*/, T: 9 /*ScalarType.STRING*/ },
             { no: 6, name: "description", kind: "scalar", opt: true, T: 9 /*ScalarType.STRING*/ },
             { no: 8, name: "conflict_strategy", kind: "enum", localName: "conflict_strategy", T: () => ["summa.proto.ConflictStrategy", ConflictStrategy] },
-            { no: 9, name: "mapped_fields", kind: "message", localName: "mapped_fields", repeat: 1 /*RepeatType.PACKED*/, T: () => MappedField }
+            { no: 9, name: "mapped_fields", kind: "message", localName: "mapped_fields", repeat: 1 /*RepeatType.PACKED*/, T: () => MappedField },
+            { no: 10, name: "auto_id_field", kind: "scalar", localName: "auto_id_field", opt: true, T: 9 /*ScalarType.STRING*/ }
         ]);
     }
     create(value?: PartialMessage<IndexAttributes>): IndexAttributes {
@@ -1712,6 +1725,9 @@ class IndexAttributes$Type extends MessageType<IndexAttributes> {
                 case /* repeated summa.proto.MappedField mapped_fields */ 9:
                     message.mapped_fields.push(MappedField.internalBinaryRead(reader, reader.uint32(), options));
                     break;
+                case /* optional string auto_id_field */ 10:
+                    message.auto_id_field = reader.string();
+                    break;
                 default:
                     let u = options.readUnknownField;
                     if (u === "throw")
@@ -1742,6 +1758,9 @@ class IndexAttributes$Type extends MessageType<IndexAttributes> {
         /* repeated summa.proto.MappedField mapped_fields = 9; */
         for (let i = 0; i < message.mapped_fields.length; i++)
             MappedField.internalBinaryWrite(message.mapped_fields[i], writer.tag(9, WireType.LengthDelimited).fork(), options).join();
+        /* optional string auto_id_field = 10; */
+        if (message.auto_id_field !== undefined)
+            writer.tag(10, WireType.LengthDelimited).string(message.auto_id_field);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2372,11 +2391,12 @@ class IndexDocumentStreamRequest$Type extends MessageType<IndexDocumentStreamReq
         super("summa.proto.IndexDocumentStreamRequest", [
             { no: 1, name: "index_name", kind: "scalar", localName: "index_name", T: 9 /*ScalarType.STRING*/ },
             { no: 2, name: "documents", kind: "scalar", repeat: 2 /*RepeatType.UNPACKED*/, T: 12 /*ScalarType.BYTES*/ },
-            { no: 3, name: "conflict_strategy", kind: "enum", localName: "conflict_strategy", opt: true, T: () => ["summa.proto.ConflictStrategy", ConflictStrategy] }
+            { no: 3, name: "conflict_strategy", kind: "enum", localName: "conflict_strategy", opt: true, T: () => ["summa.proto.ConflictStrategy", ConflictStrategy] },
+            { no: 4, name: "skip_updated_at_modification", kind: "scalar", localName: "skip_updated_at_modification", T: 8 /*ScalarType.BOOL*/ }
         ]);
     }
     create(value?: PartialMessage<IndexDocumentStreamRequest>): IndexDocumentStreamRequest {
-        const message = { index_name: "", documents: [] };
+        const message = { index_name: "", documents: [], skip_updated_at_modification: false };
         globalThis.Object.defineProperty(message, MESSAGE_TYPE, { enumerable: false, value: this });
         if (value !== undefined)
             reflectionMergePartial<IndexDocumentStreamRequest>(this, message, value);
@@ -2395,6 +2415,9 @@ class IndexDocumentStreamRequest$Type extends MessageType<IndexDocumentStreamReq
                     break;
                 case /* optional summa.proto.ConflictStrategy conflict_strategy */ 3:
                     message.conflict_strategy = reader.int32();
+                    break;
+                case /* bool skip_updated_at_modification */ 4:
+                    message.skip_updated_at_modification = reader.bool();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2417,6 +2440,9 @@ class IndexDocumentStreamRequest$Type extends MessageType<IndexDocumentStreamReq
         /* optional summa.proto.ConflictStrategy conflict_strategy = 3; */
         if (message.conflict_strategy !== undefined)
             writer.tag(3, WireType.Varint).int32(message.conflict_strategy);
+        /* bool skip_updated_at_modification = 4; */
+        if (message.skip_updated_at_modification !== false)
+            writer.tag(4, WireType.Varint).bool(message.skip_updated_at_modification);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
@@ -2493,11 +2519,12 @@ class IndexDocumentRequest$Type extends MessageType<IndexDocumentRequest> {
     constructor() {
         super("summa.proto.IndexDocumentRequest", [
             { no: 1, name: "index_name", kind: "scalar", localName: "index_name", T: 9 /*ScalarType.STRING*/ },
-            { no: 2, name: "document", kind: "scalar", T: 12 /*ScalarType.BYTES*/ }
+            { no: 2, name: "document", kind: "scalar", T: 12 /*ScalarType.BYTES*/ },
+            { no: 3, name: "skip_updated_at_modification", kind: "scalar", localName: "skip_updated_at_modification", T: 8 /*ScalarType.BOOL*/ }
         ]);
     }
     create(value?: PartialMessage<IndexDocumentRequest>): IndexDocumentRequest {
-        const message = { index_name: "", document: new Uint8Array(0) };
+        const message = { index_name: "", document: new Uint8Array(0), skip_updated_at_modification: false };
         globalThis.Object.defineProperty(message, MESSAGE_TYPE, { enumerable: false, value: this });
         if (value !== undefined)
             reflectionMergePartial<IndexDocumentRequest>(this, message, value);
@@ -2513,6 +2540,9 @@ class IndexDocumentRequest$Type extends MessageType<IndexDocumentRequest> {
                     break;
                 case /* bytes document */ 2:
                     message.document = reader.bytes();
+                    break;
+                case /* bool skip_updated_at_modification */ 3:
+                    message.skip_updated_at_modification = reader.bool();
                     break;
                 default:
                     let u = options.readUnknownField;
@@ -2532,6 +2562,9 @@ class IndexDocumentRequest$Type extends MessageType<IndexDocumentRequest> {
         /* bytes document = 2; */
         if (message.document.length)
             writer.tag(2, WireType.LengthDelimited).bytes(message.document);
+        /* bool skip_updated_at_modification = 3; */
+        if (message.skip_updated_at_modification !== false)
+            writer.tag(3, WireType.Varint).bool(message.skip_updated_at_modification);
         let u = options.writeUnknownFields;
         if (u !== false)
             (u == true ? UnknownFieldHandler.onWrite : u)(this.typeName, message, writer);
