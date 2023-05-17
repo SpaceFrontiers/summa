@@ -17,8 +17,8 @@ pyo3-asyncio = { version =  "^0.19", features = ["attributes", "tokio-runtime"] 
 pyo3-log = "^0.8"
 pythonize = "^0.19"
 serde_json = "1.0"
-summa-core = { version = "0.23.3", path = "../summa-core", default_features = false, features = ["fs", "hyper-external-request", "tokio-rt"] }
-summa-server = { version = "0.23.8", path = "../summa-server", default_features = false }
+summa-core = { version = "0.23.3", path = "../summa-core", default-features = false, features = ["fs", "hyper-external-request", "tokio-rt"] }
+summa-server = { version = "0.23.8", path = "../summa-server", default-features = false }
 summa-proto = { workspace = true }
 tantivy = { workspace = true }
 tokio = { workspace = true }

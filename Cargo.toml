@@ -18,9 +18,9 @@ derive_builder = "0.20.0"
 downcast-rs = "1.2"
 fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
 futures = "0.3"
-hyper = { version = "0.14", default_features = false, features = ["client", "http1", "http2", "tcp"] }
+hyper = { version = "0.14", default-features = false, features = ["client", "http1", "http2", "tcp"] }
 hyper-tls = { version = "0.5.0", features = ["vendored"] }
-instant = { version = "0.1", default_features = false, features = [ "inaccurate", "wasm-bindgen" ] }
+instant = { version = "0.1", default-features = false, features = [ "inaccurate", "wasm-bindgen" ] }
 itertools = "0.12.0"
 lazy_static = "1.4"
 libz-sys = { version = "1.1", features = ["static"] }
@@ -36,19 +36,19 @@ prost = "0.12"
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.6.1"
 regex = "1.8"
-serde = { version = "1.0", default_features = false, features = ["derive", "std"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_bytes = "0.11"
 serde_cbor = "0.11"
 serde_json = { version = "1.0" }
 serde_yaml = { version = "0.8" }
 strfmt = "0.2"
-summa-proto = { version = "0.36.1", path = "./summa-proto", default_features = false }
+summa-proto = { version = "0.36.1", path = "./summa-proto", default-features = false }
 take_mut = "0.2"
-tantivy = { package = "izihawa-tantivy", version = "0.22.6", default_features = false, features = ["quickwit", "sstable-termdict", "zstd-compression"] }
+tantivy = { package = "izihawa-tantivy", version = "0.22.6", default-features = false, features = ["quickwit", "sstable-termdict", "zstd-compression"] }
 tantivy-common = { package = "izihawa-tantivy-common", version = "0.7" }
 tantivy-query-grammar = { package = "izihawa-tantivy-query-grammar", version = "0.22" }
 thiserror = "1.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
-tokio = { version = "1.35.1", default_features = false }
+tokio = { version = "1.35.1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
