@@ -5,6 +5,7 @@ build-std = ['std', 'panic_abort']
 target = "wasm32-unknown-unknown"
 rustflags = [
     "-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals,+simd128",
+    "-Clink-arg=--initial-memory=67108864",
     "-Clink-arg=--max-memory=4294967296"
 ]
 

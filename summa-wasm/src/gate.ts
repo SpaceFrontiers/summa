@@ -52,6 +52,10 @@ export function request_async(method: string, url: string, headers: Array<{name:
         let xhr = new XMLHttpRequest();
         xhr.responseType = "arraybuffer";
         xhr.withCredentials = true;
+        for (const header of headers)
+        if (header.name == "range") {
+            url += ("?r=" + header.value)
+        }
         try {
             xhr.open(method, url);
             if (headers !== undefined) {

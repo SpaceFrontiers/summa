@@ -45,9 +45,9 @@ export class IndexRegistry implements IIndexRegistry {
     let actual_options = Object.assign({}, default_options, options);
     console.log('Memory config:', actual_options.memory_config);
     try {
-      await init(init_url, new WebAssembly.Memory(actual_options.memory_config!));
+      await init(init_url);
     } catch (e) {
-      await init(init_url + "?force", new WebAssembly.Memory(actual_options.memory_config!));
+      await init(init_url + "?force");
     }
     await setup_logging(actual_options.logging_level!);
     this.registry = new WrappedIndexRegistry();

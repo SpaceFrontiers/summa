@@ -23,7 +23,7 @@ export class LocalDatabaseSeed implements IIndexSeed {
     return RemoteEngineConfig.create({
       method: "GET",
       url_template: `${this.ipfs_path}{file_name}`,
-      headers_template: { range: "bytes={start}-{end}" },
+      headers_template: { range: "bytes={start}-{end}", "cache-control": "no-store" },
       cache_config: this.cache_config,
     });
   }

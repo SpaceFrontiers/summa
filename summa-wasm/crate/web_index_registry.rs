@@ -62,7 +62,7 @@ impl WrappedIndexRegistry {
         info!(action = "search", search_request = ?search_request);
         let index_holder = self.index_registry.get_index_holder(&search_request.index_alias).await?;
         let collector_outputs = index_holder
-            .custom_search(
+            .custom_search_async(
                 &search_request.index_alias,
                 search_request
                     .query

@@ -35,7 +35,7 @@ if ('WorkerGlobalScope' in self &&
     self instanceof WorkerGlobalScope) {
     wait_for_msg_type(self, 'init').then(async (data: any) => {
       const pkg = await import('../pkg');
-      await pkg.default(data.module, data.memory);
+      await pkg.default(data.module);
       postMessage({ type: 'inited' });
     });
 }

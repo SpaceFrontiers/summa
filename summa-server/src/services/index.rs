@@ -635,7 +635,7 @@ impl Index {
             .and_then(|query| query.query)
             .unwrap_or_else(|| proto::query::Query::All(proto::AllQuery {}));
         let collector_outputs = index_holder
-            .custom_search(
+            .custom_search_async(
                 &search_request.index_alias,
                 query,
                 search_request.collectors,
@@ -679,7 +679,7 @@ impl Index {
         }
 
         let collector_outputs = index_holder
-            .custom_search(
+            .custom_search_async(
                 &search_request.index_alias,
                 query,
                 search_request.collectors,

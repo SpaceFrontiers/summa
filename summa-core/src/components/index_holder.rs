@@ -13,7 +13,7 @@ use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
 use tantivy::space_usage::SearcherSpaceUsage;
-use tantivy::{Directory, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
+use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
 use tracing::{error, info, instrument, trace, warn};
 
@@ -375,7 +375,7 @@ impl IndexHolder {
     }
 
     /// Runs a query on the segment readers wrapped by the searcher asynchronously.
-    pub async fn search_in_segments(
+    pub async fn search_in_segments_async(
         &self,
         searcher: &Searcher,
         query: &dyn Query,
@@ -401,17 +401,38 @@ impl IndexHolder {
         collector.merge_fruits(fruits)
     }
 
-    pub async fn search(
+    pub fn search_in_segments(
+        &self,
+        searcher: &Searcher,
+        query: &dyn Query,
+        collector: &MultiCollector<'_>,
+        is_fieldnorms_scoring_enabled: Option<bool>,
+    ) -> tantivy::Result<MultiFruit> {
+        let enabled_scoring = match (is_fieldnorms_scoring_enabled, collector.requires_scoring()) {
+            (Some(true), true) | (None, true) => EnableScoring::enabled_from_searcher(searcher),
+            (Some(false), true) => EnableScoring::enabled_from_searcher_without_fieldnorms(searcher),
+            (_, false) => EnableScoring::disabled_from_searcher(searcher),
+        };
+        searcher.search_with_executor(query, collector, searcher.index().search_executor(), enabled_scoring)
+    }
+
+    pub fn search(&self, index_alias: &str, query: proto::query::Query, collectors: Vec<proto::Collector>) -> SummaResult<Vec<IntermediateExtractionResult>> {
+        self.custom_search(index_alias, query, collectors, None, None, None)
+    }
+
+    #[cfg(feature = "tokio-rt")]
+    pub async fn search_async(
         &self,
         index_alias: &str,
         query: proto::query::Query,
         collectors: Vec<proto::Collector>,
     ) -> SummaResult<Vec<IntermediateExtractionResult>> {
-        self.custom_search(index_alias, query, collectors, None, None, None).await
+        self.custom_search_async(index_alias, query, collectors, None, None, None).await
     }
 
+    #[cfg(feature = "tokio-rt")]
     /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
-    pub async fn custom_search(
+    pub async fn custom_search_async(
         &self,
         index_alias: &str,
         query: proto::query::Query,
@@ -429,13 +450,10 @@ impl IndexHolder {
         let store_cache = store_cache.unwrap_or(false);
 
         info!(action = "parse_query", index_name = ?self.index_name, query = ?query);
-        #[cfg(feature = "tokio-rt")]
         let parsed_query = {
             let query_parser = self.query_parser.clone();
             tokio::task::spawn_blocking(move || query_parser.parse_query(query)).await??
         };
-        #[cfg(not(feature = "tokio-rt"))]
-        let parsed_query = self.query_parser.parse_query(query)?;
 
         let caching_key = format!("{:?}|{:?}", parsed_query, is_fieldnorms_scoring_enabled);
 
@@ -505,8 +523,126 @@ impl IndexHolder {
             is_fieldnorms_scoring_enabled = is_fieldnorms_scoring_enabled,
         );
         let mut multi_fruit = self
-            .search_in_segments(&searcher, &parsed_query, &multi_collector, is_fieldnorms_scoring_enabled)
+            .search_in_segments_async(&searcher, &parsed_query, &multi_collector, is_fieldnorms_scoring_enabled)
             .await?;
+        if load_cache || store_cache {
+            let mut cache = self.collector_cache.lock();
+            for (((extractor, i), original_collector), adjusted_collector) in extractors
+                .into_iter()
+                .zip(missed_collector_indices.into_iter())
+                .zip(original_collectors.into_iter())
+                .zip(adjusted_collectors.into_iter())
+            {
+                let extracted_result = extractor.extract(&mut multi_fruit)?;
+                if CollectorCache::is_caching_enabled(&original_collector) {
+                    let adjusted_extracted_result = CollectorCache::adjust_result(&extracted_result, &original_collector);
+                    if store_cache {
+                        info!(action = "storing_collector_to_cache", index_name = ?self.index_name, caching_key = caching_key, collector = ?adjusted_collector);
+                        cache.put(&caching_key, &adjusted_collector, extracted_result);
+                    };
+                    collector_outputs[i] = Some(adjusted_extracted_result)
+                } else {
+                    collector_outputs[i] = Some(extracted_result)
+                }
+            }
+            drop(cache);
+        } else {
+            for (i, extractor) in extractors.into_iter().enumerate() {
+                collector_outputs[i] = Some(extractor.extract(&mut multi_fruit)?);
+            }
+        }
+        Ok(collector_outputs.into_iter().map(Option::unwrap).collect())
+    }
+
+    /// Search `query` in the `IndexHolder` and collecting `Fruit` with a list of `collectors`
+    pub fn custom_search(
+        &self,
+        index_alias: &str,
+        query: proto::query::Query,
+        collectors: Vec<proto::Collector>,
+        is_fieldnorms_scoring_enabled: Option<bool>,
+        load_cache: Option<bool>,
+        store_cache: Option<bool>,
+    ) -> SummaResult<Vec<IntermediateExtractionResult>> {
+        let collectors_len = collectors.len();
+        let mut missed_collector_indices = Vec::with_capacity(collectors_len);
+        let mut collector_outputs = vec![None; collectors_len];
+        let mut adjusted_collectors = Vec::with_capacity(collectors_len);
+        let mut original_collectors = Vec::with_capacity(collectors_len);
+        let load_cache = load_cache.unwrap_or(false);
+        let store_cache = store_cache.unwrap_or(false);
+
+        info!(action = "parse_query", index_name = ?self.index_name, query = ?query);
+        let parsed_query = self.query_parser.parse_query(query)?;
+
+        let caching_key = format!("{:?}|{:?}", parsed_query, is_fieldnorms_scoring_enabled);
+
+        if load_cache {
+            let mut cache = self.collector_cache.lock();
+            for (i, collector) in collectors.into_iter().enumerate() {
+                let is_caching_enabled = CollectorCache::is_caching_enabled(&collector);
+                if is_caching_enabled {
+                    let adjusted_collector = CollectorCache::adjust_collector(&collector);
+                    info!(action = "querying_cache", index_name = ?self.index_name, caching_key = caching_key, collector = ?adjusted_collector);
+                    match cache.get(&caching_key, &adjusted_collector, &collector) {
+                        Some(cached_value) => {
+                            info!(action = "match_collector_cache", index_name = ?self.index_name, caching_key = caching_key, collector = ?adjusted_collector);
+                            collector_outputs[i] = Some(cached_value)
+                        }
+                        None => {
+                            info!(action = "mismatch_collector_cache", index_name = ?self.index_name, caching_key = caching_key, collector = ?adjusted_collector);
+                            adjusted_collectors.push(adjusted_collector);
+                            original_collectors.push(collector);
+                            missed_collector_indices.push(i)
+                        }
+                    }
+                } else {
+                    info!(action = "skip_querying_cache", index_name = ?self.index_name, caching_key = caching_key, collector = ?collector);
+                    adjusted_collectors.push(collector.clone());
+                    original_collectors.push(collector);
+                    missed_collector_indices.push(i)
+                }
+            }
+            drop(cache);
+            info!(action = "queried_cache", index_name = ?self.index_name, collectors = collectors_len, cached_collectors = collectors_len - adjusted_collectors.len());
+        } else {
+            for collector in collectors.into_iter() {
+                original_collectors.push(collector.clone());
+                if store_cache && CollectorCache::is_caching_enabled(&collector) {
+                    adjusted_collectors.push(CollectorCache::adjust_collector(&collector));
+                } else {
+                    adjusted_collectors.push(collector);
+                }
+            }
+            missed_collector_indices = (0..collectors_len).collect();
+        }
+
+        if adjusted_collectors.is_empty() {
+            info!(action = "served_from_cache", index_name = ?self.index_name, query = ?parsed_query);
+            return Ok(collector_outputs.into_iter().map(Option::unwrap).collect());
+        }
+        let searcher = self.index_reader().searcher();
+        let mut multi_collector = MultiCollector::new();
+        let extractors: Vec<Box<dyn FruitExtractor>> = adjusted_collectors
+            .iter()
+            .map(|collector_proto| {
+                build_fruit_extractor(
+                    self,
+                    index_alias,
+                    searcher.clone(),
+                    collector_proto.clone(),
+                    &parsed_query,
+                    &mut multi_collector,
+                )
+            })
+            .collect::<SummaResult<_>>()?;
+        info!(
+            target: "query",
+            index_name = ?self.index_name,
+            parsed_query = ?parsed_query,
+            is_fieldnorms_scoring_enabled = is_fieldnorms_scoring_enabled,
+        );
+        let mut multi_fruit = self.search_in_segments(&searcher, &parsed_query, &multi_collector, is_fieldnorms_scoring_enabled)?;
         if load_cache || store_cache {
             let mut cache = self.collector_cache.lock();
             for (((extractor, i), original_collector), adjusted_collector) in extractors

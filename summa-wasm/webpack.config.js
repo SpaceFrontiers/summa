@@ -9,8 +9,6 @@ export default {
     entry:  {
         'main': './src/index.ts',
         'root-worker': './src/root-worker.ts',
-        'service-worker': './src/service-worker.ts',
-        'service-worker-register': './src/service-worker-register.ts',
         'search-service-grpc-web': './src/grpc-web/search_service.client',
     },
     target: "web",
@@ -42,7 +40,7 @@ export default {
         new WasmPackPlugin({
             crateDirectory: path.resolve(__dirname, 'crate'),
             args: '--log-level warn',
-            extraArgs: "--target web --mode normal",
+            extraArgs: "--target web --mode normal --release",
             forceMode: "production",
         })
     ]

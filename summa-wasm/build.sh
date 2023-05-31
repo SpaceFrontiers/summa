@@ -7,6 +7,6 @@ npx protoc \
   ../summa-proto/proto/*.proto
 
 
-npm run build
+PATH="/opt/homebrew/opt/llvm/bin/:$PATH" CC=/opt/homebrew/opt/llvm/bin/clang AR=/opt/homebrew/opt/llvm/bin/llvm-ar npm run build
 sed -i '' 's/document.baseURI ||//g' dist/root-worker.js
 sed -i '' 's/document.baseURI||//g' dist/root-worker.js
