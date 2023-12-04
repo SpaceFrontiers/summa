@@ -20,7 +20,41 @@ from .proto.search_service_pb2_grpc import SearchApiStub
 from .proto.utils_pb2 import Asc, Desc  # noqa
 
 
-def setup_metadata(session_id, request_id):
+def prepare_filters(filters: dict[str, list | tuple | str]) -> list[dict]:
+    all_extra_filters = []
+    for field_name, values in filters.items():
+        subqueries = []
+        for value in values:
+            if isinstance(value, (list, tuple)):
+                subqueries.append(
+                    {
+                        "query": {
+                            "match": {
+                                "value": f"{field_name}:+[{value[0]} TO {value[1]}]"
+                            }
+                        },
+                        "occur": "must",
+                    }
+                )
+            else:
+                subqueries.append(
+                    {
+                        "occur": "should",
+                        "query": {
+                            "match": {"value": f"{field_name}:{value}"},
+                        },
+                    }
+                )
+        all_extra_filters.append(
+            {
+                "query": {"boolean": {"subqueries": subqueries}},
+                "occur": "must",
+            }
+        )
+    return all_extra_filters
+
+
+def setup_metadata(session_id: str, request_id: str):
     metadata = []
     if session_id:
         metadata.append(('session-id', session_id))
@@ -29,7 +63,7 @@ def setup_metadata(session_id, request_id):
     return metadata
 
 
-def prepare_search_request(search_request):
+def prepare_search_request(search_request: dict | query_pb.SearchRequest) -> query_pb.SearchRequest:
     if isinstance(search_request, Dict):
         dict_search_request = search_request
         search_request = query_pb.SearchRequest()
@@ -37,7 +71,7 @@ def prepare_search_request(search_request):
     return search_request
 
 
-def prepare_query(query):
+def prepare_query(query: dict | str) -> query_pb.Query:
     if isinstance(query, Dict):
         dict_query = query
     elif isinstance(query, str):
@@ -473,12 +507,12 @@ class SummaClient(BaseGrpcClient):
 
     @expose
     async def documents(
-            self,
-            index_name: str,
-            query_filter: Optional[Union[dict, str]] = None,
-            fields: Optional[List[str]] = None,
-            request_id: Optional[str] = None,
-            session_id: Optional[str] = None,
+        self,
+        index_name: str,
+        query_filter: Optional[Union[dict, str]] = None,
+        fields: Optional[List[str]] = None,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         Retrieve all documents from the index
@@ -491,16 +525,14 @@ class SummaClient(BaseGrpcClient):
         # asyncfor is buggy: https://github.com/grpc/grpc/issues/32005
         if query_filter:
             query_filter = prepare_query(query_filter)
-        streaming_call = self.stubs['index_api'].documents(
+        async for document in self.stubs['index_api'].documents(
             index_service_pb.DocumentsRequest(
                 index_name=index_name,
                 query_filter=query_filter,
                 fields=fields,
             ),
             metadata=setup_metadata(session_id, request_id),
-        )
-        while True:
-            document = await asyncio.create_task(streaming_call.read())
+        ):
             if document == grpc.aio.EOF:
                 break
             yield document.document
