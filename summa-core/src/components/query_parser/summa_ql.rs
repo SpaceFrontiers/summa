@@ -562,7 +562,7 @@ impl QueryParser {
     fn parse_boundary_word(&self, field: Field, boundary_word: Pair<Rule>) -> Result<Bound<Term>, QueryParserError> {
         Ok(match boundary_word.as_rule() {
             Rule::star => Unbounded,
-            Rule::word => Included(self.compute_boundary_term(field, boundary_word.as_str())?),
+            Rule::signed_word => Included(self.compute_boundary_term(field, boundary_word.as_str())?),
             _ => unreachable!(),
         })
     }
