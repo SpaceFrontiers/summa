@@ -16,7 +16,7 @@ range = ${ "[" ~ WHITE_SPACE* ~ boundary_word ~ WHITE_SPACE+ ~ ^"to" ~ WHITE_SPA
 field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_" | ".")* }
 word = @{ wrapped_doi | ((LETTER | NUMBER) ~ (LETTER | NUMBER | "_" | "+" | "#" | "-" | "–" | "'")*) }
 
-boundary_word = _{ star | word }
+boundary_word = _{ star | ("-"? ~ word) }
 phrase_internals = { (!PEEK ~ ANY)* }
 phrase = ${ PUSH(quote) ~ phrase_internals? ~ (POP | EOI) ~ ("~" ~ slop)? }
 regex_internals = ${ (!PEEK ~ ANY)* }
