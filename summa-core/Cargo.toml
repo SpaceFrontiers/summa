@@ -14,7 +14,6 @@ doc = true
 
 [features]
 fs = ["tantivy/mmap", "tokio/fs"]
-hyper-external-request = ["hyper", "hyper-tls", "openssl", "openssl-src", "openssl-sys"]
 metrics = ["opentelemetry"]
 tokio-rt = ["tokio/rt"]
 
@@ -35,6 +34,7 @@ derive_builder = { workspace = true }
 downcast-rs = { workspace = true }
 fasteval2 = { workspace = true }
 futures = { workspace = true }
+http-body-util = { workspace = true }
 hyper = { workspace = true, optional = true }
 hyper-tls = { workspace = true, optional = true }
 instant = { workspace = true }

@@ -28,7 +28,6 @@ COPY summa-core summa-core
 COPY summa-embed-py summa-embed-py
 COPY summa-proto summa-proto
 COPY summa-server summa-server
-COPY summa-wasm summa-wasm
 COPY Cargo.toml Cargo.toml
 COPY rustfmt.toml rustfmt.toml
 

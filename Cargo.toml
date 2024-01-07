@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["examples", "summa-core", "summa-proto", "summa-embed-py", "summa-server", "summa-wasm"]
+members = ["examples", "summa-core", "summa-proto", "summa-embed-py", "summa-server"]
 
 [profile.release]
 lto = true
@@ -18,24 +18,26 @@ derive_builder = "0.20.0"
 downcast-rs = "1.2"
 fasteval2 = { version = "2.1.1", features = ["unsafe-vars"] }
 futures = "0.3"
-hyper = { version = "0.14", default-features = false, features = ["client", "http1", "http2", "tcp"] }
-hyper-tls = { version = "0.5.0", features = ["vendored"] }
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-tls = { version = "0.6", features = ["vendored"] }
+hyper-util = { version = "0.1", features = ["server-graceful"] }
 instant = { version = "0.1", default-features = false, features = [ "inaccurate", "wasm-bindgen" ] }
-itertools = "0.12.0"
-lazy_static = "1.4"
+itertools = "0.14"
+lazy_static = "1.5"
 libz-sys = { version = "1.1", features = ["static"] }
-lru = "0.12.1"
+lru = "0.12"
 oneshot = "0.1"
 openssl = { version = "=0.10.55", features = ["vendored"] }
 openssl-src = { version = "=111" }
 openssl-sys = { version = "=0.9.89" }
 parking_lot = { version = "0.12", features = ["send_guard"] }
-pest = "2.5"
-pest_derive = "2.5"
-prost = "0.12"
+pest = "2.7"
+pest_derive = "2.7"
+prost = "0.13"
 rand = { version = "0.8", features = ["small_rng"] }
-rayon = "1.6.1"
-regex = "1.8"
+rayon = "1.10"
+regex = "1.11"
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_bytes = "0.11"
 serde_cbor = "0.11"
@@ -47,8 +49,10 @@ take_mut = "0.2"
 tantivy = { package = "izihawa-tantivy", version = "0.22.6", default-features = false, features = ["quickwit", "sstable-termdict", "zstd-compression"] }
 tantivy-common = { package = "izihawa-tantivy-common", version = "0.7" }
 tantivy-query-grammar = { package = "izihawa-tantivy-query-grammar", version = "0.22" }
-thiserror = "1.0"
+thiserror = "2.0"
 time = { version = "0.3", features = ["serde-well-known", "wasm-bindgen"] }
-tokio = { version = "1.35.1", default-features = false }
+tokio = { version = "1.43.0", default-features = false }
+tonic = { version = "0.12", features = ["gzip"] }
+tonic-reflection = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

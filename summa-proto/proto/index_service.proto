@@ -53,11 +53,6 @@ message MergePolicy {
 // Attach file engine request
 message AttachFileEngineRequest {}
 
-// Attach remote engine request
-message AttachRemoteEngineRequest {
-  RemoteEngineConfig config = 1;
-}
-
 // Attach index request
 message AttachIndexRequest {
   // Index name for attaching
@@ -65,7 +60,6 @@ message AttachIndexRequest {
   // Attach index engine request
   oneof index_engine {
     AttachFileEngineRequest file = 2;
-    AttachRemoteEngineRequest remote = 3;
   }
   MergePolicy merge_policy = 10;
   QueryParserConfig query_parser_config = 11;
@@ -319,20 +313,6 @@ message CacheConfig {
   uint64 cache_size = 1;
 }
 
-// Remote HTTP engine config
-message RemoteEngineConfig {
-  // Which method should be used to request remote endpoint
-  string method = 1;
-  // URL template which will be used to generate real URL by variables substitution
-  string url_template = 2;
-  // Headers template which will be used to generate real URL by variables substitution
-  map<string, string> headers_template = 3;
-  // Description of the cache for the engine
-  CacheConfig cache_config = 4;
-  // Timeout for the request
-  optional uint32 timeout_ms = 5;
-}
-
 // Merge policy for implementing [LogMergePolicy](https://docs.rs/tantivy/latest/tantivy/merge_policy/struct.LogMergePolicy.html)
 message LogMergePolicy {
   // Set if once merged segment should be left intact
@@ -349,7 +329,6 @@ message IndexEngineConfig {
   oneof config {
     FileEngineConfig file = 1;
     MemoryEngineConfig memory = 2;
-    RemoteEngineConfig remote = 3;
   }
   // Merge policy
   MergePolicy merge_policy = 10;

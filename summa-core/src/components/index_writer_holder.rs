@@ -316,7 +316,7 @@ impl IndexWriterHolder {
         let unique_terms: Vec<Term> = self
             .unique_fields
             .iter()
-            .map(|(unique_field, full_path)| {
+            .flat_map(|(unique_field, full_path)| {
                 document.get_all(*unique_field).map(|value| match value {
                     OwnedValue::Str(s) => Some(Ok(vec![Term::from_field_text(*unique_field, s)])),
                     OwnedValue::Object(i) => i.get(full_path).map(|value| Ok(cast_to_term(unique_field, full_path, value))),
@@ -330,7 +330,6 @@ impl IndexWriterHolder {
                     }
                 })
             })
-            .flatten()
             .flatten()
             .collect::<SummaResult<Vec<_>>>()?
             .into_iter()

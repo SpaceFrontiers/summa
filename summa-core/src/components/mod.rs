@@ -143,7 +143,7 @@ pub mod test_utils {
             .collect()
     }
 
-    pub fn generate_documents_with_doc_id_gen_and_rng<'a>(doc_id_gen: AtomicI64, rng: &mut SmallRng, schema: &'a Schema, n: usize) -> Vec<String> {
+    pub fn generate_documents_with_doc_id_gen_and_rng(doc_id_gen: AtomicI64, rng: &mut SmallRng, schema: &Schema, n: usize) -> Vec<String> {
         (0..n)
             .map(|_| {
                 generate_document(

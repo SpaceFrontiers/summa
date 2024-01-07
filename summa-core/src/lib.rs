@@ -23,8 +23,7 @@ pub mod components;
 pub mod configs;
 pub mod directories;
 pub mod errors;
-#[cfg(feature = "hyper-external-request")]
-pub mod hyper_external_request;
+
 pub mod metrics;
 pub mod page_rank;
 pub mod proto_traits;

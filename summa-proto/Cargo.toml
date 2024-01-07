@@ -24,9 +24,9 @@ protoc-bin-vendored = "3.0.0"
 tonic-build = { version = "0.10", default-features = false, features = ["prost", "transport"], optional = true }
 
 [dependencies]
-prost = "0.12"
-prost-types = "0.12"
+prost = "0.13"
+prost-types = "0.13"
 serde = { workspace = true }
-tonic = { version = "0.10", features = ["gzip"], optional = true }
-tonic-build = { version = "0.10", default-features = false, features = ["prost", "transport"], optional = true }
-tonic-reflection = { version = "0.10", optional = true }
+tonic = { workspace = true, features = ["gzip"], optional = true }
+tonic-build = { version = "0.12", default-features = false, features = ["prost", "transport"], optional = true }
+tonic-reflection = { workspace = true, optional = true }

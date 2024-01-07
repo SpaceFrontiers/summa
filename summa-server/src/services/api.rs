@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_broadcast::Receiver;
 use futures_util::future::try_join_all;
+use http_body_util::combinators::UnsyncBoxBody;
 use hyper::header::{HeaderName, HeaderValue};
 use proto::consumer_api_server::ConsumerApiServer;
 use proto::index_api_server::IndexApiServer;
@@ -38,7 +39,7 @@ pub struct Api {
 }
 
 impl Api {
-    fn on_request(request: &hyper::Request<hyper::Body>, _span: &Span) {
+    fn on_request(request: &hyper::Request<UnsyncBoxBody<bytes::Bytes, tonic::Status>>, _span: &Span) {
         info!(path = ?request.uri().path());
     }
     fn on_response<T>(response: &hyper::Response<T>, duration: Duration, _span: &Span) {
@@ -48,7 +49,7 @@ impl Api {
         warn!(error = ?error, duration = ?duration);
     }
 
-    fn set_span(request: &hyper::Request<hyper::Body>) -> Span {
+    fn set_span(request: &hyper::Request<UnsyncBoxBody<bytes::Bytes, tonic::Status>>) -> Span {
         info_span!(
             "request",
             request_id = ?request.headers().get("request-id").expect("request-id must be set"),
@@ -84,7 +85,7 @@ impl Api {
         let grpc_reflection_service = tonic_reflection::server::Builder::configure()
             .include_reflection_service(false)
             .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
-            .build()
+            .build_v1()
             .expect("cannot build grpc server");
         let api_config = self.server_config_holder.read().await.get().api.clone();
 

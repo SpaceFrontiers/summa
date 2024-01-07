@@ -9,13 +9,12 @@ use serde::Deserialize;
 use summa_proto::proto;
 use summa_proto::proto::IndexAttributes;
 use tantivy::collector::{Collector, MultiCollector, MultiFruit};
-use tantivy::directory::OwnedBytes;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::schema::{Field, Schema};
 use tantivy::space_usage::SearcherSpaceUsage;
 use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{info, instrument, trace, warn};
 
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, ProtoQueryParser};
@@ -24,7 +23,6 @@ use crate::components::fruit_extractors::IntermediateExtractionResult;
 use crate::components::segment_attributes::SegmentAttributesMergerImpl;
 use crate::components::{IndexWriterHolder, SummaDocument};
 use crate::configs::ConfigProxy;
-use crate::directories::{CachingDirectory, ExternalRequest, ExternalRequestGenerator, FileStats, HotDirectory, NetworkDirectory, StaticDirectoryCache};
 use crate::errors::{SummaResult, ValidationError};
 use crate::proto_traits::Wrapper;
 use crate::Error;
@@ -58,19 +56,6 @@ impl PartialEq<Self> for IndexHolder {
 #[derive(Deserialize)]
 struct LightMeta {
     pub opstamp: Opstamp,
-}
-
-pub async fn read_opstamp<D: Directory>(directory: &D) -> SummaResult<Opstamp> {
-    let meta = directory.atomic_read_async(Path::new("meta.json")).await.map_err(|e| Error::Anyhow(e.into()))?;
-    let meta_string = String::from_utf8(meta).map_err(|e| Error::Anyhow(e.into()))?;
-    let meta_json: LightMeta = match serde_json::from_str(&meta_string) {
-        Ok(meta_json) => meta_json,
-        Err(e) => {
-            error!(action = "invalid_json", json = meta_string);
-            Err(e)?
-        }
-    };
-    Ok(meta_json.opstamp)
 }
 
 impl Debug for IndexHolder {
@@ -107,39 +92,6 @@ pub async fn cleanup_index(index_engine_config: proto::IndexEngineConfig) -> Sum
         _ => (),
     };
     Ok(())
-}
-
-fn wrap_with_caches<D: Directory>(
-    directory: D,
-    hotcache_bytes: Option<OwnedBytes>,
-    cache_config: Option<proto::CacheConfig>,
-    opstamp: Opstamp,
-) -> SummaResult<Box<dyn Directory>> {
-    let static_cache = hotcache_bytes
-        .map(|hotcache_bytes| StaticDirectoryCache::open(hotcache_bytes, opstamp))
-        .transpose()?;
-    info!(action = "opened_static_cache", static_cache = ?static_cache);
-    let file_lengths = static_cache
-        .as_ref()
-        .map(|static_cache| static_cache.file_lengths().clone())
-        .unwrap_or_default();
-
-    info!(action = "read_file_lengths", file_lengths = ?file_lengths);
-    let file_stats = FileStats::from_file_lengths(file_lengths);
-    let next_directory = if let Some(cache_config) = cache_config {
-        Box::new(CachingDirectory::bounded(Arc::new(directory), cache_config.cache_size as usize, file_stats)) as Box<dyn Directory>
-    } else {
-        Box::new(directory) as Box<dyn Directory>
-    };
-    info!(action = "wrapped_with_cache");
-    Ok(match static_cache {
-        Some(static_cache) => {
-            let hot_directory = HotDirectory::open(next_directory, static_cache);
-            info!(action = "opened_hotcache", hot_directory = ?hot_directory);
-            Box::new(hot_directory?)
-        }
-        None => next_directory,
-    })
 }
 
 impl IndexHolder {
@@ -235,39 +187,6 @@ impl IndexHolder {
         let index = Index::open_in_dir(&file_engine_config.path)?;
         info!(action = "opened", config = ?file_engine_config);
         Ok(index)
-    }
-
-    pub async fn open_remote_index<
-        TExternalRequest: ExternalRequest + 'static,
-        TExternalRequestGenerator: ExternalRequestGenerator<TExternalRequest> + 'static,
-    >(
-        remote_engine_config: proto::RemoteEngineConfig,
-        read_hotcache: bool,
-    ) -> SummaResult<Index> {
-        info!(action = "opening_network_directory", config = ?remote_engine_config, read_hotcache = read_hotcache);
-        let network_directory = NetworkDirectory::open(Box::new(TExternalRequestGenerator::new(remote_engine_config.clone())));
-        let opstamp = read_opstamp(&network_directory).await?;
-        let hotcache_bytes = match network_directory
-            .get_network_file_handle(format!("hotcache.{}.bin", opstamp).as_ref())
-            .do_read_bytes_async(None)
-            .await
-        {
-            Ok(hotcache_bytes) => {
-                if read_hotcache {
-                    info!(action = "read_hotcache", len = hotcache_bytes.len());
-                    Some(hotcache_bytes)
-                } else {
-                    warn!(action = "omit_hotcache");
-                    None
-                }
-            }
-            Err(error) => {
-                warn!(action = "error_hotcache", error = ?error);
-                None
-            }
-        };
-        let directory = wrap_with_caches(network_directory, hotcache_bytes, remote_engine_config.cache_config, opstamp)?;
-        Ok(Index::open_async(directory).await?)
     }
 
     /// Compression
