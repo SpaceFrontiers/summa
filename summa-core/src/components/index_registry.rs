@@ -8,7 +8,7 @@ use summa_proto::proto::collector_output::CollectorOutput;
 use summa_proto::proto::Score;
 use tantivy::DocAddress;
 use tokio::sync::RwLock;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 use super::IndexHolder;
 use crate::components::custom_serializer::NamedFieldDocument;
@@ -79,6 +79,7 @@ impl IndexRegistry {
     }
 
     pub async fn clear(self) {
+        debug!(action = "acquiring_index_holders_for_write");
         self.index_holders().write().await.clear();
     }
 
@@ -114,6 +115,7 @@ impl IndexRegistry {
     pub async fn add(&self, index_holder: IndexHolder) -> SummaResult<Handler<IndexHolder>> {
         let index_holder = OwningHandler::new(index_holder);
         let index_holder_handler = index_holder.handler();
+        debug!(action = "acquiring_index_holders_for_write");
         self.index_holders().write().await.insert(index_holder.index_name().to_string(), index_holder);
         info!(action = "added");
         Ok(index_holder_handler)
@@ -121,6 +123,7 @@ impl IndexRegistry {
 
     /// Deletes index from `IndexRegistry`
     pub async fn delete(&self, index_name: &str) {
+        debug!(action = "acquiring_index_holders_for_write");
         self.index_holders().write().await.remove(index_name);
     }
 

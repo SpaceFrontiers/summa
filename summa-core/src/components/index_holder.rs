@@ -14,7 +14,7 @@ use tantivy::schema::{Field, Schema};
 use tantivy::space_usage::SearcherSpaceUsage;
 use tantivy::{Directory, Executor, Index, IndexBuilder, IndexReader, Opstamp, ReloadPolicy, Searcher};
 use tokio::sync::RwLock;
-use tracing::{info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use super::SummaSegmentAttributes;
 use super::{build_fruit_extractor, default_tokenizers, FruitExtractor, ProtoQueryParser};
@@ -600,6 +600,7 @@ impl IndexHolder {
         };
         #[cfg(not(feature = "tokio-rt"))]
         let parsed_query = self.query_parser.parse_query(query)?;
+        debug!(action = "acquiring_index_writer_for_read");
         self.index_writer_holder()?.read().await.delete_by_query(parsed_query)
     }
 
@@ -608,12 +609,14 @@ impl IndexHolder {
     /// `IndexUpdater` bounds unbounded `SummaDocument` inside
     pub async fn index_document(&self, document_bytes: &[u8], skip_updated_at_modification: bool) -> SummaResult<()> {
         let document = SummaDocument::parse_json_bytes(&self.index.schema(), document_bytes, skip_updated_at_modification)?;
+        debug!(action = "acquiring_index_writer_for_read");
         self.index_writer_holder()?.read().await.index_document(document, self.conflict_strategy())
     }
 
     /// Index multiple documents at a time
     pub async fn index_bulk(&self, documents: &Vec<Vec<u8>>, conflict_strategy: Option<proto::ConflictStrategy>) -> SummaResult<(u64, u64)> {
         let (mut success_docs, mut failed_docs) = (0u64, 0u64);
+        debug!(action = "acquiring_index_writer_for_read");
         let index_writer_holder = self.index_writer_holder()?.read().await;
         let conflict_strategy = conflict_strategy.unwrap_or_else(|| self.conflict_strategy());
         for document in documents {

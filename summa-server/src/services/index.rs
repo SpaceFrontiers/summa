@@ -16,7 +16,7 @@ use summa_proto::proto;
 use tantivy::store::ZstdCompressor;
 use tantivy::{IndexBuilder, SegmentId};
 use tokio::sync::RwLock;
-use tracing::{error, info, info_span, instrument, warn, Instrument};
+use tracing::{debug, error, info, info_span, instrument, warn, Instrument};
 
 use crate::components::{ConsumerManager, PreparedConsumption};
 use crate::errors::SummaServerResult;
@@ -146,6 +146,7 @@ impl Index {
         for (consumer_name, consumer_config) in self.server_config.read().await.get().consumers.iter() {
             let index_holder = self.index_registry.get_index_holder(&consumer_config.index_name).await?;
             let prepared_consumption = PreparedConsumption::from_config(consumer_name, consumer_config)?;
+            debug!(action = "acquiring_consumer_manager_for_write");
             self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         }
         info!(action = "indices_ready");
@@ -327,6 +328,7 @@ impl Index {
     pub async fn delete_index(&self, delete_index_request: proto::DeleteIndexRequest) -> SummaServerResult<DeleteIndexResult> {
         let mut server_config = self.server_config.write().await;
         let aliases = server_config.get().core.get_index_aliases_for_index(&delete_index_request.index_name);
+        debug!(action = "acquiring_index_holders_for_write");
         match (
             self.index_registry
                 .index_holders()
@@ -377,6 +379,7 @@ impl Index {
         )?;
         let prepared_consumption = PreparedConsumption::from_config(&create_consumer_request.consumer_name, &consumer_config)?;
         prepared_consumption.on_create().await?;
+        debug!(action = "acquiring_consumer_manager_for_write");
         self.consumer_manager.write().await.start_consuming(&index_holder, prepared_consumption).await?;
         let mut server_config = self.server_config.write().await;
         server_config
@@ -413,6 +416,7 @@ impl Index {
         self.stop_threads().await?;
         self.should_terminate.store(true, Ordering::Relaxed);
         if !force {
+            debug!(action = "acquiring_consumer_manager_for_write");
             self.consumer_manager.write().await.stop().await?;
             for index_holder in self.index_registry.index_holders_cloned().await.values() {
                 self.commit(index_holder, false).await?;
@@ -430,6 +434,7 @@ impl Index {
     pub async fn commit_and_restart_consumption(&self, index_holder: &Handler<IndexHolder>, with_hotcache: bool) -> SummaServerResult<()> {
         let prepared_consumption = self.commit(index_holder, with_hotcache).await?;
         if let Some(prepared_consumption) = prepared_consumption {
+            debug!(action = "acquiring_consumer_manager_for_write");
             self.consumer_manager.write().await.start_consuming(index_holder, prepared_consumption).await?;
         }
         Ok(())
@@ -439,6 +444,7 @@ impl Index {
     pub async fn try_commit_and_restart_consumption(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<()> {
         let prepared_consumption = self.try_commit(index_holder).await?;
         if let Some(prepared_consumption) = prepared_consumption {
+            debug!(action = "acquiring_consumer_manager_for_write");
             self.consumer_manager.write().await.start_consuming(index_holder, prepared_consumption).await?;
         }
         Ok(())
@@ -447,7 +453,9 @@ impl Index {
     /// Commits all without restarting consuming threads
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn commit(&self, index_holder: &Handler<IndexHolder>, with_hotcache: bool) -> SummaServerResult<Option<PreparedConsumption>> {
+        debug!(action = "acquiring_consumer_manager_for_write");
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
+        debug!(action = "acquiring_index_writer_for_write");
         let mut index_writer = index_holder.index_writer_holder()?.clone().write_owned().await;
         let index_holder = index_holder.clone();
         let span = tracing::Span::current();
@@ -470,6 +478,7 @@ impl Index {
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn rollback(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
+        debug!(action = "acquiring_consumer_manager_for_write");
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.rollback())).await??;
@@ -480,6 +489,7 @@ impl Index {
     #[instrument(skip(self, index_holder), fields(index_name = ?index_holder.index_name()))]
     pub async fn try_commit(&self, index_holder: &Handler<IndexHolder>) -> SummaServerResult<Option<PreparedConsumption>> {
         let mut index_writer = index_holder.index_writer_holder()?.clone().try_write_owned()?;
+        debug!(action = "acquiring_consumer_manager_for_write");
         let stopped_consumption = self.consumer_manager.write().await.stop_consuming_for(index_holder).await?;
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || span.in_scope(|| index_writer.commit_and_prepare(false))).await??;
@@ -499,6 +509,7 @@ impl Index {
         let (shutdown_trigger, mut shutdown_tripwire) = async_broadcast::broadcast(1);
         let mut tick_task = tokio::time::interval(Duration::from_millis(interval_ms));
 
+        debug!(action = "acquiring_autocommit_thread_for_write");
         *self.autocommit_thread.write().await = Some(ThreadHandler::new(
             tokio::spawn(
                 async move {
@@ -542,6 +553,7 @@ impl Index {
         let (shutdown_trigger, mut shutdown_tripwire) = async_broadcast::broadcast(1);
         let mut tick_task = tokio::time::interval(Duration::from_millis(ttl_interval_ms));
 
+        debug!(action = "acquiring_service_thread_for_write");
         *self.service_thread.write().await = Some(ThreadHandler::new(
             tokio::spawn(
                 async move {
@@ -581,9 +593,11 @@ impl Index {
     /// Stops autocommitting thread
     #[instrument(skip(self))]
     pub async fn stop_threads(&mut self) -> SummaServerResult<()> {
+        debug!(action = "acquiring_autocommit_thread_for_write");
         if let Some(autocommit_thread) = self.autocommit_thread.write().await.take() {
             autocommit_thread.stop().await??;
         }
+        debug!(action = "acquiring_service_thread_for_write");
         if let Some(service_thread) = self.service_thread.write().await.take() {
             service_thread.stop().await??;
         }
