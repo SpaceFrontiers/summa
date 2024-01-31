@@ -65,7 +65,7 @@ fn create_writer(log_path: &Path, name: &str, guards: &mut Vec<WorkerGuard>) -> 
 
 pub fn default() -> Vec<WorkerGuard> {
     let env_filter = match std::env::var("RUST_LOG") {
-        Ok(value) => EnvFilter::new(format!("{ENV_FILTER},{REQUEST_ENV_FILTER},{value}")),
+        Ok(value) => EnvFilter::new(value),
         Err(_) => EnvFilter::new(format!("{ENV_FILTER},{REQUEST_ENV_FILTER}")),
     };
     let default_layer = fmt::layer().with_level(true).with_target(true).with_thread_names(true).with_filter(env_filter);
