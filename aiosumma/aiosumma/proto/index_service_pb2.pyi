@@ -48,25 +48,17 @@ class AttachFileEngineRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
 
-class AttachRemoteEngineRequest(_message.Message):
-    __slots__ = ("config",)
-    CONFIG_FIELD_NUMBER: _ClassVar[int]
-    config: RemoteEngineConfig
-    def __init__(self, config: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ...) -> None: ...
-
 class AttachIndexRequest(_message.Message):
-    __slots__ = ("index_name", "file", "remote", "merge_policy", "query_parser_config")
+    __slots__ = ("index_name", "file", "merge_policy", "query_parser_config")
     INDEX_NAME_FIELD_NUMBER: _ClassVar[int]
     FILE_FIELD_NUMBER: _ClassVar[int]
-    REMOTE_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     QUERY_PARSER_CONFIG_FIELD_NUMBER: _ClassVar[int]
     index_name: str
     file: AttachFileEngineRequest
-    remote: AttachRemoteEngineRequest
     merge_policy: MergePolicy
     query_parser_config: _query_pb2.QueryParserConfig
-    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., remote: _Optional[_Union[AttachRemoteEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ...) -> None: ...
+    def __init__(self, index_name: _Optional[str] = ..., file: _Optional[_Union[AttachFileEngineRequest, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ...) -> None: ...
 
 class AttachIndexResponse(_message.Message):
     __slots__ = ("index",)
@@ -389,27 +381,6 @@ class CacheConfig(_message.Message):
     cache_size: int
     def __init__(self, cache_size: _Optional[int] = ...) -> None: ...
 
-class RemoteEngineConfig(_message.Message):
-    __slots__ = ("method", "url_template", "headers_template", "cache_config", "timeout_ms")
-    class HeadersTemplateEntry(_message.Message):
-        __slots__ = ("key", "value")
-        KEY_FIELD_NUMBER: _ClassVar[int]
-        VALUE_FIELD_NUMBER: _ClassVar[int]
-        key: str
-        value: str
-        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
-    METHOD_FIELD_NUMBER: _ClassVar[int]
-    URL_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
-    HEADERS_TEMPLATE_FIELD_NUMBER: _ClassVar[int]
-    CACHE_CONFIG_FIELD_NUMBER: _ClassVar[int]
-    TIMEOUT_MS_FIELD_NUMBER: _ClassVar[int]
-    method: str
-    url_template: str
-    headers_template: _containers.ScalarMap[str, str]
-    cache_config: CacheConfig
-    timeout_ms: int
-    def __init__(self, method: _Optional[str] = ..., url_template: _Optional[str] = ..., headers_template: _Optional[_Mapping[str, str]] = ..., cache_config: _Optional[_Union[CacheConfig, _Mapping]] = ..., timeout_ms: _Optional[int] = ...) -> None: ...
-
 class LogMergePolicy(_message.Message):
     __slots__ = ("is_frozen",)
     IS_FROZEN_FIELD_NUMBER: _ClassVar[int]
@@ -423,18 +394,16 @@ class TemporalMergePolicy(_message.Message):
     def __init__(self, merge_older_then_secs: _Optional[int] = ...) -> None: ...
 
 class IndexEngineConfig(_message.Message):
-    __slots__ = ("file", "memory", "remote", "merge_policy", "query_parser_config")
+    __slots__ = ("file", "memory", "merge_policy", "query_parser_config")
     FILE_FIELD_NUMBER: _ClassVar[int]
     MEMORY_FIELD_NUMBER: _ClassVar[int]
-    REMOTE_FIELD_NUMBER: _ClassVar[int]
     MERGE_POLICY_FIELD_NUMBER: _ClassVar[int]
     QUERY_PARSER_CONFIG_FIELD_NUMBER: _ClassVar[int]
     file: FileEngineConfig
     memory: MemoryEngineConfig
-    remote: RemoteEngineConfig
     merge_policy: MergePolicy
     query_parser_config: _query_pb2.QueryParserConfig
-    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., remote: _Optional[_Union[RemoteEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ...) -> None: ...
+    def __init__(self, file: _Optional[_Union[FileEngineConfig, _Mapping]] = ..., memory: _Optional[_Union[MemoryEngineConfig, _Mapping]] = ..., merge_policy: _Optional[_Union[MergePolicy, _Mapping]] = ..., query_parser_config: _Optional[_Union[_query_pb2.QueryParserConfig, _Mapping]] = ...) -> None: ...
 
 class IndexDescription(_message.Message):
     __slots__ = ("index_name", "index_aliases", "index_engine", "num_docs", "compression", "index_attributes")

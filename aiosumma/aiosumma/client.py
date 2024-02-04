@@ -772,13 +772,20 @@ class SummaClient(BaseGrpcClient):
             metadata=setup_metadata(session_id, request_id),
         )
 
-    async def get_one_by_field_value(self, index_alias, field, value):
+    async def get_one_by_field_value(
+        self,
+        index_alias,
+        field,
+        value,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
         response = await self.search({
             'index_alias': index_alias,
             'query': {'term': {'field': field, 'value': value}},
             'collectors': [{'top_docs': {'limit': 1}}],
             'is_fieldnorms_scoring_enabled': False,
-        })
+        }, request_id=request_id, session_id=session_id)
         if response.collector_outputs[0].documents.scored_documents:
             return json.loads(response.collector_outputs[0].documents.scored_documents[0].document)
 

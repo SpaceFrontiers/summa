@@ -133,6 +133,7 @@ impl Api {
         let grpc_router = Server::builder()
             .layer(layer)
             .max_frame_size(api_config.max_frame_size_bytes.map(|x| x / 256))
+            .http2_keepalive_interval(Some(Duration::from_secs(api_config.keep_alive_timeout_seconds)))
             .add_service(grpc_reflection_service)
             .add_service(consumer_service.clone())
             .add_service(index_service.clone())

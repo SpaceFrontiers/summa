@@ -14,6 +14,8 @@ pub struct Config {
     pub concurrency_limit: usize,
     /// Maximum number of buffered requests
     pub buffer: usize,
+    /// Maximum number of in-flight requests
+    pub keep_alive_timeout_seconds: u64,
 }
 
 impl Default for Config {
@@ -22,8 +24,9 @@ impl Default for Config {
             grpc_endpoint: "127.0.0.1:8082".to_string(),
             http_endpoint: None,
             max_frame_size_bytes: Some(40 * 1024 * 1024),
-            concurrency_limit: 10,
-            buffer: 100,
+            concurrency_limit: 128,
+            buffer: 1024,
+            keep_alive_timeout_seconds: 5,
         }
     }
 }
