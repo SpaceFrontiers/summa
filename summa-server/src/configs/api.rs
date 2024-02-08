@@ -16,6 +16,8 @@ pub struct Config {
     pub buffer: usize,
     /// Maximum number of in-flight requests
     pub keep_alive_timeout_seconds: u64,
+    pub max_connection_age_seconds: u64,
+    pub max_connection_age_grace_seconds: u64,
 }
 
 impl Default for Config {
@@ -27,6 +29,8 @@ impl Default for Config {
             concurrency_limit: 128,
             buffer: 1024,
             keep_alive_timeout_seconds: 5,
+            max_connection_age_seconds: 60,
+            max_connection_age_grace_seconds: 300,
         }
     }
 }
