@@ -67,8 +67,8 @@ impl Metrics {
         let empty_header_value = HeaderValue::from_static("");
         let _span = info_span!(
             "request",
-            request_id = ?request.headers().get("request-id").unwrap_or(&empty_header_value),
-            session_id = ?request.headers().get("session-id").unwrap_or(&empty_header_value),
+            request_id = ?request.headers().get("x-request-id").unwrap_or(&empty_header_value),
+            session_id = ?request.headers().get("x-session-id").unwrap_or(&empty_header_value),
         );
         info!(path = ?request.uri().path());
         let response = match request.method() {

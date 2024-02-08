@@ -57,9 +57,9 @@ def prepare_filters(filters: dict[str, list | tuple | str]) -> list[dict]:
 def setup_metadata(session_id: str, request_id: str):
     metadata = []
     if session_id:
-        metadata.append(('session-id', session_id))
+        metadata.append(('x-session-id', session_id))
     if request_id:
-        metadata.append(('request-id', request_id))
+        metadata.append(('x-request-id', request_id))
     return metadata
 
 

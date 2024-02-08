@@ -52,8 +52,7 @@ impl Api {
     fn set_span(request: &hyper::Request<UnsyncBoxBody<bytes::Bytes, tonic::Status>>) -> Span {
         info_span!(
             "request",
-            request_id = ?request.headers().get("request-id").expect("request-id must be set"),
-            session_id = ?request.headers().get("session-id").expect("session-id must be set"),
+            request_id = ?request.headers().get("x-request-id").expect("x-request-id must be set"),
         )
     }
 
