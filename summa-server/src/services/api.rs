@@ -134,7 +134,7 @@ impl Api {
         }
 
         let grpc_router = Server::builder()
-            .layer(layer)
+            .layer(layer.clone())
             .max_frame_size(api_config.max_frame_size_bytes.map(|x| x / 256))
             .http2_keepalive_interval(Some(Duration::from_secs(api_config.keep_alive_timeout_seconds)))
             .max_connection_age(Duration::from_secs(api_config.max_connection_age_seconds))
@@ -155,12 +155,13 @@ impl Api {
                 })
                 .instrument(info_span!(parent: None, "lifecycle", mode = "grpc"))
                 .await?;
-            info!(action = "terminated");
+            info!(action = "terminated", mode = "grpc");
             Ok(())
         }));
 
         if let Some(http_endpoint) = api_config.http_endpoint {
             let http_router = Server::builder()
+                .layer(layer)
                 .accept_http1(true)
                 .add_service(tonic_web::enable(search_service))
                 .add_service(tonic_web::enable(public_service));
@@ -175,7 +176,7 @@ impl Api {
                     })
                     .instrument(info_span!(parent: None, "lifecycle", mode = "http"))
                     .await?;
-                info!(action = "terminated");
+                info!(action = "terminated", mode = "http");
                 Ok(())
             }));
         }
