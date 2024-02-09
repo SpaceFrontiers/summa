@@ -104,6 +104,8 @@ impl Api {
             .into_inner();
 
         let consumer_service = ConsumerApiServer::new(consumer_api);
+        let reflection_service = ReflectionApiServer::new(reflection_api);
+
         let mut index_service = IndexApiServer::new(index_api)
             .accept_compressed(CompressionEncoding::Gzip)
             .send_compressed(CompressionEncoding::Gzip);
@@ -112,7 +114,7 @@ impl Api {
                 .max_decoding_message_size(max_from_size_bytes as usize)
                 .max_encoding_message_size(max_from_size_bytes as usize);
         }
-        let reflection_service = ReflectionApiServer::new(reflection_api);
+
         let mut search_service = SearchApiServer::new(search_api)
             .accept_compressed(CompressionEncoding::Gzip)
             .send_compressed(CompressionEncoding::Gzip);
@@ -125,6 +127,11 @@ impl Api {
         let public_service = PublicApiServer::new(public_api)
             .accept_compressed(CompressionEncoding::Gzip)
             .send_compressed(CompressionEncoding::Gzip);
+        if let Some(max_from_size_bytes) = api_config.max_frame_size_bytes {
+            search_service = search_service
+                .max_decoding_message_size(max_from_size_bytes as usize)
+                .max_encoding_message_size(max_from_size_bytes as usize);
+        }
 
         let grpc_router = Server::builder()
             .layer(layer)
