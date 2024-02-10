@@ -52,7 +52,7 @@ impl Api {
     fn set_span(request: &hyper::Request<UnsyncBoxBody<bytes::Bytes, tonic::Status>>) -> Span {
         info_span!(
             "request",
-            request_id = ?request.headers().get("x-request-id").expect("x-request-id must be set"),
+            // request_id = ?request.headers().get("x-request-id").expect("x-request-id must be set"),
         )
     }
 
@@ -88,20 +88,20 @@ impl Api {
             .expect("cannot build grpc server");
         let api_config = self.server_config_holder.read().await.get().api.clone();
 
-        let layer = ServiceBuilder::new()
-            .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("x-request-id"), |_: &_| {
-                Some(HeaderValue::from_str(&generate_request_id()).expect("invalid generated request id"))
-            }))
-            .concurrency_limit(api_config.concurrency_limit)
-            .buffer(api_config.buffer)
-            .layer(
-                TraceLayer::new_for_grpc()
-                    .make_span_with(Api::set_span)
-                    .on_request(Api::on_request)
-                    .on_response(Api::on_response)
-                    .on_failure(Api::on_failure),
-            )
-            .into_inner();
+        // let layer = ServiceBuilder::new()
+        //     .layer(SetRequestHeaderLayer::if_not_present(HeaderName::from_static("x-request-id"), |_: &_| {
+        //         Some(HeaderValue::from_str(&generate_request_id()).expect("invalid generated request id"))
+        //     }))
+        //     .concurrency_limit(api_config.concurrency_limit)
+        //     .buffer(api_config.buffer)
+        //     .layer(
+        //         TraceLayer::new_for_grpc()
+        //             .make_span_with(Api::set_span)
+        //             .on_request(Api::on_request)
+        //             .on_response(Api::on_response)
+        //             .on_failure(Api::on_failure),
+        //     )
+        //     .into_inner();
 
         let consumer_service = ConsumerApiServer::new(consumer_api);
         let reflection_service = ReflectionApiServer::new(reflection_api);
@@ -134,7 +134,7 @@ impl Api {
         }
 
         let grpc_router = Server::builder()
-            .layer(layer.clone())
+            //.layer(layer.clone())
             .max_frame_size(api_config.max_frame_size_bytes.map(|x| x / 256))
             .http2_keepalive_interval(Some(Duration::from_secs(api_config.keep_alive_timeout_seconds)))
             .max_connection_age(Duration::from_secs(api_config.max_connection_age_seconds))
@@ -161,7 +161,7 @@ impl Api {
 
         if let Some(http_endpoint) = api_config.http_endpoint {
             let http_router = Server::builder()
-                .layer(layer)
+                // .layer(layer)
                 .accept_http1(true)
                 .add_service(tonic_web::enable(search_service))
                 .add_service(tonic_web::enable(public_service));
