@@ -75,8 +75,6 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
 tonic-web = { version = "0.12" }
-tower = { version = "0.5", features = ["buffer", "limit"] }
-tower-http = { version = "0.6", features = ["set-header", "trace"] }
 tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-futures = "0.2"
