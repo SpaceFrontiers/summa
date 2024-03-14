@@ -372,7 +372,8 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 8] {
         .filter(StopWordFilter::remove(STOP_WORDS.map(String::from).to_vec()))
         .build();
     let whitespace_tokenizer = TextAnalyzer::builder(WhitespaceTokenizer::default()).filter(LowerCaser).build();
-    let raw_tokenizer = TextAnalyzer::builder(RawTokenizer::default()).filter(LowerCaser).build();
+    let raw_tokenizer = RawTokenizer::default();
+    let raw_tokenizer_ci = TextAnalyzer::builder(RawTokenizer::default()).filter(LowerCaser).build();
     [
         ("summa".to_owned(), summa_tokenizer),
         ("summa_dict".to_owned(), summa_dict_tokenizer),
@@ -381,6 +382,7 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 8] {
         ("summa_without_stop_words".to_owned(), summa_without_stop_words_tokenizer),
         ("default".to_owned(), default_tokenizer),
         ("raw".to_owned(), raw_tokenizer),
+        ("raw_ci".to_owned(), raw_tokenizer_ci),
         ("whitespace".to_owned(), whitespace_tokenizer),
     ]
 }
