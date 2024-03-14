@@ -331,7 +331,7 @@ pub const STOP_WORDS: [&str; 321] = [
 ];
 
 /// Instantiate default tokenizers
-pub fn default_tokenizers() -> [(String, TextAnalyzer); 8] {
+pub fn default_tokenizers() -> [(String, TextAnalyzer); 9] {
     let summa_tokenizer = TextAnalyzer::builder(Tokenizer)
         .filter(RemoveLongFilter::limit(100))
         .filter(LowerCaser)

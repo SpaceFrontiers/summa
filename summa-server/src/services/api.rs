@@ -12,12 +12,11 @@ use proto::public_api_server::PublicApiServer;
 use proto::reflection_api_server::ReflectionApiServer;
 use proto::search_api_server::SearchApiServer;
 use summa_core::configs::ConfigProxy;
-use summa_core::utils::random::generate_request_id;
 use summa_proto::proto;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Server;
-use tracing::{info, info_span, instrument, warn, Instrument, Span};
+use tracing::{info, info_span, instrument, Instrument, Span};
 
 use crate::apis::consumer::ConsumerApiImpl;
 use crate::apis::index::IndexApiImpl;
