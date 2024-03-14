@@ -381,7 +381,7 @@ pub fn default_tokenizers() -> [(String, TextAnalyzer); 8] {
         ("summa_mmd".to_owned(), summa_mmd_tokenizer),
         ("summa_without_stop_words".to_owned(), summa_without_stop_words_tokenizer),
         ("default".to_owned(), default_tokenizer),
-        ("raw".to_owned(), raw_tokenizer),
+        ("raw".to_owned(), raw_tokenizer.into()),
         ("raw_ci".to_owned(), raw_tokenizer_ci),
         ("whitespace".to_owned(), whitespace_tokenizer),
     ]
