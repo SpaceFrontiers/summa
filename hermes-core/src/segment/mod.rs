@@ -1,5 +1,6 @@
 #[cfg(feature = "native")]
 mod builder;
+#[cfg(feature = "native")]
 mod merger;
 mod reader;
 mod store;
@@ -7,6 +8,7 @@ mod types;
 
 #[cfg(feature = "native")]
 pub use builder::{SegmentBuilder, SegmentBuilderConfig};
+#[cfg(feature = "native")]
 pub use merger::{SegmentMerger, delete_segment};
 pub use reader::{AsyncSegmentReader, SegmentReader};
 pub use store::*;
