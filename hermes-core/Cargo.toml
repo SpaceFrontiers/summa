@@ -29,6 +29,7 @@ rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
 log = "0.4"
 rust-stemmers = { workspace = true }
+stop-words = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }
 base64 = { workspace = true }
@@ -36,6 +37,11 @@ regex = { workspace = true }
 rand = { workspace = true }
 reqwest = { version = "0.12", default-features = false, optional = true }
 instant = { version = "0.1", features = ["wasm-bindgen"], optional = true }
+bumpalo = { workspace = true, optional = true }
+lasso = { workspace = true, optional = true }
+hashbrown = { workspace = true }
+memmap2 = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
@@ -47,7 +53,7 @@ tokio = { workspace = true }
 
 [features]
 default = ["native"]
-native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon"]
+native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid"]
 wasm = []
 http = ["dep:reqwest", "dep:instant"]
 

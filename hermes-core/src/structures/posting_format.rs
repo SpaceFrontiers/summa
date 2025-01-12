@@ -6,8 +6,10 @@
 //! - **Partitioned EF**: Best compression for large lists (>20K)
 //! - **Roaring**: Bitmap-based for very frequent terms (>1% of corpus), fastest iteration
 //!
-//! Note: VerticalBP128 and plain Elias-Fano are kept for backwards compatibility but
-//! are no longer selected by the automatic format selection algorithm.
+//! Supports three optimization modes:
+//! - **Adaptive**: Balanced compression/speed (default, zstd level 7)
+//! - **SizeOptimized**: Best compression ratio (OptP4D + zstd level 22)
+//! - **PerformanceOptimized**: Fastest decoding (Roaring + zstd level 3)
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
@@ -24,6 +26,46 @@ pub const INLINE_THRESHOLD: usize = 3;
 pub const ROARING_THRESHOLD_RATIO: f32 = 0.01; // 1% of corpus
 /// Threshold for using Partitioned EF (best compression)
 pub const PARTITIONED_EF_THRESHOLD: usize = 20_000;
+
+/// Index optimization mode for balancing compression ratio vs speed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexOptimization {
+    /// Balanced compression and speed (zstd level 7)
+    /// Uses adaptive format selection based on posting list characteristics
+    #[default]
+    Adaptive,
+    /// Optimize for smallest index size (zstd level 22)
+    /// Prefers OptP4D for best compression ratio (optimal bit-width + patched exceptions)
+    SizeOptimized,
+    /// Optimize for fastest query performance (zstd level 3)
+    /// Prefers Roaring bitmaps for fastest iteration
+    PerformanceOptimized,
+}
+
+impl IndexOptimization {
+    /// Get the zstd compression level for this optimization mode
+    pub fn zstd_level(&self) -> i32 {
+        match self {
+            IndexOptimization::Adaptive => 7,
+            IndexOptimization::SizeOptimized => 22,
+            IndexOptimization::PerformanceOptimized => 3,
+        }
+    }
+
+    /// Parse from string (for CLI)
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "adaptive" | "balanced" | "default" => Some(IndexOptimization::Adaptive),
+            "size" | "size-optimized" | "small" | "compact" => {
+                Some(IndexOptimization::SizeOptimized)
+            }
+            "performance" | "perf" | "fast" | "speed" => {
+                Some(IndexOptimization::PerformanceOptimized)
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Format tag bytes for serialization
 const FORMAT_HORIZONTAL_BP128: u8 = 0;
@@ -51,29 +93,53 @@ pub enum PostingFormat {
 }
 
 impl PostingFormat {
-    /// Select optimal format based on posting list characteristics
+    /// Select optimal format based on posting list characteristics and optimization mode
     ///
-    /// Simplified format selection (based on benchmarks):
-    /// - Very frequent (>1% of corpus, >20K docs): Roaring (fastest iteration, set ops)
-    /// - Large (≥20K docs): Partitioned EF (best compression 15.9%)
-    /// - All other lists: HorizontalBP128 (fastest encoding + decoding with SIMD, optimal compression)
-    ///
-    /// Note: HorizontalBP128 now has SIMD optimizations (NEON/SSE) and outperforms SIMD-BP128:
-    /// - Faster encoding (horizontal layout vs vertical bit-interleaved)
-    /// - Faster decoding with 64-bit unaligned reads (236K vs 199K ints/μs)
-    /// - Same compression ratio
+    /// Format selection varies by optimization mode:
+    /// - **Adaptive**: Balanced selection based on list size and frequency
+    /// - **SizeOptimized**: Prefer PartitionedEF for best compression
+    /// - **PerformanceOptimized**: Prefer Roaring for fastest iteration
     pub fn select(doc_count: usize, total_docs: usize) -> Self {
+        Self::select_with_optimization(doc_count, total_docs, IndexOptimization::Adaptive)
+    }
+
+    /// Select format with explicit optimization mode
+    pub fn select_with_optimization(
+        doc_count: usize,
+        total_docs: usize,
+        optimization: IndexOptimization,
+    ) -> Self {
         let frequency_ratio = doc_count as f32 / total_docs.max(1) as f32;
 
-        if frequency_ratio >= ROARING_THRESHOLD_RATIO && doc_count >= PARTITIONED_EF_THRESHOLD {
-            // Very frequent term - use Roaring for fast intersections
-            PostingFormat::Roaring
-        } else if doc_count >= PARTITIONED_EF_THRESHOLD {
-            // Large posting list - use Partitioned EF for best compression
-            PostingFormat::PartitionedEF
-        } else {
-            // All other lists - use HorizontalBP128 (fastest encoding + decoding with SIMD)
-            PostingFormat::HorizontalBP128
+        match optimization {
+            IndexOptimization::Adaptive => {
+                // Balanced: use best format for each size range
+                if frequency_ratio >= ROARING_THRESHOLD_RATIO
+                    && doc_count >= PARTITIONED_EF_THRESHOLD
+                {
+                    PostingFormat::Roaring
+                } else if doc_count >= PARTITIONED_EF_THRESHOLD {
+                    PostingFormat::PartitionedEF
+                } else {
+                    PostingFormat::HorizontalBP128
+                }
+            }
+            IndexOptimization::SizeOptimized => {
+                // Size: prefer OptP4D for best compression (optimal bit-width + patched exceptions)
+                if doc_count >= 128 {
+                    PostingFormat::OptP4D
+                } else {
+                    PostingFormat::HorizontalBP128
+                }
+            }
+            IndexOptimization::PerformanceOptimized => {
+                // Performance: prefer Roaring for fastest iteration
+                if doc_count >= 64 {
+                    PostingFormat::Roaring
+                } else {
+                    PostingFormat::HorizontalBP128
+                }
+            }
         }
     }
 }

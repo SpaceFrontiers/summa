@@ -1,16 +1,19 @@
+#[cfg(feature = "native")]
 mod builder;
 mod merger;
 mod reader;
 mod store;
 mod types;
 
-pub use builder::SegmentBuilder;
+#[cfg(feature = "native")]
+pub use builder::{SegmentBuilder, SegmentBuilderConfig};
 pub use merger::{SegmentMerger, delete_segment};
 pub use reader::{AsyncSegmentReader, SegmentReader};
 pub use store::*;
 pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 
 #[cfg(test)]
+#[cfg(feature = "native")]
 mod tests {
     use super::*;
     use crate::directories::RamDirectory;
@@ -27,7 +30,8 @@ mod tests {
         let segment_id = SegmentId::new();
 
         // Build segment using sync builder
-        let mut builder = SegmentBuilder::new((*schema).clone());
+        let config = SegmentBuilderConfig::default();
+        let mut builder = SegmentBuilder::new((*schema).clone(), config).unwrap();
 
         let mut doc = crate::dsl::Document::new();
         doc.add_text(title, "Hello World");

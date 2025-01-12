@@ -115,6 +115,13 @@ enum Commands {
         /// Number of threads for parallel block compression (default: number of CPUs)
         #[arg(short = 'c', long)]
         compression_threads: Option<usize>,
+
+        /// Index optimization mode: adaptive (default), size, performance
+        /// - adaptive: balanced compression/speed (zstd level 7)
+        /// - size: best compression ratio (OptP4D + zstd level 22)
+        /// - performance: fastest queries (Roaring + zstd level 3)
+        #[arg(short = 'O', long, default_value = "adaptive")]
+        optimization: String,
     },
 
     /// Commit pending changes
@@ -387,6 +394,7 @@ async fn index_from_reader<R: BufRead>(
     Ok(count)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn index_documents(
     index_path: PathBuf,
     documents_path: Option<PathBuf>,
@@ -395,13 +403,26 @@ async fn index_documents(
     max_segment_size: u32,
     indexing_threads: Option<usize>,
     compression_threads: Option<usize>,
+    optimization: String,
 ) -> Result<()> {
+    use hermes_core::structures::IndexOptimization;
+
+    let optimization_mode = IndexOptimization::parse(&optimization).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid optimization mode '{}'. Valid options: adaptive, size, performance",
+            optimization
+        )
+    })?;
+
     let dir = FsDirectory::new(&index_path);
+    let default_config = IndexConfig::default();
     let config = IndexConfig {
         max_docs_per_segment: max_segment_size,
-        num_indexing_threads: indexing_threads.unwrap_or_default(),
-        num_compression_threads: compression_threads.unwrap_or_default(),
-        ..Default::default()
+        num_indexing_threads: indexing_threads.unwrap_or(default_config.num_indexing_threads),
+        num_compression_threads: compression_threads
+            .unwrap_or(default_config.num_compression_threads),
+        optimization: optimization_mode,
+        ..default_config
     };
     let writer = IndexWriter::open(dir, config.clone()).await?;
 
@@ -415,8 +436,11 @@ async fn index_documents(
             .collect::<Vec<_>>()
     );
     info!(
-        "Indexing threads: {}, Compression threads: {}",
-        config.num_indexing_threads, config.num_compression_threads
+        "Indexing threads: {}, Compression threads: {}, Optimization: {:?} (zstd level {})",
+        config.num_indexing_threads,
+        config.num_compression_threads,
+        optimization_mode,
+        optimization_mode.zstd_level()
     );
 
     let count = if use_stdin {
@@ -1204,6 +1228,7 @@ async fn main() -> Result<()> {
             max_segment_size,
             indexing_threads,
             compression_threads,
+            optimization,
         } => {
             index_documents(
                 index,
@@ -1213,6 +1238,7 @@ async fn main() -> Result<()> {
                 max_segment_size,
                 indexing_threads,
                 compression_threads,
+                optimization,
             )
             .await?;
         }

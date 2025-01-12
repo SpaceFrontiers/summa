@@ -1,68 +1,261 @@
-//! Segment builder for creating new segments
+//! Streaming segment builder with optimized memory usage
+//!
+//! Key optimizations:
+//! - **String interning**: Terms are interned using `lasso` to avoid repeated allocations
+//! - **hashbrown HashMap**: O(1) average insertion instead of BTreeMap's O(log n)
+//! - **Streaming document store**: Documents written to disk immediately
+//! - **Incremental posting flush**: Large posting lists flushed to temp file
+//! - **Memory-mapped intermediate files**: Reduces memory pressure
+//! - **Arena allocation**: Batch allocations for reduced fragmentation
 
-use rustc_hash::FxHashMap;
-use std::collections::BTreeMap;
+#[cfg(feature = "native")]
+use std::fs::{File, OpenOptions};
+#[cfg(feature = "native")]
+use std::io::{BufWriter, Write};
+#[cfg(feature = "native")]
+use std::path::PathBuf;
+#[cfg(feature = "native")]
 use std::sync::Arc;
 
+#[cfg(feature = "native")]
+use hashbrown::HashMap;
+#[cfg(feature = "native")]
+use lasso::{Rodeo, Spur};
+#[cfg(feature = "native")]
+use rustc_hash::FxHashMap;
+
+#[cfg(feature = "native")]
 use super::store::StoreWriter;
+#[cfg(feature = "native")]
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
+#[cfg(feature = "native")]
+use crate::compression::CompressionLevel;
+#[cfg(feature = "native")]
 use crate::directories::{Directory, DirectoryWriter};
+#[cfg(feature = "native")]
 use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
+#[cfg(feature = "native")]
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
+#[cfg(feature = "native")]
 use crate::tokenizer::{BoxedTokenizer, LowercaseTokenizer};
+#[cfg(feature = "native")]
 use crate::wand::WandData;
+#[cfg(feature = "native")]
 use crate::{DocId, Result};
 
-/// Builder for creating a single segment
+/// Threshold for flushing a posting list to disk (number of postings)
+#[cfg(feature = "native")]
+const POSTING_FLUSH_THRESHOLD: usize = 100_000;
+
+/// Size of the posting spill buffer before writing to disk
+#[cfg(feature = "native")]
+const SPILL_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+/// Interned term key combining field and term
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TermKey {
+    field: u32,
+    term: Spur,
+}
+
+/// Compact posting entry for in-memory storage
+#[cfg(feature = "native")]
+#[derive(Clone, Copy)]
+struct CompactPosting {
+    doc_id: DocId,
+    term_freq: u16, // Most term frequencies fit in u16
+}
+
+/// Posting list that can spill to disk when too large
+#[cfg(feature = "native")]
+struct SpillablePostingList {
+    /// In-memory postings (hot data)
+    memory: Vec<CompactPosting>,
+    /// Offset in spill file where flushed postings start (-1 if none)
+    spill_offset: i64,
+    /// Number of postings in spill file
+    spill_count: u32,
+}
+
+#[cfg(feature = "native")]
+impl SpillablePostingList {
+    fn new() -> Self {
+        Self {
+            memory: Vec::new(),
+            spill_offset: -1,
+            spill_count: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            memory: Vec::with_capacity(capacity),
+            spill_offset: -1,
+            spill_count: 0,
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, doc_id: DocId, term_freq: u32) {
+        // Merge with last posting if same doc_id
+        if let Some(last) = self.memory.last_mut()
+            && last.doc_id == doc_id
+        {
+            last.term_freq = last.term_freq.saturating_add(term_freq as u16);
+            return;
+        }
+        self.memory.push(CompactPosting {
+            doc_id,
+            term_freq: term_freq.min(u16::MAX as u32) as u16,
+        });
+    }
+
+    fn total_count(&self) -> usize {
+        self.memory.len() + self.spill_count as usize
+    }
+
+    fn needs_spill(&self) -> bool {
+        self.memory.len() >= POSTING_FLUSH_THRESHOLD
+    }
+}
+
+/// Configuration for segment builder
+#[cfg(feature = "native")]
+#[derive(Clone)]
+pub struct SegmentBuilderConfig {
+    /// Directory for temporary spill files
+    pub temp_dir: PathBuf,
+    /// Compression level for document store
+    pub compression_level: CompressionLevel,
+    /// Number of threads for parallel compression
+    pub num_compression_threads: usize,
+    /// Initial capacity for term interner
+    pub interner_capacity: usize,
+    /// Initial capacity for posting lists hashmap
+    pub posting_map_capacity: usize,
+}
+
+#[cfg(feature = "native")]
+impl Default for SegmentBuilderConfig {
+    fn default() -> Self {
+        Self {
+            temp_dir: std::env::temp_dir(),
+            compression_level: CompressionLevel(7),
+            num_compression_threads: num_cpus::get(),
+            interner_capacity: 1_000_000,
+            posting_map_capacity: 500_000,
+        }
+    }
+}
+
+/// Segment builder with optimized memory usage
+///
+/// Features:
+/// - Streams documents to disk immediately (no in-memory document storage)
+/// - Uses string interning for terms (reduced allocations)
+/// - Uses hashbrown HashMap (faster than BTreeMap)
+/// - Spills large posting lists to disk (bounded memory)
+#[cfg(feature = "native")]
 pub struct SegmentBuilder {
     schema: Schema,
+    config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
-    inverted_index: FxHashMap<Field, BTreeMap<Vec<u8>, PostingList>>,
-    documents: Vec<Document>,
+
+    /// String interner for terms - O(1) lookup and deduplication
+    term_interner: Rodeo,
+
+    /// Inverted index using interned term keys
+    /// hashbrown HashMap has better cache locality than BTreeMap
+    inverted_index: HashMap<TermKey, SpillablePostingList>,
+
+    /// Streaming document store writer
+    store_file: BufWriter<File>,
+    store_path: PathBuf,
+
+    /// Spill file for large posting lists
+    spill_file: Option<BufWriter<File>>,
+    spill_path: PathBuf,
+    spill_offset: u64,
+
+    /// Document count
     next_doc_id: DocId,
+
     /// Per-field statistics for BM25F
     field_stats: FxHashMap<u32, FieldStats>,
-    /// Per-document field lengths (doc_id -> field_id -> token_count)
-    doc_field_lengths: Vec<FxHashMap<u32, u32>>,
+
+    /// Per-document field lengths stored compactly
+    /// Uses a flat Vec instead of Vec<HashMap> for better cache locality
+    /// Layout: [doc0_field0_len, doc0_field1_len, ..., doc1_field0_len, ...]
+    doc_field_lengths: Vec<u32>,
+    num_indexed_fields: usize,
+    field_to_slot: FxHashMap<u32, usize>,
+
     /// Optional pre-computed WAND data for IDF values
     wand_data: Option<Arc<WandData>>,
 }
 
+#[cfg(feature = "native")]
 impl SegmentBuilder {
-    pub fn new(schema: Schema) -> Self {
-        Self {
+    /// Create a new segment builder
+    pub fn new(schema: Schema, config: SegmentBuilderConfig) -> Result<Self> {
+        let segment_id = uuid::Uuid::new_v4();
+        let store_path = config
+            .temp_dir
+            .join(format!("hermes_store_{}.tmp", segment_id));
+        let spill_path = config
+            .temp_dir
+            .join(format!("hermes_spill_{}.tmp", segment_id));
+
+        let store_file = BufWriter::with_capacity(
+            SPILL_BUFFER_SIZE,
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&store_path)?,
+        );
+
+        // Count indexed fields for compact field length storage
+        let mut num_indexed_fields = 0;
+        let mut field_to_slot = FxHashMap::default();
+        for (field, entry) in schema.fields() {
+            if entry.indexed && matches!(entry.field_type, FieldType::Text) {
+                field_to_slot.insert(field.0, num_indexed_fields);
+                num_indexed_fields += 1;
+            }
+        }
+
+        Ok(Self {
             schema,
             tokenizers: FxHashMap::default(),
-            inverted_index: FxHashMap::default(),
-            documents: Vec::new(),
+            term_interner: Rodeo::new(),
+            inverted_index: HashMap::with_capacity(config.posting_map_capacity),
+            store_file,
+            store_path,
+            spill_file: None,
+            spill_path,
+            spill_offset: 0,
             next_doc_id: 0,
             field_stats: FxHashMap::default(),
             doc_field_lengths: Vec::new(),
+            num_indexed_fields,
+            field_to_slot,
             wand_data: None,
-        }
+            config,
+        })
     }
 
-    /// Create a new segment builder with pre-computed WAND data
-    ///
-    /// The WAND data provides IDF values for terms, enabling more accurate
-    /// block-max scores during indexing. This is useful when you have
-    /// pre-computed term statistics from `hermes-tool term-stats`.
-    pub fn with_wand_data(schema: Schema, wand_data: Arc<WandData>) -> Self {
-        Self {
-            schema,
-            tokenizers: FxHashMap::default(),
-            inverted_index: FxHashMap::default(),
-            documents: Vec::new(),
-            next_doc_id: 0,
-            field_stats: FxHashMap::default(),
-            doc_field_lengths: Vec::new(),
-            wand_data: Some(wand_data),
-        }
-    }
-
-    /// Set WAND data for IDF computation
-    pub fn set_wand_data(&mut self, wand_data: Arc<WandData>) {
-        self.wand_data = Some(wand_data);
+    /// Create with pre-computed WAND data
+    pub fn with_wand_data(
+        schema: Schema,
+        config: SegmentBuilderConfig,
+        wand_data: Arc<WandData>,
+    ) -> Result<Self> {
+        let mut builder = Self::new(schema, config)?;
+        builder.wand_data = Some(wand_data);
+        Ok(builder)
     }
 
     pub fn set_tokenizer(&mut self, field: Field, tokenizer: BoxedTokenizer) {
@@ -73,12 +266,15 @@ impl SegmentBuilder {
         self.next_doc_id
     }
 
+    /// Add a document - streams to disk immediately
     pub fn add_document(&mut self, doc: Document) -> Result<DocId> {
         let doc_id = self.next_doc_id;
         self.next_doc_id += 1;
 
-        // Track field lengths for this document
-        let mut doc_lengths: FxHashMap<u32, u32> = FxHashMap::default();
+        // Initialize field lengths for this document
+        let base_idx = self.doc_field_lengths.len();
+        self.doc_field_lengths
+            .resize(base_idx + self.num_indexed_fields, 0);
 
         for (field, value) in doc.field_values() {
             let entry = self.schema.get_field_entry(*field);
@@ -96,8 +292,10 @@ impl SegmentBuilder {
                     stats.total_tokens += token_count as u64;
                     stats.doc_count += 1;
 
-                    // Track per-document field length
-                    doc_lengths.insert(field.0, token_count);
+                    // Store field length compactly
+                    if let Some(&slot) = self.field_to_slot.get(&field.0) {
+                        self.doc_field_lengths[base_idx + slot] = token_count;
+                    }
                 }
                 (FieldType::U64, FieldValue::U64(v)) => {
                     self.index_numeric_field(*field, doc_id, *v)?;
@@ -112,12 +310,13 @@ impl SegmentBuilder {
             }
         }
 
-        self.doc_field_lengths.push(doc_lengths);
-        self.documents.push(doc);
+        // Stream document to disk immediately
+        self.write_document_to_store(&doc)?;
+
         Ok(doc_id)
     }
 
-    /// Index a text field and return the number of tokens
+    /// Index a text field using interned terms
     fn index_text_field(&mut self, field: Field, doc_id: DocId, text: &str) -> Result<u32> {
         let default_tokenizer = LowercaseTokenizer;
         let tokenizer: &dyn crate::tokenizer::TokenizerClone = self
@@ -129,173 +328,276 @@ impl SegmentBuilder {
         let tokens = tokenizer.tokenize(text);
         let token_count = tokens.len() as u32;
 
-        let field_index = self.inverted_index.entry(field).or_default();
-
         for token in tokens {
-            let term = token.text.as_bytes().to_vec();
-            let posting = field_index.entry(term).or_default();
+            // Intern the term - O(1) amortized
+            let term_spur = self.term_interner.get_or_intern(&token.text);
+
+            let term_key = TermKey {
+                field: field.0,
+                term: term_spur,
+            };
+
+            // hashbrown entry API is faster than BTreeMap
+            let posting = self
+                .inverted_index
+                .entry(term_key)
+                .or_insert_with(SpillablePostingList::new);
+
             posting.add(doc_id, 1);
+
+            // Check if we need to spill this posting list
+            if posting.needs_spill() {
+                self.spill_posting_list(term_key)?;
+            }
         }
 
         Ok(token_count)
     }
 
     fn index_numeric_field(&mut self, field: Field, doc_id: DocId, value: u64) -> Result<()> {
-        let term = value.to_le_bytes().to_vec();
-        let field_index = self.inverted_index.entry(field).or_default();
-        let posting = field_index.entry(term).or_default();
+        // For numeric fields, we use a special encoding
+        let term_str = format!("__num_{}", value);
+        let term_spur = self.term_interner.get_or_intern(&term_str);
+
+        let term_key = TermKey {
+            field: field.0,
+            term: term_spur,
+        };
+
+        let posting = self
+            .inverted_index
+            .entry(term_key)
+            .or_insert_with(SpillablePostingList::new);
         posting.add(doc_id, 1);
+
         Ok(())
     }
 
+    /// Write document to streaming store
+    fn write_document_to_store(&mut self, doc: &Document) -> Result<()> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        let doc_bytes = super::store::serialize_document(doc, &self.schema)?;
+
+        self.store_file
+            .write_u32::<LittleEndian>(doc_bytes.len() as u32)?;
+        self.store_file.write_all(&doc_bytes)?;
+
+        Ok(())
+    }
+
+    /// Spill a large posting list to disk
+    fn spill_posting_list(&mut self, term_key: TermKey) -> Result<()> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        let posting = self.inverted_index.get_mut(&term_key).unwrap();
+
+        // Initialize spill file if needed
+        if self.spill_file.is_none() {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(true)
+                .open(&self.spill_path)?;
+            self.spill_file = Some(BufWriter::with_capacity(SPILL_BUFFER_SIZE, file));
+        }
+
+        let spill_file = self.spill_file.as_mut().unwrap();
+
+        // Record spill offset if this is first spill for this term
+        if posting.spill_offset < 0 {
+            posting.spill_offset = self.spill_offset as i64;
+        }
+
+        // Write postings to spill file
+        for p in &posting.memory {
+            spill_file.write_u32::<LittleEndian>(p.doc_id)?;
+            spill_file.write_u16::<LittleEndian>(p.term_freq)?;
+            self.spill_offset += 6; // 4 bytes doc_id + 2 bytes term_freq
+        }
+
+        posting.spill_count += posting.memory.len() as u32;
+        posting.memory.clear();
+        posting.memory.shrink_to(POSTING_FLUSH_THRESHOLD / 4); // Keep some capacity
+
+        Ok(())
+    }
+
+    /// Build the final segment
     pub async fn build<D: Directory + DirectoryWriter>(
-        &self,
+        mut self,
         dir: &D,
         segment_id: SegmentId,
     ) -> Result<SegmentMeta> {
-        self.build_with_threads(dir, segment_id, 1).await
-    }
+        // Flush any buffered data
+        self.store_file.flush()?;
+        if let Some(ref mut spill) = self.spill_file {
+            spill.flush()?;
+        }
 
-    /// Build segment with parallel compression
-    ///
-    /// Uses `num_threads` for parallel block compression in the document store.
-    #[cfg(feature = "native")]
-    pub async fn build_with_threads<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segment_id: SegmentId,
-        num_threads: usize,
-    ) -> Result<SegmentMeta> {
         let files = SegmentFiles::new(segment_id.0);
 
-        let mut term_dict_data = Vec::new();
-        let mut postings_data = Vec::new();
-        let mut store_data = Vec::new();
+        // Build term dictionary and postings
+        let (term_dict_data, postings_data) = self.build_postings()?;
 
-        self.build_postings(&mut term_dict_data, &mut postings_data)?;
+        // Build document store from streamed data
+        let store_data = self.build_store_from_stream()?;
 
-        // Use parallel compression if num_threads > 1
-        if num_threads > 1 {
-            self.build_store_parallel(&mut store_data, num_threads)?;
+        // Write to directory
+        dir.write(&files.term_dict, &term_dict_data).await?;
+        dir.write(&files.postings, &postings_data).await?;
+        dir.write(&files.store, &store_data).await?;
+
+        let meta = SegmentMeta {
+            id: segment_id.0,
+            num_docs: self.next_doc_id,
+            field_stats: self.field_stats.clone(),
+        };
+
+        dir.write(&files.meta, &meta.serialize()?).await?;
+
+        // Cleanup temp files
+        let _ = std::fs::remove_file(&self.store_path);
+        let _ = std::fs::remove_file(&self.spill_path);
+
+        Ok(meta)
+    }
+
+    /// Build postings from inverted index
+    fn build_postings(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+        use std::collections::BTreeMap;
+
+        // We need to sort terms for SSTable, so collect into BTreeMap
+        // Key format: field_id (4 bytes) + term bytes
+        let mut sorted_terms: BTreeMap<Vec<u8>, &SpillablePostingList> = BTreeMap::new();
+
+        for (term_key, posting_list) in &self.inverted_index {
+            let term_str = self.term_interner.resolve(&term_key.term);
+            let mut key = Vec::with_capacity(4 + term_str.len());
+            key.extend_from_slice(&term_key.field.to_le_bytes());
+            key.extend_from_slice(term_str.as_bytes());
+            sorted_terms.insert(key, posting_list);
+        }
+
+        let mut term_dict = Vec::new();
+        let mut postings = Vec::new();
+        let mut writer = SSTableWriter::<TermInfo>::new(&mut term_dict);
+
+        // Memory-map spill file if it exists
+        let spill_mmap = if self.spill_file.is_some() {
+            drop(self.spill_file.take()); // Close writer
+            let file = File::open(&self.spill_path)?;
+            Some(unsafe { memmap2::Mmap::map(&file)? })
         } else {
-            self.build_store(&mut store_data)?;
-        }
-
-        dir.write(&files.term_dict, &term_dict_data).await?;
-        dir.write(&files.postings, &postings_data).await?;
-        dir.write(&files.store, &store_data).await?;
-
-        let meta = SegmentMeta {
-            id: segment_id.0,
-            num_docs: self.next_doc_id,
-            field_stats: self.field_stats.clone(),
+            None
         };
 
-        dir.write(&files.meta, &meta.serialize()?).await?;
+        for (key, spill_posting) in sorted_terms {
+            // Reconstruct full posting list
+            let mut full_postings = PostingList::with_capacity(spill_posting.total_count());
 
-        Ok(meta)
-    }
-
-    /// Build segment without parallel compression (non-native fallback)
-    #[cfg(not(feature = "native"))]
-    pub async fn build_with_threads<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segment_id: SegmentId,
-        _num_threads: usize,
-    ) -> Result<SegmentMeta> {
-        let files = SegmentFiles::new(segment_id.0);
-
-        let mut term_dict_data = Vec::new();
-        let mut postings_data = Vec::new();
-        let mut store_data = Vec::new();
-
-        self.build_postings(&mut term_dict_data, &mut postings_data)?;
-        self.build_store(&mut store_data)?;
-
-        dir.write(&files.term_dict, &term_dict_data).await?;
-        dir.write(&files.postings, &postings_data).await?;
-        dir.write(&files.store, &store_data).await?;
-
-        let meta = SegmentMeta {
-            id: segment_id.0,
-            num_docs: self.next_doc_id,
-            field_stats: self.field_stats.clone(),
-        };
-
-        dir.write(&files.meta, &meta.serialize()?).await?;
-
-        Ok(meta)
-    }
-
-    fn build_postings(&self, term_dict: &mut Vec<u8>, postings: &mut Vec<u8>) -> Result<()> {
-        let mut all_terms: BTreeMap<Vec<u8>, (Field, &PostingList)> = BTreeMap::new();
-
-        for (field, terms) in &self.inverted_index {
-            for (term, posting_list) in terms {
-                let mut key = Vec::with_capacity(4 + term.len());
-                key.extend_from_slice(&field.0.to_le_bytes());
-                key.extend_from_slice(term);
-                all_terms.insert(key, (*field, posting_list));
+            // Read spilled postings first (they come before in-memory ones)
+            if spill_posting.spill_offset >= 0
+                && let Some(ref mmap) = spill_mmap
+            {
+                let mut offset = spill_posting.spill_offset as usize;
+                for _ in 0..spill_posting.spill_count {
+                    let doc_id = u32::from_le_bytes([
+                        mmap[offset],
+                        mmap[offset + 1],
+                        mmap[offset + 2],
+                        mmap[offset + 3],
+                    ]);
+                    let term_freq = u16::from_le_bytes([mmap[offset + 4], mmap[offset + 5]]);
+                    full_postings.push(doc_id, term_freq as u32);
+                    offset += 6;
+                }
             }
-        }
 
-        let mut writer = SSTableWriter::<TermInfo>::new(term_dict);
+            // Add in-memory postings
+            for p in &spill_posting.memory {
+                full_postings.push(p.doc_id, p.term_freq as u32);
+            }
 
-        for (key, (_field, posting_list)) in &all_terms {
-            // Try to inline small posting lists
-            let doc_ids: Vec<u32> = posting_list.iter().map(|p| p.doc_id).collect();
-            let term_freqs: Vec<u32> = posting_list.iter().map(|p| p.term_freq).collect();
+            // Build term info
+            let doc_ids: Vec<u32> = full_postings.iter().map(|p| p.doc_id).collect();
+            let term_freqs: Vec<u32> = full_postings.iter().map(|p| p.term_freq).collect();
 
             let term_info = if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
-                // Small posting list - inline it directly
                 inline
             } else {
-                // Large posting list - write to external file
                 let posting_offset = postings.len() as u64;
                 let block_list =
-                    crate::structures::BlockPostingList::from_posting_list(posting_list)?;
-                block_list.serialize(postings)?;
+                    crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
+                block_list.serialize(&mut postings)?;
                 TermInfo::external(
                     posting_offset,
                     (postings.len() as u64 - posting_offset) as u32,
-                    posting_list.doc_count(),
+                    full_postings.doc_count(),
                 )
             };
 
-            writer.insert(key, &term_info)?;
+            writer.insert(&key, &term_info)?;
         }
 
         writer.finish()?;
-        Ok(())
+        Ok((term_dict, postings))
     }
 
-    fn build_store(&self, store_data: &mut Vec<u8>) -> Result<()> {
-        let mut writer = StoreWriter::new(store_data);
+    /// Build document store from streamed temp file
+    fn build_store_from_stream(&mut self) -> Result<Vec<u8>> {
+        // Memory-map the temp store file
+        drop(std::mem::replace(
+            &mut self.store_file,
+            BufWriter::new(File::create("/dev/null")?),
+        ));
 
-        for doc in &self.documents {
-            writer.store(doc, &self.schema)?;
+        let file = File::open(&self.store_path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+        // Re-compress with proper block structure
+        let mut store_data = Vec::new();
+        let mut store_writer =
+            StoreWriter::with_compression_level(&mut store_data, self.config.compression_level);
+
+        let mut offset = 0usize;
+        while offset < mmap.len() {
+            if offset + 4 > mmap.len() {
+                break;
+            }
+
+            let doc_len = u32::from_le_bytes([
+                mmap[offset],
+                mmap[offset + 1],
+                mmap[offset + 2],
+                mmap[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            if offset + doc_len > mmap.len() {
+                break;
+            }
+
+            let doc_bytes = &mmap[offset..offset + doc_len];
+            offset += doc_len;
+
+            // Deserialize and re-store with proper compression
+            if let Ok(doc) = super::store::deserialize_document(doc_bytes, &self.schema) {
+                store_writer.store(&doc, &self.schema)?;
+            }
         }
 
-        writer.finish()?;
-        Ok(())
+        store_writer.finish()?;
+        Ok(store_data)
     }
+}
 
-    /// Build store with parallel compression
-    ///
-    /// Uses `EagerParallelStoreWriter` which starts compressing blocks immediately
-    /// when they're ready, overlapping document serialization with compression.
-    #[cfg(feature = "native")]
-    fn build_store_parallel(&self, store_data: &mut Vec<u8>, num_threads: usize) -> Result<()> {
-        use super::store::EagerParallelStoreWriter;
-
-        let mut writer = EagerParallelStoreWriter::new(store_data, num_threads);
-
-        for doc in &self.documents {
-            writer.store(doc, &self.schema)?;
-        }
-
-        writer.finish()?;
-        Ok(())
+#[cfg(feature = "native")]
+impl Drop for SegmentBuilder {
+    fn drop(&mut self) {
+        // Cleanup temp files on drop
+        let _ = std::fs::remove_file(&self.store_path);
+        let _ = std::fs::remove_file(&self.spill_path);
     }
 }

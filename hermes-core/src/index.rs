@@ -19,7 +19,7 @@ use crate::directories::{Directory, SliceCachingDirectory};
 use crate::dsl::{Document, Field, Schema};
 use crate::error::{Error, Result};
 #[cfg(feature = "native")]
-use crate::segment::{SegmentBuilder, SegmentMerger};
+use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentMerger};
 use crate::segment::{SegmentId, SegmentReader};
 use crate::structures::BlockPostingList;
 #[cfg(feature = "native")]
@@ -48,6 +48,8 @@ pub struct IndexConfig {
     pub max_docs_per_segment: u32,
     /// Min segments to trigger merge
     pub merge_threshold: usize,
+    /// Index optimization mode (adaptive, size-optimized, performance-optimized)
+    pub optimization: crate::structures::IndexOptimization,
 }
 
 impl Default for IndexConfig {
@@ -65,6 +67,7 @@ impl Default for IndexConfig {
             store_cache_blocks: 32,
             max_docs_per_segment: 100_000,
             merge_threshold: 5,
+            optimization: crate::structures::IndexOptimization::default(),
         }
     }
 }
@@ -480,18 +483,21 @@ impl<D: Directory> Clone for Index<D> {
 
 /// Async IndexWriter for adding documents and committing segments
 ///
-/// Internally manages parallel segment building based on `num_indexing_threads` config.
-/// Documents are distributed across multiple segment builders round-robin style.
+/// Features:
+/// - Streams documents to disk immediately (no in-memory document storage)
+/// - Uses string interning for terms (reduced allocations)
+/// - Uses hashbrown HashMap (faster than BTreeMap)
+/// - Spills large posting lists to disk (bounded memory)
+/// - Uses memory-mapped files for intermediate data
 #[cfg(feature = "native")]
 pub struct IndexWriter<D: DirectoryWriter> {
     directory: Arc<D>,
     schema: Arc<Schema>,
     config: IndexConfig,
+    builder_config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
-    /// Multiple segment builders for parallel indexing
-    segment_builders: AsyncMutex<Vec<SegmentBuilder>>,
-    /// Round-robin counter for distributing documents
-    next_builder: std::sync::atomic::AtomicUsize,
+    /// Segment builder
+    builder: AsyncMutex<Option<SegmentBuilder>>,
     /// List of committed segment IDs (hex strings)
     segment_ids: AsyncMutex<Vec<String>>,
 }
@@ -500,6 +506,16 @@ pub struct IndexWriter<D: DirectoryWriter> {
 impl<D: DirectoryWriter> IndexWriter<D> {
     /// Create a new index in the directory
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
+        Self::create_with_config(directory, schema, config, SegmentBuilderConfig::default()).await
+    }
+
+    /// Create a new index with custom builder config
+    pub async fn create_with_config(
+        directory: D,
+        schema: Schema,
+        config: IndexConfig,
+        builder_config: SegmentBuilderConfig,
+    ) -> Result<Self> {
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
 
@@ -521,15 +537,24 @@ impl<D: DirectoryWriter> IndexWriter<D> {
             directory,
             schema,
             config,
+            builder_config,
             tokenizers: FxHashMap::default(),
-            segment_builders: AsyncMutex::new(Vec::new()),
-            next_builder: std::sync::atomic::AtomicUsize::new(0),
+            builder: AsyncMutex::new(None),
             segment_ids: AsyncMutex::new(Vec::new()),
         })
     }
 
     /// Open an existing index for writing
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
+        Self::open_with_config(directory, config, SegmentBuilderConfig::default()).await
+    }
+
+    /// Open an existing index with custom builder config
+    pub async fn open_with_config(
+        directory: D,
+        config: IndexConfig,
+        builder_config: SegmentBuilderConfig,
+    ) -> Result<Self> {
         let directory = Arc::new(directory);
 
         // Read schema
@@ -549,9 +574,9 @@ impl<D: DirectoryWriter> IndexWriter<D> {
             directory,
             schema,
             config,
+            builder_config,
             tokenizers: FxHashMap::default(),
-            segment_builders: AsyncMutex::new(Vec::new()),
-            next_builder: std::sync::atomic::AtomicUsize::new(0),
+            builder: AsyncMutex::new(None),
             segment_ids: AsyncMutex::new(segment_ids),
         })
     }
@@ -568,121 +593,51 @@ impl<D: DirectoryWriter> IndexWriter<D> {
 
     /// Add a document
     ///
-    /// Documents are distributed across internal segment builders based on
-    /// `num_indexing_threads` config. When any builder reaches `max_docs_per_segment`,
-    /// it is committed to disk in the background.
+    /// Documents are streamed to disk immediately, keeping memory usage bounded.
+    /// When the builder reaches `max_docs_per_segment`, it is committed and a new one starts.
     pub async fn add_document(&self, doc: Document) -> Result<DocId> {
-        let num_builders = self.config.num_indexing_threads.max(1);
-        let mut builders = self.segment_builders.lock().await;
+        let mut builder_guard = self.builder.lock().await;
 
-        // Initialize builders if empty
-        if builders.is_empty() {
-            for _ in 0..num_builders {
-                let mut builder = SegmentBuilder::new((*self.schema).clone());
-                for (field, tokenizer) in &self.tokenizers {
-                    builder.set_tokenizer(*field, tokenizer.clone_box());
-                }
-                builders.push(builder);
+        // Initialize builder if needed
+        if builder_guard.is_none() {
+            let mut builder =
+                SegmentBuilder::new((*self.schema).clone(), self.builder_config.clone())?;
+            for (field, tokenizer) in &self.tokenizers {
+                builder.set_tokenizer(*field, tokenizer.clone_box());
             }
+            *builder_guard = Some(builder);
         }
 
-        // Round-robin distribution
-        let idx = self
-            .next_builder
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % num_builders;
-        let builder = &mut builders[idx];
+        let builder = builder_guard.as_mut().unwrap();
         let doc_id = builder.add_document(doc)?;
 
-        // Check if this builder needs to be committed
+        // Check if we need to commit
         if builder.num_docs() >= self.config.max_docs_per_segment {
-            // Take the full builder and replace with a new one
-            let full_builder = std::mem::replace(builder, {
-                let mut new_builder = SegmentBuilder::new((*self.schema).clone());
-                for (field, tokenizer) in &self.tokenizers {
-                    new_builder.set_tokenizer(*field, tokenizer.clone_box());
-                }
-                new_builder
-            });
-            drop(builders); // Release lock before async operation
-            self.commit_segment(full_builder).await?;
+            let full_builder = builder_guard.take().unwrap();
+            drop(builder_guard); // Release lock before async operation
+            self.commit_builder(full_builder).await?;
         }
 
         Ok(doc_id)
     }
 
     /// Commit all pending segments to disk
-    ///
-    /// Commits all internal segment builders in parallel.
     pub async fn commit(&self) -> Result<()> {
-        let mut builders = self.segment_builders.lock().await;
+        let mut builder_guard = self.builder.lock().await;
 
-        if builders.is_empty() {
-            return Ok(());
-        }
-
-        // Take all builders and replace with empty vec
-        let builders_to_commit: Vec<SegmentBuilder> = std::mem::take(&mut *builders);
-        drop(builders); // Release lock before async operations
-
-        // Commit all non-empty builders in parallel
-        let mut handles = Vec::new();
-
-        for builder in builders_to_commit {
-            if builder.num_docs() == 0 {
-                continue;
-            }
-
-            let directory = Arc::clone(&self.directory);
-            let compression_threads = self.config.num_compression_threads;
-            let handle = tokio::spawn(async move {
-                let segment_id = SegmentId::new();
-                builder
-                    .build_with_threads(directory.as_ref(), segment_id, compression_threads)
-                    .await?;
-                Ok::<String, Error>(segment_id.to_hex())
-            });
-            handles.push(handle);
-        }
-
-        // Collect all new segment IDs
-        let mut new_segment_ids = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(id)) => new_segment_ids.push(id),
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(Error::Internal(format!("Task join error: {}", e))),
-            }
-        }
-
-        // Update segment list atomically
-        if !new_segment_ids.is_empty() {
-            let mut segment_ids = self.segment_ids.lock().await;
-            segment_ids.extend(new_segment_ids);
-
-            let segments_bytes = serde_json::to_vec(&*segment_ids)
-                .map_err(|e| Error::Serialization(e.to_string()))?;
-            self.directory
-                .write(Path::new("segments.json"), &segments_bytes)
-                .await?;
+        if let Some(builder) = builder_guard.take()
+            && builder.num_docs() > 0
+        {
+            drop(builder_guard);
+            self.commit_builder(builder).await?;
         }
 
         Ok(())
     }
 
-    async fn commit_segment(&self, builder: SegmentBuilder) -> Result<()> {
-        if builder.num_docs() == 0 {
-            return Ok(());
-        }
-
+    async fn commit_builder(&self, builder: SegmentBuilder) -> Result<()> {
         let segment_id = SegmentId::new();
-        builder
-            .build_with_threads(
-                self.directory.as_ref(),
-                segment_id,
-                self.config.num_compression_threads,
-            )
-            .await?;
+        builder.build(self.directory.as_ref(), segment_id).await?;
 
         // Update segment list
         let mut segment_ids = self.segment_ids.lock().await;

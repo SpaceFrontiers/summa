@@ -52,9 +52,10 @@ pub use directories::{
 
 // Re-exports from segment
 pub use segment::{
-    AsyncSegmentReader, AsyncStoreReader, FieldStats, SegmentBuilder, SegmentId, SegmentMeta,
-    SegmentReader,
+    AsyncSegmentReader, AsyncStoreReader, FieldStats, SegmentId, SegmentMeta, SegmentReader,
 };
+#[cfg(feature = "native")]
+pub use segment::{SegmentBuilder, SegmentBuilderConfig};
 
 // Re-exports from query
 pub use query::{

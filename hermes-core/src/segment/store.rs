@@ -30,8 +30,8 @@ pub const STORE_BLOCK_SIZE: usize = 256 * 1024;
 /// Default dictionary size (64KB is a good balance)
 pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
 
-/// Compression level for document store (maximum for static indexes)
-const COMPRESSION_LEVEL: CompressionLevel = CompressionLevel::MAX;
+/// Default compression level for document store
+const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel(7);
 
 /// Document store writer with optional dictionary compression
 pub struct StoreWriter<'a> {
@@ -42,11 +42,20 @@ pub struct StoreWriter<'a> {
     next_doc_id: DocId,
     block_first_doc: DocId,
     dict: Option<CompressionDict>,
+    compression_level: CompressionLevel,
 }
 
 impl<'a> StoreWriter<'a> {
     /// Create a new store writer without dictionary
     pub fn new(writer: &'a mut dyn Write) -> Self {
+        Self::with_compression_level(writer, DEFAULT_COMPRESSION_LEVEL)
+    }
+
+    /// Create a new store writer with a specific compression level
+    pub fn with_compression_level(
+        writer: &'a mut dyn Write,
+        compression_level: CompressionLevel,
+    ) -> Self {
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
@@ -55,11 +64,21 @@ impl<'a> StoreWriter<'a> {
             next_doc_id: 0,
             block_first_doc: 0,
             dict: None,
+            compression_level,
         }
     }
 
     /// Create a new store writer with a trained dictionary
     pub fn with_dict(writer: &'a mut dyn Write, dict: CompressionDict) -> Self {
+        Self::with_dict_and_level(writer, dict, DEFAULT_COMPRESSION_LEVEL)
+    }
+
+    /// Create a new store writer with a trained dictionary and specific compression level
+    pub fn with_dict_and_level(
+        writer: &'a mut dyn Write,
+        dict: CompressionDict,
+        compression_level: CompressionLevel,
+    ) -> Self {
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
@@ -68,6 +87,7 @@ impl<'a> StoreWriter<'a> {
             next_doc_id: 0,
             block_first_doc: 0,
             dict: Some(dict),
+            compression_level,
         }
     }
 
@@ -97,9 +117,13 @@ impl<'a> StoreWriter<'a> {
 
         // Use dictionary compression if available, otherwise standard compression
         let compressed = if let Some(ref dict) = self.dict {
-            crate::compression::compress_with_dict(&self.block_buffer, COMPRESSION_LEVEL, dict)?
+            crate::compression::compress_with_dict(
+                &self.block_buffer,
+                self.compression_level,
+                dict,
+            )?
         } else {
-            crate::compression::compress(&self.block_buffer, COMPRESSION_LEVEL)?
+            crate::compression::compress(&self.block_buffer, self.compression_level)?
         };
 
         self.index.push(StoreBlockIndex {
@@ -160,7 +184,7 @@ impl<'a> StoreWriter<'a> {
     }
 }
 
-fn serialize_document(doc: &Document, _schema: &Schema) -> io::Result<Vec<u8>> {
+pub fn serialize_document(doc: &Document, _schema: &Schema) -> io::Result<Vec<u8>> {
     serde_json::to_vec(doc).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
@@ -192,12 +216,22 @@ pub struct EagerParallelStoreWriter<'a> {
     next_doc_id: DocId,
     block_first_doc: DocId,
     dict: Option<Arc<CompressionDict>>,
+    compression_level: CompressionLevel,
 }
 
 #[cfg(feature = "native")]
 impl<'a> EagerParallelStoreWriter<'a> {
     /// Create a new eager parallel store writer
     pub fn new(writer: &'a mut dyn Write, _num_threads: usize) -> Self {
+        Self::with_compression_level(writer, _num_threads, DEFAULT_COMPRESSION_LEVEL)
+    }
+
+    /// Create with specific compression level
+    pub fn with_compression_level(
+        writer: &'a mut dyn Write,
+        _num_threads: usize,
+        compression_level: CompressionLevel,
+    ) -> Self {
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
@@ -207,6 +241,7 @@ impl<'a> EagerParallelStoreWriter<'a> {
             next_doc_id: 0,
             block_first_doc: 0,
             dict: None,
+            compression_level,
         }
     }
 
@@ -215,6 +250,16 @@ impl<'a> EagerParallelStoreWriter<'a> {
         writer: &'a mut dyn Write,
         dict: CompressionDict,
         _num_threads: usize,
+    ) -> Self {
+        Self::with_dict_and_level(writer, dict, _num_threads, DEFAULT_COMPRESSION_LEVEL)
+    }
+
+    /// Create with dictionary and specific compression level
+    pub fn with_dict_and_level(
+        writer: &'a mut dyn Write,
+        dict: CompressionDict,
+        _num_threads: usize,
+        compression_level: CompressionLevel,
     ) -> Self {
         Self {
             writer,
@@ -225,6 +270,7 @@ impl<'a> EagerParallelStoreWriter<'a> {
             next_doc_id: 0,
             block_first_doc: 0,
             dict: Some(Arc::new(dict)),
+            compression_level,
         }
     }
 
@@ -260,13 +306,13 @@ impl<'a> EagerParallelStoreWriter<'a> {
         self.next_seq += 1;
         self.block_first_doc = self.next_doc_id;
 
-        // Spawn compression task using rayon's thread pool
+        // Spawn compression task using thread
+        let level = self.compression_level;
         let handle = std::thread::spawn(move || {
             let compressed = if let Some(ref d) = dict {
-                crate::compression::compress_with_dict(&data, COMPRESSION_LEVEL, d)
-                    .expect("compression failed")
+                crate::compression::compress_with_dict(&data, level, d).expect("compression failed")
             } else {
-                crate::compression::compress(&data, COMPRESSION_LEVEL).expect("compression failed")
+                crate::compression::compress(&data, level).expect("compression failed")
             };
 
             CompressedBlock {
@@ -617,7 +663,7 @@ impl AsyncStoreReader {
     }
 }
 
-fn deserialize_document(data: &[u8], _schema: &Schema) -> io::Result<Document> {
+pub fn deserialize_document(data: &[u8], _schema: &Schema) -> io::Result<Document> {
     serde_json::from_slice(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 

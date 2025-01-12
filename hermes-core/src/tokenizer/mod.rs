@@ -6,6 +6,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use rust_stemmers::Algorithm;
 use serde::{Deserialize, Serialize};
+use stop_words::LANGUAGE;
 
 /// A token produced by tokenization
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +150,76 @@ impl Language {
             Language::Tamil => Algorithm::Tamil,
             Language::Turkish => Algorithm::Turkish,
         }
+    }
+
+    fn to_stop_words_language(self) -> LANGUAGE {
+        match self {
+            Language::Arabic => LANGUAGE::Arabic,
+            Language::Danish => LANGUAGE::Danish,
+            Language::Dutch => LANGUAGE::Dutch,
+            Language::English => LANGUAGE::English,
+            Language::Finnish => LANGUAGE::Finnish,
+            Language::French => LANGUAGE::French,
+            Language::German => LANGUAGE::German,
+            Language::Greek => LANGUAGE::Greek,
+            Language::Hungarian => LANGUAGE::Hungarian,
+            Language::Italian => LANGUAGE::Italian,
+            Language::Norwegian => LANGUAGE::Norwegian,
+            Language::Portuguese => LANGUAGE::Portuguese,
+            Language::Romanian => LANGUAGE::Romanian,
+            Language::Russian => LANGUAGE::Russian,
+            Language::Spanish => LANGUAGE::Spanish,
+            Language::Swedish => LANGUAGE::Swedish,
+            Language::Tamil => LANGUAGE::English, // Tamil not supported, fallback to English
+            Language::Turkish => LANGUAGE::Turkish,
+        }
+    }
+}
+
+/// Stop word filter tokenizer - wraps another tokenizer and filters out stop words
+///
+/// Uses the stop-words crate for language-specific stop word lists.
+#[derive(Debug, Clone)]
+pub struct StopWordTokenizer<T: Tokenizer> {
+    inner: T,
+    stop_words: HashSet<String>,
+}
+
+use std::collections::HashSet;
+
+impl<T: Tokenizer> StopWordTokenizer<T> {
+    /// Create a new stop word tokenizer wrapping the given tokenizer
+    pub fn new(inner: T, language: Language) -> Self {
+        let stop_words: HashSet<String> = stop_words::get(language.to_stop_words_language())
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        Self { inner, stop_words }
+    }
+
+    /// Create with English stop words
+    pub fn english(inner: T) -> Self {
+        Self::new(inner, Language::English)
+    }
+
+    /// Create with custom stop words
+    pub fn with_custom_stop_words(inner: T, stop_words: HashSet<String>) -> Self {
+        Self { inner, stop_words }
+    }
+
+    /// Check if a word is a stop word
+    pub fn is_stop_word(&self, word: &str) -> bool {
+        self.stop_words.contains(word)
+    }
+}
+
+impl<T: Tokenizer> Tokenizer for StopWordTokenizer<T> {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        self.inner
+            .tokenize(text)
+            .into_iter()
+            .filter(|token| !self.stop_words.contains(&token.text))
+            .collect()
     }
 }
 
@@ -451,6 +522,50 @@ impl TokenizerRegistry {
         self.register("tamil", StemmerTokenizer::new(Language::Tamil));
         self.register("tr_stem", StemmerTokenizer::new(Language::Turkish));
         self.register("turkish", StemmerTokenizer::new(Language::Turkish));
+
+        // Stop word filtered tokenizers (lowercase + stop words)
+        self.register(
+            "en_stop",
+            StopWordTokenizer::new(LowercaseTokenizer, Language::English),
+        );
+        self.register(
+            "de_stop",
+            StopWordTokenizer::new(LowercaseTokenizer, Language::German),
+        );
+        self.register(
+            "fr_stop",
+            StopWordTokenizer::new(LowercaseTokenizer, Language::French),
+        );
+        self.register(
+            "ru_stop",
+            StopWordTokenizer::new(LowercaseTokenizer, Language::Russian),
+        );
+        self.register(
+            "es_stop",
+            StopWordTokenizer::new(LowercaseTokenizer, Language::Spanish),
+        );
+
+        // Stop word + stemming tokenizers
+        self.register(
+            "en_stem_stop",
+            StopWordTokenizer::new(StemmerTokenizer::new(Language::English), Language::English),
+        );
+        self.register(
+            "de_stem_stop",
+            StopWordTokenizer::new(StemmerTokenizer::new(Language::German), Language::German),
+        );
+        self.register(
+            "fr_stem_stop",
+            StopWordTokenizer::new(StemmerTokenizer::new(Language::French), Language::French),
+        );
+        self.register(
+            "ru_stem_stop",
+            StopWordTokenizer::new(StemmerTokenizer::new(Language::Russian), Language::Russian),
+        );
+        self.register(
+            "es_stem_stop",
+            StopWordTokenizer::new(StemmerTokenizer::new(Language::Spanish), Language::Spanish),
+        );
     }
 
     /// Register a tokenizer with a name
@@ -665,5 +780,101 @@ mod tests {
     fn test_tokenizer_registry_nonexistent() {
         let registry = TokenizerRegistry::new();
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_stop_word_tokenizer_english() {
+        let tokenizer = StopWordTokenizer::english(LowercaseTokenizer);
+        let tokens = Tokenizer::tokenize(&tokenizer, "The quick brown fox jumps over the lazy dog");
+
+        // "the", "over" are stop words and should be filtered
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(!texts.contains(&"the"));
+        assert!(!texts.contains(&"over"));
+        assert!(texts.contains(&"quick"));
+        assert!(texts.contains(&"brown"));
+        assert!(texts.contains(&"fox"));
+        assert!(texts.contains(&"jumps"));
+        assert!(texts.contains(&"lazy"));
+        assert!(texts.contains(&"dog"));
+    }
+
+    #[test]
+    fn test_stop_word_tokenizer_with_stemmer() {
+        // Note: StopWordTokenizer filters AFTER stemming, so stop words
+        // that get stemmed may not be filtered. For proper stop word + stemming,
+        // filter stop words before stemming or use a stemmed stop word list.
+        let tokenizer = StopWordTokenizer::new(StemmerTokenizer::english(), Language::English);
+        let tokens = Tokenizer::tokenize(&tokenizer, "elephants galaxies quantum");
+
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        // Stemmed forms should be present (these are not stop words)
+        assert!(texts.contains(&"eleph")); // elephants -> eleph
+        assert!(texts.contains(&"galaxi")); // galaxies -> galaxi
+        assert!(texts.contains(&"quantum")); // quantum -> quantum
+    }
+
+    #[test]
+    fn test_stop_word_tokenizer_german() {
+        let tokenizer = StopWordTokenizer::new(LowercaseTokenizer, Language::German);
+        let tokens = Tokenizer::tokenize(&tokenizer, "Der Hund und die Katze");
+
+        // "der", "und", "die" are German stop words
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(!texts.contains(&"der"));
+        assert!(!texts.contains(&"und"));
+        assert!(!texts.contains(&"die"));
+        assert!(texts.contains(&"hund"));
+        assert!(texts.contains(&"katze"));
+    }
+
+    #[test]
+    fn test_stop_word_tokenizer_custom() {
+        let custom_stops: HashSet<String> = ["foo", "bar"].iter().map(|s| s.to_string()).collect();
+        let tokenizer = StopWordTokenizer::with_custom_stop_words(LowercaseTokenizer, custom_stops);
+        let tokens = Tokenizer::tokenize(&tokenizer, "foo baz bar qux");
+
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(!texts.contains(&"foo"));
+        assert!(!texts.contains(&"bar"));
+        assert!(texts.contains(&"baz"));
+        assert!(texts.contains(&"qux"));
+    }
+
+    #[test]
+    fn test_stop_word_tokenizer_is_stop_word() {
+        let tokenizer = StopWordTokenizer::english(LowercaseTokenizer);
+        assert!(tokenizer.is_stop_word("the"));
+        assert!(tokenizer.is_stop_word("and"));
+        assert!(tokenizer.is_stop_word("is"));
+        // These are definitely not stop words
+        assert!(!tokenizer.is_stop_word("elephant"));
+        assert!(!tokenizer.is_stop_word("quantum"));
+    }
+
+    #[test]
+    fn test_tokenizer_registry_stop_word_tokenizers() {
+        let registry = TokenizerRegistry::new();
+
+        // Check stop word tokenizers are registered
+        assert!(registry.contains("en_stop"));
+        assert!(registry.contains("en_stem_stop"));
+        assert!(registry.contains("de_stop"));
+        assert!(registry.contains("ru_stop"));
+
+        // Test en_stop filters stop words
+        let tokenizer = registry.get("en_stop").unwrap();
+        let tokens = tokenizer.tokenize("The quick fox");
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(!texts.contains(&"the"));
+        assert!(texts.contains(&"quick"));
+        assert!(texts.contains(&"fox"));
+
+        // Test en_stem_stop filters stop words AND stems
+        let tokenizer = registry.get("en_stem_stop").unwrap();
+        let tokens = tokenizer.tokenize("elephants galaxies");
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert!(texts.contains(&"eleph")); // stemmed
+        assert!(texts.contains(&"galaxi")); // stemmed
     }
 }

@@ -10,6 +10,7 @@
 //! - **NEON intrinsics on ARM**: Uses vld1q_u32, vaddq_u32, etc.
 //! - **Block-level metadata**: Skip info for BlockMax WAND
 
+use super::simd;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
@@ -23,16 +24,6 @@ const SIMD_LANES: usize = 4;
 /// Number of groups per block (128 / 4 = 32)
 #[allow(dead_code)]
 const GROUPS_PER_BLOCK: usize = VERTICAL_BP128_BLOCK_SIZE / SIMD_LANES;
-
-/// Compute bits needed for max value
-#[inline]
-pub fn bits_needed(max_val: u32) -> u8 {
-    if max_val == 0 {
-        0
-    } else {
-        32 - max_val.leading_zeros() as u8
-    }
-}
 
 // ============================================================================
 // NEON intrinsics for aarch64 (Apple Silicon, ARM servers)
@@ -967,8 +958,8 @@ impl VerticalBP128PostingList {
             max_tf = max_tf.max(tf);
         }
 
-        let doc_bit_width = bits_needed(max_delta);
-        let tf_bit_width = bits_needed(max_tf.saturating_sub(1));
+        let doc_bit_width = simd::bits_needed(max_delta);
+        let tf_bit_width = simd::bits_needed(max_tf.saturating_sub(1));
 
         let mut doc_data = Vec::new();
         pack_vertical(&deltas, doc_bit_width, &mut doc_data);
@@ -1224,7 +1215,7 @@ mod tests {
         }
 
         let max_val = values.iter().max().copied().unwrap();
-        let bit_width = bits_needed(max_val);
+        let bit_width = simd::bits_needed(max_val);
 
         let mut packed = Vec::new();
         pack_vertical(&values, bit_width, &mut packed);
@@ -1322,7 +1313,7 @@ mod tests {
             *v = i as u32;
         }
 
-        let bit_width = bits_needed(127); // 7 bits
+        let bit_width = simd::bits_needed(127); // 7 bits
         assert_eq!(bit_width, 7);
 
         let mut packed = Vec::new();

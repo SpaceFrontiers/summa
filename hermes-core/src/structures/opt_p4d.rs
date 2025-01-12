@@ -15,481 +15,9 @@
 //! - Main array: 128 values packed at `bit_width` bits each
 //! - Exceptions: [position (7 bits), high_bits (32 - bit_width bits)] for each exception
 
+use super::simd;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
-
-// ============================================================================
-// SIMD optimizations for aarch64 (Apple Silicon, ARM servers)
-// ============================================================================
-
-#[cfg(target_arch = "aarch64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-mod neon {
-    #[allow(unused_imports)]
-    use super::OPT_P4D_BLOCK_SIZE;
-    use std::arch::aarch64::*;
-
-    /// SIMD unpack for 8-bit values using NEON
-    #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_8bit_neon(input: &[u8], output: &mut [u32], count: usize) {
-        let chunks = count / 16;
-        let remainder = count % 16;
-
-        for chunk in 0..chunks {
-            let base = chunk * 16;
-            let in_ptr = input.as_ptr().add(base);
-
-            // Load 16 bytes
-            let bytes = vld1q_u8(in_ptr);
-
-            // Widen u8 -> u16 -> u32
-            let low8 = vget_low_u8(bytes);
-            let high8 = vget_high_u8(bytes);
-
-            let low16 = vmovl_u8(low8);
-            let high16 = vmovl_u8(high8);
-
-            let v0 = vmovl_u16(vget_low_u16(low16));
-            let v1 = vmovl_u16(vget_high_u16(low16));
-            let v2 = vmovl_u16(vget_low_u16(high16));
-            let v3 = vmovl_u16(vget_high_u16(high16));
-
-            let out_ptr = output.as_mut_ptr().add(base);
-            vst1q_u32(out_ptr, v0);
-            vst1q_u32(out_ptr.add(4), v1);
-            vst1q_u32(out_ptr.add(8), v2);
-            vst1q_u32(out_ptr.add(12), v3);
-        }
-
-        // Handle remainder
-        let base = chunks * 16;
-        for i in 0..remainder {
-            output[base + i] = input[base + i] as u32;
-        }
-    }
-
-    /// SIMD unpack for 16-bit values using NEON
-    #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_16bit_neon(input: &[u8], output: &mut [u32], count: usize) {
-        let chunks = count / 8;
-        let remainder = count % 8;
-
-        for chunk in 0..chunks {
-            let base = chunk * 8;
-            let in_ptr = input.as_ptr().add(base * 2) as *const u16;
-
-            let vals = vld1q_u16(in_ptr);
-            let low = vmovl_u16(vget_low_u16(vals));
-            let high = vmovl_u16(vget_high_u16(vals));
-
-            let out_ptr = output.as_mut_ptr().add(base);
-            vst1q_u32(out_ptr, low);
-            vst1q_u32(out_ptr.add(4), high);
-        }
-
-        // Handle remainder
-        let base = chunks * 8;
-        for i in 0..remainder {
-            let idx = (base + i) * 2;
-            output[base + i] = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-        }
-    }
-
-    /// SIMD delta decode: convert deltas to absolute doc IDs
-    /// deltas[i] stores (gap - 1), output[i] = first + sum(gaps[0..i])
-    #[target_feature(enable = "neon")]
-    pub unsafe fn delta_decode_neon(
-        deltas: &[u32],
-        output: &mut [u32],
-        first_doc_id: u32,
-        count: usize,
-    ) {
-        if count == 0 {
-            return;
-        }
-
-        output[0] = first_doc_id;
-        if count == 1 {
-            return;
-        }
-
-        let mut carry = first_doc_id;
-        let ones = vdupq_n_u32(1);
-
-        let full_groups = (count - 1) / 4;
-        let remainder = (count - 1) % 4;
-
-        for group in 0..full_groups {
-            let base = group * 4;
-
-            // Load 4 deltas
-            let d = vld1q_u32(deltas[base..].as_ptr());
-
-            // Add 1 to each delta (since we store gap-1)
-            let gaps = vaddq_u32(d, ones);
-
-            // Extract and compute prefix sum with carry
-            let g0 = vgetq_lane_u32(gaps, 0);
-            let g1 = vgetq_lane_u32(gaps, 1);
-            let g2 = vgetq_lane_u32(gaps, 2);
-            let g3 = vgetq_lane_u32(gaps, 3);
-
-            let v0 = carry.wrapping_add(g0);
-            let v1 = v0.wrapping_add(g1);
-            let v2 = v1.wrapping_add(g2);
-            let v3 = v2.wrapping_add(g3);
-
-            output[base + 1] = v0;
-            output[base + 2] = v1;
-            output[base + 3] = v2;
-            output[base + 4] = v3;
-
-            carry = v3;
-        }
-
-        // Handle remainder
-        let base = full_groups * 4;
-        for j in 0..remainder {
-            carry = carry.wrapping_add(deltas[base + j]).wrapping_add(1);
-            output[base + j + 1] = carry;
-        }
-    }
-
-    /// SIMD add 1 to all values (for TF decoding: stored as tf-1)
-    #[target_feature(enable = "neon")]
-    pub unsafe fn add_one_neon(values: &mut [u32], count: usize) {
-        let ones = vdupq_n_u32(1);
-        let chunks = count / 4;
-        let remainder = count % 4;
-
-        for chunk in 0..chunks {
-            let base = chunk * 4;
-            let ptr = values.as_mut_ptr().add(base);
-            let v = vld1q_u32(ptr);
-            let result = vaddq_u32(v, ones);
-            vst1q_u32(ptr, result);
-        }
-
-        let base = chunks * 4;
-        for i in 0..remainder {
-            values[base + i] += 1;
-        }
-    }
-
-    /// Check if NEON is available (always true on aarch64)
-    #[inline]
-    pub fn is_available() -> bool {
-        true
-    }
-}
-
-// ============================================================================
-// SIMD optimizations for x86_64 (Intel/AMD)
-// ============================================================================
-
-#[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-mod sse {
-    use std::arch::x86_64::*;
-
-    /// SIMD unpack for 8-bit values using SSE
-    #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_8bit_sse(input: &[u8], output: &mut [u32], count: usize) {
-        let chunks = count / 16;
-        let remainder = count % 16;
-
-        for chunk in 0..chunks {
-            let base = chunk * 16;
-            let in_ptr = input.as_ptr().add(base);
-
-            let bytes = _mm_loadu_si128(in_ptr as *const __m128i);
-
-            // Zero extend u8 -> u32 using SSE4.1 pmovzx
-            let v0 = _mm_cvtepu8_epi32(bytes);
-            let v1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes, 4));
-            let v2 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes, 8));
-            let v3 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes, 12));
-
-            let out_ptr = output.as_mut_ptr().add(base);
-            _mm_storeu_si128(out_ptr as *mut __m128i, v0);
-            _mm_storeu_si128(out_ptr.add(4) as *mut __m128i, v1);
-            _mm_storeu_si128(out_ptr.add(8) as *mut __m128i, v2);
-            _mm_storeu_si128(out_ptr.add(12) as *mut __m128i, v3);
-        }
-
-        let base = chunks * 16;
-        for i in 0..remainder {
-            output[base + i] = input[base + i] as u32;
-        }
-    }
-
-    /// SIMD unpack for 16-bit values using SSE
-    #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_16bit_sse(input: &[u8], output: &mut [u32], count: usize) {
-        let chunks = count / 8;
-        let remainder = count % 8;
-
-        for chunk in 0..chunks {
-            let base = chunk * 8;
-            let in_ptr = input.as_ptr().add(base * 2);
-
-            let vals = _mm_loadu_si128(in_ptr as *const __m128i);
-            let low = _mm_cvtepu16_epi32(vals);
-            let high = _mm_cvtepu16_epi32(_mm_srli_si128(vals, 8));
-
-            let out_ptr = output.as_mut_ptr().add(base);
-            _mm_storeu_si128(out_ptr as *mut __m128i, low);
-            _mm_storeu_si128(out_ptr.add(4) as *mut __m128i, high);
-        }
-
-        let base = chunks * 8;
-        for i in 0..remainder {
-            let idx = (base + i) * 2;
-            output[base + i] = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-        }
-    }
-
-    /// SIMD delta decode using SSE
-    #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn delta_decode_sse(
-        deltas: &[u32],
-        output: &mut [u32],
-        first_doc_id: u32,
-        count: usize,
-    ) {
-        if count == 0 {
-            return;
-        }
-
-        output[0] = first_doc_id;
-        if count == 1 {
-            return;
-        }
-
-        let mut carry = first_doc_id;
-        let ones = _mm_set1_epi32(1);
-
-        let full_groups = (count - 1) / 4;
-        let remainder = (count - 1) % 4;
-
-        for group in 0..full_groups {
-            let base = group * 4;
-
-            let d = _mm_loadu_si128(deltas[base..].as_ptr() as *const __m128i);
-            let gaps = _mm_add_epi32(d, ones);
-
-            let g0 = _mm_extract_epi32(gaps, 0) as u32;
-            let g1 = _mm_extract_epi32(gaps, 1) as u32;
-            let g2 = _mm_extract_epi32(gaps, 2) as u32;
-            let g3 = _mm_extract_epi32(gaps, 3) as u32;
-
-            let v0 = carry.wrapping_add(g0);
-            let v1 = v0.wrapping_add(g1);
-            let v2 = v1.wrapping_add(g2);
-            let v3 = v2.wrapping_add(g3);
-
-            output[base + 1] = v0;
-            output[base + 2] = v1;
-            output[base + 3] = v2;
-            output[base + 4] = v3;
-
-            carry = v3;
-        }
-
-        let base = full_groups * 4;
-        for j in 0..remainder {
-            carry = carry.wrapping_add(deltas[base + j]).wrapping_add(1);
-            output[base + j + 1] = carry;
-        }
-    }
-
-    /// SIMD add 1 to all values using SSE
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn add_one_sse(values: &mut [u32], count: usize) {
-        let ones = _mm_set1_epi32(1);
-        let chunks = count / 4;
-        let remainder = count % 4;
-
-        for chunk in 0..chunks {
-            let base = chunk * 4;
-            let ptr = values.as_mut_ptr().add(base) as *mut __m128i;
-            let v = _mm_loadu_si128(ptr);
-            let result = _mm_add_epi32(v, ones);
-            _mm_storeu_si128(ptr, result);
-        }
-
-        let base = chunks * 4;
-        for i in 0..remainder {
-            values[base + i] += 1;
-        }
-    }
-
-    /// Check if SSE4.1 is available at runtime
-    #[inline]
-    pub fn is_available() -> bool {
-        is_x86_feature_detected!("sse4.1")
-    }
-}
-
-// ============================================================================
-// Scalar fallback implementations
-// ============================================================================
-
-mod scalar {
-    /// Scalar unpack for 8-bit values
-    #[inline]
-    pub fn unpack_8bit_scalar(input: &[u8], output: &mut [u32], count: usize) {
-        for i in 0..count {
-            output[i] = input[i] as u32;
-        }
-    }
-
-    /// Scalar unpack for 16-bit values
-    #[inline]
-    pub fn unpack_16bit_scalar(input: &[u8], output: &mut [u32], count: usize) {
-        for (i, out) in output.iter_mut().enumerate().take(count) {
-            let idx = i * 2;
-            *out = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-        }
-    }
-
-    /// Scalar delta decode
-    #[inline]
-    pub fn delta_decode_scalar(
-        deltas: &[u32],
-        output: &mut [u32],
-        first_doc_id: u32,
-        count: usize,
-    ) {
-        if count == 0 {
-            return;
-        }
-
-        output[0] = first_doc_id;
-        let mut carry = first_doc_id;
-
-        for i in 0..count - 1 {
-            carry = carry.wrapping_add(deltas[i]).wrapping_add(1);
-            output[i + 1] = carry;
-        }
-    }
-
-    /// Scalar add 1 to all values
-    #[inline]
-    pub fn add_one_scalar(values: &mut [u32], count: usize) {
-        for val in values.iter_mut().take(count) {
-            *val += 1;
-        }
-    }
-}
-
-// ============================================================================
-// Dispatch functions that select SIMD or scalar at runtime
-// ============================================================================
-
-/// Unpack 8-bit packed values to u32 with SIMD acceleration
-#[inline]
-fn unpack_8bit(input: &[u8], output: &mut [u32], count: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            unsafe {
-                neon::unpack_8bit_neon(input, output, count);
-            }
-            return;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if sse::is_available() {
-            unsafe {
-                sse::unpack_8bit_sse(input, output, count);
-            }
-            return;
-        }
-    }
-
-    scalar::unpack_8bit_scalar(input, output, count);
-}
-
-/// Unpack 16-bit packed values to u32 with SIMD acceleration
-#[inline]
-fn unpack_16bit(input: &[u8], output: &mut [u32], count: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            unsafe {
-                neon::unpack_16bit_neon(input, output, count);
-            }
-            return;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if sse::is_available() {
-            unsafe {
-                sse::unpack_16bit_sse(input, output, count);
-            }
-            return;
-        }
-    }
-
-    scalar::unpack_16bit_scalar(input, output, count);
-}
-
-/// Delta decode with SIMD acceleration
-#[inline]
-fn delta_decode_simd(deltas: &[u32], output: &mut [u32], first_doc_id: u32, count: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            unsafe {
-                neon::delta_decode_neon(deltas, output, first_doc_id, count);
-            }
-            return;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if sse::is_available() {
-            unsafe {
-                sse::delta_decode_sse(deltas, output, first_doc_id, count);
-            }
-            return;
-        }
-    }
-
-    scalar::delta_decode_scalar(deltas, output, first_doc_id, count);
-}
-
-/// Add 1 to all values with SIMD acceleration
-#[inline]
-fn add_one_simd(values: &mut [u32], count: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            unsafe {
-                neon::add_one_neon(values, count);
-            }
-            return;
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if sse::is_available() {
-            unsafe {
-                sse::add_one_sse(values, count);
-            }
-            return;
-        }
-    }
-
-    scalar::add_one_scalar(values, count);
-}
 
 /// Block size for OptP4D (128 integers for SIMD alignment)
 pub const OPT_P4D_BLOCK_SIZE: usize = 128;
@@ -497,16 +25,6 @@ pub const OPT_P4D_BLOCK_SIZE: usize = 128;
 /// Maximum number of exceptions before we increase bit width
 /// (keeping exceptions under ~10% of block for good compression)
 const MAX_EXCEPTIONS_RATIO: f32 = 0.10;
-
-/// Compute the number of bits needed to represent a value
-#[inline]
-fn bits_needed(val: u32) -> u8 {
-    if val == 0 {
-        0
-    } else {
-        32 - val.leading_zeros() as u8
-    }
-}
 
 /// Find the optimal bit width for a block of values
 /// Returns (bit_width, exception_count, total_bits)
@@ -521,7 +39,7 @@ fn find_optimal_bit_width(values: &[u32]) -> (u8, usize, usize) {
     // Count how many values need each bit width
     let mut bit_counts = [0usize; 33]; // bit_counts[b] = count of values needing exactly b bits
     for &v in values {
-        let bits = bits_needed(v) as usize;
+        let bits = simd::bits_needed(v) as usize;
         bit_counts[bits] += 1;
     }
 
@@ -662,21 +180,13 @@ fn unpack_with_exceptions(
         output[..count].fill(0);
     } else if bit_width == 8 {
         // SIMD-accelerated 8-bit unpacking
-        unpack_8bit(packed, output, count);
+        simd::unpack_8bit(packed, output, count);
     } else if bit_width == 16 {
         // SIMD-accelerated 16-bit unpacking
-        unpack_16bit(packed, output, count);
+        simd::unpack_16bit(packed, output, count);
     } else if bit_width >= 32 {
-        // Direct copy for 32-bit values (no exceptions possible)
-        for (i, out) in output.iter_mut().enumerate().take(count) {
-            let idx = i * 4;
-            *out = u32::from_le_bytes([
-                packed[idx],
-                packed[idx + 1],
-                packed[idx + 2],
-                packed[idx + 3],
-            ]);
-        }
+        // SIMD-accelerated 32-bit unpacking
+        simd::unpack_32bit(packed, output, count);
         return; // No exceptions for 32-bit
     } else {
         // Generic bit unpacking for other bit widths
@@ -853,7 +363,7 @@ impl OptP4DBlock {
 
         // Convert deltas to absolute doc_ids using SIMD-accelerated prefix sum
         let mut doc_ids = vec![0u32; count];
-        delta_decode_simd(&deltas, &mut doc_ids, self.first_doc_id, count);
+        simd::delta_decode(&mut doc_ids, &deltas, self.first_doc_id, count);
 
         doc_ids
     }
@@ -877,7 +387,7 @@ impl OptP4DBlock {
         );
 
         // TF is stored as tf-1, so add 1 back using SIMD
-        add_one_simd(&mut tfs, count);
+        simd::add_one(&mut tfs, count);
 
         tfs
     }
@@ -1165,14 +675,14 @@ mod tests {
 
     #[test]
     fn test_bits_needed() {
-        assert_eq!(bits_needed(0), 0);
-        assert_eq!(bits_needed(1), 1);
-        assert_eq!(bits_needed(2), 2);
-        assert_eq!(bits_needed(3), 2);
-        assert_eq!(bits_needed(4), 3);
-        assert_eq!(bits_needed(255), 8);
-        assert_eq!(bits_needed(256), 9);
-        assert_eq!(bits_needed(u32::MAX), 32);
+        assert_eq!(simd::bits_needed(0), 0);
+        assert_eq!(simd::bits_needed(1), 1);
+        assert_eq!(simd::bits_needed(2), 2);
+        assert_eq!(simd::bits_needed(3), 2);
+        assert_eq!(simd::bits_needed(4), 3);
+        assert_eq!(simd::bits_needed(255), 8);
+        assert_eq!(simd::bits_needed(256), 9);
+        assert_eq!(simd::bits_needed(u32::MAX), 32);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use super::builder::SegmentBuilder;
+use super::builder::{SegmentBuilder, SegmentBuilderConfig};
 use super::reader::SegmentReader;
 use super::store::StoreMerger;
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
@@ -101,7 +101,8 @@ impl SegmentMerger {
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
     ) -> Result<SegmentMeta> {
-        let mut builder = SegmentBuilder::new((*self.schema).clone());
+        let mut builder =
+            SegmentBuilder::new((*self.schema).clone(), SegmentBuilderConfig::default())?;
 
         for segment in segments {
             for doc_id in 0..segment.num_docs() {

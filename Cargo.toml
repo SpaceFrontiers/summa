@@ -45,6 +45,7 @@ rust-openzl = "0.1"
 
 # Text processing
 rust-stemmers = "1.2"
+stop-words = "0.8"
 
 # Collections and utilities
 rustc-hash = "2.1"
@@ -91,3 +92,10 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 tempfile = "3.24"
 rand = "0.9"
 
+
+# High-performance data structures
+bumpalo = "3.17"
+lasso = { version = "0.7", features = ["multi-threaded"] }
+hashbrown = "0.15"
+memmap2 = "0.9"
+uuid = { version = "1.16", features = ["v4"] }

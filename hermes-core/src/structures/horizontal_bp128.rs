@@ -9,335 +9,9 @@
 //! - Binary search within decoded blocks
 //! - Variable block sizes based on posting list length
 
+use super::simd;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
-
-// ============================================================================
-// SIMD optimizations for aarch64 (Apple Silicon, ARM servers)
-// ============================================================================
-
-#[cfg(target_arch = "aarch64")]
-mod neon {
-    use super::HORIZONTAL_BP128_BLOCK_SIZE;
-    use std::arch::aarch64::*;
-
-    /// Vectorized unpack for 8-bit values using NEON
-    /// Processes 16 bytes at a time (4x u32 per iteration)
-    #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_block_8_neon(
-        input: &[u8],
-        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
-    ) {
-        unsafe {
-            // Process 16 u8 -> 16 u32 at a time (4 NEON registers)
-            for chunk in 0..8 {
-                let base = chunk * 16;
-                let in_ptr = input.as_ptr().add(base);
-
-                // Load 16 bytes
-                let bytes = vld1q_u8(in_ptr);
-
-                // Widen u8 -> u16 -> u32
-                // Low 8 bytes
-                let low8 = vget_low_u8(bytes);
-                let high8 = vget_high_u8(bytes);
-
-                // u8 -> u16
-                let low16 = vmovl_u8(low8);
-                let high16 = vmovl_u8(high8);
-
-                // u16 -> u32 (4 vectors of 4 u32 each)
-                let v0 = vmovl_u16(vget_low_u16(low16));
-                let v1 = vmovl_u16(vget_high_u16(low16));
-                let v2 = vmovl_u16(vget_low_u16(high16));
-                let v3 = vmovl_u16(vget_high_u16(high16));
-
-                // Store 16 u32 values
-                let out_ptr = output.as_mut_ptr().add(base);
-                vst1q_u32(out_ptr, v0);
-                vst1q_u32(out_ptr.add(4), v1);
-                vst1q_u32(out_ptr.add(8), v2);
-                vst1q_u32(out_ptr.add(12), v3);
-            }
-        }
-    }
-
-    /// Vectorized unpack for 16-bit values using NEON
-    #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_block_16_neon(
-        input: &[u8],
-        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
-    ) {
-        unsafe {
-            // Process 8 u16 -> 8 u32 at a time (2 NEON registers)
-            for chunk in 0..16 {
-                let base = chunk * 8;
-                let in_ptr = input.as_ptr().add(base * 2) as *const u16;
-
-                // Load 8 u16 values
-                let vals = vld1q_u16(in_ptr);
-
-                // Widen u16 -> u32
-                let low = vmovl_u16(vget_low_u16(vals));
-                let high = vmovl_u16(vget_high_u16(vals));
-
-                // Store 8 u32 values
-                let out_ptr = output.as_mut_ptr().add(base);
-                vst1q_u32(out_ptr, low);
-                vst1q_u32(out_ptr.add(4), high);
-            }
-        }
-    }
-
-    /// Vectorized unpack for 32-bit values using NEON (just a fast copy)
-    #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_block_32_neon(
-        input: &[u8],
-        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
-    ) {
-        unsafe {
-            let in_ptr = input.as_ptr() as *const u32;
-            let out_ptr = output.as_mut_ptr();
-
-            // Copy 128 u32 values (4 at a time)
-            for i in 0..32 {
-                let vals = vld1q_u32(in_ptr.add(i * 4));
-                vst1q_u32(out_ptr.add(i * 4), vals);
-            }
-        }
-    }
-
-    /// SIMD prefix sum for delta decoding
-    /// Converts deltas to absolute values: output[i] = first + sum(deltas[0..i]) + i
-    #[target_feature(enable = "neon")]
-    #[allow(dead_code)]
-    pub unsafe fn delta_decode_block_neon(
-        output: &mut [u32],
-        deltas: &[u32],
-        first_doc_id: u32,
-        count: usize,
-    ) {
-        if count == 0 {
-            return;
-        }
-
-        // Process in groups of 4 for SIMD prefix sum
-        let mut carry = first_doc_id;
-        output[0] = carry;
-
-        let full_groups = (count - 1) / 4;
-        let remainder = (count - 1) % 4;
-
-        for group in 0..full_groups {
-            let base = group * 4;
-
-            unsafe {
-                // Load 4 deltas
-                let d = vld1q_u32(deltas[base..].as_ptr());
-
-                // Add 1 to each delta (since we store gap-1)
-                let ones = vdupq_n_u32(1);
-                let gaps = vaddq_u32(d, ones);
-
-                // Extract lanes and compute prefix sum with carry
-                let g0 = vgetq_lane_u32(gaps, 0);
-                let g1 = vgetq_lane_u32(gaps, 1);
-                let g2 = vgetq_lane_u32(gaps, 2);
-                let g3 = vgetq_lane_u32(gaps, 3);
-
-                let v0 = carry.wrapping_add(g0);
-                let v1 = v0.wrapping_add(g1);
-                let v2 = v1.wrapping_add(g2);
-                let v3 = v2.wrapping_add(g3);
-
-                // Store results
-                output[base + 1] = v0;
-                output[base + 2] = v1;
-                output[base + 3] = v2;
-                output[base + 4] = v3;
-
-                carry = v3;
-            }
-        }
-
-        // Handle remainder
-        let base = full_groups * 4;
-        for j in 0..remainder {
-            carry = carry.wrapping_add(deltas[base + j]).wrapping_add(1);
-            output[base + j + 1] = carry;
-        }
-    }
-}
-
-// ============================================================================
-// SIMD optimizations for x86_64 (Intel/AMD)
-// ============================================================================
-
-#[cfg(target_arch = "x86_64")]
-#[allow(dead_code)]
-mod sse {
-    use super::HORIZONTAL_BP128_BLOCK_SIZE;
-    use std::arch::x86_64::*;
-
-    /// Vectorized unpack for 8-bit values using SSE
-    /// Processes 16 bytes at a time
-    #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_block_8_sse(
-        input: &[u8],
-        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
-    ) {
-        // Process 16 u8 -> 16 u32 at a time
-        for chunk in 0..8 {
-            let base = chunk * 16;
-            let in_ptr = input.as_ptr().add(base);
-
-            // Load 16 bytes
-            let bytes = _mm_loadu_si128(in_ptr as *const __m128i);
-
-            // Zero extend u8 -> u32 using SSE4.1 pmovzx
-            // We need to do this in 4 steps (4 bytes at a time)
-            let v0 = _mm_cvtepu8_epi32(bytes);
-            let v1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes, 4));
-            let v2 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes, 8));
-            let v3 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes, 12));
-
-            // Store 16 u32 values
-            let out_ptr = output.as_mut_ptr().add(base);
-            _mm_storeu_si128(out_ptr as *mut __m128i, v0);
-            _mm_storeu_si128(out_ptr.add(4) as *mut __m128i, v1);
-            _mm_storeu_si128(out_ptr.add(8) as *mut __m128i, v2);
-            _mm_storeu_si128(out_ptr.add(12) as *mut __m128i, v3);
-        }
-    }
-
-    /// Vectorized unpack for 16-bit values using SSE
-    #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_block_16_sse(
-        input: &[u8],
-        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
-    ) {
-        // Process 8 u16 -> 8 u32 at a time
-        for chunk in 0..16 {
-            let base = chunk * 8;
-            let in_ptr = input.as_ptr().add(base * 2);
-
-            // Load 16 bytes (8 u16 values)
-            let vals = _mm_loadu_si128(in_ptr as *const __m128i);
-
-            // Zero extend u16 -> u32
-            let low = _mm_cvtepu16_epi32(vals);
-            let high = _mm_cvtepu16_epi32(_mm_srli_si128(vals, 8));
-
-            // Store 8 u32 values
-            let out_ptr = output.as_mut_ptr().add(base);
-            _mm_storeu_si128(out_ptr as *mut __m128i, low);
-            _mm_storeu_si128(out_ptr.add(4) as *mut __m128i, high);
-        }
-    }
-
-    /// Vectorized unpack for 32-bit values using SSE (fast copy)
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn unpack_block_32_sse(
-        input: &[u8],
-        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
-    ) {
-        let in_ptr = input.as_ptr() as *const __m128i;
-        let out_ptr = output.as_mut_ptr() as *mut __m128i;
-
-        // Copy 128 u32 values (4 at a time = 32 iterations)
-        for i in 0..32 {
-            let vals = _mm_loadu_si128(in_ptr.add(i));
-            _mm_storeu_si128(out_ptr.add(i), vals);
-        }
-    }
-
-    /// SIMD prefix sum for delta decoding using SSE
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn delta_decode_block_sse(
-        output: &mut [u32],
-        deltas: &[u32],
-        first_doc_id: u32,
-        count: usize,
-    ) {
-        if count == 0 {
-            return;
-        }
-
-        // Process in groups of 4 for SIMD prefix sum
-        let mut carry = first_doc_id;
-        output[0] = carry;
-
-        let full_groups = (count - 1) / 4;
-        let remainder = (count - 1) % 4;
-
-        let ones = _mm_set1_epi32(1);
-
-        for group in 0..full_groups {
-            let base = group * 4;
-
-            // Load 4 deltas
-            let d = _mm_loadu_si128(deltas[base..].as_ptr() as *const __m128i);
-
-            // Add 1 to each delta (since we store gap-1)
-            let gaps = _mm_add_epi32(d, ones);
-
-            // Extract lanes and compute prefix sum with carry
-            let g0 = _mm_extract_epi32(gaps, 0) as u32;
-            let g1 = _mm_extract_epi32(gaps, 1) as u32;
-            let g2 = _mm_extract_epi32(gaps, 2) as u32;
-            let g3 = _mm_extract_epi32(gaps, 3) as u32;
-
-            let v0 = carry.wrapping_add(g0);
-            let v1 = v0.wrapping_add(g1);
-            let v2 = v1.wrapping_add(g2);
-            let v3 = v2.wrapping_add(g3);
-
-            // Store results
-            output[base + 1] = v0;
-            output[base + 2] = v1;
-            output[base + 3] = v2;
-            output[base + 4] = v3;
-
-            carry = v3;
-        }
-
-        // Handle remainder
-        let base = full_groups * 4;
-        for j in 0..remainder {
-            carry = carry.wrapping_add(deltas[base + j]).wrapping_add(1);
-            output[base + j + 1] = carry;
-        }
-    }
-}
-
-// Scalar fallback implementations (used on non-aarch64 platforms)
-#[allow(dead_code)]
-mod scalar {
-    use super::HORIZONTAL_BP128_BLOCK_SIZE;
-
-    #[inline]
-    pub fn unpack_block_8_scalar(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
-        for (i, out) in output.iter_mut().enumerate() {
-            *out = input[i] as u32;
-        }
-    }
-
-    #[inline]
-    pub fn unpack_block_16_scalar(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
-        for (i, out) in output.iter_mut().enumerate() {
-            let idx = i * 2;
-            *out = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-        }
-    }
-
-    #[inline]
-    pub fn unpack_block_32_scalar(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
-        for (i, out) in output.iter_mut().enumerate() {
-            let idx = i * 4;
-            *out = u32::from_le_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]);
-        }
-    }
-}
 
 /// Block size for bitpacking (128 integers per block for SIMD alignment)
 pub const HORIZONTAL_BP128_BLOCK_SIZE: usize = 128;
@@ -347,16 +21,6 @@ pub const SMALL_BLOCK_SIZE: usize = 32;
 
 /// Threshold for using small blocks (posting lists shorter than this use small blocks)
 pub const SMALL_BLOCK_THRESHOLD: usize = 256;
-
-/// Compute the number of bits needed to represent the maximum value
-#[inline]
-pub fn bits_needed(max_val: u32) -> u8 {
-    if max_val == 0 {
-        0
-    } else {
-        32 - max_val.leading_zeros() as u8
-    }
-}
 
 /// Pack a block of 128 u32 values using the specified bit width
 pub fn pack_block(
@@ -407,82 +71,10 @@ pub fn unpack_block(input: &[u8], bit_width: u8, output: &mut [u32; HORIZONTAL_B
 
     // Fast path for byte-aligned bit widths with SIMD
     match bit_width {
-        8 => unpack_block_8(input, output),
-        16 => unpack_block_16(input, output),
-        32 => unpack_block_32(input, output),
+        8 => simd::unpack_8bit(input, output, HORIZONTAL_BP128_BLOCK_SIZE),
+        16 => simd::unpack_16bit(input, output, HORIZONTAL_BP128_BLOCK_SIZE),
+        32 => simd::unpack_32bit(input, output, HORIZONTAL_BP128_BLOCK_SIZE),
         _ => unpack_block_generic(input, bit_width, output),
-    }
-}
-
-/// Optimized unpacking for 8-bit values - uses NEON on aarch64, SSE on x86_64
-#[inline]
-fn unpack_block_8(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is always available on aarch64
-        unsafe { neon::unpack_block_8_neon(input, output) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: SSE4.1 is available on virtually all x86_64 CPUs (2006+)
-        // Runtime check for older CPUs that lack SSE4.1
-        if is_x86_feature_detected!("sse4.1") {
-            unsafe { sse::unpack_block_8_sse(input, output) }
-        } else {
-            scalar::unpack_block_8_scalar(input, output)
-        }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        scalar::unpack_block_8_scalar(input, output)
-    }
-}
-
-/// Optimized unpacking for 16-bit values - uses NEON on aarch64, SSE on x86_64
-#[inline]
-fn unpack_block_16(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is always available on aarch64
-        unsafe { neon::unpack_block_16_neon(input, output) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: SSE4.1 is available on virtually all x86_64 CPUs (2006+)
-        if is_x86_feature_detected!("sse4.1") {
-            unsafe { sse::unpack_block_16_sse(input, output) }
-        } else {
-            scalar::unpack_block_16_scalar(input, output)
-        }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        scalar::unpack_block_16_scalar(input, output)
-    }
-}
-
-/// Optimized unpacking for 32-bit values - uses NEON on aarch64, SSE on x86_64
-#[inline]
-fn unpack_block_32(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is always available on aarch64
-        unsafe { neon::unpack_block_32_neon(input, output) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: SSE2 is always available on x86_64
-        unsafe { sse::unpack_block_32_sse(input, output) }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        scalar::unpack_block_32_scalar(input, output)
     }
 }
 
@@ -569,30 +161,6 @@ fn prefix_sum_8(deltas: &mut [u32; 8]) {
     // Step 4: shift by 4
     for i in (4..8).rev() {
         deltas[i] = deltas[i].wrapping_add(deltas[i - 4]);
-    }
-}
-
-/// Apply prefix sum to convert deltas to absolute doc_ids
-///
-/// Input: deltas array where deltas[i] = doc_id[i+1] - doc_id[i] - 1
-/// Output: absolute doc_ids starting from first_doc_id
-///
-/// Note: This uses a simple sequential algorithm. The Hillis-Steele parallel
-/// prefix sum could be used for SIMD optimization but requires careful handling
-/// of the delta-1 encoding and carry propagation across chunks.
-#[inline]
-pub fn delta_decode_block(output: &mut [u32], deltas: &[u32], first_doc_id: u32, count: usize) {
-    if count == 0 {
-        return;
-    }
-
-    let mut doc_id = first_doc_id;
-    output[0] = doc_id;
-
-    for i in 1..count {
-        // deltas[i-1] stores (gap - 1), so actual gap = deltas[i-1] + 1
-        doc_id = doc_id.wrapping_add(deltas[i - 1]).wrapping_add(1);
-        output[i] = doc_id;
     }
 }
 
@@ -684,7 +252,7 @@ impl HorizontalBP128Block {
         unpack_block(&self.doc_deltas, self.doc_bit_width, &mut deltas);
 
         let mut output = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
-        delta_decode_block(&mut output, &deltas, self.first_doc_id, count);
+        simd::delta_decode(&mut output, &deltas, self.first_doc_id, count);
 
         output[..count].to_vec()
     }
@@ -797,8 +365,8 @@ impl HorizontalBP128PostingList {
         // field_boost defaults to 1.0 at index time; can be adjusted at query time
         let max_block_score = Self::compute_bm25f_upper_bound(max_tf, idf, 1.0);
 
-        let doc_bit_width = bits_needed(max_delta);
-        let tf_bit_width = bits_needed(max_tf.saturating_sub(1)); // Store tf-1
+        let doc_bit_width = simd::bits_needed(max_delta);
+        let tf_bit_width = simd::bits_needed(max_tf.saturating_sub(1)); // Store tf-1
 
         let mut doc_deltas = Vec::new();
         pack_block(&deltas, doc_bit_width, &mut doc_deltas);
@@ -1037,12 +605,12 @@ mod tests {
 
     #[test]
     fn test_bits_needed() {
-        assert_eq!(bits_needed(0), 0);
-        assert_eq!(bits_needed(1), 1);
-        assert_eq!(bits_needed(2), 2);
-        assert_eq!(bits_needed(3), 2);
-        assert_eq!(bits_needed(255), 8);
-        assert_eq!(bits_needed(256), 9);
+        assert_eq!(simd::bits_needed(0), 0);
+        assert_eq!(simd::bits_needed(1), 1);
+        assert_eq!(simd::bits_needed(2), 2);
+        assert_eq!(simd::bits_needed(3), 2);
+        assert_eq!(simd::bits_needed(255), 8);
+        assert_eq!(simd::bits_needed(256), 9);
     }
 
     #[test]
@@ -1053,7 +621,7 @@ mod tests {
         }
 
         let max_val = values.iter().max().copied().unwrap();
-        let bit_width = bits_needed(max_val);
+        let bit_width = simd::bits_needed(max_val);
 
         let mut packed = Vec::new();
         pack_block(&values, bit_width, &mut packed);
@@ -1134,10 +702,10 @@ mod tests {
         // Expected: [1, 1+2, 1+2+3, 1+2+3+4, ...]
         assert_eq!(deltas, [1, 3, 6, 10, 15, 21, 28, 36]);
 
-        // Test delta_decode_block
+        // Test simd::delta_decode
         let deltas2 = [0u32; 16]; // gaps of 1 (stored as 0)
         let mut output2 = [0u32; 16];
-        delta_decode_block(&mut output2, &deltas2, 100, 8);
+        simd::delta_decode(&mut output2, &deltas2, 100, 8);
         // first_doc_id=100, then +1 each
         assert_eq!(&output2[..8], &[100, 101, 102, 103, 104, 105, 106, 107]);
 
@@ -1145,7 +713,7 @@ mod tests {
         // gaps: 2, 1, 3, 1, 5, 1, 1 → stored as: 1, 0, 2, 0, 4, 0, 0
         let deltas3 = [1u32, 0, 2, 0, 4, 0, 0, 0];
         let mut output3 = [0u32; 8];
-        delta_decode_block(&mut output3, &deltas3, 10, 8);
+        simd::delta_decode(&mut output3, &deltas3, 10, 8);
         // 10, 10+2=12, 12+1=13, 13+3=16, 16+1=17, 17+5=22, 22+1=23, 23+1=24
         assert_eq!(&output3[..8], &[10, 12, 13, 16, 17, 22, 23, 24]);
     }
