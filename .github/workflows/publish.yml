@@ -107,7 +107,7 @@ jobs:
           ref: ${{ github.ref }}
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Login to crates.io
         run: cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -138,7 +138,7 @@ jobs:
           ref: ${{ github.ref }}
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install wasm-pack
         run: cargo install wasm-pack
@@ -182,7 +182,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install maturin
         run: pip install maturin
