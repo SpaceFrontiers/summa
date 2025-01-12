@@ -225,6 +225,121 @@ fn unpack_with_exceptions(
     }
 }
 
+/// Fused unpack + exceptions + delta decode for doc_ids
+///
+/// Combines unpacking, exception application, and prefix sum in a single pass.
+/// Avoids intermediate buffer allocation.
+#[inline]
+fn unpack_exceptions_delta_decode(
+    packed: &[u8],
+    bit_width: u8,
+    exceptions: &[(u8, u32)],
+    output: &mut [u32],
+    first_doc_id: u32,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+
+    output[0] = first_doc_id;
+    if count == 1 {
+        return;
+    }
+
+    // Build exception lookup for O(1) access
+    // Since exceptions are sparse (typically <5%), a simple linear scan is fine
+    // But for very large blocks, we could use a small hashmap
+
+    let mask = if bit_width < 32 {
+        (1u64 << bit_width) - 1
+    } else {
+        u64::MAX
+    };
+
+    let mut carry = first_doc_id;
+
+    // Fast path for SIMD-friendly bit widths
+    match bit_width {
+        0 => {
+            // All zeros = consecutive doc IDs (gap of 1)
+            for item in output.iter_mut().take(count).skip(1) {
+                carry = carry.wrapping_add(1);
+                *item = carry;
+            }
+        }
+        8 => {
+            // Unpack 8-bit, apply exceptions, delta decode in one pass
+            for i in 0..count - 1 {
+                let mut delta = packed[i] as u32;
+                // Check for exception at this position
+                for &(pos, high_bits) in exceptions {
+                    if pos as usize == i {
+                        delta = (high_bits << bit_width) | delta;
+                        break;
+                    }
+                }
+                carry = carry.wrapping_add(delta).wrapping_add(1);
+                output[i + 1] = carry;
+            }
+        }
+        16 => {
+            // Unpack 16-bit, apply exceptions, delta decode in one pass
+            for i in 0..count - 1 {
+                let idx = i * 2;
+                let mut delta = u16::from_le_bytes([packed[idx], packed[idx + 1]]) as u32;
+                for &(pos, high_bits) in exceptions {
+                    if pos as usize == i {
+                        delta = (high_bits << bit_width) | delta;
+                        break;
+                    }
+                }
+                carry = carry.wrapping_add(delta).wrapping_add(1);
+                output[i + 1] = carry;
+            }
+        }
+        32 => {
+            // 32-bit has no exceptions
+            for i in 0..count - 1 {
+                let idx = i * 4;
+                let delta = u32::from_le_bytes([
+                    packed[idx],
+                    packed[idx + 1],
+                    packed[idx + 2],
+                    packed[idx + 3],
+                ]);
+                carry = carry.wrapping_add(delta).wrapping_add(1);
+                output[i + 1] = carry;
+            }
+        }
+        _ => {
+            // Generic bit width
+            let input_ptr = packed.as_ptr();
+            let mut bit_pos = 0usize;
+
+            for i in 0..count - 1 {
+                let byte_idx = bit_pos >> 3;
+                let bit_offset = bit_pos & 7;
+
+                let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
+                let mut delta = ((word >> bit_offset) & mask) as u32;
+
+                // Check for exception
+                for &(pos, high_bits) in exceptions {
+                    if pos as usize == i {
+                        delta = (high_bits << bit_width) | delta;
+                        break;
+                    }
+                }
+
+                carry = carry.wrapping_add(delta).wrapping_add(1);
+                output[i + 1] = carry;
+                bit_pos += bit_width as usize;
+            }
+        }
+    }
+}
+
 /// A single OptP4D block
 #[derive(Debug, Clone)]
 pub struct OptP4DBlock {
@@ -343,39 +458,46 @@ impl OptP4DBlock {
 
     /// Decode doc_ids from this block using SIMD-accelerated delta decoding
     pub fn decode_doc_ids(&self) -> Vec<u32> {
-        if self.num_docs == 0 {
-            return Vec::new();
-        }
+        let mut output = vec![0u32; self.num_docs as usize];
+        self.decode_doc_ids_into(&mut output);
+        output
+    }
 
+    /// Decode doc_ids into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_doc_ids_into(&self, output: &mut [u32]) -> usize {
         let count = self.num_docs as usize;
-        let mut deltas = vec![0u32; count];
-
-        // Unpack deltas with exceptions (SIMD-accelerated for 8/16/32-bit)
-        if count > 1 {
-            unpack_with_exceptions(
-                &self.doc_deltas,
-                self.doc_bit_width,
-                &self.doc_exceptions,
-                count - 1,
-                &mut deltas,
-            );
+        if count == 0 {
+            return 0;
         }
 
-        // Convert deltas to absolute doc_ids using SIMD-accelerated prefix sum
-        let mut doc_ids = vec![0u32; count];
-        simd::delta_decode(&mut doc_ids, &deltas, self.first_doc_id, count);
+        // Fused unpack + exceptions + delta decode - no intermediate buffer
+        unpack_exceptions_delta_decode(
+            &self.doc_deltas,
+            self.doc_bit_width,
+            &self.doc_exceptions,
+            output,
+            self.first_doc_id,
+            count,
+        );
 
-        doc_ids
+        count
     }
 
     /// Decode term frequencies from this block using SIMD acceleration
     pub fn decode_term_freqs(&self) -> Vec<u32> {
-        if self.num_docs == 0 {
-            return Vec::new();
-        }
+        let mut output = vec![0u32; self.num_docs as usize];
+        self.decode_term_freqs_into(&mut output);
+        output
+    }
 
+    /// Decode term frequencies into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_term_freqs_into(&self, output: &mut [u32]) -> usize {
         let count = self.num_docs as usize;
-        let mut tfs = vec![0u32; count];
+        if count == 0 {
+            return 0;
+        }
 
         // Unpack TFs with exceptions (SIMD-accelerated for 8/16/32-bit)
         unpack_with_exceptions(
@@ -383,13 +505,13 @@ impl OptP4DBlock {
             self.tf_bit_width,
             &self.tf_exceptions,
             count,
-            &mut tfs,
+            output,
         );
 
         // TF is stored as tf-1, so add 1 back using SIMD
-        simd::add_one(&mut tfs, count);
+        simd::add_one(output, count);
 
-        tfs
+        count
     }
 }
 
@@ -458,29 +580,30 @@ impl OptP4DPostingList {
         let first_doc_id = doc_ids[0];
         let last_doc_id = *doc_ids.last().unwrap();
 
-        // Compute deltas (delta - 1 to save one bit since deltas are always >= 1)
-        let mut deltas = Vec::with_capacity(num_docs.saturating_sub(1));
+        // Compute deltas using stack array (delta - 1 to save one bit)
+        let mut deltas = [0u32; OPT_P4D_BLOCK_SIZE];
         for j in 1..num_docs {
-            let delta = doc_ids[j] - doc_ids[j - 1] - 1;
-            deltas.push(delta);
+            deltas[j - 1] = doc_ids[j] - doc_ids[j - 1] - 1;
         }
 
         // Find optimal bit width for deltas
-        let (doc_bit_width, _, _) = find_optimal_bit_width(&deltas);
-        let (doc_deltas, doc_exceptions) = pack_with_exceptions(&deltas, doc_bit_width);
+        let (doc_bit_width, _, _) = find_optimal_bit_width(&deltas[..num_docs.saturating_sub(1)]);
+        let (doc_deltas, doc_exceptions) =
+            pack_with_exceptions(&deltas[..num_docs.saturating_sub(1)], doc_bit_width);
 
-        // Compute max TF and prepare TF array (store tf-1)
-        let mut tfs = Vec::with_capacity(num_docs);
+        // Compute max TF and prepare TF array using stack array (store tf-1)
+        let mut tfs = [0u32; OPT_P4D_BLOCK_SIZE];
         let mut max_tf = 0u32;
 
-        for &tf in term_freqs {
-            tfs.push(tf - 1); // Store tf-1
+        for (j, &tf) in term_freqs.iter().enumerate() {
+            tfs[j] = tf - 1; // Store tf-1
             max_tf = max_tf.max(tf);
         }
 
         // Find optimal bit width for TFs
-        let (tf_bit_width, _, _) = find_optimal_bit_width(&tfs);
-        let (term_freqs_packed, tf_exceptions) = pack_with_exceptions(&tfs, tf_bit_width);
+        let (tf_bit_width, _, _) = find_optimal_bit_width(&tfs[..num_docs]);
+        let (term_freqs_packed, tf_exceptions) =
+            pack_with_exceptions(&tfs[..num_docs], tf_bit_width);
 
         // BM25F upper bound score
         let max_block_score = Self::compute_bm25f_upper_bound(max_tf, idf);
@@ -551,7 +674,11 @@ impl OptP4DPostingList {
 pub struct OptP4DIterator<'a> {
     posting_list: &'a OptP4DPostingList,
     current_block: usize,
+    /// Number of valid elements in current block
+    current_block_len: usize,
+    /// Pre-allocated buffer for decoded doc_ids (avoids allocation per block)
     block_doc_ids: Vec<u32>,
+    /// Pre-allocated buffer for decoded term freqs
     block_term_freqs: Vec<u32>,
     pos_in_block: usize,
     exhausted: bool,
@@ -559,11 +686,13 @@ pub struct OptP4DIterator<'a> {
 
 impl<'a> OptP4DIterator<'a> {
     pub fn new(posting_list: &'a OptP4DPostingList) -> Self {
+        // Pre-allocate buffers to block size to avoid allocations during iteration
         let mut iter = Self {
             posting_list,
             current_block: 0,
-            block_doc_ids: Vec::new(),
-            block_term_freqs: Vec::new(),
+            current_block_len: 0,
+            block_doc_ids: vec![0u32; OPT_P4D_BLOCK_SIZE],
+            block_term_freqs: vec![0u32; OPT_P4D_BLOCK_SIZE],
             pos_in_block: 0,
             exhausted: posting_list.blocks.is_empty(),
         };
@@ -575,14 +704,17 @@ impl<'a> OptP4DIterator<'a> {
         iter
     }
 
+    #[inline]
     fn decode_current_block(&mut self) {
         let block = &self.posting_list.blocks[self.current_block];
-        self.block_doc_ids = block.decode_doc_ids();
-        self.block_term_freqs = block.decode_term_freqs();
+        // Decode into pre-allocated buffers (no allocation!)
+        self.current_block_len = block.decode_doc_ids_into(&mut self.block_doc_ids);
+        block.decode_term_freqs_into(&mut self.block_term_freqs);
         self.pos_in_block = 0;
     }
 
     /// Current document ID
+    #[inline]
     pub fn doc(&self) -> u32 {
         if self.exhausted {
             u32::MAX
@@ -592,6 +724,7 @@ impl<'a> OptP4DIterator<'a> {
     }
 
     /// Current term frequency
+    #[inline]
     pub fn term_freq(&self) -> u32 {
         if self.exhausted {
             0
@@ -601,6 +734,7 @@ impl<'a> OptP4DIterator<'a> {
     }
 
     /// Advance to next document
+    #[inline]
     pub fn advance(&mut self) -> u32 {
         if self.exhausted {
             return u32::MAX;
@@ -608,7 +742,7 @@ impl<'a> OptP4DIterator<'a> {
 
         self.pos_in_block += 1;
 
-        if self.pos_in_block >= self.block_doc_ids.len() {
+        if self.pos_in_block >= self.current_block_len {
             self.current_block += 1;
             if self.current_block >= self.posting_list.blocks.len() {
                 self.exhausted = true;
@@ -641,19 +775,18 @@ impl<'a> OptP4DIterator<'a> {
         }
 
         // Decode block if needed
-        if self.block_doc_ids.is_empty() || self.current_block != self.posting_list.blocks.len() - 1
-        {
+        if self.current_block_len == 0 || self.current_block != self.posting_list.blocks.len() - 1 {
             self.decode_current_block();
         }
 
         // Binary search within block
-        match self.block_doc_ids[self.pos_in_block..].binary_search(&target) {
+        match self.block_doc_ids[self.pos_in_block..self.current_block_len].binary_search(&target) {
             Ok(idx) => {
                 self.pos_in_block += idx;
             }
             Err(idx) => {
                 self.pos_in_block += idx;
-                if self.pos_in_block >= self.block_doc_ids.len() {
+                if self.pos_in_block >= self.current_block_len {
                     // Move to next block
                     self.current_block += 1;
                     if self.current_block >= self.posting_list.blocks.len() {

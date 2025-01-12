@@ -95,51 +95,63 @@ impl RoundedBP128Block {
 
     /// Decode doc_ids from this block using SIMD-friendly rounded unpacking
     pub fn decode_doc_ids(&self) -> Vec<u32> {
+        let mut doc_ids = vec![0u32; self.num_docs as usize];
+        self.decode_doc_ids_into(&mut doc_ids);
+        doc_ids
+    }
+
+    /// Decode doc_ids into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_doc_ids_into(&self, output: &mut [u32]) -> usize {
         let n = self.num_docs as usize;
-        let mut doc_ids = vec![0u32; n];
 
         if n == 0 {
-            return doc_ids;
+            return 0;
         }
 
-        doc_ids[0] = self.first_doc_id;
+        output[0] = self.first_doc_id;
 
         if n == 1 {
-            return doc_ids;
+            return 1;
         }
 
-        // Unpack deltas using rounded bit width (fast SIMD path)
-        let mut deltas = vec![0u32; n - 1];
-        let rounded_width = RoundedBitWidth::from_exact(self.doc_bit_width);
-        simd::unpack_rounded(&self.doc_deltas, rounded_width, &mut deltas, n - 1);
+        // Use fused unpack + delta decode for best performance
+        let rounded_width = RoundedBitWidth::from_u8(self.doc_bit_width);
+        simd::unpack_rounded_delta_decode(
+            &self.doc_deltas,
+            rounded_width,
+            output,
+            self.first_doc_id,
+            n,
+        );
 
-        // Delta decode: doc_ids[i] = doc_ids[i-1] + delta + 1
-        let mut current = self.first_doc_id;
-        for i in 0..n - 1 {
-            current = current + deltas[i] + 1;
-            doc_ids[i + 1] = current;
-        }
-
-        doc_ids
+        n
     }
 
     /// Decode term frequencies using SIMD-friendly rounded unpacking
     pub fn decode_term_freqs(&self) -> Vec<u32> {
+        let mut tfs = vec![0u32; self.num_docs as usize];
+        self.decode_term_freqs_into(&mut tfs);
+        tfs
+    }
+
+    /// Decode term frequencies into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_term_freqs_into(&self, output: &mut [u32]) -> usize {
         let n = self.num_docs as usize;
-        let mut tfs = vec![0u32; n];
 
         if n == 0 {
-            return tfs;
+            return 0;
         }
 
         // Unpack using rounded bit width (fast SIMD path)
-        let rounded_width = RoundedBitWidth::from_exact(self.tf_bit_width);
-        simd::unpack_rounded(&self.term_freqs, rounded_width, &mut tfs, n);
+        let rounded_width = RoundedBitWidth::from_u8(self.tf_bit_width);
+        simd::unpack_rounded(&self.term_freqs, rounded_width, output, n);
 
         // Add 1 back (we stored tf-1)
-        simd::add_one(&mut tfs, n);
+        simd::add_one(output, n);
 
-        tfs
+        n
     }
 }
 
@@ -313,18 +325,24 @@ pub struct RoundedBP128Iterator<'a> {
     posting_list: &'a RoundedBP128PostingList,
     current_block: usize,
     position_in_block: usize,
+    /// Number of valid elements in current block
+    current_block_len: usize,
+    /// Pre-allocated buffer for decoded doc_ids (avoids allocation per block)
     decoded_doc_ids: Vec<u32>,
+    /// Pre-allocated buffer for decoded term frequencies
     decoded_tfs: Vec<u32>,
 }
 
 impl<'a> RoundedBP128Iterator<'a> {
     pub fn new(posting_list: &'a RoundedBP128PostingList) -> Self {
+        // Pre-allocate buffers to block size to avoid allocations during iteration
         let mut iter = Self {
             posting_list,
             current_block: 0,
             position_in_block: 0,
-            decoded_doc_ids: Vec::new(),
-            decoded_tfs: Vec::new(),
+            current_block_len: 0,
+            decoded_doc_ids: vec![0u32; ROUNDED_BP128_BLOCK_SIZE],
+            decoded_tfs: vec![0u32; ROUNDED_BP128_BLOCK_SIZE],
         };
 
         if !posting_list.blocks.is_empty() {
@@ -334,11 +352,15 @@ impl<'a> RoundedBP128Iterator<'a> {
         iter
     }
 
+    #[inline]
     fn decode_current_block(&mut self) {
         if self.current_block < self.posting_list.blocks.len() {
             let block = &self.posting_list.blocks[self.current_block];
-            self.decoded_doc_ids = block.decode_doc_ids();
-            self.decoded_tfs = block.decode_term_freqs();
+            // Decode into pre-allocated buffers (no allocation!)
+            self.current_block_len = block.decode_doc_ids_into(&mut self.decoded_doc_ids);
+            block.decode_term_freqs_into(&mut self.decoded_tfs);
+        } else {
+            self.current_block_len = 0;
         }
     }
 
@@ -348,7 +370,7 @@ impl<'a> RoundedBP128Iterator<'a> {
         if self.current_block >= self.posting_list.blocks.len() {
             return u32::MAX;
         }
-        if self.position_in_block >= self.decoded_doc_ids.len() {
+        if self.position_in_block >= self.current_block_len {
             return u32::MAX;
         }
         self.decoded_doc_ids[self.position_in_block]
@@ -360,7 +382,7 @@ impl<'a> RoundedBP128Iterator<'a> {
         if self.current_block >= self.posting_list.blocks.len() {
             return 0;
         }
-        if self.position_in_block >= self.decoded_tfs.len() {
+        if self.position_in_block >= self.current_block_len {
             return 0;
         }
         self.decoded_tfs[self.position_in_block]
@@ -371,7 +393,7 @@ impl<'a> RoundedBP128Iterator<'a> {
     pub fn advance(&mut self) -> u32 {
         self.position_in_block += 1;
 
-        if self.position_in_block >= self.decoded_doc_ids.len() {
+        if self.position_in_block >= self.current_block_len {
             self.current_block += 1;
             self.position_in_block = 0;
 
@@ -399,12 +421,11 @@ impl<'a> RoundedBP128Iterator<'a> {
             return u32::MAX;
         }
 
-        // Decode block if needed
-        if self.decoded_doc_ids.is_empty()
-            || self.position_in_block >= self.decoded_doc_ids.len()
-            || (self.position_in_block == 0
-                && self.decoded_doc_ids[0]
-                    != self.posting_list.blocks[self.current_block].first_doc_id)
+        // Decode block if needed (check if we're on the right block)
+        let block = &self.posting_list.blocks[self.current_block];
+        if self.current_block_len == 0
+            || self.position_in_block >= self.current_block_len
+            || (self.position_in_block == 0 && self.decoded_doc_ids[0] != block.first_doc_id)
         {
             self.decode_current_block();
             self.position_in_block = 0;
@@ -412,7 +433,7 @@ impl<'a> RoundedBP128Iterator<'a> {
 
         // Binary search within block
         let start = self.position_in_block;
-        let slice = &self.decoded_doc_ids[start..];
+        let slice = &self.decoded_doc_ids[start..self.current_block_len];
         match slice.binary_search(&target) {
             Ok(pos) => {
                 self.position_in_block = start + pos;

@@ -1009,6 +1009,18 @@ impl RoundedBitWidth {
         }
     }
 
+    /// Convert from stored u8 value (must be 0, 8, 16, or 32)
+    #[inline]
+    pub fn from_u8(bits: u8) -> Self {
+        match bits {
+            0 => RoundedBitWidth::Zero,
+            8 => RoundedBitWidth::Bits8,
+            16 => RoundedBitWidth::Bits16,
+            32 => RoundedBitWidth::Bits32,
+            _ => RoundedBitWidth::Bits32, // Fallback for invalid values
+        }
+    }
+
     /// Get the byte size per value
     #[inline]
     pub fn bytes_per_value(self) -> usize {
@@ -1212,6 +1224,78 @@ pub fn unpack_16bit_delta_decode(input: &[u8], output: &mut [u32], first_value: 
         let delta = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
         carry = carry.wrapping_add(delta).wrapping_add(1);
         output[i + 1] = carry;
+    }
+}
+
+/// Fused unpack + delta decode for arbitrary bit widths
+///
+/// Combines unpacking and prefix sum in a single pass, avoiding intermediate buffer.
+/// Uses SIMD-accelerated paths for 8/16-bit widths, scalar for others.
+#[inline]
+pub fn unpack_delta_decode(
+    input: &[u8],
+    bit_width: u8,
+    output: &mut [u32],
+    first_value: u32,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+
+    output[0] = first_value;
+    if count == 1 {
+        return;
+    }
+
+    // Fast paths for SIMD-friendly bit widths
+    match bit_width {
+        0 => {
+            // All zeros = consecutive doc IDs (gap of 1)
+            let mut val = first_value;
+            for item in output.iter_mut().take(count).skip(1) {
+                val = val.wrapping_add(1);
+                *item = val;
+            }
+        }
+        8 => unpack_8bit_delta_decode(input, output, first_value, count),
+        16 => unpack_16bit_delta_decode(input, output, first_value, count),
+        32 => {
+            // 32-bit: unpack inline and delta decode
+            let mut carry = first_value;
+            for i in 0..count - 1 {
+                let idx = i * 4;
+                let delta = u32::from_le_bytes([
+                    input[idx],
+                    input[idx + 1],
+                    input[idx + 2],
+                    input[idx + 3],
+                ]);
+                carry = carry.wrapping_add(delta).wrapping_add(1);
+                output[i + 1] = carry;
+            }
+        }
+        _ => {
+            // Generic bit width: fused unpack + delta decode
+            let mask = (1u64 << bit_width) - 1;
+            let bit_width_usize = bit_width as usize;
+            let mut bit_pos = 0usize;
+            let input_ptr = input.as_ptr();
+            let mut carry = first_value;
+
+            for i in 0..count - 1 {
+                let byte_idx = bit_pos >> 3;
+                let bit_offset = bit_pos & 7;
+
+                // SAFETY: Caller guarantees input has enough data
+                let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
+                let delta = ((word >> bit_offset) & mask) as u32;
+
+                carry = carry.wrapping_add(delta).wrapping_add(1);
+                output[i + 1] = carry;
+                bit_pos += bit_width_usize;
+            }
+        }
     }
 }
 

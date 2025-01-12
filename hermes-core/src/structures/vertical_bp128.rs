@@ -843,36 +843,83 @@ impl VerticalBP128Block {
 
     /// Decode doc_ids from this block
     pub fn decode_doc_ids(&self) -> Vec<u32> {
-        if self.num_docs == 0 {
-            return Vec::new();
+        let mut output = vec![0u32; self.num_docs as usize];
+        self.decode_doc_ids_into(&mut output);
+        output
+    }
+
+    /// Decode doc_ids into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_doc_ids_into(&self, output: &mut [u32]) -> usize {
+        let count = self.num_docs as usize;
+        if count == 0 {
+            return 0;
         }
 
-        let mut output = [0u32; VERTICAL_BP128_BLOCK_SIZE];
-        unpack_vertical_d1(
-            &self.doc_data,
-            self.doc_bit_width,
-            self.first_doc_id,
-            &mut output,
-            self.num_docs as usize,
-        );
+        // For full blocks, decode directly if output is large enough
+        // For partial blocks, we need the temp buffer due to SIMD alignment
+        if count == VERTICAL_BP128_BLOCK_SIZE && output.len() >= VERTICAL_BP128_BLOCK_SIZE {
+            // SAFETY: output slice is large enough, reinterpret as fixed array
+            let out_array: &mut [u32; VERTICAL_BP128_BLOCK_SIZE] = (&mut output
+                [..VERTICAL_BP128_BLOCK_SIZE])
+                .try_into()
+                .unwrap();
+            unpack_vertical_d1(
+                &self.doc_data,
+                self.doc_bit_width,
+                self.first_doc_id,
+                out_array,
+                count,
+            );
+        } else {
+            // Partial block - need temp buffer for SIMD alignment
+            let mut temp = [0u32; VERTICAL_BP128_BLOCK_SIZE];
+            unpack_vertical_d1(
+                &self.doc_data,
+                self.doc_bit_width,
+                self.first_doc_id,
+                &mut temp,
+                count,
+            );
+            output[..count].copy_from_slice(&temp[..count]);
+        }
 
-        output[..self.num_docs as usize].to_vec()
+        count
     }
 
     /// Decode term frequencies from this block
     pub fn decode_term_freqs(&self) -> Vec<u32> {
-        if self.num_docs == 0 {
-            return Vec::new();
+        let mut output = vec![0u32; self.num_docs as usize];
+        self.decode_term_freqs_into(&mut output);
+        output
+    }
+
+    /// Decode term frequencies into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_term_freqs_into(&self, output: &mut [u32]) -> usize {
+        let count = self.num_docs as usize;
+        if count == 0 {
+            return 0;
         }
 
-        let mut output = [0u32; VERTICAL_BP128_BLOCK_SIZE];
-        unpack_vertical(&self.tf_data, self.tf_bit_width, &mut output);
+        // For full blocks, decode directly if output is large enough
+        if count == VERTICAL_BP128_BLOCK_SIZE && output.len() >= VERTICAL_BP128_BLOCK_SIZE {
+            let out_array: &mut [u32; VERTICAL_BP128_BLOCK_SIZE] = (&mut output
+                [..VERTICAL_BP128_BLOCK_SIZE])
+                .try_into()
+                .unwrap();
+            unpack_vertical(&self.tf_data, self.tf_bit_width, out_array);
+        } else {
+            // Partial block - need temp buffer for SIMD alignment
+            let mut temp = [0u32; VERTICAL_BP128_BLOCK_SIZE];
+            unpack_vertical(&self.tf_data, self.tf_bit_width, &mut temp);
+            output[..count].copy_from_slice(&temp[..count]);
+        }
 
         // TF is stored as tf-1, add 1 back
-        output[..self.num_docs as usize]
-            .iter()
-            .map(|&tf| tf + 1)
-            .collect()
+        simd::add_one(output, count);
+
+        count
     }
 }
 
@@ -1032,7 +1079,11 @@ impl VerticalBP128PostingList {
 pub struct VerticalBP128Iterator<'a> {
     list: &'a VerticalBP128PostingList,
     current_block: usize,
+    /// Number of valid elements in current block
+    current_block_len: usize,
+    /// Pre-allocated buffer for decoded doc_ids (avoids allocation per block)
     block_doc_ids: Vec<u32>,
+    /// Pre-allocated buffer for decoded term freqs
     block_term_freqs: Vec<u32>,
     pos_in_block: usize,
     exhausted: bool,
@@ -1040,11 +1091,13 @@ pub struct VerticalBP128Iterator<'a> {
 
 impl<'a> VerticalBP128Iterator<'a> {
     pub fn new(list: &'a VerticalBP128PostingList) -> Self {
+        // Pre-allocate buffers to block size to avoid allocations during iteration
         let mut iter = Self {
             list,
             current_block: 0,
-            block_doc_ids: Vec::new(),
-            block_term_freqs: Vec::new(),
+            current_block_len: 0,
+            block_doc_ids: vec![0u32; VERTICAL_BP128_BLOCK_SIZE],
+            block_term_freqs: vec![0u32; VERTICAL_BP128_BLOCK_SIZE],
             pos_in_block: 0,
             exhausted: list.blocks.is_empty(),
         };
@@ -1056,14 +1109,17 @@ impl<'a> VerticalBP128Iterator<'a> {
         iter
     }
 
+    #[inline]
     fn decode_current_block(&mut self) {
         let block = &self.list.blocks[self.current_block];
-        self.block_doc_ids = block.decode_doc_ids();
-        self.block_term_freqs = block.decode_term_freqs();
+        // Decode into pre-allocated buffers (no allocation!)
+        self.current_block_len = block.decode_doc_ids_into(&mut self.block_doc_ids);
+        block.decode_term_freqs_into(&mut self.block_term_freqs);
         self.pos_in_block = 0;
     }
 
     /// Current document ID
+    #[inline]
     pub fn doc(&self) -> u32 {
         if self.exhausted {
             u32::MAX
@@ -1073,6 +1129,7 @@ impl<'a> VerticalBP128Iterator<'a> {
     }
 
     /// Current term frequency
+    #[inline]
     pub fn term_freq(&self) -> u32 {
         if self.exhausted {
             0
@@ -1082,6 +1139,7 @@ impl<'a> VerticalBP128Iterator<'a> {
     }
 
     /// Advance to next document
+    #[inline]
     pub fn advance(&mut self) -> u32 {
         if self.exhausted {
             return u32::MAX;
@@ -1089,7 +1147,7 @@ impl<'a> VerticalBP128Iterator<'a> {
 
         self.pos_in_block += 1;
 
-        if self.pos_in_block >= self.block_doc_ids.len() {
+        if self.pos_in_block >= self.current_block_len {
             self.current_block += 1;
             if self.current_block >= self.list.blocks.len() {
                 self.exhausted = true;
@@ -1135,12 +1193,12 @@ impl<'a> VerticalBP128Iterator<'a> {
         }
 
         // Binary search within block
-        let pos = self.block_doc_ids[self.pos_in_block..]
+        let pos = self.block_doc_ids[self.pos_in_block..self.current_block_len]
             .binary_search(&target)
             .unwrap_or_else(|x| x);
         self.pos_in_block += pos;
 
-        if self.pos_in_block >= self.block_doc_ids.len() {
+        if self.pos_in_block >= self.current_block_len {
             self.current_block += 1;
             if self.current_block >= self.list.blocks.len() {
                 self.exhausted = true;

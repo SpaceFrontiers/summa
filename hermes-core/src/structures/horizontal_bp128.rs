@@ -243,34 +243,53 @@ impl HorizontalBP128Block {
 
     /// Decode doc_ids from this block
     pub fn decode_doc_ids(&self) -> Vec<u32> {
-        if self.num_docs == 0 {
-            return Vec::new();
+        let mut output = vec![0u32; self.num_docs as usize];
+        self.decode_doc_ids_into(&mut output);
+        output
+    }
+
+    /// Decode doc_ids into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_doc_ids_into(&self, output: &mut [u32]) -> usize {
+        let count = self.num_docs as usize;
+        if count == 0 {
+            return 0;
         }
 
-        let count = self.num_docs as usize;
-        let mut deltas = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
-        unpack_block(&self.doc_deltas, self.doc_bit_width, &mut deltas);
+        // Fused unpack + delta decode - no intermediate buffer needed
+        simd::unpack_delta_decode(
+            &self.doc_deltas,
+            self.doc_bit_width,
+            output,
+            self.first_doc_id,
+            count,
+        );
 
-        let mut output = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
-        simd::delta_decode(&mut output, &deltas, self.first_doc_id, count);
-
-        output[..count].to_vec()
+        count
     }
 
     /// Decode term frequencies from this block
     pub fn decode_term_freqs(&self) -> Vec<u32> {
-        if self.num_docs == 0 {
-            return Vec::new();
+        let mut output = vec![0u32; self.num_docs as usize];
+        self.decode_term_freqs_into(&mut output);
+        output
+    }
+
+    /// Decode term frequencies into a pre-allocated buffer (avoids allocation)
+    #[inline]
+    pub fn decode_term_freqs_into(&self, output: &mut [u32]) -> usize {
+        let count = self.num_docs as usize;
+        if count == 0 {
+            return 0;
         }
 
-        let mut tfs = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
-        unpack_block(&self.term_freqs, self.tf_bit_width, &mut tfs);
+        // Use slice-based unpack to avoid temp buffer copy
+        unpack_block_n(&self.term_freqs, self.tf_bit_width, output, count);
 
         // TF is stored as tf-1, so add 1 back
-        tfs[..self.num_docs as usize]
-            .iter()
-            .map(|&tf| tf + 1)
-            .collect()
+        simd::add_one(output, count);
+
+        count
     }
 }
 
@@ -429,9 +448,11 @@ pub struct HorizontalBP128Iterator<'a> {
     posting_list: &'a HorizontalBP128PostingList,
     /// Current block index
     current_block: usize,
-    /// Decoded doc_ids for current block
+    /// Number of valid elements in current block
+    current_block_len: usize,
+    /// Pre-allocated buffer for decoded doc_ids (avoids allocation per block)
     block_doc_ids: Vec<u32>,
-    /// Decoded term freqs for current block
+    /// Pre-allocated buffer for decoded term freqs
     block_term_freqs: Vec<u32>,
     /// Position within current block
     pos_in_block: usize,
@@ -441,11 +462,13 @@ pub struct HorizontalBP128Iterator<'a> {
 
 impl<'a> HorizontalBP128Iterator<'a> {
     pub fn new(posting_list: &'a HorizontalBP128PostingList) -> Self {
+        // Pre-allocate buffers to block size to avoid allocations during iteration
         let mut iter = Self {
             posting_list,
             current_block: 0,
-            block_doc_ids: Vec::new(),
-            block_term_freqs: Vec::new(),
+            current_block_len: 0,
+            block_doc_ids: vec![0u32; HORIZONTAL_BP128_BLOCK_SIZE],
+            block_term_freqs: vec![0u32; HORIZONTAL_BP128_BLOCK_SIZE],
             pos_in_block: 0,
             exhausted: posting_list.blocks.is_empty(),
         };
@@ -457,14 +480,17 @@ impl<'a> HorizontalBP128Iterator<'a> {
         iter
     }
 
+    #[inline]
     fn decode_current_block(&mut self) {
         let block = &self.posting_list.blocks[self.current_block];
-        self.block_doc_ids = block.decode_doc_ids();
-        self.block_term_freqs = block.decode_term_freqs();
+        // Decode into pre-allocated buffers (no allocation!)
+        self.current_block_len = block.decode_doc_ids_into(&mut self.block_doc_ids);
+        block.decode_term_freqs_into(&mut self.block_term_freqs);
         self.pos_in_block = 0;
     }
 
     /// Current document ID
+    #[inline]
     pub fn doc(&self) -> u32 {
         if self.exhausted {
             u32::MAX
@@ -474,6 +500,7 @@ impl<'a> HorizontalBP128Iterator<'a> {
     }
 
     /// Current term frequency
+    #[inline]
     pub fn term_freq(&self) -> u32 {
         if self.exhausted {
             0
@@ -483,6 +510,7 @@ impl<'a> HorizontalBP128Iterator<'a> {
     }
 
     /// Advance to next document
+    #[inline]
     pub fn advance(&mut self) -> u32 {
         if self.exhausted {
             return u32::MAX;
@@ -490,7 +518,7 @@ impl<'a> HorizontalBP128Iterator<'a> {
 
         self.pos_in_block += 1;
 
-        if self.pos_in_block >= self.block_doc_ids.len() {
+        if self.pos_in_block >= self.current_block_len {
             self.current_block += 1;
             if self.current_block >= self.posting_list.blocks.len() {
                 self.exhausted = true;
@@ -534,15 +562,18 @@ impl<'a> HorizontalBP128Iterator<'a> {
         if target_block != self.current_block {
             self.current_block = target_block;
             self.decode_current_block();
-        } else if self.block_doc_ids.is_empty() {
+        } else if self.current_block_len == 0 {
             self.decode_current_block();
         }
 
         // Binary search within the block
-        let pos = binary_search_block(&self.block_doc_ids[self.pos_in_block..], target);
+        let pos = binary_search_block(
+            &self.block_doc_ids[self.pos_in_block..self.current_block_len],
+            target,
+        );
         self.pos_in_block += pos;
 
-        if self.pos_in_block >= self.block_doc_ids.len() {
+        if self.pos_in_block >= self.current_block_len {
             // Target not in this block, move to next
             self.current_block += 1;
             if self.current_block >= self.posting_list.blocks.len() {
