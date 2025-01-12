@@ -1,0 +1,35 @@
+[package]
+name = "hermes-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "WASM bindings for Hermes search engine"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hermes-core = { workspace = true, default-features = false, features = ["wasm", "http"] }
+async-trait = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = ["IdbFactory", "IdbDatabase", "IdbObjectStore", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbOpenDbRequest", "IdbVersionChangeEvent", "DomStringList"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true }
+log = "0.4"
+console_log = "1.0"
+getrandom = { workspace = true }
+parking_lot = { workspace = true }
+futures-channel = "0.3"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O4", "--enable-bulk-memory"]

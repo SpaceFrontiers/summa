@@ -1,0 +1,233 @@
+name: Publish Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      publish_crates:
+        description: 'Publish to crates.io'
+        type: boolean
+        default: true
+      publish_npm:
+        description: 'Publish to NPM'
+        type: boolean
+        default: true
+      publish_pypi:
+        description: 'Publish to PyPI'
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump-version:
+    name: Bump Version
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get current version
+        id: current
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $VERSION"
+
+      - name: Calculate new version
+        id: bump
+        run: |
+          VERSION="${{ steps.current.outputs.version }}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          
+          case "${{ inputs.version_bump }}" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+          
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION"
+
+      - name: Update Cargo.toml version
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
+          echo "Updated Cargo.toml to version ${{ steps.bump.outputs.new_version }}"
+
+      - name: Update pyproject.toml version
+        run: |
+          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-python/pyproject.toml
+          echo "Updated pyproject.toml to version ${{ steps.bump.outputs.new_version }}"
+
+      - name: Commit and push
+        run: |
+          git add Cargo.toml hermes-python/pyproject.toml
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
+          git push
+
+      - name: Create git tag
+        run: |
+          git tag "v${{ steps.bump.outputs.new_version }}"
+          git push origin "v${{ steps.bump.outputs.new_version }}"
+
+
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: bump-version
+    if: inputs.publish_crates
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Login to crates.io
+        run: cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish hermes-core
+        run: cargo publish -p hermes-core --no-verify
+        continue-on-error: true
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish hermes-server
+        run: cargo publish -p hermes-server --no-verify
+        continue-on-error: true
+
+      - name: Publish hermes-tool
+        run: cargo publish -p hermes-tool --no-verify
+        continue-on-error: true
+
+      - name: Publish hermes-python
+        run: cargo publish -p hermes-python --no-verify
+        continue-on-error: true
+
+  publish-npm:
+    name: Publish to NPM
+    runs-on: ubuntu-latest
+    needs: bump-version
+    if: inputs.publish_npm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Build WASM
+        run: |
+          cd hermes-wasm
+          wasm-pack build --release --target web
+
+      - name: Publish to NPM
+        run: |
+          cd hermes-wasm/pkg
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Build and publish wheels for multiple platforms and Python versions
+  build-wheels:
+    name: Build Python wheels (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    needs: bump-version
+    if: inputs.publish_pypi
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        run: |
+          cd hermes-python
+          maturin build --release --interpreter python${{ matrix.python }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python }}
+          path: hermes-python/target/wheels/*.whl
+
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: build-wheels
+    if: inputs.publish_pypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install twine
+        run: pip install twine
+
+      - name: Publish to PyPI
+        run: twine upload dist/*.whl
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}

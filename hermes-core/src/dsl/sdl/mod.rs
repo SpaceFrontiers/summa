@@ -1,0 +1,697 @@
+//! Schema Definition Language (SDL) for Hermes
+//!
+//! A simple, readable format for defining index schemas using pest parser.
+//!
+//! # Example SDL
+//!
+//! ```text
+//! # Article index schema
+//! index articles {
+//!     # Primary text field for full-text search
+//!     field title: text [indexed, stored]
+//!     
+//!     # Body content - indexed but not stored (save space)
+//!     field body: text [indexed]
+//!     
+//!     # Author name
+//!     field author: text [indexed, stored]
+//!     
+//!     # Publication timestamp
+//!     field published_at: i64 [indexed, stored]
+//!     
+//!     # View count
+//!     field views: u64 [indexed, stored]
+//!     
+//!     # Rating score
+//!     field rating: f64 [indexed, stored]
+//!     
+//!     # Raw content hash (not indexed, just stored)
+//!     field content_hash: bytes [stored]
+//! }
+//! ```
+
+use pest::Parser;
+use pest_derive::Parser;
+
+use super::query_field_router::{QueryRouterRule, RoutingMode};
+use super::schema::{FieldType, Schema, SchemaBuilder};
+use crate::Result;
+use crate::error::Error;
+
+#[derive(Parser)]
+#[grammar = "dsl/sdl/sdl.pest"]
+pub struct SdlParser;
+
+/// Parsed field definition
+#[derive(Debug, Clone)]
+pub struct FieldDef {
+    pub name: String,
+    pub field_type: FieldType,
+    pub indexed: bool,
+    pub stored: bool,
+    /// Tokenizer name for text fields (e.g., "default", "en_stem", "german")
+    pub tokenizer: Option<String>,
+    /// Whether this field can have multiple values (serialized as array in JSON)
+    pub multi: bool,
+}
+
+/// Parsed index definition
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub name: String,
+    pub fields: Vec<FieldDef>,
+    pub default_fields: Vec<String>,
+    /// Query router rules for routing queries to specific fields
+    pub query_routers: Vec<QueryRouterRule>,
+}
+
+impl IndexDef {
+    /// Convert to a Schema
+    pub fn to_schema(&self) -> Schema {
+        let mut builder = SchemaBuilder::default();
+
+        for field in &self.fields {
+            let f = match field.field_type {
+                FieldType::Text => {
+                    let tokenizer = field.tokenizer.as_deref().unwrap_or("default");
+                    builder.add_text_field_with_tokenizer(
+                        &field.name,
+                        field.indexed,
+                        field.stored,
+                        tokenizer,
+                    )
+                }
+                FieldType::U64 => builder.add_u64_field(&field.name, field.indexed, field.stored),
+                FieldType::I64 => builder.add_i64_field(&field.name, field.indexed, field.stored),
+                FieldType::F64 => builder.add_f64_field(&field.name, field.indexed, field.stored),
+                FieldType::Bytes => builder.add_bytes_field(&field.name, field.stored),
+            };
+            if field.multi {
+                builder.set_multi(f, true);
+            }
+        }
+
+        // Set default fields if specified
+        if !self.default_fields.is_empty() {
+            builder.set_default_fields(self.default_fields.clone());
+        }
+
+        // Set query routers if specified
+        if !self.query_routers.is_empty() {
+            builder.set_query_routers(self.query_routers.clone());
+        }
+
+        builder.build()
+    }
+
+    /// Create a QueryFieldRouter from the query router rules
+    ///
+    /// Returns None if there are no query router rules defined.
+    /// Returns Err if any regex pattern is invalid.
+    pub fn to_query_router(&self) -> Result<Option<super::query_field_router::QueryFieldRouter>> {
+        if self.query_routers.is_empty() {
+            return Ok(None);
+        }
+
+        super::query_field_router::QueryFieldRouter::from_rules(&self.query_routers)
+            .map(Some)
+            .map_err(|e| Error::Schema(e))
+    }
+}
+
+/// Parse field type from string
+fn parse_field_type(type_str: &str) -> Result<FieldType> {
+    match type_str {
+        "text" | "string" | "str" => Ok(FieldType::Text),
+        "u64" | "uint" | "unsigned" => Ok(FieldType::U64),
+        "i64" | "int" | "integer" => Ok(FieldType::I64),
+        "f64" | "float" | "double" => Ok(FieldType::F64),
+        "bytes" | "binary" | "blob" => Ok(FieldType::Bytes),
+        _ => Err(Error::Schema(format!("Unknown field type: {}", type_str))),
+    }
+}
+
+/// Parse attributes from pest pair
+/// Returns (indexed, stored, multi)
+fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> (bool, bool, bool) {
+    let mut indexed = false;
+    let mut stored = false;
+    let mut multi = false;
+
+    for attr in pair.into_inner() {
+        match attr.as_str() {
+            "indexed" => indexed = true,
+            "stored" => stored = true,
+            "multi" => multi = true,
+            _ => {}
+        }
+    }
+
+    (indexed, stored, multi)
+}
+
+/// Parse a field definition from pest pair
+fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
+    let mut inner = pair.into_inner();
+
+    let name = inner
+        .next()
+        .ok_or_else(|| Error::Schema("Missing field name".to_string()))?
+        .as_str()
+        .to_string();
+
+    let field_type_str = inner
+        .next()
+        .ok_or_else(|| Error::Schema("Missing field type".to_string()))?
+        .as_str();
+
+    let field_type = parse_field_type(field_type_str)?;
+
+    // Parse optional tokenizer spec and attributes
+    let mut tokenizer = None;
+    let mut indexed = true;
+    let mut stored = true;
+    let mut multi = false;
+
+    for item in inner {
+        match item.as_rule() {
+            Rule::tokenizer_spec => {
+                // Extract tokenizer name from <name>
+                if let Some(tok_name) = item.into_inner().next() {
+                    tokenizer = Some(tok_name.as_str().to_string());
+                }
+            }
+            Rule::attributes => {
+                let (idx, sto, mul) = parse_attributes(item);
+                indexed = idx;
+                stored = sto;
+                multi = mul;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(FieldDef {
+        name,
+        field_type,
+        indexed,
+        stored,
+        tokenizer,
+        multi,
+    })
+}
+
+/// Parse default_fields definition
+fn parse_default_fields_def(pair: pest::iterators::Pair<Rule>) -> Vec<String> {
+    pair.into_inner().map(|p| p.as_str().to_string()).collect()
+}
+
+/// Parse a query router definition
+fn parse_query_router_def(pair: pest::iterators::Pair<Rule>) -> Result<QueryRouterRule> {
+    let mut pattern = String::new();
+    let mut substitution = String::new();
+    let mut target_field = String::new();
+    let mut mode = RoutingMode::Additional;
+
+    for prop in pair.into_inner() {
+        if prop.as_rule() != Rule::query_router_prop {
+            continue;
+        }
+
+        for inner in prop.into_inner() {
+            match inner.as_rule() {
+                Rule::query_router_pattern => {
+                    if let Some(regex_str) = inner.into_inner().next() {
+                        pattern = parse_string_value(regex_str);
+                    }
+                }
+                Rule::query_router_substitution => {
+                    if let Some(quoted) = inner.into_inner().next() {
+                        substitution = parse_string_value(quoted);
+                    }
+                }
+                Rule::query_router_target => {
+                    if let Some(ident) = inner.into_inner().next() {
+                        target_field = ident.as_str().to_string();
+                    }
+                }
+                Rule::query_router_mode => {
+                    if let Some(mode_val) = inner.into_inner().next() {
+                        mode = match mode_val.as_str() {
+                            "exclusive" => RoutingMode::Exclusive,
+                            "additional" => RoutingMode::Additional,
+                            _ => RoutingMode::Additional,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if pattern.is_empty() {
+        return Err(Error::Schema("query_router missing 'pattern'".to_string()));
+    }
+    if substitution.is_empty() {
+        return Err(Error::Schema(
+            "query_router missing 'substitution'".to_string(),
+        ));
+    }
+    if target_field.is_empty() {
+        return Err(Error::Schema(
+            "query_router missing 'target_field'".to_string(),
+        ));
+    }
+
+    Ok(QueryRouterRule {
+        pattern,
+        substitution,
+        target_field,
+        mode,
+    })
+}
+
+/// Parse a string value from quoted_string, raw_string, or regex_string
+fn parse_string_value(pair: pest::iterators::Pair<Rule>) -> String {
+    let s = pair.as_str();
+    match pair.as_rule() {
+        Rule::regex_string => {
+            // regex_string contains either raw_string or quoted_string
+            if let Some(inner) = pair.into_inner().next() {
+                parse_string_value(inner)
+            } else {
+                s.to_string()
+            }
+        }
+        Rule::raw_string => {
+            // r"..." - strip r" prefix and " suffix
+            s[2..s.len() - 1].to_string()
+        }
+        Rule::quoted_string => {
+            // "..." - strip quotes and handle escapes
+            let inner = &s[1..s.len() - 1];
+            // Simple escape handling
+            inner
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+        }
+        _ => s.to_string(),
+    }
+}
+
+/// Parse an index definition from pest pair
+fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
+    let mut inner = pair.into_inner();
+
+    let name = inner
+        .next()
+        .ok_or_else(|| Error::Schema("Missing index name".to_string()))?
+        .as_str()
+        .to_string();
+
+    let mut fields = Vec::new();
+    let mut default_fields = Vec::new();
+    let mut query_routers = Vec::new();
+
+    for item in inner {
+        match item.as_rule() {
+            Rule::field_def => {
+                fields.push(parse_field_def(item)?);
+            }
+            Rule::default_fields_def => {
+                default_fields = parse_default_fields_def(item);
+            }
+            Rule::query_router_def => {
+                query_routers.push(parse_query_router_def(item)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(IndexDef {
+        name,
+        fields,
+        default_fields,
+        query_routers,
+    })
+}
+
+/// Parse SDL from a string
+pub fn parse_sdl(input: &str) -> Result<Vec<IndexDef>> {
+    let pairs = SdlParser::parse(Rule::file, input)
+        .map_err(|e| Error::Schema(format!("Parse error: {}", e)))?;
+
+    let mut indexes = Vec::new();
+
+    for pair in pairs {
+        if pair.as_rule() == Rule::file {
+            for inner in pair.into_inner() {
+                if inner.as_rule() == Rule::index_def {
+                    indexes.push(parse_index_def(inner)?);
+                }
+            }
+        }
+    }
+
+    Ok(indexes)
+}
+
+/// Parse SDL and return a single index definition
+pub fn parse_single_index(input: &str) -> Result<IndexDef> {
+    let indexes = parse_sdl(input)?;
+
+    if indexes.is_empty() {
+        return Err(Error::Schema("No index definition found".to_string()));
+    }
+
+    if indexes.len() > 1 {
+        return Err(Error::Schema(
+            "Multiple index definitions found, expected one".to_string(),
+        ));
+    }
+
+    Ok(indexes.into_iter().next().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_schema() {
+        let sdl = r#"
+            index articles {
+                field title: text [indexed, stored]
+                field body: text [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 1);
+
+        let index = &indexes[0];
+        assert_eq!(index.name, "articles");
+        assert_eq!(index.fields.len(), 2);
+
+        assert_eq!(index.fields[0].name, "title");
+        assert!(matches!(index.fields[0].field_type, FieldType::Text));
+        assert!(index.fields[0].indexed);
+        assert!(index.fields[0].stored);
+
+        assert_eq!(index.fields[1].name, "body");
+        assert!(matches!(index.fields[1].field_type, FieldType::Text));
+        assert!(index.fields[1].indexed);
+        assert!(!index.fields[1].stored);
+    }
+
+    #[test]
+    fn test_parse_all_field_types() {
+        let sdl = r#"
+            index test {
+                field text_field: text [indexed, stored]
+                field u64_field: u64 [indexed, stored]
+                field i64_field: i64 [indexed, stored]
+                field f64_field: f64 [indexed, stored]
+                field bytes_field: bytes [stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let index = &indexes[0];
+
+        assert!(matches!(index.fields[0].field_type, FieldType::Text));
+        assert!(matches!(index.fields[1].field_type, FieldType::U64));
+        assert!(matches!(index.fields[2].field_type, FieldType::I64));
+        assert!(matches!(index.fields[3].field_type, FieldType::F64));
+        assert!(matches!(index.fields[4].field_type, FieldType::Bytes));
+    }
+
+    #[test]
+    fn test_parse_with_comments() {
+        let sdl = r#"
+            # This is a comment
+            index articles {
+                # Title field
+                field title: text [indexed, stored]
+                field body: text [indexed] # inline comment not supported yet
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes[0].fields.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_type_aliases() {
+        let sdl = r#"
+            index test {
+                field a: string [indexed]
+                field b: int [indexed]
+                field c: uint [indexed]
+                field d: float [indexed]
+                field e: binary [stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let index = &indexes[0];
+
+        assert!(matches!(index.fields[0].field_type, FieldType::Text));
+        assert!(matches!(index.fields[1].field_type, FieldType::I64));
+        assert!(matches!(index.fields[2].field_type, FieldType::U64));
+        assert!(matches!(index.fields[3].field_type, FieldType::F64));
+        assert!(matches!(index.fields[4].field_type, FieldType::Bytes));
+    }
+
+    #[test]
+    fn test_to_schema() {
+        let sdl = r#"
+            index articles {
+                field title: text [indexed, stored]
+                field views: u64 [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let schema = indexes[0].to_schema();
+
+        assert!(schema.get_field("title").is_some());
+        assert!(schema.get_field("views").is_some());
+        assert!(schema.get_field("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_default_attributes() {
+        let sdl = r#"
+            index test {
+                field title: text
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let field = &indexes[0].fields[0];
+
+        // Default should be indexed and stored
+        assert!(field.indexed);
+        assert!(field.stored);
+    }
+
+    #[test]
+    fn test_multiple_indexes() {
+        let sdl = r#"
+            index articles {
+                field title: text [indexed, stored]
+            }
+            
+            index users {
+                field name: text [indexed, stored]
+                field email: text [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(indexes[0].name, "articles");
+        assert_eq!(indexes[1].name, "users");
+    }
+
+    #[test]
+    fn test_tokenizer_spec() {
+        let sdl = r#"
+            index articles {
+                field title: text<en_stem> [indexed, stored]
+                field body: text<default> [indexed]
+                field author: text [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let index = &indexes[0];
+
+        assert_eq!(index.fields[0].name, "title");
+        assert_eq!(index.fields[0].tokenizer, Some("en_stem".to_string()));
+
+        assert_eq!(index.fields[1].name, "body");
+        assert_eq!(index.fields[1].tokenizer, Some("default".to_string()));
+
+        assert_eq!(index.fields[2].name, "author");
+        assert_eq!(index.fields[2].tokenizer, None); // No tokenizer specified
+    }
+
+    #[test]
+    fn test_tokenizer_in_schema() {
+        let sdl = r#"
+            index articles {
+                field title: text<german> [indexed, stored]
+                field body: text<en_stem> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let schema = indexes[0].to_schema();
+
+        let title_field = schema.get_field("title").unwrap();
+        let title_entry = schema.get_field_entry(title_field).unwrap();
+        assert_eq!(title_entry.tokenizer, Some("german".to_string()));
+
+        let body_field = schema.get_field("body").unwrap();
+        let body_entry = schema.get_field_entry(body_field).unwrap();
+        assert_eq!(body_entry.tokenizer, Some("en_stem".to_string()));
+    }
+
+    #[test]
+    fn test_query_router_basic() {
+        let sdl = r#"
+            index documents {
+                field title: text [indexed, stored]
+                field uri: text [indexed, stored]
+                
+                query_router {
+                    pattern: "10\\.\\d{4,}/[^\\s]+"
+                    substitution: "doi://{0}"
+                    target_field: uris
+                    mode: exclusive
+                }
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let index = &indexes[0];
+
+        assert_eq!(index.query_routers.len(), 1);
+        let router = &index.query_routers[0];
+        assert_eq!(router.pattern, r"10\.\d{4,}/[^\s]+");
+        assert_eq!(router.substitution, "doi://{0}");
+        assert_eq!(router.target_field, "uris");
+        assert_eq!(router.mode, RoutingMode::Exclusive);
+    }
+
+    #[test]
+    fn test_query_router_raw_string() {
+        let sdl = r#"
+            index documents {
+                field uris: text [indexed, stored]
+                
+                query_router {
+                    pattern: r"^pmid:(\d+)$"
+                    substitution: "pubmed://{1}"
+                    target_field: uris
+                    mode: additional
+                }
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let router = &indexes[0].query_routers[0];
+
+        assert_eq!(router.pattern, r"^pmid:(\d+)$");
+        assert_eq!(router.substitution, "pubmed://{1}");
+        assert_eq!(router.mode, RoutingMode::Additional);
+    }
+
+    #[test]
+    fn test_multiple_query_routers() {
+        let sdl = r#"
+            index documents {
+                field uris: text [indexed, stored]
+                
+                query_router {
+                    pattern: r"^doi:(10\.\d{4,}/[^\s]+)$"
+                    substitution: "doi://{1}"
+                    target_field: uris
+                    mode: exclusive
+                }
+                
+                query_router {
+                    pattern: r"^pmid:(\d+)$"
+                    substitution: "pubmed://{1}"
+                    target_field: uris
+                    mode: exclusive
+                }
+                
+                query_router {
+                    pattern: r"^arxiv:(\d+\.\d+)$"
+                    substitution: "arxiv://{1}"
+                    target_field: uris
+                    mode: additional
+                }
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes[0].query_routers.len(), 3);
+    }
+
+    #[test]
+    fn test_query_router_default_mode() {
+        let sdl = r#"
+            index documents {
+                field uris: text [indexed, stored]
+                
+                query_router {
+                    pattern: r"test"
+                    substitution: "{0}"
+                    target_field: uris
+                }
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        // Default mode should be Additional
+        assert_eq!(indexes[0].query_routers[0].mode, RoutingMode::Additional);
+    }
+
+    #[test]
+    fn test_multi_attribute() {
+        let sdl = r#"
+            index documents {
+                field uris: text [indexed, stored, multi]
+                field title: text [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 1);
+
+        let fields = &indexes[0].fields;
+        assert_eq!(fields.len(), 2);
+
+        // uris should have multi=true
+        assert_eq!(fields[0].name, "uris");
+        assert!(fields[0].multi, "uris field should have multi=true");
+
+        // title should have multi=false
+        assert_eq!(fields[1].name, "title");
+        assert!(!fields[1].multi, "title field should have multi=false");
+
+        // Verify schema conversion preserves multi attribute
+        let schema = indexes[0].to_schema();
+        let uris_field = schema.get_field("uris").unwrap();
+        let title_field = schema.get_field("title").unwrap();
+
+        assert!(schema.get_field_entry(uris_field).unwrap().multi);
+        assert!(!schema.get_field_entry(title_field).unwrap().multi);
+    }
+}

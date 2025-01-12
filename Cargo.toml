@@ -1,0 +1,93 @@
+[workspace]
+members = [
+    "hermes-core",
+    "hermes-server",
+    "hermes-tool",
+    "hermes-python",
+    "hermes-wasm",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/SpaceFrontiers/hermes"
+homepage = "https://github.com/SpaceFrontiers/hermes"
+documentation = "https://docs.rs/hermes-core"
+authors = ["izihawa"]
+keywords = ["search", "full-text-search", "indexing", "ir"]
+categories = ["database", "text-processing"]
+
+# Enable Python bindings now that pyo3 0.27 supports Python 3.14
+
+[workspace.dependencies]
+# Internal crates
+hermes-core = { version = "0.1.0", path = "hermes-core", default-features = false }
+
+# Async runtime
+tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+byteorder = "1.5"
+bincode = "1.3"
+prost = "0.14"
+prost-types = "0.14"
+
+# Compression
+zstd = { version = "0.13", default-features = false, features = ["zdict_builder"] }
+rust-openzl = "0.1"
+
+# Text processing
+rust-stemmers = "1.2"
+
+# Collections and utilities
+rustc-hash = "2.1"
+smallvec = "1.15"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+num_cpus = "1.17"
+rayon = "1.11"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Parsing
+pest = "2.7"
+pest_derive = "2.7"
+regex = "1.11"
+
+# Encoding
+base64 = "0.22"
+
+# gRPC
+tonic = "0.14"
+tonic-build = "0.14"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Python bindings
+pyo3 = { version = "0.27", features = ["extension-module"] }
+
+# WASM
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "Window", "Response", "Headers", "Request", "RequestInit", "RequestMode"] }
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# Testing
+tempfile = "3.24"
+rand = "0.9"
+

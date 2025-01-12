@@ -1,0 +1,921 @@
+//! Async SSTable with lazy loading via FileSlice
+//!
+//! Only loads the index into memory, blocks are loaded on-demand.
+//!
+//! ## Sparse Index Optimization
+//!
+//! To reduce I/O during binary search, we maintain a sparse top-level index
+//! that samples every Nth block's first key. This allows us to narrow down
+//! the search range in-memory before doing any I/O, reducing bisect reads
+//! from O(log N) to O(log(N/SPARSE_INDEX_INTERVAL)) ≈ 1-2 reads.
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
+use std::io::{self, Read, Write};
+use std::sync::Arc;
+
+use crate::directories::{AsyncFileRead, LazyFileHandle, LazyFileSlice};
+
+/// SSTable magic number
+pub const SSTABLE_MAGIC: u32 = 0x53544232; // "STB2"
+
+/// Block size for SSTable (16KB default)
+pub const BLOCK_SIZE: usize = 16 * 1024;
+
+/// Sparse index sampling interval - sample every Nth block
+/// The block index is already fully in memory; sparse index provides
+/// an additional level for very large SSTables.
+pub const SPARSE_INDEX_INTERVAL: usize = 16;
+
+/// SSTable value trait
+pub trait SSTableValue: Clone + Send + Sync {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()>;
+    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self>;
+}
+
+/// u64 value implementation
+impl SSTableValue for u64 {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        write_vint(writer, *self)
+    }
+
+    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        read_vint(reader)
+    }
+}
+
+/// Vec<u8> value implementation
+impl SSTableValue for Vec<u8> {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        write_vint(writer, self.len() as u64)?;
+        writer.write_all(self)
+    }
+
+    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let len = read_vint(reader)? as usize;
+        let mut data = vec![0u8; len];
+        reader.read_exact(&mut data)?;
+        Ok(data)
+    }
+}
+
+/// Maximum number of postings that can be inlined in TermInfo
+pub const MAX_INLINE_POSTINGS: usize = 3;
+
+/// Term info for posting list references
+///
+/// Supports two modes:
+/// - **Inline**: Small posting lists (1-3 docs) stored directly in TermInfo
+/// - **External**: Larger posting lists stored in separate .post file
+///
+/// This eliminates a separate I/O read for rare/unique terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermInfo {
+    /// Small posting list inlined directly (up to MAX_INLINE_POSTINGS entries)
+    /// Each entry is (doc_id, term_freq) delta-encoded
+    Inline {
+        /// Number of postings (1-3)
+        doc_freq: u8,
+        /// Inline data: delta-encoded (doc_id, term_freq) pairs
+        /// Format: [delta_doc_id, term_freq, delta_doc_id, term_freq, ...]
+        data: [u8; 16],
+        /// Actual length of data used
+        data_len: u8,
+    },
+    /// Reference to external posting list in .post file
+    External {
+        posting_offset: u64,
+        posting_len: u32,
+        doc_freq: u32,
+    },
+}
+
+impl TermInfo {
+    /// Create an external reference
+    pub fn external(posting_offset: u64, posting_len: u32, doc_freq: u32) -> Self {
+        TermInfo::External {
+            posting_offset,
+            posting_len,
+            doc_freq,
+        }
+    }
+
+    /// Try to create an inline TermInfo from posting data
+    /// Returns None if posting list is too large to inline
+    pub fn try_inline(doc_ids: &[u32], term_freqs: &[u32]) -> Option<Self> {
+        if doc_ids.len() > MAX_INLINE_POSTINGS || doc_ids.is_empty() {
+            return None;
+        }
+
+        let mut data = [0u8; 16];
+        let mut cursor = std::io::Cursor::new(&mut data[..]);
+        let mut prev_doc_id = 0u32;
+
+        for (i, &doc_id) in doc_ids.iter().enumerate() {
+            let delta = doc_id - prev_doc_id;
+            if write_vint(&mut cursor, delta as u64).is_err() {
+                return None;
+            }
+            if write_vint(&mut cursor, term_freqs[i] as u64).is_err() {
+                return None;
+            }
+            prev_doc_id = doc_id;
+        }
+
+        let data_len = cursor.position() as u8;
+        if data_len > 16 {
+            return None;
+        }
+
+        Some(TermInfo::Inline {
+            doc_freq: doc_ids.len() as u8,
+            data,
+            data_len,
+        })
+    }
+
+    /// Get document frequency
+    pub fn doc_freq(&self) -> u32 {
+        match self {
+            TermInfo::Inline { doc_freq, .. } => *doc_freq as u32,
+            TermInfo::External { doc_freq, .. } => *doc_freq,
+        }
+    }
+
+    /// Check if this is an inline posting list
+    pub fn is_inline(&self) -> bool {
+        matches!(self, TermInfo::Inline { .. })
+    }
+
+    /// Get external posting info (offset, len) - returns None for inline
+    pub fn external_info(&self) -> Option<(u64, u32)> {
+        match self {
+            TermInfo::External {
+                posting_offset,
+                posting_len,
+                ..
+            } => Some((*posting_offset, *posting_len)),
+            TermInfo::Inline { .. } => None,
+        }
+    }
+
+    /// Decode inline postings into (doc_ids, term_freqs)
+    /// Returns None if this is an external reference
+    pub fn decode_inline(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        match self {
+            TermInfo::Inline {
+                doc_freq,
+                data,
+                data_len,
+            } => {
+                let mut doc_ids = Vec::with_capacity(*doc_freq as usize);
+                let mut term_freqs = Vec::with_capacity(*doc_freq as usize);
+                let mut reader = &data[..*data_len as usize];
+                let mut prev_doc_id = 0u32;
+
+                for _ in 0..*doc_freq {
+                    let delta = read_vint(&mut reader).ok()? as u32;
+                    let tf = read_vint(&mut reader).ok()? as u32;
+                    let doc_id = prev_doc_id + delta;
+                    doc_ids.push(doc_id);
+                    term_freqs.push(tf);
+                    prev_doc_id = doc_id;
+                }
+
+                Some((doc_ids, term_freqs))
+            }
+            TermInfo::External { .. } => None,
+        }
+    }
+}
+
+impl SSTableValue for TermInfo {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        match self {
+            TermInfo::Inline {
+                doc_freq,
+                data,
+                data_len,
+            } => {
+                // Tag byte 0xFF = inline marker
+                writer.write_u8(0xFF)?;
+                writer.write_u8(*doc_freq)?;
+                writer.write_u8(*data_len)?;
+                writer.write_all(&data[..*data_len as usize])?;
+            }
+            TermInfo::External {
+                posting_offset,
+                posting_len,
+                doc_freq,
+            } => {
+                // Tag byte 0x00 = external marker
+                writer.write_u8(0x00)?;
+                write_vint(writer, *doc_freq as u64)?;
+                write_vint(writer, *posting_offset)?;
+                write_vint(writer, *posting_len as u64)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let tag = reader.read_u8()?;
+
+        if tag == 0xFF {
+            // Inline
+            let doc_freq = reader.read_u8()?;
+            let data_len = reader.read_u8()?;
+            let mut data = [0u8; 16];
+            reader.read_exact(&mut data[..data_len as usize])?;
+            Ok(TermInfo::Inline {
+                doc_freq,
+                data,
+                data_len,
+            })
+        } else if tag == 0x00 {
+            // External
+            let doc_freq = read_vint(reader)? as u32;
+            let posting_offset = read_vint(reader)?;
+            let posting_len = read_vint(reader)? as u32;
+            Ok(TermInfo::External {
+                posting_offset,
+                posting_len,
+                doc_freq,
+            })
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid TermInfo tag: {}", tag),
+            ))
+        }
+    }
+}
+
+/// Write variable-length integer
+pub fn write_vint<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            writer.write_u8(byte)?;
+            return Ok(());
+        } else {
+            writer.write_u8(byte | 0x80)?;
+        }
+    }
+}
+
+/// Read variable-length integer
+pub fn read_vint<R: Read>(reader: &mut R) -> io::Result<u64> {
+    let mut result = 0u64;
+    let mut shift = 0;
+
+    loop {
+        let byte = reader.read_u8()?;
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint too long",
+            ));
+        }
+    }
+}
+
+/// Compute common prefix length
+pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Sparse index entry - samples every Nth block for fast range narrowing
+#[derive(Debug, Clone)]
+struct SparseIndexEntry {
+    /// First key of the sampled block
+    first_key: Vec<u8>,
+    /// Index into the full block index
+    block_idx: u32,
+}
+
+/// SSTable statistics for debugging
+#[derive(Debug, Clone)]
+pub struct SSTableStats {
+    pub num_blocks: usize,
+    pub num_sparse_entries: usize,
+    pub num_entries: u64,
+}
+
+/// SSTable writer
+pub struct SSTableWriter<'a, V: SSTableValue> {
+    writer: &'a mut dyn Write,
+    block_buffer: Vec<u8>,
+    prev_key: Vec<u8>,
+    index: Vec<BlockIndexEntry>,
+    current_offset: u64,
+    num_entries: u64,
+    block_first_key: Option<Vec<u8>>,
+    _phantom: std::marker::PhantomData<V>,
+}
+
+impl<'a, V: SSTableValue> SSTableWriter<'a, V> {
+    pub fn new(writer: &'a mut dyn Write) -> Self {
+        Self {
+            writer,
+            block_buffer: Vec::with_capacity(BLOCK_SIZE),
+            prev_key: Vec::new(),
+            index: Vec::new(),
+            current_offset: 0,
+            num_entries: 0,
+            block_first_key: None,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn insert(&mut self, key: &[u8], value: &V) -> io::Result<()> {
+        if self.block_first_key.is_none() {
+            self.block_first_key = Some(key.to_vec());
+        }
+
+        let prefix_len = common_prefix_len(&self.prev_key, key);
+        let suffix = &key[prefix_len..];
+
+        write_vint(&mut self.block_buffer, prefix_len as u64)?;
+        write_vint(&mut self.block_buffer, suffix.len() as u64)?;
+        self.block_buffer.extend_from_slice(suffix);
+        value.serialize(&mut self.block_buffer)?;
+
+        self.prev_key.clear();
+        self.prev_key.extend_from_slice(key);
+        self.num_entries += 1;
+
+        if self.block_buffer.len() >= BLOCK_SIZE {
+            self.flush_block()?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> io::Result<()> {
+        if self.block_buffer.is_empty() {
+            return Ok(());
+        }
+
+        let compressed = crate::compression::compress(
+            &self.block_buffer[..],
+            crate::compression::CompressionLevel(3),
+        )?;
+
+        if let Some(first_key) = self.block_first_key.take() {
+            self.index.push(BlockIndexEntry {
+                first_key,
+                offset: self.current_offset,
+                length: compressed.len() as u32,
+            });
+        }
+
+        self.writer.write_all(&compressed)?;
+        self.current_offset += compressed.len() as u64;
+
+        self.block_buffer.clear();
+        self.prev_key.clear();
+
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<()> {
+        self.flush_block()?;
+
+        let data_end_offset = self.current_offset;
+
+        // Build sparse index - sample every SPARSE_INDEX_INTERVAL blocks
+        let sparse_index: Vec<SparseIndexEntry> = self
+            .index
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i % SPARSE_INDEX_INTERVAL == 0)
+            .map(|(i, entry)| SparseIndexEntry {
+                first_key: entry.first_key.clone(),
+                block_idx: i as u32,
+            })
+            .collect();
+
+        // Write block index
+        self.writer
+            .write_u32::<LittleEndian>(self.index.len() as u32)?;
+        for entry in &self.index {
+            self.writer
+                .write_u16::<LittleEndian>(entry.first_key.len() as u16)?;
+            self.writer.write_all(&entry.first_key)?;
+            self.writer.write_u64::<LittleEndian>(entry.offset)?;
+            self.writer.write_u32::<LittleEndian>(entry.length)?;
+        }
+
+        // Write sparse index
+        self.writer
+            .write_u32::<LittleEndian>(sparse_index.len() as u32)?;
+        for entry in &sparse_index {
+            self.writer
+                .write_u16::<LittleEndian>(entry.first_key.len() as u16)?;
+            self.writer.write_all(&entry.first_key)?;
+            self.writer.write_u32::<LittleEndian>(entry.block_idx)?;
+        }
+
+        // Write footer
+        self.writer.write_u64::<LittleEndian>(data_end_offset)?;
+        self.writer.write_u64::<LittleEndian>(self.num_entries)?;
+        self.writer.write_u32::<LittleEndian>(SSTABLE_MAGIC)?;
+
+        Ok(())
+    }
+}
+
+/// Block index entry
+#[derive(Debug, Clone)]
+struct BlockIndexEntry {
+    first_key: Vec<u8>,
+    offset: u64,
+    length: u32,
+}
+
+/// Async SSTable reader - loads blocks on demand via LazyFileSlice
+pub struct AsyncSSTableReader<V: SSTableValue> {
+    /// LazyFileSlice for the data portion (blocks only) - fetches ranges on demand
+    data_slice: LazyFileSlice,
+    /// Block index (loaded into memory - small)
+    index: Vec<BlockIndexEntry>,
+    /// Sparse index for fast range narrowing (samples every Nth block)
+    sparse_index: Vec<SparseIndexEntry>,
+    num_entries: u64,
+    /// Hot cache for decompressed blocks
+    cache: RwLock<BlockCache>,
+    _phantom: std::marker::PhantomData<V>,
+}
+
+/// LRU-style block cache
+struct BlockCache {
+    blocks: FxHashMap<u64, Arc<Vec<u8>>>,
+    access_order: Vec<u64>,
+    max_blocks: usize,
+}
+
+impl BlockCache {
+    fn new(max_blocks: usize) -> Self {
+        Self {
+            blocks: FxHashMap::default(),
+            access_order: Vec::new(),
+            max_blocks,
+        }
+    }
+
+    fn get(&mut self, offset: u64) -> Option<Arc<Vec<u8>>> {
+        if let Some(block) = self.blocks.get(&offset) {
+            if let Some(pos) = self.access_order.iter().position(|&o| o == offset) {
+                self.access_order.remove(pos);
+                self.access_order.push(offset);
+            }
+            Some(Arc::clone(block))
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, offset: u64, block: Arc<Vec<u8>>) {
+        while self.blocks.len() >= self.max_blocks && !self.access_order.is_empty() {
+            let evict_offset = self.access_order.remove(0);
+            self.blocks.remove(&evict_offset);
+        }
+        self.blocks.insert(offset, block);
+        self.access_order.push(offset);
+    }
+}
+
+impl<V: SSTableValue> AsyncSSTableReader<V> {
+    /// Open an SSTable from a LazyFileHandle
+    /// Only loads the footer and index into memory, data blocks fetched on-demand
+    pub async fn open(file_handle: LazyFileHandle, cache_blocks: usize) -> io::Result<Self> {
+        let file_len = file_handle.len();
+        if file_len < 20 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable too small",
+            ));
+        }
+
+        // Read footer (last 20 bytes)
+        let footer_bytes = file_handle
+            .read_bytes_range(file_len - 20..file_len)
+            .await?;
+        let mut footer_reader = footer_bytes.as_slice();
+
+        let data_end_offset = footer_reader.read_u64::<LittleEndian>()?;
+        let num_entries = footer_reader.read_u64::<LittleEndian>()?;
+        let magic = footer_reader.read_u32::<LittleEndian>()?;
+
+        if magic != SSTABLE_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid SSTable magic",
+            ));
+        }
+
+        // Read index (from data_end_offset to footer)
+        let index_start = data_end_offset as usize;
+        let index_end = file_len - 20;
+        let index_bytes = file_handle.read_bytes_range(index_start..index_end).await?;
+        let mut reader = index_bytes.as_slice();
+
+        // Read block index
+        let num_blocks = reader.read_u32::<LittleEndian>()? as usize;
+        let mut index = Vec::with_capacity(num_blocks);
+
+        for _ in 0..num_blocks {
+            let key_len = reader.read_u16::<LittleEndian>()? as usize;
+            let mut first_key = vec![0u8; key_len];
+            reader.read_exact(&mut first_key)?;
+            let offset = reader.read_u64::<LittleEndian>()?;
+            let length = reader.read_u32::<LittleEndian>()?;
+
+            index.push(BlockIndexEntry {
+                first_key,
+                offset,
+                length,
+            });
+        }
+
+        // Read sparse index
+        let num_sparse = reader.read_u32::<LittleEndian>()? as usize;
+        let mut sparse_index = Vec::with_capacity(num_sparse);
+
+        for _ in 0..num_sparse {
+            let key_len = reader.read_u16::<LittleEndian>()? as usize;
+            let mut first_key = vec![0u8; key_len];
+            reader.read_exact(&mut first_key)?;
+            let block_idx = reader.read_u32::<LittleEndian>()?;
+
+            sparse_index.push(SparseIndexEntry {
+                first_key,
+                block_idx,
+            });
+        }
+
+        // Create a lazy slice for just the data portion
+        let data_slice = file_handle.slice(0..data_end_offset as usize);
+
+        Ok(Self {
+            data_slice,
+            index,
+            sparse_index,
+            num_entries,
+            cache: RwLock::new(BlockCache::new(cache_blocks)),
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+    /// Number of entries
+    pub fn num_entries(&self) -> u64 {
+        self.num_entries
+    }
+
+    /// Get stats about this SSTable for debugging
+    pub fn stats(&self) -> SSTableStats {
+        SSTableStats {
+            num_blocks: self.index.len(),
+            num_sparse_entries: self.sparse_index.len(),
+            num_entries: self.num_entries,
+        }
+    }
+
+    /// Look up a key (async - may need to load block)
+    ///
+    /// Uses sparse index to narrow search range before binary search,
+    /// reducing I/O from O(log N) to typically 1 block read.
+    pub async fn get(&self, key: &[u8]) -> io::Result<Option<V>> {
+        log::debug!(
+            "SSTable::get called, key_len={}, total_blocks={}, sparse_entries={}",
+            key.len(),
+            self.index.len(),
+            self.sparse_index.len()
+        );
+
+        // Use sparse index to find the block range to search
+        let (start_block, end_block) = self.find_block_range(key);
+        log::debug!("SSTable::get sparse_range=[{}, {}]", start_block, end_block);
+
+        // Binary search within the narrowed range (in-memory, no I/O)
+        let search_range = &self.index[start_block..=end_block];
+        let block_idx =
+            match search_range.binary_search_by(|entry| entry.first_key.as_slice().cmp(key)) {
+                Ok(idx) => start_block + idx,
+                Err(0) => {
+                    if start_block == 0 {
+                        log::debug!("SSTable::get key not found (before first block)");
+                        return Ok(None);
+                    }
+                    start_block
+                }
+                Err(idx) => start_block + idx - 1,
+            };
+
+        log::debug!("SSTable::get loading block_idx={}", block_idx);
+
+        // Now we know exactly which block to load - single I/O
+        let block_data = self.load_block(block_idx).await?;
+        self.search_block(&block_data, key)
+    }
+
+    /// Batch lookup multiple keys with optimized I/O
+    ///
+    /// Groups keys by block and loads each block only once, reducing
+    /// I/O from N reads to at most N reads (often fewer if keys share blocks).
+    pub async fn get_batch(&self, keys: &[&[u8]]) -> io::Result<Vec<Option<V>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Map each key to its block index
+        let mut key_to_block: Vec<(usize, usize)> = Vec::with_capacity(keys.len());
+        for (key_idx, key) in keys.iter().enumerate() {
+            let (start_block, end_block) = self.find_block_range(key);
+            let search_range = &self.index[start_block..=end_block];
+            let block_idx =
+                match search_range.binary_search_by(|entry| entry.first_key.as_slice().cmp(key)) {
+                    Ok(idx) => start_block + idx,
+                    Err(0) => {
+                        if start_block == 0 {
+                            key_to_block.push((key_idx, usize::MAX)); // Mark as not found
+                            continue;
+                        }
+                        start_block
+                    }
+                    Err(idx) => start_block + idx - 1,
+                };
+            key_to_block.push((key_idx, block_idx));
+        }
+
+        // Group keys by block
+        let mut blocks_to_load: Vec<usize> = key_to_block
+            .iter()
+            .filter(|(_, b)| *b != usize::MAX)
+            .map(|(_, b)| *b)
+            .collect();
+        blocks_to_load.sort_unstable();
+        blocks_to_load.dedup();
+
+        // Load all needed blocks (this is where I/O happens)
+        for &block_idx in &blocks_to_load {
+            let _ = self.load_block(block_idx).await?;
+        }
+
+        // Now search each key in its block (all blocks are cached)
+        let mut results = vec![None; keys.len()];
+        for (key_idx, block_idx) in key_to_block {
+            if block_idx == usize::MAX {
+                continue;
+            }
+            let block_data = self.load_block(block_idx).await?; // Will hit cache
+            results[key_idx] = self.search_block(&block_data, keys[key_idx])?;
+        }
+
+        Ok(results)
+    }
+
+    /// Find the block range that could contain the key using sparse index
+    ///
+    /// Returns (start_block_idx, end_block_idx) inclusive range
+    fn find_block_range(&self, key: &[u8]) -> (usize, usize) {
+        if self.sparse_index.is_empty() {
+            return (0, self.index.len().saturating_sub(1));
+        }
+
+        // Binary search in sparse index (in-memory, no I/O)
+        let sparse_pos = match self
+            .sparse_index
+            .binary_search_by(|entry| entry.first_key.as_slice().cmp(key))
+        {
+            Ok(idx) => idx,
+            Err(0) => 0,
+            Err(idx) => idx - 1,
+        };
+
+        let start_block = self.sparse_index[sparse_pos].block_idx as usize;
+        let end_block = if sparse_pos + 1 < self.sparse_index.len() {
+            // End at the next sparse entry's block (exclusive becomes inclusive -1)
+            (self.sparse_index[sparse_pos + 1].block_idx as usize).saturating_sub(1)
+        } else {
+            // Last sparse entry - search to end of index
+            self.index.len().saturating_sub(1)
+        };
+
+        (start_block, end_block.max(start_block))
+    }
+
+    /// Preload all data blocks into memory
+    ///
+    /// Call this after open() to eliminate all I/O during subsequent lookups.
+    /// Useful when the SSTable is small enough to fit in memory.
+    pub async fn preload_all_blocks(&self) -> io::Result<()> {
+        for block_idx in 0..self.index.len() {
+            self.load_block(block_idx).await?;
+        }
+        Ok(())
+    }
+
+    /// Load a block (checks cache first, then loads from FileSlice)
+    async fn load_block(&self, block_idx: usize) -> io::Result<Arc<Vec<u8>>> {
+        let entry = &self.index[block_idx];
+
+        // Check cache first
+        {
+            let mut cache = self.cache.write();
+            if let Some(block) = cache.get(entry.offset) {
+                log::debug!("SSTable::load_block idx={} CACHE HIT", block_idx);
+                return Ok(block);
+            }
+        }
+
+        log::debug!(
+            "SSTable::load_block idx={} CACHE MISS, reading bytes [{}-{}]",
+            block_idx,
+            entry.offset,
+            entry.offset + entry.length as u64
+        );
+
+        // Load from FileSlice
+        let start = entry.offset as usize;
+        let end = start + entry.length as usize;
+        let compressed = self.data_slice.read_bytes_range(start..end).await?;
+
+        let decompressed = crate::compression::decompress(compressed.as_slice())?;
+
+        let block = Arc::new(decompressed);
+
+        // Insert into cache
+        {
+            let mut cache = self.cache.write();
+            cache.insert(entry.offset, Arc::clone(&block));
+        }
+
+        Ok(block)
+    }
+
+    fn search_block(&self, block_data: &[u8], target_key: &[u8]) -> io::Result<Option<V>> {
+        let mut reader = block_data;
+        let mut current_key = Vec::new();
+
+        while !reader.is_empty() {
+            let common_prefix_len = read_vint(&mut reader)? as usize;
+            let suffix_len = read_vint(&mut reader)? as usize;
+
+            current_key.truncate(common_prefix_len);
+            let mut suffix = vec![0u8; suffix_len];
+            reader.read_exact(&mut suffix)?;
+            current_key.extend_from_slice(&suffix);
+
+            let value = V::deserialize(&mut reader)?;
+
+            match current_key.as_slice().cmp(target_key) {
+                std::cmp::Ordering::Equal => return Ok(Some(value)),
+                std::cmp::Ordering::Greater => return Ok(None),
+                std::cmp::Ordering::Less => continue,
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Prefetch blocks for a key range
+    pub async fn prefetch_range(&self, start_key: &[u8], end_key: &[u8]) -> io::Result<()> {
+        let start_block = match self
+            .index
+            .binary_search_by(|e| e.first_key.as_slice().cmp(start_key))
+        {
+            Ok(idx) => idx,
+            Err(0) => 0,
+            Err(idx) => idx - 1,
+        };
+
+        let end_block = match self
+            .index
+            .binary_search_by(|e| e.first_key.as_slice().cmp(end_key))
+        {
+            Ok(idx) => idx,
+            Err(idx) if idx >= self.index.len() => self.index.len().saturating_sub(1),
+            Err(idx) => idx,
+        };
+
+        for block_idx in start_block..=end_block.min(self.index.len().saturating_sub(1)) {
+            let _ = self.load_block(block_idx).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Iterate over all entries (loads blocks as needed)
+    pub fn iter(&self) -> AsyncSSTableIterator<'_, V> {
+        AsyncSSTableIterator::new(self)
+    }
+
+    /// Get all entries as a vector (for merging)
+    pub async fn all_entries(&self) -> io::Result<Vec<(Vec<u8>, V)>> {
+        let mut results = Vec::new();
+
+        for block_idx in 0..self.index.len() {
+            let block_data = self.load_block(block_idx).await?;
+            let mut reader = block_data.as_slice();
+            let mut current_key = Vec::new();
+
+            while !reader.is_empty() {
+                let common_prefix_len = read_vint(&mut reader)? as usize;
+                let suffix_len = read_vint(&mut reader)? as usize;
+
+                current_key.truncate(common_prefix_len);
+                let mut suffix = vec![0u8; suffix_len];
+                reader.read_exact(&mut suffix)?;
+                current_key.extend_from_slice(&suffix);
+
+                let value = V::deserialize(&mut reader)?;
+                results.push((current_key.clone(), value));
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+/// Async iterator over SSTable entries
+pub struct AsyncSSTableIterator<'a, V: SSTableValue> {
+    reader: &'a AsyncSSTableReader<V>,
+    current_block: usize,
+    block_data: Option<Arc<Vec<u8>>>,
+    block_offset: usize,
+    current_key: Vec<u8>,
+    finished: bool,
+}
+
+impl<'a, V: SSTableValue> AsyncSSTableIterator<'a, V> {
+    fn new(reader: &'a AsyncSSTableReader<V>) -> Self {
+        Self {
+            reader,
+            current_block: 0,
+            block_data: None,
+            block_offset: 0,
+            current_key: Vec::new(),
+            finished: reader.index.is_empty(),
+        }
+    }
+
+    async fn load_next_block(&mut self) -> io::Result<bool> {
+        if self.current_block >= self.reader.index.len() {
+            self.finished = true;
+            return Ok(false);
+        }
+
+        self.block_data = Some(self.reader.load_block(self.current_block).await?);
+        self.block_offset = 0;
+        self.current_key.clear();
+        self.current_block += 1;
+        Ok(true)
+    }
+
+    /// Advance to next entry (async)
+    pub async fn next(&mut self) -> io::Result<Option<(Vec<u8>, V)>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        if self.block_data.is_none() && !self.load_next_block().await? {
+            return Ok(None);
+        }
+
+        loop {
+            let block = self.block_data.as_ref().unwrap();
+            if self.block_offset >= block.len() {
+                if !self.load_next_block().await? {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            let mut reader = &block[self.block_offset..];
+            let start_len = reader.len();
+
+            let common_prefix_len = read_vint(&mut reader)? as usize;
+            let suffix_len = read_vint(&mut reader)? as usize;
+
+            self.current_key.truncate(common_prefix_len);
+            let mut suffix = vec![0u8; suffix_len];
+            reader.read_exact(&mut suffix)?;
+            self.current_key.extend_from_slice(&suffix);
+
+            let value = V::deserialize(&mut reader)?;
+
+            self.block_offset += start_len - reader.len();
+
+            return Ok(Some((self.current_key.clone(), value)));
+        }
+    }
+}

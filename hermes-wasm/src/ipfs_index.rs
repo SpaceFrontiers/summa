@@ -1,0 +1,421 @@
+//! IPFS-based index using JavaScript fetch callbacks
+
+use std::collections::HashMap;
+use std::io;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use hermes_core::directories::{
+    Directory, FileSlice, LazyFileHandle, OwnedBytes, SliceCachingDirectory,
+};
+use hermes_core::{Index, IndexConfig, SLICE_CACHE_FILENAME};
+use parking_lot::RwLock;
+use serde::Serialize;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
+
+use crate::DEFAULT_CACHE_SIZE;
+use crate::idb::{cache_key, idb_delete, idb_get, idb_put};
+
+/// A Directory implementation that calls back to JavaScript for fetching
+///
+/// This allows using custom fetch implementations like @helia/verified-fetch
+/// for IPFS content retrieval without gateways.
+pub struct JsFetchDirectory {
+    base_path: String,
+    /// JavaScript function: (path: string) => Promise<Uint8Array>
+    fetch_fn: js_sys::Function,
+    /// JavaScript function: (path: string) => Promise<number> (file size)
+    size_fn: js_sys::Function,
+    /// Cache for file sizes
+    size_cache: RwLock<HashMap<PathBuf, u64>>,
+}
+
+impl JsFetchDirectory {
+    pub fn new(base_path: String, fetch_fn: js_sys::Function, size_fn: js_sys::Function) -> Self {
+        Self {
+            base_path,
+            fetch_fn,
+            size_fn,
+            size_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn path_for(&self, path: &Path) -> String {
+        if self.base_path.is_empty() {
+            path.display().to_string()
+        } else {
+            format!(
+                "{}/{}",
+                self.base_path.trim_end_matches('/'),
+                path.display()
+            )
+        }
+    }
+
+    async fn call_fetch(&self, path: &str) -> io::Result<Vec<u8>> {
+        let this = JsValue::NULL;
+        let path_js = JsValue::from_str(path);
+
+        let promise = self.fetch_fn.call1(&this, &path_js).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("JS fetch call failed: {:?}", e),
+            )
+        })?;
+
+        let result = JsFuture::from(js_sys::Promise::from(promise))
+            .await
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("JS fetch failed: {:?}", e))
+            })?;
+
+        let array = js_sys::Uint8Array::new(&result);
+        Ok(array.to_vec())
+    }
+
+    async fn call_size(&self, path: &str) -> io::Result<u64> {
+        let this = JsValue::NULL;
+        let path_js = JsValue::from_str(path);
+
+        let promise = self.size_fn.call1(&this, &path_js).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("JS size call failed: {:?}", e),
+            )
+        })?;
+
+        let result = JsFuture::from(js_sys::Promise::from(promise))
+            .await
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("JS size failed: {:?}", e))
+            })?;
+
+        result
+            .as_f64()
+            .map(|n| n as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Size is not a number"))
+    }
+}
+
+#[async_trait(?Send)]
+impl Directory for JsFetchDirectory {
+    async fn exists(&self, _path: &Path) -> io::Result<bool> {
+        // Assume files exist, will fail on actual read if not
+        Ok(true)
+    }
+
+    async fn file_size(&self, path: &Path) -> io::Result<u64> {
+        // Check cache first
+        if let Some(&size) = self.size_cache.read().get(path) {
+            return Ok(size);
+        }
+
+        let full_path = self.path_for(path);
+        let size = self.call_size(&full_path).await?;
+
+        self.size_cache.write().insert(path.to_path_buf(), size);
+        Ok(size)
+    }
+
+    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+        let full_path = self.path_for(path);
+        let data = self.call_fetch(&full_path).await?;
+        Ok(FileSlice::new(OwnedBytes::new(data)))
+    }
+
+    async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
+        // For now, fetch full file and slice
+        // TODO: Add range support to JS callback
+        let full_path = self.path_for(path);
+        let data = self.call_fetch(&full_path).await?;
+
+        let start = range.start as usize;
+        let end = (range.end as usize).min(data.len());
+
+        if start >= data.len() {
+            return Ok(OwnedBytes::new(vec![]));
+        }
+
+        Ok(OwnedBytes::new(data[start..end].to_vec()))
+    }
+
+    async fn list_files(&self, _prefix: &Path) -> io::Result<Vec<PathBuf>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "JsFetchDirectory does not support file listing",
+        ))
+    }
+
+    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
+        // JsFetchDirectory doesn't support lazy loading directly because
+        // js_sys::Function is not Send+Sync. Instead, we load the full file
+        // and wrap it in a LazyFileHandle that serves from memory.
+        let full_path = self.path_for(path);
+        let data = self.call_fetch(&full_path).await?;
+        let file_size = data.len();
+        let data = Arc::new(data);
+
+        // Create a simple range read function that reads from the cached data
+        let read_fn: hermes_core::directories::RangeReadFn = Arc::new(move |range: Range<u64>| {
+            let data = Arc::clone(&data);
+            Box::pin(async move {
+                let start = range.start as usize;
+                let end = (range.end as usize).min(data.len());
+
+                if start >= data.len() {
+                    return Ok(OwnedBytes::new(vec![]));
+                }
+
+                Ok(OwnedBytes::new(data[start..end].to_vec()))
+            })
+        });
+
+        Ok(LazyFileHandle::new(file_size, read_fn))
+    }
+}
+
+/// Type alias for cached JS fetch directory
+pub type CachedJsFetchDirectory = SliceCachingDirectory<JsFetchDirectory>;
+
+/// IPFS Index that uses JavaScript verified-fetch for content retrieval
+///
+/// This allows loading indexes from IPFS without using gateways by
+/// leveraging @helia/verified-fetch in JavaScript.
+#[wasm_bindgen]
+pub struct IpfsIndex {
+    base_path: String,
+    cache_size: usize,
+    index: Option<Index<CachedJsFetchDirectory>>,
+}
+
+#[wasm_bindgen]
+impl IpfsIndex {
+    /// Create a new IPFS index
+    ///
+    /// @param base_path - The IPFS path (e.g., "/ipfs/Qm..." or "/ipns/...")
+    #[wasm_bindgen(constructor)]
+    pub fn new(base_path: String) -> Self {
+        Self {
+            base_path,
+            cache_size: DEFAULT_CACHE_SIZE,
+            index: None,
+        }
+    }
+
+    /// Create with custom cache size
+    #[wasm_bindgen]
+    pub fn with_cache_size(base_path: String, cache_size: usize) -> Self {
+        Self {
+            base_path,
+            cache_size,
+            index: None,
+        }
+    }
+
+    /// Load index using JavaScript fetch functions
+    ///
+    /// @param fetch_fn - JS function: (path: string) => Promise<Uint8Array>
+    /// @param size_fn - JS function: (path: string) => Promise<number>
+    #[wasm_bindgen]
+    pub async fn load(
+        &mut self,
+        fetch_fn: js_sys::Function,
+        size_fn: js_sys::Function,
+    ) -> Result<(), JsValue> {
+        let js_dir =
+            JsFetchDirectory::new(self.base_path.clone(), fetch_fn.clone(), size_fn.clone());
+        let cached_dir = SliceCachingDirectory::new(js_dir, self.cache_size);
+
+        // Try to load slice cache
+        let cache_path = format!(
+            "{}/{}",
+            self.base_path.trim_end_matches('/'),
+            SLICE_CACHE_FILENAME
+        );
+
+        // Try to fetch cache file via JS
+        let this = JsValue::NULL;
+        let cache_path_js = JsValue::from_str(&cache_path);
+        if let Ok(promise) = fetch_fn.call1(&this, &cache_path_js) {
+            if let Ok(result) = JsFuture::from(js_sys::Promise::from(promise)).await {
+                let array = js_sys::Uint8Array::new(&result);
+                let cache_data = array.to_vec();
+                let _ = cached_dir.deserialize(&cache_data);
+            }
+        }
+
+        let config = IndexConfig::default();
+
+        let index = Index::open(cached_dir, config)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to open index: {}", e)))?;
+
+        self.index = Some(index);
+        Ok(())
+    }
+
+    /// Get cache statistics
+    #[wasm_bindgen]
+    pub fn cache_stats(&self) -> JsValue {
+        #[derive(Serialize)]
+        struct CacheStatsJs {
+            total_bytes: usize,
+            max_bytes: usize,
+            total_slices: usize,
+            files_cached: usize,
+        }
+
+        if let Some(index) = &self.index {
+            let stats = index.directory().stats();
+            let js_stats = CacheStatsJs {
+                total_bytes: stats.total_bytes,
+                max_bytes: stats.max_bytes,
+                total_slices: stats.total_slices,
+                files_cached: stats.files_cached,
+            };
+            serde_wasm_bindgen::to_value(&js_stats).unwrap_or(JsValue::NULL)
+        } else {
+            JsValue::NULL
+        }
+    }
+
+    /// Get number of documents
+    #[wasm_bindgen]
+    pub fn num_docs(&self) -> u32 {
+        self.index.as_ref().map(|i| i.num_docs()).unwrap_or(0)
+    }
+
+    /// Get number of segments
+    #[wasm_bindgen]
+    pub fn num_segments(&self) -> usize {
+        self.index
+            .as_ref()
+            .map(|i| i.segment_readers().len())
+            .unwrap_or(0)
+    }
+
+    /// Get field names
+    #[wasm_bindgen]
+    pub fn field_names(&self) -> JsValue {
+        let names: Vec<String> = self
+            .index
+            .as_ref()
+            .map(|i| i.schema().fields().map(|(_, f)| f.name.clone()).collect())
+            .unwrap_or_default();
+        serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
+    }
+
+    /// Search the index
+    #[wasm_bindgen]
+    pub async fn search(&self, query_str: String, limit: usize) -> Result<JsValue, JsValue> {
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+
+        let response = index
+            .query(&query_str, limit)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
+
+        response
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+    }
+
+    /// Get a document by address
+    #[wasm_bindgen]
+    pub async fn get_document(&self, segment_id: String, doc_id: u32) -> Result<JsValue, JsValue> {
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+
+        let address = hermes_core::query::DocAddress { segment_id, doc_id };
+
+        let doc = index
+            .get_document(&address)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
+
+        match doc {
+            Some(document) => {
+                let json = document.to_json(index.schema());
+                json.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+                    .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+            }
+            None => Ok(JsValue::NULL),
+        }
+    }
+
+    /// Get default fields
+    #[wasm_bindgen]
+    pub fn default_fields(&self) -> JsValue {
+        let names: Vec<String> = self
+            .index
+            .as_ref()
+            .map(|i| {
+                i.default_fields()
+                    .iter()
+                    .filter_map(|f| i.schema().get_field_name(*f).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
+    }
+
+    /// Export cache
+    #[wasm_bindgen]
+    pub fn export_cache(&self) -> Option<Vec<u8>> {
+        self.index.as_ref().map(|i| i.directory().serialize())
+    }
+
+    /// Import cache
+    #[wasm_bindgen]
+    pub fn import_cache(&self, data: &[u8]) -> Result<(), JsValue> {
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+
+        index
+            .directory()
+            .deserialize(data)
+            .map_err(|e| JsValue::from_str(&format!("Failed to import cache: {}", e)))
+    }
+
+    /// Save cache to IndexedDB
+    #[wasm_bindgen]
+    pub async fn save_cache_to_idb(&self) -> Result<(), JsValue> {
+        let cache_data = self
+            .export_cache()
+            .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
+
+        let key = cache_key(&self.base_path);
+        idb_put(&key, &cache_data).await
+    }
+
+    /// Load cache from IndexedDB
+    #[wasm_bindgen]
+    pub async fn load_cache_from_idb(&self) -> Result<bool, JsValue> {
+        let key = cache_key(&self.base_path);
+
+        match idb_get(&key).await? {
+            Some(data) => {
+                self.import_cache(&data)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Clear IndexedDB cache
+    #[wasm_bindgen]
+    pub async fn clear_idb_cache(&self) -> Result<(), JsValue> {
+        let key = cache_key(&self.base_path);
+        idb_delete(&key).await
+    }
+}

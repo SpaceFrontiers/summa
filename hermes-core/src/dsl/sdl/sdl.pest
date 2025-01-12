@@ -1,0 +1,73 @@
+// Hermes Schema Definition Language (SDL) Grammar
+
+// Main entry point - a file contains one or more index definitions
+file = { SOI ~ index_def+ ~ EOI }
+
+// Index definition
+index_def = { "index" ~ identifier ~ "{" ~ (field_def | default_fields_def | query_router_def)* ~ "}" }
+
+// Default fields definition
+default_fields_def = { "default_fields" ~ ":" ~ "[" ~ identifier ~ ("," ~ identifier)* ~ "]" }
+
+// Query router definition for routing queries to specific fields based on regex
+// Example:
+//   query_router {
+//       pattern: r"10\.\d{4,}/[^\s]+"
+//       substitution: "doi://{0}"
+//       target_field: uris
+//       mode: exclusive
+//   }
+query_router_def = { "query_router" ~ "{" ~ query_router_prop+ ~ "}" }
+
+// Query router properties
+query_router_prop = { 
+    query_router_pattern | 
+    query_router_substitution | 
+    query_router_target | 
+    query_router_mode 
+}
+
+query_router_pattern = { "pattern" ~ ":" ~ regex_string }
+query_router_substitution = { "substitution" ~ ":" ~ quoted_string }
+query_router_target = { "target_field" ~ ":" ~ identifier }
+query_router_mode = { "mode" ~ ":" ~ routing_mode }
+
+// Routing mode: exclusive (only target field) or additional (target + default fields)
+routing_mode = { "exclusive" | "additional" }
+
+// Regex string: r"..." or just "..."
+regex_string = { raw_string | quoted_string }
+raw_string = @{ "r\"" ~ raw_string_inner ~ "\"" }
+raw_string_inner = @{ (!("\"") ~ ANY)* }
+quoted_string = @{ "\"" ~ string_inner ~ "\"" }
+string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
+
+// Field definition with optional tokenizer
+// Examples:
+//   field title: text [indexed, stored]
+//   field body: text<en_stem> [indexed]
+//   field name: text<default> [indexed, stored]
+field_def = { "field" ~ identifier ~ ":" ~ field_type ~ tokenizer_spec? ~ attributes? }
+
+// Field types
+field_type = { 
+    "text" | "string" | "str" |
+    "u64" | "uint" | "unsigned" |
+    "i64" | "int" | "integer" |
+    "f64" | "float" | "double" |
+    "bytes" | "binary" | "blob"
+}
+
+// Tokenizer specification: <tokenizer_name>
+tokenizer_spec = { "<" ~ identifier ~ ">" }
+
+// Attributes like [indexed, stored, multi]
+attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
+attribute = { "indexed" | "stored" | "multi" }
+
+// Identifier (field names, index names, tokenizer names)
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Whitespace and comments
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }

@@ -1,0 +1,34 @@
+// Hermes Query Language Grammar
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+// Basic tokens
+term = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+quoted_string = @{ "\"" ~ inner_string ~ "\"" }
+inner_string = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
+
+// Field specification
+field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+field_spec = { field_name ~ ":" }
+
+// Query types
+term_query = { field_spec? ~ term }
+phrase_query = { field_spec? ~ quoted_string }
+
+// Boolean operators
+and_op = { "AND" | "&&" }
+or_op = { "OR" | "||" }
+not_op = { "NOT" | "-" | "!" }
+
+// Grouping
+group = { "(" ~ or_expr ~ ")" }
+
+// Primary expression
+primary = { not_op? ~ (group | phrase_query | term_query) }
+
+// Boolean expressions
+and_expr = { primary ~ (and_op ~ primary)* }
+or_expr = { and_expr ~ (or_op ~ and_expr)* }
+
+// Top-level: or_expr, or multiple terms separated by space (implicit OR)
+query = { SOI ~ or_expr ~ EOI }

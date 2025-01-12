@@ -1,0 +1,186 @@
+syntax = "proto3";
+
+package hermes;
+
+// Search service
+service SearchService {
+  // Search for documents
+  rpc Search(SearchRequest) returns (SearchResponse);
+  
+  // Get document by ID
+  rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
+  
+  // Get index info
+  rpc GetIndexInfo(GetIndexInfoRequest) returns (GetIndexInfoResponse);
+}
+
+// Index service  
+service IndexService {
+  // Create a new index
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
+  
+  // Add documents to index
+  rpc IndexDocuments(stream IndexDocumentRequest) returns (IndexDocumentsResponse);
+  
+  // Commit pending changes
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  
+  // Force merge segments
+  rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
+  
+  // Delete an index
+  rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
+}
+
+// Field types
+enum FieldType {
+  FIELD_TYPE_UNSPECIFIED = 0;
+  FIELD_TYPE_TEXT = 1;
+  FIELD_TYPE_U64 = 2;
+  FIELD_TYPE_I64 = 3;
+  FIELD_TYPE_F64 = 4;
+  FIELD_TYPE_BYTES = 5;
+}
+
+// Field definition
+message FieldDefinition {
+  string name = 1;
+  FieldType field_type = 2;
+  bool indexed = 3;
+  bool stored = 4;
+}
+
+// Schema definition
+message Schema {
+  repeated FieldDefinition fields = 1;
+}
+
+// Query types
+message Query {
+  oneof query {
+    TermQuery term = 1;
+    BooleanQuery boolean = 2;
+    BoostQuery boost = 3;
+    AllQuery all = 4;
+  }
+}
+
+message TermQuery {
+  string field = 1;
+  string term = 2;
+}
+
+message BooleanQuery {
+  repeated Query must = 1;
+  repeated Query should = 2;
+  repeated Query must_not = 3;
+}
+
+message BoostQuery {
+  Query query = 1;
+  float boost = 2;
+}
+
+message AllQuery {}
+
+// Search request/response
+message SearchRequest {
+  string index_name = 1;
+  Query query = 2;
+  uint32 limit = 3;
+  uint32 offset = 4;
+  repeated string fields_to_load = 5;
+}
+
+message SearchHit {
+  uint32 doc_id = 1;
+  float score = 2;
+  map<string, FieldValue> fields = 3;
+}
+
+message FieldValue {
+  oneof value {
+    string text = 1;
+    uint64 u64 = 2;
+    int64 i64 = 3;
+    double f64 = 4;
+    bytes bytes_value = 5;
+  }
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  uint32 total_hits = 2;
+  uint64 took_ms = 3;
+}
+
+// Get document request/response
+message GetDocumentRequest {
+  string index_name = 1;
+  uint32 doc_id = 2;
+}
+
+message GetDocumentResponse {
+  map<string, FieldValue> fields = 1;
+}
+
+// Index info request/response
+message GetIndexInfoRequest {
+  string index_name = 1;
+}
+
+message GetIndexInfoResponse {
+  string index_name = 1;
+  uint32 num_docs = 2;
+  uint32 num_segments = 3;
+  Schema schema = 4;
+}
+
+// Create index request/response
+message CreateIndexRequest {
+  string index_name = 1;
+  Schema schema = 2;
+}
+
+message CreateIndexResponse {
+  bool success = 1;
+}
+
+// Index document request/response
+message IndexDocumentRequest {
+  string index_name = 1;
+  map<string, FieldValue> fields = 2;
+}
+
+message IndexDocumentsResponse {
+  uint32 indexed_count = 1;
+}
+
+// Commit request/response
+message CommitRequest {
+  string index_name = 1;
+}
+
+message CommitResponse {
+  bool success = 1;
+  uint32 num_docs = 2;
+}
+
+// Force merge request/response
+message ForceMergeRequest {
+  string index_name = 1;
+}
+
+message ForceMergeResponse {
+  bool success = 1;
+  uint32 num_segments = 2;
+}
+
+// Delete index request/response
+message DeleteIndexRequest {
+  string index_name = 1;
+}
+
+message DeleteIndexResponse {
+  bool success = 1;
+}

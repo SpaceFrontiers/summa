@@ -1,0 +1,47 @@
+# Build artifacts
+/target/
+/dist/
+
+# Data files (generated indexes, processed data)
+/data/
+*.zst
+dump.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.windsurf/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+hermes-web/dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+hermes-python/target/
+
+# Rust
+*.rs.bk
+Cargo.lock.bak
+
+# WASM build output (regenerated on build)
+hermes-wasm/pkg/
+
+# Maturin
+hermes-python/target/
+
+# Environment
+.env
+.env.local
