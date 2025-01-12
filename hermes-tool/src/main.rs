@@ -1019,7 +1019,7 @@ fn run_sort(
     Ok(())
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
 pub struct TermStats {
     pub term: String,
     pub df: u32,
@@ -1029,7 +1029,7 @@ pub struct TermStats {
     pub upper_bound: f32,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
 pub struct WandStats {
     pub total_docs: u64,
     pub total_tokens: u64,
@@ -1176,7 +1176,7 @@ fn run_term_stats(
             writeln!(writer)?;
         }
         "binary" => {
-            let encoded = bincode::serialize(&wand_stats)
+            let encoded = bincode::encode_to_vec(&wand_stats, bincode::config::standard())
                 .map_err(|e| anyhow::anyhow!("Bincode error: {}", e))?;
             writer.write_all(&encoded)?;
         }
