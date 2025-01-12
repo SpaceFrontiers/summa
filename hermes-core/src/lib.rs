@@ -55,7 +55,7 @@ pub use segment::{
     AsyncSegmentReader, AsyncStoreReader, FieldStats, SegmentId, SegmentMeta, SegmentReader,
 };
 #[cfg(feature = "native")]
-pub use segment::{SegmentBuilder, SegmentBuilderConfig};
+pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 
 // Re-exports from query
 pub use query::{

@@ -5,6 +5,7 @@ mod partitioned_ef;
 mod posting;
 mod posting_format;
 mod roaring;
+mod rounded_bp128;
 pub mod simd;
 mod sstable;
 #[allow(dead_code)]
@@ -34,6 +35,9 @@ pub use posting_format::{
 pub use roaring::{
     ROARING_BLOCK_SIZE, RoaringBitmap, RoaringBlockInfo, RoaringIterator, RoaringPostingIterator,
     RoaringPostingList,
+};
+pub use rounded_bp128::{
+    ROUNDED_BP128_BLOCK_SIZE, RoundedBP128Block, RoundedBP128Iterator, RoundedBP128PostingList,
 };
 pub use simd::bits_needed;
 pub use sstable::{

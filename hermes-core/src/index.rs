@@ -621,6 +621,12 @@ impl<D: DirectoryWriter> IndexWriter<D> {
         Ok(doc_id)
     }
 
+    /// Get current builder statistics for debugging
+    pub async fn get_builder_stats(&self) -> Option<crate::segment::SegmentBuilderStats> {
+        let builder_guard = self.builder.lock().await;
+        builder_guard.as_ref().map(|b| b.stats())
+    }
+
     /// Commit all pending segments to disk
     pub async fn commit(&self) -> Result<()> {
         let mut builder_guard = self.builder.lock().await;

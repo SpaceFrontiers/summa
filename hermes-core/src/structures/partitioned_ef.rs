@@ -33,8 +33,6 @@ pub struct EFPartition {
     first_value: u32,
     /// Last value in partition (absolute)
     last_value: u32,
-    /// Local universe size (last_value - first_value + 1)
-    local_universe: u32,
     /// Number of lower bits per element
     lower_bit_width: u8,
 }
@@ -50,7 +48,6 @@ impl EFPartition {
                 len: 0,
                 first_value: 0,
                 last_value: 0,
-                local_universe: 0,
                 lower_bit_width: 0,
             };
         }
@@ -123,7 +120,6 @@ impl EFPartition {
             len: values.len() as u32,
             first_value,
             last_value,
-            local_universe,
             lower_bit_width,
         }
     }
@@ -370,7 +366,7 @@ impl EFPartition {
         writer.write_u32::<LittleEndian>(self.len)?;
         writer.write_u32::<LittleEndian>(self.first_value)?;
         writer.write_u32::<LittleEndian>(self.last_value)?;
-        writer.write_u32::<LittleEndian>(self.local_universe)?;
+        // local_universe removed - computed as last_value - first_value + 1
         writer.write_u8(self.lower_bit_width)?;
 
         writer.write_u32::<LittleEndian>(self.lower_bits.len() as u32)?;
@@ -391,7 +387,7 @@ impl EFPartition {
         let len = reader.read_u32::<LittleEndian>()?;
         let first_value = reader.read_u32::<LittleEndian>()?;
         let last_value = reader.read_u32::<LittleEndian>()?;
-        let local_universe = reader.read_u32::<LittleEndian>()?;
+        // local_universe removed - computed as last_value - first_value + 1
         let lower_bit_width = reader.read_u8()?;
 
         let lower_len = reader.read_u32::<LittleEndian>()? as usize;
@@ -412,14 +408,13 @@ impl EFPartition {
             len,
             first_value,
             last_value,
-            local_universe,
             lower_bit_width,
         })
     }
 
-    /// Size in bytes
+    /// Size in bytes (13 bytes header + arrays)
     pub fn size_bytes(&self) -> usize {
-        17 + self.lower_bits.len() * 8 + self.upper_bits.len() * 8
+        13 + self.lower_bits.len() * 8 + self.upper_bits.len() * 8
     }
 }
 
@@ -446,8 +441,8 @@ fn estimate_partition_cost(values: &[u32]) -> usize {
     // Upper bits: approximately 2n bits
     let upper_bits = 2 * n;
 
-    // Overhead: partition header
-    let overhead = 17 * 8; // 17 bytes header
+    // Overhead: partition header (13 bytes after removing local_universe)
+    let overhead = 13 * 8; // 13 bytes header
 
     (lower_bits + upper_bits + overhead).div_ceil(8)
 }

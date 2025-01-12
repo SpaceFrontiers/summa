@@ -340,7 +340,7 @@ async fn index_from_reader<R: BufRead>(
             continue;
         }
 
-        let json: serde_json::Value = match serde_json::from_str(&line) {
+        let json: serde_json::Value = match sonic_rs::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
                 if errors < 10 {
@@ -368,10 +368,27 @@ async fn index_from_reader<R: BufRead>(
         if progress_interval > 0 && count.is_multiple_of(progress_interval) {
             let elapsed = start_time.elapsed().as_secs_f64();
             let rate = count as f64 / elapsed;
-            info!(
-                "Progress: {} documents indexed ({:.0} docs/sec)",
-                count, rate
-            );
+
+            // Get builder stats for debugging
+            if let Some(stats) = writer.get_builder_stats().await {
+                info!(
+                    "Progress: {} docs ({:.0}/s) | terms: {} | postings: {} | interned: {} | shards: {}-{}-{} | spill: {}KB",
+                    count,
+                    rate,
+                    stats.unique_terms,
+                    stats.postings_in_memory,
+                    stats.interned_strings,
+                    stats.shard_min,
+                    stats.shard_avg,
+                    stats.shard_max,
+                    stats.spill_bytes / 1024
+                );
+            } else {
+                info!(
+                    "Progress: {} documents indexed ({:.0} docs/sec)",
+                    count, rate
+                );
+            }
         }
     }
 
@@ -635,7 +652,7 @@ fn run_simhash(field: &str, output_field: &str) -> Result<()> {
             let results: Vec<String> = batch
                 .into_par_iter()
                 .filter_map(|line| {
-                    let mut json: serde_json::Value = match serde_json::from_str(&line) {
+                    let mut json: serde_json::Value = match sonic_rs::from_str(&line) {
                         Ok(v) => v,
                         Err(_) => {
                             errors_clone.fetch_add(1, Ordering::Relaxed);
@@ -802,7 +819,7 @@ fn merge_chunks(
     let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
     for (idx, reader) in readers.iter_mut().enumerate() {
         if let Some(Ok(line)) = reader.next()
-            && let Ok(value) = serde_json::from_str(&line)
+            && let Ok(value) = sonic_rs::from_str(&line)
         {
             heap.push(HeapItem {
                 value,
@@ -824,7 +841,7 @@ fn merge_chunks(
         output_count += 1;
 
         if let Some(Ok(line)) = readers[item.chunk_idx].next()
-            && let Ok(value) = serde_json::from_str(&line)
+            && let Ok(value) = sonic_rs::from_str(&line)
         {
             heap.push(HeapItem {
                 value,
@@ -931,7 +948,7 @@ fn run_sort(
             continue;
         }
 
-        match serde_json::from_str(&line) {
+        match sonic_rs::from_str(&line) {
             Ok(v) => {
                 chunk.push(v);
                 total_docs += 1;
@@ -1082,7 +1099,7 @@ fn run_term_stats(
             continue;
         }
 
-        let json: serde_json::Value = match serde_json::from_str(&line) {
+        let json: serde_json::Value = match sonic_rs::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
                 if errors < 5 {

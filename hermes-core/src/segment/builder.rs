@@ -105,9 +105,30 @@ impl ShardedInvertedIndex {
             .or_insert_with(SpillablePostingList::new)
     }
 
-    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    /// Get total number of in-memory postings across all shards
+    fn total_postings_in_memory(&self) -> usize {
+        self.shards
+            .iter()
+            .flat_map(|s| s.values())
+            .map(|p| p.memory.len())
+            .sum()
+    }
+
+    /// Get shard size distribution (min, max, avg)
+    fn shard_stats(&self) -> (usize, usize, usize) {
+        let sizes: Vec<usize> = self.shards.iter().map(|s| s.len()).collect();
+        let min = *sizes.iter().min().unwrap_or(&0);
+        let max = *sizes.iter().max().unwrap_or(&0);
+        let avg = if sizes.is_empty() {
+            0
+        } else {
+            sizes.iter().sum::<usize>() / sizes.len()
+        };
+        (min, max, avg)
     }
 }
 
@@ -211,6 +232,28 @@ impl SpillablePostingList {
     fn needs_spill(&self) -> bool {
         self.memory.len() >= POSTING_FLUSH_THRESHOLD
     }
+}
+
+/// Statistics for debugging segment builder performance
+#[cfg(feature = "native")]
+#[derive(Debug, Clone)]
+pub struct SegmentBuilderStats {
+    /// Number of documents indexed
+    pub num_docs: u32,
+    /// Number of unique terms in the inverted index
+    pub unique_terms: usize,
+    /// Total postings in memory (across all terms)
+    pub postings_in_memory: usize,
+    /// Number of interned strings
+    pub interned_strings: usize,
+    /// Size of doc_field_lengths vector
+    pub doc_field_lengths_size: usize,
+    /// Shard distribution (min, max, avg terms per shard)
+    pub shard_min: usize,
+    pub shard_max: usize,
+    pub shard_avg: usize,
+    /// Spill file offset (bytes written to disk)
+    pub spill_bytes: u64,
 }
 
 /// Configuration for segment builder
@@ -367,6 +410,22 @@ impl SegmentBuilder {
 
     pub fn num_docs(&self) -> u32 {
         self.next_doc_id
+    }
+
+    /// Get current statistics for debugging performance
+    pub fn stats(&self) -> SegmentBuilderStats {
+        let (shard_min, shard_max, shard_avg) = self.inverted_index.shard_stats();
+        SegmentBuilderStats {
+            num_docs: self.next_doc_id,
+            unique_terms: self.inverted_index.len(),
+            postings_in_memory: self.inverted_index.total_postings_in_memory(),
+            interned_strings: self.term_interner.len(),
+            doc_field_lengths_size: self.doc_field_lengths.len(),
+            shard_min,
+            shard_max,
+            shard_avg,
+            spill_bytes: self.spill_offset,
+        }
     }
 
     /// Add a document - streams to disk immediately
