@@ -79,9 +79,12 @@ jobs:
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "New version: $NEW_VERSION"
 
-      - name: Update Cargo.toml version
+      - name: Update Cargo.toml versions
         run: |
+          # Update workspace package version
           sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
+          # Update hermes-core dependency version in workspace
+          sed -i 's/hermes-core = { version = "[^"]*"/hermes-core = { version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
           echo "Updated Cargo.toml to version ${{ steps.bump.outputs.new_version }}"
 
       - name: Update pyproject.toml version
