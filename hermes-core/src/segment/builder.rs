@@ -51,12 +51,104 @@ const POSTING_FLUSH_THRESHOLD: usize = 100_000;
 #[cfg(feature = "native")]
 const SPILL_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
+/// Number of shards for the inverted index
+/// Power of 2 for fast modulo via bitwise AND
+#[cfg(feature = "native")]
+const NUM_INDEX_SHARDS: usize = 64;
+
 /// Interned term key combining field and term
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TermKey {
     field: u32,
     term: Spur,
+}
+
+#[cfg(feature = "native")]
+impl TermKey {
+    /// Get shard index for this term key (uses term's internal id for distribution)
+    #[inline]
+    fn shard(&self) -> usize {
+        // Spur wraps NonZero<u32>, get the raw value for sharding
+        // Using bitwise AND since NUM_INDEX_SHARDS is power of 2
+        (self.term.into_inner().get() as usize) & (NUM_INDEX_SHARDS - 1)
+    }
+}
+
+/// Sharded inverted index for better cache locality
+/// Each shard is a smaller hashmap that fits better in CPU cache
+#[cfg(feature = "native")]
+struct ShardedInvertedIndex {
+    shards: Vec<HashMap<TermKey, SpillablePostingList>>,
+}
+
+#[cfg(feature = "native")]
+impl ShardedInvertedIndex {
+    fn new(capacity_per_shard: usize) -> Self {
+        let mut shards = Vec::with_capacity(NUM_INDEX_SHARDS);
+        for _ in 0..NUM_INDEX_SHARDS {
+            shards.push(HashMap::with_capacity(capacity_per_shard));
+        }
+        Self { shards }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &TermKey) -> Option<&mut SpillablePostingList> {
+        self.shards[key.shard()].get_mut(key)
+    }
+
+    /// Get or insert a posting list for the given term key
+    #[inline]
+    fn get_or_insert(&mut self, key: TermKey) -> &mut SpillablePostingList {
+        self.shards[key.shard()]
+            .entry(key)
+            .or_insert_with(SpillablePostingList::new)
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+}
+
+/// Iterator over all entries in the sharded index
+#[cfg(feature = "native")]
+struct ShardedIndexIter<'a> {
+    shards: std::slice::Iter<'a, HashMap<TermKey, SpillablePostingList>>,
+    current: Option<hashbrown::hash_map::Iter<'a, TermKey, SpillablePostingList>>,
+}
+
+#[cfg(feature = "native")]
+impl<'a> Iterator for ShardedIndexIter<'a> {
+    type Item = (&'a TermKey, &'a SpillablePostingList);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ref mut current) = self.current
+                && let Some(item) = current.next()
+            {
+                return Some(item);
+            }
+            // Move to next shard
+            match self.shards.next() {
+                Some(shard) => self.current = Some(shard.iter()),
+                None => return None,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "native")]
+impl<'a> IntoIterator for &'a ShardedInvertedIndex {
+    type Item = (&'a TermKey, &'a SpillablePostingList);
+    type IntoIter = ShardedIndexIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ShardedIndexIter {
+            shards: self.shards.iter(),
+            current: None,
+        }
+    }
 }
 
 /// Compact posting entry for in-memory storage
@@ -166,9 +258,9 @@ pub struct SegmentBuilder {
     /// String interner for terms - O(1) lookup and deduplication
     term_interner: Rodeo,
 
-    /// Inverted index using interned term keys
-    /// hashbrown HashMap has better cache locality than BTreeMap
-    inverted_index: HashMap<TermKey, SpillablePostingList>,
+    /// Sharded inverted index for better cache locality
+    /// Each shard is a smaller hashmap that fits better in CPU cache
+    inverted_index: ShardedInvertedIndex,
 
     /// Streaming document store writer
     store_file: BufWriter<File>,
@@ -194,6 +286,13 @@ pub struct SegmentBuilder {
 
     /// Optional pre-computed WAND data for IDF values
     wand_data: Option<Arc<WandData>>,
+
+    /// Reusable buffer for per-document term frequency aggregation
+    /// Avoids allocating a new hashmap for each document
+    local_tf_buffer: FxHashMap<Spur, u32>,
+
+    /// Reusable buffer for terms that need spilling
+    terms_to_spill_buffer: Vec<TermKey>,
 }
 
 #[cfg(feature = "native")]
@@ -231,7 +330,9 @@ impl SegmentBuilder {
             schema,
             tokenizers: FxHashMap::default(),
             term_interner: Rodeo::new(),
-            inverted_index: HashMap::with_capacity(config.posting_map_capacity),
+            inverted_index: ShardedInvertedIndex::new(
+                config.posting_map_capacity / NUM_INDEX_SHARDS,
+            ),
             store_file,
             store_path,
             spill_file: None,
@@ -243,6 +344,8 @@ impl SegmentBuilder {
             num_indexed_fields,
             field_to_slot,
             wand_data: None,
+            local_tf_buffer: FxHashMap::default(),
+            terms_to_spill_buffer: Vec::new(),
             config,
         })
     }
@@ -317,6 +420,10 @@ impl SegmentBuilder {
     }
 
     /// Index a text field using interned terms
+    ///
+    /// Optimization: aggregate term frequencies within the document first,
+    /// then do a single insert per unique term. This reduces hash lookups
+    /// from O(total_tokens) to O(unique_terms_in_doc).
     fn index_text_field(&mut self, field: Field, doc_id: DocId, text: &str) -> Result<u32> {
         let default_tokenizer = LowercaseTokenizer;
         let tokenizer: &dyn crate::tokenizer::TokenizerClone = self
@@ -328,27 +435,41 @@ impl SegmentBuilder {
         let tokens = tokenizer.tokenize(text);
         let token_count = tokens.len() as u32;
 
+        // Phase 1: Aggregate term frequencies within this document
+        // Reuse buffer to avoid allocations
+        self.local_tf_buffer.clear();
+
         for token in tokens {
             // Intern the term - O(1) amortized
             let term_spur = self.term_interner.get_or_intern(&token.text);
+            *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
+        }
 
+        // Phase 2: Insert aggregated terms into inverted index
+        // Now we only do one inverted_index lookup per unique term in doc
+        // Reuse buffer for terms to spill
+        let field_id = field.0;
+        self.terms_to_spill_buffer.clear();
+
+        for (&term_spur, &tf) in &self.local_tf_buffer {
             let term_key = TermKey {
-                field: field.0,
+                field: field_id,
                 term: term_spur,
             };
 
-            // hashbrown entry API is faster than BTreeMap
-            let posting = self
-                .inverted_index
-                .entry(term_key)
-                .or_insert_with(SpillablePostingList::new);
+            let posting = self.inverted_index.get_or_insert(term_key);
+            posting.add(doc_id, tf);
 
-            posting.add(doc_id, 1);
-
-            // Check if we need to spill this posting list
+            // Mark for spilling if needed
             if posting.needs_spill() {
-                self.spill_posting_list(term_key)?;
+                self.terms_to_spill_buffer.push(term_key);
             }
+        }
+
+        // Phase 3: Spill large posting lists
+        for i in 0..self.terms_to_spill_buffer.len() {
+            let term_key = self.terms_to_spill_buffer[i];
+            self.spill_posting_list(term_key)?;
         }
 
         Ok(token_count)
@@ -364,10 +485,7 @@ impl SegmentBuilder {
             term: term_spur,
         };
 
-        let posting = self
-            .inverted_index
-            .entry(term_key)
-            .or_insert_with(SpillablePostingList::new);
+        let posting = self.inverted_index.get_or_insert(term_key);
         posting.add(doc_id, 1);
 
         Ok(())
