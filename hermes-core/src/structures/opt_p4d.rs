@@ -275,7 +275,7 @@ fn unpack_exceptions_delta_decode(
                 // Check for exception at this position
                 for &(pos, high_bits) in exceptions {
                     if pos as usize == i {
-                        delta = (high_bits << bit_width) | delta;
+                        delta |= high_bits << bit_width;
                         break;
                     }
                 }
@@ -290,7 +290,7 @@ fn unpack_exceptions_delta_decode(
                 let mut delta = u16::from_le_bytes([packed[idx], packed[idx + 1]]) as u32;
                 for &(pos, high_bits) in exceptions {
                     if pos as usize == i {
-                        delta = (high_bits << bit_width) | delta;
+                        delta |= high_bits << bit_width;
                         break;
                     }
                 }
@@ -327,7 +327,7 @@ fn unpack_exceptions_delta_decode(
                 // Check for exception
                 for &(pos, high_bits) in exceptions {
                     if pos as usize == i {
-                        delta = (high_bits << bit_width) | delta;
+                        delta |= high_bits << bit_width;
                         break;
                     }
                 }

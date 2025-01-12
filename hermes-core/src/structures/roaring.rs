@@ -594,11 +594,13 @@ impl RoaringBitmap {
 
     /// Create an iterator
     pub fn iter(&self) -> RoaringIterator<'_> {
+        // Pre-allocate buffer for typical container size (4096 is array threshold)
         RoaringIterator {
             bitmap: self,
             container_idx: 0,
             value_idx: 0,
-            current_values: Vec::new(),
+            current_len: 0,
+            current_values: Vec::with_capacity(ARRAY_TO_BITMAP_THRESHOLD),
         }
     }
 }
@@ -614,6 +616,9 @@ pub struct RoaringIterator<'a> {
     bitmap: &'a RoaringBitmap,
     container_idx: usize,
     value_idx: usize,
+    /// Number of valid values in current_values
+    current_len: usize,
+    /// Pre-allocated buffer for container values (max 65536 values per container)
     current_values: Vec<u16>,
 }
 
@@ -622,7 +627,7 @@ impl<'a> Iterator for RoaringIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.value_idx < self.current_values.len() {
+            if self.value_idx < self.current_len {
                 let high = self.bitmap.containers[self.container_idx - 1].0 as u32;
                 let low = self.current_values[self.value_idx] as u32;
                 self.value_idx += 1;
@@ -634,10 +639,77 @@ impl<'a> Iterator for RoaringIterator<'a> {
             }
 
             let (_, container) = &self.bitmap.containers[self.container_idx];
-            self.current_values = RoaringBitmap::container_to_array(container);
+            // Decode into pre-allocated buffer (no allocation!)
+            self.current_len = Self::decode_container_into(container, &mut self.current_values);
             self.value_idx = 0;
             self.container_idx += 1;
         }
+    }
+}
+
+impl<'a> RoaringIterator<'a> {
+    /// Decode container values into a pre-allocated buffer
+    /// Returns the number of values decoded
+    #[inline]
+    fn decode_container_into(container: &Container, output: &mut Vec<u16>) -> usize {
+        match container {
+            Container::Array(arr) => {
+                let len = arr.len();
+                if output.len() < len {
+                    output.resize(len, 0);
+                }
+                output[..len].copy_from_slice(arr);
+                len
+            }
+            Container::Bitmap(bm) => Self::decode_bitmap_into(bm, output),
+            Container::Runs(runs) => {
+                let mut count = 0;
+                for &(start, len) in runs {
+                    for i in 0..=len {
+                        let val = start + i;
+                        if count >= output.len() {
+                            output.push(val);
+                        } else {
+                            output[count] = val;
+                        }
+                        count += 1;
+                    }
+                }
+                count
+            }
+        }
+    }
+
+    /// Decode bitmap container into output buffer
+    /// Uses optimized bit extraction
+    #[inline]
+    fn decode_bitmap_into(bm: &[u64; 1024], output: &mut Vec<u16>) -> usize {
+        let mut count = 0;
+
+        for (word_idx, &word) in bm.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+
+            let base = (word_idx * 64) as u16;
+            let mut w = word;
+
+            // Unroll the bit extraction loop for better performance
+            while w != 0 {
+                let bit_idx = w.trailing_zeros() as u16;
+                let val = base + bit_idx;
+
+                if count >= output.len() {
+                    output.push(val);
+                } else {
+                    output[count] = val;
+                }
+                count += 1;
+                w &= w - 1; // Clear lowest set bit
+            }
+        }
+
+        count
     }
 }
 
