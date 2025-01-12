@@ -2,52 +2,74 @@
 //!
 //! Automatically selects the best compression method based on posting list characteristics:
 //! - **Inline**: 1-3 postings stored directly in TermInfo (no separate I/O)
-//! - **Bitpacked**: Standard block-based compression for medium lists
-//! - **Elias-Fano**: Near-optimal compression for long lists (>10K docs)
-//! - **Roaring**: Bitmap-based for very frequent terms (>1% of corpus)
+//! - **SIMD-BP128**: NEON/SSE accelerated for all lists up to 20K (fastest decoding)
+//! - **Partitioned EF**: Best compression for large lists (>20K)
+//! - **Roaring**: Bitmap-based for very frequent terms (>1% of corpus), fastest iteration
+//!
+//! Note: Bitpacked and plain Elias-Fano are kept for backwards compatibility but
+//! are no longer selected by the automatic format selection algorithm.
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
 use super::bitpacking::BitpackedPostingList;
 use super::elias_fano::EliasFanoPostingList;
+use super::partitioned_ef::PartitionedEFPostingList;
 use super::roaring::RoaringPostingList;
+use super::simd_bp128::SimdBp128PostingList;
 
-/// Thresholds for format selection
+/// Thresholds for format selection (based on benchmarks)
 pub const INLINE_THRESHOLD: usize = 3;
-pub const ELIAS_FANO_THRESHOLD: usize = 10_000;
 pub const ROARING_THRESHOLD_RATIO: f32 = 0.01; // 1% of corpus
+/// Threshold for using Partitioned EF (best compression)
+pub const PARTITIONED_EF_THRESHOLD: usize = 20_000;
 
 /// Format tag bytes for serialization
 const FORMAT_BITPACKED: u8 = 0;
 const FORMAT_ELIAS_FANO: u8 = 1;
 const FORMAT_ROARING: u8 = 2;
+const FORMAT_SIMD_BP128: u8 = 3;
+const FORMAT_PARTITIONED_EF: u8 = 4;
 
 /// Posting list format selector
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostingFormat {
-    /// Standard bitpacked format (default)
+    /// Standard bitpacked format (default for small lists)
     Bitpacked,
+    /// SIMD-BP128 with vertical layout (medium lists, fast decoding)
+    SimdBp128,
     /// Elias-Fano for long posting lists
     EliasFano,
+    /// Partitioned Elias-Fano (very long lists, better compression)
+    PartitionedEF,
     /// Roaring bitmap for very frequent terms
     Roaring,
 }
 
 impl PostingFormat {
     /// Select optimal format based on posting list characteristics
+    ///
+    /// Simplified format selection (based on benchmarks):
+    /// - Very frequent (>1% of corpus, >20K docs): Roaring (fastest iteration, set ops)
+    /// - Large (≥20K docs): Partitioned EF (best compression 15.9%)
+    /// - All other lists: SIMD-BP128 (fastest decoding 198K ints/μs, optimal compression 16.3%)
+    ///
+    /// Note: SIMD-BP128 replaces both Bitpacked and plain Elias-Fano as it has:
+    /// - Same compression as Bitpacked (16.3%)
+    /// - Faster decoding than Bitpacked (198K vs 192K ints/μs)
+    /// - Much faster than Elias-Fano (198K vs 9.6K ints/μs)
     pub fn select(doc_count: usize, total_docs: usize) -> Self {
         let frequency_ratio = doc_count as f32 / total_docs.max(1) as f32;
 
-        if frequency_ratio >= ROARING_THRESHOLD_RATIO && doc_count > ELIAS_FANO_THRESHOLD {
+        if frequency_ratio >= ROARING_THRESHOLD_RATIO && doc_count >= PARTITIONED_EF_THRESHOLD {
             // Very frequent term - use Roaring for fast intersections
             PostingFormat::Roaring
-        } else if doc_count >= ELIAS_FANO_THRESHOLD {
-            // Long posting list - use Elias-Fano for better compression
-            PostingFormat::EliasFano
+        } else if doc_count >= PARTITIONED_EF_THRESHOLD {
+            // Large posting list - use Partitioned EF for best compression
+            PostingFormat::PartitionedEF
         } else {
-            // Standard case - use bitpacked
-            PostingFormat::Bitpacked
+            // All other lists - use SIMD-BP128 (fastest decoding, optimal compression)
+            PostingFormat::SimdBp128
         }
     }
 }
@@ -56,7 +78,9 @@ impl PostingFormat {
 #[derive(Debug, Clone)]
 pub enum CompressedPostingList {
     Bitpacked(BitpackedPostingList),
+    SimdBp128(SimdBp128PostingList),
     EliasFano(EliasFanoPostingList),
+    PartitionedEF(PartitionedEFPostingList),
     Roaring(RoaringPostingList),
 }
 
@@ -69,8 +93,14 @@ impl CompressedPostingList {
             PostingFormat::Bitpacked => CompressedPostingList::Bitpacked(
                 BitpackedPostingList::from_postings(doc_ids, term_freqs, idf),
             ),
+            PostingFormat::SimdBp128 => CompressedPostingList::SimdBp128(
+                SimdBp128PostingList::from_postings(doc_ids, term_freqs, idf),
+            ),
             PostingFormat::EliasFano => CompressedPostingList::EliasFano(
                 EliasFanoPostingList::from_postings(doc_ids, term_freqs),
+            ),
+            PostingFormat::PartitionedEF => CompressedPostingList::PartitionedEF(
+                PartitionedEFPostingList::from_postings_with_idf(doc_ids, term_freqs, idf),
             ),
             PostingFormat::Roaring => CompressedPostingList::Roaring(
                 RoaringPostingList::from_postings(doc_ids, term_freqs),
@@ -89,8 +119,14 @@ impl CompressedPostingList {
             PostingFormat::Bitpacked => CompressedPostingList::Bitpacked(
                 BitpackedPostingList::from_postings(doc_ids, term_freqs, idf),
             ),
+            PostingFormat::SimdBp128 => CompressedPostingList::SimdBp128(
+                SimdBp128PostingList::from_postings(doc_ids, term_freqs, idf),
+            ),
             PostingFormat::EliasFano => CompressedPostingList::EliasFano(
                 EliasFanoPostingList::from_postings(doc_ids, term_freqs),
+            ),
+            PostingFormat::PartitionedEF => CompressedPostingList::PartitionedEF(
+                PartitionedEFPostingList::from_postings_with_idf(doc_ids, term_freqs, idf),
             ),
             PostingFormat::Roaring => CompressedPostingList::Roaring(
                 RoaringPostingList::from_postings(doc_ids, term_freqs),
@@ -102,7 +138,9 @@ impl CompressedPostingList {
     pub fn doc_count(&self) -> u32 {
         match self {
             CompressedPostingList::Bitpacked(p) => p.doc_count,
+            CompressedPostingList::SimdBp128(p) => p.doc_count,
             CompressedPostingList::EliasFano(p) => p.len(),
+            CompressedPostingList::PartitionedEF(p) => p.len(),
             CompressedPostingList::Roaring(p) => p.len(),
         }
     }
@@ -111,7 +149,11 @@ impl CompressedPostingList {
     pub fn max_tf(&self) -> u32 {
         match self {
             CompressedPostingList::Bitpacked(p) => p.max_score as u32, // Approximation
+            CompressedPostingList::SimdBp128(p) => {
+                p.blocks.iter().map(|b| b.max_tf).max().unwrap_or(0)
+            }
             CompressedPostingList::EliasFano(p) => p.max_tf,
+            CompressedPostingList::PartitionedEF(p) => p.max_tf,
             CompressedPostingList::Roaring(p) => p.max_tf,
         }
     }
@@ -120,7 +162,9 @@ impl CompressedPostingList {
     pub fn format(&self) -> PostingFormat {
         match self {
             CompressedPostingList::Bitpacked(_) => PostingFormat::Bitpacked,
+            CompressedPostingList::SimdBp128(_) => PostingFormat::SimdBp128,
             CompressedPostingList::EliasFano(_) => PostingFormat::EliasFano,
+            CompressedPostingList::PartitionedEF(_) => PostingFormat::PartitionedEF,
             CompressedPostingList::Roaring(_) => PostingFormat::Roaring,
         }
     }
@@ -132,8 +176,16 @@ impl CompressedPostingList {
                 writer.write_u8(FORMAT_BITPACKED)?;
                 p.serialize(writer)
             }
+            CompressedPostingList::SimdBp128(p) => {
+                writer.write_u8(FORMAT_SIMD_BP128)?;
+                p.serialize(writer)
+            }
             CompressedPostingList::EliasFano(p) => {
                 writer.write_u8(FORMAT_ELIAS_FANO)?;
+                p.serialize(writer)
+            }
+            CompressedPostingList::PartitionedEF(p) => {
+                writer.write_u8(FORMAT_PARTITIONED_EF)?;
                 p.serialize(writer)
             }
             CompressedPostingList::Roaring(p) => {
@@ -150,8 +202,14 @@ impl CompressedPostingList {
             FORMAT_BITPACKED => Ok(CompressedPostingList::Bitpacked(
                 BitpackedPostingList::deserialize(reader)?,
             )),
+            FORMAT_SIMD_BP128 => Ok(CompressedPostingList::SimdBp128(
+                SimdBp128PostingList::deserialize(reader)?,
+            )),
             FORMAT_ELIAS_FANO => Ok(CompressedPostingList::EliasFano(
                 EliasFanoPostingList::deserialize(reader)?,
+            )),
+            FORMAT_PARTITIONED_EF => Ok(CompressedPostingList::PartitionedEF(
+                PartitionedEFPostingList::deserialize(reader)?,
             )),
             FORMAT_ROARING => Ok(CompressedPostingList::Roaring(
                 RoaringPostingList::deserialize(reader)?,
@@ -169,8 +227,14 @@ impl CompressedPostingList {
             CompressedPostingList::Bitpacked(p) => {
                 CompressedPostingIterator::Bitpacked(p.iterator())
             }
+            CompressedPostingList::SimdBp128(p) => {
+                CompressedPostingIterator::SimdBp128(p.iterator())
+            }
             CompressedPostingList::EliasFano(p) => {
                 CompressedPostingIterator::EliasFano(p.iterator())
+            }
+            CompressedPostingList::PartitionedEF(p) => {
+                CompressedPostingIterator::PartitionedEF(p.iterator())
             }
             CompressedPostingList::Roaring(p) => {
                 let mut iter = p.iterator();
@@ -184,7 +248,9 @@ impl CompressedPostingList {
 /// Unified iterator over any posting list format
 pub enum CompressedPostingIterator<'a> {
     Bitpacked(super::bitpacking::BitpackedPostingIterator<'a>),
+    SimdBp128(super::simd_bp128::SimdBp128Iterator<'a>),
     EliasFano(super::elias_fano::EliasFanoPostingIterator<'a>),
+    PartitionedEF(super::partitioned_ef::PartitionedEFPostingIterator<'a>),
     Roaring(super::roaring::RoaringPostingIterator<'a>),
 }
 
@@ -193,7 +259,9 @@ impl<'a> CompressedPostingIterator<'a> {
     pub fn doc(&self) -> u32 {
         match self {
             CompressedPostingIterator::Bitpacked(i) => i.doc(),
+            CompressedPostingIterator::SimdBp128(i) => i.doc(),
             CompressedPostingIterator::EliasFano(i) => i.doc(),
+            CompressedPostingIterator::PartitionedEF(i) => i.doc(),
             CompressedPostingIterator::Roaring(i) => i.doc(),
         }
     }
@@ -202,7 +270,9 @@ impl<'a> CompressedPostingIterator<'a> {
     pub fn term_freq(&self) -> u32 {
         match self {
             CompressedPostingIterator::Bitpacked(i) => i.term_freq(),
+            CompressedPostingIterator::SimdBp128(i) => i.term_freq(),
             CompressedPostingIterator::EliasFano(i) => i.term_freq(),
+            CompressedPostingIterator::PartitionedEF(i) => i.term_freq(),
             CompressedPostingIterator::Roaring(i) => i.term_freq(),
         }
     }
@@ -211,7 +281,9 @@ impl<'a> CompressedPostingIterator<'a> {
     pub fn advance(&mut self) -> u32 {
         match self {
             CompressedPostingIterator::Bitpacked(i) => i.advance(),
+            CompressedPostingIterator::SimdBp128(i) => i.advance(),
             CompressedPostingIterator::EliasFano(i) => i.advance(),
+            CompressedPostingIterator::PartitionedEF(i) => i.advance(),
             CompressedPostingIterator::Roaring(i) => i.advance(),
         }
     }
@@ -220,7 +292,9 @@ impl<'a> CompressedPostingIterator<'a> {
     pub fn seek(&mut self, target: u32) -> u32 {
         match self {
             CompressedPostingIterator::Bitpacked(i) => i.seek(target),
+            CompressedPostingIterator::SimdBp128(i) => i.seek(target),
             CompressedPostingIterator::EliasFano(i) => i.seek(target),
+            CompressedPostingIterator::PartitionedEF(i) => i.seek(target),
             CompressedPostingIterator::Roaring(i) => i.seek(target),
         }
     }
@@ -236,8 +310,12 @@ impl<'a> CompressedPostingIterator<'a> {
 pub struct CompressionStats {
     pub bitpacked_count: u32,
     pub bitpacked_docs: u64,
+    pub simd_bp128_count: u32,
+    pub simd_bp128_docs: u64,
     pub elias_fano_count: u32,
     pub elias_fano_docs: u64,
+    pub partitioned_ef_count: u32,
+    pub partitioned_ef_docs: u64,
     pub roaring_count: u32,
     pub roaring_docs: u64,
     pub inline_count: u32,
@@ -251,9 +329,17 @@ impl CompressionStats {
                 self.bitpacked_count += 1;
                 self.bitpacked_docs += doc_count as u64;
             }
+            PostingFormat::SimdBp128 => {
+                self.simd_bp128_count += 1;
+                self.simd_bp128_docs += doc_count as u64;
+            }
             PostingFormat::EliasFano => {
                 self.elias_fano_count += 1;
                 self.elias_fano_docs += doc_count as u64;
+            }
+            PostingFormat::PartitionedEF => {
+                self.partitioned_ef_count += 1;
+                self.partitioned_ef_docs += doc_count as u64;
             }
             PostingFormat::Roaring => {
                 self.roaring_count += 1;
@@ -268,11 +354,21 @@ impl CompressionStats {
     }
 
     pub fn total_terms(&self) -> u32 {
-        self.bitpacked_count + self.elias_fano_count + self.roaring_count + self.inline_count
+        self.bitpacked_count
+            + self.simd_bp128_count
+            + self.elias_fano_count
+            + self.partitioned_ef_count
+            + self.roaring_count
+            + self.inline_count
     }
 
     pub fn total_postings(&self) -> u64 {
-        self.bitpacked_docs + self.elias_fano_docs + self.roaring_docs + self.inline_docs
+        self.bitpacked_docs
+            + self.simd_bp128_docs
+            + self.elias_fano_docs
+            + self.partitioned_ef_docs
+            + self.roaring_docs
+            + self.inline_docs
     }
 }
 
@@ -282,27 +378,35 @@ mod tests {
 
     #[test]
     fn test_format_selection() {
-        // Small list -> Bitpacked
+        // Small list -> SIMD-BP128 (replaces Bitpacked)
         assert_eq!(
             PostingFormat::select(100, 1_000_000),
-            PostingFormat::Bitpacked
+            PostingFormat::SimdBp128
         );
 
-        // Medium list -> Bitpacked
+        // Medium list -> SIMD-BP128
+        assert_eq!(
+            PostingFormat::select(500, 1_000_000),
+            PostingFormat::SimdBp128
+        );
+
         assert_eq!(
             PostingFormat::select(5_000, 1_000_000),
-            PostingFormat::Bitpacked
+            PostingFormat::SimdBp128
         );
 
-        // Long list but not frequent enough -> Elias-Fano
-        // 15K / 1M = 1.5% which is > 1% threshold, so it's Roaring
-        // Use a larger corpus to get Elias-Fano
         assert_eq!(
             PostingFormat::select(15_000, 10_000_000),
-            PostingFormat::EliasFano
+            PostingFormat::SimdBp128
         );
 
-        // Very frequent term (>1% of corpus AND >10K docs) -> Roaring
+        // Large list (>=20K) -> Partitioned EF
+        assert_eq!(
+            PostingFormat::select(25_000, 10_000_000),
+            PostingFormat::PartitionedEF
+        );
+
+        // Very frequent term (>1% of corpus AND >=20K docs) -> Roaring
         assert_eq!(
             PostingFormat::select(50_000, 1_000_000),
             PostingFormat::Roaring
@@ -310,13 +414,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compressed_posting_list_bitpacked() {
+    fn test_compressed_posting_list_small() {
         let doc_ids: Vec<u32> = (0..100).map(|i| i * 2).collect();
         let term_freqs: Vec<u32> = vec![1; 100];
 
         let list = CompressedPostingList::from_postings(&doc_ids, &term_freqs, 1_000_000, 1.0);
 
-        assert_eq!(list.format(), PostingFormat::Bitpacked);
+        // Small lists now use SIMD-BP128 (replaces Bitpacked)
+        assert_eq!(list.format(), PostingFormat::SimdBp128);
         assert_eq!(list.doc_count(), 100);
 
         let mut iter = list.iterator();
@@ -327,14 +432,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compressed_posting_list_elias_fano() {
+    fn test_compressed_posting_list_simd_bp128() {
         let doc_ids: Vec<u32> = (0..15_000).map(|i| i * 2).collect();
         let term_freqs: Vec<u32> = vec![1; 15_000];
 
-        // Use large corpus so 15K docs is < 1% (Elias-Fano, not Roaring)
+        // 15K docs with large corpus -> SIMD-BP128 (256-20K range)
         let list = CompressedPostingList::from_postings(&doc_ids, &term_freqs, 10_000_000, 1.0);
 
-        assert_eq!(list.format(), PostingFormat::EliasFano);
+        assert_eq!(list.format(), PostingFormat::SimdBp128);
         assert_eq!(list.doc_count(), 15_000);
     }
 

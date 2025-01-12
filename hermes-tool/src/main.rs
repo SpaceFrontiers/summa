@@ -554,48 +554,124 @@ fn simhash(text: &str) -> u32 {
 }
 
 fn run_simhash(field: &str, output_field: &str) -> Result<()> {
-    let stdin = io::stdin();
-    let reader = BufReader::new(stdin.lock());
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
+    use crossbeam_channel::{Receiver, Sender, bounded};
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
-    let mut count = 0usize;
-    let mut errors = 0usize;
+    const BATCH_SIZE: usize = 10_000;
+    const CHANNEL_CAPACITY: usize = 4;
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
+    let field = field.to_string();
+    let output_field = output_field.to_string();
 
-        let mut json: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                if errors < 5 {
-                    eprintln!("Warning: Failed to parse JSON at line {}: {}", count + 1, e);
-                }
-                errors += 1;
+    // Channels for pipeline: reader -> processor -> writer
+    let (line_tx, line_rx): (Sender<Vec<String>>, Receiver<Vec<String>>) =
+        bounded(CHANNEL_CAPACITY);
+    let (result_tx, result_rx): (Sender<Vec<String>>, Receiver<Vec<String>>) =
+        bounded(CHANNEL_CAPACITY);
+
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let errors = std::sync::Arc::new(AtomicUsize::new(0));
+
+    let count_clone = count.clone();
+    let errors_clone = errors.clone();
+
+    // Reader thread
+    let reader_handle = thread::spawn(move || -> Result<()> {
+        let stdin = io::stdin();
+        let reader = BufReader::new(stdin.lock());
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
                 continue;
             }
-        };
+            batch.push(line);
 
-        if let Some(obj) = json.as_object_mut() {
-            let text = obj.get(field).and_then(|v| v.as_str()).unwrap_or("");
-            let hash = simhash(text);
-            obj.insert(output_field.to_string(), serde_json::Value::from(hash));
-            serde_json::to_writer(&mut writer, &json)?;
-            writeln!(writer)?;
+            if batch.len() >= BATCH_SIZE {
+                if line_tx.send(std::mem::take(&mut batch)).is_err() {
+                    break;
+                }
+                batch = Vec::with_capacity(BATCH_SIZE);
+            }
         }
 
-        count += 1;
-    }
+        if !batch.is_empty() {
+            let _ = line_tx.send(batch);
+        }
 
-    writer.flush()?;
+        Ok(())
+    });
 
-    if errors > 0 {
-        eprintln!("Processed {} documents, {} errors", count, errors);
+    // Processor thread (uses rayon for parallel simhash computation)
+    let processor_handle = thread::spawn(move || {
+        while let Ok(batch) = line_rx.recv() {
+            let results: Vec<String> = batch
+                .into_par_iter()
+                .filter_map(|line| {
+                    let mut json: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            errors_clone.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
+                    };
+
+                    if let Some(obj) = json.as_object_mut() {
+                        let text = obj.get(&field).and_then(|v| v.as_str()).unwrap_or("");
+                        let hash = simhash(text);
+                        obj.insert(output_field.clone(), serde_json::Value::from(hash));
+                        count_clone.fetch_add(1, Ordering::Relaxed);
+                        serde_json::to_string(&json).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if result_tx.send(results).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Writer thread
+    let writer_handle = thread::spawn(move || -> Result<()> {
+        let stdout = io::stdout();
+        let mut writer = BufWriter::new(stdout.lock());
+
+        while let Ok(batch) = result_rx.recv() {
+            for line in batch {
+                writeln!(writer, "{}", line)?;
+            }
+        }
+
+        writer.flush()?;
+        Ok(())
+    });
+
+    reader_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Reader thread panicked"))??;
+    processor_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Processor thread panicked"))?;
+    writer_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+
+    let final_count = count.load(Ordering::Relaxed);
+    let final_errors = errors.load(Ordering::Relaxed);
+
+    if final_errors > 0 {
+        eprintln!(
+            "Processed {} documents, {} errors",
+            final_count, final_errors
+        );
     } else {
-        eprintln!("Processed {} documents", count);
+        eprintln!("Processed {} documents", final_count);
     }
 
     Ok(())
@@ -627,14 +703,17 @@ fn compare_by_field(
 }
 
 fn write_chunk(
-    chunk: &mut [serde_json::Value],
+    mut chunk: Vec<serde_json::Value>,
     field: &str,
     numeric: bool,
     reverse: bool,
     temp_dir: &std::path::Path,
     chunk_num: usize,
 ) -> Result<PathBuf> {
-    chunk.sort_by(|a, b| compare_by_field(a, b, field, numeric, reverse));
+    use rayon::prelude::*;
+
+    // Use parallel sort
+    chunk.par_sort_by(|a, b| compare_by_field(a, b, field, numeric, reverse));
 
     let chunk_path = temp_dir.join(format!("chunk_{:06}.jsonl", chunk_num));
     let file = std::fs::File::create(&chunk_path)?;
@@ -754,18 +833,73 @@ fn run_sort(
     chunk_size: usize,
     temp_dir: Option<PathBuf>,
 ) -> Result<()> {
+    use crossbeam_channel::{Sender, bounded};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
     let stdin = io::stdin();
     let reader = BufReader::new(stdin.lock());
 
     let temp_dir = temp_dir.unwrap_or_else(|| std::env::temp_dir().join("hermes-sort"));
     std::fs::create_dir_all(&temp_dir)?;
 
+    // Channel for sending chunks to be sorted/written in parallel
+    #[allow(clippy::type_complexity)]
+    let (chunk_tx, chunk_rx): (
+        Sender<(Vec<serde_json::Value>, usize)>,
+        crossbeam_channel::Receiver<(Vec<serde_json::Value>, usize)>,
+    ) = bounded(4);
+
+    // Channel for receiving completed chunk paths
+    #[allow(clippy::type_complexity)]
+    let (path_tx, path_rx): (
+        Sender<(usize, PathBuf)>,
+        crossbeam_channel::Receiver<(usize, PathBuf)>,
+    ) = bounded(100);
+
+    let field_clone = field.to_string();
+    let temp_dir_clone = temp_dir.clone();
+    let errors_count = Arc::new(AtomicUsize::new(0));
+
+    // Spawn worker threads for parallel chunk sorting/writing
+    let num_workers = rayon::current_num_threads().min(4);
+    let mut worker_handles = Vec::new();
+
+    for _ in 0..num_workers {
+        let rx = chunk_rx.clone();
+        let tx = path_tx.clone();
+        let field = field_clone.clone();
+        let temp_dir = temp_dir_clone.clone();
+
+        let handle = thread::spawn(move || {
+            while let Ok((chunk, chunk_num)) = rx.recv() {
+                match write_chunk(chunk, &field, numeric, reverse, &temp_dir, chunk_num) {
+                    Ok(path) => {
+                        let _ = tx.send((chunk_num, path));
+                    }
+                    Err(e) => {
+                        eprintln!("Error writing chunk {}: {}", chunk_num, e);
+                    }
+                }
+            }
+        });
+        worker_handles.push(handle);
+    }
+
+    // Drop extra senders so workers can terminate
+    drop(chunk_rx);
+    drop(path_tx);
+
     let mut chunk: Vec<serde_json::Value> = Vec::with_capacity(chunk_size);
-    let mut chunk_paths: Vec<PathBuf> = Vec::new();
+    let mut chunk_num = 0usize;
     let mut total_docs = 0usize;
     let mut errors = 0usize;
 
-    eprintln!("Reading and sorting chunks (chunk_size={})...", chunk_size);
+    eprintln!(
+        "Reading and sorting chunks (chunk_size={}, workers={})...",
+        chunk_size, num_workers
+    );
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
@@ -779,17 +913,15 @@ fn run_sort(
                 total_docs += 1;
 
                 if chunk.len() >= chunk_size {
-                    let path = write_chunk(
-                        &mut chunk,
-                        field,
-                        numeric,
-                        reverse,
-                        &temp_dir,
-                        chunk_paths.len(),
-                    )?;
-                    eprintln!("  Wrote chunk {} ({} docs)", chunk_paths.len(), chunk.len());
-                    chunk_paths.push(path);
-                    chunk.clear();
+                    eprintln!("  Sending chunk {} ({} docs)", chunk_num, chunk.len());
+                    if chunk_tx
+                        .send((std::mem::take(&mut chunk), chunk_num))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    chunk_num += 1;
+                    chunk = Vec::with_capacity(chunk_size);
                 }
             }
             Err(e) => {
@@ -805,18 +937,26 @@ fn run_sort(
         }
     }
 
+    // Send final chunk
     if !chunk.is_empty() {
-        let path = write_chunk(
-            &mut chunk,
-            field,
-            numeric,
-            reverse,
-            &temp_dir,
-            chunk_paths.len(),
-        )?;
-        eprintln!("  Wrote chunk {} ({} docs)", chunk_paths.len(), chunk.len());
-        chunk_paths.push(path);
+        eprintln!("  Sending chunk {} ({} docs)", chunk_num, chunk.len());
+        let _ = chunk_tx.send((chunk, chunk_num));
     }
+
+    // Close sender to signal workers to finish
+    drop(chunk_tx);
+
+    // Wait for all workers to complete
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
+
+    // Collect all chunk paths and sort by chunk number to maintain order
+    let mut chunk_paths: Vec<(usize, PathBuf)> = path_rx.iter().collect();
+    chunk_paths.sort_by_key(|(num, _)| *num);
+    let chunk_paths: Vec<PathBuf> = chunk_paths.into_iter().map(|(_, path)| path).collect();
+
+    errors += errors_count.load(Ordering::Relaxed);
 
     eprintln!(
         "Read {} documents into {} chunks",
