@@ -358,7 +358,7 @@ mod scalar {
                 let base_int = byte_idx * 8;
 
                 // Extract 8 bits from this byte
-                output[base_int + 0] |= ((byte_val >> 0) & 1) as u32 * (1 << bit_pos);
+                output[base_int] |= (byte_val & 1) as u32 * (1 << bit_pos);
                 output[base_int + 1] |= ((byte_val >> 1) & 1) as u32 * (1 << bit_pos);
                 output[base_int + 2] |= ((byte_val >> 2) & 1) as u32 * (1 << bit_pos);
                 output[base_int + 3] |= ((byte_val >> 3) & 1) as u32 * (1 << bit_pos);

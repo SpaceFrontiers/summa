@@ -164,7 +164,7 @@ impl EFPartition {
         Some(self.first_value + relative_val as u32)
     }
 
-    /// Find position of i-th set bit
+    /// Find position of i-th set bit (optimized with NEON on aarch64)
     fn select1(&self, i: u32) -> Option<u32> {
         if i >= self.len {
             return None;
@@ -173,17 +173,85 @@ impl EFPartition {
         let mut remaining = i + 1;
         let mut pos = 0u32;
 
-        for &word in &self.upper_bits {
-            let popcount = word.count_ones();
-            if popcount >= remaining {
-                let mut w = word;
-                for _ in 0..remaining - 1 {
-                    w &= w - 1;
+        // Process 4 words at a time on aarch64 using NEON popcount
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+
+            let chunks = self.upper_bits.chunks_exact(4);
+            let remainder = chunks.remainder();
+
+            for chunk in chunks {
+                // Load 4 u64 words (32 bytes)
+                let words: [u64; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+
+                // Count bits in each word using NEON
+                // vcntq_u8 counts bits per byte, then sum horizontally
+                unsafe {
+                    let bytes = std::mem::transmute::<[u64; 4], [u8; 32]>(words);
+
+                    // Process first 16 bytes (words 0-1)
+                    let v0 = vld1q_u8(bytes.as_ptr());
+                    let cnt0 = vcntq_u8(v0);
+                    let sum0 = vaddlvq_u8(cnt0) as u32;
+
+                    // Process next 16 bytes (words 2-3)
+                    let v1 = vld1q_u8(bytes.as_ptr().add(16));
+                    let cnt1 = vcntq_u8(v1);
+                    let sum1 = vaddlvq_u8(cnt1) as u32;
+
+                    let total_popcount = sum0 + sum1;
+
+                    if total_popcount >= remaining {
+                        // Found the chunk, now find exact word
+                        for &word in chunk {
+                            let popcount = word.count_ones();
+                            if popcount >= remaining {
+                                let mut w = word;
+                                for _ in 0..remaining - 1 {
+                                    w &= w - 1;
+                                }
+                                return Some(pos + w.trailing_zeros());
+                            }
+                            remaining -= popcount;
+                            pos += 64;
+                        }
+                    }
+                    remaining -= total_popcount;
+                    pos += 256; // 4 words * 64 bits
                 }
-                return Some(pos + w.trailing_zeros());
             }
-            remaining -= popcount;
-            pos += 64;
+
+            // Handle remaining words
+            for &word in remainder {
+                let popcount = word.count_ones();
+                if popcount >= remaining {
+                    let mut w = word;
+                    for _ in 0..remaining - 1 {
+                        w &= w - 1;
+                    }
+                    return Some(pos + w.trailing_zeros());
+                }
+                remaining -= popcount;
+                pos += 64;
+            }
+        }
+
+        // Scalar fallback for non-aarch64
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for &word in &self.upper_bits {
+                let popcount = word.count_ones();
+                if popcount >= remaining {
+                    let mut w = word;
+                    for _ in 0..remaining - 1 {
+                        w &= w - 1;
+                    }
+                    return Some(pos + w.trailing_zeros());
+                }
+                remaining -= popcount;
+                pos += 64;
+            }
         }
 
         None
