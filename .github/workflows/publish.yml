@@ -204,6 +204,7 @@ jobs:
           maturin build --release --out dist
 
       - name: List wheels
+        shell: bash
         run: ls -la hermes-core-python/dist/
 
       - name: Upload wheels
