@@ -608,8 +608,7 @@ unsafe fn unpack_vertical_sse(
             let mut byte_array = [0u8; 16];
             _mm_storeu_si128(byte_array.as_mut_ptr() as *mut __m128i, bytes);
 
-            for byte_idx in 0..16 {
-                let byte_val = byte_array[byte_idx];
+            for (byte_idx, &byte_val) in byte_array.iter().enumerate() {
                 let base_int = byte_idx * 8;
 
                 // Scatter 8 bits to 8 integers
