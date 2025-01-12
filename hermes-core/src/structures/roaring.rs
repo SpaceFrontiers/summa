@@ -44,7 +44,7 @@ impl Container {
         }
     }
 
-    /// NEON-accelerated bitmap cardinality on aarch64
+    /// SIMD-accelerated bitmap cardinality (NEON on aarch64, POPCNT on x86_64)
     #[inline]
     fn bitmap_cardinality(bm: &[u64; 1024]) -> u32 {
         #[cfg(target_arch = "aarch64")]
@@ -54,7 +54,7 @@ impl Container {
             let mut total = 0u32;
             let bytes = bm.as_ptr() as *const u8;
 
-            // Process 16 bytes (2 u64 words) at a time
+            // Process 16 bytes (2 u64 words) at a time using NEON vcntq_u8
             unsafe {
                 for i in (0..8192).step_by(16) {
                     let v = vld1q_u8(bytes.add(i));
@@ -66,7 +66,17 @@ impl Container {
             total
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Use POPCNT instruction on x86_64 (available on all modern CPUs)
+            let mut total = 0u32;
+            for &word in bm.iter() {
+                total += word.count_ones();
+            }
+            total
+        }
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             bm.iter().map(|w| w.count_ones()).sum()
         }

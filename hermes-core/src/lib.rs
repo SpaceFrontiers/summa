@@ -36,7 +36,7 @@ pub mod schema {
 
 // Re-exports from structures
 pub use structures::{
-    AsyncSSTableReader, BitpackedPostingIterator, BitpackedPostingList, BlockPostingList,
+    AsyncSSTableReader, BlockPostingList, HorizontalBP128Iterator, HorizontalBP128PostingList,
     PostingList, PostingListIterator, SSTableValue, TERMINATED, TermInfo,
 };
 

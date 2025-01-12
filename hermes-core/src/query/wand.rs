@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use crate::structures::{BitpackedPostingIterator, BitpackedPostingList};
+use crate::structures::{HorizontalBP128Iterator, HorizontalBP128PostingList};
 use crate::{DocId, Score};
 
 /// BM25F parameters for WAND scoring
@@ -18,7 +18,7 @@ pub const WAND_B: f32 = 0.75;
 /// Term scorer with MaxScore info and BM25F support
 pub struct TermScorer<'a> {
     /// Iterator over postings
-    pub iter: BitpackedPostingIterator<'a>,
+    pub iter: HorizontalBP128Iterator<'a>,
     /// Maximum possible score for this term (computed with BM25F upper bound)
     pub max_score: f32,
     /// IDF component
@@ -33,7 +33,7 @@ pub struct TermScorer<'a> {
 
 impl<'a> TermScorer<'a> {
     /// Create a new term scorer with default BM25F parameters
-    pub fn new(posting_list: &'a BitpackedPostingList, idf: f32, term_idx: usize) -> Self {
+    pub fn new(posting_list: &'a HorizontalBP128PostingList, idf: f32, term_idx: usize) -> Self {
         Self {
             iter: posting_list.iterator(),
             max_score: posting_list.max_score,
@@ -46,7 +46,7 @@ impl<'a> TermScorer<'a> {
 
     /// Create a term scorer with BM25F parameters
     pub fn with_bm25f(
-        posting_list: &'a BitpackedPostingList,
+        posting_list: &'a HorizontalBP128PostingList,
         idf: f32,
         term_idx: usize,
         field_boost: f32,
@@ -61,7 +61,7 @@ impl<'a> TermScorer<'a> {
                 .map(|b| b.max_tf)
                 .max()
                 .unwrap_or(1);
-            BitpackedPostingList::compute_bm25f_upper_bound(max_tf, idf, field_boost)
+            HorizontalBP128PostingList::compute_bm25f_upper_bound(max_tf, idf, field_boost)
         } else {
             posting_list.max_score
         };
@@ -105,7 +105,7 @@ impl<'a> TermScorer<'a> {
         } else {
             // Recompute with field boost
             let block_max_tf = self.iter.current_block_max_tf();
-            BitpackedPostingList::compute_bm25f_upper_bound(
+            HorizontalBP128PostingList::compute_bm25f_upper_bound(
                 block_max_tf,
                 self.idf,
                 self.field_boost,
@@ -537,8 +537,8 @@ mod tests {
         doc_ids: &[u32],
         term_freqs: &[u32],
         idf: f32,
-    ) -> BitpackedPostingList {
-        BitpackedPostingList::from_postings(doc_ids, term_freqs, idf)
+    ) -> HorizontalBP128PostingList {
+        HorizontalBP128PostingList::from_postings(doc_ids, term_freqs, idf)
     }
 
     #[test]

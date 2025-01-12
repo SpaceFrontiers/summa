@@ -18,13 +18,16 @@ use std::io::{self, Read, Write};
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::BITPACK_BLOCK_SIZE;
+    use super::HORIZONTAL_BP128_BLOCK_SIZE;
     use std::arch::aarch64::*;
 
     /// Vectorized unpack for 8-bit values using NEON
     /// Processes 16 bytes at a time (4x u32 per iteration)
     #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_block_8_neon(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub unsafe fn unpack_block_8_neon(
+        input: &[u8],
+        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
+    ) {
         unsafe {
             // Process 16 u8 -> 16 u32 at a time (4 NEON registers)
             for chunk in 0..8 {
@@ -61,7 +64,10 @@ mod neon {
 
     /// Vectorized unpack for 16-bit values using NEON
     #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_block_16_neon(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub unsafe fn unpack_block_16_neon(
+        input: &[u8],
+        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
+    ) {
         unsafe {
             // Process 8 u16 -> 8 u32 at a time (2 NEON registers)
             for chunk in 0..16 {
@@ -85,7 +91,10 @@ mod neon {
 
     /// Vectorized unpack for 32-bit values using NEON (just a fast copy)
     #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_block_32_neon(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub unsafe fn unpack_block_32_neon(
+        input: &[u8],
+        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
+    ) {
         unsafe {
             let in_ptr = input.as_ptr() as *const u32;
             let out_ptr = output.as_mut_ptr();
@@ -165,14 +174,18 @@ mod neon {
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 mod sse {
-    use super::BITPACK_BLOCK_SIZE;
+    use super::HORIZONTAL_BP128_BLOCK_SIZE;
     use std::arch::x86_64::*;
 
     /// Vectorized unpack for 8-bit values using SSE
     /// Processes 16 bytes at a time
     #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_block_8_sse(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub unsafe fn unpack_block_8_sse(
+        input: &[u8],
+        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
+    ) {
         // Process 16 u8 -> 16 u32 at a time
         for chunk in 0..8 {
             let base = chunk * 16;
@@ -199,7 +212,10 @@ mod sse {
 
     /// Vectorized unpack for 16-bit values using SSE
     #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_block_16_sse(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub unsafe fn unpack_block_16_sse(
+        input: &[u8],
+        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
+    ) {
         // Process 8 u16 -> 8 u32 at a time
         for chunk in 0..16 {
             let base = chunk * 8;
@@ -221,7 +237,10 @@ mod sse {
 
     /// Vectorized unpack for 32-bit values using SSE (fast copy)
     #[target_feature(enable = "sse2")]
-    pub unsafe fn unpack_block_32_sse(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub unsafe fn unpack_block_32_sse(
+        input: &[u8],
+        output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
+    ) {
         let in_ptr = input.as_ptr() as *const __m128i;
         let out_ptr = output.as_mut_ptr() as *mut __m128i;
 
@@ -294,17 +313,17 @@ mod sse {
 // Scalar fallback implementations (used on non-aarch64 platforms)
 #[allow(dead_code)]
 mod scalar {
-    use super::BITPACK_BLOCK_SIZE;
+    use super::HORIZONTAL_BP128_BLOCK_SIZE;
 
     #[inline]
-    pub fn unpack_block_8_scalar(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub fn unpack_block_8_scalar(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
         for (i, out) in output.iter_mut().enumerate() {
             *out = input[i] as u32;
         }
     }
 
     #[inline]
-    pub fn unpack_block_16_scalar(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub fn unpack_block_16_scalar(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
         for (i, out) in output.iter_mut().enumerate() {
             let idx = i * 2;
             *out = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
@@ -312,7 +331,7 @@ mod scalar {
     }
 
     #[inline]
-    pub fn unpack_block_32_scalar(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+    pub fn unpack_block_32_scalar(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
         for (i, out) in output.iter_mut().enumerate() {
             let idx = i * 4;
             *out = u32::from_le_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]);
@@ -321,7 +340,7 @@ mod scalar {
 }
 
 /// Block size for bitpacking (128 integers per block for SIMD alignment)
-pub const BITPACK_BLOCK_SIZE: usize = 128;
+pub const HORIZONTAL_BP128_BLOCK_SIZE: usize = 128;
 
 /// Small block size for short posting lists (better cache locality)
 pub const SMALL_BLOCK_SIZE: usize = 32;
@@ -340,12 +359,16 @@ pub fn bits_needed(max_val: u32) -> u8 {
 }
 
 /// Pack a block of 128 u32 values using the specified bit width
-pub fn pack_block(values: &[u32; BITPACK_BLOCK_SIZE], bit_width: u8, output: &mut Vec<u8>) {
+pub fn pack_block(
+    values: &[u32; HORIZONTAL_BP128_BLOCK_SIZE],
+    bit_width: u8,
+    output: &mut Vec<u8>,
+) {
     if bit_width == 0 {
         return;
     }
 
-    let bytes_needed = (BITPACK_BLOCK_SIZE * bit_width as usize).div_ceil(8);
+    let bytes_needed = (HORIZONTAL_BP128_BLOCK_SIZE * bit_width as usize).div_ceil(8);
     let start = output.len();
     output.resize(start + bytes_needed, 0);
 
@@ -376,7 +399,7 @@ pub fn pack_block(values: &[u32; BITPACK_BLOCK_SIZE], bit_width: u8, output: &mu
 
 /// Unpack a block of 128 u32 values
 /// Uses SIMD-optimized unpacking for common bit widths on supported architectures
-pub fn unpack_block(input: &[u8], bit_width: u8, output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+pub fn unpack_block(input: &[u8], bit_width: u8, output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
     if bit_width == 0 {
         output.fill(0);
         return;
@@ -391,77 +414,111 @@ pub fn unpack_block(input: &[u8], bit_width: u8, output: &mut [u32; BITPACK_BLOC
     }
 }
 
-/// Optimized unpacking for 8-bit values - uses NEON on aarch64
+/// Optimized unpacking for 8-bit values - uses NEON on aarch64, SSE on x86_64
 #[inline]
-fn unpack_block_8(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+fn unpack_block_8(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is always available on aarch64
         unsafe { neon::unpack_block_8_neon(input, output) }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE4.1 is available on virtually all x86_64 CPUs (2006+)
+        // Runtime check for older CPUs that lack SSE4.1
+        if is_x86_feature_detected!("sse4.1") {
+            unsafe { sse::unpack_block_8_sse(input, output) }
+        } else {
+            scalar::unpack_block_8_scalar(input, output)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         scalar::unpack_block_8_scalar(input, output)
     }
 }
 
-/// Optimized unpacking for 16-bit values - uses NEON on aarch64
+/// Optimized unpacking for 16-bit values - uses NEON on aarch64, SSE on x86_64
 #[inline]
-fn unpack_block_16(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+fn unpack_block_16(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is always available on aarch64
         unsafe { neon::unpack_block_16_neon(input, output) }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE4.1 is available on virtually all x86_64 CPUs (2006+)
+        if is_x86_feature_detected!("sse4.1") {
+            unsafe { sse::unpack_block_16_sse(input, output) }
+        } else {
+            scalar::unpack_block_16_scalar(input, output)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         scalar::unpack_block_16_scalar(input, output)
     }
 }
 
-/// Optimized unpacking for 32-bit values - uses NEON on aarch64
+/// Optimized unpacking for 32-bit values - uses NEON on aarch64, SSE on x86_64
 #[inline]
-fn unpack_block_32(input: &[u8], output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+fn unpack_block_32(input: &[u8], output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is always available on aarch64
         unsafe { neon::unpack_block_32_neon(input, output) }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is always available on x86_64
+        unsafe { sse::unpack_block_32_sse(input, output) }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         scalar::unpack_block_32_scalar(input, output)
     }
 }
 
 /// Generic unpacking for arbitrary bit widths
-/// Optimized: reads 64 bits at a time to avoid byte-by-byte extraction
-fn unpack_block_generic(input: &[u8], bit_width: u8, output: &mut [u32; BITPACK_BLOCK_SIZE]) {
+/// Optimized: reads 64 bits at a time using unaligned pointer read
+#[inline]
+fn unpack_block_generic(
+    input: &[u8],
+    bit_width: u8,
+    output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
+) {
     let mask = (1u64 << bit_width) - 1;
+    let bit_width_usize = bit_width as usize;
     let mut bit_pos = 0usize;
 
+    // Ensure we have enough padding for the last read
+    // Max bytes needed: (127 * 32 + 32 + 7) / 8 = 516 bytes for 32-bit width
+    // For typical widths (1-20 bits), we need much less
+    let input_ptr = input.as_ptr();
+
     for out in output.iter_mut() {
-        let byte_idx = bit_pos / 8;
-        let bit_offset = bit_pos % 8;
+        let byte_idx = bit_pos >> 3; // bit_pos / 8
+        let bit_offset = bit_pos & 7; // bit_pos % 8
 
-        // Read up to 8 bytes starting at byte_idx (handles unaligned access)
-        // This is safe because we need at most (bit_offset + bit_width) bits,
-        // which is at most 7 + 32 = 39 bits = 5 bytes
-        let mut buf = [0u8; 8];
-        let bytes_available = input.len().saturating_sub(byte_idx).min(8);
-        buf[..bytes_available].copy_from_slice(&input[byte_idx..byte_idx + bytes_available]);
-        let word = u64::from_le_bytes(buf);
+        // SAFETY: We read up to 8 bytes. The caller guarantees input has enough data.
+        // For 128 values at max 32 bits = 512 bytes, plus up to 7 bits offset = 513 bytes max.
+        let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
 
-        // Extract value with single shift and mask
         *out = ((word >> bit_offset) & mask) as u32;
-        bit_pos += bit_width as usize;
+        bit_pos += bit_width_usize;
     }
 }
 
 /// Unpack a smaller block (for variable block sizes)
-/// Optimized: reads 64 bits at a time to avoid byte-by-byte extraction
+/// Optimized: reads 64 bits at a time using unaligned pointer read
+#[inline]
 pub fn unpack_block_n(input: &[u8], bit_width: u8, output: &mut [u32], n: usize) {
     if bit_width == 0 {
         output[..n].fill(0);
@@ -469,21 +526,19 @@ pub fn unpack_block_n(input: &[u8], bit_width: u8, output: &mut [u32], n: usize)
     }
 
     let mask = (1u64 << bit_width) - 1;
+    let bit_width_usize = bit_width as usize;
     let mut bit_pos = 0usize;
+    let input_ptr = input.as_ptr();
 
     for out in output[..n].iter_mut() {
-        let byte_idx = bit_pos / 8;
-        let bit_offset = bit_pos % 8;
+        let byte_idx = bit_pos >> 3;
+        let bit_offset = bit_pos & 7;
 
-        // Read up to 8 bytes starting at byte_idx
-        let mut buf = [0u8; 8];
-        let bytes_available = input.len().saturating_sub(byte_idx).min(8);
-        buf[..bytes_available].copy_from_slice(&input[byte_idx..byte_idx + bytes_available]);
-        let word = u64::from_le_bytes(buf);
+        // SAFETY: Caller guarantees input has enough data for n values at bit_width bits each
+        let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
 
-        // Extract value with single shift and mask
         *out = ((word >> bit_offset) & mask) as u32;
-        bit_pos += bit_width as usize;
+        bit_pos += bit_width_usize;
     }
 }
 
@@ -543,7 +598,7 @@ pub fn delta_decode_block(output: &mut [u32], deltas: &[u32], first_doc_id: u32,
 
 /// Bitpacked block with skip info for BlockWAND
 #[derive(Debug, Clone)]
-pub struct BitpackedBlock {
+pub struct HorizontalBP128Block {
     /// Delta-encoded doc_ids (bitpacked)
     pub doc_deltas: Vec<u8>,
     /// Bit width for doc deltas
@@ -565,7 +620,7 @@ pub struct BitpackedBlock {
     pub max_block_score: f32,
 }
 
-impl BitpackedBlock {
+impl HorizontalBP128Block {
     /// Serialize the block
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u32::<LittleEndian>(self.first_doc_id)?;
@@ -625,10 +680,10 @@ impl BitpackedBlock {
         }
 
         let count = self.num_docs as usize;
-        let mut deltas = [0u32; BITPACK_BLOCK_SIZE];
+        let mut deltas = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
         unpack_block(&self.doc_deltas, self.doc_bit_width, &mut deltas);
 
-        let mut output = [0u32; BITPACK_BLOCK_SIZE];
+        let mut output = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
         delta_decode_block(&mut output, &deltas, self.first_doc_id, count);
 
         output[..count].to_vec()
@@ -640,7 +695,7 @@ impl BitpackedBlock {
             return Vec::new();
         }
 
-        let mut tfs = [0u32; BITPACK_BLOCK_SIZE];
+        let mut tfs = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
         unpack_block(&self.term_freqs, self.tf_bit_width, &mut tfs);
 
         // TF is stored as tf-1, so add 1 back
@@ -653,16 +708,16 @@ impl BitpackedBlock {
 
 /// Bitpacked posting list with block-level skip info
 #[derive(Debug, Clone)]
-pub struct BitpackedPostingList {
+pub struct HorizontalBP128PostingList {
     /// Blocks of postings
-    pub blocks: Vec<BitpackedBlock>,
+    pub blocks: Vec<HorizontalBP128Block>,
     /// Total document count
     pub doc_count: u32,
     /// Maximum score across all blocks (for MaxScore pruning)
     pub max_score: f32,
 }
 
-impl BitpackedPostingList {
+impl HorizontalBP128PostingList {
     /// Create from raw doc_ids and term frequencies
     pub fn from_postings(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> Self {
         assert_eq!(doc_ids.len(), term_freqs.len());
@@ -680,7 +735,7 @@ impl BitpackedPostingList {
         let mut i = 0;
 
         while i < doc_ids.len() {
-            let block_end = (i + BITPACK_BLOCK_SIZE).min(doc_ids.len());
+            let block_end = (i + HORIZONTAL_BP128_BLOCK_SIZE).min(doc_ids.len());
             let block_docs = &doc_ids[i..block_end];
             let block_tfs = &term_freqs[i..block_end];
 
@@ -715,13 +770,13 @@ impl BitpackedPostingList {
         idf * tf_norm
     }
 
-    fn create_block(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> BitpackedBlock {
+    fn create_block(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> HorizontalBP128Block {
         let num_docs = doc_ids.len();
         let first_doc_id = doc_ids[0];
         let last_doc_id = *doc_ids.last().unwrap();
 
         // Compute deltas (delta - 1 to save one bit since deltas are always >= 1)
-        let mut deltas = [0u32; BITPACK_BLOCK_SIZE];
+        let mut deltas = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
         let mut max_delta = 0u32;
         for j in 1..num_docs {
             let delta = doc_ids[j] - doc_ids[j - 1] - 1;
@@ -730,7 +785,7 @@ impl BitpackedPostingList {
         }
 
         // Compute max TF and prepare TF array (store tf-1)
-        let mut tfs = [0u32; BITPACK_BLOCK_SIZE];
+        let mut tfs = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
         let mut max_tf = 0u32;
 
         for (j, &tf) in term_freqs.iter().enumerate() {
@@ -751,7 +806,7 @@ impl BitpackedPostingList {
         let mut term_freqs_packed = Vec::new();
         pack_block(&tfs, tf_bit_width, &mut term_freqs_packed);
 
-        BitpackedBlock {
+        HorizontalBP128Block {
             doc_deltas,
             doc_bit_width,
             term_freqs: term_freqs_packed,
@@ -785,7 +840,7 @@ impl BitpackedPostingList {
 
         let mut blocks = Vec::with_capacity(num_blocks);
         for _ in 0..num_blocks {
-            blocks.push(BitpackedBlock::deserialize(reader)?);
+            blocks.push(HorizontalBP128Block::deserialize(reader)?);
         }
 
         Ok(Self {
@@ -796,14 +851,14 @@ impl BitpackedPostingList {
     }
 
     /// Create an iterator
-    pub fn iterator(&self) -> BitpackedPostingIterator<'_> {
-        BitpackedPostingIterator::new(self)
+    pub fn iterator(&self) -> HorizontalBP128Iterator<'_> {
+        HorizontalBP128Iterator::new(self)
     }
 }
 
 /// Iterator over bitpacked posting list with block skipping support
-pub struct BitpackedPostingIterator<'a> {
-    posting_list: &'a BitpackedPostingList,
+pub struct HorizontalBP128Iterator<'a> {
+    posting_list: &'a HorizontalBP128PostingList,
     /// Current block index
     current_block: usize,
     /// Decoded doc_ids for current block
@@ -816,8 +871,8 @@ pub struct BitpackedPostingIterator<'a> {
     exhausted: bool,
 }
 
-impl<'a> BitpackedPostingIterator<'a> {
-    pub fn new(posting_list: &'a BitpackedPostingList) -> Self {
+impl<'a> HorizontalBP128Iterator<'a> {
+    pub fn new(posting_list: &'a HorizontalBP128PostingList) -> Self {
         let mut iter = Self {
             posting_list,
             current_block: 0,
@@ -992,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_pack_unpack() {
-        let mut values = [0u32; BITPACK_BLOCK_SIZE];
+        let mut values = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
         for (i, value) in values.iter_mut().enumerate() {
             *value = (i * 3) as u32;
         }
@@ -1003,7 +1058,7 @@ mod tests {
         let mut packed = Vec::new();
         pack_block(&values, bit_width, &mut packed);
 
-        let mut unpacked = [0u32; BITPACK_BLOCK_SIZE];
+        let mut unpacked = [0u32; HORIZONTAL_BP128_BLOCK_SIZE];
         unpack_block(&packed, bit_width, &mut unpacked);
 
         assert_eq!(values, unpacked);
@@ -1014,7 +1069,7 @@ mod tests {
         let doc_ids: Vec<u32> = (0..200).map(|i| i * 2).collect();
         let term_freqs: Vec<u32> = (0..200).map(|i| (i % 10) + 1).collect();
 
-        let posting_list = BitpackedPostingList::from_postings(&doc_ids, &term_freqs, 1.0);
+        let posting_list = HorizontalBP128PostingList::from_postings(&doc_ids, &term_freqs, 1.0);
 
         assert_eq!(posting_list.doc_count, 200);
         assert_eq!(posting_list.blocks.len(), 2); // 128 + 72
@@ -1035,7 +1090,7 @@ mod tests {
         let doc_ids: Vec<u32> = vec![10, 20, 30, 100, 200, 300, 1000, 2000];
         let term_freqs: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
 
-        let posting_list = BitpackedPostingList::from_postings(&doc_ids, &term_freqs, 1.0);
+        let posting_list = HorizontalBP128PostingList::from_postings(&doc_ids, &term_freqs, 1.0);
         let mut iter = posting_list.iterator();
 
         assert_eq!(iter.seek(25), 30);
@@ -1049,12 +1104,12 @@ mod tests {
         let doc_ids: Vec<u32> = (0..50).map(|i| i * 3).collect();
         let term_freqs: Vec<u32> = (0..50).map(|_| 1).collect();
 
-        let posting_list = BitpackedPostingList::from_postings(&doc_ids, &term_freqs, 1.5);
+        let posting_list = HorizontalBP128PostingList::from_postings(&doc_ids, &term_freqs, 1.5);
 
         let mut buffer = Vec::new();
         posting_list.serialize(&mut buffer).unwrap();
 
-        let restored = BitpackedPostingList::deserialize(&mut &buffer[..]).unwrap();
+        let restored = HorizontalBP128PostingList::deserialize(&mut &buffer[..]).unwrap();
 
         assert_eq!(restored.doc_count, posting_list.doc_count);
         assert_eq!(restored.blocks.len(), posting_list.blocks.len());
@@ -1101,7 +1156,7 @@ mod tests {
         let doc_ids: Vec<u32> = (0..128).map(|i| i * 5 + 100).collect();
         let term_freqs: Vec<u32> = vec![1; 128];
 
-        let posting_list = BitpackedPostingList::from_postings(&doc_ids, &term_freqs, 1.0);
+        let posting_list = HorizontalBP128PostingList::from_postings(&doc_ids, &term_freqs, 1.0);
         let decoded = posting_list.blocks[0].decode_doc_ids();
 
         assert_eq!(decoded.len(), 128);

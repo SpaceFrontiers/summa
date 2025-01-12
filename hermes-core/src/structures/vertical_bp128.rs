@@ -14,7 +14,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
 /// Block size: 128 integers (32 groups of 4 for SIMD lanes)
-pub const SIMD_BLOCK_SIZE: usize = 128;
+pub const VERTICAL_BP128_BLOCK_SIZE: usize = 128;
 
 /// Number of 32-bit lanes in NEON/SSE (4 x 32-bit = 128-bit)
 #[allow(dead_code)]
@@ -22,7 +22,7 @@ const SIMD_LANES: usize = 4;
 
 /// Number of groups per block (128 / 4 = 32)
 #[allow(dead_code)]
-const GROUPS_PER_BLOCK: usize = SIMD_BLOCK_SIZE / SIMD_LANES;
+const GROUPS_PER_BLOCK: usize = VERTICAL_BP128_BLOCK_SIZE / SIMD_LANES;
 
 /// Compute bits needed for max value
 #[inline]
@@ -125,7 +125,7 @@ mod neon {
     pub unsafe fn unpack_block_neon(
         input: &[u8],
         bit_width: u8,
-        output: &mut [u32; SIMD_BLOCK_SIZE],
+        output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
     ) {
         if bit_width == 0 {
             output.fill(0);
@@ -135,7 +135,7 @@ mod neon {
         // Clear output using NEON
         unsafe {
             let zero = vdupq_n_u32(0);
-            for i in (0..SIMD_BLOCK_SIZE).step_by(4) {
+            for i in (0..VERTICAL_BP128_BLOCK_SIZE).step_by(4) {
                 vst1q_u32(output[i..].as_mut_ptr(), zero);
             }
         }
@@ -259,7 +259,10 @@ mod neon {
 
     /// Prefix sum for 128 elements using NEON
     #[target_feature(enable = "neon")]
-    pub unsafe fn prefix_sum_block_neon(deltas: &mut [u32; SIMD_BLOCK_SIZE], first_val: u32) {
+    pub unsafe fn prefix_sum_block_neon(
+        deltas: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
+        first_val: u32,
+    ) {
         let mut carry = first_val;
 
         for group in 0..GROUPS_PER_BLOCK {
@@ -340,7 +343,11 @@ mod scalar {
     }
 
     /// Unpack 128 integers from true vertical layout
-    pub fn unpack_block_scalar(input: &[u8], bit_width: u8, output: &mut [u32; SIMD_BLOCK_SIZE]) {
+    pub fn unpack_block_scalar(
+        input: &[u8],
+        bit_width: u8,
+        output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
+    ) {
         if bit_width == 0 {
             output.fill(0);
             return;
@@ -371,7 +378,7 @@ mod scalar {
     }
 
     /// Prefix sum for 128 elements
-    pub fn prefix_sum_block_scalar(deltas: &mut [u32; SIMD_BLOCK_SIZE], first_val: u32) {
+    pub fn prefix_sum_block_scalar(deltas: &mut [u32; VERTICAL_BP128_BLOCK_SIZE], first_val: u32) {
         let mut carry = first_val;
 
         for group in 0..GROUPS_PER_BLOCK {
@@ -392,75 +399,327 @@ mod scalar {
 }
 
 // ============================================================================
-// Public API - dispatches to NEON or scalar
+// Public API - True Vertical Bit-Interleaved Layout
 // ============================================================================
+//
+// Vertical Layout Specification:
+// For a block of 128 integers at bit_width bits each:
+// - Total bytes = 128 * bit_width / 8
+// - For each bit position b (0 to bit_width-1):
+//   - Store 16 bytes containing bit b from all 128 integers
+//   - Byte i within those 16 bytes contains bit b from integers i*8 to i*8+7
+//   - Bit j within byte i = bit b of integer i*8+j
+//
+// Example for bit_width=4:
+//   Bytes 0-15:  bit 0 of all 128 integers (16 bytes × 8 bits = 128 bits)
+//   Bytes 16-31: bit 1 of all 128 integers
+//   Bytes 32-47: bit 2 of all 128 integers
+//   Bytes 48-63: bit 3 of all 128 integers
+//   Total: 64 bytes
+//
+// This layout enables SIMD: one 16-byte load gets one bit from all 128 integers.
 
-/// Pack 128 integers using true vertical layout (optimal compression)
+/// Pack 128 integers using true vertical bit-interleaved layout
 ///
-/// Vertical layout stores bit i of all 128 integers together.
-/// Total size: exactly BLOCK_SIZE * bit_width / 8 bytes (no padding waste)
-pub fn pack_horizontal(values: &[u32; SIMD_BLOCK_SIZE], bit_width: u8, output: &mut Vec<u8>) {
+/// Vertical layout stores bit i of all 128 integers together in 16 consecutive bytes.
+/// Total size: exactly 128 * bit_width / 8 bytes (no padding waste)
+///
+/// This layout is optimal for SIMD unpacking: a single 16-byte load retrieves
+/// one bit position from all 128 integers simultaneously.
+pub fn pack_vertical(
+    values: &[u32; VERTICAL_BP128_BLOCK_SIZE],
+    bit_width: u8,
+    output: &mut Vec<u8>,
+) {
     if bit_width == 0 {
         return;
     }
 
-    // True vertical layout: exactly (128 * bit_width) / 8 bytes
-    let total_bytes = (SIMD_BLOCK_SIZE * bit_width as usize) / 8;
+    // Total bytes = 128 * bit_width / 8 = 16 * bit_width
+    let total_bytes = 16 * bit_width as usize;
     let start = output.len();
     output.resize(start + total_bytes, 0);
 
-    // Pack using vertical bit-interleaved layout
-    // For each bit position, pack that bit from all 128 integers
+    // For each bit position, pack that bit from all 128 integers into 16 bytes
     for bit_pos in 0..bit_width as usize {
-        let byte_offset = start + bit_pos * (SIMD_BLOCK_SIZE / 8);
-        for (int_idx, &val) in values.iter().enumerate() {
-            let bit = (val >> bit_pos) & 1;
-            let byte_idx = byte_offset + int_idx / 8;
-            let bit_in_byte = int_idx % 8;
-            output[byte_idx] |= (bit as u8) << bit_in_byte;
+        let byte_offset = start + bit_pos * 16;
+
+        // Process 16 bytes (128 integers, 8 per byte)
+        for byte_idx in 0..16 {
+            let base_int = byte_idx * 8;
+            let mut byte_val = 0u8;
+
+            // Pack 8 integers' bits into one byte
+            byte_val |= ((values[base_int] >> bit_pos) & 1) as u8;
+            byte_val |= (((values[base_int + 1] >> bit_pos) & 1) as u8) << 1;
+            byte_val |= (((values[base_int + 2] >> bit_pos) & 1) as u8) << 2;
+            byte_val |= (((values[base_int + 3] >> bit_pos) & 1) as u8) << 3;
+            byte_val |= (((values[base_int + 4] >> bit_pos) & 1) as u8) << 4;
+            byte_val |= (((values[base_int + 5] >> bit_pos) & 1) as u8) << 5;
+            byte_val |= (((values[base_int + 6] >> bit_pos) & 1) as u8) << 6;
+            byte_val |= (((values[base_int + 7] >> bit_pos) & 1) as u8) << 7;
+
+            output[byte_offset + byte_idx] = byte_val;
         }
     }
 }
 
-/// Unpack 128 integers from true vertical layout (optimized)
+/// Unpack 128 integers from true vertical bit-interleaved layout
 ///
-/// This is the inverse of pack_horizontal - extracts bits from vertical layout.
-/// Optimized to process 8 integers per byte using lookup tables.
-pub fn unpack_horizontal(input: &[u8], bit_width: u8, output: &mut [u32; SIMD_BLOCK_SIZE]) {
+/// Uses SIMD on supported architectures (NEON on aarch64, SSE on x86_64).
+/// Falls back to optimized scalar implementation on other platforms.
+pub fn unpack_vertical(input: &[u8], bit_width: u8, output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE]) {
     if bit_width == 0 {
         output.fill(0);
         return;
     }
 
-    // Clear output first
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { unpack_vertical_neon(input, bit_width, output) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            unsafe { unpack_vertical_sse(input, bit_width, output) }
+        } else {
+            unpack_vertical_scalar(input, bit_width, output)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        unpack_vertical_scalar(input, bit_width, output)
+    }
+}
+
+/// Scalar implementation of vertical unpack
+#[inline]
+fn unpack_vertical_scalar(
+    input: &[u8],
+    bit_width: u8,
+    output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
+) {
     output.fill(0);
 
-    // Process 8 integers at a time (one byte contains bit i of 8 consecutive integers)
-    // For each bit position, we have 16 bytes (128 integers / 8 = 16 bytes)
+    // For each bit position, scatter that bit to all 128 integers
     for bit_pos in 0..bit_width as usize {
-        let byte_offset = bit_pos * 16; // 128/8 = 16 bytes per bit position
+        let byte_offset = bit_pos * 16;
+        let bit_mask = 1u32 << bit_pos;
 
-        // Process 16 bytes (128 integers) for this bit position
+        // Process 16 bytes (128 integers)
         for byte_idx in 0..16 {
             let byte_val = input[byte_offset + byte_idx];
             let base_int = byte_idx * 8;
 
-            // Unroll: extract 8 bits from this byte
-            output[base_int] |= (byte_val & 1) as u32 * (1 << bit_pos);
-            output[base_int + 1] |= ((byte_val >> 1) & 1) as u32 * (1 << bit_pos);
-            output[base_int + 2] |= ((byte_val >> 2) & 1) as u32 * (1 << bit_pos);
-            output[base_int + 3] |= ((byte_val >> 3) & 1) as u32 * (1 << bit_pos);
-            output[base_int + 4] |= ((byte_val >> 4) & 1) as u32 * (1 << bit_pos);
-            output[base_int + 5] |= ((byte_val >> 5) & 1) as u32 * (1 << bit_pos);
-            output[base_int + 6] |= ((byte_val >> 6) & 1) as u32 * (1 << bit_pos);
-            output[base_int + 7] |= ((byte_val >> 7) & 1) as u32 * (1 << bit_pos);
+            // Scatter 8 bits to 8 integers
+            if byte_val & 0x01 != 0 {
+                output[base_int] |= bit_mask;
+            }
+            if byte_val & 0x02 != 0 {
+                output[base_int + 1] |= bit_mask;
+            }
+            if byte_val & 0x04 != 0 {
+                output[base_int + 2] |= bit_mask;
+            }
+            if byte_val & 0x08 != 0 {
+                output[base_int + 3] |= bit_mask;
+            }
+            if byte_val & 0x10 != 0 {
+                output[base_int + 4] |= bit_mask;
+            }
+            if byte_val & 0x20 != 0 {
+                output[base_int + 5] |= bit_mask;
+            }
+            if byte_val & 0x40 != 0 {
+                output[base_int + 6] |= bit_mask;
+            }
+            if byte_val & 0x80 != 0 {
+                output[base_int + 7] |= bit_mask;
+            }
         }
+    }
+}
+
+/// NEON-optimized vertical unpack for aarch64
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_vertical_neon(
+    input: &[u8],
+    bit_width: u8,
+    output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
+) {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        // Clear output using NEON
+        let zero = vdupq_n_u32(0);
+        for i in (0..VERTICAL_BP128_BLOCK_SIZE).step_by(4) {
+            vst1q_u32(output[i..].as_mut_ptr(), zero);
+        }
+
+        // For each bit position
+        for bit_pos in 0..bit_width as usize {
+            let byte_offset = bit_pos * 16;
+            let bit_mask = 1u32 << bit_pos;
+
+            // Load 16 bytes (one bit-plane for all 128 integers)
+            let bytes = vld1q_u8(input.as_ptr().add(byte_offset));
+
+            // Store to array for processing (NEON lane extraction requires constants)
+            let mut byte_array = [0u8; 16];
+            vst1q_u8(byte_array.as_mut_ptr(), bytes);
+
+            // Process 16 bytes (128 integers, 8 per byte)
+            for (byte_idx, &byte_val) in byte_array.iter().enumerate() {
+                let base_int = byte_idx * 8;
+
+                // Scatter 8 bits to 8 integers using branchless OR
+                output[base_int] |= ((byte_val & 0x01) as u32) * bit_mask;
+                output[base_int + 1] |= (((byte_val >> 1) & 0x01) as u32) * bit_mask;
+                output[base_int + 2] |= (((byte_val >> 2) & 0x01) as u32) * bit_mask;
+                output[base_int + 3] |= (((byte_val >> 3) & 0x01) as u32) * bit_mask;
+                output[base_int + 4] |= (((byte_val >> 4) & 0x01) as u32) * bit_mask;
+                output[base_int + 5] |= (((byte_val >> 5) & 0x01) as u32) * bit_mask;
+                output[base_int + 6] |= (((byte_val >> 6) & 0x01) as u32) * bit_mask;
+                output[base_int + 7] |= (((byte_val >> 7) & 0x01) as u32) * bit_mask;
+            }
+        }
+    }
+}
+
+/// SSE-optimized vertical unpack for x86_64
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn unpack_vertical_sse(
+    input: &[u8],
+    bit_width: u8,
+    output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        // Clear output
+        let zero = _mm_setzero_si128();
+        for i in (0..VERTICAL_BP128_BLOCK_SIZE).step_by(4) {
+            _mm_storeu_si128(output[i..].as_mut_ptr() as *mut __m128i, zero);
+        }
+
+        // For each bit position
+        for bit_pos in 0..bit_width as usize {
+            let byte_offset = bit_pos * 16;
+
+            // Load 16 bytes (one bit-plane for all 128 integers)
+            let bytes = _mm_loadu_si128(input.as_ptr().add(byte_offset) as *const __m128i);
+
+            // Extract bytes and scatter bits
+            let mut byte_array = [0u8; 16];
+            _mm_storeu_si128(byte_array.as_mut_ptr() as *mut __m128i, bytes);
+
+            for byte_idx in 0..16 {
+                let byte_val = byte_array[byte_idx];
+                let base_int = byte_idx * 8;
+
+                // Scatter 8 bits to 8 integers
+                if byte_val & 0x01 != 0 {
+                    output[base_int] |= 1u32 << bit_pos;
+                }
+                if byte_val & 0x02 != 0 {
+                    output[base_int + 1] |= 1u32 << bit_pos;
+                }
+                if byte_val & 0x04 != 0 {
+                    output[base_int + 2] |= 1u32 << bit_pos;
+                }
+                if byte_val & 0x08 != 0 {
+                    output[base_int + 3] |= 1u32 << bit_pos;
+                }
+                if byte_val & 0x10 != 0 {
+                    output[base_int + 4] |= 1u32 << bit_pos;
+                }
+                if byte_val & 0x20 != 0 {
+                    output[base_int + 5] |= 1u32 << bit_pos;
+                }
+                if byte_val & 0x40 != 0 {
+                    output[base_int + 6] |= 1u32 << bit_pos;
+                }
+                if byte_val & 0x80 != 0 {
+                    output[base_int + 7] |= 1u32 << bit_pos;
+                }
+            }
+        }
+    }
+}
+
+// Keep horizontal layout functions for compatibility (used by bitpacking)
+#[allow(dead_code)]
+pub fn pack_horizontal(
+    values: &[u32; VERTICAL_BP128_BLOCK_SIZE],
+    bit_width: u8,
+    output: &mut Vec<u8>,
+) {
+    if bit_width == 0 {
+        return;
+    }
+
+    let bytes_needed = (VERTICAL_BP128_BLOCK_SIZE * bit_width as usize).div_ceil(8);
+    let start = output.len();
+    output.resize(start + bytes_needed, 0);
+
+    let mut bit_pos = 0usize;
+    for &value in values {
+        let byte_idx = start + bit_pos / 8;
+        let bit_offset = bit_pos % 8;
+
+        let mut remaining_bits = bit_width as usize;
+        let mut val = value;
+        let mut current_byte_idx = byte_idx;
+        let mut current_bit_offset = bit_offset;
+
+        while remaining_bits > 0 {
+            let bits_in_byte = (8 - current_bit_offset).min(remaining_bits);
+            let mask = ((1u32 << bits_in_byte) - 1) as u8;
+            output[current_byte_idx] |= ((val as u8) & mask) << current_bit_offset;
+            val >>= bits_in_byte;
+            remaining_bits -= bits_in_byte;
+            current_byte_idx += 1;
+            current_bit_offset = 0;
+        }
+
+        bit_pos += bit_width as usize;
+    }
+}
+
+#[allow(dead_code)]
+pub fn unpack_horizontal(
+    input: &[u8],
+    bit_width: u8,
+    output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
+) {
+    if bit_width == 0 {
+        output.fill(0);
+        return;
+    }
+
+    let mask = (1u64 << bit_width) - 1;
+    let bit_width_usize = bit_width as usize;
+    let mut bit_pos = 0usize;
+    let input_ptr = input.as_ptr();
+
+    for out in output.iter_mut() {
+        let byte_idx = bit_pos >> 3;
+        let bit_offset = bit_pos & 7;
+
+        let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
+
+        *out = ((word >> bit_offset) & mask) as u32;
+        bit_pos += bit_width_usize;
     }
 }
 
 /// Prefix sum for 128 elements - uses NEON on aarch64
 #[allow(dead_code)]
-pub fn prefix_sum_128(deltas: &mut [u32; SIMD_BLOCK_SIZE], first_val: u32) {
+pub fn prefix_sum_128(deltas: &mut [u32; VERTICAL_BP128_BLOCK_SIZE], first_val: u32) {
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { neon::prefix_sum_block_neon(deltas, first_val) }
@@ -472,15 +731,6 @@ pub fn prefix_sum_128(deltas: &mut [u32; SIMD_BLOCK_SIZE], first_val: u32) {
     }
 }
 
-// Keep old names for compatibility
-pub fn pack_vertical(values: &[u32; SIMD_BLOCK_SIZE], bit_width: u8, output: &mut Vec<u8>) {
-    pack_horizontal(values, bit_width, output)
-}
-
-pub fn unpack_vertical(input: &[u8], bit_width: u8, output: &mut [u32; SIMD_BLOCK_SIZE]) {
-    unpack_horizontal(input, bit_width, output)
-}
-
 /// Unpack with integrated delta decoding (fused for better performance)
 ///
 /// The encoding stores deltas[i] = doc_ids[i+1] - doc_ids[i] - 1
@@ -488,12 +738,12 @@ pub fn unpack_vertical(input: &[u8], bit_width: u8, output: &mut [u32; SIMD_BLOC
 /// first_doc_id is doc_ids[0], and we compute the rest from deltas.
 ///
 /// This fused version avoids a separate prefix sum pass by computing
-/// doc_ids inline during unpacking.
+/// doc_ids inline during unpacking. Uses true vertical bit-interleaved layout.
 pub fn unpack_vertical_d1(
     input: &[u8],
     bit_width: u8,
     first_doc_id: u32,
-    output: &mut [u32; SIMD_BLOCK_SIZE],
+    output: &mut [u32; VERTICAL_BP128_BLOCK_SIZE],
     count: usize,
 ) {
     if count == 0 {
@@ -511,58 +761,25 @@ pub fn unpack_vertical_d1(
         return;
     }
 
-    // Fused unpack + prefix sum: compute doc_ids inline
+    // First unpack all deltas from vertical layout
+    let mut deltas = [0u32; VERTICAL_BP128_BLOCK_SIZE];
+    unpack_vertical(input, bit_width, &mut deltas);
+
+    // Then apply prefix sum with delta decoding
     output[0] = first_doc_id;
     let mut current = first_doc_id;
 
-    // Process in groups of 4 for better cache locality
-    let full_groups = (count - 1) / 4;
-    let remainder = (count - 1) % 4;
-
-    for group in 0..full_groups {
-        let base_idx = group * 4;
-
-        // Extract 4 deltas from vertical layout
-        let mut deltas = [0u32; 4];
-        for bit_pos in 0..bit_width as usize {
-            let byte_offset = bit_pos * (SIMD_BLOCK_SIZE / 8);
-            for (j, delta) in deltas.iter_mut().enumerate() {
-                let int_idx = base_idx + j;
-                let byte_idx = byte_offset + int_idx / 8;
-                let bit_in_byte = int_idx % 8;
-                let bit = ((input[byte_idx] >> bit_in_byte) & 1) as u32;
-                *delta |= bit << bit_pos;
-            }
-        }
-
-        // Apply prefix sum inline
-        for j in 0..4 {
-            current = current.wrapping_add(deltas[j]).wrapping_add(1);
-            output[base_idx + j + 1] = current;
-        }
-    }
-
-    // Handle remainder
-    let base_idx = full_groups * 4;
-    for j in 0..remainder {
-        let int_idx = base_idx + j;
-        let mut delta = 0u32;
-        for bit_pos in 0..bit_width as usize {
-            let byte_offset = bit_pos * (SIMD_BLOCK_SIZE / 8);
-            let byte_idx = byte_offset + int_idx / 8;
-            let bit_in_byte = int_idx % 8;
-            let bit = ((input[byte_idx] >> bit_in_byte) & 1) as u32;
-            delta |= bit << bit_pos;
-        }
-        current = current.wrapping_add(delta).wrapping_add(1);
-        output[base_idx + j + 1] = current;
+    for i in 1..count {
+        // deltas[i-1] stores (gap - 1), so actual gap = deltas[i-1] + 1
+        current = current.wrapping_add(deltas[i - 1]).wrapping_add(1);
+        output[i] = current;
     }
 }
 
 /// A single SIMD-BP128 block with metadata
 #[derive(Debug, Clone)]
-pub struct SimdBp128Block {
-    /// Vertically-packed delta-encoded doc_ids
+pub struct VerticalBP128Block {
+    /// Vertically-packed delta-encoded doc_ids (true vertical bit-interleaved layout)
     pub doc_data: Vec<u8>,
     /// Bit width for doc deltas
     pub doc_bit_width: u8,
@@ -582,7 +799,7 @@ pub struct SimdBp128Block {
     pub max_block_score: f32,
 }
 
-impl SimdBp128Block {
+impl VerticalBP128Block {
     /// Serialize block
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u32::<LittleEndian>(self.first_doc_id)?;
@@ -639,7 +856,7 @@ impl SimdBp128Block {
             return Vec::new();
         }
 
-        let mut output = [0u32; SIMD_BLOCK_SIZE];
+        let mut output = [0u32; VERTICAL_BP128_BLOCK_SIZE];
         unpack_vertical_d1(
             &self.doc_data,
             self.doc_bit_width,
@@ -657,7 +874,7 @@ impl SimdBp128Block {
             return Vec::new();
         }
 
-        let mut output = [0u32; SIMD_BLOCK_SIZE];
+        let mut output = [0u32; VERTICAL_BP128_BLOCK_SIZE];
         unpack_vertical(&self.tf_data, self.tf_bit_width, &mut output);
 
         // TF is stored as tf-1, add 1 back
@@ -670,16 +887,16 @@ impl SimdBp128Block {
 
 /// SIMD-BP128 posting list with vertical layout and BlockMax support
 #[derive(Debug, Clone)]
-pub struct SimdBp128PostingList {
+pub struct VerticalBP128PostingList {
     /// Blocks of postings
-    pub blocks: Vec<SimdBp128Block>,
+    pub blocks: Vec<VerticalBP128Block>,
     /// Total document count
     pub doc_count: u32,
     /// Maximum score across all blocks
     pub max_score: f32,
 }
 
-impl SimdBp128PostingList {
+impl VerticalBP128PostingList {
     /// BM25 parameters
     const K1: f32 = 1.2;
     const B: f32 = 0.75;
@@ -710,7 +927,7 @@ impl SimdBp128PostingList {
         let mut i = 0;
 
         while i < doc_ids.len() {
-            let block_end = (i + SIMD_BLOCK_SIZE).min(doc_ids.len());
+            let block_end = (i + VERTICAL_BP128_BLOCK_SIZE).min(doc_ids.len());
             let block_docs = &doc_ids[i..block_end];
             let block_tfs = &term_freqs[i..block_end];
 
@@ -728,13 +945,13 @@ impl SimdBp128PostingList {
         }
     }
 
-    fn create_block(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> SimdBp128Block {
+    fn create_block(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> VerticalBP128Block {
         let num_docs = doc_ids.len();
         let first_doc_id = doc_ids[0];
         let last_doc_id = *doc_ids.last().unwrap();
 
         // Compute deltas (gap - 1)
-        let mut deltas = [0u32; SIMD_BLOCK_SIZE];
+        let mut deltas = [0u32; VERTICAL_BP128_BLOCK_SIZE];
         let mut max_delta = 0u32;
         for j in 1..num_docs {
             let delta = doc_ids[j] - doc_ids[j - 1] - 1;
@@ -743,7 +960,7 @@ impl SimdBp128PostingList {
         }
 
         // Compute TFs (tf - 1)
-        let mut tfs = [0u32; SIMD_BLOCK_SIZE];
+        let mut tfs = [0u32; VERTICAL_BP128_BLOCK_SIZE];
         let mut max_tf = 0u32;
         for (j, &tf) in term_freqs.iter().enumerate() {
             tfs[j] = tf.saturating_sub(1);
@@ -761,7 +978,7 @@ impl SimdBp128PostingList {
 
         let max_block_score = Self::compute_bm25_upper_bound(max_tf, idf);
 
-        SimdBp128Block {
+        VerticalBP128Block {
             doc_data,
             doc_bit_width,
             tf_data,
@@ -795,7 +1012,7 @@ impl SimdBp128PostingList {
 
         let mut blocks = Vec::with_capacity(num_blocks);
         for _ in 0..num_blocks {
-            blocks.push(SimdBp128Block::deserialize(reader)?);
+            blocks.push(VerticalBP128Block::deserialize(reader)?);
         }
 
         Ok(Self {
@@ -806,8 +1023,8 @@ impl SimdBp128PostingList {
     }
 
     /// Create iterator
-    pub fn iterator(&self) -> SimdBp128Iterator<'_> {
-        SimdBp128Iterator::new(self)
+    pub fn iterator(&self) -> VerticalBP128Iterator<'_> {
+        VerticalBP128Iterator::new(self)
     }
 
     /// Get approximate size in bytes
@@ -821,8 +1038,8 @@ impl SimdBp128PostingList {
 }
 
 /// Iterator over SIMD-BP128 posting list
-pub struct SimdBp128Iterator<'a> {
-    list: &'a SimdBp128PostingList,
+pub struct VerticalBP128Iterator<'a> {
+    list: &'a VerticalBP128PostingList,
     current_block: usize,
     block_doc_ids: Vec<u32>,
     block_term_freqs: Vec<u32>,
@@ -830,8 +1047,8 @@ pub struct SimdBp128Iterator<'a> {
     exhausted: bool,
 }
 
-impl<'a> SimdBp128Iterator<'a> {
-    pub fn new(list: &'a SimdBp128PostingList) -> Self {
+impl<'a> VerticalBP128Iterator<'a> {
+    pub fn new(list: &'a VerticalBP128PostingList) -> Self {
         let mut iter = Self {
             list,
             current_block: 0,
@@ -1001,7 +1218,7 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_vertical() {
-        let mut values = [0u32; SIMD_BLOCK_SIZE];
+        let mut values = [0u32; VERTICAL_BP128_BLOCK_SIZE];
         for (i, v) in values.iter_mut().enumerate() {
             *v = (i * 3) as u32;
         }
@@ -1012,7 +1229,7 @@ mod tests {
         let mut packed = Vec::new();
         pack_vertical(&values, bit_width, &mut packed);
 
-        let mut unpacked = [0u32; SIMD_BLOCK_SIZE];
+        let mut unpacked = [0u32; VERTICAL_BP128_BLOCK_SIZE];
         unpack_vertical(&packed, bit_width, &mut unpacked);
 
         assert_eq!(values, unpacked);
@@ -1021,7 +1238,7 @@ mod tests {
     #[test]
     fn test_pack_unpack_vertical_various_widths() {
         for bit_width in 1..=20 {
-            let mut values = [0u32; SIMD_BLOCK_SIZE];
+            let mut values = [0u32; VERTICAL_BP128_BLOCK_SIZE];
             let max_val = (1u32 << bit_width) - 1;
             for (i, v) in values.iter_mut().enumerate() {
                 *v = (i as u32) % (max_val + 1);
@@ -1030,7 +1247,7 @@ mod tests {
             let mut packed = Vec::new();
             pack_vertical(&values, bit_width, &mut packed);
 
-            let mut unpacked = [0u32; SIMD_BLOCK_SIZE];
+            let mut unpacked = [0u32; VERTICAL_BP128_BLOCK_SIZE];
             unpack_vertical(&packed, bit_width, &mut unpacked);
 
             assert_eq!(values, unpacked, "Failed for bit_width={}", bit_width);
@@ -1042,7 +1259,7 @@ mod tests {
         let doc_ids: Vec<u32> = (0..200).map(|i| i * 2).collect();
         let term_freqs: Vec<u32> = (0..200).map(|i| (i % 10) + 1).collect();
 
-        let list = SimdBp128PostingList::from_postings(&doc_ids, &term_freqs, 1.0);
+        let list = VerticalBP128PostingList::from_postings(&doc_ids, &term_freqs, 1.0);
 
         assert_eq!(list.doc_count, 200);
         assert_eq!(list.blocks.len(), 2); // 128 + 72
@@ -1062,7 +1279,7 @@ mod tests {
         let doc_ids: Vec<u32> = vec![10, 20, 30, 100, 200, 300, 1000, 2000];
         let term_freqs: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
 
-        let list = SimdBp128PostingList::from_postings(&doc_ids, &term_freqs, 1.0);
+        let list = VerticalBP128PostingList::from_postings(&doc_ids, &term_freqs, 1.0);
         let mut iter = list.iterator();
 
         assert_eq!(iter.seek(25), 30);
@@ -1076,12 +1293,12 @@ mod tests {
         let doc_ids: Vec<u32> = (0..300).map(|i| i * 3).collect();
         let term_freqs: Vec<u32> = (0..300).map(|i| (i % 5) + 1).collect();
 
-        let list = SimdBp128PostingList::from_postings(&doc_ids, &term_freqs, 1.5);
+        let list = VerticalBP128PostingList::from_postings(&doc_ids, &term_freqs, 1.5);
 
         let mut buffer = Vec::new();
         list.serialize(&mut buffer).unwrap();
 
-        let restored = SimdBp128PostingList::deserialize(&mut &buffer[..]).unwrap();
+        let restored = VerticalBP128PostingList::deserialize(&mut &buffer[..]).unwrap();
 
         assert_eq!(restored.doc_count, list.doc_count);
         assert_eq!(restored.blocks.len(), list.blocks.len());
@@ -1100,7 +1317,7 @@ mod tests {
     #[test]
     fn test_vertical_layout_size() {
         // True vertical layout: BLOCK_SIZE * bit_width / 8 bytes (optimal)
-        let mut values = [0u32; SIMD_BLOCK_SIZE];
+        let mut values = [0u32; VERTICAL_BP128_BLOCK_SIZE];
         for (i, v) in values.iter_mut().enumerate() {
             *v = i as u32;
         }
@@ -1112,7 +1329,7 @@ mod tests {
         pack_horizontal(&values, bit_width, &mut packed);
 
         // True vertical layout: 128 * 7 / 8 = 112 bytes (optimal, no padding)
-        let expected_bytes = (SIMD_BLOCK_SIZE * bit_width as usize) / 8;
+        let expected_bytes = (VERTICAL_BP128_BLOCK_SIZE * bit_width as usize) / 8;
         assert_eq!(expected_bytes, 112);
         assert_eq!(packed.len(), expected_bytes);
     }
@@ -1136,7 +1353,7 @@ mod tests {
             })
             .collect();
 
-        let list = SimdBp128PostingList::from_postings(&doc_ids, &term_freqs, 2.0);
+        let list = VerticalBP128PostingList::from_postings(&doc_ids, &term_freqs, 2.0);
 
         // Should have 4 blocks (500 docs / 128 per block)
         assert_eq!(list.blocks.len(), 4);

@@ -154,6 +154,7 @@ impl EliasFano {
     }
 
     /// Find position of i-th set bit (0-indexed)
+    /// Uses POPCNT on x86_64 and efficient intrinsics on aarch64
     fn select1(&self, i: u32) -> Option<u32> {
         if i >= self.len {
             return None;
@@ -162,15 +163,12 @@ impl EliasFano {
         let mut remaining = i + 1;
         let mut pos = 0u32;
 
+        // Process words using architecture-specific popcount
         for &word in self.upper_bits.iter() {
-            let popcount = word.count_ones();
+            let popcount = Self::popcount64(word);
             if popcount >= remaining {
-                // Target is in this word
-                let mut w = word;
-                for _ in 0..remaining - 1 {
-                    w &= w - 1; // Clear lowest set bit
-                }
-                let bit_pos = w.trailing_zeros();
+                // Target is in this word - find the remaining-th set bit
+                let bit_pos = Self::select_in_word(word, remaining);
                 return Some(pos + bit_pos);
             }
             remaining -= popcount;
@@ -178,6 +176,36 @@ impl EliasFano {
         }
 
         None
+    }
+
+    /// Fast popcount using architecture-specific intrinsics
+    #[inline]
+    fn popcount64(word: u64) -> u32 {
+        // count_ones() compiles to POPCNT on x86_64 and efficient code on aarch64
+        word.count_ones()
+    }
+
+    /// Find position of k-th set bit within a word (1-indexed k)
+    #[inline]
+    fn select_in_word(word: u64, k: u32) -> u32 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            // Use PDEP instruction for O(1) select on BMI2-capable CPUs
+            use std::arch::x86_64::_pdep_u64;
+            let mask = 1u64 << (k - 1);
+            let selected = unsafe { _pdep_u64(mask, word) };
+            selected.trailing_zeros()
+        }
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            // Fallback: clear lowest set bits one by one
+            let mut w = word;
+            for _ in 0..k - 1 {
+                w &= w - 1; // Clear lowest set bit
+            }
+            w.trailing_zeros()
+        }
     }
 
     /// Find first element >= target (NextGEQ operation)
