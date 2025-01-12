@@ -282,11 +282,14 @@ impl SegmentBuilder {
     }
 
     /// Build store with parallel compression
+    ///
+    /// Uses `EagerParallelStoreWriter` which starts compressing blocks immediately
+    /// when they're ready, overlapping document serialization with compression.
     #[cfg(feature = "native")]
     fn build_store_parallel(&self, store_data: &mut Vec<u8>, num_threads: usize) -> Result<()> {
-        use super::store::ParallelStoreWriter;
+        use super::store::EagerParallelStoreWriter;
 
-        let mut writer = ParallelStoreWriter::new(store_data, num_threads);
+        let mut writer = EagerParallelStoreWriter::new(store_data, num_threads);
 
         for doc in &self.documents {
             writer.store(doc, &self.schema)?;

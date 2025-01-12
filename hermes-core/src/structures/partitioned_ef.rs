@@ -237,8 +237,81 @@ impl EFPartition {
             }
         }
 
-        // Scalar fallback for non-aarch64
-        #[cfg(not(target_arch = "aarch64"))]
+        // Process 4 words at a time on x86_64 using POPCNT instruction
+        #[cfg(target_arch = "x86_64")]
+        {
+            #[cfg(target_feature = "popcnt")]
+            {
+                use std::arch::x86_64::*;
+
+                let chunks = self.upper_bits.chunks_exact(4);
+                let remainder = chunks.remainder();
+
+                for chunk in chunks {
+                    // Use hardware POPCNT for each word
+                    unsafe {
+                        let p0 = _popcnt64(chunk[0] as i64) as u32;
+                        let p1 = _popcnt64(chunk[1] as i64) as u32;
+                        let p2 = _popcnt64(chunk[2] as i64) as u32;
+                        let p3 = _popcnt64(chunk[3] as i64) as u32;
+
+                        let total_popcount = p0 + p1 + p2 + p3;
+
+                        if total_popcount >= remaining {
+                            // Found the chunk, now find exact word
+                            for &word in chunk {
+                                let popcount = word.count_ones();
+                                if popcount >= remaining {
+                                    let mut w = word;
+                                    for _ in 0..remaining - 1 {
+                                        w &= w - 1;
+                                    }
+                                    return Some(pos + w.trailing_zeros());
+                                }
+                                remaining -= popcount;
+                                pos += 64;
+                            }
+                        }
+                        remaining -= total_popcount;
+                        pos += 256; // 4 words * 64 bits
+                    }
+                }
+
+                // Handle remaining words
+                for &word in remainder {
+                    let popcount = word.count_ones();
+                    if popcount >= remaining {
+                        let mut w = word;
+                        for _ in 0..remaining - 1 {
+                            w &= w - 1;
+                        }
+                        return Some(pos + w.trailing_zeros());
+                    }
+                    remaining -= popcount;
+                    pos += 64;
+                }
+            }
+
+            // Scalar fallback when POPCNT not available
+            #[cfg(not(target_feature = "popcnt"))]
+            {
+                for &word in &self.upper_bits {
+                    let popcount = word.count_ones();
+                    if popcount >= remaining {
+                        let mut w = word;
+                        for _ in 0..remaining - 1 {
+                            w &= w - 1;
+                        }
+                        return Some(pos + w.trailing_zeros());
+                    }
+                    remaining -= popcount;
+                    pos += 64;
+                }
+            }
+        }
+
+        // Scalar fallback for other architectures
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             for &word in &self.upper_bits {
                 let popcount = word.count_ones();

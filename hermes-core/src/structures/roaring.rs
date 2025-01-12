@@ -39,8 +39,36 @@ impl Container {
     fn cardinality(&self) -> u32 {
         match self {
             Container::Array(arr) => arr.len() as u32,
-            Container::Bitmap(bm) => bm.iter().map(|w| w.count_ones()).sum(),
+            Container::Bitmap(bm) => Self::bitmap_cardinality(bm),
             Container::Runs(runs) => runs.iter().map(|(_, len)| *len as u32 + 1).sum(),
+        }
+    }
+
+    /// NEON-accelerated bitmap cardinality on aarch64
+    #[inline]
+    fn bitmap_cardinality(bm: &[u64; 1024]) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+
+            let mut total = 0u32;
+            let bytes = bm.as_ptr() as *const u8;
+
+            // Process 16 bytes (2 u64 words) at a time
+            unsafe {
+                for i in (0..8192).step_by(16) {
+                    let v = vld1q_u8(bytes.add(i));
+                    let cnt = vcntq_u8(v);
+                    total += vaddlvq_u8(cnt) as u32;
+                }
+            }
+
+            total
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            bm.iter().map(|w| w.count_ones()).sum()
         }
     }
 

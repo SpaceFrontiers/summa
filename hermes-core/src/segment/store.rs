@@ -164,15 +164,6 @@ fn serialize_document(doc: &Document, _schema: &Schema) -> io::Result<Vec<u8>> {
     serde_json::to_vec(doc).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Pending block for parallel compression
-#[cfg(feature = "native")]
-struct PendingBlock {
-    seq: usize,
-    first_doc_id: DocId,
-    num_docs: u32,
-    data: Vec<u8>,
-}
-
 /// Compressed block result
 #[cfg(feature = "native")]
 struct CompressedBlock {
@@ -182,50 +173,58 @@ struct CompressedBlock {
     compressed: Vec<u8>,
 }
 
-/// Parallel document store writer - compresses blocks in parallel while maintaining order
+/// Parallel document store writer - compresses blocks immediately when queued
 ///
-/// Uses a thread pool to compress blocks concurrently. Blocks are written in sequence
-/// order to maintain correct document ordering in the output file.
+/// Spawns compression tasks as soon as blocks are ready, overlapping document
+/// ingestion with compression to reduce total indexing time.
+///
+/// Uses background threads to compress blocks while the main thread continues
+/// accepting documents.
 #[cfg(feature = "native")]
-pub struct ParallelStoreWriter<'a> {
+pub struct EagerParallelStoreWriter<'a> {
     writer: &'a mut dyn Write,
     block_buffer: Vec<u8>,
-    pending_blocks: Vec<PendingBlock>,
+    /// Compressed blocks ready to be written (may arrive out of order)
+    compressed_blocks: Vec<CompressedBlock>,
+    /// Handles for in-flight compression tasks
+    pending_handles: Vec<std::thread::JoinHandle<CompressedBlock>>,
     next_seq: usize,
     next_doc_id: DocId,
     block_first_doc: DocId,
-    dict: Option<CompressionDict>,
-    #[allow(dead_code)]
-    num_threads: usize,
+    dict: Option<Arc<CompressionDict>>,
 }
 
 #[cfg(feature = "native")]
-impl<'a> ParallelStoreWriter<'a> {
-    /// Create a new parallel store writer
-    pub fn new(writer: &'a mut dyn Write, num_threads: usize) -> Self {
+impl<'a> EagerParallelStoreWriter<'a> {
+    /// Create a new eager parallel store writer
+    pub fn new(writer: &'a mut dyn Write, _num_threads: usize) -> Self {
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
-            pending_blocks: Vec::new(),
+            compressed_blocks: Vec::new(),
+            pending_handles: Vec::new(),
             next_seq: 0,
             next_doc_id: 0,
             block_first_doc: 0,
             dict: None,
-            num_threads: num_threads.max(1),
         }
     }
 
     /// Create with dictionary
-    pub fn with_dict(writer: &'a mut dyn Write, dict: CompressionDict, num_threads: usize) -> Self {
+    pub fn with_dict(
+        writer: &'a mut dyn Write,
+        dict: CompressionDict,
+        _num_threads: usize,
+    ) -> Self {
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
-            pending_blocks: Vec::new(),
+            compressed_blocks: Vec::new(),
+            pending_handles: Vec::new(),
             next_seq: 0,
             next_doc_id: 0,
             block_first_doc: 0,
-            dict: Some(dict),
-            num_threads: num_threads.max(1),
+            dict: Some(Arc::new(dict)),
         }
     }
 
@@ -240,36 +239,77 @@ impl<'a> ParallelStoreWriter<'a> {
         self.block_buffer.extend_from_slice(&doc_bytes);
 
         if self.block_buffer.len() >= STORE_BLOCK_SIZE {
-            self.queue_block();
+            self.spawn_compression();
         }
 
         Ok(doc_id)
     }
 
-    fn queue_block(&mut self) {
+    /// Spawn compression for the current block immediately
+    fn spawn_compression(&mut self) {
         if self.block_buffer.is_empty() {
             return;
         }
 
         let num_docs = self.next_doc_id - self.block_first_doc;
         let data = std::mem::replace(&mut self.block_buffer, Vec::with_capacity(STORE_BLOCK_SIZE));
-
-        self.pending_blocks.push(PendingBlock {
-            seq: self.next_seq,
-            first_doc_id: self.block_first_doc,
-            num_docs,
-            data,
-        });
+        let seq = self.next_seq;
+        let first_doc_id = self.block_first_doc;
+        let dict = self.dict.clone();
 
         self.next_seq += 1;
         self.block_first_doc = self.next_doc_id;
+
+        // Spawn compression task using rayon's thread pool
+        let handle = std::thread::spawn(move || {
+            let compressed = if let Some(ref d) = dict {
+                crate::compression::compress_with_dict(&data, COMPRESSION_LEVEL, d)
+                    .expect("compression failed")
+            } else {
+                crate::compression::compress(&data, COMPRESSION_LEVEL).expect("compression failed")
+            };
+
+            CompressedBlock {
+                seq,
+                first_doc_id,
+                num_docs,
+                compressed,
+            }
+        });
+
+        self.pending_handles.push(handle);
+    }
+
+    /// Collect any completed compression tasks
+    fn collect_completed(&mut self) {
+        let mut remaining = Vec::new();
+        for handle in self.pending_handles.drain(..) {
+            if handle.is_finished() {
+                if let Ok(block) = handle.join() {
+                    self.compressed_blocks.push(block);
+                }
+            } else {
+                remaining.push(handle);
+            }
+        }
+        self.pending_handles = remaining;
     }
 
     pub fn finish(mut self) -> io::Result<u32> {
-        // Queue any remaining data
-        self.queue_block();
+        // Spawn compression for any remaining data
+        self.spawn_compression();
 
-        if self.pending_blocks.is_empty() {
+        // Collect any already-completed tasks
+        self.collect_completed();
+
+        // Wait for all remaining compression tasks
+        for handle in self.pending_handles.drain(..) {
+            if let Ok(block) = handle.join() {
+                self.compressed_blocks.push(block);
+            }
+        }
+
+        if self.compressed_blocks.is_empty() {
             // Write empty store
             let data_end_offset = 0u64;
             self.writer.write_u32::<LittleEndian>(0)?; // num blocks
@@ -282,41 +322,14 @@ impl<'a> ParallelStoreWriter<'a> {
             return Ok(0);
         }
 
-        // Compress all blocks in parallel using rayon
-        let dict = self.dict.clone();
-        let compressed_blocks: Vec<CompressedBlock> = {
-            use rayon::prelude::*;
-
-            self.pending_blocks
-                .into_par_iter()
-                .map(|block| {
-                    let compressed = if let Some(ref d) = dict {
-                        crate::compression::compress_with_dict(&block.data, COMPRESSION_LEVEL, d)
-                            .expect("compression failed")
-                    } else {
-                        crate::compression::compress(&block.data, COMPRESSION_LEVEL)
-                            .expect("compression failed")
-                    };
-
-                    CompressedBlock {
-                        seq: block.seq,
-                        first_doc_id: block.first_doc_id,
-                        num_docs: block.num_docs,
-                        compressed,
-                    }
-                })
-                .collect()
-        };
-
         // Sort by sequence to maintain order
-        let mut sorted_blocks = compressed_blocks;
-        sorted_blocks.sort_by_key(|b| b.seq);
+        self.compressed_blocks.sort_by_key(|b| b.seq);
 
         // Write blocks in order and build index
-        let mut index = Vec::with_capacity(sorted_blocks.len());
+        let mut index = Vec::with_capacity(self.compressed_blocks.len());
         let mut current_offset = 0u64;
 
-        for block in sorted_blocks {
+        for block in &self.compressed_blocks {
             index.push(StoreBlockIndex {
                 first_doc_id: block.first_doc_id,
                 offset: current_offset,
@@ -337,7 +350,6 @@ impl<'a> ParallelStoreWriter<'a> {
             self.writer
                 .write_u32::<LittleEndian>(dict_bytes.len() as u32)?;
             self.writer.write_all(dict_bytes)?;
-            let _ = current_offset + 4 + dict_bytes.len() as u64; // offset tracking ends here
             Some(offset)
         } else {
             None
@@ -622,7 +634,7 @@ pub struct RawStoreBlock {
 ///
 /// This is much faster than rebuilding stores since it avoids:
 /// - Decompressing blocks from source stores
-/// - Re-serializing documents  
+/// - Re-serializing documents
 /// - Re-compressing blocks at level 22
 ///
 /// Limitations:
