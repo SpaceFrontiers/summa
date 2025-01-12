@@ -216,7 +216,7 @@ jobs:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     needs: build-wheels
-    if: inputs.publish_pypi
+    if: inputs.publish_pypi && needs.build-wheels.result == 'success'
     steps:
       - uses: actions/checkout@v4
 
