@@ -1,5 +1,5 @@
 repos:
-  # Rust formatting
+  # Rust - single combined check (fmt + clippy in one compilation)
   - repo: local
     hooks:
       - id: rustfmt
@@ -8,22 +8,13 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
-      - id: cargo-check
-        name: cargo check
-        entry: cargo check --all-targets
-        language: system
-        types: [rust]
-        pass_filenames: false
-
-  # Rust linting (clippy)
-  - repo: local
-    hooks:
       - id: clippy
         name: clippy
         entry: cargo clippy --all-targets --all-features -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
+        stages: [pre-push]
 
   # Python formatting and linting
   - repo: https://github.com/astral-sh/ruff-pre-commit
