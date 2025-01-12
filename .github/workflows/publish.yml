@@ -201,16 +201,16 @@ jobs:
       - name: Build wheel
         run: |
           cd hermes-core-python
-          maturin build --release
+          maturin build --release --out dist
 
       - name: List wheels
-        run: ls -la hermes-core-python/target/wheels/
+        run: ls -la hermes-core-python/dist/
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-py${{ matrix.python }}
-          path: hermes-core-python/target/wheels/*.whl
+          path: hermes-core-python/dist/*.whl
 
   publish-pypi:
     name: Publish to PyPI
