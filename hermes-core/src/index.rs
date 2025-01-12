@@ -876,9 +876,11 @@ mod tests {
         let schema = schema_builder.build();
 
         let dir = RamDirectory::new();
-        let mut config = IndexConfig::default();
-        config.max_docs_per_segment = 5; // Small segments for testing
-        config.merge_threshold = 10; // Don't auto-merge
+        let config = IndexConfig {
+            max_docs_per_segment: 5, // Small segments for testing
+            merge_threshold: 10,     // Don't auto-merge
+            ..Default::default()
+        };
 
         let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
@@ -907,9 +909,11 @@ mod tests {
         let schema = schema_builder.build();
 
         let dir = RamDirectory::new();
-        let mut config = IndexConfig::default();
-        config.max_docs_per_segment = 3;
-        config.merge_threshold = 100; // Don't auto-merge
+        let config = IndexConfig {
+            max_docs_per_segment: 3,
+            merge_threshold: 100, // Don't auto-merge
+            ..Default::default()
+        };
 
         let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
@@ -982,7 +986,7 @@ mod tests {
 
         // Test match query with multiple tokens
         let results = index.query("rust programming", 10).await.unwrap();
-        assert!(results.hits.len() >= 1);
+        assert!(!results.hits.is_empty());
 
         // Verify hit has address (segment_id + doc_id)
         let hit = &results.hits[0];

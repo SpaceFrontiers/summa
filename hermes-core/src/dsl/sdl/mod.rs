@@ -9,22 +9,22 @@
 //! index articles {
 //!     # Primary text field for full-text search
 //!     field title: text [indexed, stored]
-//!     
+//!
 //!     # Body content - indexed but not stored (save space)
 //!     field body: text [indexed]
-//!     
+//!
 //!     # Author name
 //!     field author: text [indexed, stored]
-//!     
+//!
 //!     # Publication timestamp
 //!     field published_at: i64 [indexed, stored]
-//!     
+//!
 //!     # View count
 //!     field views: u64 [indexed, stored]
-//!     
+//!
 //!     # Rating score
 //!     field rating: f64 [indexed, stored]
-//!     
+//!
 //!     # Raw content hash (not indexed, just stored)
 //!     field content_hash: bytes [stored]
 //! }
@@ -115,7 +115,7 @@ impl IndexDef {
 
         super::query_field_router::QueryFieldRouter::from_rules(&self.query_routers)
             .map(Some)
-            .map_err(|e| Error::Schema(e))
+            .map_err(Error::Schema)
     }
 }
 
@@ -504,7 +504,7 @@ mod tests {
             index articles {
                 field title: text [indexed, stored]
             }
-            
+
             index users {
                 field name: text [indexed, stored]
                 field email: text [indexed, stored]
@@ -567,7 +567,7 @@ mod tests {
             index documents {
                 field title: text [indexed, stored]
                 field uri: text [indexed, stored]
-                
+
                 query_router {
                     pattern: "10\\.\\d{4,}/[^\\s]+"
                     substitution: "doi://{0}"
@@ -593,7 +593,7 @@ mod tests {
         let sdl = r#"
             index documents {
                 field uris: text [indexed, stored]
-                
+
                 query_router {
                     pattern: r"^pmid:(\d+)$"
                     substitution: "pubmed://{1}"
@@ -616,21 +616,21 @@ mod tests {
         let sdl = r#"
             index documents {
                 field uris: text [indexed, stored]
-                
+
                 query_router {
                     pattern: r"^doi:(10\.\d{4,}/[^\s]+)$"
                     substitution: "doi://{1}"
                     target_field: uris
                     mode: exclusive
                 }
-                
+
                 query_router {
                     pattern: r"^pmid:(\d+)$"
                     substitution: "pubmed://{1}"
                     target_field: uris
                     mode: exclusive
                 }
-                
+
                 query_router {
                     pattern: r"^arxiv:(\d+\.\d+)$"
                     substitution: "arxiv://{1}"
@@ -649,7 +649,7 @@ mod tests {
         let sdl = r#"
             index documents {
                 field uris: text [indexed, stored]
-                
+
                 query_router {
                     pattern: r"test"
                     substitution: "{0}"

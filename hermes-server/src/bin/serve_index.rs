@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> std::io::Result<()> {
     let index_dir = std::env::args()
@@ -245,7 +245,7 @@ fn send_partial_response(
     stream.flush()
 }
 
-fn guess_content_type(path: &PathBuf) -> &'static str {
+fn guess_content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => "application/json",
         Some("bin") => "application/octet-stream",

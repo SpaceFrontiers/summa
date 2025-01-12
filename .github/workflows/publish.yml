@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version_bump:
-        description: 'Version bump type'
+        description: "Version bump type"
         type: choice
         options:
           - patch
@@ -12,15 +12,15 @@ on:
           - major
         default: patch
       publish_crates:
-        description: 'Publish to crates.io'
+        description: "Publish to crates.io"
         type: boolean
         default: true
       publish_npm:
-        description: 'Publish to NPM'
+        description: "Publish to NPM"
         type: boolean
         default: true
       publish_pypi:
-        description: 'Publish to PyPI'
+        description: "Publish to PyPI"
         type: boolean
         default: true
 
@@ -55,7 +55,7 @@ jobs:
         run: |
           VERSION="${{ steps.current.outputs.version }}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-          
+
           case "${{ inputs.version_bump }}" in
             major)
               MAJOR=$((MAJOR + 1))
@@ -70,7 +70,7 @@ jobs:
               PATCH=$((PATCH + 1))
               ;;
           esac
-          
+
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "New version: $NEW_VERSION"
@@ -82,12 +82,12 @@ jobs:
 
       - name: Update pyproject.toml version
         run: |
-          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-python/pyproject.toml
+          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-core-python/pyproject.toml
           echo "Updated pyproject.toml to version ${{ steps.bump.outputs.new_version }}"
 
       - name: Commit and push
         run: |
-          git add Cargo.toml hermes-python/pyproject.toml
+          git add Cargo.toml hermes-core-python/pyproject.toml
           git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
           git push
 
@@ -95,7 +95,6 @@ jobs:
         run: |
           git tag "v${{ steps.bump.outputs.new_version }}"
           git push origin "v${{ steps.bump.outputs.new_version }}"
-
 
   publish-crates:
     name: Publish to crates.io
@@ -128,10 +127,6 @@ jobs:
         run: cargo publish -p hermes-tool --no-verify
         continue-on-error: true
 
-      - name: Publish hermes-python
-        run: cargo publish -p hermes-python --no-verify
-        continue-on-error: true
-
   publish-npm:
     name: Publish to NPM
     runs-on: ubuntu-latest
@@ -151,8 +146,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
 
       - name: Build WASM
         run: |
@@ -175,7 +170,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ['3.12', '3.13', '3.14']
+        python: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -194,14 +189,14 @@ jobs:
 
       - name: Build wheel
         run: |
-          cd hermes-python
+          cd hermes-core-python
           maturin build --release --interpreter python${{ matrix.python }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-py${{ matrix.python }}
-          path: hermes-python/target/wheels/*.whl
+          path: hermes-core-python/target/wheels/*.whl
 
   publish-pypi:
     name: Publish to PyPI
@@ -221,7 +216,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install twine
         run: pip install twine

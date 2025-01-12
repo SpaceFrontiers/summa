@@ -1,0 +1,8 @@
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]  # Line too long - handled by formatter
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

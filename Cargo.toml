@@ -3,7 +3,7 @@ members = [
     "hermes-core",
     "hermes-server",
     "hermes-tool",
-    "hermes-python",
+    "hermes-core-python",
     "hermes-wasm",
 ]
 resolver = "2"

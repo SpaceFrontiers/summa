@@ -223,7 +223,7 @@ pub struct BitpackedBlock {
     pub doc_deltas: Vec<u8>,
     /// Bit width for doc deltas
     pub doc_bit_width: u8,
-    /// Term frequencies (bitpacked)  
+    /// Term frequencies (bitpacked)
     pub term_freqs: Vec<u8>,
     /// Bit width for term frequencies
     pub tf_bit_width: u8,
@@ -668,8 +668,8 @@ mod tests {
     #[test]
     fn test_pack_unpack() {
         let mut values = [0u32; BITPACK_BLOCK_SIZE];
-        for i in 0..BITPACK_BLOCK_SIZE {
-            values[i] = (i * 3) as u32;
+        for (i, value) in values.iter_mut().enumerate() {
+            *value = (i * 3) as u32;
         }
 
         let max_val = values.iter().max().copied().unwrap();

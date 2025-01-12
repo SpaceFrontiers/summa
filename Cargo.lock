@@ -631,21 +631,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hermes-index-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hermes-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "hermes-python"
+name = "hermes-core-python"
 version = "0.1.0"
 dependencies = [
  "hermes-core",

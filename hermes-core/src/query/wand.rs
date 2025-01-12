@@ -595,7 +595,7 @@ mod tests {
         // High-scoring term
         let pl1 = create_test_posting_list(&[1, 100, 200], &[10, 10, 10], 2.0);
         // Low-scoring term with many docs
-        let pl2 = create_test_posting_list(&(0..50).collect::<Vec<_>>(), &vec![1; 50], 0.1);
+        let pl2 = create_test_posting_list(&(0..50).collect::<Vec<_>>(), &[1; 50], 0.1);
 
         let scorers = vec![TermScorer::new(&pl1, 2.0, 0), TermScorer::new(&pl2, 0.1, 1)];
 

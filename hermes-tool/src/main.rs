@@ -64,7 +64,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     // === Index Management Commands ===
-
     /// Create a new index from a schema file (JSON or SDL format)
     Create {
         /// Path to the index directory
@@ -151,7 +150,6 @@ enum Commands {
     },
 
     // === Data Processing Commands ===
-
     /// Calculate SimHash for a text field and add to JSON
     Simhash {
         /// Field name to calculate SimHash from
@@ -360,7 +358,7 @@ async fn index_from_reader<R: BufRead>(
         writer.add_document(doc).await?;
         count += 1;
 
-        if progress_interval > 0 && count % progress_interval == 0 {
+        if progress_interval > 0 && count.is_multiple_of(progress_interval) {
             let elapsed = start_time.elapsed().as_secs_f64();
             let rate = count as f64 / elapsed;
             info!(
@@ -399,14 +397,12 @@ async fn index_documents(
     compression_threads: Option<usize>,
 ) -> Result<()> {
     let dir = FsDirectory::new(&index_path);
-    let mut config = IndexConfig::default();
-    config.max_docs_per_segment = max_segment_size;
-    if let Some(t) = indexing_threads {
-        config.num_indexing_threads = t;
-    }
-    if let Some(t) = compression_threads {
-        config.num_compression_threads = t;
-    }
+    let config = IndexConfig {
+        max_docs_per_segment: max_segment_size,
+        num_indexing_threads: indexing_threads.unwrap_or_default(),
+        num_compression_threads: compression_threads.unwrap_or_default(),
+        ..Default::default()
+    };
     let writer = IndexWriter::open(dir, config.clone()).await?;
 
     info!("Opened index at {:?}", index_path);
@@ -538,18 +534,18 @@ fn simhash(text: &str) -> u32 {
     for token in tokens {
         let hash = murmur3::murmur3_32(&mut Cursor::new(token.as_bytes()), 0).unwrap_or(0);
 
-        for i in 0..32 {
+        for (i, count) in bit_counts.iter_mut().enumerate() {
             if (hash >> i) & 1 == 0 {
-                bit_counts[i] += 1;
+                *count += 1;
             } else {
-                bit_counts[i] -= 1;
+                *count -= 1;
             }
         }
     }
 
     let mut fingerprint = 0u32;
-    for i in 0..32 {
-        if bit_counts[i] > 0 {
+    for (i, &count) in bit_counts.iter().enumerate() {
+        if count > 0 {
             fingerprint |= 1 << i;
         }
     }
@@ -631,7 +627,7 @@ fn compare_by_field(
 }
 
 fn write_chunk(
-    chunk: &mut Vec<serde_json::Value>,
+    chunk: &mut [serde_json::Value],
     field: &str,
     numeric: bool,
     reverse: bool,
@@ -702,16 +698,16 @@ fn merge_chunks(
 
     let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
     for (idx, reader) in readers.iter_mut().enumerate() {
-        if let Some(Ok(line)) = reader.next() {
-            if let Ok(value) = serde_json::from_str(&line) {
-                heap.push(HeapItem {
-                    value,
-                    chunk_idx: idx,
-                    field: field.to_string(),
-                    numeric,
-                    reverse,
-                });
-            }
+        if let Some(Ok(line)) = reader.next()
+            && let Ok(value) = serde_json::from_str(&line)
+        {
+            heap.push(HeapItem {
+                value,
+                chunk_idx: idx,
+                field: field.to_string(),
+                numeric,
+                reverse,
+            });
         }
     }
 
@@ -724,16 +720,16 @@ fn merge_chunks(
         writeln!(writer)?;
         output_count += 1;
 
-        if let Some(Ok(line)) = readers[item.chunk_idx].next() {
-            if let Ok(value) = serde_json::from_str(&line) {
-                heap.push(HeapItem {
-                    value,
-                    chunk_idx: item.chunk_idx,
-                    field: field.to_string(),
-                    numeric,
-                    reverse,
-                });
-            }
+        if let Some(Ok(line)) = readers[item.chunk_idx].next()
+            && let Ok(value) = serde_json::from_str(&line)
+        {
+            heap.push(HeapItem {
+                value,
+                chunk_idx: item.chunk_idx,
+                field: field.to_string(),
+                numeric,
+                reverse,
+            });
         }
     }
 
@@ -957,7 +953,7 @@ fn run_term_stats(
             }
         }
 
-        if total_docs % 100_000 == 0 {
+        if total_docs.is_multiple_of(100_000) {
             eprintln!(
                 "  Processed {} documents, {} unique terms...",
                 total_docs,

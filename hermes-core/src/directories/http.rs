@@ -136,7 +136,7 @@ impl HttpDirectory {
             .get(url)
             .send()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         if !response.status().is_success() {
             return Err(io::Error::new(
@@ -149,7 +149,7 @@ impl HttpDirectory {
             .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Record stats
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -169,7 +169,7 @@ impl HttpDirectory {
             .header("Range", range_header)
             .send()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Accept both 200 (full content) and 206 (partial content)
         if !response.status().is_success() {
@@ -183,7 +183,7 @@ impl HttpDirectory {
             .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Record stats
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -203,7 +203,7 @@ impl HttpDirectory {
             .head(url)
             .send()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         if !response.status().is_success() {
             return Err(io::Error::new(
@@ -217,7 +217,7 @@ impl HttpDirectory {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No Content-Length header"))
+            .ok_or_else(|| io::Error::other("No Content-Length header"))
     }
 }
 
@@ -309,7 +309,7 @@ impl Directory for HttpDirectory {
                     .header("Range", range_header)
                     .send()
                     .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 if !response.status().is_success() {
                     return Err(io::Error::new(
@@ -321,7 +321,7 @@ impl Directory for HttpDirectory {
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
 
                 // Record stats
                 let duration_ms = start_time.elapsed().as_millis() as u64;

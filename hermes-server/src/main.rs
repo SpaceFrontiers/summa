@@ -202,14 +202,14 @@ impl SearchService for SearchServiceImpl {
             let local_doc_id = doc_id - segment.doc_id_offset();
             let mut fields = HashMap::new();
 
-            if !req.fields_to_load.is_empty() {
-                if let Ok(Some(doc)) = segment.doc(local_doc_id).await {
-                    for field_name in &req.fields_to_load {
-                        if let Some(field) = index.schema().get_field(field_name) {
-                            if let Some(value) = doc.get_first(field) {
-                                fields.insert(field_name.clone(), convert_field_value(value));
-                            }
-                        }
+            if !req.fields_to_load.is_empty()
+                && let Ok(Some(doc)) = segment.doc(local_doc_id).await
+            {
+                for field_name in &req.fields_to_load {
+                    if let Some(field) = index.schema().get_field(field_name)
+                        && let Some(value) = doc.get_first(field)
+                    {
+                        fields.insert(field_name.clone(), convert_field_value(value));
                     }
                 }
             }

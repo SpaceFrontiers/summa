@@ -25,7 +25,7 @@
 //! index documents {
 //!     field title: text [indexed, stored]
 //!     field uri: text [indexed, stored]
-//!     
+//!
 //!     # Route DOI queries to uri field exclusively
 //!     query_router {
 //!         pattern: r"10\.\d{4,}/[^\s]+"
@@ -33,7 +33,7 @@
 //!         target_field: uri
 //!         mode: exclusive
 //!     }
-//!     
+//!
 //!     # Route ISBN with hyphen removal
 //!     query_router {
 //!         pattern: r"^isbn:([\d\-]+)$"
@@ -102,7 +102,7 @@ mod template {
                 let mut expr = String::new();
                 let mut brace_depth = 1;
 
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if c == '{' {
                         brace_depth += 1;
                         expr.push(c);
@@ -231,7 +231,7 @@ mod template {
         let mut in_string = false;
         let mut string_char = '"';
 
-        while let Some(c) = chars.next() {
+        for c in chars.by_ref() {
             if c == ')' && !in_string {
                 // End of arguments
                 let arg = current_arg.trim().to_string();

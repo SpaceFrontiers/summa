@@ -100,15 +100,15 @@ impl QueryLanguageParser {
         }
 
         // Check if query matches any routing rules
-        if let Some(router) = &self.field_router {
-            if let Some(routed) = router.route(query_str) {
-                return self.build_routed_query(
-                    &routed.query,
-                    &routed.target_field,
-                    routed.mode,
-                    query_str,
-                );
-            }
+        if let Some(router) = &self.field_router
+            && let Some(routed) = router.route(query_str)
+        {
+            return self.build_routed_query(
+                &routed.query,
+                &routed.target_field,
+                routed.mode,
+                query_str,
+            );
         }
 
         // No routing match - parse normally

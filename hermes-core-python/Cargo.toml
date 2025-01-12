@@ -1,5 +1,5 @@
 [package]
-name = "hermes-python"
+name = "hermes-core-python"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
