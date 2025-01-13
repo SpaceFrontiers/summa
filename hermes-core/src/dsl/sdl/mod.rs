@@ -42,6 +42,7 @@ use crate::error::Error;
 #[grammar = "dsl/sdl/sdl.pest"]
 pub struct SdlParser;
 
+use super::schema::DenseVectorConfig;
 use crate::structures::{IndexSize, SparseVectorConfig, WeightQuantization};
 
 /// Parsed field definition
@@ -57,6 +58,8 @@ pub struct FieldDef {
     pub multi: bool,
     /// Configuration for sparse vector fields
     pub sparse_vector_config: Option<SparseVectorConfig>,
+    /// Configuration for dense vector fields
+    pub dense_vector_config: Option<DenseVectorConfig>,
 }
 
 /// Parsed index definition
@@ -101,6 +104,19 @@ impl IndexDef {
                         builder.add_sparse_vector_field(&field.name, field.indexed, field.stored)
                     }
                 }
+                FieldType::DenseVector => {
+                    // Dense vector dimension must be specified via config
+                    let config = field
+                        .dense_vector_config
+                        .as_ref()
+                        .expect("DenseVector field requires dimension to be specified");
+                    builder.add_dense_vector_field_with_config(
+                        &field.name,
+                        field.indexed,
+                        field.stored,
+                        config.clone(),
+                    )
+                }
             };
             if field.multi {
                 builder.set_multi(f, true);
@@ -144,6 +160,7 @@ fn parse_field_type(type_str: &str) -> Result<FieldType> {
         "f64" | "float" | "double" => Ok(FieldType::F64),
         "bytes" | "binary" | "blob" => Ok(FieldType::Bytes),
         "sparse_vector" => Ok(FieldType::SparseVector),
+        "dense_vector" | "vector" => Ok(FieldType::DenseVector),
         _ => Err(Error::Schema(format!("Unknown field type: {}", type_str))),
     }
 }
@@ -184,9 +201,10 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
 
     let field_type = parse_field_type(field_type_str)?;
 
-    // Parse optional tokenizer spec, sparse_vector_config, and attributes
+    // Parse optional tokenizer spec, sparse_vector_config, dense_vector_config, and attributes
     let mut tokenizer = None;
     let mut sparse_vector_config = None;
+    let mut dense_vector_config = None;
     let mut indexed = true;
     let mut stored = true;
     let mut multi = false;
@@ -227,6 +245,10 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                     weight_quantization: quantization,
                 });
             }
+            Rule::dense_vector_config => {
+                // Parse dense_vector_params (keyword or positional)
+                dense_vector_config = Some(parse_dense_vector_config(item));
+            }
             Rule::attributes => {
                 let (idx, sto, mul) = parse_attributes(item);
                 indexed = idx;
@@ -245,7 +267,77 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         tokenizer,
         multi,
         sparse_vector_config,
+        dense_vector_config,
     })
+}
+
+/// Parse dense_vector_config with keyword or positional params
+fn parse_dense_vector_config(pair: pest::iterators::Pair<Rule>) -> DenseVectorConfig {
+    let mut dim: usize = 0;
+    let mut centroids_path: Option<String> = None;
+    let mut nprobe: usize = 32;
+
+    // Navigate to dense_vector_params
+    for params in pair.into_inner() {
+        if params.as_rule() == Rule::dense_vector_params {
+            for inner in params.into_inner() {
+                match inner.as_rule() {
+                    Rule::dense_vector_keyword_params => {
+                        // Parse keyword args: dims: N, centroids: "path", nprobe: N
+                        for kwarg in inner.into_inner() {
+                            if kwarg.as_rule() == Rule::dense_vector_kwarg {
+                                for kw in kwarg.into_inner() {
+                                    match kw.as_rule() {
+                                        Rule::dims_kwarg => {
+                                            if let Some(d) = kw.into_inner().next() {
+                                                dim = d.as_str().parse().unwrap_or(0);
+                                            }
+                                        }
+                                        Rule::centroids_kwarg => {
+                                            if let Some(path) = kw.into_inner().next()
+                                                && let Some(inner_path) = path.into_inner().next()
+                                            {
+                                                centroids_path =
+                                                    Some(inner_path.as_str().to_string());
+                                            }
+                                        }
+                                        Rule::nprobe_kwarg => {
+                                            if let Some(n) = kw.into_inner().next() {
+                                                nprobe = n.as_str().parse().unwrap_or(32);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Rule::dense_vector_positional_params => {
+                        // Parse positional: dimension, "path", nprobe
+                        let mut positional = inner.into_inner();
+                        if let Some(dim_pair) = positional.next() {
+                            dim = dim_pair.as_str().parse().unwrap_or(0);
+                        }
+                        if let Some(path_pair) = positional.next()
+                            && let Some(inner_path) = path_pair.into_inner().next()
+                        {
+                            centroids_path = Some(inner_path.as_str().to_string());
+                        }
+                        if let Some(nprobe_pair) = positional.next() {
+                            nprobe = nprobe_pair.as_str().parse().unwrap_or(32);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(path) = centroids_path {
+        DenseVectorConfig::with_ivf(dim, path, nprobe)
+    } else {
+        DenseVectorConfig::new(dim)
+    }
 }
 
 /// Parse default_fields definition
@@ -783,5 +875,141 @@ mod tests {
         let config2 = f2.sparse_vector_config.as_ref().unwrap();
         assert_eq!(config2.index_size, IndexSize::U32);
         assert_eq!(config2.weight_quantization, WeightQuantization::Float32);
+    }
+
+    #[test]
+    fn test_dense_vector_field() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].fields.len(), 1);
+
+        let f = &indexes[0].fields[0];
+        assert_eq!(f.name, "embedding");
+        assert_eq!(f.field_type, FieldType::DenseVector);
+
+        let config = f.dense_vector_config.as_ref().unwrap();
+        assert_eq!(config.dim, 768);
+    }
+
+    #[test]
+    fn test_dense_vector_alias() {
+        let sdl = r#"
+            index documents {
+                field embedding: vector<1536> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes[0].fields[0].field_type, FieldType::DenseVector);
+        assert_eq!(
+            indexes[0].fields[0]
+                .dense_vector_config
+                .as_ref()
+                .unwrap()
+                .dim,
+            1536
+        );
+    }
+
+    #[test]
+    fn test_dense_vector_with_centroids() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768, "centroids.bin"> [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 1);
+
+        let f = &indexes[0].fields[0];
+        assert_eq!(f.name, "embedding");
+        assert_eq!(f.field_type, FieldType::DenseVector);
+
+        let config = f.dense_vector_config.as_ref().unwrap();
+        assert_eq!(config.dim, 768);
+        assert_eq!(
+            config.coarse_centroids_path.as_deref(),
+            Some("centroids.bin")
+        );
+        assert_eq!(config.nprobe, 32); // default
+    }
+
+    #[test]
+    fn test_dense_vector_with_centroids_and_nprobe() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<1536, "/path/to/centroids.bin", 64> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 1536);
+        assert_eq!(
+            config.coarse_centroids_path.as_deref(),
+            Some("/path/to/centroids.bin")
+        );
+        assert_eq!(config.nprobe, 64);
+    }
+
+    #[test]
+    fn test_dense_vector_keyword_syntax() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<dims: 1536> [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 1536);
+        assert!(config.coarse_centroids_path.is_none());
+    }
+
+    #[test]
+    fn test_dense_vector_keyword_syntax_full() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<dims: 1536, centroids: "/path/to/centroids.bin", nprobe: 64> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 1536);
+        assert_eq!(
+            config.coarse_centroids_path.as_deref(),
+            Some("/path/to/centroids.bin")
+        );
+        assert_eq!(config.nprobe, 64);
+    }
+
+    #[test]
+    fn test_dense_vector_keyword_syntax_partial() {
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<dims: 768, centroids: "centroids.bin"> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 768);
+        assert_eq!(
+            config.coarse_centroids_path.as_deref(),
+            Some("centroids.bin")
+        );
+        assert_eq!(config.nprobe, 32); // default
     }
 }

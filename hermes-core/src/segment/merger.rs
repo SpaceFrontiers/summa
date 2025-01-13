@@ -10,8 +10,10 @@ use super::store::StoreMerger;
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
-use crate::dsl::Schema;
-use crate::structures::{BlockPostingList, PostingList, SSTableWriter, TERMINATED, TermInfo};
+use crate::dsl::{FieldType, Schema};
+use crate::structures::{
+    BlockPostingList, PostingList, RaBitQConfig, RaBitQIndex, SSTableWriter, TERMINATED, TermInfo,
+};
 
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
@@ -71,6 +73,9 @@ impl SegmentMerger {
         dir.write(&files.term_dict, &term_dict_data).await?;
         dir.write(&files.postings, &postings_data).await?;
         dir.write(&files.store, &store_data).await?;
+
+        // Merge dense vector indexes
+        self.merge_dense_vectors(dir, segments, &files).await?;
 
         // Merge field stats
         let mut merged_field_stats: FxHashMap<u32, FieldStats> = FxHashMap::default();
@@ -334,6 +339,112 @@ impl SegmentMerger {
             merged.doc_count(),
         ))
     }
+    /// Merge dense vector indexes from multiple segments into unified file
+    ///
+    /// For IVF-RaBitQ: O(1) merge by concatenating cluster data (same centroids)
+    /// For RaBitQ: Must rebuild with new centroid from all vectors
+    async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        files: &SegmentFiles,
+    ) -> Result<()> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        let mut field_indexes: Vec<(u32, Vec<u8>)> = Vec::new();
+
+        for (field, entry) in self.schema.fields() {
+            if !matches!(entry.field_type, FieldType::DenseVector) {
+                continue;
+            }
+
+            // Check if all segments have IVF indexes for this field
+            let ivf_indexes: Vec<_> = segments
+                .iter()
+                .filter_map(|s| s.get_ivf_vector_index(field))
+                .collect();
+
+            if ivf_indexes.len()
+                == segments
+                    .iter()
+                    .filter(|s| s.has_dense_vector_index(field))
+                    .count()
+                && !ivf_indexes.is_empty()
+            {
+                // All segments have IVF - use O(1) cluster merge!
+                let refs: Vec<&crate::structures::IVFRaBitQIndex> =
+                    ivf_indexes.iter().map(|arc| arc.as_ref()).collect();
+
+                // Calculate doc_id offsets
+                let mut doc_offsets = Vec::with_capacity(segments.len());
+                let mut offset = 0u32;
+                for segment in segments {
+                    doc_offsets.push(offset);
+                    offset += segment.num_docs();
+                }
+
+                match crate::structures::IVFRaBitQIndex::merge(&refs, &doc_offsets) {
+                    Ok(merged) => {
+                        let bytes = serde_json::to_vec(&merged)
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                        field_indexes.push((field.0, bytes));
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("IVF merge failed: {}, falling back to rebuild", e);
+                    }
+                }
+            }
+
+            // Fall back to RaBitQ rebuild (collect raw vectors)
+            let mut all_vectors: Vec<Vec<f32>> = Vec::new();
+
+            for segment in segments {
+                if let Some(index) = segment.get_dense_vector_index(field)
+                    && let Some(raw_vecs) = &index.raw_vectors
+                {
+                    all_vectors.extend(raw_vecs.iter().cloned());
+                }
+            }
+
+            if !all_vectors.is_empty() {
+                let dim = all_vectors[0].len();
+                let config = RaBitQConfig::new(dim);
+                let merged_index = RaBitQIndex::build(config, &all_vectors, true);
+
+                let index_bytes = serde_json::to_vec(&merged_index)
+                    .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+
+                field_indexes.push((field.0, index_bytes));
+            }
+        }
+
+        // Write unified vectors file
+        if !field_indexes.is_empty() {
+            field_indexes.sort_by_key(|(id, _)| *id);
+
+            let header_size = 4 + field_indexes.len() * (4 + 8 + 8);
+            let mut output = Vec::new();
+
+            output.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
+
+            let mut current_offset = header_size as u64;
+            for (field_id, data) in &field_indexes {
+                output.write_u32::<LittleEndian>(*field_id)?;
+                output.write_u64::<LittleEndian>(current_offset)?;
+                output.write_u64::<LittleEndian>(data.len() as u64)?;
+                current_offset += data.len() as u64;
+            }
+
+            for (_, data) in field_indexes {
+                output.extend_from_slice(&data);
+            }
+
+            dir.write(&files.vectors, &output).await?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Delete segment files from directory
@@ -346,5 +457,6 @@ pub async fn delete_segment<D: Directory + DirectoryWriter>(
     let _ = dir.delete(&files.postings).await;
     let _ = dir.delete(&files.store).await;
     let _ = dir.delete(&files.meta).await;
+    let _ = dir.delete(&files.vectors).await;
     Ok(())
 }

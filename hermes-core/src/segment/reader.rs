@@ -2,13 +2,26 @@
 
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
 use crate::dsl::{Document, Field, Schema};
-use crate::structures::{AsyncSSTableReader, BlockPostingList, SSTableStats, TermInfo};
+use crate::structures::{
+    AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFRaBitQIndex, RaBitQIndex,
+    SSTableStats, TermInfo,
+};
 use crate::{DocId, Error, Result};
 
 use super::store::{AsyncStoreReader, RawStoreBlock};
 use super::types::{SegmentFiles, SegmentId, SegmentMeta};
+
+/// Vector index type - either RaBitQ or IVF-RaBitQ
+#[derive(Clone)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum VectorIndex {
+    RaBitQ(Arc<RaBitQIndex>),
+    IVF(Arc<IVFRaBitQIndex>),
+}
 
 /// Async segment reader with lazy loading
 ///
@@ -26,6 +39,10 @@ pub struct AsyncSegmentReader {
     schema: Arc<Schema>,
     /// Base doc_id offset for this segment
     doc_id_offset: DocId,
+    /// Dense vector indexes per field (RaBitQ or IVF-RaBitQ)
+    vector_indexes: FxHashMap<u32, VectorIndex>,
+    /// Shared coarse centroids for IVF search (loaded once)
+    coarse_centroids: Option<Arc<CoarseCentroids>>,
 }
 
 impl AsyncSegmentReader {
@@ -56,6 +73,10 @@ impl AsyncSegmentReader {
         let store_handle = dir.open_lazy(&files.store).await?;
         let store = AsyncStoreReader::open(store_handle, cache_blocks).await?;
 
+        // Load dense vector indexes from unified .vectors file
+        let (vector_indexes, coarse_centroids) =
+            Self::load_vectors_file(dir, &files, &schema).await?;
+
         Ok(Self {
             meta,
             term_dict: Arc::new(term_dict),
@@ -63,6 +84,8 @@ impl AsyncSegmentReader {
             store: Arc::new(store),
             schema,
             doc_id_offset,
+            vector_indexes,
+            coarse_centroids,
         })
     }
 
@@ -208,6 +231,185 @@ impl AsyncSegmentReader {
         let end = start + len as usize;
         let bytes = self.postings_handle.read_bytes_range(start..end).await?;
         Ok(bytes.to_vec())
+    }
+
+    /// Search dense vectors using RaBitQ
+    ///
+    /// Returns (doc_id, distance) pairs sorted by distance (ascending).
+    /// The doc_ids are adjusted by doc_id_offset for this segment.
+    pub fn search_dense_vector(
+        &self,
+        field: Field,
+        query: &[f32],
+        k: usize,
+        rerank_factor: usize,
+    ) -> Result<Vec<(DocId, f32)>> {
+        let index = self
+            .vector_indexes
+            .get(&field.0)
+            .ok_or_else(|| Error::Schema(format!("No dense vector index for field {}", field.0)))?;
+
+        let results: Vec<(u32, f32)> = match index {
+            VectorIndex::RaBitQ(rabitq) => rabitq
+                .search(query, k, rerank_factor)
+                .into_iter()
+                .map(|(idx, dist)| (idx as u32, dist))
+                .collect(),
+            VectorIndex::IVF(ivf) => {
+                let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
+                    Error::Schema("IVF index requires coarse centroids".to_string())
+                })?;
+                let nprobe = rerank_factor.max(32); // Use rerank_factor as nprobe hint
+                ivf.search(centroids, query, k, nprobe)
+            }
+        };
+
+        // Adjust doc_ids by segment offset
+        Ok(results
+            .into_iter()
+            .map(|(idx, dist)| (idx as DocId + self.doc_id_offset, dist))
+            .collect())
+    }
+
+    /// Check if this segment has a dense vector index for the given field
+    pub fn has_dense_vector_index(&self, field: Field) -> bool {
+        self.vector_indexes.contains_key(&field.0)
+    }
+
+    /// Get the dense vector index for a field (if available)
+    pub fn get_dense_vector_index(&self, field: Field) -> Option<Arc<RaBitQIndex>> {
+        match self.vector_indexes.get(&field.0) {
+            Some(VectorIndex::RaBitQ(idx)) => Some(idx.clone()),
+            _ => None,
+        }
+    }
+
+    /// Get the IVF vector index for a field (if available)
+    pub fn get_ivf_vector_index(&self, field: Field) -> Option<Arc<IVFRaBitQIndex>> {
+        match self.vector_indexes.get(&field.0) {
+            Some(VectorIndex::IVF(idx)) => Some(idx.clone()),
+            _ => None,
+        }
+    }
+
+    /// Get the vector index type for a field
+    pub fn get_vector_index(&self, field: Field) -> Option<&VectorIndex> {
+        self.vector_indexes.get(&field.0)
+    }
+
+    /// Search for similar sparse vectors using inverted index
+    ///
+    /// Sparse vectors are indexed as terms "dim_{index}" with the weight stored.
+    /// This method accumulates dot product scores across all non-zero dimensions.
+    ///
+    /// Returns (doc_id, score) pairs sorted by score descending.
+    pub async fn search_sparse_vector(
+        &self,
+        field: Field,
+        indices: &[u32],
+        weights: &[f32],
+        k: usize,
+    ) -> Result<Vec<(u32, f32)>> {
+        use rustc_hash::FxHashMap;
+
+        let mut doc_scores: FxHashMap<DocId, f32> = FxHashMap::default();
+
+        // For each non-zero dimension, look up the posting list
+        for (&idx, &weight) in indices.iter().zip(weights.iter()) {
+            // Sparse vector dimensions are indexed as "dim_{index}"
+            let term = format!("dim_{}", idx);
+
+            if let Some(postings) = self.get_postings(field, term.as_bytes()).await? {
+                // Iterate through posting list and accumulate scores
+                // Term frequency represents the stored weight (quantized)
+                let mut iter = postings.iterator();
+                while iter.doc() != crate::TERMINATED {
+                    let doc_id = iter.doc();
+                    let tf = iter.term_freq();
+                    // Dequantize TF back to weight (stored as tf * 1000)
+                    let stored_weight = tf as f32 / 1000.0;
+                    *doc_scores.entry(doc_id).or_insert(0.0) += weight * stored_weight;
+                    iter.advance();
+                }
+            }
+        }
+
+        // Sort by score descending and take top k
+        let mut results: Vec<(u32, f32)> = doc_scores.into_iter().collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+
+        Ok(results)
+    }
+
+    /// Load dense vector indexes from unified .vectors file
+    ///
+    /// Tries to deserialize as IVF-RaBitQ first, falls back to RaBitQ.
+    /// Also loads coarse centroids if any IVF index is found.
+    async fn load_vectors_file<D: Directory>(
+        dir: &D,
+        files: &SegmentFiles,
+        schema: &Schema,
+    ) -> Result<(FxHashMap<u32, VectorIndex>, Option<Arc<CoarseCentroids>>)> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+        use std::io::Cursor;
+
+        let mut indexes = FxHashMap::default();
+        let mut coarse_centroids: Option<Arc<CoarseCentroids>> = None;
+
+        // Try to open vectors file (may not exist if no vectors were indexed)
+        let handle = match dir.open_lazy(&files.vectors).await {
+            Ok(h) => h,
+            Err(_) => return Ok((indexes, None)),
+        };
+
+        let bytes = match handle.read_bytes().await {
+            Ok(b) => b,
+            Err(_) => return Ok((indexes, None)),
+        };
+
+        if bytes.is_empty() {
+            return Ok((indexes, None));
+        }
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+
+        // Read header
+        let num_fields = cursor.read_u32::<LittleEndian>()?;
+
+        // Read field entries
+        let mut entries = Vec::with_capacity(num_fields as usize);
+        for _ in 0..num_fields {
+            let field_id = cursor.read_u32::<LittleEndian>()?;
+            let offset = cursor.read_u64::<LittleEndian>()?;
+            let length = cursor.read_u64::<LittleEndian>()?;
+            entries.push((field_id, offset as usize, length as usize));
+        }
+
+        // Load each index - try IVF first, fall back to RaBitQ
+        for (field_id, offset, length) in entries {
+            let data = &bytes.as_slice()[offset..offset + length];
+
+            // Try IVF-RaBitQ first
+            if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data) {
+                // Load coarse centroids if not already loaded
+                if coarse_centroids.is_none() {
+                    let field = crate::dsl::Field(field_id);
+                    if let Some(entry) = schema.get_field_entry(field)
+                        && let Some(ref config) = entry.dense_vector_config
+                        && let Some(ref path) = config.coarse_centroids_path
+                        && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
+                    {
+                        coarse_centroids = Some(Arc::new(c));
+                    }
+                }
+                indexes.insert(field_id, VectorIndex::IVF(Arc::new(ivf_index)));
+            } else if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data) {
+                indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
+            }
+        }
+
+        Ok((indexes, coarse_centroids))
     }
 }
 

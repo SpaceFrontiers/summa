@@ -1,10 +1,12 @@
 mod elias_fano;
 mod horizontal_bp128;
+mod ivf_rabitq;
 mod opt_p4d;
 mod partitioned_ef;
 mod posting;
 mod posting_common;
 mod posting_format;
+mod rabitq;
 mod roaring;
 mod rounded_bp128;
 pub mod simd;
@@ -21,6 +23,7 @@ pub use horizontal_bp128::{
     HorizontalBP128PostingList, SMALL_BLOCK_SIZE, SMALL_BLOCK_THRESHOLD, binary_search_block,
     pack_block, unpack_block, unpack_block_n,
 };
+pub use ivf_rabitq::*;
 pub use opt_p4d::{OPT_P4D_BLOCK_SIZE, OptP4DBlock, OptP4DIterator, OptP4DPostingList};
 pub use partitioned_ef::{
     PEF_BLOCK_SIZE, PEFBlockInfo, PartitionedEFPostingIterator, PartitionedEFPostingList,
@@ -38,6 +41,7 @@ pub use posting_format::{
     CompressedPostingIterator, CompressedPostingList, CompressionStats, INLINE_THRESHOLD,
     IndexOptimization, PARTITIONED_EF_THRESHOLD, PostingFormat, ROARING_THRESHOLD_RATIO,
 };
+pub use rabitq::{QuantizedQuery, QuantizedVector, RaBitQConfig, RaBitQIndex};
 pub use roaring::{
     ROARING_BLOCK_SIZE, RoaringBitmap, RoaringBlockInfo, RoaringIterator, RoaringPostingIterator,
     RoaringPostingList,

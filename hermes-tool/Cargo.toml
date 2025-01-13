@@ -28,5 +28,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 murmur3 = "0.5"
 chrono = "0.4"
-rayon = "1.10"
+rayon = "1.11"
 crossbeam-channel = "0.5"

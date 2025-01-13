@@ -28,6 +28,9 @@ pub enum FieldType {
     /// Sparse vector field - indexed as inverted posting lists with quantized weights
     #[serde(rename = "sparse_vector")]
     SparseVector,
+    /// Dense vector field - indexed using RaBitQ binary quantization for ANN search
+    #[serde(rename = "dense_vector")]
+    DenseVector,
 }
 
 /// Field options
@@ -45,6 +48,68 @@ pub struct FieldEntry {
     /// Configuration for sparse vector fields (index size, weight quantization)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sparse_vector_config: Option<crate::structures::SparseVectorConfig>,
+    /// Configuration for dense vector fields (dimension, quantization)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_vector_config: Option<DenseVectorConfig>,
+}
+
+/// Configuration for dense vector fields using RaBitQ or IVF-RaBitQ
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DenseVectorConfig {
+    /// Dimensionality of vectors
+    pub dim: usize,
+    /// Whether to store raw vectors for re-ranking (increases storage but improves accuracy)
+    #[serde(default = "default_store_raw")]
+    pub store_raw: bool,
+    /// Path to pre-trained coarse centroids file for IVF-RaBitQ
+    /// If None, uses single-centroid RaBitQ (suitable for <100K vectors)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coarse_centroids_path: Option<String>,
+    /// Number of clusters to probe during search (default: 32)
+    #[serde(default = "default_nprobe")]
+    pub nprobe: usize,
+}
+
+fn default_store_raw() -> bool {
+    true
+}
+
+fn default_nprobe() -> usize {
+    32
+}
+
+impl DenseVectorConfig {
+    pub fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            store_raw: true,
+            coarse_centroids_path: None,
+            nprobe: 32,
+        }
+    }
+
+    pub fn with_ivf(dim: usize, centroids_path: String, nprobe: usize) -> Self {
+        Self {
+            dim,
+            store_raw: true,
+            coarse_centroids_path: Some(centroids_path),
+            nprobe,
+        }
+    }
+
+    pub fn without_raw(dim: usize) -> Self {
+        Self {
+            dim,
+            store_raw: false,
+            coarse_centroids_path: None,
+            nprobe: 32,
+        }
+    }
+
+    /// Check if this config uses IVF (has coarse centroids)
+    pub fn uses_ivf(&self) -> bool {
+        self.coarse_centroids_path.is_some()
+    }
 }
 
 use super::query_field_router::QueryRouterRule;
@@ -195,6 +260,7 @@ impl SchemaBuilder {
             tokenizer: None,
             multi: false,
             sparse_vector_config: Some(config),
+            dense_vector_config: None,
         });
         field
     }
@@ -208,6 +274,42 @@ impl SchemaBuilder {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.sparse_vector_config = Some(config);
         }
+    }
+
+    /// Add a dense vector field with default configuration
+    ///
+    /// Dense vectors are indexed using RaBitQ binary quantization for fast ANN search.
+    /// The dimension must be specified as it determines the quantization structure.
+    pub fn add_dense_vector_field(
+        &mut self,
+        name: &str,
+        dim: usize,
+        indexed: bool,
+        stored: bool,
+    ) -> Field {
+        self.add_dense_vector_field_with_config(name, indexed, stored, DenseVectorConfig::new(dim))
+    }
+
+    /// Add a dense vector field with custom configuration
+    pub fn add_dense_vector_field_with_config(
+        &mut self,
+        name: &str,
+        indexed: bool,
+        stored: bool,
+        config: DenseVectorConfig,
+    ) -> Field {
+        let field = Field(self.fields.len() as u32);
+        self.fields.push(FieldEntry {
+            name: name.to_string(),
+            field_type: FieldType::DenseVector,
+            indexed,
+            stored,
+            tokenizer: None,
+            multi: false,
+            sparse_vector_config: None,
+            dense_vector_config: Some(config),
+        });
+        field
     }
 
     fn add_field(
@@ -249,6 +351,7 @@ impl SchemaBuilder {
             tokenizer,
             multi,
             sparse_vector_config: None,
+            dense_vector_config: None,
         });
         field
     }
@@ -308,6 +411,9 @@ pub enum FieldValue {
     /// Sparse vector: (dimension_ids, weights)
     #[serde(rename = "sparse_vector")]
     SparseVector { indices: Vec<u32>, values: Vec<f32> },
+    /// Dense vector: float32 values
+    #[serde(rename = "dense_vector")]
+    DenseVector(Vec<f32>),
 }
 
 impl FieldValue {
@@ -349,6 +455,13 @@ impl FieldValue {
     pub fn as_sparse_vector(&self) -> Option<(&[u32], &[f32])> {
         match self {
             FieldValue::SparseVector { indices, values } => Some((indices, values)),
+            _ => None,
+        }
+    }
+
+    pub fn as_dense_vector(&self) -> Option<&[f32]> {
+        match self {
+            FieldValue::DenseVector(v) => Some(v),
             _ => None,
         }
     }
@@ -394,6 +507,11 @@ impl Document {
         );
         self.field_values
             .push((field, FieldValue::SparseVector { indices, values }));
+    }
+
+    pub fn add_dense_vector(&mut self, field: Field, values: Vec<f32>) {
+        self.field_values
+            .push((field, FieldValue::DenseVector(values)));
     }
 
     pub fn get_first(&self, field: Field) -> Option<&FieldValue> {
@@ -444,6 +562,9 @@ impl Document {
                             "indices": indices,
                             "values": values
                         })
+                    }
+                    FieldValue::DenseVector(values) => {
+                        serde_json::json!(values)
                     }
                 };
                 field_values_map

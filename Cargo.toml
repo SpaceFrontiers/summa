@@ -61,9 +61,9 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Parsing
-pest = "2.7"
-pest_derive = "2.7"
-regex = "1.11"
+pest = "2.8"
+pest_derive = "2.8"
+regex = "1.12"
 
 # Encoding
 base64 = "0.22"
@@ -95,8 +95,8 @@ rand = "0.9"
 
 
 # High-performance data structures
-bumpalo = "3.17"
+bumpalo = "3.19"
 lasso = { version = "0.7", features = ["multi-threaded"] }
 hashbrown = "0.15"
 memmap2 = "0.9"
-uuid = { version = "1.16", features = ["v4"] }
+uuid = { version = "1.19", features = ["v4"] }

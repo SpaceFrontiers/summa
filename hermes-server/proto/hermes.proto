@@ -41,6 +41,7 @@ enum FieldType {
   FIELD_TYPE_F64 = 4;
   FIELD_TYPE_BYTES = 5;
   FIELD_TYPE_SPARSE_VECTOR = 6;
+  FIELD_TYPE_DENSE_VECTOR = 7;
 }
 
 // Field definition
@@ -107,6 +108,7 @@ message FieldValue {
     double f64 = 4;
     bytes bytes_value = 5;
     SparseVector sparse_vector = 6;
+    DenseVector dense_vector = 7;
   }
 }
 
@@ -114,6 +116,11 @@ message FieldValue {
 message SparseVector {
   repeated uint32 indices = 1;
   repeated float values = 2;
+}
+
+// Dense vector (float32 values)
+message DenseVector {
+  repeated float values = 1;
 }
 
 message SearchResponse {

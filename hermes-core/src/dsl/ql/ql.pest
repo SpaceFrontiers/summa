@@ -6,6 +6,7 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 term = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
 quoted_string = @{ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
+number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 
 // Field specification
 field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
@@ -15,6 +16,18 @@ field_spec = { field_name ~ ":" }
 term_query = { field_spec? ~ term }
 phrase_query = { field_spec? ~ quoted_string }
 
+// Vector query: field:ann([1.0, 2.0, 3.0], k=10, nprobe=32)
+// or field:ann([1.0, 2.0, 3.0], 10)
+vector_array = { "[" ~ number ~ ("," ~ number)* ~ "]" }
+ann_param = { ("k" | "nprobe" | "rerank") ~ "=" ~ number }
+ann_params = { number | ann_param ~ ("," ~ ann_param)* }
+ann_query = { field_spec ~ "ann" ~ "(" ~ vector_array ~ ("," ~ ann_params)? ~ ")" }
+
+// Sparse vector query: field:sparse({1: 0.5, 5: 0.3}, k=10)
+sparse_entry = { number ~ ":" ~ number }
+sparse_map = { "{" ~ sparse_entry ~ ("," ~ sparse_entry)* ~ "}" }
+sparse_query = { field_spec ~ "sparse" ~ "(" ~ sparse_map ~ ("," ~ ann_params)? ~ ")" }
+
 // Boolean operators
 and_op = { "AND" | "&&" }
 or_op = { "OR" | "||" }
@@ -23,8 +36,8 @@ not_op = { "NOT" | "-" | "!" }
 // Grouping
 group = { "(" ~ or_expr ~ ")" }
 
-// Primary expression
-primary = { not_op? ~ (group | phrase_query | term_query) }
+// Primary expression (vector queries added)
+primary = { not_op? ~ (group | ann_query | sparse_query | phrase_query | term_query) }
 
 // Boolean expressions
 and_expr = { primary ~ (and_op ~ primary)* }

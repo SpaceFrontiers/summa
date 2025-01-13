@@ -47,7 +47,8 @@ string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 //   field title: text [indexed, stored]
 //   field body: text<en_stem> [indexed]
 //   field name: text<default> [indexed, stored]
-field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (tokenizer_spec | sparse_vector_config)? ~ attributes? }
+//   field embedding: dense_vector<768> [indexed, stored]
+field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (tokenizer_spec | sparse_vector_config | dense_vector_config)? ~ attributes? }
 
 // Field types
 field_type = {
@@ -56,7 +57,8 @@ field_type = {
     "i64" | "int" | "integer" |
     "f64" | "float" | "double" |
     "bytes" | "binary" | "blob" |
-    "sparse_vector"
+    "sparse_vector" |
+    "dense_vector" | "vector"
 }
 
 // Sparse vector configuration: <index_size, quantization>
@@ -67,6 +69,32 @@ field_type = {
 sparse_vector_config = { "<" ~ index_size_spec ~ "," ~ quantization_spec ~ ">" }
 index_size_spec = { "u16" | "u32" }
 quantization_spec = { "float32" | "float16" | "uint8" | "uint4" | "f32" | "f16" | "u8" | "u4" }
+
+// Dense vector configuration with explicit keywords
+// Examples:
+//   field embedding: dense_vector<768> [indexed, stored]
+//   field embedding: dense_vector<dims: 1536> [indexed]
+//   field embedding: dense_vector<dims: 768, centroids: "/path/to/centroids.bin"> [indexed]
+//   field embedding: dense_vector<dims: 1536, centroids: "centroids.bin", nprobe: 64> [indexed]
+// Legacy positional syntax also supported:
+//   field embedding: dense_vector<1536, "centroids.bin", 64> [indexed]
+dense_vector_config = { "<" ~ dense_vector_params ~ ">" }
+dense_vector_params = { dense_vector_keyword_params | dense_vector_positional_params }
+
+// Keyword-based params: dims: N, centroids: "path", nprobe: N
+dense_vector_keyword_params = { dense_vector_kwarg ~ ("," ~ dense_vector_kwarg)* }
+dense_vector_kwarg = { dims_kwarg | centroids_kwarg | nprobe_kwarg }
+dims_kwarg = { "dims" ~ ":" ~ dimension_spec }
+centroids_kwarg = { "centroids" ~ ":" ~ centroids_path }
+nprobe_kwarg = { "nprobe" ~ ":" ~ nprobe_spec }
+
+// Legacy positional params: dimension, "centroids_path", nprobe
+dense_vector_positional_params = { dimension_spec ~ ("," ~ centroids_path ~ ("," ~ nprobe_spec)?)? }
+
+dimension_spec = @{ ASCII_DIGIT+ }
+centroids_path = { "\"" ~ path_chars ~ "\"" }
+path_chars = @{ (!("\"") ~ ANY)* }
+nprobe_spec = @{ ASCII_DIGIT+ }
 
 // Tokenizer specification: <tokenizer_name>
 tokenizer_spec = { "<" ~ identifier ~ ">" }

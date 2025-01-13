@@ -221,6 +221,10 @@ fn field_value_to_py(py: Python<'_>, value: &FieldValue) -> Py<PyAny> {
             dict.set_item("values", values).unwrap();
             dict.into_pyobject(py).unwrap().into_any().unbind()
         }
+        FieldValue::DenseVector(values) => {
+            // Return as list of floats
+            values.into_pyobject(py).unwrap().into_any().unbind()
+        }
     }
 }
 

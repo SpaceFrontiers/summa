@@ -149,6 +149,8 @@ pub struct SegmentFiles {
     pub postings: PathBuf,
     pub store: PathBuf,
     pub meta: PathBuf,
+    /// Dense vector indexes (all fields in one file)
+    pub vectors: PathBuf,
 }
 
 impl SegmentFiles {
@@ -159,6 +161,7 @@ impl SegmentFiles {
             postings: PathBuf::from(format!("{}.post", prefix)),
             store: PathBuf::from(format!("{}.store", prefix)),
             meta: PathBuf::from(format!("{}.meta", prefix)),
+            vectors: PathBuf::from(format!("{}.vectors", prefix)),
         }
     }
 }

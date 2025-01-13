@@ -171,6 +171,52 @@ pub struct SegmentBuilder {
 
     /// Reusable buffer for tokenization to avoid per-token String allocations
     token_buffer: String,
+
+    /// Dense vector storage per field: field -> (doc_ids, vectors)
+    /// Vectors are stored as flat f32 arrays for efficient RaBitQ indexing
+    dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
+}
+
+/// Builder for dense vector index using RaBitQ
+struct DenseVectorBuilder {
+    /// Dimension of vectors
+    dim: usize,
+    /// Document IDs with vectors
+    doc_ids: Vec<DocId>,
+    /// Flat vector storage (doc_ids.len() * dim floats)
+    vectors: Vec<f32>,
+}
+
+impl DenseVectorBuilder {
+    fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            doc_ids: Vec::new(),
+            vectors: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, doc_id: DocId, vector: &[f32]) {
+        debug_assert_eq!(vector.len(), self.dim, "Vector dimension mismatch");
+        self.doc_ids.push(doc_id);
+        self.vectors.extend_from_slice(vector);
+    }
+
+    fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+
+    /// Get all vectors as Vec<Vec<f32>> for RaBitQ indexing
+    fn get_vectors(&self) -> Vec<Vec<f32>> {
+        self.doc_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let start = i * self.dim;
+                self.vectors[start..start + self.dim].to_vec()
+            })
+            .collect()
+    }
 }
 
 impl SegmentBuilder {
@@ -216,6 +262,7 @@ impl SegmentBuilder {
             local_tf_buffer: FxHashMap::default(),
             token_buffer: String::with_capacity(64),
             config,
+            dense_vectors: FxHashMap::default(),
         })
     }
 
@@ -290,6 +337,12 @@ impl SegmentBuilder {
                 }
                 (FieldType::F64, FieldValue::F64(v)) => {
                     self.index_numeric_field(*field, doc_id, v.to_bits())?;
+                }
+                (FieldType::DenseVector, FieldValue::DenseVector(vec)) => {
+                    self.index_dense_vector_field(*field, doc_id, vec)?;
+                }
+                (FieldType::SparseVector, FieldValue::SparseVector { indices, values }) => {
+                    self.index_sparse_vector_field(*field, doc_id, indices, values)?;
                 }
                 _ => {}
             }
@@ -377,6 +430,68 @@ impl SegmentBuilder {
         Ok(())
     }
 
+    /// Index a dense vector field
+    fn index_dense_vector_field(
+        &mut self,
+        field: Field,
+        doc_id: DocId,
+        vector: &[f32],
+    ) -> Result<()> {
+        let dim = vector.len();
+
+        let builder = self
+            .dense_vectors
+            .entry(field.0)
+            .or_insert_with(|| DenseVectorBuilder::new(dim));
+
+        // Verify dimension consistency
+        if builder.dim != dim && builder.len() > 0 {
+            return Err(crate::Error::Schema(format!(
+                "Dense vector dimension mismatch: expected {}, got {}",
+                builder.dim, dim
+            )));
+        }
+
+        builder.add(doc_id, vector);
+        Ok(())
+    }
+
+    /// Index a sparse vector field using the inverted index
+    ///
+    /// Each dimension becomes a term (prefixed with __sparse_), and the weight
+    /// is stored as a quantized term frequency. This allows reusing the existing
+    /// posting list infrastructure for sparse vector retrieval.
+    fn index_sparse_vector_field(
+        &mut self,
+        field: Field,
+        doc_id: DocId,
+        indices: &[u32],
+        values: &[f32],
+    ) -> Result<()> {
+        for (&dim_id, &weight) in indices.iter().zip(values.iter()) {
+            // Use a special prefix to distinguish sparse vector dimensions from text terms
+            let term_str = format!("__sparse_{}", dim_id);
+            let term_spur = self.term_interner.get_or_intern(&term_str);
+
+            let term_key = TermKey {
+                field: field.0,
+                term: term_spur,
+            };
+
+            // Quantize weight to term frequency (scale by 1000 for precision)
+            // This is a simple approach; more sophisticated quantization can be added
+            let quantized_weight = (weight.abs() * 1000.0).min(u16::MAX as f32) as u32;
+
+            let posting = self
+                .inverted_index
+                .entry(term_key)
+                .or_insert_with(PostingListBuilder::new);
+            posting.add(doc_id, quantized_weight.max(1));
+        }
+
+        Ok(())
+    }
+
     /// Write document to streaming store
     fn write_document_to_store(&mut self, doc: &Document) -> Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
@@ -428,6 +543,14 @@ impl SegmentBuilder {
         dir.write(&files.postings, &postings_data).await?;
         dir.write(&files.store, &store_data).await?;
 
+        // Build and write dense vector indexes (RaBitQ) - all in one file
+        if !self.dense_vectors.is_empty() {
+            let vectors_data = self.build_vectors_file()?;
+            if !vectors_data.is_empty() {
+                dir.write(&files.vectors, &vectors_data).await?;
+            }
+        }
+
         let meta = SegmentMeta {
             id: segment_id.0,
             num_docs: self.next_doc_id,
@@ -440,6 +563,101 @@ impl SegmentBuilder {
         let _ = std::fs::remove_file(&self.store_path);
 
         Ok(meta)
+    }
+
+    /// Build unified vectors file containing all dense vector indexes
+    ///
+    /// File format:
+    /// - Header: num_fields (u32)
+    /// - For each field: field_id (u32), offset (u64), length (u64)
+    /// - Data: concatenated serialized RaBitQ indexes
+    fn build_vectors_file(&self) -> Result<Vec<u8>> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        // Build all indexes first
+        let mut field_indexes: Vec<(u32, Vec<u8>)> = Vec::new();
+
+        for (&field_id, builder) in &self.dense_vectors {
+            if builder.len() == 0 {
+                continue;
+            }
+
+            let vectors = builder.get_vectors();
+            let field = crate::dsl::Field(field_id);
+
+            // Check if field has IVF config
+            let ivf_config = self
+                .schema
+                .get_field_entry(field)
+                .and_then(|e| e.dense_vector_config.as_ref())
+                .filter(|c| c.uses_ivf());
+
+            let index_bytes = if let Some(dense_config) = ivf_config {
+                // Try to load coarse centroids for IVF-RaBitQ
+                let centroids_path = dense_config.coarse_centroids_path.as_ref().unwrap();
+                match crate::structures::CoarseCentroids::load(std::path::Path::new(centroids_path))
+                {
+                    Ok(coarse_centroids) => {
+                        let ivf_cfg = crate::structures::IVFConfig::new(builder.dim);
+                        let doc_ids: Vec<u32> = builder.doc_ids.clone();
+                        let ivf_index = crate::structures::IVFRaBitQIndex::build(
+                            ivf_cfg,
+                            &coarse_centroids,
+                            &vectors,
+                            Some(&doc_ids),
+                        );
+                        serde_json::to_vec(&ivf_index)
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to load centroids: {}, using RaBitQ", e);
+                        let cfg = crate::structures::RaBitQConfig::new(builder.dim);
+                        let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, true);
+                        serde_json::to_vec(&idx)
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?
+                    }
+                }
+            } else {
+                // Regular RaBitQ
+                let cfg = crate::structures::RaBitQConfig::new(builder.dim);
+                let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, true);
+                serde_json::to_vec(&idx).map_err(|e| crate::Error::Serialization(e.to_string()))?
+            };
+
+            field_indexes.push((field_id, index_bytes));
+        }
+
+        if field_indexes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sort by field_id for consistent ordering
+        field_indexes.sort_by_key(|(id, _)| *id);
+
+        // Calculate header size: num_fields + (field_id, offset, len) per field
+        let header_size = 4 + field_indexes.len() * (4 + 8 + 8);
+
+        // Build output
+        let mut output = Vec::new();
+
+        // Write number of fields
+        output.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
+
+        // Calculate offsets and write header entries
+        let mut current_offset = header_size as u64;
+        for (field_id, data) in &field_indexes {
+            output.write_u32::<LittleEndian>(*field_id)?;
+            output.write_u64::<LittleEndian>(current_offset)?;
+            output.write_u64::<LittleEndian>(data.len() as u64)?;
+            current_offset += data.len() as u64;
+        }
+
+        // Write data
+        for (_, data) in field_indexes {
+            output.extend_from_slice(&data);
+        }
+
+        Ok(output)
     }
 
     /// Build postings from inverted index

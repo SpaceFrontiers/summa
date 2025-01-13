@@ -15,6 +15,7 @@ pub mod directories;
 pub mod dsl;
 pub mod error;
 pub mod index;
+pub mod merge;
 pub mod query;
 pub mod segment;
 pub mod structures;
@@ -76,8 +77,10 @@ pub use index::{Index, IndexConfig, SLICE_CACHE_FILENAME};
 #[cfg(feature = "native")]
 pub use index::{IndexWriter, warmup_and_save_slice_cache};
 
-// Re-exports from wand
-pub use wand::{TermWandInfo, WandData};
+// Re-exports from merge
+#[cfg(feature = "native")]
+pub use merge::SegmentManager;
+pub use merge::{MergeCandidate, MergePolicy, NoMergePolicy, SegmentInfo, TieredMergePolicy};
 
 pub type DocId = u32;
 pub type TermFreq = u32;
