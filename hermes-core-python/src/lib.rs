@@ -214,6 +214,13 @@ fn field_value_to_py(py: Python<'_>, value: &FieldValue) -> Py<PyAny> {
         FieldValue::I64(n) => n.into_pyobject(py).unwrap().into_any().unbind(),
         FieldValue::F64(n) => n.into_pyobject(py).unwrap().into_any().unbind(),
         FieldValue::Bytes(b) => b.into_pyobject(py).unwrap().into_any().unbind(),
+        FieldValue::SparseVector { indices, values } => {
+            // Return as dict with "indices" and "values" keys (consistent with proto)
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("indices", indices).unwrap();
+            dict.set_item("values", values).unwrap();
+            dict.into_pyobject(py).unwrap().into_any().unbind()
+        }
     }
 }
 

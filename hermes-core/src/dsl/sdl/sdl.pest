@@ -20,11 +20,11 @@ default_fields_def = { "default_fields" ~ ":" ~ "[" ~ identifier ~ ("," ~ identi
 query_router_def = { "query_router" ~ "{" ~ query_router_prop+ ~ "}" }
 
 // Query router properties
-query_router_prop = { 
-    query_router_pattern | 
-    query_router_substitution | 
-    query_router_target | 
-    query_router_mode 
+query_router_prop = {
+    query_router_pattern |
+    query_router_substitution |
+    query_router_target |
+    query_router_mode
 }
 
 query_router_pattern = { "pattern" ~ ":" ~ regex_string }
@@ -47,16 +47,26 @@ string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 //   field title: text [indexed, stored]
 //   field body: text<en_stem> [indexed]
 //   field name: text<default> [indexed, stored]
-field_def = { "field" ~ identifier ~ ":" ~ field_type ~ tokenizer_spec? ~ attributes? }
+field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (tokenizer_spec | sparse_vector_config)? ~ attributes? }
 
 // Field types
-field_type = { 
+field_type = {
     "text" | "string" | "str" |
     "u64" | "uint" | "unsigned" |
     "i64" | "int" | "integer" |
     "f64" | "float" | "double" |
-    "bytes" | "binary" | "blob"
+    "bytes" | "binary" | "blob" |
+    "sparse_vector"
 }
+
+// Sparse vector configuration: <index_size, quantization>
+// Examples:
+//   field embedding: sparse_vector [indexed, stored]
+//   field embedding: sparse_vector<u16, uint8> [indexed, stored]
+//   field embedding: sparse_vector<u32, float16> [indexed]
+sparse_vector_config = { "<" ~ index_size_spec ~ "," ~ quantization_spec ~ ">" }
+index_size_spec = { "u16" | "u32" }
+quantization_spec = { "float32" | "float16" | "uint8" | "uint4" | "f32" | "f16" | "u8" | "u4" }
 
 // Tokenizer specification: <tokenizer_name>
 tokenizer_spec = { "<" ~ identifier ~ ">" }

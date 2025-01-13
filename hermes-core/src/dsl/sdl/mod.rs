@@ -42,6 +42,8 @@ use crate::error::Error;
 #[grammar = "dsl/sdl/sdl.pest"]
 pub struct SdlParser;
 
+use crate::structures::{IndexSize, SparseVectorConfig, WeightQuantization};
+
 /// Parsed field definition
 #[derive(Debug, Clone)]
 pub struct FieldDef {
@@ -53,6 +55,8 @@ pub struct FieldDef {
     pub tokenizer: Option<String>,
     /// Whether this field can have multiple values (serialized as array in JSON)
     pub multi: bool,
+    /// Configuration for sparse vector fields
+    pub sparse_vector_config: Option<SparseVectorConfig>,
 }
 
 /// Parsed index definition
@@ -85,6 +89,18 @@ impl IndexDef {
                 FieldType::I64 => builder.add_i64_field(&field.name, field.indexed, field.stored),
                 FieldType::F64 => builder.add_f64_field(&field.name, field.indexed, field.stored),
                 FieldType::Bytes => builder.add_bytes_field(&field.name, field.stored),
+                FieldType::SparseVector => {
+                    if let Some(config) = &field.sparse_vector_config {
+                        builder.add_sparse_vector_field_with_config(
+                            &field.name,
+                            field.indexed,
+                            field.stored,
+                            *config,
+                        )
+                    } else {
+                        builder.add_sparse_vector_field(&field.name, field.indexed, field.stored)
+                    }
+                }
             };
             if field.multi {
                 builder.set_multi(f, true);
@@ -127,6 +143,7 @@ fn parse_field_type(type_str: &str) -> Result<FieldType> {
         "i64" | "int" | "integer" => Ok(FieldType::I64),
         "f64" | "float" | "double" => Ok(FieldType::F64),
         "bytes" | "binary" | "blob" => Ok(FieldType::Bytes),
+        "sparse_vector" => Ok(FieldType::SparseVector),
         _ => Err(Error::Schema(format!("Unknown field type: {}", type_str))),
     }
 }
@@ -167,8 +184,9 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
 
     let field_type = parse_field_type(field_type_str)?;
 
-    // Parse optional tokenizer spec and attributes
+    // Parse optional tokenizer spec, sparse_vector_config, and attributes
     let mut tokenizer = None;
+    let mut sparse_vector_config = None;
     let mut indexed = true;
     let mut stored = true;
     let mut multi = false;
@@ -180,6 +198,34 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 if let Some(tok_name) = item.into_inner().next() {
                     tokenizer = Some(tok_name.as_str().to_string());
                 }
+            }
+            Rule::sparse_vector_config => {
+                // Parse <index_size, quantization>
+                let mut config_inner = item.into_inner();
+                let index_size = if let Some(size_pair) = config_inner.next() {
+                    match size_pair.as_str() {
+                        "u16" => IndexSize::U16,
+                        "u32" => IndexSize::U32,
+                        _ => IndexSize::default(),
+                    }
+                } else {
+                    IndexSize::default()
+                };
+                let quantization = if let Some(quant_pair) = config_inner.next() {
+                    match quant_pair.as_str() {
+                        "float32" | "f32" => WeightQuantization::Float32,
+                        "float16" | "f16" => WeightQuantization::Float16,
+                        "uint8" | "u8" => WeightQuantization::UInt8,
+                        "uint4" | "u4" => WeightQuantization::UInt4,
+                        _ => WeightQuantization::default(),
+                    }
+                } else {
+                    WeightQuantization::default()
+                };
+                sparse_vector_config = Some(SparseVectorConfig {
+                    index_size,
+                    weight_quantization: quantization,
+                });
             }
             Rule::attributes => {
                 let (idx, sto, mul) = parse_attributes(item);
@@ -198,6 +244,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         stored,
         tokenizer,
         multi,
+        sparse_vector_config,
     })
 }
 
@@ -693,5 +740,48 @@ mod tests {
 
         assert!(schema.get_field_entry(uris_field).unwrap().multi);
         assert!(!schema.get_field_entry(title_field).unwrap().multi);
+    }
+
+    #[test]
+    fn test_sparse_vector_field() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].fields.len(), 1);
+        assert_eq!(indexes[0].fields[0].name, "embedding");
+        assert_eq!(indexes[0].fields[0].field_type, FieldType::SparseVector);
+        assert!(indexes[0].fields[0].sparse_vector_config.is_none());
+    }
+
+    #[test]
+    fn test_sparse_vector_with_config() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16, uint8> [indexed, stored]
+                field dense: sparse_vector<u32, float32> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes[0].fields.len(), 2);
+
+        // First field: u16 indices, uint8 quantization
+        let f1 = &indexes[0].fields[0];
+        assert_eq!(f1.name, "embedding");
+        let config1 = f1.sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config1.index_size, IndexSize::U16);
+        assert_eq!(config1.weight_quantization, WeightQuantization::UInt8);
+
+        // Second field: u32 indices, float32 quantization
+        let f2 = &indexes[0].fields[1];
+        assert_eq!(f2.name, "dense");
+        let config2 = f2.sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config2.index_size, IndexSize::U32);
+        assert_eq!(config2.weight_quantization, WeightQuantization::Float32);
     }
 }

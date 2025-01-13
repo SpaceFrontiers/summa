@@ -16,7 +16,7 @@ pub enum FieldType {
     /// Unsigned 64-bit integer
     #[serde(rename = "u64")]
     U64,
-    /// Signed 64-bit integer  
+    /// Signed 64-bit integer
     #[serde(rename = "i64")]
     I64,
     /// 64-bit floating point
@@ -25,6 +25,9 @@ pub enum FieldType {
     /// Raw bytes (not tokenized)
     #[serde(rename = "bytes")]
     Bytes,
+    /// Sparse vector field - indexed as inverted posting lists with quantized weights
+    #[serde(rename = "sparse_vector")]
+    SparseVector,
 }
 
 /// Field options
@@ -39,6 +42,9 @@ pub struct FieldEntry {
     /// Whether this field can have multiple values (serialized as array in JSON)
     #[serde(default)]
     pub multi: bool,
+    /// Configuration for sparse vector fields (index size, weight quantization)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_vector_config: Option<crate::structures::SparseVectorConfig>,
 }
 
 use super::query_field_router::QueryRouterRule;
@@ -156,6 +162,54 @@ impl SchemaBuilder {
         self.add_field(name, FieldType::Bytes, false, stored)
     }
 
+    /// Add a sparse vector field with default configuration
+    ///
+    /// Sparse vectors are indexed as inverted posting lists where each dimension
+    /// becomes a "term" and documents have quantized weights for each dimension.
+    pub fn add_sparse_vector_field(&mut self, name: &str, indexed: bool, stored: bool) -> Field {
+        self.add_sparse_vector_field_with_config(
+            name,
+            indexed,
+            stored,
+            crate::structures::SparseVectorConfig::default(),
+        )
+    }
+
+    /// Add a sparse vector field with custom configuration
+    ///
+    /// Use `SparseVectorConfig::splade()` for SPLADE models (u16 indices, uint8 weights).
+    /// Use `SparseVectorConfig::compact()` for maximum compression (u16 indices, uint4 weights).
+    pub fn add_sparse_vector_field_with_config(
+        &mut self,
+        name: &str,
+        indexed: bool,
+        stored: bool,
+        config: crate::structures::SparseVectorConfig,
+    ) -> Field {
+        let field = Field(self.fields.len() as u32);
+        self.fields.push(FieldEntry {
+            name: name.to_string(),
+            field_type: FieldType::SparseVector,
+            indexed,
+            stored,
+            tokenizer: None,
+            multi: false,
+            sparse_vector_config: Some(config),
+        });
+        field
+    }
+
+    /// Set sparse vector configuration for an existing field
+    pub fn set_sparse_vector_config(
+        &mut self,
+        field: Field,
+        config: crate::structures::SparseVectorConfig,
+    ) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.sparse_vector_config = Some(config);
+        }
+    }
+
     fn add_field(
         &mut self,
         name: &str,
@@ -194,6 +248,7 @@ impl SchemaBuilder {
             stored,
             tokenizer,
             multi,
+            sparse_vector_config: None,
         });
         field
     }
@@ -250,6 +305,9 @@ pub enum FieldValue {
     F64(f64),
     #[serde(rename = "bytes")]
     Bytes(Vec<u8>),
+    /// Sparse vector: (dimension_ids, weights)
+    #[serde(rename = "sparse_vector")]
+    SparseVector { indices: Vec<u32>, values: Vec<f32> },
 }
 
 impl FieldValue {
@@ -287,6 +345,13 @@ impl FieldValue {
             _ => None,
         }
     }
+
+    pub fn as_sparse_vector(&self) -> Option<(&[u32], &[f32])> {
+        match self {
+            FieldValue::SparseVector { indices, values } => Some((indices, values)),
+            _ => None,
+        }
+    }
 }
 
 /// A document to be indexed
@@ -319,6 +384,16 @@ impl Document {
 
     pub fn add_bytes(&mut self, field: Field, value: Vec<u8>) {
         self.field_values.push((field, FieldValue::Bytes(value)));
+    }
+
+    pub fn add_sparse_vector(&mut self, field: Field, indices: Vec<u32>, values: Vec<f32>) {
+        debug_assert_eq!(
+            indices.len(),
+            values.len(),
+            "Sparse vector indices and values must have same length"
+        );
+        self.field_values
+            .push((field, FieldValue::SparseVector { indices, values }));
     }
 
     pub fn get_first(&self, field: Field) -> Option<&FieldValue> {
@@ -363,6 +438,12 @@ impl Document {
                         serde_json::Value::String(
                             base64::engine::general_purpose::STANDARD.encode(b),
                         )
+                    }
+                    FieldValue::SparseVector { indices, values } => {
+                        serde_json::json!({
+                            "indices": indices,
+                            "values": values
+                        })
                     }
                 };
                 field_values_map
@@ -453,6 +534,33 @@ impl Document {
                     Self::add_json_value(doc, field, field_type, item);
                 }
             }
+            // Handle sparse vector objects
+            serde_json::Value::Object(obj) if matches!(field_type, FieldType::SparseVector) => {
+                if let (Some(indices_val), Some(values_val)) =
+                    (obj.get("indices"), obj.get("values"))
+                {
+                    let indices: Vec<u32> = indices_val
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let values: Vec<f32> = values_val
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_f64().map(|n| n as f32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if indices.len() == values.len() {
+                        doc.add_sparse_vector(field, indices, values);
+                    }
+                }
+            }
+            serde_json::Value::Object(_) => {}
             _ => {}
         }
     }
@@ -634,5 +742,59 @@ mod tests {
             "Non-multi single-value field should be a string"
         );
         assert_eq!(title_json.as_str(), Some("Test Document"));
+    }
+
+    #[test]
+    fn test_sparse_vector_field() {
+        let mut builder = Schema::builder();
+        let embedding = builder.add_sparse_vector_field("embedding", true, true);
+        let title = builder.add_text_field("title", true, true);
+        let schema = builder.build();
+
+        assert_eq!(schema.get_field("embedding"), Some(embedding));
+        assert_eq!(
+            schema.get_field_entry(embedding).unwrap().field_type,
+            FieldType::SparseVector
+        );
+
+        // Create document with sparse vector
+        let mut doc = Document::new();
+        doc.add_sparse_vector(embedding, vec![0, 5, 10], vec![1.0, 2.5, 0.5]);
+        doc.add_text(title, "Test Document");
+
+        // Verify accessor
+        let (indices, values) = doc
+            .get_first(embedding)
+            .unwrap()
+            .as_sparse_vector()
+            .unwrap();
+        assert_eq!(indices, &[0, 5, 10]);
+        assert_eq!(values, &[1.0, 2.5, 0.5]);
+
+        // Verify JSON roundtrip
+        let json = doc.to_json(&schema);
+        let embedding_json = json.get("embedding").unwrap();
+        assert!(embedding_json.is_object());
+        assert_eq!(
+            embedding_json
+                .get("indices")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // Parse back from JSON
+        let doc2 = Document::from_json(&json, &schema).unwrap();
+        let (indices2, values2) = doc2
+            .get_first(embedding)
+            .unwrap()
+            .as_sparse_vector()
+            .unwrap();
+        assert_eq!(indices2, &[0, 5, 10]);
+        assert!((values2[0] - 1.0).abs() < 1e-6);
+        assert!((values2[1] - 2.5).abs() < 1e-6);
+        assert!((values2[2] - 0.5).abs() < 1e-6);
     }
 }

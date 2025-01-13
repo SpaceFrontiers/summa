@@ -8,45 +8,29 @@
 //! - **Memory-mapped intermediate files**: Reduces memory pressure
 //! - **Arena allocation**: Batch allocations for reduced fragmentation
 
-#[cfg(feature = "native")]
 use std::fs::{File, OpenOptions};
-#[cfg(feature = "native")]
 use std::io::{BufWriter, Write};
-#[cfg(feature = "native")]
 use std::path::PathBuf;
-#[cfg(feature = "native")]
 use std::sync::Arc;
 
-#[cfg(feature = "native")]
 use hashbrown::HashMap;
-#[cfg(feature = "native")]
 use lasso::{Rodeo, Spur};
-#[cfg(feature = "native")]
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-#[cfg(feature = "native")]
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
-#[cfg(feature = "native")]
 use crate::compression::CompressionLevel;
-#[cfg(feature = "native")]
 use crate::directories::{Directory, DirectoryWriter};
-#[cfg(feature = "native")]
 use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
-#[cfg(feature = "native")]
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
-#[cfg(feature = "native")]
 use crate::tokenizer::BoxedTokenizer;
-#[cfg(feature = "native")]
 use crate::wand::WandData;
-#[cfg(feature = "native")]
 use crate::{DocId, Result};
 
 /// Size of the document store buffer before writing to disk
-#[cfg(feature = "native")]
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
 /// Interned term key combining field and term
-#[cfg(feature = "native")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TermKey {
     field: u32,
@@ -54,7 +38,6 @@ struct TermKey {
 }
 
 /// Compact posting entry for in-memory storage
-#[cfg(feature = "native")]
 #[derive(Clone, Copy)]
 struct CompactPosting {
     doc_id: DocId,
@@ -62,13 +45,11 @@ struct CompactPosting {
 }
 
 /// In-memory posting list for a term
-#[cfg(feature = "native")]
 struct PostingListBuilder {
     /// In-memory postings
     postings: Vec<CompactPosting>,
 }
 
-#[cfg(feature = "native")]
 impl PostingListBuilder {
     fn new() -> Self {
         Self {
@@ -97,8 +78,15 @@ impl PostingListBuilder {
     }
 }
 
+/// Intermediate result for parallel posting serialization
+enum SerializedPosting {
+    /// Inline posting (small enough to fit in TermInfo)
+    Inline(TermInfo),
+    /// External posting with serialized bytes
+    External { bytes: Vec<u8>, doc_count: u32 },
+}
+
 /// Statistics for debugging segment builder performance
-#[cfg(feature = "native")]
 #[derive(Debug, Clone)]
 pub struct SegmentBuilderStats {
     /// Number of documents indexed
@@ -114,7 +102,6 @@ pub struct SegmentBuilderStats {
 }
 
 /// Configuration for segment builder
-#[cfg(feature = "native")]
 #[derive(Clone)]
 pub struct SegmentBuilderConfig {
     /// Directory for temporary spill files
@@ -129,7 +116,6 @@ pub struct SegmentBuilderConfig {
     pub posting_map_capacity: usize,
 }
 
-#[cfg(feature = "native")]
 impl Default for SegmentBuilderConfig {
     fn default() -> Self {
         Self {
@@ -148,7 +134,6 @@ impl Default for SegmentBuilderConfig {
 /// - Streams documents to disk immediately (no in-memory document storage)
 /// - Uses string interning for terms (reduced allocations)
 /// - Uses hashbrown HashMap (faster than BTreeMap)
-#[cfg(feature = "native")]
 pub struct SegmentBuilder {
     schema: Schema,
     config: SegmentBuilderConfig,
@@ -188,7 +173,6 @@ pub struct SegmentBuilder {
     token_buffer: String,
 }
 
-#[cfg(feature = "native")]
 impl SegmentBuilder {
     /// Create a new segment builder
     pub fn new(schema: Schema, config: SegmentBuilderConfig) -> Result<Self> {
@@ -443,48 +427,76 @@ impl SegmentBuilder {
     }
 
     /// Build postings from inverted index
+    ///
+    /// Uses parallel processing to serialize posting lists concurrently.
     fn build_postings(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
-        use std::collections::BTreeMap;
-
-        // We need to sort terms for SSTable, so collect into BTreeMap
+        // Phase 1: Collect and sort term keys (parallel key generation)
         // Key format: field_id (4 bytes) + term bytes
-        let mut sorted_terms: BTreeMap<Vec<u8>, &PostingListBuilder> = BTreeMap::new();
+        let mut term_entries: Vec<(Vec<u8>, &PostingListBuilder)> = self
+            .inverted_index
+            .iter()
+            .map(|(term_key, posting_list)| {
+                let term_str = self.term_interner.resolve(&term_key.term);
+                let mut key = Vec::with_capacity(4 + term_str.len());
+                key.extend_from_slice(&term_key.field.to_le_bytes());
+                key.extend_from_slice(term_str.as_bytes());
+                (key, posting_list)
+            })
+            .collect();
 
-        for (term_key, posting_list) in &self.inverted_index {
-            let term_str = self.term_interner.resolve(&term_key.term);
-            let mut key = Vec::with_capacity(4 + term_str.len());
-            key.extend_from_slice(&term_key.field.to_le_bytes());
-            key.extend_from_slice(term_str.as_bytes());
-            sorted_terms.insert(key, posting_list);
-        }
+        // Sort by key for SSTable ordering
+        term_entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+        // Phase 2: Parallel serialization of posting lists
+        // Each term's posting list is serialized independently
+        let serialized: Vec<(Vec<u8>, SerializedPosting)> = term_entries
+            .into_par_iter()
+            .map(|(key, posting_builder)| {
+                // Build posting list from in-memory postings
+                let mut full_postings = PostingList::with_capacity(posting_builder.len());
+                for p in &posting_builder.postings {
+                    full_postings.push(p.doc_id, p.term_freq as u32);
+                }
+
+                // Build term info
+                let doc_ids: Vec<u32> = full_postings.iter().map(|p| p.doc_id).collect();
+                let term_freqs: Vec<u32> = full_postings.iter().map(|p| p.term_freq).collect();
+
+                let result = if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
+                    SerializedPosting::Inline(inline)
+                } else {
+                    // Serialize to local buffer
+                    let mut posting_bytes = Vec::new();
+                    let block_list =
+                        crate::structures::BlockPostingList::from_posting_list(&full_postings)
+                            .expect("BlockPostingList creation failed");
+                    block_list
+                        .serialize(&mut posting_bytes)
+                        .expect("BlockPostingList serialization failed");
+                    SerializedPosting::External {
+                        bytes: posting_bytes,
+                        doc_count: full_postings.doc_count(),
+                    }
+                };
+
+                (key, result)
+            })
+            .collect();
+
+        // Phase 3: Sequential assembly (must be sequential for offset calculation)
         let mut term_dict = Vec::new();
         let mut postings = Vec::new();
         let mut writer = SSTableWriter::<TermInfo>::new(&mut term_dict);
 
-        for (key, posting_builder) in sorted_terms {
-            // Build posting list from in-memory postings
-            let mut full_postings = PostingList::with_capacity(posting_builder.len());
-            for p in &posting_builder.postings {
-                full_postings.push(p.doc_id, p.term_freq as u32);
-            }
-
-            // Build term info
-            let doc_ids: Vec<u32> = full_postings.iter().map(|p| p.doc_id).collect();
-            let term_freqs: Vec<u32> = full_postings.iter().map(|p| p.term_freq).collect();
-
-            let term_info = if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
-                inline
-            } else {
-                let posting_offset = postings.len() as u64;
-                let block_list =
-                    crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
-                block_list.serialize(&mut postings)?;
-                TermInfo::external(
-                    posting_offset,
-                    (postings.len() as u64 - posting_offset) as u32,
-                    full_postings.doc_count(),
-                )
+        for (key, serialized_posting) in serialized {
+            let term_info = match serialized_posting {
+                SerializedPosting::Inline(info) => info,
+                SerializedPosting::External { bytes, doc_count } => {
+                    let posting_offset = postings.len() as u64;
+                    let posting_len = bytes.len() as u32;
+                    postings.extend_from_slice(&bytes);
+                    TermInfo::external(posting_offset, posting_len, doc_count)
+                }
             };
 
             writer.insert(&key, &term_info)?;
@@ -547,7 +559,6 @@ impl SegmentBuilder {
     }
 }
 
-#[cfg(feature = "native")]
 impl Drop for SegmentBuilder {
     fn drop(&mut self) {
         // Cleanup temp files on drop

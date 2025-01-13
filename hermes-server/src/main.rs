@@ -465,6 +465,12 @@ fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
         CoreFieldValue::I64(n) => Value::I64(*n),
         CoreFieldValue::F64(n) => Value::F64(*n),
         CoreFieldValue::Bytes(b) => Value::BytesValue(b.clone()),
+        CoreFieldValue::SparseVector { indices, values } => {
+            Value::SparseVector(proto::SparseVector {
+                indices: indices.clone(),
+                values: values.clone(),
+            })
+        }
     };
     proto::FieldValue { value: Some(v) }
 }
@@ -480,6 +486,7 @@ fn convert_schema_to_proto(schema: &Schema) -> proto::Schema {
                 CoreFieldType::I64 => proto::FieldType::I64 as i32,
                 CoreFieldType::F64 => proto::FieldType::F64 as i32,
                 CoreFieldType::Bytes => proto::FieldType::Bytes as i32,
+                CoreFieldType::SparseVector => proto::FieldType::SparseVector as i32,
             },
             indexed: entry.indexed,
             stored: entry.stored,
@@ -513,6 +520,9 @@ fn convert_proto_to_schema(proto_schema: &proto::Schema) -> Result<Schema, Strin
             proto::FieldType::Bytes => {
                 builder.add_bytes_field(&field.name, field.stored);
             }
+            proto::FieldType::SparseVector => {
+                builder.add_sparse_vector_field(&field.name, field.indexed, field.stored);
+            }
         }
     }
 
@@ -536,6 +546,9 @@ fn convert_proto_to_document(
             Some(Value::I64(n)) => doc.add_i64(field, *n),
             Some(Value::F64(n)) => doc.add_f64(field, *n),
             Some(Value::BytesValue(b)) => doc.add_bytes(field, b.clone()),
+            Some(Value::SparseVector(sv)) => {
+                doc.add_sparse_vector(field, sv.indices.clone(), sv.values.clone());
+            }
             None => return Err(format!("Field '{}' has no value", name)),
         }
     }

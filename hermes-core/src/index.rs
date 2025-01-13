@@ -26,7 +26,11 @@ use crate::structures::BlockPostingList;
 use crate::tokenizer::BoxedTokenizer;
 
 #[cfg(feature = "native")]
+use rand::Rng;
+#[cfg(feature = "native")]
 use tokio::sync::Mutex as AsyncMutex;
+#[cfg(feature = "native")]
+use tokio::task::JoinHandle;
 
 /// Default file name for the slice cache
 pub const SLICE_CACHE_FILENAME: &str = "index.slicecache";
@@ -494,10 +498,10 @@ pub struct IndexWriter<D: DirectoryWriter> {
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
     /// Multiple segment builders for parallel indexing
     builders: Vec<AsyncMutex<Option<SegmentBuilder>>>,
-    /// Round-robin counter for document distribution
-    next_builder: std::sync::atomic::AtomicUsize,
     /// List of committed segment IDs (hex strings)
     segment_ids: AsyncMutex<Vec<String>>,
+    /// Background segment build tasks - allows document ingestion to continue while building
+    background_builds: AsyncMutex<Vec<JoinHandle<Result<String>>>>,
 }
 
 #[cfg(feature = "native")]
@@ -545,8 +549,8 @@ impl<D: DirectoryWriter> IndexWriter<D> {
             builder_config,
             tokenizers: FxHashMap::default(),
             builders,
-            next_builder: std::sync::atomic::AtomicUsize::new(0),
             segment_ids: AsyncMutex::new(Vec::new()),
+            background_builds: AsyncMutex::new(Vec::new()),
         })
     }
 
@@ -590,8 +594,8 @@ impl<D: DirectoryWriter> IndexWriter<D> {
             builder_config,
             tokenizers: FxHashMap::default(),
             builders,
-            next_builder: std::sync::atomic::AtomicUsize::new(0),
             segment_ids: AsyncMutex::new(segment_ids),
+            background_builds: AsyncMutex::new(Vec::new()),
         })
     }
 
@@ -607,14 +611,12 @@ impl<D: DirectoryWriter> IndexWriter<D> {
 
     /// Add a document
     ///
-    /// Documents are distributed round-robin across multiple builders for parallel indexing.
+    /// Documents are distributed randomly across multiple builders for parallel indexing.
+    /// Random distribution avoids atomic contention and provides better load balancing.
     /// When a builder reaches `max_docs_per_segment`, it is committed and a new one starts.
     pub async fn add_document(&self, doc: Document) -> Result<DocId> {
-        // Round-robin selection of builder
-        let builder_idx = self
-            .next_builder
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.builders.len();
+        // Random selection of builder - avoids atomic contention
+        let builder_idx = rand::rng().random_range(0..self.builders.len());
 
         let mut builder_guard = self.builders[builder_idx].lock().await;
 
@@ -634,11 +636,55 @@ impl<D: DirectoryWriter> IndexWriter<D> {
         // Check if we need to commit
         if builder.num_docs() >= self.config.max_docs_per_segment {
             let full_builder = builder_guard.take().unwrap();
-            drop(builder_guard); // Release lock before async operation
-            self.commit_builder(full_builder).await?;
+            drop(builder_guard); // Release lock before spawning background task
+            self.spawn_background_build(full_builder).await;
         }
 
         Ok(doc_id)
+    }
+
+    /// Spawn a background task to build a segment without blocking document ingestion
+    async fn spawn_background_build(&self, builder: SegmentBuilder) {
+        let directory = Arc::clone(&self.directory);
+        let segment_id = SegmentId::new();
+        let segment_hex = segment_id.to_hex();
+
+        let handle = tokio::spawn(async move {
+            builder.build(directory.as_ref(), segment_id).await?;
+            Ok(segment_hex)
+        });
+
+        let mut builds = self.background_builds.lock().await;
+        builds.push(handle);
+    }
+
+    /// Wait for all background builds to complete
+    async fn wait_for_background_builds(&self) -> Result<()> {
+        let mut builds = self.background_builds.lock().await;
+        let mut completed_ids = Vec::new();
+
+        for handle in builds.drain(..) {
+            match handle.await {
+                Ok(Ok(segment_hex)) => completed_ids.push(segment_hex),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(Error::Io(std::io::Error::other(e))),
+            }
+        }
+        drop(builds);
+
+        // Register completed segment IDs
+        if !completed_ids.is_empty() {
+            let mut segment_ids = self.segment_ids.lock().await;
+            segment_ids.extend(completed_ids);
+
+            let segments_bytes = serde_json::to_vec(&*segment_ids)
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            self.directory
+                .write(Path::new("segments.json"), &segments_bytes)
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Get current builder statistics for debugging (aggregated from all builders)
@@ -665,7 +711,13 @@ impl<D: DirectoryWriter> IndexWriter<D> {
     }
 
     /// Commit all pending segments to disk
+    ///
+    /// This waits for all background builds to complete, then commits any remaining
+    /// in-progress builders.
     pub async fn commit(&self) -> Result<()> {
+        // First, wait for all background builds to complete
+        self.wait_for_background_builds().await?;
+
         // Collect all builders that have documents
         let mut builders_to_commit = Vec::new();
 
@@ -678,27 +730,41 @@ impl<D: DirectoryWriter> IndexWriter<D> {
             }
         }
 
-        // Commit each builder
+        // Build remaining segments in parallel using tokio tasks
+        let mut handles = Vec::new();
         for builder in builders_to_commit {
-            self.commit_builder(builder).await?;
+            let directory = Arc::clone(&self.directory);
+            let segment_id = SegmentId::new();
+            let segment_hex = segment_id.to_hex();
+
+            let handle = tokio::spawn(async move {
+                builder.build(directory.as_ref(), segment_id).await?;
+                Ok::<_, Error>(segment_hex)
+            });
+            handles.push(handle);
         }
 
-        Ok(())
-    }
-
-    async fn commit_builder(&self, builder: SegmentBuilder) -> Result<()> {
-        let segment_id = SegmentId::new();
-        builder.build(self.directory.as_ref(), segment_id).await?;
+        // Wait for all and collect segment IDs
+        let mut new_segment_ids = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(segment_hex)) => new_segment_ids.push(segment_hex),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(Error::Io(std::io::Error::other(e))),
+            }
+        }
 
         // Update segment list
-        let mut segment_ids = self.segment_ids.lock().await;
-        segment_ids.push(segment_id.to_hex());
+        if !new_segment_ids.is_empty() {
+            let mut segment_ids = self.segment_ids.lock().await;
+            segment_ids.extend(new_segment_ids);
 
-        let segments_bytes =
-            serde_json::to_vec(&*segment_ids).map_err(|e| Error::Serialization(e.to_string()))?;
-        self.directory
-            .write(Path::new("segments.json"), &segments_bytes)
-            .await?;
+            let segments_bytes = serde_json::to_vec(&*segment_ids)
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            self.directory
+                .write(Path::new("segments.json"), &segments_bytes)
+                .await?;
+        }
 
         Ok(())
     }

@@ -1299,6 +1299,323 @@ pub fn unpack_delta_decode(
     }
 }
 
+// ============================================================================
+// Sparse Vector SIMD Functions
+// ============================================================================
+
+/// Dequantize UInt8 weights to f32 with SIMD acceleration
+///
+/// Computes: output[i] = input[i] as f32 * scale + min_val
+#[inline]
+pub fn dequantize_uint8(input: &[u8], output: &mut [f32], scale: f32, min_val: f32, count: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon::is_available() {
+            unsafe {
+                dequantize_uint8_neon(input, output, scale, min_val, count);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse::is_available() {
+            unsafe {
+                dequantize_uint8_sse(input, output, scale, min_val, count);
+            }
+            return;
+        }
+    }
+
+    // Scalar fallback
+    for i in 0..count {
+        output[i] = input[i] as f32 * scale + min_val;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dequantize_uint8_neon(
+    input: &[u8],
+    output: &mut [f32],
+    scale: f32,
+    min_val: f32,
+    count: usize,
+) {
+    use std::arch::aarch64::*;
+
+    let scale_v = vdupq_n_f32(scale);
+    let min_v = vdupq_n_f32(min_val);
+
+    let chunks = count / 16;
+    let remainder = count % 16;
+
+    for chunk in 0..chunks {
+        let base = chunk * 16;
+        let in_ptr = input.as_ptr().add(base);
+
+        // Load 16 bytes
+        let bytes = vld1q_u8(in_ptr);
+
+        // Widen u8 -> u16 -> u32 -> f32
+        let low8 = vget_low_u8(bytes);
+        let high8 = vget_high_u8(bytes);
+
+        let low16 = vmovl_u8(low8);
+        let high16 = vmovl_u8(high8);
+
+        // Process 4 values at a time
+        let u32_0 = vmovl_u16(vget_low_u16(low16));
+        let u32_1 = vmovl_u16(vget_high_u16(low16));
+        let u32_2 = vmovl_u16(vget_low_u16(high16));
+        let u32_3 = vmovl_u16(vget_high_u16(high16));
+
+        // Convert to f32 and apply scale + min_val
+        let f32_0 = vfmaq_f32(min_v, vcvtq_f32_u32(u32_0), scale_v);
+        let f32_1 = vfmaq_f32(min_v, vcvtq_f32_u32(u32_1), scale_v);
+        let f32_2 = vfmaq_f32(min_v, vcvtq_f32_u32(u32_2), scale_v);
+        let f32_3 = vfmaq_f32(min_v, vcvtq_f32_u32(u32_3), scale_v);
+
+        let out_ptr = output.as_mut_ptr().add(base);
+        vst1q_f32(out_ptr, f32_0);
+        vst1q_f32(out_ptr.add(4), f32_1);
+        vst1q_f32(out_ptr.add(8), f32_2);
+        vst1q_f32(out_ptr.add(12), f32_3);
+    }
+
+    // Handle remainder
+    let base = chunks * 16;
+    for i in 0..remainder {
+        output[base + i] = input[base + i] as f32 * scale + min_val;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2", enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dequantize_uint8_sse(
+    input: &[u8],
+    output: &mut [f32],
+    scale: f32,
+    min_val: f32,
+    count: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let scale_v = _mm_set1_ps(scale);
+    let min_v = _mm_set1_ps(min_val);
+
+    let chunks = count / 4;
+    let remainder = count % 4;
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+
+        // Load 4 bytes and zero-extend to 32-bit
+        let b0 = input[base] as i32;
+        let b1 = input[base + 1] as i32;
+        let b2 = input[base + 2] as i32;
+        let b3 = input[base + 3] as i32;
+
+        let ints = _mm_set_epi32(b3, b2, b1, b0);
+        let floats = _mm_cvtepi32_ps(ints);
+
+        // Apply scale and min_val: result = floats * scale + min_val
+        let scaled = _mm_add_ps(_mm_mul_ps(floats, scale_v), min_v);
+
+        _mm_storeu_ps(output.as_mut_ptr().add(base), scaled);
+    }
+
+    // Handle remainder
+    let base = chunks * 4;
+    for i in 0..remainder {
+        output[base + i] = input[base + i] as f32 * scale + min_val;
+    }
+}
+
+/// Compute dot product of two f32 arrays with SIMD acceleration
+#[inline]
+pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon::is_available() {
+            return unsafe { dot_product_f32_neon(a, b, count) };
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse::is_available() {
+            return unsafe { dot_product_f32_sse(a, b, count) };
+        }
+    }
+
+    // Scalar fallback
+    let mut sum = 0.0f32;
+    for i in 0..count {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_product_f32_neon(a: &[f32], b: &[f32], count: usize) -> f32 {
+    use std::arch::aarch64::*;
+
+    let chunks = count / 4;
+    let remainder = count % 4;
+
+    let mut acc = vdupq_n_f32(0.0);
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let va = vld1q_f32(a.as_ptr().add(base));
+        let vb = vld1q_f32(b.as_ptr().add(base));
+        acc = vfmaq_f32(acc, va, vb);
+    }
+
+    // Horizontal sum
+    let mut sum = vaddvq_f32(acc);
+
+    // Handle remainder
+    let base = chunks * 4;
+    for i in 0..remainder {
+        sum += a[base + i] * b[base + i];
+    }
+
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_product_f32_sse(a: &[f32], b: &[f32], count: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let chunks = count / 4;
+    let remainder = count % 4;
+
+    let mut acc = _mm_setzero_ps();
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let va = _mm_loadu_ps(a.as_ptr().add(base));
+        let vb = _mm_loadu_ps(b.as_ptr().add(base));
+        acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+    }
+
+    // Horizontal sum: [a, b, c, d] -> a + b + c + d
+    let shuf = _mm_shuffle_ps(acc, acc, 0b10_11_00_01); // [b, a, d, c]
+    let sums = _mm_add_ps(acc, shuf); // [a+b, a+b, c+d, c+d]
+    let shuf2 = _mm_movehl_ps(sums, sums); // [c+d, c+d, ?, ?]
+    let final_sum = _mm_add_ss(sums, shuf2); // [a+b+c+d, ?, ?, ?]
+
+    let mut sum = _mm_cvtss_f32(final_sum);
+
+    // Handle remainder
+    let base = chunks * 4;
+    for i in 0..remainder {
+        sum += a[base + i] * b[base + i];
+    }
+
+    sum
+}
+
+/// Find maximum value in f32 array with SIMD acceleration
+#[inline]
+pub fn max_f32(values: &[f32], count: usize) -> f32 {
+    if count == 0 {
+        return f32::NEG_INFINITY;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon::is_available() {
+            return unsafe { max_f32_neon(values, count) };
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse::is_available() {
+            return unsafe { max_f32_sse(values, count) };
+        }
+    }
+
+    // Scalar fallback
+    values[..count]
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn max_f32_neon(values: &[f32], count: usize) -> f32 {
+    use std::arch::aarch64::*;
+
+    let chunks = count / 4;
+    let remainder = count % 4;
+
+    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let v = vld1q_f32(values.as_ptr().add(base));
+        max_v = vmaxq_f32(max_v, v);
+    }
+
+    // Horizontal max
+    let mut max_val = vmaxvq_f32(max_v);
+
+    // Handle remainder
+    let base = chunks * 4;
+    for i in 0..remainder {
+        max_val = max_val.max(values[base + i]);
+    }
+
+    max_val
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn max_f32_sse(values: &[f32], count: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let chunks = count / 4;
+    let remainder = count % 4;
+
+    let mut max_v = _mm_set1_ps(f32::NEG_INFINITY);
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let v = _mm_loadu_ps(values.as_ptr().add(base));
+        max_v = _mm_max_ps(max_v, v);
+    }
+
+    // Horizontal max: [a, b, c, d] -> max(a, b, c, d)
+    let shuf = _mm_shuffle_ps(max_v, max_v, 0b10_11_00_01); // [b, a, d, c]
+    let max1 = _mm_max_ps(max_v, shuf); // [max(a,b), max(a,b), max(c,d), max(c,d)]
+    let shuf2 = _mm_movehl_ps(max1, max1); // [max(c,d), max(c,d), ?, ?]
+    let final_max = _mm_max_ss(max1, shuf2); // [max(a,b,c,d), ?, ?, ?]
+
+    let mut max_val = _mm_cvtss_f32(final_max);
+
+    // Handle remainder
+    let base = chunks * 4;
+    for i in 0..remainder {
+        max_val = max_val.max(values[base + i]);
+    }
+
+    max_val
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,5 +1838,108 @@ mod tests {
         unpack_rounded_delta_decode(&input, RoundedBitWidth::Zero, &mut output, 100, 5);
 
         assert_eq!(output, vec![100, 101, 102, 103, 104]);
+    }
+
+    // ========================================================================
+    // Sparse Vector SIMD Tests
+    // ========================================================================
+
+    #[test]
+    fn test_dequantize_uint8() {
+        let input: Vec<u8> = vec![0, 128, 255, 64, 192];
+        let mut output = vec![0.0f32; 5];
+        let scale = 0.1;
+        let min_val = 1.0;
+
+        dequantize_uint8(&input, &mut output, scale, min_val, 5);
+
+        // Expected: input[i] * scale + min_val
+        assert!((output[0] - 1.0).abs() < 1e-6); // 0 * 0.1 + 1.0 = 1.0
+        assert!((output[1] - 13.8).abs() < 1e-6); // 128 * 0.1 + 1.0 = 13.8
+        assert!((output[2] - 26.5).abs() < 1e-6); // 255 * 0.1 + 1.0 = 26.5
+        assert!((output[3] - 7.4).abs() < 1e-6); // 64 * 0.1 + 1.0 = 7.4
+        assert!((output[4] - 20.2).abs() < 1e-6); // 192 * 0.1 + 1.0 = 20.2
+    }
+
+    #[test]
+    fn test_dequantize_uint8_large() {
+        // Test with 128 values (full SIMD block)
+        let input: Vec<u8> = (0..128).collect();
+        let mut output = vec![0.0f32; 128];
+        let scale = 2.0;
+        let min_val = -10.0;
+
+        dequantize_uint8(&input, &mut output, scale, min_val, 128);
+
+        for (i, &out) in output.iter().enumerate().take(128) {
+            let expected = i as f32 * scale + min_val;
+            assert!(
+                (out - expected).abs() < 1e-5,
+                "Mismatch at {}: expected {}, got {}",
+                i,
+                expected,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn test_dot_product_f32() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let b = vec![2.0f32, 3.0, 4.0, 5.0, 6.0];
+
+        let result = dot_product_f32(&a, &b, 5);
+
+        // Expected: 1*2 + 2*3 + 3*4 + 4*5 + 5*6 = 2 + 6 + 12 + 20 + 30 = 70
+        assert!((result - 70.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_dot_product_f32_large() {
+        // Test with 128 values
+        let a: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..128).map(|i| (i + 1) as f32).collect();
+
+        let result = dot_product_f32(&a, &b, 128);
+
+        // Compute expected
+        let expected: f32 = (0..128).map(|i| (i as f32) * ((i + 1) as f32)).sum();
+        assert!(
+            (result - expected).abs() < 1e-3,
+            "Expected {}, got {}",
+            expected,
+            result
+        );
+    }
+
+    #[test]
+    fn test_max_f32() {
+        let values = vec![1.0f32, 5.0, 3.0, 9.0, 2.0, 7.0];
+        let result = max_f32(&values, 6);
+        assert!((result - 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_max_f32_large() {
+        // Test with 128 values, max at position 77
+        let mut values: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        values[77] = 1000.0;
+
+        let result = max_f32(&values, 128);
+        assert!((result - 1000.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_max_f32_negative() {
+        let values = vec![-5.0f32, -2.0, -10.0, -1.0, -3.0];
+        let result = max_f32(&values, 5);
+        assert!((result - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_max_f32_empty() {
+        let values: Vec<f32> = vec![];
+        let result = max_f32(&values, 0);
+        assert_eq!(result, f32::NEG_INFINITY);
     }
 }
