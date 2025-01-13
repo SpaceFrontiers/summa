@@ -45,120 +45,12 @@ use crate::{DocId, Result};
 #[cfg(feature = "native")]
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
-/// Number of shards for the inverted index
-/// Power of 2 for fast modulo via bitwise AND
-#[cfg(feature = "native")]
-const NUM_INDEX_SHARDS: usize = 64;
-
 /// Interned term key combining field and term
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TermKey {
     field: u32,
     term: Spur,
-}
-
-#[cfg(feature = "native")]
-impl TermKey {
-    /// Get shard index for this term key (uses term's internal id for distribution)
-    #[inline]
-    fn shard(&self) -> usize {
-        // Spur wraps NonZero<u32>, get the raw value for sharding
-        // Using bitwise AND since NUM_INDEX_SHARDS is power of 2
-        (self.term.into_inner().get() as usize) & (NUM_INDEX_SHARDS - 1)
-    }
-}
-
-/// Sharded inverted index for better cache locality
-/// Each shard is a smaller hashmap that fits better in CPU cache
-#[cfg(feature = "native")]
-struct ShardedInvertedIndex {
-    shards: Vec<HashMap<TermKey, PostingListBuilder>>,
-}
-
-#[cfg(feature = "native")]
-impl ShardedInvertedIndex {
-    fn new(capacity_per_shard: usize) -> Self {
-        let mut shards = Vec::with_capacity(NUM_INDEX_SHARDS);
-        for _ in 0..NUM_INDEX_SHARDS {
-            shards.push(HashMap::with_capacity(capacity_per_shard));
-        }
-        Self { shards }
-    }
-
-    /// Get or insert a posting list for the given term key
-    #[inline]
-    fn get_or_insert(&mut self, key: TermKey) -> &mut PostingListBuilder {
-        self.shards[key.shard()]
-            .entry(key)
-            .or_insert_with(PostingListBuilder::new)
-    }
-
-    fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.len()).sum()
-    }
-
-    /// Get total number of in-memory postings across all shards
-    fn total_postings_in_memory(&self) -> usize {
-        self.shards
-            .iter()
-            .flat_map(|s| s.values())
-            .map(|p| p.postings.len())
-            .sum()
-    }
-
-    /// Get shard size distribution (min, max, avg)
-    fn shard_stats(&self) -> (usize, usize, usize) {
-        let sizes: Vec<usize> = self.shards.iter().map(|s| s.len()).collect();
-        let min = *sizes.iter().min().unwrap_or(&0);
-        let max = *sizes.iter().max().unwrap_or(&0);
-        let avg = if sizes.is_empty() {
-            0
-        } else {
-            sizes.iter().sum::<usize>() / sizes.len()
-        };
-        (min, max, avg)
-    }
-}
-
-/// Iterator over all entries in the sharded index
-#[cfg(feature = "native")]
-struct ShardedIndexIter<'a> {
-    shards: std::slice::Iter<'a, HashMap<TermKey, PostingListBuilder>>,
-    current: Option<hashbrown::hash_map::Iter<'a, TermKey, PostingListBuilder>>,
-}
-
-#[cfg(feature = "native")]
-impl<'a> Iterator for ShardedIndexIter<'a> {
-    type Item = (&'a TermKey, &'a PostingListBuilder);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(ref mut current) = self.current
-                && let Some(item) = current.next()
-            {
-                return Some(item);
-            }
-            // Move to next shard
-            match self.shards.next() {
-                Some(shard) => self.current = Some(shard.iter()),
-                None => return None,
-            }
-        }
-    }
-}
-
-#[cfg(feature = "native")]
-impl<'a> IntoIterator for &'a ShardedInvertedIndex {
-    type Item = (&'a TermKey, &'a PostingListBuilder);
-    type IntoIter = ShardedIndexIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        ShardedIndexIter {
-            shards: self.shards.iter(),
-            current: None,
-        }
-    }
 }
 
 /// Compact posting entry for in-memory storage
@@ -219,10 +111,6 @@ pub struct SegmentBuilderStats {
     pub interned_strings: usize,
     /// Size of doc_field_lengths vector
     pub doc_field_lengths_size: usize,
-    /// Shard distribution (min, max, avg terms per shard)
-    pub shard_min: usize,
-    pub shard_max: usize,
-    pub shard_avg: usize,
 }
 
 /// Configuration for segment builder
@@ -260,7 +148,6 @@ impl Default for SegmentBuilderConfig {
 /// - Streams documents to disk immediately (no in-memory document storage)
 /// - Uses string interning for terms (reduced allocations)
 /// - Uses hashbrown HashMap (faster than BTreeMap)
-/// - Spills large posting lists to disk (bounded memory)
 #[cfg(feature = "native")]
 pub struct SegmentBuilder {
     schema: Schema,
@@ -270,9 +157,8 @@ pub struct SegmentBuilder {
     /// String interner for terms - O(1) lookup and deduplication
     term_interner: Rodeo,
 
-    /// Sharded inverted index for better cache locality
-    /// Each shard is a smaller hashmap that fits better in CPU cache
-    inverted_index: ShardedInvertedIndex,
+    /// Inverted index: term key -> posting list
+    inverted_index: HashMap<TermKey, PostingListBuilder>,
 
     /// Streaming document store writer
     store_file: BufWriter<File>,
@@ -334,9 +220,7 @@ impl SegmentBuilder {
             schema,
             tokenizers: FxHashMap::default(),
             term_interner: Rodeo::new(),
-            inverted_index: ShardedInvertedIndex::new(
-                config.posting_map_capacity / NUM_INDEX_SHARDS,
-            ),
+            inverted_index: HashMap::with_capacity(config.posting_map_capacity),
             store_file,
             store_path,
             next_doc_id: 0,
@@ -372,16 +256,14 @@ impl SegmentBuilder {
 
     /// Get current statistics for debugging performance
     pub fn stats(&self) -> SegmentBuilderStats {
-        let (shard_min, shard_max, shard_avg) = self.inverted_index.shard_stats();
+        let postings_in_memory: usize =
+            self.inverted_index.values().map(|p| p.postings.len()).sum();
         SegmentBuilderStats {
             num_docs: self.next_doc_id,
             unique_terms: self.inverted_index.len(),
-            postings_in_memory: self.inverted_index.total_postings_in_memory(),
+            postings_in_memory,
             interned_strings: self.term_interner.len(),
             doc_field_lengths_size: self.doc_field_lengths.len(),
-            shard_min,
-            shard_max,
-            shard_avg,
         }
     }
 
@@ -482,7 +364,10 @@ impl SegmentBuilder {
                 term: term_spur,
             };
 
-            let posting = self.inverted_index.get_or_insert(term_key);
+            let posting = self
+                .inverted_index
+                .entry(term_key)
+                .or_insert_with(PostingListBuilder::new);
             posting.add(doc_id, tf);
         }
 
@@ -499,7 +384,10 @@ impl SegmentBuilder {
             term: term_spur,
         };
 
-        let posting = self.inverted_index.get_or_insert(term_key);
+        let posting = self
+            .inverted_index
+            .entry(term_key)
+            .or_insert_with(PostingListBuilder::new);
         posting.add(doc_id, 1);
 
         Ok(())

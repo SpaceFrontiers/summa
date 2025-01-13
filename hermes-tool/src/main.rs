@@ -372,15 +372,12 @@ async fn index_from_reader<R: BufRead>(
             // Get builder stats for debugging
             if let Some(stats) = writer.get_builder_stats().await {
                 info!(
-                    "Progress: {} docs ({:.0}/s) | terms: {} | postings: {} | interned: {} | shards: {}-{}-{}",
+                    "Progress: {} docs ({:.0}/s) | terms: {} | postings: {} | interned: {}",
                     count,
                     rate,
                     stats.unique_terms,
                     stats.postings_in_memory,
                     stats.interned_strings,
-                    stats.shard_min,
-                    stats.shard_avg,
-                    stats.shard_max,
                 );
             } else {
                 info!(

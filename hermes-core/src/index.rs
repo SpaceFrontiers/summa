@@ -481,11 +481,10 @@ impl<D: Directory> Clone for Index<D> {
 /// Async IndexWriter for adding documents and committing segments
 ///
 /// Features:
+/// - Parallel indexing with multiple segment builders
 /// - Streams documents to disk immediately (no in-memory document storage)
 /// - Uses string interning for terms (reduced allocations)
 /// - Uses hashbrown HashMap (faster than BTreeMap)
-/// - Spills large posting lists to disk (bounded memory)
-/// - Uses memory-mapped files for intermediate data
 #[cfg(feature = "native")]
 pub struct IndexWriter<D: DirectoryWriter> {
     directory: Arc<D>,
@@ -493,8 +492,10 @@ pub struct IndexWriter<D: DirectoryWriter> {
     config: IndexConfig,
     builder_config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
-    /// Segment builder
-    builder: AsyncMutex<Option<SegmentBuilder>>,
+    /// Multiple segment builders for parallel indexing
+    builders: Vec<AsyncMutex<Option<SegmentBuilder>>>,
+    /// Round-robin counter for document distribution
+    next_builder: std::sync::atomic::AtomicUsize,
     /// List of committed segment IDs (hex strings)
     segment_ids: AsyncMutex<Vec<String>>,
 }
@@ -530,13 +531,21 @@ impl<D: DirectoryWriter> IndexWriter<D> {
             .write(Path::new("segments.json"), &segments_bytes)
             .await?;
 
+        // Create multiple builders for parallel indexing
+        let num_builders = config.num_indexing_threads.max(1);
+        let mut builders = Vec::with_capacity(num_builders);
+        for _ in 0..num_builders {
+            builders.push(AsyncMutex::new(None));
+        }
+
         Ok(Self {
             directory,
             schema,
             config,
             builder_config,
             tokenizers: FxHashMap::default(),
-            builder: AsyncMutex::new(None),
+            builders,
+            next_builder: std::sync::atomic::AtomicUsize::new(0),
             segment_ids: AsyncMutex::new(Vec::new()),
         })
     }
@@ -567,13 +576,21 @@ impl<D: DirectoryWriter> IndexWriter<D> {
         let segment_ids: Vec<String> = serde_json::from_slice(segments_bytes.as_slice())
             .map_err(|e| Error::Serialization(e.to_string()))?;
 
+        // Create multiple builders for parallel indexing
+        let num_builders = config.num_indexing_threads.max(1);
+        let mut builders = Vec::with_capacity(num_builders);
+        for _ in 0..num_builders {
+            builders.push(AsyncMutex::new(None));
+        }
+
         Ok(Self {
             directory,
             schema,
             config,
             builder_config,
             tokenizers: FxHashMap::default(),
-            builder: AsyncMutex::new(None),
+            builders,
+            next_builder: std::sync::atomic::AtomicUsize::new(0),
             segment_ids: AsyncMutex::new(segment_ids),
         })
     }
@@ -590,10 +607,16 @@ impl<D: DirectoryWriter> IndexWriter<D> {
 
     /// Add a document
     ///
-    /// Documents are streamed to disk immediately, keeping memory usage bounded.
-    /// When the builder reaches `max_docs_per_segment`, it is committed and a new one starts.
+    /// Documents are distributed round-robin across multiple builders for parallel indexing.
+    /// When a builder reaches `max_docs_per_segment`, it is committed and a new one starts.
     pub async fn add_document(&self, doc: Document) -> Result<DocId> {
-        let mut builder_guard = self.builder.lock().await;
+        // Round-robin selection of builder
+        let builder_idx = self
+            .next_builder
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.builders.len();
+
+        let mut builder_guard = self.builders[builder_idx].lock().await;
 
         // Initialize builder if needed
         if builder_guard.is_none() {
@@ -618,20 +641,45 @@ impl<D: DirectoryWriter> IndexWriter<D> {
         Ok(doc_id)
     }
 
-    /// Get current builder statistics for debugging
+    /// Get current builder statistics for debugging (aggregated from all builders)
     pub async fn get_builder_stats(&self) -> Option<crate::segment::SegmentBuilderStats> {
-        let builder_guard = self.builder.lock().await;
-        builder_guard.as_ref().map(|b| b.stats())
+        let mut total_stats: Option<crate::segment::SegmentBuilderStats> = None;
+
+        for builder_mutex in &self.builders {
+            let guard = builder_mutex.lock().await;
+            if let Some(builder) = guard.as_ref() {
+                let stats = builder.stats();
+                if let Some(ref mut total) = total_stats {
+                    total.num_docs += stats.num_docs;
+                    total.unique_terms += stats.unique_terms;
+                    total.postings_in_memory += stats.postings_in_memory;
+                    total.interned_strings += stats.interned_strings;
+                    total.doc_field_lengths_size += stats.doc_field_lengths_size;
+                } else {
+                    total_stats = Some(stats);
+                }
+            }
+        }
+
+        total_stats
     }
 
     /// Commit all pending segments to disk
     pub async fn commit(&self) -> Result<()> {
-        let mut builder_guard = self.builder.lock().await;
+        // Collect all builders that have documents
+        let mut builders_to_commit = Vec::new();
 
-        if let Some(builder) = builder_guard.take()
-            && builder.num_docs() > 0
-        {
-            drop(builder_guard);
+        for builder_mutex in &self.builders {
+            let mut guard = builder_mutex.lock().await;
+            if let Some(builder) = guard.take()
+                && builder.num_docs() > 0
+            {
+                builders_to_commit.push(builder);
+            }
+        }
+
+        // Commit each builder
+        for builder in builders_to_commit {
             self.commit_builder(builder).await?;
         }
 
