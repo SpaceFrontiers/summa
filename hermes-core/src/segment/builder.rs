@@ -401,11 +401,27 @@ impl SegmentBuilder {
 
         let files = SegmentFiles::new(segment_id.0);
 
-        // Build term dictionary and postings
-        let (term_dict_data, postings_data) = self.build_postings()?;
+        // Extract data needed for parallel processing
+        let store_path = self.store_path.clone();
+        let schema = self.schema.clone();
+        let num_compression_threads = self.config.num_compression_threads;
+        let compression_level = self.config.compression_level;
 
-        // Build document store from streamed data
-        let store_data = self.build_store_from_stream()?;
+        // Build postings and document store in parallel
+        let (postings_result, store_result) = rayon::join(
+            || self.build_postings(),
+            || {
+                Self::build_store_parallel(
+                    &store_path,
+                    &schema,
+                    num_compression_threads,
+                    compression_level,
+                )
+            },
+        );
+
+        let (term_dict_data, postings_data) = postings_result?;
+        let store_data = store_result?;
 
         // Write to directory
         dir.write(&files.term_dict, &term_dict_data).await?;
@@ -506,33 +522,24 @@ impl SegmentBuilder {
         Ok((term_dict, postings))
     }
 
-    /// Build document store from streamed temp file
-    fn build_store_from_stream(&mut self) -> Result<Vec<u8>> {
+    /// Build document store from streamed temp file (static method for parallel execution)
+    ///
+    /// Uses parallel processing to deserialize documents concurrently.
+    fn build_store_parallel(
+        store_path: &PathBuf,
+        schema: &Schema,
+        num_compression_threads: usize,
+        compression_level: CompressionLevel,
+    ) -> Result<Vec<u8>> {
         use super::store::EagerParallelStoreWriter;
 
-        // Memory-map the temp store file
-        drop(std::mem::replace(
-            &mut self.store_file,
-            BufWriter::new(File::create("/dev/null")?),
-        ));
-
-        let file = File::open(&self.store_path)?;
+        let file = File::open(store_path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-        // Re-compress with proper block structure using parallel compression
-        let mut store_data = Vec::new();
-        let mut store_writer = EagerParallelStoreWriter::with_compression_level(
-            &mut store_data,
-            self.config.num_compression_threads,
-            self.config.compression_level,
-        );
-
+        // Phase 1: Parse document boundaries (sequential, fast)
+        let mut doc_ranges: Vec<(usize, usize)> = Vec::new();
         let mut offset = 0usize;
-        while offset < mmap.len() {
-            if offset + 4 > mmap.len() {
-                break;
-            }
-
+        while offset + 4 <= mmap.len() {
             let doc_len = u32::from_le_bytes([
                 mmap[offset],
                 mmap[offset + 1],
@@ -545,13 +552,29 @@ impl SegmentBuilder {
                 break;
             }
 
-            let doc_bytes = &mmap[offset..offset + doc_len];
+            doc_ranges.push((offset, doc_len));
             offset += doc_len;
+        }
 
-            // Deserialize and re-store with proper compression
-            if let Ok(doc) = super::store::deserialize_document(doc_bytes, &self.schema) {
-                store_writer.store(&doc, &self.schema)?;
-            }
+        // Phase 2: Parallel deserialization of documents
+        let docs: Vec<Document> = doc_ranges
+            .into_par_iter()
+            .filter_map(|(start, len)| {
+                let doc_bytes = &mmap[start..start + len];
+                super::store::deserialize_document(doc_bytes, schema).ok()
+            })
+            .collect();
+
+        // Phase 3: Write to store (compression is already parallel in EagerParallelStoreWriter)
+        let mut store_data = Vec::new();
+        let mut store_writer = EagerParallelStoreWriter::with_compression_level(
+            &mut store_data,
+            num_compression_threads,
+            compression_level,
+        );
+
+        for doc in &docs {
+            store_writer.store(doc, schema)?;
         }
 
         store_writer.finish()?;
