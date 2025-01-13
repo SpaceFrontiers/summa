@@ -37,16 +37,15 @@ use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 #[cfg(feature = "native")]
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
 #[cfg(feature = "native")]
-use crate::tokenizer::{BoxedTokenizer, LowercaseTokenizer};
+use crate::tokenizer::BoxedTokenizer;
 #[cfg(feature = "native")]
 use crate::wand::WandData;
 #[cfg(feature = "native")]
 use crate::{DocId, Result};
 
 /// Threshold for flushing a posting list to disk (number of postings)
-/// Lower threshold = more aggressive spilling = less memory pressure
 #[cfg(feature = "native")]
-const POSTING_FLUSH_THRESHOLD: usize = 1_000;
+const POSTING_FLUSH_THRESHOLD: usize = 10_000;
 
 /// Size of the posting spill buffer before writing to disk
 #[cfg(feature = "native")]
@@ -337,6 +336,9 @@ pub struct SegmentBuilder {
 
     /// Reusable buffer for terms that need spilling
     terms_to_spill_buffer: Vec<TermKey>,
+
+    /// Reusable buffer for tokenization to avoid per-token String allocations
+    token_buffer: String,
 }
 
 #[cfg(feature = "native")]
@@ -390,6 +392,7 @@ impl SegmentBuilder {
             wand_data: None,
             local_tf_buffer: FxHashMap::default(),
             terms_to_spill_buffer: Vec::new(),
+            token_buffer: String::with_capacity(64),
             config,
         })
     }
@@ -481,27 +484,38 @@ impl SegmentBuilder {
 
     /// Index a text field using interned terms
     ///
-    /// Optimization: aggregate term frequencies within the document first,
-    /// then do a single insert per unique term. This reduces hash lookups
-    /// from O(total_tokens) to O(unique_terms_in_doc).
+    /// Optimization: Zero-allocation inline tokenization + term frequency aggregation.
+    /// Instead of allocating a String per token, we:
+    /// 1. Iterate over whitespace-split words
+    /// 2. Build lowercase token in a reusable buffer
+    /// 3. Intern directly from the buffer
     fn index_text_field(&mut self, field: Field, doc_id: DocId, text: &str) -> Result<u32> {
-        let default_tokenizer = LowercaseTokenizer;
-        let tokenizer: &dyn crate::tokenizer::TokenizerClone = self
-            .tokenizers
-            .get(&field)
-            .map(|t| t.as_ref())
-            .unwrap_or(&default_tokenizer);
-
-        let tokens = tokenizer.tokenize(text);
-        let token_count = tokens.len() as u32;
-
         // Phase 1: Aggregate term frequencies within this document
         // Reuse buffer to avoid allocations
         self.local_tf_buffer.clear();
 
-        for token in tokens {
-            // Intern the term - O(1) amortized
-            let term_spur = self.term_interner.get_or_intern(&token.text);
+        let mut token_count = 0u32;
+
+        // Zero-allocation tokenization: iterate words, lowercase inline, intern directly
+        for word in text.split_whitespace() {
+            // Build lowercase token in reusable buffer
+            self.token_buffer.clear();
+            for c in word.chars() {
+                if c.is_alphanumeric() {
+                    for lc in c.to_lowercase() {
+                        self.token_buffer.push(lc);
+                    }
+                }
+            }
+
+            if self.token_buffer.is_empty() {
+                continue;
+            }
+
+            token_count += 1;
+
+            // Intern the term directly from buffer - O(1) amortized
+            let term_spur = self.term_interner.get_or_intern(&self.token_buffer);
             *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
         }
 
