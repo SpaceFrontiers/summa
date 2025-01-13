@@ -239,8 +239,10 @@ pub const BLOCK_SIZE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct BlockPostingList {
-    /// Skip list: (last_doc_id_in_block, byte_offset)
-    skip_list: Vec<(DocId, u32)>,
+    /// Skip list: (base_doc_id, last_doc_id_in_block, byte_offset)
+    /// base_doc_id is the first doc_id in the block (absolute, not delta)
+    /// This allows blocks to be independently relocated during merge
+    skip_list: Vec<(DocId, DocId, u32)>,
     /// Compressed posting data
     data: Vec<u8>,
     /// Total number of postings
@@ -261,17 +263,24 @@ impl BlockPostingList {
             let block_end = (i + BLOCK_SIZE).min(postings.len());
             let block = &postings[i..block_end];
 
-            // Record skip entry
+            // Record skip entry with base_doc_id (first doc in block)
+            let base_doc_id = block.first().unwrap().doc_id;
             let last_doc_id = block.last().unwrap().doc_id;
-            skip_list.push((last_doc_id, block_start));
+            skip_list.push((base_doc_id, last_doc_id, block_start));
 
-            // Write block
-            let mut prev_doc_id = if i == 0 { 0 } else { postings[i - 1].doc_id };
+            // Write block - first doc is stored as absolute, rest as deltas
             write_vint(&mut data, block.len() as u64)?;
 
-            for posting in block {
-                let delta = posting.doc_id - prev_doc_id;
-                write_vint(&mut data, delta as u64)?;
+            let mut prev_doc_id = base_doc_id;
+            for (j, posting) in block.iter().enumerate() {
+                if j == 0 {
+                    // First doc in block: store absolute (will be adjusted during merge)
+                    write_vint(&mut data, posting.doc_id as u64)?;
+                } else {
+                    // Rest: store delta from previous
+                    let delta = posting.doc_id - prev_doc_id;
+                    write_vint(&mut data, delta as u64)?;
+                }
                 write_vint(&mut data, posting.term_freq as u64)?;
                 prev_doc_id = posting.doc_id;
             }
@@ -291,10 +300,11 @@ impl BlockPostingList {
         // Write doc count
         writer.write_u32::<LittleEndian>(self.doc_count)?;
 
-        // Write skip list
+        // Write skip list (base_doc_id, last_doc_id, offset)
         writer.write_u32::<LittleEndian>(self.skip_list.len() as u32)?;
-        for (doc_id, offset) in &self.skip_list {
-            writer.write_u32::<LittleEndian>(*doc_id)?;
+        for (base_doc_id, last_doc_id, offset) in &self.skip_list {
+            writer.write_u32::<LittleEndian>(*base_doc_id)?;
+            writer.write_u32::<LittleEndian>(*last_doc_id)?;
             writer.write_u32::<LittleEndian>(*offset)?;
         }
 
@@ -312,9 +322,10 @@ impl BlockPostingList {
         let skip_count = reader.read_u32::<LittleEndian>()? as usize;
         let mut skip_list = Vec::with_capacity(skip_count);
         for _ in 0..skip_count {
-            let doc_id = reader.read_u32::<LittleEndian>()?;
+            let base_doc_id = reader.read_u32::<LittleEndian>()?;
+            let last_doc_id = reader.read_u32::<LittleEndian>()?;
             let offset = reader.read_u32::<LittleEndian>()?;
-            skip_list.push((doc_id, offset));
+            skip_list.push((base_doc_id, last_doc_id, offset));
         }
 
         let data_len = reader.read_u32::<LittleEndian>()? as usize;
@@ -330,6 +341,77 @@ impl BlockPostingList {
 
     pub fn doc_count(&self) -> u32 {
         self.doc_count
+    }
+
+    /// Get number of blocks
+    pub fn num_blocks(&self) -> usize {
+        self.skip_list.len()
+    }
+
+    /// Get block metadata: (base_doc_id, last_doc_id, data_offset, data_len)
+    pub fn block_info(&self, block_idx: usize) -> Option<(DocId, DocId, usize, usize)> {
+        if block_idx >= self.skip_list.len() {
+            return None;
+        }
+        let (base, last, offset) = self.skip_list[block_idx];
+        let next_offset = if block_idx + 1 < self.skip_list.len() {
+            self.skip_list[block_idx + 1].2 as usize
+        } else {
+            self.data.len()
+        };
+        Some((base, last, offset as usize, next_offset - offset as usize))
+    }
+
+    /// Get raw block data for direct copying during merge
+    pub fn block_data(&self, block_idx: usize) -> Option<&[u8]> {
+        let (_, _, offset, len) = self.block_info(block_idx)?;
+        Some(&self.data[offset..offset + len])
+    }
+
+    /// Concatenate blocks from multiple posting lists with doc_id remapping
+    /// This is O(num_blocks) instead of O(num_postings)
+    pub fn concatenate_blocks(sources: &[(BlockPostingList, u32)]) -> io::Result<Self> {
+        let mut skip_list = Vec::new();
+        let mut data = Vec::new();
+        let mut total_docs = 0u32;
+
+        for (source, doc_offset) in sources {
+            for block_idx in 0..source.num_blocks() {
+                if let Some((base, last, src_offset, len)) = source.block_info(block_idx) {
+                    let new_base = base + doc_offset;
+                    let new_last = last + doc_offset;
+                    let new_offset = data.len() as u32;
+
+                    // Copy block data, but we need to adjust the first doc_id in the block
+                    let block_bytes = &source.data[src_offset..src_offset + len];
+                    let mut reader = block_bytes;
+
+                    // Read count
+                    let count = read_vint(&mut reader)? as usize;
+
+                    // Write count
+                    write_vint(&mut data, count as u64)?;
+
+                    // Read and adjust first doc_id
+                    let first_doc = read_vint(&mut reader)? as u32;
+                    let first_tf = read_vint(&mut reader)?;
+                    write_vint(&mut data, (first_doc + doc_offset) as u64)?;
+                    write_vint(&mut data, first_tf)?;
+
+                    // Copy remaining postings unchanged (they're deltas)
+                    data.extend_from_slice(reader);
+
+                    skip_list.push((new_base, new_last, new_offset));
+                    total_docs += count as u32;
+                }
+            }
+        }
+
+        Ok(Self {
+            skip_list,
+            data,
+            doc_count: total_docs,
+        })
     }
 
     /// Create an iterator with skip support
@@ -397,22 +479,24 @@ impl<'a> BlockPostingIterator<'a> {
         self.current_block = block_idx;
         self.position_in_block = 0;
 
-        let offset = self.block_list.skip_list[block_idx].1 as usize;
+        let offset = self.block_list.skip_list[block_idx].2 as usize;
         let mut reader = &self.block_list.data[offset..];
 
         let count = read_vint(&mut reader).unwrap_or(0) as usize;
         self.block_postings.clear();
         self.block_postings.reserve(count);
 
-        let mut prev_doc_id = if block_idx == 0 {
-            0
-        } else {
-            self.block_list.skip_list[block_idx - 1].0
-        };
+        let mut prev_doc_id = 0u32;
 
-        for _ in 0..count {
-            if let (Ok(delta), Ok(tf)) = (read_vint(&mut reader), read_vint(&mut reader)) {
-                let doc_id = prev_doc_id + delta as u32;
+        for i in 0..count {
+            if let (Ok(value), Ok(tf)) = (read_vint(&mut reader), read_vint(&mut reader)) {
+                let doc_id = if i == 0 {
+                    // First doc in block: absolute value
+                    value as u32
+                } else {
+                    // Rest: delta from previous
+                    prev_doc_id + value as u32
+                };
                 self.block_postings.push(Posting {
                     doc_id,
                     term_freq: tf as u32,
@@ -461,7 +545,7 @@ impl<'a> BlockPostingIterator<'a> {
             .block_list
             .skip_list
             .iter()
-            .position(|(last_doc, _)| *last_doc >= target);
+            .position(|(_, last_doc, _)| *last_doc >= target);
 
         if let Some(block_idx) = target_block {
             if block_idx != self.current_block {

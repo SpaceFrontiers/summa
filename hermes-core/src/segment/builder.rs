@@ -25,8 +25,6 @@ use lasso::{Rodeo, Spur};
 use rustc_hash::FxHashMap;
 
 #[cfg(feature = "native")]
-use super::store::StoreWriter;
-#[cfg(feature = "native")]
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 #[cfg(feature = "native")]
 use crate::compression::CompressionLevel;
@@ -43,13 +41,9 @@ use crate::wand::WandData;
 #[cfg(feature = "native")]
 use crate::{DocId, Result};
 
-/// Threshold for flushing a posting list to disk (number of postings)
+/// Size of the document store buffer before writing to disk
 #[cfg(feature = "native")]
-const POSTING_FLUSH_THRESHOLD: usize = 10_000;
-
-/// Size of the posting spill buffer before writing to disk
-#[cfg(feature = "native")]
-const SPILL_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
+const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
 /// Number of shards for the inverted index
 /// Power of 2 for fast modulo via bitwise AND
@@ -79,7 +73,7 @@ impl TermKey {
 /// Each shard is a smaller hashmap that fits better in CPU cache
 #[cfg(feature = "native")]
 struct ShardedInvertedIndex {
-    shards: Vec<HashMap<TermKey, PostingListMeta>>,
+    shards: Vec<HashMap<TermKey, PostingListBuilder>>,
 }
 
 #[cfg(feature = "native")]
@@ -92,18 +86,12 @@ impl ShardedInvertedIndex {
         Self { shards }
     }
 
+    /// Get or insert a posting list for the given term key
     #[inline]
-    fn get_mut(&mut self, key: &TermKey) -> Option<&mut PostingListMeta> {
-        self.shards[key.shard()].get_mut(key)
-    }
-
-    /// Get or insert a posting list meta for the given term key
-    /// The arena_len is used to set the start position for new terms
-    #[inline]
-    fn get_or_insert(&mut self, key: TermKey, arena_len: u32) -> &mut PostingListMeta {
+    fn get_or_insert(&mut self, key: TermKey) -> &mut PostingListBuilder {
         self.shards[key.shard()]
             .entry(key)
-            .or_insert_with(|| PostingListMeta::new(arena_len))
+            .or_insert_with(PostingListBuilder::new)
     }
 
     fn len(&self) -> usize {
@@ -115,7 +103,7 @@ impl ShardedInvertedIndex {
         self.shards
             .iter()
             .flat_map(|s| s.values())
-            .map(|p| p.len as usize)
+            .map(|p| p.postings.len())
             .sum()
     }
 
@@ -136,13 +124,13 @@ impl ShardedInvertedIndex {
 /// Iterator over all entries in the sharded index
 #[cfg(feature = "native")]
 struct ShardedIndexIter<'a> {
-    shards: std::slice::Iter<'a, HashMap<TermKey, PostingListMeta>>,
-    current: Option<hashbrown::hash_map::Iter<'a, TermKey, PostingListMeta>>,
+    shards: std::slice::Iter<'a, HashMap<TermKey, PostingListBuilder>>,
+    current: Option<hashbrown::hash_map::Iter<'a, TermKey, PostingListBuilder>>,
 }
 
 #[cfg(feature = "native")]
 impl<'a> Iterator for ShardedIndexIter<'a> {
-    type Item = (&'a TermKey, &'a PostingListMeta);
+    type Item = (&'a TermKey, &'a PostingListBuilder);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -162,7 +150,7 @@ impl<'a> Iterator for ShardedIndexIter<'a> {
 
 #[cfg(feature = "native")]
 impl<'a> IntoIterator for &'a ShardedInvertedIndex {
-    type Item = (&'a TermKey, &'a PostingListMeta);
+    type Item = (&'a TermKey, &'a PostingListBuilder);
     type IntoIter = ShardedIndexIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -173,106 +161,47 @@ impl<'a> IntoIterator for &'a ShardedInvertedIndex {
     }
 }
 
-/// Compact posting entry for in-memory storage (6 bytes)
+/// Compact posting entry for in-memory storage
 #[cfg(feature = "native")]
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
 struct CompactPosting {
     doc_id: DocId,
     term_freq: u16,
 }
 
-/// Metadata for a term's posting list (stored in hashmap, points into arena)
+/// In-memory posting list for a term
 #[cfg(feature = "native")]
-#[derive(Clone, Copy)]
-struct PostingListMeta {
-    /// Start index in the posting arena
-    start: u32,
-    /// Number of postings in arena
-    len: u32,
-    /// Last doc_id for merging duplicate postings
-    last_doc_id: DocId,
-    /// Offset in spill file (-1 if none)
-    spill_offset: i64,
-    /// Number of postings in spill file
-    spill_count: u32,
+struct PostingListBuilder {
+    /// In-memory postings
+    postings: Vec<CompactPosting>,
 }
 
 #[cfg(feature = "native")]
-impl PostingListMeta {
-    fn new(start: u32) -> Self {
+impl PostingListBuilder {
+    fn new() -> Self {
         Self {
-            start,
-            len: 0,
-            last_doc_id: u32::MAX,
-            spill_offset: -1,
-            spill_count: 0,
+            postings: Vec::new(),
         }
     }
 
-    fn total_count(&self) -> usize {
-        self.len as usize + self.spill_count as usize
-    }
-
-    fn needs_spill(&self) -> bool {
-        self.len as usize >= POSTING_FLUSH_THRESHOLD
-    }
-}
-
-/// Arena for storing all postings contiguously
-/// Eliminates millions of small Vec allocations
-#[cfg(feature = "native")]
-struct PostingArena {
-    /// Single contiguous buffer for all postings
-    data: Vec<CompactPosting>,
-}
-
-#[cfg(feature = "native")]
-impl PostingArena {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(capacity),
-        }
-    }
-
-    /// Add a posting for a term, returns true if added (false if merged with last)
+    /// Add a posting, merging if same doc_id as last
     #[inline]
-    fn add(&mut self, meta: &mut PostingListMeta, doc_id: DocId, term_freq: u32) {
-        // Check if we can merge with the last posting for this term
-        if meta.len > 0 && meta.last_doc_id == doc_id {
-            // Merge: update the last posting's term_freq
-            let idx = meta.start as usize + meta.len as usize - 1;
-            let posting = &mut self.data[idx];
-            posting.term_freq = posting.term_freq.saturating_add(term_freq as u16);
+    fn add(&mut self, doc_id: DocId, term_freq: u32) {
+        // Check if we can merge with the last posting
+        if let Some(last) = self.postings.last_mut()
+            && last.doc_id == doc_id
+        {
+            last.term_freq = last.term_freq.saturating_add(term_freq as u16);
             return;
         }
-
-        // Add new posting
-        self.data.push(CompactPosting {
+        self.postings.push(CompactPosting {
             doc_id,
             term_freq: term_freq.min(u16::MAX as u32) as u16,
         });
-        meta.len += 1;
-        meta.last_doc_id = doc_id;
-    }
-
-    /// Get postings for a term
-    fn get_postings(&self, meta: &PostingListMeta) -> &[CompactPosting] {
-        let start = meta.start as usize;
-        let end = start + meta.len as usize;
-        &self.data[start..end]
-    }
-
-    /// Clear postings for a term (after spilling)
-    fn clear_postings(&mut self, meta: &mut PostingListMeta) {
-        // We can't actually remove from middle of arena, but we mark as empty
-        // The space is "wasted" but avoids reallocation
-        meta.len = 0;
-        meta.start = self.data.len() as u32; // Point to end for future adds
     }
 
     fn len(&self) -> usize {
-        self.data.len()
+        self.postings.len()
     }
 }
 
@@ -294,8 +223,6 @@ pub struct SegmentBuilderStats {
     pub shard_min: usize,
     pub shard_max: usize,
     pub shard_avg: usize,
-    /// Spill file offset (bytes written to disk)
-    pub spill_bytes: u64,
 }
 
 /// Configuration for segment builder
@@ -347,17 +274,9 @@ pub struct SegmentBuilder {
     /// Each shard is a smaller hashmap that fits better in CPU cache
     inverted_index: ShardedInvertedIndex,
 
-    /// Arena for all postings - single contiguous allocation
-    posting_arena: PostingArena,
-
     /// Streaming document store writer
     store_file: BufWriter<File>,
     store_path: PathBuf,
-
-    /// Spill file for large posting lists
-    spill_file: Option<BufWriter<File>>,
-    spill_path: PathBuf,
-    spill_offset: u64,
 
     /// Document count
     next_doc_id: DocId,
@@ -379,9 +298,6 @@ pub struct SegmentBuilder {
     /// Avoids allocating a new hashmap for each document
     local_tf_buffer: FxHashMap<Spur, u32>,
 
-    /// Reusable buffer for terms that need spilling
-    terms_to_spill_buffer: Vec<TermKey>,
-
     /// Reusable buffer for tokenization to avoid per-token String allocations
     token_buffer: String,
 }
@@ -394,12 +310,9 @@ impl SegmentBuilder {
         let store_path = config
             .temp_dir
             .join(format!("hermes_store_{}.tmp", segment_id));
-        let spill_path = config
-            .temp_dir
-            .join(format!("hermes_spill_{}.tmp", segment_id));
 
         let store_file = BufWriter::with_capacity(
-            SPILL_BUFFER_SIZE,
+            STORE_BUFFER_SIZE,
             OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -424,12 +337,8 @@ impl SegmentBuilder {
             inverted_index: ShardedInvertedIndex::new(
                 config.posting_map_capacity / NUM_INDEX_SHARDS,
             ),
-            posting_arena: PostingArena::with_capacity(config.posting_map_capacity * 4),
             store_file,
             store_path,
-            spill_file: None,
-            spill_path,
-            spill_offset: 0,
             next_doc_id: 0,
             field_stats: FxHashMap::default(),
             doc_field_lengths: Vec::new(),
@@ -437,7 +346,6 @@ impl SegmentBuilder {
             field_to_slot,
             wand_data: None,
             local_tf_buffer: FxHashMap::default(),
-            terms_to_spill_buffer: Vec::new(),
             token_buffer: String::with_capacity(64),
             config,
         })
@@ -474,7 +382,6 @@ impl SegmentBuilder {
             shard_min,
             shard_max,
             shard_avg,
-            spill_bytes: self.spill_offset,
         }
     }
 
@@ -567,9 +474,7 @@ impl SegmentBuilder {
 
         // Phase 2: Insert aggregated terms into inverted index
         // Now we only do one inverted_index lookup per unique term in doc
-        // Reuse buffer for terms to spill
         let field_id = field.0;
-        self.terms_to_spill_buffer.clear();
 
         for (&term_spur, &tf) in &self.local_tf_buffer {
             let term_key = TermKey {
@@ -577,20 +482,8 @@ impl SegmentBuilder {
                 term: term_spur,
             };
 
-            let arena_len = self.posting_arena.len() as u32;
-            let meta = self.inverted_index.get_or_insert(term_key, arena_len);
-            self.posting_arena.add(meta, doc_id, tf);
-
-            // Mark for spilling if needed
-            if meta.needs_spill() {
-                self.terms_to_spill_buffer.push(term_key);
-            }
-        }
-
-        // Phase 3: Spill large posting lists
-        for i in 0..self.terms_to_spill_buffer.len() {
-            let term_key = self.terms_to_spill_buffer[i];
-            self.spill_posting_list(term_key)?;
+            let posting = self.inverted_index.get_or_insert(term_key);
+            posting.add(doc_id, tf);
         }
 
         Ok(token_count)
@@ -606,9 +499,8 @@ impl SegmentBuilder {
             term: term_spur,
         };
 
-        let arena_len = self.posting_arena.len() as u32;
-        let meta = self.inverted_index.get_or_insert(term_key, arena_len);
-        self.posting_arena.add(meta, doc_id, 1);
+        let posting = self.inverted_index.get_or_insert(term_key);
+        posting.add(doc_id, 1);
 
         Ok(())
     }
@@ -626,46 +518,6 @@ impl SegmentBuilder {
         Ok(())
     }
 
-    /// Spill a large posting list to disk
-    fn spill_posting_list(&mut self, term_key: TermKey) -> Result<()> {
-        use byteorder::{LittleEndian, WriteBytesExt};
-
-        // Initialize spill file if needed
-        if self.spill_file.is_none() {
-            let file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .truncate(true)
-                .open(&self.spill_path)?;
-            self.spill_file = Some(BufWriter::with_capacity(SPILL_BUFFER_SIZE, file));
-        }
-
-        let meta = self.inverted_index.get_mut(&term_key).unwrap();
-        let postings = self.posting_arena.get_postings(meta);
-
-        // Record spill offset if this is first spill for this term
-        if meta.spill_offset < 0 {
-            meta.spill_offset = self.spill_offset as i64;
-        }
-
-        let spill_file = self.spill_file.as_mut().unwrap();
-
-        // Write postings to spill file
-        for p in postings {
-            spill_file.write_u32::<LittleEndian>(p.doc_id)?;
-            spill_file.write_u16::<LittleEndian>(p.term_freq)?;
-            self.spill_offset += 6; // 4 bytes doc_id + 2 bytes term_freq
-        }
-
-        meta.spill_count += meta.len;
-
-        // Clear postings in arena (mark as empty, point to end for future adds)
-        self.posting_arena.clear_postings(meta);
-
-        Ok(())
-    }
-
     /// Build the final segment
     pub async fn build<D: Directory + DirectoryWriter>(
         mut self,
@@ -674,9 +526,6 @@ impl SegmentBuilder {
     ) -> Result<SegmentMeta> {
         // Flush any buffered data
         self.store_file.flush()?;
-        if let Some(ref mut spill) = self.spill_file {
-            spill.flush()?;
-        }
 
         let files = SegmentFiles::new(segment_id.0);
 
@@ -701,7 +550,6 @@ impl SegmentBuilder {
 
         // Cleanup temp files
         let _ = std::fs::remove_file(&self.store_path);
-        let _ = std::fs::remove_file(&self.spill_path);
 
         Ok(meta)
     }
@@ -712,54 +560,24 @@ impl SegmentBuilder {
 
         // We need to sort terms for SSTable, so collect into BTreeMap
         // Key format: field_id (4 bytes) + term bytes
-        let mut sorted_terms: BTreeMap<Vec<u8>, &PostingListMeta> = BTreeMap::new();
+        let mut sorted_terms: BTreeMap<Vec<u8>, &PostingListBuilder> = BTreeMap::new();
 
-        for (term_key, meta) in &self.inverted_index {
+        for (term_key, posting_list) in &self.inverted_index {
             let term_str = self.term_interner.resolve(&term_key.term);
             let mut key = Vec::with_capacity(4 + term_str.len());
             key.extend_from_slice(&term_key.field.to_le_bytes());
             key.extend_from_slice(term_str.as_bytes());
-            sorted_terms.insert(key, meta);
+            sorted_terms.insert(key, posting_list);
         }
 
         let mut term_dict = Vec::new();
         let mut postings = Vec::new();
         let mut writer = SSTableWriter::<TermInfo>::new(&mut term_dict);
 
-        // Memory-map spill file if it exists
-        let spill_mmap = if self.spill_file.is_some() {
-            drop(self.spill_file.take()); // Close writer
-            let file = File::open(&self.spill_path)?;
-            Some(unsafe { memmap2::Mmap::map(&file)? })
-        } else {
-            None
-        };
-
-        for (key, meta) in sorted_terms {
-            // Reconstruct full posting list
-            let mut full_postings = PostingList::with_capacity(meta.total_count());
-
-            // Read spilled postings first (they come before in-memory ones)
-            if meta.spill_offset >= 0
-                && let Some(ref mmap) = spill_mmap
-            {
-                let mut offset = meta.spill_offset as usize;
-                for _ in 0..meta.spill_count {
-                    let doc_id = u32::from_le_bytes([
-                        mmap[offset],
-                        mmap[offset + 1],
-                        mmap[offset + 2],
-                        mmap[offset + 3],
-                    ]);
-                    let term_freq = u16::from_le_bytes([mmap[offset + 4], mmap[offset + 5]]);
-                    full_postings.push(doc_id, term_freq as u32);
-                    offset += 6;
-                }
-            }
-
-            // Add in-memory postings from arena
-            let arena_postings = self.posting_arena.get_postings(meta);
-            for p in arena_postings {
+        for (key, posting_builder) in sorted_terms {
+            // Build posting list from in-memory postings
+            let mut full_postings = PostingList::with_capacity(posting_builder.len());
+            for p in &posting_builder.postings {
                 full_postings.push(p.doc_id, p.term_freq as u32);
             }
 
@@ -790,6 +608,8 @@ impl SegmentBuilder {
 
     /// Build document store from streamed temp file
     fn build_store_from_stream(&mut self) -> Result<Vec<u8>> {
+        use super::store::EagerParallelStoreWriter;
+
         // Memory-map the temp store file
         drop(std::mem::replace(
             &mut self.store_file,
@@ -799,10 +619,13 @@ impl SegmentBuilder {
         let file = File::open(&self.store_path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-        // Re-compress with proper block structure
+        // Re-compress with proper block structure using parallel compression
         let mut store_data = Vec::new();
-        let mut store_writer =
-            StoreWriter::with_compression_level(&mut store_data, self.config.compression_level);
+        let mut store_writer = EagerParallelStoreWriter::with_compression_level(
+            &mut store_data,
+            self.config.num_compression_threads,
+            self.config.compression_level,
+        );
 
         let mut offset = 0usize;
         while offset < mmap.len() {
@@ -841,6 +664,5 @@ impl Drop for SegmentBuilder {
     fn drop(&mut self) {
         // Cleanup temp files on drop
         let _ = std::fs::remove_file(&self.store_path);
-        let _ = std::fs::remove_file(&self.spill_path);
     }
 }

@@ -372,7 +372,7 @@ async fn index_from_reader<R: BufRead>(
             // Get builder stats for debugging
             if let Some(stats) = writer.get_builder_stats().await {
                 info!(
-                    "Progress: {} docs ({:.0}/s) | terms: {} | postings: {} | interned: {} | shards: {}-{}-{} | spill: {}KB",
+                    "Progress: {} docs ({:.0}/s) | terms: {} | postings: {} | interned: {} | shards: {}-{}-{}",
                     count,
                     rate,
                     stats.unique_terms,
@@ -381,7 +381,6 @@ async fn index_from_reader<R: BufRead>(
                     stats.shard_min,
                     stats.shard_avg,
                     stats.shard_max,
-                    stats.spill_bytes / 1024
                 );
             } else {
                 info!(

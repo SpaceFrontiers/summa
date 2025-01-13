@@ -46,8 +46,6 @@ pub struct IndexConfig {
     pub store_cache_blocks: usize,
     /// Max documents per segment before auto-commit
     pub max_docs_per_segment: u32,
-    /// Min segments to trigger merge
-    pub merge_threshold: usize,
     /// Index optimization mode (adaptive, size-optimized, performance-optimized)
     pub optimization: crate::structures::IndexOptimization,
 }
@@ -66,7 +64,6 @@ impl Default for IndexConfig {
             term_cache_blocks: 256,
             store_cache_blocks: 32,
             max_docs_per_segment: 100_000,
-            merge_threshold: 5,
             optimization: crate::structures::IndexOptimization::default(),
         }
     }
@@ -655,20 +652,14 @@ impl<D: DirectoryWriter> IndexWriter<D> {
             .write(Path::new("segments.json"), &segments_bytes)
             .await?;
 
-        // Check if merge is needed
-        if segment_ids.len() >= self.config.merge_threshold {
-            drop(segment_ids); // Release lock
-            self.maybe_merge().await?;
-        }
-
         Ok(())
     }
 
-    /// Merge segments if threshold is reached
-    async fn maybe_merge(&self) -> Result<()> {
+    /// Merge all segments into one (called explicitly via force_merge)
+    async fn do_merge(&self) -> Result<()> {
         let segment_ids = self.segment_ids.lock().await;
 
-        if segment_ids.len() < self.config.merge_threshold {
+        if segment_ids.len() < 2 {
             return Ok(());
         }
 
@@ -726,60 +717,8 @@ impl<D: DirectoryWriter> IndexWriter<D> {
     pub async fn force_merge(&self) -> Result<()> {
         // First commit any pending documents
         self.commit().await?;
-
-        let segment_ids = self.segment_ids.lock().await;
-        if segment_ids.len() <= 1 {
-            return Ok(());
-        }
-
-        let ids_to_merge: Vec<String> = segment_ids.clone();
-        drop(segment_ids);
-
-        // Load all segments
-        let mut readers = Vec::new();
-        let mut doc_offset = 0u32;
-
-        for id_str in &ids_to_merge {
-            let segment_id = SegmentId::from_hex(id_str)
-                .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = SegmentReader::open(
-                self.directory.as_ref(),
-                segment_id,
-                Arc::clone(&self.schema),
-                doc_offset,
-                self.config.term_cache_blocks,
-            )
-            .await?;
-            doc_offset += reader.meta().num_docs;
-            readers.push(reader);
-        }
-
-        // Merge
-        let merger = SegmentMerger::new(Arc::clone(&self.schema));
-        let new_segment_id = SegmentId::new();
-        merger
-            .merge(self.directory.as_ref(), &readers, new_segment_id)
-            .await?;
-
-        // Update segment list
-        let mut segment_ids = self.segment_ids.lock().await;
-        segment_ids.clear();
-        segment_ids.push(new_segment_id.to_hex());
-
-        let segments_bytes =
-            serde_json::to_vec(&*segment_ids).map_err(|e| Error::Serialization(e.to_string()))?;
-        self.directory
-            .write(Path::new("segments.json"), &segments_bytes)
-            .await?;
-
-        // Delete old segments
-        for id_str in ids_to_merge {
-            if let Some(segment_id) = SegmentId::from_hex(&id_str) {
-                let _ = crate::segment::delete_segment(self.directory.as_ref(), segment_id).await;
-            }
-        }
-
-        Ok(())
+        // Then merge all segments
+        self.do_merge().await
     }
 }
 
@@ -839,7 +778,6 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig {
             max_docs_per_segment: 5, // Small segments for testing
-            merge_threshold: 10,     // Don't auto-merge
             ..Default::default()
         };
 
@@ -872,7 +810,6 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig {
             max_docs_per_segment: 3,
-            merge_threshold: 100, // Don't auto-merge
             ..Default::default()
         };
 
