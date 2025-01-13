@@ -687,7 +687,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "0.4.13"
+version = "0.4.14"
 dependencies = [
  "async-trait",
  "base64",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core-python"
-version = "0.4.13"
+version = "0.4.14"
 dependencies = [
  "hermes-core",
  "pyo3",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "0.4.13"
+version = "0.4.14"
 dependencies = [
  "anyhow",
  "clap",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "0.4.13"
+version = "0.4.14"
 dependencies = [
  "anyhow",
  "bincode",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "0.4.13"
+version = "0.4.14"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
