@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hermes-core-python"
-version = "0.4.12"
+version = "0.4.13"
 description = "Python bindings for Hermes search engine"
 readme = "../README.md"
 license = { text = "MIT" }
