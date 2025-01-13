@@ -20,7 +20,7 @@ use std::sync::Arc;
 #[cfg(feature = "native")]
 use hashbrown::HashMap;
 #[cfg(feature = "native")]
-use lasso::{Rodeo, Spur};
+use lasso::{Key, Rodeo, Spur};
 #[cfg(feature = "native")]
 use rustc_hash::FxHashMap;
 
@@ -61,17 +61,17 @@ const NUM_INDEX_SHARDS: usize = 64;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TermKey {
     field: u32,
-    term: Spur,
+    term: ShardedSpur,
 }
 
 #[cfg(feature = "native")]
 impl TermKey {
-    /// Get shard index for this term key (uses term's internal id for distribution)
+    /// Get shard index for this term key (uses term's packed id for distribution)
     #[inline]
     fn shard(&self) -> usize {
-        // Spur wraps NonZero<u32>, get the raw value for sharding
+        // Use the packed value for sharding (combines shard + local_id)
         // Using bitwise AND since NUM_INDEX_SHARDS is power of 2
-        (self.term.into_inner().get() as usize) & (NUM_INDEX_SHARDS - 1)
+        (self.term.packed as usize) & (NUM_INDEX_SHARDS - 1)
     }
 }
 
@@ -169,6 +169,89 @@ impl<'a> IntoIterator for &'a ShardedInvertedIndex {
             shards: self.shards.iter(),
             current: None,
         }
+    }
+}
+
+/// Number of shards for the term interner
+/// Power of 2 for fast modulo via bitwise AND
+#[cfg(feature = "native")]
+const NUM_INTERNER_SHARDS: usize = 64;
+
+/// Sharded term ID combining shard index and local Spur
+/// Layout: [8 bits shard][24 bits local_id]
+#[cfg(feature = "native")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ShardedSpur {
+    /// Combined shard (high 8 bits) and local id (low 24 bits)
+    packed: u32,
+}
+
+#[cfg(feature = "native")]
+impl ShardedSpur {
+    #[inline]
+    fn new(shard: u8, local_spur: Spur) -> Self {
+        let local_id = local_spur.into_inner().get();
+        debug_assert!(local_id < (1 << 24), "Local spur ID overflow");
+        Self {
+            packed: ((shard as u32) << 24) | (local_id & 0x00FF_FFFF),
+        }
+    }
+
+    #[inline]
+    fn shard(self) -> usize {
+        (self.packed >> 24) as usize
+    }
+
+    #[inline]
+    fn local_id(self) -> u32 {
+        self.packed & 0x00FF_FFFF
+    }
+}
+
+/// Sharded string interner for better cache locality with large term counts
+/// Each shard is an independent Rodeo interner
+#[cfg(feature = "native")]
+struct ShardedTermInterner {
+    shards: Vec<Rodeo>,
+}
+
+#[cfg(feature = "native")]
+impl ShardedTermInterner {
+    fn new() -> Self {
+        let mut shards = Vec::with_capacity(NUM_INTERNER_SHARDS);
+        for _ in 0..NUM_INTERNER_SHARDS {
+            shards.push(Rodeo::new());
+        }
+        Self { shards }
+    }
+
+    /// Hash a string to determine its shard
+    #[inline]
+    fn shard_for_str(s: &str) -> usize {
+        // Use FxHash for fast hashing
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        s.hash(&mut hasher);
+        (hasher.finish() as usize) & (NUM_INTERNER_SHARDS - 1)
+    }
+
+    /// Get or intern a string, returning a sharded spur
+    #[inline]
+    fn get_or_intern(&mut self, s: &str) -> ShardedSpur {
+        let shard_idx = Self::shard_for_str(s);
+        let local_spur = self.shards[shard_idx].get_or_intern(s);
+        ShardedSpur::new(shard_idx as u8, local_spur)
+    }
+
+    /// Resolve a sharded spur back to its string
+    #[inline]
+    fn resolve(&self, spur: ShardedSpur) -> &str {
+        self.shards[spur.shard()].resolve(&Spur::try_from_usize(spur.local_id() as usize).unwrap())
+    }
+
+    /// Total number of interned strings across all shards
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
     }
 }
 
@@ -298,8 +381,9 @@ pub struct SegmentBuilder {
     config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
 
-    /// String interner for terms - O(1) lookup and deduplication
-    term_interner: Rodeo,
+    /// Sharded string interner for terms - O(1) lookup and deduplication
+    /// Sharded for better cache locality with large term counts
+    term_interner: ShardedTermInterner,
 
     /// Sharded inverted index for better cache locality
     /// Each shard is a smaller hashmap that fits better in CPU cache
@@ -332,7 +416,7 @@ pub struct SegmentBuilder {
 
     /// Reusable buffer for per-document term frequency aggregation
     /// Avoids allocating a new hashmap for each document
-    local_tf_buffer: FxHashMap<Spur, u32>,
+    local_tf_buffer: FxHashMap<ShardedSpur, u32>,
 
     /// Reusable buffer for terms that need spilling
     terms_to_spill_buffer: Vec<TermKey>,
@@ -372,7 +456,7 @@ impl SegmentBuilder {
         Ok(Self {
             schema,
             tokenizers: FxHashMap::default(),
-            term_interner: Rodeo::new(),
+            term_interner: ShardedTermInterner::new(),
             inverted_index: ShardedInvertedIndex::new(
                 config.posting_map_capacity / NUM_INDEX_SHARDS,
             ),
@@ -650,7 +734,7 @@ impl SegmentBuilder {
         let mut sorted_terms: BTreeMap<Vec<u8>, &SpillablePostingList> = BTreeMap::new();
 
         for (term_key, posting_list) in &self.inverted_index {
-            let term_str = self.term_interner.resolve(&term_key.term);
+            let term_str = self.term_interner.resolve(term_key.term);
             let mut key = Vec::with_capacity(4 + term_str.len());
             key.extend_from_slice(&term_key.field.to_le_bytes());
             key.extend_from_slice(term_str.as_bytes());
