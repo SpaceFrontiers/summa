@@ -31,6 +31,7 @@ pub const STORE_BLOCK_SIZE: usize = 256 * 1024;
 pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
 
 /// Default compression level for document store
+#[cfg(feature = "native")]
 const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel(7);
 
 pub fn serialize_document(doc: &Document, _schema: &Schema) -> io::Result<Vec<u8>> {

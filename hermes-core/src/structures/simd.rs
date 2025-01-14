@@ -520,8 +520,10 @@ mod sse {
         for group in 0..full_groups {
             let base = group * 4;
 
-            // Load 4 bytes and zero-extend to u32
-            let bytes = _mm_cvtsi32_si128(*(input.as_ptr().add(base) as *const i32));
+            // Load 4 bytes (unaligned) and zero-extend to u32
+            let bytes = _mm_cvtsi32_si128(std::ptr::read_unaligned(
+                input.as_ptr().add(base) as *const i32
+            ));
             let d = _mm_cvtepu8_epi32(bytes);
 
             // Add 1 (since we store gap-1)
@@ -574,8 +576,8 @@ mod sse {
             let base = group * 4;
             let in_ptr = input.as_ptr().add(base * 2);
 
-            // Load 8 bytes (4 u16 values) and zero-extend to u32
-            let vals = _mm_loadl_epi64(in_ptr as *const __m128i);
+            // Load 8 bytes (4 u16 values, unaligned) and zero-extend to u32
+            let vals = _mm_loadl_epi64(in_ptr as *const __m128i); // loadl_epi64 supports unaligned
             let d = _mm_cvtepu16_epi32(vals);
 
             // Add 1 (since we store gap-1)

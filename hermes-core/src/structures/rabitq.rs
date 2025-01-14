@@ -705,7 +705,7 @@ mod tests {
         let qv = index.quantize_vector(&raw);
 
         // D bits = D/8 bytes for bits, plus 3 floats (12 bytes)
-        let expected_bits = (dim + 7) / 8;
+        let expected_bits = dim.div_ceil(8);
         assert_eq!(qv.bits.len(), expected_bits);
 
         // Total: bits + 12 bytes for floats
