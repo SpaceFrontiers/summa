@@ -359,12 +359,14 @@ impl QueryLanguageParser {
                                 }
                             }
                             Rule::ann_param => {
-                                let mut param_inner = param.into_inner();
-                                if let (Some(name), Some(value)) =
-                                    (param_inner.next(), param_inner.next())
-                                {
-                                    let val: usize = value.as_str().parse().unwrap_or(0);
-                                    match name.as_str() {
+                                // ann_param = { ("k" | "nprobe" | "rerank") ~ "=" ~ number }
+                                // The param.as_str() contains the full "k=20" string
+                                let param_str = param.as_str();
+                                if let Some(eq_pos) = param_str.find('=') {
+                                    let name = &param_str[..eq_pos];
+                                    let value = &param_str[eq_pos + 1..];
+                                    let val: usize = value.parse().unwrap_or(0);
+                                    match name {
                                         "k" => k = val,
                                         "nprobe" => nprobe = val,
                                         "rerank" => rerank = val,
@@ -423,12 +425,15 @@ impl QueryLanguageParser {
                                 k = v;
                             }
                         } else if param.as_rule() == Rule::ann_param {
-                            let mut param_inner = param.into_inner();
-                            if let (Some(name), Some(value)) =
-                                (param_inner.next(), param_inner.next())
-                                && name.as_str() == "k"
-                            {
-                                k = value.as_str().parse().unwrap_or(10);
+                            // ann_param = { ("k" | "nprobe" | "rerank") ~ "=" ~ number }
+                            // The param.as_str() contains the full "k=20" string
+                            let param_str = param.as_str();
+                            if let Some(eq_pos) = param_str.find('=') {
+                                let name = &param_str[..eq_pos];
+                                let value = &param_str[eq_pos + 1..];
+                                if name == "k" {
+                                    k = value.parse().unwrap_or(10);
+                                }
                             }
                         }
                     }
