@@ -958,6 +958,14 @@ impl BlockSparsePostingList {
         BlockSparsePostingIterator::new(self)
     }
 
+    /// Approximate size in bytes
+    pub fn size_bytes(&self) -> usize {
+        // Header: quantization (1) + scale (4) + min_val (4) + doc_count (4) = 13
+        // Skip list: count (4) + global_max (4) + entries * (first_doc + last_doc + offset + max_weight) = 4 + 4 + n * 16
+        // Data: data.len()
+        13 + 8 + self.skip_list.len() * 16 + self.data.len()
+    }
+
     /// Concatenate multiple posting lists with doc_id remapping
     pub fn concatenate(
         sources: &[(BlockSparsePostingList, u32)],
@@ -1121,6 +1129,12 @@ impl<'a> BlockSparsePostingIterator<'a> {
         for (doc_id, weight) in doc_ids.into_iter().zip(weights.into_iter()) {
             self.block_postings.push((doc_id, weight));
         }
+    }
+
+    /// Check if iterator is exhausted
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// Current document ID

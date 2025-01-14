@@ -599,6 +599,11 @@ impl RaBitQIndex {
         vectors_size + centroid_size + transform_size + raw_size
     }
 
+    /// Alias for memory_usage (for benchmark compatibility)
+    pub fn size_bytes(&self) -> usize {
+        self.memory_usage()
+    }
+
     /// Compression ratio compared to raw float32 vectors
     pub fn compression_ratio(&self) -> f32 {
         if self.vectors.is_empty() {

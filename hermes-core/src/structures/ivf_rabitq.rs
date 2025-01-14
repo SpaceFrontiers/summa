@@ -785,6 +785,28 @@ impl IVFRaBitQIndex {
     pub fn is_empty(&self) -> bool {
         self.num_vectors == 0
     }
+
+    /// Approximate size in bytes
+    pub fn size_bytes(&self) -> usize {
+        let mut size = 0;
+        for cluster in self.clusters.values() {
+            // doc_ids: 4 bytes each
+            size += cluster.doc_ids.len() * 4;
+            // binary_codes (quantized vectors)
+            for qv in &cluster.binary_codes {
+                size += qv.bits.len() + 12; // bits + dist_to_centroid + self_dot + popcount
+            }
+            // raw_vectors if present
+            if let Some(ref raw) = cluster.raw_vectors {
+                for v in raw {
+                    size += v.len() * 4;
+                }
+            }
+            // centroid + random_signs + random_perm
+            size += self.config.dim * 4 + self.config.dim + self.config.dim * 4;
+        }
+        size
+    }
 }
 
 /// Prepared query for fast distance estimation

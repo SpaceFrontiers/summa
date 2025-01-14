@@ -46,10 +46,16 @@ pub use structures::{
 pub use directories::FsDirectory;
 #[cfg(feature = "http")]
 pub use directories::HttpDirectory;
+#[cfg(feature = "native")]
+pub use directories::MmapDirectory;
 pub use directories::{
     AsyncFileRead, CachingDirectory, Directory, DirectoryWriter, FileSlice, LazyFileHandle,
     LazyFileSlice, OwnedBytes, RamDirectory, SliceCacheStats, SliceCachingDirectory,
 };
+
+/// Default directory type for native builds - uses memory-mapped files for efficient access
+#[cfg(feature = "native")]
+pub type DefaultDirectory = MmapDirectory;
 
 // Re-exports from segment
 pub use segment::{
