@@ -7,6 +7,10 @@ use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+#[cfg(not(feature = "native"))]
+use rand::SeedableRng;
+#[cfg(not(feature = "native"))]
+use rand::prelude::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use super::soar::{MultiAssignment, SoarConfig};
