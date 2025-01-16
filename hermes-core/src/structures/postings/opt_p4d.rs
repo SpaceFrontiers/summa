@@ -15,7 +15,7 @@
 //! - Main array: 128 values packed at `bit_width` bits each
 //! - Exceptions: [position (7 bits), high_bits (32 - bit_width bits)] for each exception
 
-use super::simd;
+use crate::structures::simd;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 

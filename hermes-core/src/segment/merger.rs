@@ -341,6 +341,7 @@ impl SegmentMerger {
     }
     /// Merge dense vector indexes from multiple segments into unified file
     ///
+    /// For ScaNN (IVF-PQ): O(1) merge by concatenating cluster data (same codebook)
     /// For IVF-RaBitQ: O(1) merge by concatenating cluster data (same centroids)
     /// For RaBitQ: Must rebuild with new centroid from all vectors
     async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
@@ -351,11 +352,51 @@ impl SegmentMerger {
     ) -> Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
 
-        let mut field_indexes: Vec<(u32, Vec<u8>)> = Vec::new();
+        // (field_id, index_type, data)
+        let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
 
         for (field, entry) in self.schema.fields() {
             if !matches!(entry.field_type, FieldType::DenseVector) {
                 continue;
+            }
+
+            // Check if all segments have ScaNN indexes for this field
+            let scann_indexes: Vec<_> = segments
+                .iter()
+                .filter_map(|s| s.get_scann_vector_index(field))
+                .collect();
+
+            if scann_indexes.len()
+                == segments
+                    .iter()
+                    .filter(|s| s.has_dense_vector_index(field))
+                    .count()
+                && !scann_indexes.is_empty()
+            {
+                // All segments have ScaNN - use O(1) cluster merge!
+                let refs: Vec<&crate::structures::IVFPQIndex> =
+                    scann_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
+
+                // Calculate doc_id offsets
+                let mut doc_offsets = Vec::with_capacity(segments.len());
+                let mut offset = 0u32;
+                for segment in segments {
+                    doc_offsets.push(offset);
+                    offset += segment.num_docs();
+                }
+
+                match crate::structures::IVFPQIndex::merge(&refs, &doc_offsets) {
+                    Ok(merged) => {
+                        let bytes = merged
+                            .to_bytes()
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                        field_indexes.push((field.0, 2u8, bytes)); // 2 = ScaNN
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("ScaNN merge failed: {}, falling back to IVF", e);
+                    }
+                }
             }
 
             // Check if all segments have IVF indexes for this field
@@ -385,9 +426,10 @@ impl SegmentMerger {
 
                 match crate::structures::IVFRaBitQIndex::merge(&refs, &doc_offsets) {
                     Ok(merged) => {
-                        let bytes = serde_json::to_vec(&merged)
+                        let bytes = merged
+                            .to_bytes()
                             .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        field_indexes.push((field.0, bytes));
+                        field_indexes.push((field.0, 1u8, bytes)); // 1 = IVF-RaBitQ
                         continue;
                     }
                     Err(e) => {
@@ -415,28 +457,30 @@ impl SegmentMerger {
                 let index_bytes = serde_json::to_vec(&merged_index)
                     .map_err(|e| crate::Error::Serialization(e.to_string()))?;
 
-                field_indexes.push((field.0, index_bytes));
+                field_indexes.push((field.0, 0u8, index_bytes)); // 0 = RaBitQ
             }
         }
 
-        // Write unified vectors file
+        // Write unified vectors file with index_type
         if !field_indexes.is_empty() {
-            field_indexes.sort_by_key(|(id, _)| *id);
+            field_indexes.sort_by_key(|(id, _, _)| *id);
 
-            let header_size = 4 + field_indexes.len() * (4 + 8 + 8);
+            // Header: num_fields + (field_id, index_type, offset, len) per field
+            let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
             let mut output = Vec::new();
 
             output.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
 
             let mut current_offset = header_size as u64;
-            for (field_id, data) in &field_indexes {
+            for (field_id, index_type, data) in &field_indexes {
                 output.write_u32::<LittleEndian>(*field_id)?;
+                output.write_u8(*index_type)?;
                 output.write_u64::<LittleEndian>(current_offset)?;
                 output.write_u64::<LittleEndian>(data.len() as u64)?;
                 current_offset += data.len() as u64;
             }
 
-            for (_, data) in field_indexes {
+            for (_, _, data) in field_indexes {
                 output.extend_from_slice(&data);
             }
 

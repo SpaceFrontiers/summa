@@ -42,6 +42,7 @@ enum FieldType {
   FIELD_TYPE_BYTES = 5;
   FIELD_TYPE_SPARSE_VECTOR = 6;
   FIELD_TYPE_DENSE_VECTOR = 7;
+  FIELD_TYPE_JSON = 8;
 }
 
 // Field definition
@@ -109,6 +110,7 @@ message FieldValue {
     bytes bytes_value = 5;
     SparseVector sparse_vector = 6;
     DenseVector dense_vector = 7;
+    string json_value = 8;  // JSON serialized as string
   }
 }
 

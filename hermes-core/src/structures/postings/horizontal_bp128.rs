@@ -9,7 +9,7 @@
 //! - Binary search within decoded blocks
 //! - Variable block sizes based on posting list length
 
-use super::simd;
+use crate::structures::simd;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 

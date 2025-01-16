@@ -225,6 +225,39 @@ fn field_value_to_py(py: Python<'_>, value: &FieldValue) -> Py<PyAny> {
             // Return as list of floats
             values.into_pyobject(py).unwrap().into_any().unbind()
         }
+        FieldValue::Json(json_value) => {
+            // Convert serde_json::Value to Python object
+            json_to_py(py, json_value)
+        }
+    }
+}
+
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> Py<PyAny> {
+    use pyo3::types::PyBool;
+    match value {
+        serde_json::Value::Null => py.None(),
+        serde_json::Value::Bool(b) => PyBool::new(py, *b).to_owned().unbind().into_any(),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_pyobject(py).unwrap().into_any().unbind()
+            } else if let Some(f) = n.as_f64() {
+                f.into_pyobject(py).unwrap().into_any().unbind()
+            } else {
+                py.None()
+            }
+        }
+        serde_json::Value::String(s) => s.as_str().into_pyobject(py).unwrap().into_any().unbind(),
+        serde_json::Value::Array(arr) => {
+            let list = pyo3::types::PyList::new(py, arr.iter().map(|v| json_to_py(py, v))).unwrap();
+            list.unbind().into_any()
+        }
+        serde_json::Value::Object(obj) => {
+            let dict = pyo3::types::PyDict::new(py);
+            for (k, v) in obj {
+                dict.set_item(k, json_to_py(py, v)).unwrap();
+            }
+            dict.unbind().into_any()
+        }
     }
 }
 

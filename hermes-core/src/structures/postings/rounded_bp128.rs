@@ -10,7 +10,7 @@
 //!
 //! The tradeoff: ~2-4x faster decoding for ~20-60% larger posting lists.
 
-use super::simd::{self, RoundedBitWidth};
+use crate::structures::simd::{self, RoundedBitWidth};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 

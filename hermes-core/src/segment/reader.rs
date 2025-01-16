@@ -7,20 +7,30 @@ use rustc_hash::FxHashMap;
 use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
 use crate::dsl::{Document, Field, Schema};
 use crate::structures::{
-    AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFRaBitQIndex, RaBitQIndex,
-    SSTableStats, TermInfo,
+    AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFPQIndex, IVFRaBitQIndex, PQCodebook,
+    RaBitQCodebook, RaBitQIndex, SSTableStats, TermInfo,
 };
 use crate::{DocId, Error, Result};
 
 use super::store::{AsyncStoreReader, RawStoreBlock};
 use super::types::{SegmentFiles, SegmentId, SegmentMeta};
 
-/// Vector index type - either RaBitQ or IVF-RaBitQ
+/// Vector index type - RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
+    /// RaBitQ - binary quantization, good for small datasets
     RaBitQ(Arc<RaBitQIndex>),
-    IVF(Arc<IVFRaBitQIndex>),
+    /// IVF-RaBitQ - inverted file with RaBitQ, good for medium datasets
+    IVF {
+        index: Arc<IVFRaBitQIndex>,
+        codebook: Arc<RaBitQCodebook>,
+    },
+    /// ScaNN (IVF-PQ) - product quantization with OPQ, best for large datasets
+    ScaNN {
+        index: Arc<IVFPQIndex>,
+        codebook: Arc<PQCodebook>,
+    },
 }
 
 /// Async segment reader with lazy loading
@@ -237,6 +247,7 @@ impl AsyncSegmentReader {
     ///
     /// Returns (doc_id, distance) pairs sorted by distance (ascending).
     /// The doc_ids are adjusted by doc_id_offset for this segment.
+    /// If mrl_dim is configured, the query vector is automatically trimmed.
     pub fn search_dense_vector(
         &self,
         field: Field,
@@ -249,18 +260,45 @@ impl AsyncSegmentReader {
             .get(&field.0)
             .ok_or_else(|| Error::Schema(format!("No dense vector index for field {}", field.0)))?;
 
+        // Get mrl_dim from config to trim query vector if needed
+        let mrl_dim = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|e| e.dense_vector_config.as_ref())
+            .and_then(|c| c.mrl_dim);
+
+        // Trim query vector if mrl_dim is set
+        let query_vec: Vec<f32>;
+        let effective_query = if let Some(trim_dim) = mrl_dim {
+            if trim_dim < query.len() {
+                query_vec = query[..trim_dim].to_vec();
+                query_vec.as_slice()
+            } else {
+                query
+            }
+        } else {
+            query
+        };
+
         let results: Vec<(u32, f32)> = match index {
             VectorIndex::RaBitQ(rabitq) => rabitq
-                .search(query, k, rerank_factor)
+                .search(effective_query, k, rerank_factor)
                 .into_iter()
                 .map(|(idx, dist)| (idx as u32, dist))
                 .collect(),
-            VectorIndex::IVF(ivf) => {
+            VectorIndex::IVF { index, codebook } => {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("IVF index requires coarse centroids".to_string())
                 })?;
                 let nprobe = rerank_factor.max(32); // Use rerank_factor as nprobe hint
-                ivf.search(centroids, query, k, nprobe)
+                index.search(centroids, codebook, effective_query, k, Some(nprobe))
+            }
+            VectorIndex::ScaNN { index, codebook } => {
+                let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
+                    Error::Schema("ScaNN index requires coarse centroids".to_string())
+                })?;
+                let nprobe = rerank_factor.max(32);
+                index.search(centroids, codebook, effective_query, k, Some(nprobe))
             }
         };
 
@@ -287,7 +325,18 @@ impl AsyncSegmentReader {
     /// Get the IVF vector index for a field (if available)
     pub fn get_ivf_vector_index(&self, field: Field) -> Option<Arc<IVFRaBitQIndex>> {
         match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::IVF(idx)) => Some(idx.clone()),
+            Some(VectorIndex::IVF { index, .. }) => Some(index.clone()),
+            _ => None,
+        }
+    }
+
+    /// Get the ScaNN vector index for a field (if available)
+    pub fn get_scann_vector_index(
+        &self,
+        field: Field,
+    ) -> Option<(Arc<IVFPQIndex>, Arc<PQCodebook>)> {
+        match self.vector_indexes.get(&field.0) {
+            Some(VectorIndex::ScaNN { index, codebook }) => Some((index.clone(), codebook.clone())),
             _ => None,
         }
     }
@@ -344,8 +393,8 @@ impl AsyncSegmentReader {
 
     /// Load dense vector indexes from unified .vectors file
     ///
-    /// Tries to deserialize as IVF-RaBitQ first, falls back to RaBitQ.
-    /// Also loads coarse centroids if any IVF index is found.
+    /// Supports RaBitQ (type 0), IVF-RaBitQ (type 1), and ScaNN (type 2).
+    /// Also loads coarse centroids and PQ codebook as needed.
     async fn load_vectors_file<D: Directory>(
         dir: &D,
         files: &SegmentFiles,
@@ -377,35 +426,108 @@ impl AsyncSegmentReader {
         // Read header
         let num_fields = cursor.read_u32::<LittleEndian>()?;
 
-        // Read field entries
+        // Read field entries (field_id, index_type, offset, length)
         let mut entries = Vec::with_capacity(num_fields as usize);
         for _ in 0..num_fields {
             let field_id = cursor.read_u32::<LittleEndian>()?;
+            // Try to read index_type - if this fails, assume old format without type
+            let index_type = cursor.read_u8().unwrap_or(255); // 255 = unknown/legacy
             let offset = cursor.read_u64::<LittleEndian>()?;
             let length = cursor.read_u64::<LittleEndian>()?;
-            entries.push((field_id, offset as usize, length as usize));
+            entries.push((field_id, index_type, offset as usize, length as usize));
         }
 
-        // Load each index - try IVF first, fall back to RaBitQ
-        for (field_id, offset, length) in entries {
+        // Load each index based on type
+        for (field_id, index_type, offset, length) in entries {
             let data = &bytes.as_slice()[offset..offset + length];
+            let field = crate::dsl::Field(field_id);
 
-            // Try IVF-RaBitQ first
-            if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data) {
-                // Load coarse centroids if not already loaded
-                if coarse_centroids.is_none() {
-                    let field = crate::dsl::Field(field_id);
-                    if let Some(entry) = schema.get_field_entry(field)
-                        && let Some(ref config) = entry.dense_vector_config
-                        && let Some(ref path) = config.coarse_centroids_path
-                        && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
-                    {
-                        coarse_centroids = Some(Arc::new(c));
+            match index_type {
+                2 => {
+                    // ScaNN (IVF-PQ)
+                    if let Ok(ivfpq_index) = IVFPQIndex::from_bytes(data) {
+                        // Load coarse centroids if not already loaded
+                        if coarse_centroids.is_none()
+                            && let Some(entry) = schema.get_field_entry(field)
+                            && let Some(ref config) = entry.dense_vector_config
+                            && let Some(ref path) = config.coarse_centroids_path
+                            && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
+                        {
+                            coarse_centroids = Some(Arc::new(c));
+                        }
+
+                        // Load PQ codebook
+                        if let Some(entry) = schema.get_field_entry(field)
+                            && let Some(ref config) = entry.dense_vector_config
+                            && let Some(ref path) = config.pq_codebook_path
+                            && let Ok(codebook) = PQCodebook::load(std::path::Path::new(path))
+                        {
+                            indexes.insert(
+                                field_id,
+                                VectorIndex::ScaNN {
+                                    index: Arc::new(ivfpq_index),
+                                    codebook: Arc::new(codebook),
+                                },
+                            );
+                        }
                     }
                 }
-                indexes.insert(field_id, VectorIndex::IVF(Arc::new(ivf_index)));
-            } else if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data) {
-                indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
+                1 => {
+                    // IVF-RaBitQ
+                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data) {
+                        if coarse_centroids.is_none()
+                            && let Some(entry) = schema.get_field_entry(field)
+                            && let Some(ref config) = entry.dense_vector_config
+                            && let Some(ref path) = config.coarse_centroids_path
+                            && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
+                        {
+                            coarse_centroids = Some(Arc::new(c));
+                        }
+                        // Create a codebook for the IVF index
+                        let codebook = Arc::new(RaBitQCodebook::new(
+                            crate::structures::RaBitQConfig::new(ivf_index.config.dim),
+                        ));
+                        indexes.insert(
+                            field_id,
+                            VectorIndex::IVF {
+                                index: Arc::new(ivf_index),
+                                codebook,
+                            },
+                        );
+                    }
+                }
+                0 => {
+                    // RaBitQ
+                    if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data) {
+                        indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
+                    }
+                }
+                _ => {
+                    // Legacy format without type - try to auto-detect
+                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data) {
+                        if coarse_centroids.is_none()
+                            && let Some(entry) = schema.get_field_entry(field)
+                            && let Some(ref config) = entry.dense_vector_config
+                            && let Some(ref path) = config.coarse_centroids_path
+                            && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
+                        {
+                            coarse_centroids = Some(Arc::new(c));
+                        }
+                        // Create a codebook for the IVF index
+                        let codebook = Arc::new(RaBitQCodebook::new(
+                            crate::structures::RaBitQConfig::new(ivf_index.config.dim),
+                        ));
+                        indexes.insert(
+                            field_id,
+                            VectorIndex::IVF {
+                                index: Arc::new(ivf_index),
+                                codebook,
+                            },
+                        );
+                    } else if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data) {
+                        indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
+                    }
+                }
             }
         }
 

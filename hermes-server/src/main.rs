@@ -474,6 +474,9 @@ fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
         CoreFieldValue::DenseVector(values) => Value::DenseVector(proto::DenseVector {
             values: values.clone(),
         }),
+        CoreFieldValue::Json(json_val) => {
+            Value::JsonValue(serde_json::to_string(json_val).unwrap_or_default())
+        }
     };
     proto::FieldValue { value: Some(v) }
 }
@@ -491,6 +494,7 @@ fn convert_schema_to_proto(schema: &Schema) -> proto::Schema {
                 CoreFieldType::Bytes => proto::FieldType::Bytes as i32,
                 CoreFieldType::SparseVector => proto::FieldType::SparseVector as i32,
                 CoreFieldType::DenseVector => proto::FieldType::DenseVector as i32,
+                CoreFieldType::Json => proto::FieldType::Json as i32,
             },
             indexed: entry.indexed,
             stored: entry.stored,
@@ -531,6 +535,9 @@ fn convert_proto_to_schema(proto_schema: &proto::Schema) -> Result<Schema, Strin
                 // Default dimension of 0 - will be set from actual vectors
                 builder.add_dense_vector_field(&field.name, 0, field.indexed, field.stored);
             }
+            proto::FieldType::Json => {
+                builder.add_json_field(&field.name, field.stored);
+            }
         }
     }
 
@@ -559,6 +566,11 @@ fn convert_proto_to_document(
             }
             Some(Value::DenseVector(dv)) => {
                 doc.add_dense_vector(field, dv.values.clone());
+            }
+            Some(Value::JsonValue(json_str)) => {
+                let json_val: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| format!("Invalid JSON in field '{}': {}", name, e))?;
+                doc.add_json(field, json_val);
             }
             None => return Err(format!("Field '{}' has no value", name)),
         }

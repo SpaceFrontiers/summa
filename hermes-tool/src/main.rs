@@ -321,6 +321,9 @@ fn build_schema(config: &SchemaConfig) -> Result<hermes_core::Schema> {
             "bytes" => {
                 builder.add_bytes_field(&field.name, field.stored);
             }
+            "json" => {
+                builder.add_json_field(&field.name, field.stored);
+            }
             other => {
                 anyhow::bail!("Unknown field type: {}", other);
             }
@@ -1341,7 +1344,10 @@ fn train_centroids(
     );
 
     let start = std::time::Instant::now();
-    let centroids = CoarseCentroids::train(&vectors, num_clusters, max_iters, seed);
+    let coarse_config = hermes_core::structures::CoarseConfig::new(dim, num_clusters)
+        .with_max_iters(max_iters)
+        .with_seed(seed);
+    let centroids = CoarseCentroids::train(&coarse_config, &vectors);
     let elapsed = start.elapsed();
 
     info!(
@@ -1413,7 +1419,7 @@ async fn retrain_centroids(
         return Ok(());
     }
 
-    let _dim = vectors[0].len();
+    let dim = vectors[0].len();
     let num_clusters = clusters.unwrap_or_else(|| {
         let sqrt = (vectors.len() as f64).sqrt() as usize;
         sqrt.clamp(16, 65536)
@@ -1425,7 +1431,10 @@ async fn retrain_centroids(
         vectors.len()
     );
 
-    let centroids = CoarseCentroids::train(&vectors, num_clusters, max_iters, seed);
+    let coarse_config = hermes_core::structures::CoarseConfig::new(dim, num_clusters)
+        .with_max_iters(max_iters)
+        .with_seed(seed);
+    let centroids = CoarseCentroids::train(&coarse_config, &vectors);
 
     // Save centroids to index directory
     let centroids_path = index_path.join("coarse_centroids.bin");

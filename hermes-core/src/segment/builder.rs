@@ -217,6 +217,19 @@ impl DenseVectorBuilder {
             })
             .collect()
     }
+
+    /// Get vectors trimmed to specified dimension for matryoshka/MRL indexing
+    fn get_vectors_trimmed(&self, trim_dim: usize) -> Vec<Vec<f32>> {
+        debug_assert!(trim_dim <= self.dim, "trim_dim must be <= dim");
+        self.doc_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let start = i * self.dim;
+                self.vectors[start..start + trim_dim].to_vec()
+            })
+            .collect()
+    }
 }
 
 impl SegmentBuilder {
@@ -461,6 +474,8 @@ impl SegmentBuilder {
     /// Each dimension becomes a term (prefixed with __sparse_), and the weight
     /// is stored as a quantized term frequency. This allows reusing the existing
     /// posting list infrastructure for sparse vector retrieval.
+    ///
+    /// Weights below the configured `weight_threshold` are not indexed.
     fn index_sparse_vector_field(
         &mut self,
         field: Field,
@@ -468,7 +483,20 @@ impl SegmentBuilder {
         indices: &[u32],
         values: &[f32],
     ) -> Result<()> {
+        // Get weight threshold from field config (default 0.0 = no filtering)
+        let weight_threshold = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|entry| entry.sparse_vector_config.as_ref())
+            .map(|config| config.weight_threshold)
+            .unwrap_or(0.0);
+
         for (&dim_id, &weight) in indices.iter().zip(values.iter()) {
+            // Skip weights below threshold
+            if weight.abs() < weight_threshold {
+                continue;
+            }
+
             // Use a special prefix to distinguish sparse vector dimensions from text terms
             let term_str = format!("__sparse_{}", dim_id);
             let term_spur = self.term_interner.get_or_intern(&term_str);
@@ -569,62 +597,128 @@ impl SegmentBuilder {
     ///
     /// File format:
     /// - Header: num_fields (u32)
-    /// - For each field: field_id (u32), offset (u64), length (u64)
-    /// - Data: concatenated serialized RaBitQ indexes
+    /// - For each field: field_id (u32), index_type (u8), offset (u64), length (u64)
+    /// - Data: concatenated serialized indexes (RaBitQ, IVF-RaBitQ, or ScaNN)
     fn build_vectors_file(&self) -> Result<Vec<u8>> {
+        use crate::dsl::VectorIndexType;
         use byteorder::{LittleEndian, WriteBytesExt};
 
-        // Build all indexes first
-        let mut field_indexes: Vec<(u32, Vec<u8>)> = Vec::new();
+        // Build all indexes first: (field_id, index_type, data)
+        let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
 
         for (&field_id, builder) in &self.dense_vectors {
             if builder.len() == 0 {
                 continue;
             }
 
-            let vectors = builder.get_vectors();
             let field = crate::dsl::Field(field_id);
 
-            // Check if field has IVF config
-            let ivf_config = self
+            // Get dense vector config
+            let dense_config = self
                 .schema
                 .get_field_entry(field)
-                .and_then(|e| e.dense_vector_config.as_ref())
-                .filter(|c| c.uses_ivf());
+                .and_then(|e| e.dense_vector_config.as_ref());
 
-            let index_bytes = if let Some(dense_config) = ivf_config {
-                // Try to load coarse centroids for IVF-RaBitQ
-                let centroids_path = dense_config.coarse_centroids_path.as_ref().unwrap();
-                match crate::structures::CoarseCentroids::load(std::path::Path::new(centroids_path))
-                {
-                    Ok(coarse_centroids) => {
-                        let ivf_cfg = crate::structures::IVFConfig::new(builder.dim);
-                        let doc_ids: Vec<u32> = builder.doc_ids.clone();
-                        let ivf_index = crate::structures::IVFRaBitQIndex::build(
-                            ivf_cfg,
-                            &coarse_centroids,
-                            &vectors,
-                            Some(&doc_ids),
-                        );
-                        serde_json::to_vec(&ivf_index)
-                            .map_err(|e| crate::Error::Serialization(e.to_string()))?
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to load centroids: {}, using RaBitQ", e);
-                        let cfg = crate::structures::RaBitQConfig::new(builder.dim);
-                        let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, true);
-                        serde_json::to_vec(&idx)
-                            .map_err(|e| crate::Error::Serialization(e.to_string()))?
-                    }
-                }
+            // Get vectors, potentially trimmed for matryoshka/MRL indexing
+            let index_dim = dense_config.map(|c| c.index_dim()).unwrap_or(builder.dim);
+            let vectors = if index_dim < builder.dim {
+                // Trim vectors to mrl_dim for indexing
+                builder.get_vectors_trimmed(index_dim)
             } else {
-                // Regular RaBitQ
-                let cfg = crate::structures::RaBitQConfig::new(builder.dim);
-                let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, true);
-                serde_json::to_vec(&idx).map_err(|e| crate::Error::Serialization(e.to_string()))?
+                builder.get_vectors()
             };
 
-            field_indexes.push((field_id, index_bytes));
+            let (index_type, index_bytes) = match dense_config.map(|c| c.index_type) {
+                Some(VectorIndexType::ScaNN) => {
+                    // ScaNN (IVF-PQ) index
+                    let config = dense_config.unwrap();
+                    let centroids_path =
+                        config.coarse_centroids_path.as_ref().ok_or_else(|| {
+                            crate::Error::Schema("ScaNN requires coarse_centroids_path".into())
+                        })?;
+                    let codebook_path = config.pq_codebook_path.as_ref().ok_or_else(|| {
+                        crate::Error::Schema("ScaNN requires pq_codebook_path".into())
+                    })?;
+
+                    let coarse_centroids = crate::structures::CoarseCentroids::load(
+                        std::path::Path::new(centroids_path),
+                    )
+                    .map_err(crate::Error::Io)?;
+
+                    let pq_codebook =
+                        crate::structures::PQCodebook::load(std::path::Path::new(codebook_path))
+                            .map_err(crate::Error::Io)?;
+
+                    let doc_ids: Vec<u32> = builder.doc_ids.clone();
+                    let ivfpq_config = crate::structures::IVFPQConfig::new(index_dim)
+                        .with_store_raw(config.store_raw);
+
+                    let ivfpq_index = crate::structures::IVFPQIndex::build(
+                        ivfpq_config,
+                        &coarse_centroids,
+                        &pq_codebook,
+                        &vectors,
+                        Some(doc_ids.as_slice()),
+                    );
+
+                    // Serialize ScaNN index (IVFPQIndex only - codebook loaded separately)
+                    let bytes = ivfpq_index
+                        .to_bytes()
+                        .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                    (2u8, bytes) // 2 = ScaNN
+                }
+                Some(VectorIndexType::IvfRaBitQ) => {
+                    // IVF-RaBitQ index
+                    let config = dense_config.unwrap();
+                    let centroids_path =
+                        config.coarse_centroids_path.as_ref().ok_or_else(|| {
+                            crate::Error::Schema("IVF-RaBitQ requires coarse_centroids_path".into())
+                        })?;
+
+                    match crate::structures::CoarseCentroids::load(std::path::Path::new(
+                        centroids_path,
+                    )) {
+                        Ok(coarse_centroids) => {
+                            let ivf_cfg = crate::structures::IVFRaBitQConfig::new(index_dim)
+                                .with_store_raw(config.store_raw);
+                            let rabitq_codebook = crate::structures::RaBitQCodebook::new(
+                                crate::structures::RaBitQConfig::new(index_dim),
+                            );
+                            let doc_ids: Vec<u32> = builder.doc_ids.clone();
+                            let ivf_index = crate::structures::IVFRaBitQIndex::build(
+                                ivf_cfg,
+                                &coarse_centroids,
+                                &rabitq_codebook,
+                                &vectors,
+                                Some(doc_ids.as_slice()),
+                            );
+                            let bytes = ivf_index
+                                .to_bytes()
+                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                            (1u8, bytes) // 1 = IVF-RaBitQ
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to load centroids: {}, falling back to RaBitQ", e);
+                            let cfg = crate::structures::RaBitQConfig::new(index_dim);
+                            let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, true);
+                            let bytes = serde_json::to_vec(&idx)
+                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                            (0u8, bytes) // 0 = RaBitQ
+                        }
+                    }
+                }
+                _ => {
+                    // Default: RaBitQ
+                    let store_raw = dense_config.map(|c| c.store_raw).unwrap_or(true);
+                    let cfg = crate::structures::RaBitQConfig::new(index_dim);
+                    let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, store_raw);
+                    let bytes = serde_json::to_vec(&idx)
+                        .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                    (0u8, bytes) // 0 = RaBitQ
+                }
+            };
+
+            field_indexes.push((field_id, index_type, index_bytes));
         }
 
         if field_indexes.is_empty() {
@@ -632,10 +726,10 @@ impl SegmentBuilder {
         }
 
         // Sort by field_id for consistent ordering
-        field_indexes.sort_by_key(|(id, _)| *id);
+        field_indexes.sort_by_key(|(id, _, _)| *id);
 
-        // Calculate header size: num_fields + (field_id, offset, len) per field
-        let header_size = 4 + field_indexes.len() * (4 + 8 + 8);
+        // Calculate header size: num_fields + (field_id, index_type, offset, len) per field
+        let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
 
         // Build output
         let mut output = Vec::new();
@@ -645,15 +739,16 @@ impl SegmentBuilder {
 
         // Calculate offsets and write header entries
         let mut current_offset = header_size as u64;
-        for (field_id, data) in &field_indexes {
+        for (field_id, index_type, data) in &field_indexes {
             output.write_u32::<LittleEndian>(*field_id)?;
+            output.write_u8(*index_type)?;
             output.write_u64::<LittleEndian>(current_offset)?;
             output.write_u64::<LittleEndian>(data.len() as u64)?;
             current_offset += data.len() as u64;
         }
 
         // Write data
-        for (_, data) in field_indexes {
+        for (_, _, data) in field_indexes {
             output.extend_from_slice(&data);
         }
 

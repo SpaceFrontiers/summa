@@ -31,6 +31,9 @@ pub enum FieldType {
     /// Dense vector field - indexed using RaBitQ binary quantization for ANN search
     #[serde(rename = "dense_vector")]
     DenseVector,
+    /// JSON field - arbitrary JSON data, stored but not indexed
+    #[serde(rename = "json")]
+    Json,
 }
 
 /// Field options
@@ -53,21 +56,45 @@ pub struct FieldEntry {
     pub dense_vector_config: Option<DenseVectorConfig>,
 }
 
-/// Configuration for dense vector fields using RaBitQ or IVF-RaBitQ
+/// Vector index algorithm type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorIndexType {
+    /// RaBitQ - binary quantization, good for small datasets (<100K)
+    #[default]
+    RaBitQ,
+    /// IVF-RaBitQ - inverted file with RaBitQ, good for medium datasets
+    IvfRaBitQ,
+    /// ScaNN - product quantization with OPQ and anisotropic loss, best for large datasets
+    ScaNN,
+}
+
+/// Configuration for dense vector fields using RaBitQ, IVF-RaBitQ, or ScaNN
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenseVectorConfig {
     /// Dimensionality of vectors
     pub dim: usize,
+    /// Vector index algorithm to use
+    #[serde(default)]
+    pub index_type: VectorIndexType,
     /// Whether to store raw vectors for re-ranking (increases storage but improves accuracy)
     #[serde(default = "default_store_raw")]
     pub store_raw: bool,
-    /// Path to pre-trained coarse centroids file for IVF-RaBitQ
-    /// If None, uses single-centroid RaBitQ (suitable for <100K vectors)
+    /// Path to pre-trained coarse centroids file for IVF indexes
+    /// Required for IVF-RaBitQ and ScaNN
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_centroids_path: Option<String>,
+    /// Path to pre-trained PQ codebook file for ScaNN
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_codebook_path: Option<String>,
     /// Number of clusters to probe during search (default: 32)
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
+    /// Matryoshka/MRL dimension for index - use only first mrl_dim coordinates for indexing
+    /// Full vectors are stored but index uses truncated vectors for faster search
+    /// Must be <= dim. If None, uses full dim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrl_dim: Option<usize>,
 }
 
 fn default_store_raw() -> bool {
@@ -82,33 +109,76 @@ impl DenseVectorConfig {
     pub fn new(dim: usize) -> Self {
         Self {
             dim,
+            index_type: VectorIndexType::RaBitQ,
             store_raw: true,
             coarse_centroids_path: None,
+            pq_codebook_path: None,
             nprobe: 32,
+            mrl_dim: None,
         }
     }
 
     pub fn with_ivf(dim: usize, centroids_path: String, nprobe: usize) -> Self {
         Self {
             dim,
+            index_type: VectorIndexType::IvfRaBitQ,
             store_raw: true,
             coarse_centroids_path: Some(centroids_path),
+            pq_codebook_path: None,
             nprobe,
+            mrl_dim: None,
+        }
+    }
+
+    /// Create ScaNN configuration with pre-trained centroids and codebook
+    pub fn with_scann(
+        dim: usize,
+        centroids_path: String,
+        codebook_path: String,
+        nprobe: usize,
+    ) -> Self {
+        Self {
+            dim,
+            index_type: VectorIndexType::ScaNN,
+            store_raw: true,
+            coarse_centroids_path: Some(centroids_path),
+            pq_codebook_path: Some(codebook_path),
+            nprobe,
+            mrl_dim: None,
         }
     }
 
     pub fn without_raw(dim: usize) -> Self {
         Self {
             dim,
+            index_type: VectorIndexType::RaBitQ,
             store_raw: false,
             coarse_centroids_path: None,
+            pq_codebook_path: None,
             nprobe: 32,
+            mrl_dim: None,
         }
+    }
+
+    /// Set matryoshka/MRL dimension for index truncation
+    pub fn with_mrl_dim(mut self, mrl_dim: usize) -> Self {
+        self.mrl_dim = Some(mrl_dim);
+        self
+    }
+
+    /// Get the effective dimension for indexing (mrl_dim if set, otherwise dim)
+    pub fn index_dim(&self) -> usize {
+        self.mrl_dim.unwrap_or(self.dim)
     }
 
     /// Check if this config uses IVF (has coarse centroids)
     pub fn uses_ivf(&self) -> bool {
         self.coarse_centroids_path.is_some()
+    }
+
+    /// Check if this config uses ScaNN
+    pub fn uses_scann(&self) -> bool {
+        self.index_type == VectorIndexType::ScaNN
     }
 }
 
@@ -225,6 +295,14 @@ impl SchemaBuilder {
 
     pub fn add_bytes_field(&mut self, name: &str, stored: bool) -> Field {
         self.add_field(name, FieldType::Bytes, false, stored)
+    }
+
+    /// Add a JSON field for storing arbitrary JSON data
+    ///
+    /// JSON fields are never indexed, only stored. They can hold any valid JSON value
+    /// (objects, arrays, strings, numbers, booleans, null).
+    pub fn add_json_field(&mut self, name: &str, stored: bool) -> Field {
+        self.add_field(name, FieldType::Json, false, stored)
     }
 
     /// Add a sparse vector field with default configuration
@@ -414,6 +492,9 @@ pub enum FieldValue {
     /// Dense vector: float32 values
     #[serde(rename = "dense_vector")]
     DenseVector(Vec<f32>),
+    /// Arbitrary JSON value
+    #[serde(rename = "json")]
+    Json(serde_json::Value),
 }
 
 impl FieldValue {
@@ -465,6 +546,13 @@ impl FieldValue {
             _ => None,
         }
     }
+
+    pub fn as_json(&self) -> Option<&serde_json::Value> {
+        match self {
+            FieldValue::Json(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// A document to be indexed
@@ -512,6 +600,10 @@ impl Document {
     pub fn add_dense_vector(&mut self, field: Field, values: Vec<f32>) {
         self.field_values
             .push((field, FieldValue::DenseVector(values)));
+    }
+
+    pub fn add_json(&mut self, field: Field, value: serde_json::Value) {
+        self.field_values.push((field, FieldValue::Json(value)));
     }
 
     pub fn get_first(&self, field: Field) -> Option<&FieldValue> {
@@ -566,6 +658,7 @@ impl Document {
                     FieldValue::DenseVector(values) => {
                         serde_json::json!(values)
                     }
+                    FieldValue::Json(v) => v.clone(),
                 };
                 field_values_map
                     .entry(*field)
@@ -680,6 +773,10 @@ impl Document {
                         doc.add_sparse_vector(field, indices, values);
                     }
                 }
+            }
+            // Handle JSON fields - accept any value directly
+            _ if matches!(field_type, FieldType::Json) => {
+                doc.add_json(field, value.clone());
             }
             serde_json::Value::Object(_) => {}
             _ => {}
@@ -917,5 +1014,93 @@ mod tests {
         assert!((values2[0] - 1.0).abs() < 1e-6);
         assert!((values2[1] - 2.5).abs() < 1e-6);
         assert!((values2[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_json_field() {
+        let mut builder = Schema::builder();
+        let metadata = builder.add_json_field("metadata", true);
+        let title = builder.add_text_field("title", true, true);
+        let schema = builder.build();
+
+        assert_eq!(schema.get_field("metadata"), Some(metadata));
+        assert_eq!(
+            schema.get_field_entry(metadata).unwrap().field_type,
+            FieldType::Json
+        );
+        // JSON fields are never indexed
+        assert!(!schema.get_field_entry(metadata).unwrap().indexed);
+        assert!(schema.get_field_entry(metadata).unwrap().stored);
+
+        // Create document with JSON value (object)
+        let json_value = serde_json::json!({
+            "author": "John Doe",
+            "tags": ["rust", "search"],
+            "nested": {"key": "value"}
+        });
+        let mut doc = Document::new();
+        doc.add_json(metadata, json_value.clone());
+        doc.add_text(title, "Test Document");
+
+        // Verify accessor
+        let stored_json = doc.get_first(metadata).unwrap().as_json().unwrap();
+        assert_eq!(stored_json, &json_value);
+        assert_eq!(
+            stored_json.get("author").unwrap().as_str(),
+            Some("John Doe")
+        );
+
+        // Verify JSON roundtrip via to_json/from_json
+        let doc_json = doc.to_json(&schema);
+        let metadata_out = doc_json.get("metadata").unwrap();
+        assert_eq!(metadata_out, &json_value);
+
+        // Parse back from JSON
+        let doc2 = Document::from_json(&doc_json, &schema).unwrap();
+        let stored_json2 = doc2.get_first(metadata).unwrap().as_json().unwrap();
+        assert_eq!(stored_json2, &json_value);
+    }
+
+    #[test]
+    fn test_json_field_various_types() {
+        let mut builder = Schema::builder();
+        let data = builder.add_json_field("data", true);
+        let _schema = builder.build();
+
+        // Test with array
+        let arr_value = serde_json::json!([1, 2, 3, "four", null]);
+        let mut doc = Document::new();
+        doc.add_json(data, arr_value.clone());
+        assert_eq!(doc.get_first(data).unwrap().as_json().unwrap(), &arr_value);
+
+        // Test with string
+        let str_value = serde_json::json!("just a string");
+        let mut doc2 = Document::new();
+        doc2.add_json(data, str_value.clone());
+        assert_eq!(doc2.get_first(data).unwrap().as_json().unwrap(), &str_value);
+
+        // Test with number
+        let num_value = serde_json::json!(42.5);
+        let mut doc3 = Document::new();
+        doc3.add_json(data, num_value.clone());
+        assert_eq!(doc3.get_first(data).unwrap().as_json().unwrap(), &num_value);
+
+        // Test with null
+        let null_value = serde_json::Value::Null;
+        let mut doc4 = Document::new();
+        doc4.add_json(data, null_value.clone());
+        assert_eq!(
+            doc4.get_first(data).unwrap().as_json().unwrap(),
+            &null_value
+        );
+
+        // Test with boolean
+        let bool_value = serde_json::json!(true);
+        let mut doc5 = Document::new();
+        doc5.add_json(data, bool_value.clone());
+        assert_eq!(
+            doc5.get_first(data).unwrap().as_json().unwrap(),
+            &bool_value
+        );
     }
 }

@@ -10,7 +10,7 @@
 //! - **NEON intrinsics on ARM**: Uses vld1q_u32, vaddq_u32, etc.
 //! - **Block-level metadata**: Skip info for BlockMax WAND
 
-use super::simd;
+use crate::structures::simd;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 

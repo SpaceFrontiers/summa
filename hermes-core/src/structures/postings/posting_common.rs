@@ -235,7 +235,7 @@ pub fn read_doc_id_block<R: Read>(reader: &mut R) -> io::Result<Vec<DocId>> {
 // Fixed-width bitpacking for SIMD-friendly delta encoding
 // ============================================================================
 
-use super::simd;
+use crate::structures::simd;
 
 /// Rounded bit width for SIMD-friendly encoding
 ///

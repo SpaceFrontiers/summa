@@ -100,12 +100,16 @@ impl WeightQuantization {
 }
 
 /// Configuration for sparse vector storage
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SparseVectorConfig {
     /// Size of dimension/term indices
     pub index_size: IndexSize,
     /// Quantization for weights
     pub weight_quantization: WeightQuantization,
+    /// Minimum weight threshold - weights below this value are not indexed
+    /// This reduces index size and can improve query speed at the cost of recall
+    #[serde(default)]
+    pub weight_threshold: f32,
 }
 
 impl Default for SparseVectorConfig {
@@ -113,6 +117,7 @@ impl Default for SparseVectorConfig {
         Self {
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
+            weight_threshold: 0.0,
         }
     }
 }
@@ -123,6 +128,7 @@ impl SparseVectorConfig {
         Self {
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt8,
+            weight_threshold: 0.0,
         }
     }
 
@@ -131,6 +137,7 @@ impl SparseVectorConfig {
         Self {
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt4,
+            weight_threshold: 0.0,
         }
     }
 
@@ -139,7 +146,14 @@ impl SparseVectorConfig {
         Self {
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
+            weight_threshold: 0.0,
         }
+    }
+
+    /// Set weight threshold (builder pattern)
+    pub fn with_weight_threshold(mut self, threshold: f32) -> Self {
+        self.weight_threshold = threshold;
+        self
     }
 
     /// Bytes per entry (index + weight)
@@ -153,12 +167,14 @@ impl SparseVectorConfig {
     }
 
     /// Deserialize config from a single byte
+    /// Note: weight_threshold is not serialized in the byte, defaults to 0.0
     pub fn from_byte(b: u8) -> Option<Self> {
         let index_size = IndexSize::from_u8(b >> 4)?;
         let weight_quantization = WeightQuantization::from_u8(b & 0x0F)?;
         Some(Self {
             index_size,
             weight_quantization,
+            weight_threshold: 0.0,
         })
     }
 }
