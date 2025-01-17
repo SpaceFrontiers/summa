@@ -30,3 +30,6 @@ murmur3 = "0.5"
 chrono = "0.4"
 rayon = "1.11"
 crossbeam-channel = "0.5"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"

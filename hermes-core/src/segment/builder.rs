@@ -99,6 +99,27 @@ pub struct SegmentBuilderStats {
     pub interned_strings: usize,
     /// Size of doc_field_lengths vector
     pub doc_field_lengths_size: usize,
+    /// Estimated total memory usage in bytes
+    pub estimated_memory_bytes: usize,
+    /// Memory breakdown by component
+    pub memory_breakdown: MemoryBreakdown,
+}
+
+/// Detailed memory breakdown by component
+#[derive(Debug, Clone, Default)]
+pub struct MemoryBreakdown {
+    /// Postings memory (CompactPosting structs)
+    pub postings_bytes: usize,
+    /// Inverted index HashMap overhead
+    pub index_overhead_bytes: usize,
+    /// Term interner memory
+    pub interner_bytes: usize,
+    /// Document field lengths
+    pub field_lengths_bytes: usize,
+    /// Dense vector storage
+    pub dense_vectors_bytes: usize,
+    /// Number of dense vectors
+    pub dense_vector_count: usize,
 }
 
 /// Configuration for segment builder
@@ -300,14 +321,85 @@ impl SegmentBuilder {
 
     /// Get current statistics for debugging performance
     pub fn stats(&self) -> SegmentBuilderStats {
+        use std::mem::size_of;
+
         let postings_in_memory: usize =
             self.inverted_index.values().map(|p| p.postings.len()).sum();
+
+        // Precise memory calculation using actual struct sizes
+        // CompactPosting: doc_id (u32) + term_freq (u16) = 6 bytes, but may have padding
+        let compact_posting_size = size_of::<CompactPosting>();
+
+        // Postings: actual Vec capacity * element size + Vec overhead (24 bytes on 64-bit)
+        let postings_bytes: usize = self
+            .inverted_index
+            .values()
+            .map(|p| {
+                p.postings.capacity() * compact_posting_size + size_of::<Vec<CompactPosting>>()
+            })
+            .sum();
+
+        // Inverted index: HashMap overhead per entry
+        // Each entry: TermKey (field u32 + Spur 4 bytes = 8 bytes) + PostingListBuilder + HashMap bucket overhead
+        // HashMap typically uses ~1.5x capacity, each bucket ~16-24 bytes
+        let term_key_size = size_of::<TermKey>();
+        let posting_builder_size = size_of::<PostingListBuilder>();
+        let hashmap_entry_overhead = 24; // bucket pointer + metadata
+        let index_overhead_bytes = self.inverted_index.len()
+            * (term_key_size + posting_builder_size + hashmap_entry_overhead);
+
+        // Term interner: Rodeo stores strings + metadata
+        // Each interned string: actual string bytes + Spur (4 bytes) + internal overhead (~16 bytes)
+        // We can't get exact string lengths, so estimate average term length of 8 bytes
+        let avg_term_len = 8;
+        let interner_overhead_per_string = size_of::<lasso::Spur>() + 16;
+        let interner_bytes =
+            self.term_interner.len() * (avg_term_len + interner_overhead_per_string);
+
+        // Doc field lengths: Vec<u32> with capacity
+        let field_lengths_bytes =
+            self.doc_field_lengths.capacity() * size_of::<u32>() + size_of::<Vec<u32>>();
+
+        // Dense vectors: actual capacity used
+        let mut dense_vectors_bytes: usize = 0;
+        let mut dense_vector_count: usize = 0;
+        for b in self.dense_vectors.values() {
+            // vectors: Vec<f32> capacity + doc_ids: Vec<DocId> capacity
+            dense_vectors_bytes += b.vectors.capacity() * size_of::<f32>()
+                + b.doc_ids.capacity() * size_of::<DocId>()
+                + size_of::<Vec<f32>>()
+                + size_of::<Vec<DocId>>();
+            dense_vector_count += b.doc_ids.len();
+        }
+
+        // Local buffers
+        let local_tf_buffer_bytes =
+            self.local_tf_buffer.capacity() * (size_of::<lasso::Spur>() + size_of::<u32>() + 16);
+
+        let estimated_memory_bytes = postings_bytes
+            + index_overhead_bytes
+            + interner_bytes
+            + field_lengths_bytes
+            + dense_vectors_bytes
+            + local_tf_buffer_bytes;
+
+        let memory_breakdown = MemoryBreakdown {
+            postings_bytes,
+            index_overhead_bytes,
+            interner_bytes,
+            field_lengths_bytes,
+            dense_vectors_bytes,
+            dense_vector_count,
+        };
+
         SegmentBuilderStats {
             num_docs: self.next_doc_id,
             unique_terms: self.inverted_index.len(),
             postings_in_memory,
             interned_strings: self.term_interner.len(),
             doc_field_lengths_size: self.doc_field_lengths.len(),
+            estimated_memory_bytes,
+            memory_breakdown,
         }
     }
 

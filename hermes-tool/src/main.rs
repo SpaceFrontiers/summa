@@ -38,6 +38,14 @@
 //! zstdcat dump.zst | hermes-tool simhash -f title -o hash | hermes-tool sort -f hash
 //! ```
 
+// Use jemalloc for better memory management (returns memory to OS)
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Write};
@@ -435,13 +443,17 @@ async fn index_from_reader<R: BufRead>(
 
             // Get builder stats for debugging
             if let Some(stats) = writer.get_builder_stats().await {
+                let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+                let m = &stats.memory_breakdown;
                 info!(
-                    "Progress: {} docs ({:.0}/s) | terms: {} | postings: {} | interned: {}",
+                    "Progress: {} docs ({:.0}/s) | mem: {:.1} MB (postings: {:.1}, index: {:.1}, interner: {:.1}, vectors: {:.1})",
                     count,
                     rate,
-                    stats.unique_terms,
-                    stats.postings_in_memory,
-                    stats.interned_strings,
+                    mb(stats.estimated_memory_bytes),
+                    mb(m.postings_bytes),
+                    mb(m.index_overhead_bytes),
+                    mb(m.interner_bytes),
+                    mb(m.dense_vectors_bytes),
                 );
             } else {
                 info!(
