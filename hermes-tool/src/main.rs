@@ -53,10 +53,13 @@ fn release_memory_to_os() {
     // Advance epoch to get fresh stats and trigger cleanup
     let _ = epoch::advance();
     // Request jemalloc to release unused pages back to OS
-    if let Ok(purge) = tikv_jemalloc_ctl::raw::read::<bool>(b"opt.background_thread\0") {
-        if !purge {
-            // If background threads are disabled, manually purge
-            let _ = tikv_jemalloc_ctl::raw::write(b"arena.0.purge\0", ());
+    // SAFETY: These are standard jemalloc control operations
+    unsafe {
+        if let Ok(purge) = tikv_jemalloc_ctl::raw::read::<bool>(b"opt.background_thread\0") {
+            if !purge {
+                // If background threads are disabled, manually purge all arenas
+                let _ = tikv_jemalloc_ctl::raw::write(b"arena.0.purge\0", ());
+            }
         }
     }
     // Log current memory stats
