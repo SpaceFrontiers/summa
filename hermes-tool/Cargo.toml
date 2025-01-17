@@ -32,4 +32,5 @@ rayon = "1.11"
 crossbeam-channel = "0.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", features = ["stats", "background_threads"] }
+tikv-jemalloc-ctl = "0.6"

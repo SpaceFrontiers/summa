@@ -46,6 +46,34 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+/// Release unused memory back to the OS
+#[cfg(not(target_env = "msvc"))]
+fn release_memory_to_os() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // Advance epoch to get fresh stats and trigger cleanup
+    let _ = epoch::advance();
+    // Request jemalloc to release unused pages back to OS
+    if let Ok(purge) = tikv_jemalloc_ctl::raw::read::<bool>(b"opt.background_thread\0") {
+        if !purge {
+            // If background threads are disabled, manually purge
+            let _ = tikv_jemalloc_ctl::raw::write(b"arena.0.purge\0", ());
+        }
+    }
+    // Log current memory stats
+    if let (Ok(allocated), Ok(resident)) = (stats::allocated::read(), stats::resident::read()) {
+        tracing::debug!(
+            "Memory: allocated={:.1} MB, resident={:.1} MB",
+            allocated as f64 / (1024.0 * 1024.0),
+            resident as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
+
+#[cfg(target_env = "msvc")]
+fn release_memory_to_os() {
+    // No-op on MSVC
+}
+
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Write};
@@ -445,6 +473,12 @@ async fn index_from_reader<R: BufRead>(
             if let Some(stats) = writer.get_builder_stats().await {
                 let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
                 let m = &stats.memory_breakdown;
+
+                // Detect flush (memory dropped significantly) and release memory to OS
+                if stats.estimated_memory_bytes < 5 * 1024 * 1024 {
+                    release_memory_to_os();
+                }
+
                 info!(
                     "Progress: {} docs ({:.0}/s) | mem: {:.1} MB (postings: {:.1}, index: {:.1}, interner: {:.1}, vectors: {:.1})",
                     count,
@@ -465,6 +499,7 @@ async fn index_from_reader<R: BufRead>(
     }
 
     writer.commit().await?;
+    release_memory_to_os();
 
     let elapsed = start_time.elapsed();
     let rate = count as f64 / elapsed.as_secs_f64();
