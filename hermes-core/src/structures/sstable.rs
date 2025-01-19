@@ -857,7 +857,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         }
 
         // Read index section
-        let index_start = data_end_offset as usize;
+        let index_start = data_end_offset;
         let index_end = file_len - 37;
         let index_bytes = file_handle.read_bytes_range(index_start..index_end).await?;
         let mut reader = index_bytes.as_slice();
@@ -906,7 +906,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         // Load bloom filter if present
         let bloom_filter = if bloom_offset > 0 {
-            let bloom_start = bloom_offset as usize;
+            let bloom_start = bloom_offset;
             // Read bloom filter size first (12 bytes header)
             let bloom_header = file_handle
                 .read_bytes_range(bloom_start..bloom_start + 12)
@@ -916,7 +916,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 bloom_header[9],
                 bloom_header[10],
                 bloom_header[11],
-            ]) as usize;
+            ]) as u64;
             let bloom_size = 12 + num_words * 8;
             let bloom_data = file_handle
                 .read_bytes_range(bloom_start..bloom_start + bloom_size)
@@ -928,7 +928,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         // Load dictionary if present
         let dictionary = if dict_offset > 0 {
-            let dict_start = dict_offset as usize;
+            let dict_start = dict_offset;
             // Read dictionary size first
             let dict_len_bytes = file_handle
                 .read_bytes_range(dict_start..dict_start + 4)
@@ -938,7 +938,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 dict_len_bytes[1],
                 dict_len_bytes[2],
                 dict_len_bytes[3],
-            ]) as usize;
+            ]) as u64;
             let dict_data = file_handle
                 .read_bytes_range(dict_start + 4..dict_start + 4 + dict_len)
                 .await?;
@@ -948,7 +948,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         };
 
         // Create a lazy slice for just the data portion
-        let data_slice = file_handle.slice(0..data_end_offset as usize);
+        let data_slice = file_handle.slice(0..data_end_offset);
 
         Ok(Self {
             data_slice,
@@ -1159,8 +1159,8 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         );
 
         // Load from FileSlice
-        let start = entry.offset as usize;
-        let end = start + entry.length as usize;
+        let start = entry.offset;
+        let end = start + entry.length as u64;
         let compressed = self.data_slice.read_bytes_range(start..end).await?;
 
         // Decompress with dictionary if available

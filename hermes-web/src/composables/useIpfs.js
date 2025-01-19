@@ -1,10 +1,18 @@
 import { ref } from 'vue'
+import { useAppConfig } from './useAppConfig'
+import { createDownloadManager } from '../lib/downloadManager'
 
-let verifiedFetch = null
+// Singleton state
+const isInitialized = ref(false)
+const isInitializing = ref(false)
+const error = ref(null)
+let downloadManager = null
 
 /**
- * IPFS composable for handling IPFS/IPNS URLs with Helia verified-fetch
- * 
+ * IPFS composable using HTTP gateway fetching
+ *
+ * Uses download manager for resumable downloads with gateway fallback.
+ *
  * Supports:
  * - /ipfs/<CID> - Direct IPFS content addressing
  * - /ipns/<name> - IPNS name resolution
@@ -12,43 +20,63 @@ let verifiedFetch = null
  * - ipns://<name> - IPNS URI scheme
  */
 export function useIpfs() {
-  const isInitialized = ref(false)
-  const isInitializing = ref(false)
-  const error = ref(null)
-  
+  const appConfig = useAppConfig()
+
+  // Download manager handles all network operations (singleton)
+  const getDownloadManager = () => {
+    if (!downloadManager) {
+      downloadManager = createDownloadManager(appConfig)
+    }
+    return downloadManager
+  }
+
   /**
-   * Initialize Helia verified-fetch
+   * Initialize IPFS HTTP gateway fetcher
    */
   const init = async () => {
     if (isInitialized.value || isInitializing.value) return isInitialized.value
-    
+
     isInitializing.value = true
     error.value = null
-    
+
     try {
-      const { createVerifiedFetch } = await import('@helia/verified-fetch')
-      verifiedFetch = await createVerifiedFetch()
+      // Ensure app config detection has run
+      if (!appConfig.isDetected.value) {
+        appConfig.detect()
+      }
+
+      // Initialize download manager
+      getDownloadManager()
+
+      // Log gateway configuration
+      if (appConfig.isLocalDaemon.value) {
+        console.log('IPFS: Using local daemon at', appConfig.gatewayUrl.value)
+      } else if (appConfig.isIpfsGateway.value) {
+        console.log('IPFS: Using serving gateway at', appConfig.gatewayUrl.value)
+      } else {
+        console.log('IPFS: Using remote gateways')
+      }
+
       isInitialized.value = true
-      console.log('Helia verified-fetch initialized')
       return true
     } catch (e) {
       error.value = `Failed to initialize IPFS: ${e.message}`
-      console.error('Failed to initialize Helia:', e)
+      console.error('Failed to initialize IPFS:', e)
       return false
     } finally {
       isInitializing.value = false
     }
   }
-  
+
   /**
-   * Parse an IPFS/IPNS URL and extract the path
-   * 
+   * Parse an IPFS/IPNS URL or local path and extract the path
+   *
    * @param {string} url - URL to parse
-   * @returns {{ type: 'ipfs'|'ipns'|null, path: string, original: string }}
+   * @returns {{ type: 'ipfs'|'ipns'|'local'|null, path: string, original: string }}
    */
   const parseIpfsUrl = (url) => {
     const trimmed = url.trim()
-    
+
     // Handle ipfs:// and ipns:// URI schemes
     if (trimmed.startsWith('ipfs://')) {
       return { type: 'ipfs', path: trimmed.slice(7), original: trimmed }
@@ -56,7 +84,7 @@ export function useIpfs() {
     if (trimmed.startsWith('ipns://')) {
       return { type: 'ipns', path: trimmed.slice(7), original: trimmed }
     }
-    
+
     // Handle /ipfs/ and /ipns/ paths
     if (trimmed.startsWith('/ipfs/')) {
       return { type: 'ipfs', path: trimmed.slice(6), original: trimmed }
@@ -64,11 +92,16 @@ export function useIpfs() {
     if (trimmed.startsWith('/ipns/')) {
       return { type: 'ipns', path: trimmed.slice(6), original: trimmed }
     }
-    
+
+    // Local path starting with / (e.g., /s)
+    if (trimmed.startsWith('/')) {
+      return { type: 'local', path: trimmed, original: trimmed }
+    }
+
     // Not an IPFS URL
     return { type: null, path: null, original: trimmed }
   }
-  
+
   /**
    * Check if a URL is an IPFS/IPNS URL
    */
@@ -85,13 +118,13 @@ export function useIpfs() {
     if (!type) return url
     return `${type}://${path}`
   }
-  
+
   /**
    * Parse IPFS error messages into user-friendly format
    */
   const parseIpfsError = (error, path) => {
     const msg = error.message || String(error)
-    
+
     if (msg.includes('no providers found')) {
       return `Content not available: No peers found serving "${path}". The content may not be pinned or the CID may be incorrect.`
     }
@@ -104,32 +137,35 @@ export function useIpfs() {
     if (msg.includes('not found') || msg.includes('404')) {
       return `Content not found: "${path}" does not exist on IPFS.`
     }
-    
+    if (msg.includes('500') || msg.includes('Internal Server Error')) {
+      return `IPFS gateway error for "${path}". The gateway may be overloaded. Try again later.`
+    }
+    if (msg.includes('501') || msg.includes('Not Implemented')) {
+      return `IPFS gateway does not support this request type for "${path}".`
+    }
+
     return `IPFS error for "${path}": ${msg}`
   }
 
+
   /**
-   * Create fetch function for IpfsIndex
-   * Returns a function: (path: string) => Promise<Uint8Array>
+   * Create fetch function for IpfsIndex using HTTP gateways
+   * Returns a function: (path: string, rangeStart?: number, rangeEnd?: number) => Promise<Uint8Array>
    */
   const createFetchFn = () => {
-    if (!verifiedFetch) {
+    if (!isInitialized.value) {
       throw new Error('IPFS not initialized. Call init() first.')
     }
-    
-    return async (path) => {
-      console.log('IPFS fetch:', path)
-      const uri = toIpfsUri(path)
-      
+
+    const dm = getDownloadManager()
+
+    return async (path, rangeStart, rangeEnd) => {
+      const hasRange = rangeStart !== undefined && rangeEnd !== undefined
+      console.log('IPFS fetch:', path, hasRange ? `[${rangeStart}-${rangeEnd}]` : '(full)')
+
       try {
-        const response = await verifiedFetch(uri)
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-        }
-        
-        const buffer = await response.arrayBuffer()
-        return new Uint8Array(buffer)
+        const data = await dm.download(path, { rangeStart, rangeEnd })
+        return data
       } catch (e) {
         const friendlyError = parseIpfsError(e, path)
         console.error('IPFS fetch error:', friendlyError)
@@ -137,40 +173,28 @@ export function useIpfs() {
       }
     }
   }
-  
+
   /**
-   * Create size function for IpfsIndex
+   * Create size function for IpfsIndex using HTTP gateways
    * Returns a function: (path: string) => Promise<number>
-   * 
-   * Note: IPFS doesn't have a native HEAD-like operation, so we fetch
-   * the content and return its length. The SliceCachingDirectory will
-   * cache this for subsequent reads.
    */
   const createSizeFn = () => {
-    if (!verifiedFetch) {
+    if (!isInitialized.value) {
       throw new Error('IPFS not initialized. Call init() first.')
     }
-    
-    // Cache sizes to avoid re-fetching
+
+    const dm = getDownloadManager()
     const sizeCache = new Map()
-    
+
     return async (path) => {
       if (sizeCache.has(path)) {
         return sizeCache.get(path)
       }
-      
+
       console.log('IPFS size:', path)
-      const uri = toIpfsUri(path)
-      
+
       try {
-        const response = await verifiedFetch(uri)
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-        }
-        
-        const buffer = await response.arrayBuffer()
-        const size = buffer.byteLength
+        const size = await dm.getSize(path)
         sizeCache.set(path, size)
         return size
       } catch (e) {
@@ -180,7 +204,21 @@ export function useIpfs() {
       }
     }
   }
-  
+
+  /**
+   * Get network stats from download manager
+   */
+  const getStats = () => {
+    return getDownloadManager().stats
+  }
+
+  /**
+   * Reset network stats
+   */
+  const resetStats = () => {
+    getDownloadManager().resetStats()
+  }
+
   return {
     isInitialized,
     isInitializing,
@@ -190,6 +228,8 @@ export function useIpfs() {
     isIpfsUrl,
     toIpfsUri,
     createFetchFn,
-    createSizeFn
+    createSizeFn,
+    getStats,
+    resetStats
   }
 }

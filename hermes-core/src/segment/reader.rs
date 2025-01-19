@@ -173,8 +173,8 @@ impl AsyncSegmentReader {
             Error::Corruption("TermInfo has neither inline nor external data".to_string())
         })?;
 
-        let start = posting_offset as usize;
-        let end = start + posting_len as usize;
+        let start = posting_offset;
+        let end = start + posting_len as u64;
 
         if end > self.postings_handle.len() {
             return Err(Error::Corruption(
@@ -235,10 +235,15 @@ impl AsyncSegmentReader {
         self.term_dict.all_entries().await.map_err(Error::from)
     }
 
+    /// Get streaming iterator over term dictionary (for memory-efficient merge)
+    pub fn term_dict_iter(&self) -> crate::structures::AsyncSSTableIterator<'_, TermInfo> {
+        self.term_dict.iter()
+    }
+
     /// Read raw posting bytes at offset
     pub async fn read_postings(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
-        let start = offset as usize;
-        let end = start + len as usize;
+        let start = offset;
+        let end = start + len as u64;
         let bytes = self.postings_handle.read_bytes_range(start..end).await?;
         Ok(bytes.to_vec())
     }
@@ -395,6 +400,9 @@ impl AsyncSegmentReader {
     ///
     /// Supports RaBitQ (type 0), IVF-RaBitQ (type 1), and ScaNN (type 2).
     /// Also loads coarse centroids and PQ codebook as needed.
+    ///
+    /// Memory optimization: Uses lazy range reads to load each index separately,
+    /// avoiding loading the entire vectors file into memory at once.
     async fn load_vectors_file<D: Directory>(
         dir: &D,
         files: &SegmentFiles,
@@ -406,25 +414,41 @@ impl AsyncSegmentReader {
         let mut indexes = FxHashMap::default();
         let mut coarse_centroids: Option<Arc<CoarseCentroids>> = None;
 
+        // Skip loading vectors file if schema has no dense vector fields
+        let has_dense_vectors = schema
+            .fields()
+            .any(|(_, entry)| entry.dense_vector_config.is_some());
+        if !has_dense_vectors {
+            return Ok((indexes, None));
+        }
+
         // Try to open vectors file (may not exist if no vectors were indexed)
         let handle = match dir.open_lazy(&files.vectors).await {
             Ok(h) => h,
             Err(_) => return Ok((indexes, None)),
         };
 
-        let bytes = match handle.read_bytes().await {
+        // Read only the header first (4 bytes for num_fields)
+        let header_bytes = match handle.read_bytes_range(0..4).await {
             Ok(b) => b,
             Err(_) => return Ok((indexes, None)),
         };
 
-        if bytes.is_empty() {
+        if header_bytes.is_empty() {
             return Ok((indexes, None));
         }
 
-        let mut cursor = Cursor::new(bytes.as_slice());
-
-        // Read header
+        let mut cursor = Cursor::new(header_bytes.as_slice());
         let num_fields = cursor.read_u32::<LittleEndian>()?;
+
+        if num_fields == 0 {
+            return Ok((indexes, None));
+        }
+
+        // Read field entries header: (field_id: 4, index_type: 1, offset: 8, length: 8) = 21 bytes per field
+        let entries_size = num_fields as u64 * 21;
+        let entries_bytes = handle.read_bytes_range(4..4 + entries_size).await?;
+        let mut cursor = Cursor::new(entries_bytes.as_slice());
 
         // Read field entries (field_id, index_type, offset, length)
         let mut entries = Vec::with_capacity(num_fields as usize);
@@ -434,18 +458,19 @@ impl AsyncSegmentReader {
             let index_type = cursor.read_u8().unwrap_or(255); // 255 = unknown/legacy
             let offset = cursor.read_u64::<LittleEndian>()?;
             let length = cursor.read_u64::<LittleEndian>()?;
-            entries.push((field_id, index_type, offset as usize, length as usize));
+            entries.push((field_id, index_type, offset, length));
         }
 
-        // Load each index based on type
+        // Load each index on-demand using range reads (memory efficient)
         for (field_id, index_type, offset, length) in entries {
-            let data = &bytes.as_slice()[offset..offset + length];
+            // Read only this index's data
+            let data = handle.read_bytes_range(offset..offset + length).await?;
             let field = crate::dsl::Field(field_id);
 
             match index_type {
                 2 => {
                     // ScaNN (IVF-PQ)
-                    if let Ok(ivfpq_index) = IVFPQIndex::from_bytes(data) {
+                    if let Ok(ivfpq_index) = IVFPQIndex::from_bytes(data.as_slice()) {
                         // Load coarse centroids if not already loaded
                         if coarse_centroids.is_none()
                             && let Some(entry) = schema.get_field_entry(field)
@@ -474,7 +499,8 @@ impl AsyncSegmentReader {
                 }
                 1 => {
                     // IVF-RaBitQ
-                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data) {
+                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data.as_slice())
+                    {
                         if coarse_centroids.is_none()
                             && let Some(entry) = schema.get_field_entry(field)
                             && let Some(ref config) = entry.dense_vector_config
@@ -498,13 +524,15 @@ impl AsyncSegmentReader {
                 }
                 0 => {
                     // RaBitQ
-                    if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data) {
+                    if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data.as_slice())
+                    {
                         indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
                     }
                 }
                 _ => {
                     // Legacy format without type - try to auto-detect
-                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data) {
+                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data.as_slice())
+                    {
                         if coarse_centroids.is_none()
                             && let Some(entry) = schema.get_field_entry(field)
                             && let Some(ref config) = entry.dense_vector_config
@@ -524,7 +552,9 @@ impl AsyncSegmentReader {
                                 codebook,
                             },
                         );
-                    } else if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data) {
+                    } else if let Ok(rabitq_index) =
+                        serde_json::from_slice::<RaBitQIndex>(data.as_slice())
+                    {
                         indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
                     }
                 }

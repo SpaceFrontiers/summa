@@ -16,7 +16,9 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use crate::DocId;
-use crate::compression::{CompressionDict, CompressionLevel};
+use crate::compression::CompressionDict;
+#[cfg(feature = "native")]
+use crate::compression::CompressionLevel;
 use crate::directories::{AsyncFileRead, LazyFileHandle, LazyFileSlice};
 use crate::dsl::{Document, Schema};
 
@@ -373,11 +375,11 @@ impl AsyncStoreReader {
 
         // Load dictionary if present
         let dict = if has_dict && dict_offset > 0 {
-            let dict_start = dict_offset as usize;
+            let dict_start = dict_offset;
             let dict_len_bytes = file_handle
                 .read_bytes_range(dict_start..dict_start + 4)
                 .await?;
-            let dict_len = (&dict_len_bytes[..]).read_u32::<LittleEndian>()? as usize;
+            let dict_len = (&dict_len_bytes[..]).read_u32::<LittleEndian>()? as u64;
             let dict_bytes = file_handle
                 .read_bytes_range(dict_start + 4..dict_start + 4 + dict_len)
                 .await?;
@@ -388,14 +390,14 @@ impl AsyncStoreReader {
 
         // Calculate index location
         let index_start = if has_dict && dict_offset > 0 {
-            let dict_start = dict_offset as usize;
+            let dict_start = dict_offset;
             let dict_len_bytes = file_handle
                 .read_bytes_range(dict_start..dict_start + 4)
                 .await?;
-            let dict_len = (&dict_len_bytes[..]).read_u32::<LittleEndian>()? as usize;
+            let dict_len = (&dict_len_bytes[..]).read_u32::<LittleEndian>()? as u64;
             dict_start + 4 + dict_len
         } else {
-            data_end_offset as usize
+            data_end_offset
         };
         let index_end = file_len - 32;
 
@@ -420,7 +422,7 @@ impl AsyncStoreReader {
         }
 
         // Create lazy slice for data portion only
-        let data_slice = file_handle.slice(0..data_end_offset as usize);
+        let data_slice = file_handle.slice(0..data_end_offset);
 
         Ok(Self {
             data_slice,
@@ -490,8 +492,8 @@ impl AsyncStoreReader {
         }
 
         // Load from FileSlice
-        let start = entry.offset as usize;
-        let end = start + entry.length as usize;
+        let start = entry.offset;
+        let end = start + entry.length as u64;
         let compressed = self.data_slice.read_bytes_range(start..end).await?;
 
         // Use dictionary decompression if available
@@ -564,8 +566,8 @@ impl<'a, W: Write> StoreMerger<'a, W> {
     ) -> io::Result<()> {
         for block in blocks {
             // Read raw compressed block data
-            let start = block.offset as usize;
-            let end = start + block.length as usize;
+            let start = block.offset;
+            let end = start + block.length as u64;
             let compressed_data = data_slice.read_bytes_range(start..end).await?;
 
             // Write to output

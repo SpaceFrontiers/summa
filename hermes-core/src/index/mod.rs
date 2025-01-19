@@ -276,12 +276,25 @@ impl<D: Directory> Index<D> {
         query: &dyn crate::query::Query,
         limit: usize,
     ) -> Result<crate::query::SearchResponse> {
+        self.search_with_addresses_offset(query, limit, 0).await
+    }
+
+    /// Search with offset for pagination
+    pub async fn search_with_addresses_offset(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+        offset: usize,
+    ) -> Result<crate::query::SearchResponse> {
         let segments = self.segments.read().clone();
         let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
 
+        // Fetch enough results to cover offset + limit
+        let fetch_limit = offset + limit;
         for segment in &segments {
             let segment_id = segment.meta().id;
-            let results = crate::query::search_segment(segment.as_ref(), query, limit).await?;
+            let results =
+                crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?;
             for result in results {
                 all_results.push((segment_id, result));
             }
@@ -293,11 +306,15 @@ impl<D: Directory> Index<D> {
                 .partial_cmp(&a.1.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all_results.truncate(limit);
 
+        // Total hits before pagination
         let total_hits = all_results.len() as u32;
+
+        // Apply offset and limit
         let hits: Vec<crate::query::SearchHit> = all_results
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|(segment_id, result)| crate::query::SearchHit {
                 address: crate::query::DocAddress::new(segment_id, result.doc_id),
                 score: result.score,
@@ -378,9 +395,20 @@ impl<D: Directory> Index<D> {
         query_str: &str,
         limit: usize,
     ) -> Result<crate::query::SearchResponse> {
+        self.query_offset(query_str, limit, 0).await
+    }
+
+    /// Query with offset for pagination
+    pub async fn query_offset(
+        &self,
+        query_str: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<crate::query::SearchResponse> {
         let parser = self.query_parser();
         let query = parser.parse(query_str).map_err(Error::Query)?;
-        self.search_with_addresses(query.as_ref(), limit).await
+        self.search_with_addresses_offset(query.as_ref(), limit, offset)
+            .await
     }
 }
 

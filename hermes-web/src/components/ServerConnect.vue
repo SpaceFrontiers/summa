@@ -1,16 +1,49 @@
 <template>
   <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
     <h2 class="text-lg font-semibold text-gray-900 mb-4">Index Connection</h2>
-    
+
     <div class="flex gap-3">
-      <input
-        v-model="serverUrl"
-        type="text"
-        placeholder="http://localhost:8765 or /ipfs/Qm..."
-        :disabled="isConnected || isLoading"
-        class="flex-1 px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all disabled:bg-gray-100 disabled:text-gray-500"
-        @keyup.enter="handleConnect"
-      />
+      <div class="flex-1 relative">
+        <input
+          v-model="serverUrl"
+          type="text"
+          placeholder="http://localhost:8765 or /ipfs/Qm..."
+          :disabled="isConnected || isLoading"
+          class="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all disabled:bg-gray-100 disabled:text-gray-500"
+          @keyup.enter="handleConnect"
+          @focus="showDropdown = true"
+          @blur="hideDropdownDelayed"
+        />
+        <!-- Recent URLs dropdown -->
+        <div
+          v-if="showDropdown && !isConnected && connectionsStore.recentUrls.length > 0"
+          class="absolute z-10 w-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto"
+        >
+          <div class="px-3 py-2 text-xs text-gray-500 border-b border-gray-100 flex justify-between items-center">
+            <span>Recent connections</span>
+            <button
+              @mousedown.prevent="connectionsStore.clearRecent()"
+              class="text-gray-400 hover:text-red-500"
+            >
+              Clear
+            </button>
+          </div>
+          <button
+            v-for="url in connectionsStore.recentUrls"
+            :key="url"
+            @mousedown.prevent="selectUrl(url)"
+            class="w-full px-4 py-2 text-left text-sm hover:bg-gray-50 flex items-center justify-between group"
+          >
+            <span class="truncate">{{ url }}</span>
+            <span
+              @mousedown.prevent.stop="connectionsStore.removeRecent(url)"
+              class="text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 ml-2"
+            >
+              ×
+            </span>
+          </button>
+        </div>
+      </div>
       <button
         v-if="!isConnected"
         @click="handleConnect"
@@ -45,7 +78,7 @@
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
         </svg>
         Connected
-        <span v-if="connectionType" class="ml-2 px-2 py-0.5 text-xs rounded-full" 
+        <span v-if="connectionType" class="ml-2 px-2 py-0.5 text-xs rounded-full"
               :class="connectionType === 'ipfs' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'">
           {{ connectionType.toUpperCase() }}
         </span>
@@ -69,9 +102,10 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
+import { useConnectionsStore } from '../stores/connections'
 
-const props = defineProps({
+defineProps({
   isLoading: Boolean,
   isConnected: Boolean,
   connectionType: String,
@@ -81,15 +115,42 @@ const props = defineProps({
 
 const emit = defineEmits(['connect', 'disconnect'])
 
-const serverUrl = ref('http://localhost:8765')
+const connectionsStore = useConnectionsStore()
+const serverUrl = ref('')
+const showDropdown = ref(false)
+
+// Initialize with last used URL or default
+onMounted(() => {
+  if (connectionsStore.currentUrl) {
+    serverUrl.value = connectionsStore.currentUrl
+  } else if (connectionsStore.recentUrls.length > 0) {
+    serverUrl.value = connectionsStore.recentUrls[0]
+  } else {
+    serverUrl.value = 'http://localhost:8765'
+  }
+})
 
 const handleConnect = () => {
   if (serverUrl.value.trim()) {
+    connectionsStore.setCurrentUrl(serverUrl.value.trim())
     emit('connect', serverUrl.value.trim())
   }
 }
 
 const handleDisconnect = () => {
+  connectionsStore.disconnect()
   emit('disconnect')
+}
+
+const selectUrl = (url) => {
+  serverUrl.value = url
+  showDropdown.value = false
+  handleConnect()
+}
+
+const hideDropdownDelayed = () => {
+  setTimeout(() => {
+    showDropdown.value = false
+  }, 150)
 }
 </script>

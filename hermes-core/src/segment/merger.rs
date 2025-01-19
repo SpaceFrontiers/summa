@@ -1,5 +1,7 @@
 //! Segment merger for combining multiple segments
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -14,6 +16,71 @@ use crate::dsl::{FieldType, Schema};
 use crate::structures::{
     BlockPostingList, PostingList, RaBitQConfig, RaBitQIndex, SSTableWriter, TERMINATED, TermInfo,
 };
+
+/// Statistics for merge operations
+#[derive(Debug, Clone, Default)]
+pub struct MergeStats {
+    /// Number of terms processed
+    pub terms_processed: usize,
+    /// Number of postings merged
+    pub postings_merged: usize,
+    /// Peak memory usage in bytes (estimated)
+    pub peak_memory_bytes: usize,
+    /// Current memory usage in bytes (estimated)
+    pub current_memory_bytes: usize,
+    /// Term dictionary output size
+    pub term_dict_bytes: usize,
+    /// Postings output size
+    pub postings_bytes: usize,
+    /// Store output size
+    pub store_bytes: usize,
+    /// Vector index output size
+    pub vectors_bytes: usize,
+}
+
+impl MergeStats {
+    /// Format memory as human-readable string
+    pub fn format_memory(bytes: usize) -> String {
+        if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if bytes >= 1024 * 1024 {
+            format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.2} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+}
+
+/// Entry for k-way merge heap
+struct MergeEntry {
+    key: Vec<u8>,
+    term_info: TermInfo,
+    segment_idx: usize,
+    doc_offset: u32,
+}
+
+impl PartialEq for MergeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for MergeEntry {}
+
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse order for min-heap (BinaryHeap is max-heap by default)
+        other.key.cmp(&self.key)
+    }
+}
 
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
@@ -32,30 +99,58 @@ impl SegmentMerger {
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
     ) -> Result<SegmentMeta> {
-        // Check if we can use optimized store stacking (no dictionaries)
-        let can_stack_stores = segments.iter().all(|s| !s.store_has_dict());
-
-        if can_stack_stores {
-            self.merge_optimized(dir, segments, new_segment_id).await
-        } else {
-            self.merge_rebuild(dir, segments, new_segment_id).await
-        }
+        let (meta, _stats) = self.merge_with_stats(dir, segments, new_segment_id).await?;
+        Ok(meta)
     }
 
-    /// Optimized merge: stack compressed store blocks, rebuild only term dict/postings
-    async fn merge_optimized<D: Directory + DirectoryWriter>(
+    /// Merge segments with memory tracking - returns merge statistics
+    pub async fn merge_with_stats<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
-    ) -> Result<SegmentMeta> {
+    ) -> Result<(SegmentMeta, MergeStats)> {
+        // Check if we can use optimized store stacking (no dictionaries)
+        let can_stack_stores = segments.iter().all(|s| !s.store_has_dict());
+
+        if can_stack_stores {
+            self.merge_optimized_with_stats(dir, segments, new_segment_id)
+                .await
+        } else {
+            self.merge_rebuild_with_stats(dir, segments, new_segment_id)
+                .await
+        }
+    }
+
+    /// Optimized merge with stats tracking
+    async fn merge_optimized_with_stats<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        new_segment_id: SegmentId,
+    ) -> Result<(SegmentMeta, MergeStats)> {
+        let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
 
-        // Build merged term dictionary and postings (still need to rebuild these)
+        // Build merged term dictionary and postings
         let mut term_dict_data = Vec::new();
         let mut postings_data = Vec::new();
-        self.merge_postings(segments, &mut term_dict_data, &mut postings_data)
+        let terms_processed = self
+            .merge_postings_with_stats(
+                segments,
+                &mut term_dict_data,
+                &mut postings_data,
+                &mut stats,
+            )
             .await?;
+        stats.terms_processed = terms_processed;
+        stats.term_dict_bytes = term_dict_data.len();
+        stats.postings_bytes = postings_data.len();
+
+        // Track peak memory (term dict + postings buffers)
+        let current_mem = term_dict_data.capacity() + postings_data.capacity();
+        stats.current_memory_bytes = current_mem;
+        stats.peak_memory_bytes = stats.peak_memory_bytes.max(current_mem);
 
         // Stack store files without recompression
         let mut store_data = Vec::new();
@@ -68,22 +163,36 @@ impl SegmentMerger {
             }
             store_merger.finish()?;
         }
+        stats.store_bytes = store_data.len();
+
+        // Update peak memory
+        let current_mem =
+            term_dict_data.capacity() + postings_data.capacity() + store_data.capacity();
+        stats.peak_memory_bytes = stats.peak_memory_bytes.max(current_mem);
 
         // Write files
         dir.write(&files.term_dict, &term_dict_data).await?;
         dir.write(&files.postings, &postings_data).await?;
         dir.write(&files.store, &store_data).await?;
 
+        // Free memory after writing
+        drop(term_dict_data);
+        drop(postings_data);
+        drop(store_data);
+
         // Merge dense vector indexes
-        self.merge_dense_vectors(dir, segments, &files).await?;
+        let vectors_bytes = self
+            .merge_dense_vectors_with_stats(dir, segments, &files)
+            .await?;
+        stats.vectors_bytes = vectors_bytes;
 
         // Merge field stats
         let mut merged_field_stats: FxHashMap<u32, FieldStats> = FxHashMap::default();
         for segment in segments {
-            for (&field_id, stats) in &segment.meta().field_stats {
+            for (&field_id, field_stats) in &segment.meta().field_stats {
                 let entry = merged_field_stats.entry(field_id).or_default();
-                entry.total_tokens += stats.total_tokens;
-                entry.doc_count += stats.doc_count;
+                entry.total_tokens += field_stats.total_tokens;
+                entry.doc_count += field_stats.doc_count;
             }
         }
 
@@ -96,16 +205,27 @@ impl SegmentMerger {
 
         dir.write(&files.meta, &meta.serialize()?).await?;
 
-        Ok(meta)
+        log::info!(
+            "Merge complete: {} terms, output: term_dict={}, postings={}, store={}, vectors={}",
+            stats.terms_processed,
+            MergeStats::format_memory(stats.term_dict_bytes),
+            MergeStats::format_memory(stats.postings_bytes),
+            MergeStats::format_memory(stats.store_bytes),
+            MergeStats::format_memory(stats.vectors_bytes),
+        );
+
+        Ok((meta, stats))
     }
 
-    /// Fallback merge: rebuild everything from documents
-    async fn merge_rebuild<D: Directory + DirectoryWriter>(
+    /// Fallback merge with stats tracking
+    async fn merge_rebuild_with_stats<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
-    ) -> Result<SegmentMeta> {
+    ) -> Result<(SegmentMeta, MergeStats)> {
+        let mut stats = MergeStats::default();
+
         let mut builder =
             SegmentBuilder::new((*self.schema).clone(), SegmentBuilderConfig::default())?;
 
@@ -114,46 +234,114 @@ impl SegmentMerger {
                 if let Some(doc) = segment.doc(doc_id).await? {
                     builder.add_document(doc)?;
                 }
+
+                // Track memory periodically
+                if doc_id % 10000 == 0 {
+                    let builder_stats = builder.stats();
+                    stats.current_memory_bytes = builder_stats.estimated_memory_bytes;
+                    stats.peak_memory_bytes =
+                        stats.peak_memory_bytes.max(stats.current_memory_bytes);
+                }
             }
         }
 
-        builder.build(dir, new_segment_id).await
+        let meta = builder.build(dir, new_segment_id).await?;
+        Ok((meta, stats))
     }
 
-    /// Merge postings from multiple segments using hybrid stacking
+    /// Merge postings from multiple segments using streaming k-way merge
+    ///
+    /// This implementation uses a min-heap to merge terms from all segments
+    /// in sorted order without loading all terms into memory at once.
+    /// Memory usage is O(num_segments) instead of O(total_terms).
     ///
     /// Optimization: For terms that exist in only one segment, we copy the
     /// posting data directly without decode/encode. Only terms that exist
     /// in multiple segments need full merge.
-    async fn merge_postings(
+    ///
+    /// Returns the number of terms processed.
+    async fn merge_postings_with_stats(
         &self,
         segments: &[SegmentReader],
         term_dict: &mut Vec<u8>,
         postings_out: &mut Vec<u8>,
-    ) -> Result<()> {
-        use std::collections::BTreeMap;
-
-        // Phase 1: Collect all terms and track which segments contain each term
-        // Key -> Vec<(segment_index, term_info, doc_offset)>
-        let mut term_sources: BTreeMap<Vec<u8>, Vec<(usize, TermInfo, u32)>> = BTreeMap::new();
-        let mut doc_offset = 0u32;
-
-        for (seg_idx, segment) in segments.iter().enumerate() {
-            let terms = segment.all_terms().await?;
-            for (key, term_info) in terms {
-                term_sources
-                    .entry(key)
-                    .or_default()
-                    .push((seg_idx, term_info, doc_offset));
-            }
-            doc_offset += segment.num_docs();
+        stats: &mut MergeStats,
+    ) -> Result<usize> {
+        // Calculate doc offsets for each segment
+        let mut doc_offsets = Vec::with_capacity(segments.len());
+        let mut offset = 0u32;
+        for segment in segments {
+            doc_offsets.push(offset);
+            offset += segment.num_docs();
         }
 
-        // Phase 2: Process terms - collect all results first (async)
-        // This avoids holding SSTableWriter across await points
-        let mut term_results: Vec<(Vec<u8>, TermInfo)> = Vec::with_capacity(term_sources.len());
+        // Create iterators for each segment's term dictionary
+        let mut iterators: Vec<_> = segments.iter().map(|s| s.term_dict_iter()).collect();
 
-        for (key, sources) in term_sources {
+        // Initialize min-heap with first entry from each segment
+        let mut heap: BinaryHeap<MergeEntry> = BinaryHeap::new();
+        for (seg_idx, iter) in iterators.iter_mut().enumerate() {
+            if let Some((key, term_info)) = iter.next().await.map_err(crate::Error::from)? {
+                heap.push(MergeEntry {
+                    key,
+                    term_info,
+                    segment_idx: seg_idx,
+                    doc_offset: doc_offsets[seg_idx],
+                });
+            }
+        }
+
+        // Collect results for SSTable writing (need to buffer due to async)
+        let mut term_results: Vec<(Vec<u8>, TermInfo)> = Vec::new();
+        let mut terms_processed = 0usize;
+
+        while !heap.is_empty() {
+            // Get the smallest key
+            let first = heap.pop().unwrap();
+            let current_key = first.key.clone();
+
+            // Collect all entries with the same key
+            let mut sources: Vec<(usize, TermInfo, u32)> =
+                vec![(first.segment_idx, first.term_info, first.doc_offset)];
+
+            // Advance the iterator that provided this entry
+            if let Some((key, term_info)) = iterators[first.segment_idx]
+                .next()
+                .await
+                .map_err(crate::Error::from)?
+            {
+                heap.push(MergeEntry {
+                    key,
+                    term_info,
+                    segment_idx: first.segment_idx,
+                    doc_offset: doc_offsets[first.segment_idx],
+                });
+            }
+
+            // Check if other segments have the same key
+            while let Some(entry) = heap.peek() {
+                if entry.key != current_key {
+                    break;
+                }
+                let entry = heap.pop().unwrap();
+                sources.push((entry.segment_idx, entry.term_info, entry.doc_offset));
+
+                // Advance this iterator too
+                if let Some((key, term_info)) = iterators[entry.segment_idx]
+                    .next()
+                    .await
+                    .map_err(crate::Error::from)?
+                {
+                    heap.push(MergeEntry {
+                        key,
+                        term_info,
+                        segment_idx: entry.segment_idx,
+                        doc_offset: doc_offsets[entry.segment_idx],
+                    });
+                }
+            }
+
+            // Process this term
             let term_info = if sources.len() == 1 {
                 // Optimization: Term exists in only one segment - copy directly
                 let (seg_idx, source_info, seg_doc_offset) = &sources[0];
@@ -170,17 +358,34 @@ impl SegmentMerger {
                     .await?
             };
 
-            term_results.push((key, term_info));
+            term_results.push((current_key, term_info));
+            terms_processed += 1;
+
+            // Log progress every 100k terms
+            if terms_processed.is_multiple_of(100_000) {
+                log::debug!("Merge progress: {} terms processed", terms_processed);
+            }
         }
 
-        // Phase 3: Write to SSTable (sync, no await points)
+        log::info!(
+            "Merge complete: {} terms processed from {} segments",
+            terms_processed,
+            segments.len()
+        );
+
+        // Track memory for term_results buffer
+        let results_mem = term_results.capacity() * std::mem::size_of::<(Vec<u8>, TermInfo)>();
+        stats.current_memory_bytes = results_mem + postings_out.capacity();
+        stats.peak_memory_bytes = stats.peak_memory_bytes.max(stats.current_memory_bytes);
+
+        // Write to SSTable (sync, no await points)
         let mut writer = SSTableWriter::<TermInfo>::new(term_dict);
         for (key, term_info) in term_results {
             writer.insert(&key, &term_info)?;
         }
         writer.finish()?;
 
-        Ok(())
+        Ok(terms_processed)
     }
 
     /// Copy a term's posting data directly from source segment (no decode/encode)
@@ -339,17 +544,17 @@ impl SegmentMerger {
             merged.doc_count(),
         ))
     }
-    /// Merge dense vector indexes from multiple segments into unified file
+    /// Merge dense vector indexes with stats tracking - returns output size in bytes
     ///
     /// For ScaNN (IVF-PQ): O(1) merge by concatenating cluster data (same codebook)
     /// For IVF-RaBitQ: O(1) merge by concatenating cluster data (same centroids)
     /// For RaBitQ: Must rebuild with new centroid from all vectors
-    async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
+    async fn merge_dense_vectors_with_stats<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
         files: &SegmentFiles,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         use byteorder::{LittleEndian, WriteBytesExt};
 
         // (field_id, index_type, data)
@@ -484,10 +689,12 @@ impl SegmentMerger {
                 output.extend_from_slice(&data);
             }
 
+            let output_size = output.len();
             dir.write(&files.vectors, &output).await?;
+            return Ok(output_size);
         }
 
-        Ok(())
+        Ok(0)
     }
 }
 

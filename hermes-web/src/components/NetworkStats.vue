@@ -43,22 +43,22 @@
         </div>
       </div>
 
-      <div v-if="stats.operations?.length" class="space-y-2 max-h-48 overflow-y-auto">
+      <div v-if="stats.requests?.length" ref="requestsContainer" class="space-y-2 max-h-48 overflow-y-auto">
         <div
-          v-for="(op, idx) in stats.operations"
+          v-for="(req, idx) in stats.requests"
           :key="idx"
           class="flex items-center justify-between text-sm py-2 border-b border-gray-800 last:border-0"
         >
           <div class="flex items-center gap-2 min-w-0">
             <span class="text-green-400 font-mono">GET</span>
-            <span v-if="op.range" class="text-orange-400 font-mono text-xs">
-              [{{ op.range[0] }}-{{ op.range[1] }}]
+            <span v-if="req.range_start != null" class="text-orange-400 font-mono text-xs">
+              [{{ req.range_start }}-{{ req.range_end }}]
             </span>
             <span v-else class="text-green-400 font-mono text-xs">[full]</span>
-            <span class="text-gray-300 truncate">{{ getFileName(op.url) }}</span>
+            <span class="text-gray-300 truncate">{{ getFileName(req.path) }}</span>
           </div>
           <div class="text-gray-500 text-xs shrink-0 ml-2">
-            {{ formatBytes(op.bytes) }} · {{ op.duration_ms }}ms
+            {{ formatBytes(req.bytes) }}
           </div>
         </div>
       </div>
@@ -67,7 +67,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, watch, nextTick } from 'vue'
 
 const props = defineProps({
   stats: Object,
@@ -75,6 +75,20 @@ const props = defineProps({
 })
 
 defineEmits(['reset'])
+
+const requestsContainer = ref(null)
+
+// Auto-scroll to bottom when new requests appear
+watch(
+  () => props.stats?.requests?.length,
+  () => {
+    nextTick(() => {
+      if (requestsContainer.value) {
+        requestsContainer.value.scrollTop = requestsContainer.value.scrollHeight
+      }
+    })
+  }
+)
 
 const totalTime = computed(() => {
   if (!props.stats?.operations) return 0
@@ -88,11 +102,10 @@ const formatBytes = (bytes) => {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
 }
 
-const getFileName = (url) => {
-  try {
-    return new URL(url).pathname.split('/').pop() || url
-  } catch {
-    return url
-  }
+const getFileName = (path) => {
+  if (!path) return ''
+  // Extract filename from IPFS path like /ipfs/Qm.../filename.ext
+  const parts = path.split('/')
+  return parts[parts.length - 1] || path
 }
 </script>

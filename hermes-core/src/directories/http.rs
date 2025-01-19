@@ -288,7 +288,7 @@ impl Directory for HttpDirectory {
 
     async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
         // Get file size via HEAD request
-        let file_size = self.file_size(path).await? as usize;
+        let file_size = self.file_size(path).await?;
 
         // Create the range read function
         let url = self.url_for(path);

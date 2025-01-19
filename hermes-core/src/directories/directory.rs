@@ -15,12 +15,12 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct FileSlice {
     data: OwnedBytes,
-    range: Range<usize>,
+    range: Range<u64>,
 }
 
 impl FileSlice {
     pub fn new(data: OwnedBytes) -> Self {
-        let len = data.len();
+        let len = data.len() as u64;
         Self {
             data,
             range: 0..len,
@@ -34,7 +34,7 @@ impl FileSlice {
         }
     }
 
-    pub fn slice(&self, range: Range<usize>) -> Self {
+    pub fn slice(&self, range: Range<u64>) -> Self {
         let start = self.range.start + range.start;
         let end = self.range.start + range.end;
         Self {
@@ -43,21 +43,23 @@ impl FileSlice {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.range.len()
+    pub fn len(&self) -> u64 {
+        self.range.end - self.range.start
     }
 
     pub fn is_empty(&self) -> bool {
-        self.range.is_empty()
+        self.range.start == self.range.end
     }
 
     /// Read the entire slice (async for network compatibility)
     pub async fn read_bytes(&self) -> io::Result<OwnedBytes> {
-        Ok(self.data.slice(self.range.clone()))
+        Ok(self
+            .data
+            .slice(self.range.start as usize..self.range.end as usize))
     }
 
     /// Read a specific range within this slice
-    pub async fn read_bytes_range(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+    pub async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
         let start = self.range.start + range.start;
         let end = self.range.start + range.end;
         if end > self.range.end {
@@ -66,7 +68,7 @@ impl FileSlice {
                 "Range out of bounds",
             ));
         }
-        Ok(self.data.slice(start..end))
+        Ok(self.data.slice(start as usize..end as usize))
     }
 }
 
@@ -75,8 +77,8 @@ impl FileSlice {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg(not(target_arch = "wasm32"))]
 pub trait AsyncFileRead: Send + Sync {
-    /// Get the total length of the file/slice
-    fn len(&self) -> usize;
+    /// Get the total length of the file/slice (u64 to support >4GB files on 32-bit platforms)
+    fn len(&self) -> u64;
 
     /// Check if empty
     fn is_empty(&self) -> bool {
@@ -84,7 +86,7 @@ pub trait AsyncFileRead: Send + Sync {
     }
 
     /// Read a specific byte range
-    async fn read_bytes_range(&self, range: Range<usize>) -> io::Result<OwnedBytes>;
+    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes>;
 
     /// Read all bytes
     async fn read_bytes(&self) -> io::Result<OwnedBytes> {
@@ -96,8 +98,8 @@ pub trait AsyncFileRead: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg(target_arch = "wasm32")]
 pub trait AsyncFileRead {
-    /// Get the total length of the file/slice
-    fn len(&self) -> usize;
+    /// Get the total length of the file/slice (u64 to support >4GB files on 32-bit platforms)
+    fn len(&self) -> u64;
 
     /// Check if empty
     fn is_empty(&self) -> bool {
@@ -105,7 +107,7 @@ pub trait AsyncFileRead {
     }
 
     /// Read a specific byte range
-    async fn read_bytes_range(&self, range: Range<usize>) -> io::Result<OwnedBytes>;
+    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes>;
 
     /// Read all bytes
     async fn read_bytes(&self) -> io::Result<OwnedBytes> {
@@ -116,11 +118,11 @@ pub trait AsyncFileRead {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl AsyncFileRead for FileSlice {
-    fn len(&self) -> usize {
-        self.range.len()
+    fn len(&self) -> u64 {
+        self.range.end - self.range.start
     }
 
-    async fn read_bytes_range(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
         let start = self.range.start + range.start;
         let end = self.range.start + range.end;
         if end > self.range.end {
@@ -129,7 +131,7 @@ impl AsyncFileRead for FileSlice {
                 "Range out of bounds",
             ));
         }
-        Ok(self.data.slice(start..end))
+        Ok(self.data.slice(start as usize..end as usize))
     }
 }
 
@@ -154,8 +156,8 @@ pub type RangeReadFn = Arc<
 /// Lazy file handle that fetches ranges on demand via HTTP range requests
 /// Does NOT load the entire file into memory
 pub struct LazyFileHandle {
-    /// Total file size
-    file_size: usize,
+    /// Total file size (u64 to support >4GB files on 32-bit platforms like WASM)
+    file_size: u64,
     /// Callback to read a range from the underlying directory
     read_fn: RangeReadFn,
 }
@@ -179,17 +181,17 @@ impl Clone for LazyFileHandle {
 
 impl LazyFileHandle {
     /// Create a new lazy file handle
-    pub fn new(file_size: usize, read_fn: RangeReadFn) -> Self {
+    pub fn new(file_size: u64, read_fn: RangeReadFn) -> Self {
         Self { file_size, read_fn }
     }
 
     /// Get file size
-    pub fn file_size(&self) -> usize {
+    pub fn file_size(&self) -> u64 {
         self.file_size
     }
 
     /// Create a sub-slice view (still lazy)
-    pub fn slice(&self, range: Range<usize>) -> LazyFileSlice {
+    pub fn slice(&self, range: Range<u64>) -> LazyFileSlice {
         LazyFileSlice {
             handle: self.clone(),
             offset: range.start,
@@ -201,11 +203,11 @@ impl LazyFileHandle {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl AsyncFileRead for LazyFileHandle {
-    fn len(&self) -> usize {
+    fn len(&self) -> u64 {
         self.file_size
     }
 
-    async fn read_bytes_range(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
         if range.end > self.file_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -215,7 +217,7 @@ impl AsyncFileRead for LazyFileHandle {
                 ),
             ));
         }
-        (self.read_fn)(range.start as u64..range.end as u64).await
+        (self.read_fn)(range).await
     }
 }
 
@@ -223,8 +225,8 @@ impl AsyncFileRead for LazyFileHandle {
 #[derive(Clone)]
 pub struct LazyFileSlice {
     handle: LazyFileHandle,
-    offset: usize,
-    len: usize,
+    offset: u64,
+    len: u64,
 }
 
 impl std::fmt::Debug for LazyFileSlice {
@@ -238,7 +240,7 @@ impl std::fmt::Debug for LazyFileSlice {
 
 impl LazyFileSlice {
     /// Create a sub-slice
-    pub fn slice(&self, range: Range<usize>) -> Self {
+    pub fn slice(&self, range: Range<u64>) -> Self {
         Self {
             handle: self.handle.clone(),
             offset: self.offset + range.start,
@@ -250,11 +252,11 @@ impl LazyFileSlice {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl AsyncFileRead for LazyFileSlice {
-    fn len(&self) -> usize {
+    fn len(&self) -> u64 {
         self.len
     }
 
-    async fn read_bytes_range(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
         if range.end > self.len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -481,7 +483,7 @@ impl Directory for RamDirectory {
             let files_guard = files.read();
             files_guard
                 .get(&path)
-                .map(|data| data.len())
+                .map(|data| data.len() as u64)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?
         };
 
@@ -613,7 +615,7 @@ impl Directory for FsDirectory {
     async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
         let full_path = self.resolve(path);
         let metadata = tokio::fs::metadata(&full_path).await?;
-        let file_size = metadata.len() as usize;
+        let file_size = metadata.len();
 
         let read_fn: RangeReadFn = Arc::new(move |range: Range<u64>| {
             let full_path = full_path.clone();

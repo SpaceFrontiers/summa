@@ -20,7 +20,8 @@ pub const SLICE_CACHE_EXTENSION: &str = "slicecache";
 const SLICE_CACHE_MAGIC: &[u8; 8] = b"HRMSCACH";
 
 /// Current version of the slice cache format
-const SLICE_CACHE_VERSION: u32 = 1;
+/// v2: Added file size caching
+const SLICE_CACHE_VERSION: u32 = 2;
 
 /// A cached slice of a file
 #[derive(Debug, Clone)]
@@ -258,10 +259,13 @@ impl FileSliceCache {
 /// - Overlap detection and merging
 /// - LRU eviction when cache limit is reached
 /// - Bounded total memory usage
+/// - File size caching to avoid HEAD requests
 pub struct SliceCachingDirectory<D: Directory> {
     inner: Arc<D>,
     /// Per-file slice caches
     caches: Arc<RwLock<std::collections::HashMap<PathBuf, FileSliceCache>>>,
+    /// Cached file sizes (avoids HEAD requests on lazy open)
+    file_sizes: Arc<RwLock<std::collections::HashMap<PathBuf, u64>>>,
     /// Maximum total bytes to cache
     max_bytes: usize,
     /// Current total bytes cached
@@ -276,6 +280,7 @@ impl<D: Directory> SliceCachingDirectory<D> {
         Self {
             inner: Arc::new(inner),
             caches: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            file_sizes: Arc::new(RwLock::new(std::collections::HashMap::new())),
             max_bytes,
             current_bytes: Arc::new(RwLock::new(0)),
             access_counter: Arc::new(RwLock::new(0)),
@@ -390,7 +395,7 @@ impl<D: Directory> SliceCachingDirectory<D> {
 
     /// Serialize the entire cache to a single binary blob
     ///
-    /// Format:
+    /// Format (v2):
     /// - Magic: 8 bytes "HRMSCACH"
     /// - Version: 4 bytes (u32 LE)
     /// - Num files: 4 bytes (u32 LE)
@@ -398,8 +403,14 @@ impl<D: Directory> SliceCachingDirectory<D> {
     ///   - Path length: 4 bytes (u32 LE)
     ///   - Path: UTF-8 bytes
     ///   - File cache data (see FileSliceCache::serialize)
+    /// - Num file sizes: 4 bytes (u32 LE) [v2+]
+    /// - For each file size: [v2+]
+    ///   - Path length: 4 bytes (u32 LE)
+    ///   - Path: UTF-8 bytes
+    ///   - File size: 8 bytes (u64 LE)
     pub fn serialize(&self) -> Vec<u8> {
         let caches = self.caches.read();
+        let file_sizes = self.file_sizes.read();
         let mut buf = Vec::new();
 
         // Magic and version
@@ -423,6 +434,16 @@ impl<D: Directory> SliceCachingDirectory<D> {
             // File cache data
             let cache_data = file_cache.serialize();
             buf.extend_from_slice(&cache_data);
+        }
+
+        // v2: File sizes section
+        buf.extend_from_slice(&(file_sizes.len() as u32).to_le_bytes());
+        for (path, &size) in file_sizes.iter() {
+            let path_str = path.to_string_lossy();
+            let path_bytes = path_str.as_bytes();
+            buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(path_bytes);
+            buf.extend_from_slice(&size.to_le_bytes());
         }
 
         buf
@@ -450,9 +471,9 @@ impl<D: Directory> SliceCachingDirectory<D> {
         }
         pos += 8;
 
-        // Check version
+        // Check version (support v1 and v2)
         let version = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        if version != SLICE_CACHE_VERSION {
+        if version != 1 && version != 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported slice cache version: {}", version),
@@ -495,6 +516,39 @@ impl<D: Directory> SliceCachingDirectory<D> {
             // Merge into existing cache
             *current_bytes += file_cache.total_bytes;
             caches.insert(path, file_cache);
+        }
+
+        // v2: Load file sizes if present
+        if version >= 2 && pos + 4 <= data.len() {
+            let num_sizes = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            let mut file_sizes = self.file_sizes.write();
+            for _ in 0..num_sizes {
+                if pos + 4 > data.len() {
+                    break;
+                }
+                let path_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+
+                if pos + path_len > data.len() {
+                    break;
+                }
+                let path_str = match std::str::from_utf8(&data[pos..pos + path_len]) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let path = PathBuf::from(path_str);
+                pos += path_len;
+
+                if pos + 8 > data.len() {
+                    break;
+                }
+                let size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+
+                file_sizes.insert(path, size);
+            }
         }
 
         Ok(())
@@ -544,12 +598,26 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
     }
 
     async fn file_size(&self, path: &Path) -> io::Result<u64> {
-        self.inner.file_size(path).await
+        // Check cache first
+        {
+            let file_sizes = self.file_sizes.read();
+            if let Some(&size) = file_sizes.get(path) {
+                return Ok(size);
+            }
+        }
+
+        // Fetch from inner and cache
+        let size = self.inner.file_size(path).await?;
+        {
+            let mut file_sizes = self.file_sizes.write();
+            file_sizes.insert(path.to_path_buf(), size);
+        }
+        Ok(size)
     }
 
     async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
-        // Check if we have the full file cached
-        let file_size = self.inner.file_size(path).await?;
+        // Check if we have the full file cached (use our caching file_size)
+        let file_size = self.file_size(path).await?;
         let full_range = 0..file_size;
 
         // Try cache first for full file
@@ -587,8 +655,8 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
     }
 
     async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
-        // Get file size from inner
-        let file_size = self.inner.file_size(path).await? as usize;
+        // Get file size (uses cache to avoid HEAD requests)
+        let file_size = self.file_size(path).await?;
 
         // Create a caching wrapper around the inner directory's read_range
         let path_buf = path.to_path_buf();
@@ -613,9 +681,12 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
                     if let Some(file_cache) = caches_guard.get_mut(&path)
                         && let Some(data) = file_cache.try_read(range.clone(), &mut counter)
                     {
+                        log::trace!("Cache HIT: {:?} [{}-{}]", path, range.start, range.end);
                         return Ok(OwnedBytes::new(data));
                     }
                 }
+
+                log::trace!("Cache MISS: {:?} [{}-{}]", path, range.start, range.end);
 
                 // Read from inner
                 let data = inner.read_range(&path, range.clone()).await?;

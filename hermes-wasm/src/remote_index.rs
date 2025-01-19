@@ -148,7 +148,20 @@ impl RemoteIndex {
     /// Returns document addresses (segment_id + doc_id) without document content.
     #[wasm_bindgen]
     pub async fn search(&self, query_str: String, limit: usize) -> Result<JsValue, JsValue> {
-        web_sys::console::log_1(&format!("=== SEARCH START: '{}' ===", query_str).into());
+        self.search_offset(query_str, limit, 0).await
+    }
+
+    /// Search with offset for pagination
+    #[wasm_bindgen]
+    pub async fn search_offset(
+        &self,
+        query_str: String,
+        limit: usize,
+        offset: usize,
+    ) -> Result<JsValue, JsValue> {
+        web_sys::console::log_1(
+            &format!("=== SEARCH START: '{}' offset={} ===", query_str, offset).into(),
+        );
 
         let index = self
             .index
@@ -171,7 +184,7 @@ impl RemoteIndex {
         index.directory().inner().reset_stats();
 
         let response = index
-            .query(&query_str, limit)
+            .query_offset(&query_str, limit, offset)
             .await
             .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
 

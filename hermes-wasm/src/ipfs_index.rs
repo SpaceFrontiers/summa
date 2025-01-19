@@ -5,6 +5,7 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use hermes_core::directories::{
@@ -19,27 +20,81 @@ use wasm_bindgen_futures::JsFuture;
 use crate::DEFAULT_CACHE_SIZE;
 use crate::idb::{cache_key, idb_delete, idb_get, idb_put};
 
+/// A single network request record
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestRecord {
+    pub path: String,
+    pub bytes: u64,
+    pub range_start: Option<u64>,
+    pub range_end: Option<u64>,
+}
+
+/// Network statistics for IPFS fetching
+#[derive(Debug, Default)]
+pub struct IpfsNetworkStats {
+    pub total_requests: AtomicU64,
+    pub total_bytes: AtomicU64,
+    pub requests: RwLock<Vec<RequestRecord>>,
+}
+
+impl IpfsNetworkStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, path: &str, bytes: u64, range: Option<Range<u64>>) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
+
+        let record = RequestRecord {
+            path: path.to_string(),
+            bytes,
+            range_start: range.as_ref().map(|r| r.start),
+            range_end: range.as_ref().map(|r| r.end),
+        };
+        self.requests.write().push(record);
+    }
+
+    pub fn reset(&self) {
+        self.total_requests.store(0, Ordering::Relaxed);
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.requests.write().clear();
+    }
+
+    pub fn get_requests(&self) -> Vec<RequestRecord> {
+        self.requests.read().clone()
+    }
+}
+
 /// A Directory implementation that calls back to JavaScript for fetching
 ///
-/// This allows using custom fetch implementations like @helia/verified-fetch
-/// for IPFS content retrieval without gateways.
+/// This allows using custom fetch implementations like HTTP gateway fetching
+/// for IPFS content retrieval.
 pub struct JsFetchDirectory {
     base_path: String,
-    /// JavaScript function: (path: string) => Promise<Uint8Array>
+    /// JavaScript function: (path: string, rangeStart?: number, rangeEnd?: number) => Promise<Uint8Array>
     fetch_fn: js_sys::Function,
     /// JavaScript function: (path: string) => Promise<number> (file size)
     size_fn: js_sys::Function,
     /// Cache for file sizes
     size_cache: RwLock<HashMap<PathBuf, u64>>,
+    /// Network statistics
+    stats: Arc<IpfsNetworkStats>,
 }
 
 impl JsFetchDirectory {
-    pub fn new(base_path: String, fetch_fn: js_sys::Function, size_fn: js_sys::Function) -> Self {
+    pub fn new(
+        base_path: String,
+        fetch_fn: js_sys::Function,
+        size_fn: js_sys::Function,
+        stats: Arc<IpfsNetworkStats>,
+    ) -> Self {
         Self {
             base_path,
             fetch_fn,
             size_fn,
             size_cache: RwLock::new(HashMap::new()),
+            stats,
         }
     }
 
@@ -55,11 +110,25 @@ impl JsFetchDirectory {
         }
     }
 
+    /// Fetch full file content
     async fn call_fetch(&self, path: &str) -> io::Result<Vec<u8>> {
+        self.call_fetch_range(path, None).await
+    }
+
+    /// Fetch file content with optional range
+    async fn call_fetch_range(&self, path: &str, range: Option<Range<u64>>) -> io::Result<Vec<u8>> {
         let this = JsValue::NULL;
         let path_js = JsValue::from_str(path);
 
-        let promise = self.fetch_fn.call1(&this, &path_js).map_err(|e| {
+        let promise = match &range {
+            Some(r) => {
+                let start = JsValue::from_f64(r.start as f64);
+                let end = JsValue::from_f64(r.end as f64);
+                self.fetch_fn.call3(&this, &path_js, &start, &end)
+            }
+            None => self.fetch_fn.call1(&this, &path_js),
+        }
+        .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
                 format!("JS fetch call failed: {:?}", e),
@@ -73,7 +142,12 @@ impl JsFetchDirectory {
             })?;
 
         let array = js_sys::Uint8Array::new(&result);
-        Ok(array.to_vec())
+        let data = array.to_vec();
+
+        // Record network stats with path and range
+        self.stats.record(path, data.len() as u64, range);
+
+        Ok(data)
     }
 
     async fn call_size(&self, path: &str) -> io::Result<u64> {
@@ -127,19 +201,9 @@ impl Directory for JsFetchDirectory {
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
-        // For now, fetch full file and slice
-        // TODO: Add range support to JS callback
         let full_path = self.path_for(path);
-        let data = self.call_fetch(&full_path).await?;
-
-        let start = range.start as usize;
-        let end = (range.end as usize).min(data.len());
-
-        if start >= data.len() {
-            return Ok(OwnedBytes::new(vec![]));
-        }
-
-        Ok(OwnedBytes::new(data[start..end].to_vec()))
+        let data = self.call_fetch_range(&full_path, Some(range)).await?;
+        Ok(OwnedBytes::new(data))
     }
 
     async fn list_files(&self, _prefix: &Path) -> io::Result<Vec<PathBuf>> {
@@ -155,7 +219,7 @@ impl Directory for JsFetchDirectory {
         // and wrap it in a LazyFileHandle that serves from memory.
         let full_path = self.path_for(path);
         let data = self.call_fetch(&full_path).await?;
-        let file_size = data.len();
+        let file_size = data.len() as u64;
         let data = Arc::new(data);
 
         // Create a simple range read function that reads from the cached data
@@ -189,6 +253,7 @@ pub struct IpfsIndex {
     base_path: String,
     cache_size: usize,
     index: Option<Index<CachedJsFetchDirectory>>,
+    stats: Arc<IpfsNetworkStats>,
 }
 
 #[wasm_bindgen]
@@ -202,6 +267,7 @@ impl IpfsIndex {
             base_path,
             cache_size: DEFAULT_CACHE_SIZE,
             index: None,
+            stats: Arc::new(IpfsNetworkStats::new()),
         }
     }
 
@@ -212,6 +278,7 @@ impl IpfsIndex {
             base_path,
             cache_size,
             index: None,
+            stats: Arc::new(IpfsNetworkStats::new()),
         }
     }
 
@@ -225,8 +292,12 @@ impl IpfsIndex {
         fetch_fn: js_sys::Function,
         size_fn: js_sys::Function,
     ) -> Result<(), JsValue> {
-        let js_dir =
-            JsFetchDirectory::new(self.base_path.clone(), fetch_fn.clone(), size_fn.clone());
+        let js_dir = JsFetchDirectory::new(
+            self.base_path.clone(),
+            fetch_fn.clone(),
+            size_fn.clone(),
+            Arc::clone(&self.stats),
+        );
         let cached_dir = SliceCachingDirectory::new(js_dir, self.cache_size);
 
         // Try to load slice cache
@@ -255,6 +326,29 @@ impl IpfsIndex {
 
         self.index = Some(index);
         Ok(())
+    }
+
+    /// Get network statistics
+    #[wasm_bindgen]
+    pub fn network_stats(&self) -> JsValue {
+        #[derive(Serialize)]
+        struct NetworkStatsJs {
+            total_requests: u64,
+            total_bytes: u64,
+            requests: Vec<RequestRecord>,
+        }
+        let stats = NetworkStatsJs {
+            total_requests: self.stats.total_requests.load(Ordering::Relaxed),
+            total_bytes: self.stats.total_bytes.load(Ordering::Relaxed),
+            requests: self.stats.get_requests(),
+        };
+        serde_wasm_bindgen::to_value(&stats).unwrap_or(JsValue::NULL)
+    }
+
+    /// Reset network statistics
+    #[wasm_bindgen]
+    pub fn reset_network_stats(&self) {
+        self.stats.reset();
     }
 
     /// Get cache statistics
@@ -311,13 +405,24 @@ impl IpfsIndex {
     /// Search the index
     #[wasm_bindgen]
     pub async fn search(&self, query_str: String, limit: usize) -> Result<JsValue, JsValue> {
+        self.search_offset(query_str, limit, 0).await
+    }
+
+    /// Search the index with offset for pagination
+    #[wasm_bindgen]
+    pub async fn search_offset(
+        &self,
+        query_str: String,
+        limit: usize,
+        offset: usize,
+    ) -> Result<JsValue, JsValue> {
         let index = self
             .index
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
         let response = index
-            .query(&query_str, limit)
+            .query_offset(&query_str, limit, offset)
             .await
             .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
 

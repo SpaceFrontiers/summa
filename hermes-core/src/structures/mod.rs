@@ -136,6 +136,6 @@ pub use simd::bits_needed;
 
 // Re-export sstable
 pub use sstable::{
-    AsyncSSTableReader, BLOCK_SIZE as SSTABLE_BLOCK_SIZE, BloomFilter, SSTABLE_MAGIC, SSTableStats,
-    SSTableValue, SSTableWriter, SSTableWriterConfig, TermInfo,
+    AsyncSSTableIterator, AsyncSSTableReader, BLOCK_SIZE as SSTABLE_BLOCK_SIZE, BloomFilter,
+    SSTABLE_MAGIC, SSTableStats, SSTableValue, SSTableWriter, SSTableWriterConfig, TermInfo,
 };

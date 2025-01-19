@@ -144,7 +144,7 @@ impl Directory for MmapDirectory {
 
     async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
         let mmap = self.get_mmap(path).await?;
-        let file_size = mmap.len();
+        let file_size = mmap.len() as u64;
 
         // Clone the mmap Arc for the closure
         let mmap_clone = Arc::clone(&mmap);
