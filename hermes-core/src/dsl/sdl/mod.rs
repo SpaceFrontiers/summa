@@ -58,7 +58,9 @@ use crate::error::Error;
 pub struct SdlParser;
 
 use super::schema::DenseVectorConfig;
-use crate::structures::{IndexSize, SparseVectorConfig, WeightQuantization};
+use crate::structures::{
+    IndexSize, QueryWeighting, SparseQueryConfig, SparseVectorConfig, WeightQuantization,
+};
 
 /// Parsed field definition
 #[derive(Debug, Clone)]
@@ -114,7 +116,7 @@ impl IndexDef {
                             &field.name,
                             field.indexed,
                             field.stored,
-                            *config,
+                            config.clone(),
                         )
                     } else {
                         builder.add_sparse_vector_field(&field.name, field.indexed, field.stored)
@@ -193,6 +195,9 @@ struct IndexConfig {
     // Sparse vector index params
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
+    // Sparse vector query-time config
+    query_tokenizer: Option<String>,
+    query_weighting: Option<QueryWeighting>,
 }
 
 /// Parse attributes from pest pair
@@ -323,7 +328,46 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                 config.weight_threshold = Some(t.as_str().parse().unwrap_or(0.0));
             }
         }
+        Rule::query_config_block => {
+            // query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
+            parse_query_config_block(config, p);
+        }
         _ => {}
+    }
+}
+
+/// Parse query configuration block: query<tokenizer: "...", weighting: idf>
+fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pair<Rule>) {
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::query_config_params {
+            for param in inner.into_inner() {
+                if param.as_rule() == Rule::query_config_param {
+                    for p in param.into_inner() {
+                        match p.as_rule() {
+                            Rule::query_tokenizer_kwarg => {
+                                // query_tokenizer_kwarg = { "tokenizer" ~ ":" ~ tokenizer_path }
+                                if let Some(path) = p.into_inner().next()
+                                    && let Some(inner_path) = path.into_inner().next()
+                                {
+                                    config.query_tokenizer = Some(inner_path.as_str().to_string());
+                                }
+                            }
+                            Rule::query_weighting_kwarg => {
+                                // query_weighting_kwarg = { "weighting" ~ ":" ~ weighting_spec }
+                                if let Some(w) = p.into_inner().next() {
+                                    config.query_weighting = Some(match w.as_str() {
+                                        "one" => QueryWeighting::One,
+                                        "idf" => QueryWeighting::Idf,
+                                        _ => QueryWeighting::One,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -458,6 +502,8 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
         index_size,
         weight_quantization: WeightQuantization::default(),
         weight_threshold: 0.0,
+        posting_list_pruning: None,
+        query_config: None,
     }
 }
 
@@ -468,6 +514,18 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     }
     if let Some(t) = idx_cfg.weight_threshold {
         config.weight_threshold = t;
+    }
+    // Apply query-time configuration if present
+    if idx_cfg.query_tokenizer.is_some() || idx_cfg.query_weighting.is_some() {
+        let query_config = config
+            .query_config
+            .get_or_insert(SparseQueryConfig::default());
+        if let Some(tokenizer) = idx_cfg.query_tokenizer {
+            query_config.tokenizer = Some(tokenizer);
+        }
+        if let Some(weighting) = idx_cfg.query_weighting {
+            query_config.weighting = weighting;
+        }
     }
 }
 
@@ -1377,5 +1435,68 @@ mod tests {
         assert_eq!(entry.field_type, FieldType::Json);
         assert!(!entry.indexed); // JSON fields are never indexed
         assert!(entry.stored);
+    }
+
+    #[test]
+    fn test_sparse_vector_query_config() {
+        use crate::structures::QueryWeighting;
+
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16> [indexed<quantization: uint8, query<tokenizer: "Alibaba-NLP/gte-Qwen2-1.5B-instruct", weighting: idf>>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let index = &indexes[0];
+
+        assert_eq!(index.fields.len(), 1);
+        assert_eq!(index.fields[0].name, "embedding");
+        assert!(matches!(
+            index.fields[0].field_type,
+            FieldType::SparseVector
+        ));
+
+        let config = index.fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.index_size, IndexSize::U16);
+        assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
+
+        // Check query config
+        let query_config = config.query_config.as_ref().unwrap();
+        assert_eq!(
+            query_config.tokenizer.as_deref(),
+            Some("Alibaba-NLP/gte-Qwen2-1.5B-instruct")
+        );
+        assert_eq!(query_config.weighting, QueryWeighting::Idf);
+
+        // Verify schema conversion preserves query config
+        let schema = index.to_schema();
+        let embedding_field = schema.get_field("embedding").unwrap();
+        let entry = schema.get_field_entry(embedding_field).unwrap();
+        let sv_config = entry.sparse_vector_config.as_ref().unwrap();
+        let qc = sv_config.query_config.as_ref().unwrap();
+        assert_eq!(
+            qc.tokenizer.as_deref(),
+            Some("Alibaba-NLP/gte-Qwen2-1.5B-instruct")
+        );
+        assert_eq!(qc.weighting, QueryWeighting::Idf);
+    }
+
+    #[test]
+    fn test_sparse_vector_query_config_weighting_one() {
+        use crate::structures::QueryWeighting;
+
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector [indexed<query<weighting: one>>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+
+        let query_config = config.query_config.as_ref().unwrap();
+        assert!(query_config.tokenizer.is_none());
+        assert_eq!(query_config.weighting, QueryWeighting::One);
     }
 }

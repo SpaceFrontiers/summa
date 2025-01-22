@@ -785,17 +785,6 @@ pub struct PartitionedEFPostingList {
 }
 
 impl PartitionedEFPostingList {
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    #[inline]
-    pub fn compute_bm25_upper_bound(max_tf: u32, idf: f32) -> f32 {
-        let tf = max_tf as f32;
-        let min_length_norm = 1.0 - Self::B;
-        let tf_norm = (tf * (Self::K1 + 1.0)) / (tf + Self::K1 * min_length_norm);
-        idf * tf_norm
-    }
-
     /// Create from postings
     pub fn from_postings(doc_ids: &[u32], term_freqs: &[u32]) -> Self {
         Self::from_postings_with_idf(doc_ids, term_freqs, 1.0)
@@ -860,7 +849,7 @@ impl PartitionedEFPostingList {
             let block_tfs = &term_freqs[i..block_end];
 
             let block_max_tf = *block_tfs.iter().max().unwrap_or(&1);
-            let block_score = Self::compute_bm25_upper_bound(block_max_tf, idf);
+            let block_score = crate::query::bm25_upper_bound(block_max_tf as f32, idf);
             max_score = max_score.max(block_score);
 
             // Find partition info for this block start

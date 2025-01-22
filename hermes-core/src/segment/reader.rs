@@ -7,8 +7,8 @@ use rustc_hash::FxHashMap;
 use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
 use crate::dsl::{Document, Field, Schema};
 use crate::structures::{
-    AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFPQIndex, IVFRaBitQIndex, PQCodebook,
-    RaBitQCodebook, RaBitQIndex, SSTableStats, TermInfo,
+    AsyncSSTableReader, BlockPostingList, BlockSparsePostingList, CoarseCentroids, IVFPQIndex,
+    IVFRaBitQIndex, PQCodebook, RaBitQCodebook, RaBitQIndex, SSTableStats, TermInfo,
 };
 use crate::{DocId, Error, Result};
 
@@ -33,6 +33,41 @@ pub enum VectorIndex {
     },
 }
 
+/// Sparse vector index for a field: direct-indexed by dimension ID
+#[derive(Clone)]
+pub struct SparseIndex {
+    /// Posting lists indexed directly by dimension ID (O(1) lookup)
+    /// None means dimension not present in index
+    pub postings: Vec<Option<Arc<BlockSparsePostingList>>>,
+    /// Total document count in this segment (for IDF computation)
+    pub total_docs: u32,
+}
+
+impl SparseIndex {
+    /// Compute IDF (inverse document frequency) for a dimension
+    ///
+    /// IDF = log(N / df) where N = total docs, df = docs containing dimension
+    /// Returns 0.0 if dimension not present
+    #[inline]
+    pub fn idf(&self, dim_id: u32) -> f32 {
+        if let Some(Some(pl)) = self.postings.get(dim_id as usize) {
+            let df = pl.doc_count() as f32;
+            if df > 0.0 {
+                (self.total_docs as f32 / df).ln()
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Get IDF weights for multiple dimensions
+    pub fn idf_weights(&self, dim_ids: &[u32]) -> Vec<f32> {
+        dim_ids.iter().map(|&d| self.idf(d)).collect()
+    }
+}
+
 /// Async segment reader with lazy loading
 ///
 /// - Term dictionary: only index loaded, blocks loaded on-demand
@@ -53,6 +88,8 @@ pub struct AsyncSegmentReader {
     vector_indexes: FxHashMap<u32, VectorIndex>,
     /// Shared coarse centroids for IVF search (loaded once)
     coarse_centroids: Option<Arc<CoarseCentroids>>,
+    /// Sparse vector indexes per field
+    sparse_indexes: FxHashMap<u32, SparseIndex>,
 }
 
 impl AsyncSegmentReader {
@@ -87,6 +124,9 @@ impl AsyncSegmentReader {
         let (vector_indexes, coarse_centroids) =
             Self::load_vectors_file(dir, &files, &schema).await?;
 
+        // Load sparse vector indexes from .sparse file
+        let sparse_indexes = Self::load_sparse_file(dir, &files, meta.num_docs).await?;
+
         Ok(Self {
             meta,
             term_dict: Arc::new(term_dict),
@@ -96,6 +136,7 @@ impl AsyncSegmentReader {
             doc_id_offset,
             vector_indexes,
             coarse_centroids,
+            sparse_indexes,
         })
     }
 
@@ -118,6 +159,11 @@ impl AsyncSegmentReader {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Get sparse indexes for all fields
+    pub fn sparse_indexes(&self) -> &FxHashMap<u32, SparseIndex> {
+        &self.sparse_indexes
     }
 
     /// Get term dictionary stats for debugging
@@ -233,6 +279,28 @@ impl AsyncSegmentReader {
     /// Get all terms from this segment (for merge)
     pub async fn all_terms(&self) -> Result<Vec<(Vec<u8>, TermInfo)>> {
         self.term_dict.all_entries().await.map_err(Error::from)
+    }
+
+    /// Get all terms with parsed field and term string (for statistics aggregation)
+    ///
+    /// Returns (field, term_string, doc_freq) for each term in the dictionary.
+    /// Skips terms that aren't valid UTF-8.
+    pub async fn all_terms_with_stats(&self) -> Result<Vec<(Field, String, u32)>> {
+        let entries = self.term_dict.all_entries().await?;
+        let mut result = Vec::with_capacity(entries.len());
+
+        for (key, term_info) in entries {
+            // Key format: field_id (4 bytes little-endian) + term bytes
+            if key.len() > 4 {
+                let field_id = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+                let term_bytes = &key[4..];
+                if let Ok(term_str) = std::str::from_utf8(term_bytes) {
+                    result.push((Field(field_id), term_str.to_string(), term_info.doc_freq()));
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get streaming iterator over term dictionary (for memory-efficient merge)
@@ -351,49 +419,50 @@ impl AsyncSegmentReader {
         self.vector_indexes.get(&field.0)
     }
 
-    /// Search for similar sparse vectors using inverted index
+    /// Search for similar sparse vectors using dedicated sparse posting lists
     ///
-    /// Sparse vectors are indexed as terms "dim_{index}" with the weight stored.
-    /// This method accumulates dot product scores across all non-zero dimensions.
+    /// Uses shared `WandExecutor` with `SparseTermScorer` for efficient top-k retrieval.
+    /// Optimizations (via WandExecutor):
+    /// 1. **MaxScore pruning**: Dimensions sorted by max contribution
+    /// 2. **Block-Max WAND**: Skips blocks where max contribution < threshold
+    /// 3. **Top-K heap**: Efficient score collection
     ///
     /// Returns (doc_id, score) pairs sorted by score descending.
     pub async fn search_sparse_vector(
         &self,
         field: Field,
-        indices: &[u32],
-        weights: &[f32],
-        k: usize,
+        vector: &[(u32, f32)],
+        limit: usize,
     ) -> Result<Vec<(u32, f32)>> {
-        use rustc_hash::FxHashMap;
+        use crate::query::{SparseTermScorer, WandExecutor};
 
-        let mut doc_scores: FxHashMap<DocId, f32> = FxHashMap::default();
+        // Get sparse index for this field
+        let sparse_index = match self.sparse_indexes.get(&field.0) {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()),
+        };
 
-        // For each non-zero dimension, look up the posting list
-        for (&idx, &weight) in indices.iter().zip(weights.iter()) {
-            // Sparse vector dimensions are indexed as "dim_{index}"
-            let term = format!("dim_{}", idx);
+        // Build scorers for each dimension that exists in the index
+        let scorers: Vec<SparseTermScorer> = vector
+            .iter()
+            .filter_map(|&(dim_id, query_weight)| {
+                // Direct indexing: O(1) lookup
+                sparse_index
+                    .postings
+                    .get(dim_id as usize)
+                    .and_then(|opt| opt.as_ref())
+                    .map(|pl| SparseTermScorer::from_arc(pl, query_weight))
+            })
+            .collect();
 
-            if let Some(postings) = self.get_postings(field, term.as_bytes()).await? {
-                // Iterate through posting list and accumulate scores
-                // Term frequency represents the stored weight (quantized)
-                let mut iter = postings.iterator();
-                while iter.doc() != crate::TERMINATED {
-                    let doc_id = iter.doc();
-                    let tf = iter.term_freq();
-                    // Dequantize TF back to weight (stored as tf * 1000)
-                    let stored_weight = tf as f32 / 1000.0;
-                    *doc_scores.entry(doc_id).or_insert(0.0) += weight * stored_weight;
-                    iter.advance();
-                }
-            }
+        if scorers.is_empty() {
+            return Ok(Vec::new());
         }
 
-        // Sort by score descending and take top k
-        let mut results: Vec<(u32, f32)> = doc_scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(k);
+        // Use shared WandExecutor for top-k retrieval
+        let results = WandExecutor::new(scorers, limit).execute();
 
-        Ok(results)
+        Ok(results.into_iter().map(|r| (r.doc_id, r.score)).collect())
     }
 
     /// Load dense vector indexes from unified .vectors file
@@ -562,6 +631,91 @@ impl AsyncSegmentReader {
         }
 
         Ok((indexes, coarse_centroids))
+    }
+
+    /// Load sparse vector indexes from .sparse file
+    ///
+    /// File format (direct-indexed table for O(1) dimension lookup):
+    /// - Header: num_fields (u32)
+    /// - For each field:
+    ///   - field_id (u32)
+    ///   - quantization (u8)
+    ///   - max_dim_id (u32)          ← table size
+    ///   - table: [(offset: u64, length: u32)] × max_dim_id  ← direct indexed
+    ///     (offset=0, length=0 means dimension not present)
+    /// - Data: concatenated serialized BlockSparsePostingList
+    async fn load_sparse_file<D: Directory>(
+        dir: &D,
+        files: &SegmentFiles,
+        total_docs: u32,
+    ) -> Result<FxHashMap<u32, SparseIndex>> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+        use std::io::Cursor;
+
+        let mut indexes = FxHashMap::default();
+
+        // Try to open sparse file (may not exist if no sparse vectors were indexed)
+        let handle = match dir.open_lazy(&files.sparse).await {
+            Ok(h) => h,
+            Err(_) => return Ok(indexes),
+        };
+
+        // Read the entire file (sparse files are typically small enough)
+        let data = match handle.read_bytes().await {
+            Ok(d) => d,
+            Err(_) => return Ok(indexes),
+        };
+
+        if data.len() < 4 {
+            return Ok(indexes);
+        }
+
+        let mut cursor = Cursor::new(data.as_slice());
+        let num_fields = cursor.read_u32::<LittleEndian>()?;
+
+        if num_fields == 0 {
+            return Ok(indexes);
+        }
+
+        // Read field entries and build indexes
+        for _ in 0..num_fields {
+            let field_id = cursor.read_u32::<LittleEndian>()?;
+            let _quantization = cursor.read_u8()?; // Already stored in each BlockSparsePostingList
+            let max_dim_id = cursor.read_u32::<LittleEndian>()?;
+
+            // Read direct-indexed table
+            let mut postings: Vec<Option<Arc<BlockSparsePostingList>>> =
+                vec![None; max_dim_id as usize];
+
+            for dim_id in 0..max_dim_id {
+                let offset = cursor.read_u64::<LittleEndian>()?;
+                let length = cursor.read_u32::<LittleEndian>()?;
+
+                // offset=0, length=0 means dimension not present
+                if length > 0 {
+                    let start = offset as usize;
+                    let end = start + length as usize;
+                    if end <= data.len() {
+                        let posting_data = &data.as_slice()[start..end];
+                        if let Ok(posting_list) =
+                            BlockSparsePostingList::deserialize(&mut Cursor::new(posting_data))
+                        {
+                            postings[dim_id as usize] = Some(Arc::new(posting_list));
+                        }
+                    }
+                }
+            }
+
+            indexes.insert(
+                field_id,
+                SparseIndex {
+                    postings,
+                    total_docs,
+                },
+            );
+        }
+
+        Ok(indexes)
     }
 }
 

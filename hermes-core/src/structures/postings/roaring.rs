@@ -777,20 +777,6 @@ pub struct RoaringPostingList {
 }
 
 impl RoaringPostingList {
-    /// BM25 parameters for block-max score calculation
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    /// Compute BM25 upper bound score for a given max_tf and IDF
-    #[inline]
-    pub fn compute_bm25_upper_bound(max_tf: u32, idf: f32) -> f32 {
-        let tf = max_tf as f32;
-        // Conservative upper bound: assume dl=0, so length_norm = 1 - b = 0.25
-        let min_length_norm = 1.0 - Self::B;
-        let tf_norm = (tf * (Self::K1 + 1.0)) / (tf + Self::K1 * min_length_norm);
-        idf * tf_norm
-    }
-
     /// Create from doc_ids and term frequencies (without IDF - for backwards compatibility)
     pub fn from_postings(doc_ids: &[u32], term_freqs: &[u32]) -> Self {
         Self::from_postings_with_idf(doc_ids, term_freqs, 1.0)
@@ -852,7 +838,7 @@ impl RoaringPostingList {
             let block_doc_ids = &doc_ids[block_start..i];
             let block_tfs = &term_freqs[block_start..i];
             let block_max_tf = *block_tfs.iter().max().unwrap_or(&1);
-            let block_score = Self::compute_bm25_upper_bound(block_max_tf, idf);
+            let block_score = crate::query::bm25_upper_bound(block_max_tf as f32, idf);
             max_score = max_score.max(block_score);
 
             blocks.push(RoaringBlockInfo {

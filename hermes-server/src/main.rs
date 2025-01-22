@@ -13,8 +13,8 @@ use tonic::{Request, Response, Status, transport::Server};
 use tracing::info;
 
 use hermes_core::{
-    BooleanQuery, BoostQuery, Document, FieldType as CoreFieldType, FieldValue as CoreFieldValue,
-    FsDirectory, Index, IndexConfig, IndexWriter, Query, Schema, TermQuery, search_segment,
+    BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, FsDirectory, Index,
+    IndexConfig, IndexWriter, Query, Schema, TermQuery, parse_schema, search_segment,
 };
 
 pub mod proto {
@@ -260,13 +260,14 @@ impl SearchService for SearchServiceImpl {
         let req = request.into_inner();
         let index = self.registry.get_or_open_index(&req.index_name).await?;
 
-        let schema = convert_schema_to_proto(index.schema());
+        // Convert schema to SDL string
+        let schema_str = schema_to_sdl(index.schema());
 
         Ok(Response::new(GetIndexInfoResponse {
             index_name: req.index_name,
             num_docs: index.num_docs(),
             num_segments: index.segment_readers().len() as u32,
-            schema: Some(schema),
+            schema: schema_str,
         }))
     }
 }
@@ -284,11 +285,11 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<CreateIndexResponse>, Status> {
         let req = request.into_inner();
 
-        let proto_schema = req
-            .schema
-            .ok_or_else(|| Status::invalid_argument("Schema is required"))?;
+        if req.schema.is_empty() {
+            return Err(Status::invalid_argument("Schema is required"));
+        }
 
-        let schema = convert_proto_to_schema(&proto_schema)
+        let schema = parse_schema(&req.schema)
             .map_err(|e| Status::invalid_argument(format!("Invalid schema: {}", e)))?;
 
         self.registry.create_index(&req.index_name, schema).await?;
@@ -296,6 +297,42 @@ impl IndexService for IndexServiceImpl {
         info!(index_name = %req.index_name, "Created index");
 
         Ok(Response::new(CreateIndexResponse { success: true }))
+    }
+
+    async fn batch_index_documents(
+        &self,
+        request: Request<BatchIndexDocumentsRequest>,
+    ) -> Result<Response<BatchIndexDocumentsResponse>, Status> {
+        let req = request.into_inner();
+
+        let writer = self.registry.get_writer(&req.index_name).await?;
+        let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let schema = index.schema();
+
+        let mut indexed_count = 0u32;
+        let mut error_count = 0u32;
+
+        for named_doc in req.documents {
+            match convert_proto_to_document(&named_doc.fields, schema) {
+                Ok(doc) => match writer.lock().await.add_document(doc).await {
+                    Ok(_) => indexed_count += 1,
+                    Err(_) => error_count += 1,
+                },
+                Err(_) => error_count += 1,
+            }
+        }
+
+        info!(
+            index_name = %req.index_name,
+            indexed = indexed_count,
+            errors = error_count,
+            "Batch indexed documents"
+        );
+
+        Ok(Response::new(BatchIndexDocumentsResponse {
+            indexed_count,
+            error_count,
+        }))
     }
 
     async fn index_documents(
@@ -465,11 +502,9 @@ fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
         CoreFieldValue::I64(n) => Value::I64(*n),
         CoreFieldValue::F64(n) => Value::F64(*n),
         CoreFieldValue::Bytes(b) => Value::BytesValue(b.clone()),
-        CoreFieldValue::SparseVector { indices, values } => {
-            Value::SparseVector(proto::SparseVector {
-                indices: indices.clone(),
-                values: values.clone(),
-            })
+        CoreFieldValue::SparseVector(entries) => {
+            let (indices, values): (Vec<u32>, Vec<f32>) = entries.iter().copied().unzip();
+            Value::SparseVector(proto::SparseVector { indices, values })
         }
         CoreFieldValue::DenseVector(values) => Value::DenseVector(proto::DenseVector {
             values: values.clone(),
@@ -481,67 +516,38 @@ fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
     proto::FieldValue { value: Some(v) }
 }
 
-fn convert_schema_to_proto(schema: &Schema) -> proto::Schema {
-    let fields = schema
-        .fields()
-        .map(|(_, entry)| proto::FieldDefinition {
-            name: entry.name.clone(),
-            field_type: match entry.field_type {
-                CoreFieldType::Text => proto::FieldType::Text as i32,
-                CoreFieldType::U64 => proto::FieldType::U64 as i32,
-                CoreFieldType::I64 => proto::FieldType::I64 as i32,
-                CoreFieldType::F64 => proto::FieldType::F64 as i32,
-                CoreFieldType::Bytes => proto::FieldType::Bytes as i32,
-                CoreFieldType::SparseVector => proto::FieldType::SparseVector as i32,
-                CoreFieldType::DenseVector => proto::FieldType::DenseVector as i32,
-                CoreFieldType::Json => proto::FieldType::Json as i32,
-            },
-            indexed: entry.indexed,
-            stored: entry.stored,
-        })
-        .collect();
+/// Convert Schema to SDL string representation
+fn schema_to_sdl(schema: &Schema) -> String {
+    use hermes_core::FieldType;
 
-    proto::Schema { fields }
-}
-
-fn convert_proto_to_schema(proto_schema: &proto::Schema) -> Result<Schema, String> {
-    let mut builder = hermes_core::schema::SchemaBuilder::default();
-
-    for field in &proto_schema.fields {
-        let field_type = proto::FieldType::try_from(field.field_type)
-            .map_err(|_| format!("Invalid field type: {}", field.field_type))?;
-
-        match field_type {
-            proto::FieldType::Unspecified => return Err("Field type is required".to_string()),
-            proto::FieldType::Text => {
-                builder.add_text_field(&field.name, field.indexed, field.stored);
-            }
-            proto::FieldType::U64 => {
-                builder.add_u64_field(&field.name, field.indexed, field.stored);
-            }
-            proto::FieldType::I64 => {
-                builder.add_i64_field(&field.name, field.indexed, field.stored);
-            }
-            proto::FieldType::F64 => {
-                builder.add_f64_field(&field.name, field.indexed, field.stored);
-            }
-            proto::FieldType::Bytes => {
-                builder.add_bytes_field(&field.name, field.stored);
-            }
-            proto::FieldType::SparseVector => {
-                builder.add_sparse_vector_field(&field.name, field.indexed, field.stored);
-            }
-            proto::FieldType::DenseVector => {
-                // Default dimension of 0 - will be set from actual vectors
-                builder.add_dense_vector_field(&field.name, 0, field.indexed, field.stored);
-            }
-            proto::FieldType::Json => {
-                builder.add_json_field(&field.name, field.stored);
-            }
+    let mut lines = vec!["index _ {".to_string()];
+    for (_, entry) in schema.fields() {
+        let type_str = match entry.field_type {
+            FieldType::Text => "text",
+            FieldType::U64 => "u64",
+            FieldType::I64 => "i64",
+            FieldType::F64 => "f64",
+            FieldType::Bytes => "bytes",
+            FieldType::SparseVector => "sparse_vector",
+            FieldType::DenseVector => "dense_vector",
+            FieldType::Json => "json",
+        };
+        let mut flags = Vec::new();
+        if entry.indexed {
+            flags.push("indexed");
         }
+        if entry.stored {
+            flags.push("stored");
+        }
+        lines.push(format!(
+            "    {}: {} {}",
+            entry.name,
+            type_str,
+            flags.join(" ")
+        ));
     }
-
-    Ok(builder.build())
+    lines.push("}".to_string());
+    lines.join("\n")
 }
 
 fn convert_proto_to_document(
@@ -562,7 +568,13 @@ fn convert_proto_to_document(
             Some(Value::F64(n)) => doc.add_f64(field, *n),
             Some(Value::BytesValue(b)) => doc.add_bytes(field, b.clone()),
             Some(Value::SparseVector(sv)) => {
-                doc.add_sparse_vector(field, sv.indices.clone(), sv.values.clone());
+                let entries: Vec<(u32, f32)> = sv
+                    .indices
+                    .iter()
+                    .copied()
+                    .zip(sv.values.iter().copied())
+                    .collect();
+                doc.add_sparse_vector(field, entries);
             }
             Some(Value::DenseVector(dv)) => {
                 doc.add_dense_vector(field, dv.values.clone());

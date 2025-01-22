@@ -22,6 +22,14 @@ mod writer;
 #[cfg(feature = "native")]
 pub use writer::IndexWriter;
 
+#[cfg(feature = "native")]
+mod helpers;
+#[cfg(feature = "native")]
+pub use helpers::{
+    IndexingStats, SchemaConfig, SchemaFieldConfig, create_index_at_path, create_index_from_sdl,
+    index_documents_from_reader, index_json_document, parse_schema,
+};
+
 /// Default file name for the slice cache
 pub const SLICE_CACHE_FILENAME: &str = "index.slicecache";
 
@@ -77,6 +85,8 @@ pub struct Index<D: Directory> {
     segments: RwLock<Vec<Arc<SegmentReader>>>,
     default_fields: Vec<crate::Field>,
     tokenizers: Arc<crate::tokenizer::TokenizerRegistry>,
+    /// Cached global statistics for cross-segment IDF computation
+    global_stats: crate::query::GlobalStatsCache,
     #[cfg(feature = "native")]
     thread_pool: Arc<rayon::ThreadPool>,
 }
@@ -125,6 +135,7 @@ impl<D: Directory> Index<D> {
             segments: RwLock::new(segments),
             default_fields,
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
+            global_stats: crate::query::GlobalStatsCache::new(),
             #[cfg(feature = "native")]
             thread_pool,
         })
@@ -242,45 +253,105 @@ impl<D: Directory> Index<D> {
     pub async fn reload(&self) -> Result<()> {
         let new_segments = Self::load_segments(&self.directory, &self.schema, &self.config).await?;
         *self.segments.write() = new_segments;
+        // Invalidate global stats cache since segments changed
+        self.global_stats.invalidate();
         Ok(())
     }
 
-    /// Search across all segments
+    /// Get global statistics for cross-segment IDF computation (sync, basic stats only)
+    ///
+    /// Returns cached stats if available. For full stats including term frequencies,
+    /// call `build_global_stats().await` first.
+    ///
+    /// This sync version only includes:
+    /// - Total docs
+    /// - Sparse vector dimension document frequencies
+    /// - Average field lengths
+    pub fn global_stats(&self) -> Option<Arc<crate::query::GlobalStats>> {
+        self.global_stats.get()
+    }
+
+    /// Build and cache global statistics (async, includes term frequencies)
+    ///
+    /// This iterates term dictionaries across all segments to compute
+    /// accurate cross-segment IDF values for full-text queries.
+    ///
+    /// Call this once after opening the index or after reload().
+    pub async fn build_global_stats(&self) -> Result<Arc<crate::query::GlobalStats>> {
+        // Return cached if available
+        if let Some(stats) = self.global_stats.get() {
+            return Ok(stats);
+        }
+
+        let segments = self.segments.read().clone();
+        let schema = &self.schema;
+        let mut builder = crate::query::GlobalStatsBuilder::new();
+
+        // Track field length sums for computing global avg
+        let mut field_len_sums: rustc_hash::FxHashMap<u32, (u64, u64)> =
+            rustc_hash::FxHashMap::default();
+
+        for segment in &segments {
+            let num_docs = segment.num_docs() as u64;
+            builder.total_docs += num_docs;
+
+            // Aggregate sparse vector statistics
+            for (&field_id, sparse_index) in segment.sparse_indexes() {
+                for (dim_id, posting_list) in sparse_index.postings.iter().enumerate() {
+                    if let Some(pl) = posting_list {
+                        builder.add_sparse_df(
+                            crate::dsl::Field(field_id),
+                            dim_id as u32,
+                            pl.doc_count() as u64,
+                        );
+                    }
+                }
+            }
+
+            // Aggregate text field average lengths
+            for (field, entry) in schema.fields() {
+                if entry.indexed && entry.field_type == crate::dsl::FieldType::Text {
+                    let avg_len = segment.avg_field_len(field);
+                    let (sum, count) = field_len_sums.entry(field.0).or_insert((0, 0));
+                    *sum += (avg_len * num_docs as f32) as u64;
+                    *count += num_docs;
+                }
+            }
+
+            // Iterate term dictionary to get term document frequencies
+            for (field, term, doc_freq) in segment.all_terms_with_stats().await? {
+                builder.add_text_df(field, term, doc_freq as u64);
+            }
+        }
+
+        // Set global average field lengths
+        for (field_id, (sum, count)) in field_len_sums {
+            if count > 0 {
+                let global_avg = sum as f32 / count as f32;
+                builder.set_avg_field_len(crate::dsl::Field(field_id), global_avg);
+            }
+        }
+
+        let generation = self.global_stats.generation();
+        let stats = builder.build(generation);
+        self.global_stats.set_stats(stats);
+
+        Ok(self.global_stats.get().unwrap())
+    }
+
+    /// Search and return results with document addresses (no document content)
+    ///
+    /// This is the primary search method. Use `get_document` to fetch document content.
     pub async fn search(
         &self,
         query: &dyn crate::query::Query,
         limit: usize,
-    ) -> Result<Vec<crate::query::SearchResult>> {
-        let segments = self.segments.read().clone();
-        let mut all_results = Vec::new();
-
-        for segment in &segments {
-            let results = crate::query::search_segment(segment.as_ref(), query, limit).await?;
-            all_results.extend(results);
-        }
-
-        // Sort by score descending
-        all_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all_results.truncate(limit);
-
-        Ok(all_results)
-    }
-
-    /// Search and return results with document addresses (no document content)
-    pub async fn search_with_addresses(
-        &self,
-        query: &dyn crate::query::Query,
-        limit: usize,
     ) -> Result<crate::query::SearchResponse> {
-        self.search_with_addresses_offset(query, limit, 0).await
+        self.search_offset(query, limit, 0).await
     }
 
     /// Search with offset for pagination
-    pub async fn search_with_addresses_offset(
+    pub async fn search_offset(
         &self,
         query: &dyn crate::query::Query,
         limit: usize,
@@ -407,8 +478,7 @@ impl<D: Directory> Index<D> {
     ) -> Result<crate::query::SearchResponse> {
         let parser = self.query_parser();
         let query = parser.parse(query_str).map_err(Error::Query)?;
-        self.search_with_addresses_offset(query.as_ref(), limit, offset)
-            .await
+        self.search_offset(query.as_ref(), limit, offset).await
     }
 }
 
@@ -498,6 +568,7 @@ impl<D: Directory> Clone for Index<D> {
             segments: RwLock::new(self.segments.read().clone()),
             default_fields: self.default_fields.clone(),
             tokenizers: Arc::clone(&self.tokenizers),
+            global_stats: crate::query::GlobalStatsCache::new(),
             thread_pool: Arc::clone(&self.thread_pool),
         }
     }
@@ -811,5 +882,182 @@ mod tests {
         // Verify searching for non-existent value returns no results
         let results = index.query("uris:nonexistent", 10).await.unwrap();
         assert_eq!(results.hits.len(), 0, "Should not find non-existent value");
+    }
+
+    /// Comprehensive test for WAND optimization in BooleanQuery OR queries
+    ///
+    /// This test verifies that:
+    /// 1. BooleanQuery with multiple SHOULD term queries uses WAND automatically
+    /// 2. Search results are correct regardless of WAND optimization
+    /// 3. Scores are reasonable for matching documents
+    #[tokio::test]
+    async fn test_wand_optimization_for_or_queries() {
+        use crate::query::{BooleanQuery, TermQuery};
+
+        let mut schema_builder = SchemaBuilder::default();
+        let content = schema_builder.add_text_field("content", true, true);
+        let schema = schema_builder.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig::default();
+
+        // Create index with documents containing various terms
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Doc 0: contains "rust" and "programming"
+        let mut doc = Document::new();
+        doc.add_text(content, "rust programming language is fast");
+        writer.add_document(doc).await.unwrap();
+
+        // Doc 1: contains "rust" only
+        let mut doc = Document::new();
+        doc.add_text(content, "rust is a systems language");
+        writer.add_document(doc).await.unwrap();
+
+        // Doc 2: contains "programming" only
+        let mut doc = Document::new();
+        doc.add_text(content, "programming is fun");
+        writer.add_document(doc).await.unwrap();
+
+        // Doc 3: contains "python" (neither rust nor programming)
+        let mut doc = Document::new();
+        doc.add_text(content, "python is easy to learn");
+        writer.add_document(doc).await.unwrap();
+
+        // Doc 4: contains both "rust" and "programming" multiple times
+        let mut doc = Document::new();
+        doc.add_text(content, "rust rust programming programming systems");
+        writer.add_document(doc).await.unwrap();
+
+        writer.commit().await.unwrap();
+
+        // Open for reading
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+
+        // Test 1: Pure OR query with multiple terms (should use WAND automatically)
+        let or_query = BooleanQuery::new()
+            .should(TermQuery::text(content, "rust"))
+            .should(TermQuery::text(content, "programming"));
+
+        let results = index.search(&or_query, 10).await.unwrap();
+
+        // Should find docs 0, 1, 2, 4 (all that contain "rust" OR "programming")
+        assert_eq!(results.hits.len(), 4, "Should find exactly 4 documents");
+
+        let doc_ids: Vec<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert!(doc_ids.contains(&0), "Should find doc 0");
+        assert!(doc_ids.contains(&1), "Should find doc 1");
+        assert!(doc_ids.contains(&2), "Should find doc 2");
+        assert!(doc_ids.contains(&4), "Should find doc 4");
+        assert!(
+            !doc_ids.contains(&3),
+            "Should NOT find doc 3 (only has 'python')"
+        );
+
+        // Test 2: Single term query (should NOT use WAND, but still work)
+        let single_query = BooleanQuery::new().should(TermQuery::text(content, "rust"));
+
+        let results = index.search(&single_query, 10).await.unwrap();
+        assert_eq!(results.hits.len(), 3, "Should find 3 documents with 'rust'");
+
+        // Test 3: Query with MUST (should NOT use WAND)
+        let must_query = BooleanQuery::new()
+            .must(TermQuery::text(content, "rust"))
+            .should(TermQuery::text(content, "programming"));
+
+        let results = index.search(&must_query, 10).await.unwrap();
+        // Must have "rust", optionally "programming"
+        assert_eq!(results.hits.len(), 3, "Should find 3 documents with 'rust'");
+
+        // Test 4: Query with MUST_NOT (should NOT use WAND)
+        let must_not_query = BooleanQuery::new()
+            .should(TermQuery::text(content, "rust"))
+            .should(TermQuery::text(content, "programming"))
+            .must_not(TermQuery::text(content, "systems"));
+
+        let results = index.search(&must_not_query, 10).await.unwrap();
+        // Should exclude docs with "systems" (doc 1 and 4)
+        let doc_ids: Vec<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert!(
+            !doc_ids.contains(&1),
+            "Should NOT find doc 1 (has 'systems')"
+        );
+        assert!(
+            !doc_ids.contains(&4),
+            "Should NOT find doc 4 (has 'systems')"
+        );
+
+        // Test 5: Verify top-k limit works correctly with WAND
+        let or_query = BooleanQuery::new()
+            .should(TermQuery::text(content, "rust"))
+            .should(TermQuery::text(content, "programming"));
+
+        let results = index.search(&or_query, 2).await.unwrap();
+        assert_eq!(results.hits.len(), 2, "Should return only top 2 results");
+
+        // Top results should be docs that match both terms (higher scores)
+        // Doc 0 and 4 contain both "rust" and "programming"
+    }
+
+    /// Test that WAND optimization produces same results as non-WAND for correctness
+    #[tokio::test]
+    async fn test_wand_results_match_standard_boolean() {
+        use crate::query::{BooleanQuery, TermQuery, WandOrQuery};
+
+        let mut schema_builder = SchemaBuilder::default();
+        let content = schema_builder.add_text_field("content", true, true);
+        let schema = schema_builder.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig::default();
+
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Add several documents
+        for i in 0..10 {
+            let mut doc = Document::new();
+            let text = match i % 4 {
+                0 => "apple banana cherry",
+                1 => "apple orange",
+                2 => "banana grape",
+                _ => "cherry date",
+            };
+            doc.add_text(content, text);
+            writer.add_document(doc).await.unwrap();
+        }
+
+        writer.commit().await.unwrap();
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+
+        // Compare explicit WandOrQuery with auto-optimized BooleanQuery
+        let wand_query = WandOrQuery::new(content).term("apple").term("banana");
+
+        let bool_query = BooleanQuery::new()
+            .should(TermQuery::text(content, "apple"))
+            .should(TermQuery::text(content, "banana"));
+
+        let wand_results = index.search(&wand_query, 10).await.unwrap();
+        let bool_results = index.search(&bool_query, 10).await.unwrap();
+
+        // Both should find the same documents
+        assert_eq!(
+            wand_results.hits.len(),
+            bool_results.hits.len(),
+            "WAND and Boolean should find same number of docs"
+        );
+
+        let wand_docs: std::collections::HashSet<u32> =
+            wand_results.hits.iter().map(|h| h.address.doc_id).collect();
+        let bool_docs: std::collections::HashSet<u32> =
+            bool_results.hits.iter().map(|h| h.address.doc_id).collect();
+
+        assert_eq!(
+            wand_docs, bool_docs,
+            "WAND and Boolean should find same documents"
+        );
     }
 }

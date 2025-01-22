@@ -1,0 +1,403 @@
+"""Async Hermes client implementation."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator
+from typing import Any
+
+import grpc
+from grpc import aio
+
+from . import hermes_pb2 as pb
+from . import hermes_pb2_grpc as pb_grpc
+from .types import Document, IndexInfo, SearchHit, SearchResponse
+
+
+class HermesClient:
+    """Async client for Hermes search server.
+
+    Example:
+        async with HermesClient("localhost:50051") as client:
+            # Create index
+            await client.create_index("articles", '''
+                index articles {
+                    title: text indexed stored
+                    body: text indexed stored
+                }
+            ''')
+
+            # Index documents
+            await client.index_documents("articles", [
+                {"title": "Hello", "body": "World"},
+                {"title": "Foo", "body": "Bar"},
+            ])
+            await client.commit("articles")
+
+            # Search
+            results = await client.search("articles", term=("title", "hello"))
+            for hit in results.hits:
+                print(hit.doc_id, hit.score)
+    """
+
+    def __init__(self, address: str = "localhost:50051"):
+        """Initialize client.
+
+        Args:
+            address: Server address in format "host:port"
+        """
+        self.address = address
+        self._channel: aio.Channel | None = None
+        self._index_stub: pb_grpc.IndexServiceStub | None = None
+        self._search_stub: pb_grpc.SearchServiceStub | None = None
+
+    async def connect(self) -> None:
+        """Connect to the server."""
+        self._channel = aio.insecure_channel(self.address)
+        self._index_stub = pb_grpc.IndexServiceStub(self._channel)
+        self._search_stub = pb_grpc.SearchServiceStub(self._channel)
+
+    async def close(self) -> None:
+        """Close the connection."""
+        if self._channel:
+            await self._channel.close()
+            self._channel = None
+            self._index_stub = None
+            self._search_stub = None
+
+    async def __aenter__(self) -> HermesClient:
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
+
+    def _ensure_connected(self) -> None:
+        if self._index_stub is None or self._search_stub is None:
+            raise RuntimeError(
+                "Client not connected. Use 'async with' or call connect() first."
+            )
+
+    # =========================================================================
+    # Index Management
+    # =========================================================================
+
+    async def create_index(self, index_name: str, schema: str) -> bool:
+        """Create a new index.
+
+        Args:
+            index_name: Name of the index
+            schema: Schema definition in SDL or JSON format
+
+        Returns:
+            True if successful
+
+        Example SDL schema:
+            index myindex {
+                title: text indexed stored
+                body: text indexed stored
+                score: f64 stored
+            }
+
+        Example JSON schema:
+            {
+                "fields": [
+                    {"name": "title", "type": "text", "indexed": true, "stored": true}
+                ]
+            }
+        """
+        self._ensure_connected()
+        request = pb.CreateIndexRequest(index_name=index_name, schema=schema)
+        response = await self._index_stub.CreateIndex(request)
+        return response.success
+
+    async def delete_index(self, index_name: str) -> bool:
+        """Delete an index.
+
+        Args:
+            index_name: Name of the index to delete
+
+        Returns:
+            True if successful
+        """
+        self._ensure_connected()
+        request = pb.DeleteIndexRequest(index_name=index_name)
+        response = await self._index_stub.DeleteIndex(request)
+        return response.success
+
+    async def get_index_info(self, index_name: str) -> IndexInfo:
+        """Get information about an index.
+
+        Args:
+            index_name: Name of the index
+
+        Returns:
+            IndexInfo with document count, segments, and schema
+        """
+        self._ensure_connected()
+        request = pb.GetIndexInfoRequest(index_name=index_name)
+        response = await self._search_stub.GetIndexInfo(request)
+        return IndexInfo(
+            index_name=response.index_name,
+            num_docs=response.num_docs,
+            num_segments=response.num_segments,
+            schema=response.schema,
+        )
+
+    # =========================================================================
+    # Document Indexing
+    # =========================================================================
+
+    async def index_documents(
+        self, index_name: str, documents: list[dict[str, Any]]
+    ) -> tuple[int, int]:
+        """Index multiple documents in batch.
+
+        Args:
+            index_name: Name of the index
+            documents: List of documents (dicts with field names as keys)
+
+        Returns:
+            Tuple of (indexed_count, error_count)
+        """
+        self._ensure_connected()
+
+        named_docs = []
+        for doc in documents:
+            fields = {k: _to_field_value(v) for k, v in doc.items()}
+            named_docs.append(pb.NamedDocument(fields=fields))
+
+        request = pb.BatchIndexDocumentsRequest(
+            index_name=index_name, documents=named_docs
+        )
+        response = await self._index_stub.BatchIndexDocuments(request)
+        return response.indexed_count, response.error_count
+
+    async def index_document(self, index_name: str, document: dict[str, Any]) -> None:
+        """Index a single document.
+
+        Args:
+            index_name: Name of the index
+            document: Document as dict with field names as keys
+        """
+        await self.index_documents(index_name, [document])
+
+    async def index_documents_stream(
+        self, index_name: str, documents: AsyncIterator[dict[str, Any]]
+    ) -> int:
+        """Stream documents for indexing.
+
+        Args:
+            index_name: Name of the index
+            documents: Async iterator of documents
+
+        Returns:
+            Number of indexed documents
+        """
+        self._ensure_connected()
+
+        async def request_iterator():
+            async for doc in documents:
+                fields = {k: _to_field_value(v) for k, v in doc.items()}
+                yield pb.IndexDocumentRequest(index_name=index_name, fields=fields)
+
+        response = await self._index_stub.IndexDocuments(request_iterator())
+        return response.indexed_count
+
+    async def commit(self, index_name: str) -> int:
+        """Commit pending changes.
+
+        Args:
+            index_name: Name of the index
+
+        Returns:
+            Total number of documents in the index
+        """
+        self._ensure_connected()
+        request = pb.CommitRequest(index_name=index_name)
+        response = await self._index_stub.Commit(request)
+        return response.num_docs
+
+    async def force_merge(self, index_name: str) -> int:
+        """Force merge all segments.
+
+        Args:
+            index_name: Name of the index
+
+        Returns:
+            Number of segments after merge
+        """
+        self._ensure_connected()
+        request = pb.ForceMergeRequest(index_name=index_name)
+        response = await self._index_stub.ForceMerge(request)
+        return response.num_segments
+
+    # =========================================================================
+    # Search
+    # =========================================================================
+
+    async def search(
+        self,
+        index_name: str,
+        *,
+        term: tuple[str, str] | None = None,
+        boolean: dict[str, list[tuple[str, str]]] | None = None,
+        limit: int = 10,
+        offset: int = 0,
+        fields_to_load: list[str] | None = None,
+    ) -> SearchResponse:
+        """Search for documents.
+
+        Args:
+            index_name: Name of the index
+            term: Term query as (field, term) tuple
+            boolean: Boolean query with "must", "should", "must_not" keys
+            limit: Maximum number of results
+            offset: Offset for pagination
+            fields_to_load: List of fields to include in results
+
+        Returns:
+            SearchResponse with hits
+
+        Examples:
+            # Term query
+            results = await client.search("articles", term=("title", "hello"))
+
+            # Boolean query
+            results = await client.search("articles", boolean={
+                "must": [("title", "hello")],
+                "should": [("body", "world")],
+            })
+        """
+        self._ensure_connected()
+
+        query = _build_query(term=term, boolean=boolean)
+
+        request = pb.SearchRequest(
+            index_name=index_name,
+            query=query,
+            limit=limit,
+            offset=offset,
+            fields_to_load=fields_to_load or [],
+        )
+
+        response = await self._search_stub.Search(request)
+
+        hits = [
+            SearchHit(
+                doc_id=hit.doc_id,
+                score=hit.score,
+                fields={k: _from_field_value(v) for k, v in hit.fields.items()},
+            )
+            for hit in response.hits
+        ]
+
+        return SearchResponse(
+            hits=hits,
+            total_hits=response.total_hits,
+            took_ms=response.took_ms,
+        )
+
+    async def get_document(self, index_name: str, doc_id: int) -> Document | None:
+        """Get a document by ID.
+
+        Args:
+            index_name: Name of the index
+            doc_id: Document ID
+
+        Returns:
+            Document or None if not found
+        """
+        self._ensure_connected()
+        request = pb.GetDocumentRequest(index_name=index_name, doc_id=doc_id)
+        try:
+            response = await self._search_stub.GetDocument(request)
+            fields = {k: _from_field_value(v) for k, v in response.fields.items()}
+            return Document(fields=fields)
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.NOT_FOUND:
+                return None
+            raise
+
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+
+def _to_field_value(value: Any) -> pb.FieldValue:
+    """Convert Python value to protobuf FieldValue."""
+    if isinstance(value, str):
+        return pb.FieldValue(text=value)
+    elif isinstance(value, bool):
+        return pb.FieldValue(u64=1 if value else 0)
+    elif isinstance(value, int):
+        if value >= 0:
+            return pb.FieldValue(u64=value)
+        else:
+            return pb.FieldValue(i64=value)
+    elif isinstance(value, float):
+        return pb.FieldValue(f64=value)
+    elif isinstance(value, bytes):
+        return pb.FieldValue(bytes_value=value)
+    elif isinstance(value, (list, dict)):
+        # Assume JSON for complex types
+        return pb.FieldValue(json_value=json.dumps(value))
+    else:
+        return pb.FieldValue(text=str(value))
+
+
+def _from_field_value(fv: pb.FieldValue) -> Any:
+    """Convert protobuf FieldValue to Python value."""
+    which = fv.WhichOneof("value")
+    if which == "text":
+        return fv.text
+    elif which == "u64":
+        return fv.u64
+    elif which == "i64":
+        return fv.i64
+    elif which == "f64":
+        return fv.f64
+    elif which == "bytes_value":
+        return fv.bytes_value
+    elif which == "json_value":
+        return json.loads(fv.json_value)
+    elif which == "sparse_vector":
+        return {
+            "indices": list(fv.sparse_vector.indices),
+            "values": list(fv.sparse_vector.values),
+        }
+    elif which == "dense_vector":
+        return list(fv.dense_vector.values)
+    return None
+
+
+def _build_query(
+    *,
+    term: tuple[str, str] | None = None,
+    boolean: dict[str, list[tuple[str, str]]] | None = None,
+) -> pb.Query:
+    """Build a protobuf Query from parameters."""
+    if term is not None:
+        field, value = term
+        return pb.Query(term=pb.TermQuery(field=field, term=value))
+
+    if boolean is not None:
+        must = [
+            pb.Query(term=pb.TermQuery(field=f, term=t))
+            for f, t in boolean.get("must", [])
+        ]
+        should = [
+            pb.Query(term=pb.TermQuery(field=f, term=t))
+            for f, t in boolean.get("should", [])
+        ]
+        must_not = [
+            pb.Query(term=pb.TermQuery(field=f, term=t))
+            for f, t in boolean.get("must_not", [])
+        ]
+        return pb.Query(
+            boolean=pb.BooleanQuery(must=must, should=should, must_not=must_not)
+        )
+
+    # Default: match all (empty boolean query)
+    return pb.Query(boolean=pb.BooleanQuery())

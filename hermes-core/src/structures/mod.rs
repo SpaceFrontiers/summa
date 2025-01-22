@@ -55,6 +55,7 @@ pub use postings::{
     PostingFormat,
     PostingList,
     PostingListIterator,
+    QueryWeighting,
     // Roaring
     ROARING_BLOCK_SIZE,
     ROARING_THRESHOLD_RATIO,
@@ -78,6 +79,7 @@ pub use postings::{
     SparsePosting,
     SparsePostingIterator,
     SparsePostingList,
+    SparseQueryConfig,
     SparseSkipEntry,
     SparseSkipList,
     SparseVector,

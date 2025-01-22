@@ -16,11 +16,14 @@ service SearchService {
 
 // Index service
 service IndexService {
-  // Create a new index
+  // Create a new index (supports both structured schema and SDL string)
   rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
 
-  // Add documents to index
+  // Add documents to index (streaming)
   rpc IndexDocuments(stream IndexDocumentRequest) returns (IndexDocumentsResponse);
+
+  // Add documents in batch
+  rpc BatchIndexDocuments(BatchIndexDocumentsRequest) returns (BatchIndexDocumentsResponse);
 
   // Commit pending changes
   rpc Commit(CommitRequest) returns (CommitResponse);
@@ -30,32 +33,6 @@ service IndexService {
 
   // Delete an index
   rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
-}
-
-// Field types
-enum FieldType {
-  FIELD_TYPE_UNSPECIFIED = 0;
-  FIELD_TYPE_TEXT = 1;
-  FIELD_TYPE_U64 = 2;
-  FIELD_TYPE_I64 = 3;
-  FIELD_TYPE_F64 = 4;
-  FIELD_TYPE_BYTES = 5;
-  FIELD_TYPE_SPARSE_VECTOR = 6;
-  FIELD_TYPE_DENSE_VECTOR = 7;
-  FIELD_TYPE_JSON = 8;
-}
-
-// Field definition
-message FieldDefinition {
-  string name = 1;
-  FieldType field_type = 2;
-  bool indexed = 3;
-  bool stored = 4;
-}
-
-// Schema definition
-message Schema {
-  repeated FieldDefinition fields = 1;
 }
 
 // Query types
@@ -150,17 +127,35 @@ message GetIndexInfoResponse {
   string index_name = 1;
   uint32 num_docs = 2;
   uint32 num_segments = 3;
-  Schema schema = 4;
+  // Schema in SDL format
+  string schema = 4;
 }
 
 // Create index request/response
 message CreateIndexRequest {
   string index_name = 1;
-  Schema schema = 2;
+  // Schema definition
+  string schema = 2;
 }
 
 message CreateIndexResponse {
   bool success = 1;
+}
+
+// Named document for batch indexing
+message NamedDocument {
+  map<string, FieldValue> fields = 1;
+}
+
+// Batch index documents request
+message BatchIndexDocumentsRequest {
+  string index_name = 1;
+  repeated NamedDocument documents = 2;
+}
+
+message BatchIndexDocumentsResponse {
+  uint32 indexed_count = 1;
+  uint32 error_count = 2;
 }
 
 // Index document request/response

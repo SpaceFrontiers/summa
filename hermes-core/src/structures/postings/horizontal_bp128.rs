@@ -340,24 +340,9 @@ impl HorizontalBP128PostingList {
         }
     }
 
-    /// BM25F parameters for block-max score calculation
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    /// Compute BM25F upper bound score for a given max_tf and IDF
-    /// Uses conservative length normalization (assumes shortest possible document)
-    #[inline]
-    pub fn compute_bm25f_upper_bound(max_tf: u32, idf: f32, field_boost: f32) -> f32 {
-        let tf = max_tf as f32;
-        // Conservative upper bound: assume dl=0, so length_norm = 1 - b = 0.25
-        // This gives the maximum possible score for this tf
-        let min_length_norm = 1.0 - Self::B;
-        let tf_norm =
-            (tf * field_boost * (Self::K1 + 1.0)) / (tf * field_boost + Self::K1 * min_length_norm);
-        idf * tf_norm
-    }
-
     fn create_block(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> HorizontalBP128Block {
+        use crate::query::bm25_upper_bound;
+
         let num_docs = doc_ids.len();
         let first_doc_id = doc_ids[0];
         let last_doc_id = *doc_ids.last().unwrap();
@@ -380,9 +365,8 @@ impl HorizontalBP128PostingList {
             max_tf = max_tf.max(tf);
         }
 
-        // BM25F upper bound score using conservative length normalization
-        // field_boost defaults to 1.0 at index time; can be adjusted at query time
-        let max_block_score = Self::compute_bm25f_upper_bound(max_tf, idf, 1.0);
+        // BM25 upper bound score using conservative length normalization
+        let max_block_score = bm25_upper_bound(max_tf as f32, idf);
 
         let doc_bit_width = simd::bits_needed(max_delta);
         let tf_bit_width = simd::bits_needed(max_tf.saturating_sub(1)); // Store tf-1

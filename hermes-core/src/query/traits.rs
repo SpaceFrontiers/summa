@@ -35,33 +35,64 @@ pub type CountFuture<'a> = Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>
 #[cfg(target_arch = "wasm32")]
 pub type CountFuture<'a> = Pin<Box<dyn Future<Output = Result<u32>> + 'a>>;
 
+/// Info for WAND-optimizable term queries
+#[derive(Debug, Clone)]
+pub struct TermQueryInfo {
+    /// Field being searched
+    pub field: crate::dsl::Field,
+    /// Term bytes (lowercase)
+    pub term: Vec<u8>,
+}
+
 /// A search query (async)
 #[cfg(not(target_arch = "wasm32"))]
 pub trait Query: Send + Sync {
     /// Create a scorer for this query against a single segment (async)
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader) -> ScorerFuture<'a>;
+    ///
+    /// The `limit` parameter specifies the maximum number of results to return.
+    /// This is passed from the top-level search limit.
+    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a>;
 
     /// Estimated number of matching documents in a segment (async)
     fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a>;
+
+    /// Return term info if this is a simple term query eligible for WAND optimization
+    ///
+    /// Returns None for complex queries (boolean, phrase, etc.)
+    fn as_term_query_info(&self) -> Option<TermQueryInfo> {
+        None
+    }
 }
 
 /// A search query (async) - WASM version without Send bounds
 #[cfg(target_arch = "wasm32")]
 pub trait Query {
     /// Create a scorer for this query against a single segment (async)
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader) -> ScorerFuture<'a>;
+    ///
+    /// The `limit` parameter specifies the maximum number of results to return.
+    /// This is passed from the top-level search limit.
+    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a>;
 
     /// Estimated number of matching documents in a segment (async)
     fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a>;
+
+    /// Return term info if this is a simple term query eligible for WAND optimization
+    fn as_term_query_info(&self) -> Option<TermQueryInfo> {
+        None
+    }
 }
 
 impl Query for Box<dyn Query> {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader) -> ScorerFuture<'a> {
-        (**self).scorer(reader)
+    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        (**self).scorer(reader, limit)
     }
 
     fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a> {
         (**self).count_estimate(reader)
+    }
+
+    fn as_term_query_info(&self) -> Option<TermQueryInfo> {
+        (**self).as_term_query_info()
     }
 }
 

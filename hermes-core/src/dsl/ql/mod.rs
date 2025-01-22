@@ -31,20 +31,17 @@ pub enum ParsedQuery {
         field: Option<String>,
         phrase: String,
     },
-    /// Dense vector KNN query
-    Knn {
+    /// Dense vector ANN query
+    Ann {
         field: String,
         vector: Vec<f32>,
-        k: usize,
         nprobe: usize,
         rerank: usize,
     },
     /// Sparse vector query
     Sparse {
         field: String,
-        indices: Vec<u32>,
-        weights: Vec<f32>,
-        k: usize,
+        vector: Vec<(u32, f32)>,
     },
     And(Vec<ParsedQuery>),
     Or(Vec<ParsedQuery>),
@@ -327,11 +324,10 @@ impl QueryLanguageParser {
         Ok(ParsedQuery::Phrase { field, phrase })
     }
 
-    /// Parse an ANN query: field:ann([1.0, 2.0, 3.0], k=10, nprobe=32)
+    /// Parse an ANN query: field:ann([1.0, 2.0, 3.0], nprobe=32, rerank=3)
     fn parse_ann_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
         let mut field = String::new();
         let mut vector = Vec::new();
-        let mut k = 10usize;
         let mut nprobe = 32usize;
         let mut rerank = 3usize;
 
@@ -351,30 +347,19 @@ impl QueryLanguageParser {
                 }
                 Rule::ann_params => {
                     for param in inner.into_inner() {
-                        match param.as_rule() {
-                            Rule::number => {
-                                // Simple k value
-                                if let Ok(v) = param.as_str().parse::<usize>() {
-                                    k = v;
+                        if param.as_rule() == Rule::ann_param {
+                            // ann_param = { ("nprobe" | "rerank") ~ "=" ~ number }
+                            let param_str = param.as_str();
+                            if let Some(eq_pos) = param_str.find('=') {
+                                let name = &param_str[..eq_pos];
+                                let value = &param_str[eq_pos + 1..];
+                                let val: usize = value.parse().unwrap_or(0);
+                                match name {
+                                    "nprobe" => nprobe = val,
+                                    "rerank" => rerank = val,
+                                    _ => {}
                                 }
                             }
-                            Rule::ann_param => {
-                                // ann_param = { ("k" | "nprobe" | "rerank") ~ "=" ~ number }
-                                // The param.as_str() contains the full "k=20" string
-                                let param_str = param.as_str();
-                                if let Some(eq_pos) = param_str.find('=') {
-                                    let name = &param_str[..eq_pos];
-                                    let value = &param_str[eq_pos + 1..];
-                                    let val: usize = value.parse().unwrap_or(0);
-                                    match name {
-                                        "k" => k = val,
-                                        "nprobe" => nprobe = val,
-                                        "rerank" => rerank = val,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -382,21 +367,18 @@ impl QueryLanguageParser {
             }
         }
 
-        Ok(ParsedQuery::Knn {
+        Ok(ParsedQuery::Ann {
             field,
             vector,
-            k,
             nprobe,
             rerank,
         })
     }
 
-    /// Parse a sparse vector query: field:sparse({1: 0.5, 5: 0.3}, k=10)
+    /// Parse a sparse vector query: field:sparse({1: 0.5, 5: 0.3})
     fn parse_sparse_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
         let mut field = String::new();
-        let mut indices = Vec::new();
-        let mut weights = Vec::new();
-        let mut k = 10usize;
+        let mut vector = Vec::new();
 
         for inner in pair.into_inner() {
             match inner.as_rule() {
@@ -412,28 +394,7 @@ impl QueryLanguageParser {
                                 && let (Ok(i), Ok(w)) =
                                     (idx.as_str().parse::<u32>(), weight.as_str().parse::<f32>())
                             {
-                                indices.push(i);
-                                weights.push(w);
-                            }
-                        }
-                    }
-                }
-                Rule::ann_params => {
-                    for param in inner.into_inner() {
-                        if param.as_rule() == Rule::number {
-                            if let Ok(v) = param.as_str().parse::<usize>() {
-                                k = v;
-                            }
-                        } else if param.as_rule() == Rule::ann_param {
-                            // ann_param = { ("k" | "nprobe" | "rerank") ~ "=" ~ number }
-                            // The param.as_str() contains the full "k=20" string
-                            let param_str = param.as_str();
-                            if let Some(eq_pos) = param_str.find('=') {
-                                let name = &param_str[..eq_pos];
-                                let value = &param_str[eq_pos + 1..];
-                                if name == "k" {
-                                    k = value.parse().unwrap_or(10);
-                                }
+                                vector.push((i, w));
                             }
                         }
                     }
@@ -442,12 +403,7 @@ impl QueryLanguageParser {
             }
         }
 
-        Ok(ParsedQuery::Sparse {
-            field,
-            indices,
-            weights,
-            k,
-        })
+        Ok(ParsedQuery::Sparse { field, vector })
     }
 
     fn build_query(&self, parsed: &ParsedQuery) -> Result<Box<dyn Query>, String> {
@@ -458,10 +414,9 @@ impl QueryLanguageParser {
             ParsedQuery::Phrase { field, phrase } => {
                 self.build_phrase_query(field.as_deref(), phrase)
             }
-            ParsedQuery::Knn {
+            ParsedQuery::Ann {
                 field,
                 vector,
-                k,
                 nprobe,
                 rerank,
             } => {
@@ -469,22 +424,17 @@ impl QueryLanguageParser {
                     .schema
                     .get_field(field)
                     .ok_or_else(|| format!("Unknown field: {}", field))?;
-                let query = DenseVectorQuery::new(field_id, vector.clone(), *k)
+                let query = DenseVectorQuery::new(field_id, vector.clone())
                     .with_nprobe(*nprobe)
                     .with_rerank_factor(*rerank);
                 Ok(Box::new(query))
             }
-            ParsedQuery::Sparse {
-                field,
-                indices,
-                weights,
-                k,
-            } => {
+            ParsedQuery::Sparse { field, vector } => {
                 let field_id = self
                     .schema
                     .get_field(field)
                     .ok_or_else(|| format!("Unknown field: {}", field))?;
-                let query = SparseVectorQuery::new(field_id, indices.clone(), weights.clone(), *k);
+                let query = SparseVectorQuery::new(field_id, vector.clone());
                 Ok(Box::new(query))
             }
             ParsedQuery::And(queries) => {
@@ -815,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_knn_query() {
+    fn test_parse_ann_query() {
         let mut builder = SchemaBuilder::default();
         let embedding = builder.add_dense_vector_field("embedding", 128, true, true);
         let schema = Arc::new(builder.build());
@@ -823,25 +773,23 @@ mod tests {
 
         let parser = QueryLanguageParser::new(schema, vec![embedding], tokenizers);
 
-        // Parse KNN query
-        let result = parser.parse_query_string("embedding:ann([1.0, 2.0, 3.0], k=10, nprobe=32)");
-        assert!(result.is_ok(), "Failed to parse KNN query: {:?}", result);
+        // Parse ANN query
+        let result = parser.parse_query_string("embedding:ann([1.0, 2.0, 3.0], nprobe=32)");
+        assert!(result.is_ok(), "Failed to parse ANN query: {:?}", result);
 
-        if let Ok(ParsedQuery::Knn {
+        if let Ok(ParsedQuery::Ann {
             field,
             vector,
-            k,
             nprobe,
             rerank,
         }) = result
         {
             assert_eq!(field, "embedding");
             assert_eq!(vector, vec![1.0, 2.0, 3.0]);
-            assert_eq!(k, 10);
             assert_eq!(nprobe, 32);
             assert_eq!(rerank, 3); // default
         } else {
-            panic!("Expected Knn query, got: {:?}", result);
+            panic!("Expected Ann query, got: {:?}", result);
         }
     }
 
@@ -855,20 +803,12 @@ mod tests {
         let parser = QueryLanguageParser::new(schema, vec![sparse], tokenizers);
 
         // Parse sparse query
-        let result = parser.parse_query_string("sparse:sparse({1: 0.5, 5: 0.3}, k=20)");
+        let result = parser.parse_query_string("sparse:sparse({1: 0.5, 5: 0.3})");
         assert!(result.is_ok(), "Failed to parse sparse query: {:?}", result);
 
-        if let Ok(ParsedQuery::Sparse {
-            field,
-            indices,
-            weights,
-            k,
-        }) = result
-        {
+        if let Ok(ParsedQuery::Sparse { field, vector }) = result {
             assert_eq!(field, "sparse");
-            assert_eq!(indices, vec![1, 5]);
-            assert_eq!(weights, vec![0.5, 0.3]);
-            assert_eq!(k, 20);
+            assert_eq!(vector, vec![(1, 0.5), (5, 0.3)]);
         } else {
             panic!("Expected Sparse query, got: {:?}", result);
         }

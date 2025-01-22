@@ -239,14 +239,16 @@ pub const BLOCK_SIZE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct BlockPostingList {
-    /// Skip list: (base_doc_id, last_doc_id_in_block, byte_offset)
+    /// Skip list: (base_doc_id, last_doc_id_in_block, byte_offset, block_max_tf)
     /// base_doc_id is the first doc_id in the block (absolute, not delta)
-    /// This allows blocks to be independently relocated during merge
-    skip_list: Vec<(DocId, DocId, u32)>,
+    /// block_max_tf enables Block-Max WAND optimization
+    skip_list: Vec<(DocId, DocId, u32, u32)>,
     /// Compressed posting data
     data: Vec<u8>,
     /// Total number of postings
     doc_count: u32,
+    /// Maximum term frequency across all postings (for WAND upper bound)
+    max_tf: u32,
 }
 
 impl BlockPostingList {
@@ -254,6 +256,7 @@ impl BlockPostingList {
     pub fn from_posting_list(list: &PostingList) -> io::Result<Self> {
         let mut skip_list = Vec::new();
         let mut data = Vec::new();
+        let mut max_tf = 0u32;
 
         let postings = &list.postings;
         let mut i = 0;
@@ -263,10 +266,14 @@ impl BlockPostingList {
             let block_end = (i + BLOCK_SIZE).min(postings.len());
             let block = &postings[i..block_end];
 
+            // Compute block's max term frequency for Block-Max WAND
+            let block_max_tf = block.iter().map(|p| p.term_freq).max().unwrap_or(0);
+            max_tf = max_tf.max(block_max_tf);
+
             // Record skip entry with base_doc_id (first doc in block)
             let base_doc_id = block.first().unwrap().doc_id;
             let last_doc_id = block.last().unwrap().doc_id;
-            skip_list.push((base_doc_id, last_doc_id, block_start));
+            skip_list.push((base_doc_id, last_doc_id, block_start, block_max_tf));
 
             // Write block - first doc is stored as absolute, rest as deltas
             write_vint(&mut data, block.len() as u64)?;
@@ -292,20 +299,23 @@ impl BlockPostingList {
             skip_list,
             data,
             doc_count: postings.len() as u32,
+            max_tf,
         })
     }
 
     /// Serialize the block posting list
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Write doc count
+        // Write doc count and max_tf
         writer.write_u32::<LittleEndian>(self.doc_count)?;
+        writer.write_u32::<LittleEndian>(self.max_tf)?;
 
-        // Write skip list (base_doc_id, last_doc_id, offset)
+        // Write skip list (base_doc_id, last_doc_id, offset, block_max_tf)
         writer.write_u32::<LittleEndian>(self.skip_list.len() as u32)?;
-        for (base_doc_id, last_doc_id, offset) in &self.skip_list {
+        for (base_doc_id, last_doc_id, offset, block_max_tf) in &self.skip_list {
             writer.write_u32::<LittleEndian>(*base_doc_id)?;
             writer.write_u32::<LittleEndian>(*last_doc_id)?;
             writer.write_u32::<LittleEndian>(*offset)?;
+            writer.write_u32::<LittleEndian>(*block_max_tf)?;
         }
 
         // Write data
@@ -318,6 +328,7 @@ impl BlockPostingList {
     /// Deserialize
     pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let doc_count = reader.read_u32::<LittleEndian>()?;
+        let max_tf = reader.read_u32::<LittleEndian>()?;
 
         let skip_count = reader.read_u32::<LittleEndian>()? as usize;
         let mut skip_list = Vec::with_capacity(skip_count);
@@ -325,7 +336,8 @@ impl BlockPostingList {
             let base_doc_id = reader.read_u32::<LittleEndian>()?;
             let last_doc_id = reader.read_u32::<LittleEndian>()?;
             let offset = reader.read_u32::<LittleEndian>()?;
-            skip_list.push((base_doc_id, last_doc_id, offset));
+            let block_max_tf = reader.read_u32::<LittleEndian>()?;
+            skip_list.push((base_doc_id, last_doc_id, offset, block_max_tf));
         }
 
         let data_len = reader.read_u32::<LittleEndian>()? as usize;
@@ -335,6 +347,7 @@ impl BlockPostingList {
         Ok(Self {
             skip_list,
             data,
+            max_tf,
             doc_count,
         })
     }
@@ -343,28 +356,46 @@ impl BlockPostingList {
         self.doc_count
     }
 
+    /// Get maximum term frequency (for WAND upper bound computation)
+    pub fn max_tf(&self) -> u32 {
+        self.max_tf
+    }
+
     /// Get number of blocks
     pub fn num_blocks(&self) -> usize {
         self.skip_list.len()
     }
 
-    /// Get block metadata: (base_doc_id, last_doc_id, data_offset, data_len)
-    pub fn block_info(&self, block_idx: usize) -> Option<(DocId, DocId, usize, usize)> {
+    /// Get block metadata: (base_doc_id, last_doc_id, data_offset, data_len, block_max_tf)
+    pub fn block_info(&self, block_idx: usize) -> Option<(DocId, DocId, usize, usize, u32)> {
         if block_idx >= self.skip_list.len() {
             return None;
         }
-        let (base, last, offset) = self.skip_list[block_idx];
+        let (base, last, offset, block_max_tf) = self.skip_list[block_idx];
         let next_offset = if block_idx + 1 < self.skip_list.len() {
             self.skip_list[block_idx + 1].2 as usize
         } else {
             self.data.len()
         };
-        Some((base, last, offset as usize, next_offset - offset as usize))
+        Some((
+            base,
+            last,
+            offset as usize,
+            next_offset - offset as usize,
+            block_max_tf,
+        ))
+    }
+
+    /// Get block's max term frequency for Block-Max WAND
+    pub fn block_max_tf(&self, block_idx: usize) -> Option<u32> {
+        self.skip_list
+            .get(block_idx)
+            .map(|(_, _, _, max_tf)| *max_tf)
     }
 
     /// Get raw block data for direct copying during merge
     pub fn block_data(&self, block_idx: usize) -> Option<&[u8]> {
-        let (_, _, offset, len) = self.block_info(block_idx)?;
+        let (_, _, offset, len, _) = self.block_info(block_idx)?;
         Some(&self.data[offset..offset + len])
     }
 
@@ -374,10 +405,14 @@ impl BlockPostingList {
         let mut skip_list = Vec::new();
         let mut data = Vec::new();
         let mut total_docs = 0u32;
+        let mut max_tf = 0u32;
 
         for (source, doc_offset) in sources {
+            max_tf = max_tf.max(source.max_tf);
             for block_idx in 0..source.num_blocks() {
-                if let Some((base, last, src_offset, len)) = source.block_info(block_idx) {
+                if let Some((base, last, src_offset, len, block_max_tf)) =
+                    source.block_info(block_idx)
+                {
                     let new_base = base + doc_offset;
                     let new_last = last + doc_offset;
                     let new_offset = data.len() as u32;
@@ -401,7 +436,7 @@ impl BlockPostingList {
                     // Copy remaining postings unchanged (they're deltas)
                     data.extend_from_slice(reader);
 
-                    skip_list.push((new_base, new_last, new_offset));
+                    skip_list.push((new_base, new_last, new_offset, block_max_tf));
                     total_docs += count as u32;
                 }
             }
@@ -411,6 +446,7 @@ impl BlockPostingList {
             skip_list,
             data,
             doc_count: total_docs,
+            max_tf,
         })
     }
 
@@ -545,7 +581,7 @@ impl<'a> BlockPostingIterator<'a> {
             .block_list
             .skip_list
             .iter()
-            .position(|(_, last_doc, _)| *last_doc >= target);
+            .position(|(_, last_doc, _, _)| *last_doc >= target);
 
         if let Some(block_idx) = target_block {
             if block_idx != self.current_block {
@@ -564,6 +600,39 @@ impl<'a> BlockPostingIterator<'a> {
         } else {
             self.exhausted = true;
             TERMINATED
+        }
+    }
+
+    /// Skip to the next block, returning the first doc_id in the new block
+    /// This is used for block-max WAND optimization when the current block's
+    /// max score can't beat the threshold.
+    pub fn skip_to_next_block(&mut self) -> DocId {
+        if self.exhausted {
+            return TERMINATED;
+        }
+        self.load_block(self.current_block + 1);
+        self.doc()
+    }
+
+    /// Get the current block index
+    #[inline]
+    pub fn current_block_idx(&self) -> usize {
+        self.current_block
+    }
+
+    /// Get total number of blocks
+    #[inline]
+    pub fn num_blocks(&self) -> usize {
+        self.block_list.skip_list.len()
+    }
+
+    /// Get the current block's max term frequency for Block-Max WAND
+    #[inline]
+    pub fn current_block_max_tf(&self) -> u32 {
+        if self.exhausted || self.current_block >= self.block_list.skip_list.len() {
+            0
+        } else {
+            self.block_list.skip_list[self.current_block].3
         }
     }
 }

@@ -29,9 +29,9 @@ impl BoostQuery {
 }
 
 impl Query for BoostQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader) -> ScorerFuture<'a> {
+    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         Box::pin(async move {
-            let inner_scorer = self.inner.scorer(reader).await?;
+            let inner_scorer = self.inner.scorer(reader, limit).await?;
             Ok(Box::new(BoostScorer {
                 inner: inner_scorer,
                 boost: self.boost,

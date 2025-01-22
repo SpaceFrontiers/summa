@@ -471,15 +471,15 @@ impl<D: Directory> SliceCachingDirectory<D> {
         }
         pos += 8;
 
-        // Check version (support v1 and v2)
+        // Check version (v2 only)
         let version = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        if version != 1 && version != 2 {
+        pos += 4;
+        if version != 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported slice cache version: {}", version),
+                format!("unsupported slice cache version: {} (expected 2)", version),
             ));
         }
-        pos += 4;
 
         // Number of files
         let num_files = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
@@ -518,8 +518,8 @@ impl<D: Directory> SliceCachingDirectory<D> {
             caches.insert(path, file_cache);
         }
 
-        // v2: Load file sizes if present
-        if version >= 2 && pos + 4 <= data.len() {
+        // Load file sizes
+        if pos + 4 <= data.len() {
             let num_sizes = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 

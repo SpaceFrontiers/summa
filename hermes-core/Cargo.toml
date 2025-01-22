@@ -35,7 +35,7 @@ pest_derive = { workspace = true }
 base64 = { workspace = true }
 regex = { workspace = true }
 rand = { workspace = true }
-reqwest = { version = "0.12", default-features = false, optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
 instant = { version = "0.1", features = ["wasm-bindgen"], optional = true }
 bumpalo = { workspace = true, optional = true }
 lasso = { workspace = true, optional = true }
@@ -45,7 +45,20 @@ bincode = { version = "2.0", optional = true }
 memmap2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 kmeans = { version = "2.0", optional = true }
-nalgebra = { version = "0.33", optional = true }
+nalgebra = { version = "0.34", optional = true }
+# Native tokenizers with onig (C library) for full regex support
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokenizers]
+version = "0.22"
+default-features = false
+features = ["onig", "http"]
+optional = true
+
+# WASM tokenizers with fancy-regex (pure Rust, no C dependencies)
+[target.'cfg(target_arch = "wasm32")'.dependencies.tokenizers]
+version = "0.22"
+default-features = false
+features = ["fancy-regex"]
+optional = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
@@ -57,17 +70,17 @@ tokio = { workspace = true }
 
 [features]
 default = ["native"]
-native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:bincode", "dep:kmeans", "dep:nalgebra"]
-wasm = []
+native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:bincode", "dep:kmeans", "dep:nalgebra", "dep:tokenizers"]
+wasm = ["dep:tokenizers"]
 http = ["dep:reqwest", "dep:instant"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.reqwest]
-version = "0.12"
+version = "0.13"
 default-features = false
-features = ["rustls-tls"]
+features = ["rustls"]
 optional = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.reqwest]
-version = "0.12"
+version = "0.13"
 default-features = false
 optional = true

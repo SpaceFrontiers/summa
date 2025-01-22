@@ -10,7 +10,7 @@ mod types;
 pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
-pub use reader::{AsyncSegmentReader, SegmentReader};
+pub use reader::{AsyncSegmentReader, SegmentReader, SparseIndex};
 pub use store::*;
 pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 

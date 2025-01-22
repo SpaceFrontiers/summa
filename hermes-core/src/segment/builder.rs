@@ -11,7 +11,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use hashbrown::HashMap;
 use lasso::{Rodeo, Spur};
@@ -24,7 +23,6 @@ use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
 use crate::tokenizer::BoxedTokenizer;
-use crate::wand::WandData;
 use crate::{DocId, Result};
 
 /// Size of the document store buffer before writing to disk
@@ -183,9 +181,6 @@ pub struct SegmentBuilder {
     num_indexed_fields: usize,
     field_to_slot: FxHashMap<u32, usize>,
 
-    /// Optional pre-computed WAND data for IDF values
-    wand_data: Option<Arc<WandData>>,
-
     /// Reusable buffer for per-document term frequency aggregation
     /// Avoids allocating a new hashmap for each document
     local_tf_buffer: FxHashMap<Spur, u32>,
@@ -196,6 +191,10 @@ pub struct SegmentBuilder {
     /// Dense vector storage per field: field -> (doc_ids, vectors)
     /// Vectors are stored as flat f32 arrays for efficient RaBitQ indexing
     dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
+
+    /// Sparse vector storage per field: field -> SparseVectorBuilder
+    /// Uses proper BlockSparsePostingList with configurable quantization
+    sparse_vectors: FxHashMap<u32, SparseVectorBuilder>,
 }
 
 /// Builder for dense vector index using RaBitQ
@@ -253,6 +252,36 @@ impl DenseVectorBuilder {
     }
 }
 
+/// Builder for sparse vector index using BlockSparsePostingList
+///
+/// Collects (doc_id, weight) postings per dimension, then builds
+/// BlockSparsePostingList with proper quantization during commit.
+struct SparseVectorBuilder {
+    /// Postings per dimension: dim_id -> Vec<(doc_id, weight)>
+    postings: FxHashMap<u32, Vec<(DocId, f32)>>,
+}
+
+impl SparseVectorBuilder {
+    fn new() -> Self {
+        Self {
+            postings: FxHashMap::default(),
+        }
+    }
+
+    /// Add a sparse vector entry
+    #[inline]
+    fn add(&mut self, dim_id: u32, doc_id: DocId, weight: f32) {
+        self.postings
+            .entry(dim_id)
+            .or_default()
+            .push((doc_id, weight));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.postings.is_empty()
+    }
+}
+
 impl SegmentBuilder {
     /// Create a new segment builder
     pub fn new(schema: Schema, config: SegmentBuilderConfig) -> Result<Self> {
@@ -292,23 +321,12 @@ impl SegmentBuilder {
             doc_field_lengths: Vec::new(),
             num_indexed_fields,
             field_to_slot,
-            wand_data: None,
             local_tf_buffer: FxHashMap::default(),
             token_buffer: String::with_capacity(64),
             config,
             dense_vectors: FxHashMap::default(),
+            sparse_vectors: FxHashMap::default(),
         })
-    }
-
-    /// Create with pre-computed WAND data
-    pub fn with_wand_data(
-        schema: Schema,
-        config: SegmentBuilderConfig,
-        wand_data: Arc<WandData>,
-    ) -> Result<Self> {
-        let mut builder = Self::new(schema, config)?;
-        builder.wand_data = Some(wand_data);
-        Ok(builder)
     }
 
     pub fn set_tokenizer(&mut self, field: Field, tokenizer: BoxedTokenizer) {
@@ -446,8 +464,8 @@ impl SegmentBuilder {
                 (FieldType::DenseVector, FieldValue::DenseVector(vec)) => {
                     self.index_dense_vector_field(*field, doc_id, vec)?;
                 }
-                (FieldType::SparseVector, FieldValue::SparseVector { indices, values }) => {
-                    self.index_sparse_vector_field(*field, doc_id, indices, values)?;
+                (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
+                    self.index_sparse_vector_field(*field, doc_id, entries)?;
                 }
                 _ => {}
             }
@@ -561,19 +579,17 @@ impl SegmentBuilder {
         Ok(())
     }
 
-    /// Index a sparse vector field using the inverted index
+    /// Index a sparse vector field using dedicated sparse posting lists
     ///
-    /// Each dimension becomes a term (prefixed with __sparse_), and the weight
-    /// is stored as a quantized term frequency. This allows reusing the existing
-    /// posting list infrastructure for sparse vector retrieval.
+    /// Collects (doc_id, weight) postings per dimension. During commit, these are
+    /// converted to BlockSparsePostingList with proper quantization from SparseVectorConfig.
     ///
     /// Weights below the configured `weight_threshold` are not indexed.
     fn index_sparse_vector_field(
         &mut self,
         field: Field,
         doc_id: DocId,
-        indices: &[u32],
-        values: &[f32],
+        entries: &[(u32, f32)],
     ) -> Result<()> {
         // Get weight threshold from field config (default 0.0 = no filtering)
         let weight_threshold = self
@@ -583,30 +599,18 @@ impl SegmentBuilder {
             .map(|config| config.weight_threshold)
             .unwrap_or(0.0);
 
-        for (&dim_id, &weight) in indices.iter().zip(values.iter()) {
+        let builder = self
+            .sparse_vectors
+            .entry(field.0)
+            .or_insert_with(SparseVectorBuilder::new);
+
+        for &(dim_id, weight) in entries {
             // Skip weights below threshold
             if weight.abs() < weight_threshold {
                 continue;
             }
 
-            // Use a special prefix to distinguish sparse vector dimensions from text terms
-            let term_str = format!("__sparse_{}", dim_id);
-            let term_spur = self.term_interner.get_or_intern(&term_str);
-
-            let term_key = TermKey {
-                field: field.0,
-                term: term_spur,
-            };
-
-            // Quantize weight to term frequency (scale by 1000 for precision)
-            // This is a simple approach; more sophisticated quantization can be added
-            let quantized_weight = (weight.abs() * 1000.0).min(u16::MAX as f32) as u32;
-
-            let posting = self
-                .inverted_index
-                .entry(term_key)
-                .or_insert_with(PostingListBuilder::new);
-            posting.add(doc_id, quantized_weight.max(1));
+            builder.add(dim_id, doc_id, weight);
         }
 
         Ok(())
@@ -668,6 +672,14 @@ impl SegmentBuilder {
             let vectors_data = self.build_vectors_file()?;
             if !vectors_data.is_empty() {
                 dir.write(&files.vectors, &vectors_data).await?;
+            }
+        }
+
+        // Build and write sparse vector posting lists
+        if !self.sparse_vectors.is_empty() {
+            let sparse_data = self.build_sparse_file()?;
+            if !sparse_data.is_empty() {
+                dir.write(&files.sparse, &sparse_data).await?;
             }
         }
 
@@ -843,6 +855,134 @@ impl SegmentBuilder {
         for (_, _, data) in field_indexes {
             output.extend_from_slice(&data);
         }
+
+        Ok(output)
+    }
+
+    /// Build sparse vectors file containing BlockSparsePostingList per field/dimension
+    ///
+    /// File format (direct-indexed table for O(1) dimension lookup):
+    /// - Header: num_fields (u32)
+    /// - For each field:
+    ///   - field_id (u32)
+    ///   - quantization (u8)
+    ///   - max_dim_id (u32)          ← highest dimension ID + 1 (table size)
+    ///   - table: [(offset: u64, length: u32)] × max_dim_id  ← direct indexed by dim_id
+    ///     (offset=0, length=0 means dimension not present)
+    /// - Data: concatenated serialized BlockSparsePostingList
+    fn build_sparse_file(&self) -> Result<Vec<u8>> {
+        use crate::structures::{BlockSparsePostingList, WeightQuantization};
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        if self.sparse_vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect field data: (field_id, quantization, max_dim_id, dim_id -> serialized_bytes)
+        type SparseFieldData = (u32, WeightQuantization, u32, FxHashMap<u32, Vec<u8>>);
+        let mut field_data: Vec<SparseFieldData> = Vec::new();
+
+        for (&field_id, builder) in &self.sparse_vectors {
+            if builder.is_empty() {
+                continue;
+            }
+
+            let field = crate::dsl::Field(field_id);
+
+            // Get quantization from field config
+            let quantization = self
+                .schema
+                .get_field_entry(field)
+                .and_then(|e| e.sparse_vector_config.as_ref())
+                .map(|c| c.weight_quantization)
+                .unwrap_or(WeightQuantization::Float32);
+
+            // Find max dimension ID
+            let max_dim_id = builder.postings.keys().max().copied().unwrap_or(0);
+
+            // Build BlockSparsePostingList for each dimension
+            let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
+
+            for (&dim_id, postings) in &builder.postings {
+                // Sort postings by doc_id
+                let mut sorted_postings = postings.clone();
+                sorted_postings.sort_by_key(|(doc_id, _)| *doc_id);
+
+                // Build BlockSparsePostingList
+                let block_list =
+                    BlockSparsePostingList::from_postings(&sorted_postings, quantization)
+                        .map_err(crate::Error::Io)?;
+
+                // Serialize
+                let mut bytes = Vec::new();
+                block_list.serialize(&mut bytes).map_err(crate::Error::Io)?;
+
+                dim_bytes.insert(dim_id, bytes);
+            }
+
+            field_data.push((field_id, quantization, max_dim_id + 1, dim_bytes));
+        }
+
+        if field_data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sort by field_id
+        field_data.sort_by_key(|(id, _, _, _)| *id);
+
+        // Calculate header size
+        // Header: num_fields (4)
+        // Per field: field_id (4) + quant (1) + max_dim_id (4) + table (12 * max_dim_id)
+        let mut header_size = 4u64;
+        for (_, _, max_dim_id, _) in &field_data {
+            header_size += 4 + 1 + 4; // field_id + quant + max_dim_id
+            header_size += (*max_dim_id as u64) * 12; // table entries: (offset: u64, length: u32)
+        }
+
+        // Build output
+        let mut output = Vec::new();
+
+        // Write num_fields
+        output.write_u32::<LittleEndian>(field_data.len() as u32)?;
+
+        // Track current data offset (after all headers)
+        let mut current_offset = header_size;
+
+        // First, collect all data bytes in order and build offset tables
+        let mut all_data: Vec<u8> = Vec::new();
+        let mut field_tables: Vec<Vec<(u64, u32)>> = Vec::new();
+
+        for (_, _, max_dim_id, dim_bytes) in &field_data {
+            let mut table: Vec<(u64, u32)> = vec![(0, 0); *max_dim_id as usize];
+
+            // Process dimensions in order
+            for dim_id in 0..*max_dim_id {
+                if let Some(bytes) = dim_bytes.get(&dim_id) {
+                    table[dim_id as usize] = (current_offset, bytes.len() as u32);
+                    current_offset += bytes.len() as u64;
+                    all_data.extend_from_slice(bytes);
+                }
+                // else: table entry stays (0, 0) meaning dimension not present
+            }
+
+            field_tables.push(table);
+        }
+
+        // Write field headers and tables
+        for (i, (field_id, quantization, max_dim_id, _)) in field_data.iter().enumerate() {
+            output.write_u32::<LittleEndian>(*field_id)?;
+            output.write_u8(*quantization as u8)?;
+            output.write_u32::<LittleEndian>(*max_dim_id)?;
+
+            // Write table (direct indexed by dim_id)
+            for &(offset, length) in &field_tables[i] {
+                output.write_u64::<LittleEndian>(offset)?;
+                output.write_u32::<LittleEndian>(length)?;
+            }
+        }
+
+        // Write data
+        output.extend_from_slice(&all_data);
 
         Ok(output)
     }

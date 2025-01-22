@@ -13,8 +13,6 @@ pub struct DenseVectorQuery {
     pub field: Field,
     /// Query vector
     pub vector: Vec<f32>,
-    /// Number of results to return
-    pub k: usize,
     /// Number of clusters to probe (for IVF indexes)
     pub nprobe: usize,
     /// Re-ranking factor (multiplied by k for candidate selection)
@@ -23,11 +21,10 @@ pub struct DenseVectorQuery {
 
 impl DenseVectorQuery {
     /// Create a new dense vector query
-    pub fn new(field: Field, vector: Vec<f32>, k: usize) -> Self {
+    pub fn new(field: Field, vector: Vec<f32>) -> Self {
         Self {
             field,
             vector,
-            k,
             nprobe: 32,
             rerank_factor: 3,
         }
@@ -47,18 +44,17 @@ impl DenseVectorQuery {
 }
 
 impl Query for DenseVectorQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader) -> ScorerFuture<'a> {
+    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         Box::pin(async move {
             let results =
-                reader.search_dense_vector(self.field, &self.vector, self.k, self.rerank_factor)?;
+                reader.search_dense_vector(self.field, &self.vector, limit, self.rerank_factor)?;
 
             Ok(Box::new(DenseVectorScorer::new(results)) as Box<dyn Scorer>)
         })
     }
 
     fn count_estimate<'a>(&'a self, _reader: &'a SegmentReader) -> CountFuture<'a> {
-        let k = self.k as u32;
-        Box::pin(async move { Ok(k) })
+        Box::pin(async move { Ok(u32::MAX) })
     }
 }
 
@@ -118,36 +114,146 @@ impl Scorer for DenseVectorScorer {
 pub struct SparseVectorQuery {
     /// Field containing the sparse vectors
     pub field: Field,
-    /// Query vector as (index, weight) pairs
-    pub indices: Vec<u32>,
-    pub weights: Vec<f32>,
-    /// Number of results to return
-    pub k: usize,
+    /// Query vector as (dimension_id, weight) pairs
+    pub vector: Vec<(u32, f32)>,
 }
 
 impl SparseVectorQuery {
     /// Create a new sparse vector query
-    pub fn new(field: Field, indices: Vec<u32>, weights: Vec<f32>, k: usize) -> Self {
-        Self {
-            field,
-            indices,
-            weights,
-            k,
-        }
+    pub fn new(field: Field, vector: Vec<(u32, f32)>) -> Self {
+        Self { field, vector }
     }
 
-    /// Create from a sparse vector map
-    pub fn from_map(field: Field, sparse_vec: &[(u32, f32)], k: usize) -> Self {
-        let (indices, weights): (Vec<u32>, Vec<f32>) = sparse_vec.iter().copied().unzip();
-        Self::new(field, indices, weights, k)
+    /// Create from separate indices and weights vectors
+    pub fn from_indices_weights(field: Field, indices: Vec<u32>, weights: Vec<f32>) -> Self {
+        let vector: Vec<(u32, f32)> = indices.into_iter().zip(weights).collect();
+        Self::new(field, vector)
+    }
+
+    /// Create from raw text using a HuggingFace tokenizer (single segment)
+    ///
+    /// This method tokenizes the text and creates a sparse vector query.
+    /// For multi-segment indexes, use `from_text_with_stats` instead.
+    ///
+    /// # Arguments
+    /// * `field` - The sparse vector field to search
+    /// * `text` - Raw text to tokenize
+    /// * `tokenizer_name` - HuggingFace tokenizer path (e.g., "bert-base-uncased")
+    /// * `weighting` - Weighting strategy for tokens
+    /// * `sparse_index` - Optional sparse index for IDF lookup (required for IDF weighting)
+    #[cfg(feature = "native")]
+    pub fn from_text(
+        field: Field,
+        text: &str,
+        tokenizer_name: &str,
+        weighting: crate::structures::QueryWeighting,
+        sparse_index: Option<&crate::segment::SparseIndex>,
+    ) -> crate::Result<Self> {
+        use crate::structures::QueryWeighting;
+        use crate::tokenizer::tokenizer_cache;
+
+        let tokenizer = tokenizer_cache().get_or_load(tokenizer_name)?;
+        let token_ids = tokenizer.tokenize_unique(text)?;
+
+        let weights: Vec<f32> = match weighting {
+            QueryWeighting::One => vec![1.0f32; token_ids.len()],
+            QueryWeighting::Idf => {
+                if let Some(index) = sparse_index {
+                    index.idf_weights(&token_ids)
+                } else {
+                    vec![1.0f32; token_ids.len()]
+                }
+            }
+        };
+
+        let vector: Vec<(u32, f32)> = token_ids.into_iter().zip(weights).collect();
+        Ok(Self::new(field, vector))
+    }
+
+    /// Create from raw text using global statistics (multi-segment)
+    ///
+    /// This is the recommended method for multi-segment indexes as it uses
+    /// aggregated IDF values across all segments for consistent ranking.
+    ///
+    /// # Arguments
+    /// * `field` - The sparse vector field to search
+    /// * `text` - Raw text to tokenize
+    /// * `tokenizer` - Pre-loaded HuggingFace tokenizer
+    /// * `weighting` - Weighting strategy for tokens
+    /// * `global_stats` - Global statistics for IDF computation
+    #[cfg(feature = "native")]
+    pub fn from_text_with_stats(
+        field: Field,
+        text: &str,
+        tokenizer: &crate::tokenizer::HfTokenizer,
+        weighting: crate::structures::QueryWeighting,
+        global_stats: Option<&super::GlobalStats>,
+    ) -> crate::Result<Self> {
+        use crate::structures::QueryWeighting;
+
+        let token_ids = tokenizer.tokenize_unique(text)?;
+
+        let weights: Vec<f32> = match weighting {
+            QueryWeighting::One => vec![1.0f32; token_ids.len()],
+            QueryWeighting::Idf => {
+                if let Some(stats) = global_stats {
+                    stats.sparse_idf_weights(field, &token_ids)
+                } else {
+                    vec![1.0f32; token_ids.len()]
+                }
+            }
+        };
+
+        let vector: Vec<(u32, f32)> = token_ids.into_iter().zip(weights).collect();
+        Ok(Self::new(field, vector))
+    }
+
+    /// Create from raw text, loading tokenizer from index directory
+    ///
+    /// This method supports the `index://` prefix for tokenizer paths,
+    /// loading tokenizer.json from the index directory.
+    ///
+    /// # Arguments
+    /// * `field` - The sparse vector field to search
+    /// * `text` - Raw text to tokenize
+    /// * `tokenizer_bytes` - Tokenizer JSON bytes (pre-loaded from directory)
+    /// * `weighting` - Weighting strategy for tokens
+    /// * `global_stats` - Global statistics for IDF computation
+    #[cfg(feature = "native")]
+    pub fn from_text_with_tokenizer_bytes(
+        field: Field,
+        text: &str,
+        tokenizer_bytes: &[u8],
+        weighting: crate::structures::QueryWeighting,
+        global_stats: Option<&super::GlobalStats>,
+    ) -> crate::Result<Self> {
+        use crate::structures::QueryWeighting;
+        use crate::tokenizer::HfTokenizer;
+
+        let tokenizer = HfTokenizer::from_bytes(tokenizer_bytes)?;
+        let token_ids = tokenizer.tokenize_unique(text)?;
+
+        let weights: Vec<f32> = match weighting {
+            QueryWeighting::One => vec![1.0f32; token_ids.len()],
+            QueryWeighting::Idf => {
+                if let Some(stats) = global_stats {
+                    stats.sparse_idf_weights(field, &token_ids)
+                } else {
+                    vec![1.0f32; token_ids.len()]
+                }
+            }
+        };
+
+        let vector: Vec<(u32, f32)> = token_ids.into_iter().zip(weights).collect();
+        Ok(Self::new(field, vector))
     }
 }
 
 impl Query for SparseVectorQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader) -> ScorerFuture<'a> {
+    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         Box::pin(async move {
             let results = reader
-                .search_sparse_vector(self.field, &self.indices, &self.weights, self.k)
+                .search_sparse_vector(self.field, &self.vector, limit)
                 .await?;
 
             Ok(Box::new(SparseVectorScorer::new(results)) as Box<dyn Scorer>)
@@ -155,8 +261,7 @@ impl Query for SparseVectorQuery {
     }
 
     fn count_estimate<'a>(&'a self, _reader: &'a SegmentReader) -> CountFuture<'a> {
-        let k = self.k as u32;
-        Box::pin(async move { Ok(k) })
+        Box::pin(async move { Ok(u32::MAX) })
     }
 }
 
@@ -216,24 +321,30 @@ mod tests {
 
     #[test]
     fn test_dense_vector_query_builder() {
-        let query = DenseVectorQuery::new(Field(0), vec![1.0, 2.0, 3.0], 10)
+        let query = DenseVectorQuery::new(Field(0), vec![1.0, 2.0, 3.0])
             .with_nprobe(64)
             .with_rerank_factor(5);
 
         assert_eq!(query.field, Field(0));
         assert_eq!(query.vector.len(), 3);
-        assert_eq!(query.k, 10);
         assert_eq!(query.nprobe, 64);
         assert_eq!(query.rerank_factor, 5);
     }
 
     #[test]
-    fn test_sparse_vector_query_from_map() {
+    fn test_sparse_vector_query_new() {
         let sparse = vec![(1, 0.5), (5, 0.3), (10, 0.2)];
-        let query = SparseVectorQuery::from_map(Field(0), &sparse, 10);
+        let query = SparseVectorQuery::new(Field(0), sparse.clone());
 
-        assert_eq!(query.indices, vec![1, 5, 10]);
-        assert_eq!(query.weights, vec![0.5, 0.3, 0.2]);
-        assert_eq!(query.k, 10);
+        assert_eq!(query.field, Field(0));
+        assert_eq!(query.vector, sparse);
+    }
+
+    #[test]
+    fn test_sparse_vector_query_from_indices_weights() {
+        let query =
+            SparseVectorQuery::from_indices_weights(Field(0), vec![1, 5, 10], vec![0.5, 0.3, 0.2]);
+
+        assert_eq!(query.vector, vec![(1, 0.5), (5, 0.3), (10, 0.2)]);
     }
 }

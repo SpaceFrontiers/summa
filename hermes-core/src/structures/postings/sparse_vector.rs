@@ -99,8 +99,58 @@ impl WeightQuantization {
     }
 }
 
+/// Query-time weighting strategy for sparse vector queries
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QueryWeighting {
+    /// All terms get weight 1.0
+    #[default]
+    One,
+    /// Terms weighted by IDF (inverse document frequency) from the index
+    Idf,
+}
+
+/// Query-time configuration for sparse vectors
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparseQueryConfig {
+    /// HuggingFace tokenizer path/name for query-time tokenization
+    /// Example: "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<String>,
+    /// Weighting strategy for tokenized query terms
+    #[serde(default)]
+    pub weighting: QueryWeighting,
+    /// Heap factor for approximate search (SEISMIC-style optimization)
+    /// A block is skipped if its max possible score < heap_factor * threshold
+    /// - 1.0 = exact search (default)
+    /// - 0.8 = approximate, ~20% faster with minor recall loss
+    /// - 0.5 = very approximate, much faster
+    #[serde(default = "default_heap_factor")]
+    pub heap_factor: f32,
+    /// Maximum number of query dimensions to process (query pruning)
+    /// Processes only the top-k dimensions by weight
+    /// - None = process all dimensions (default)
+    /// - Some(10) = process top 10 dimensions only
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_query_dims: Option<usize>,
+}
+
+fn default_heap_factor() -> f32 {
+    1.0
+}
+
+impl Default for SparseQueryConfig {
+    fn default() -> Self {
+        Self {
+            tokenizer: None,
+            weighting: QueryWeighting::One,
+            heap_factor: 1.0,
+            max_query_dims: None,
+        }
+    }
+}
+
 /// Configuration for sparse vector storage
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseVectorConfig {
     /// Size of dimension/term indices
     pub index_size: IndexSize,
@@ -110,6 +160,18 @@ pub struct SparseVectorConfig {
     /// This reduces index size and can improve query speed at the cost of recall
     #[serde(default)]
     pub weight_threshold: f32,
+    /// Static pruning: fraction of postings to keep per inverted list (SEISMIC-style)
+    /// Lists are sorted by weight descending and truncated to top fraction.
+    /// - None = keep all postings (default, exact)
+    /// - Some(0.1) = keep top 10% of postings per dimension
+    ///
+    /// Applied only during initial segment build, not during merge.
+    /// This exploits "concentration of importance" - top entries preserve most of inner product.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posting_list_pruning: Option<f32>,
+    /// Query-time configuration (tokenizer, weighting)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_config: Option<SparseQueryConfig>,
 }
 
 impl Default for SparseVectorConfig {
@@ -118,6 +180,8 @@ impl Default for SparseVectorConfig {
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
+            posting_list_pruning: None,
+            query_config: None,
         }
     }
 }
@@ -129,6 +193,8 @@ impl SparseVectorConfig {
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt8,
             weight_threshold: 0.0,
+            posting_list_pruning: None,
+            query_config: None,
         }
     }
 
@@ -138,6 +204,8 @@ impl SparseVectorConfig {
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt4,
             weight_threshold: 0.0,
+            posting_list_pruning: None,
+            query_config: None,
         }
     }
 
@@ -147,12 +215,21 @@ impl SparseVectorConfig {
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
+            posting_list_pruning: None,
+            query_config: None,
         }
     }
 
     /// Set weight threshold (builder pattern)
     pub fn with_weight_threshold(mut self, threshold: f32) -> Self {
         self.weight_threshold = threshold;
+        self
+    }
+
+    /// Set posting list pruning fraction (builder pattern)
+    /// e.g., 0.1 = keep top 10% of postings per dimension
+    pub fn with_pruning(mut self, fraction: f32) -> Self {
+        self.posting_list_pruning = Some(fraction.clamp(0.0, 1.0));
         self
     }
 
@@ -167,7 +244,7 @@ impl SparseVectorConfig {
     }
 
     /// Deserialize config from a single byte
-    /// Note: weight_threshold is not serialized in the byte, defaults to 0.0
+    /// Note: weight_threshold and query_config are not serialized in the byte
     pub fn from_byte(b: u8) -> Option<Self> {
         let index_size = IndexSize::from_u8(b >> 4)?;
         let weight_quantization = WeightQuantization::from_u8(b & 0x0F)?;
@@ -175,7 +252,15 @@ impl SparseVectorConfig {
             index_size,
             weight_quantization,
             weight_threshold: 0.0,
+            posting_list_pruning: None,
+            query_config: None,
         })
+    }
+
+    /// Set query configuration (builder pattern)
+    pub fn with_query_config(mut self, config: SparseQueryConfig) -> Self {
+        self.query_config = Some(config);
+        self
     }
 }
 
@@ -270,6 +355,40 @@ impl SparseVector {
     /// L2 norm
     pub fn norm(&self) -> f32 {
         self.norm_squared().sqrt()
+    }
+
+    /// Prune to top-k dimensions by weight (SEISMIC query_cut optimization)
+    ///
+    /// Returns a new SparseVector with only the top-k dimensions by absolute weight.
+    /// This exploits "concentration of importance" - top dimensions preserve most of inner product.
+    pub fn top_k(&self, k: usize) -> Self {
+        if self.entries.len() <= k {
+            return self.clone();
+        }
+
+        // Sort by weight descending, take top-k, re-sort by dim_id
+        let mut sorted: Vec<SparseEntry> = self.entries.clone();
+        sorted.sort_by(|a, b| {
+            b.weight
+                .abs()
+                .partial_cmp(&a.weight.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        sorted.truncate(k);
+        sorted.sort_by_key(|e| e.dim_id);
+
+        Self { entries: sorted }
+    }
+
+    /// Prune dimensions below a weight threshold
+    pub fn filter_by_weight(&self, min_weight: f32) -> Self {
+        let entries: Vec<SparseEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.weight.abs() >= min_weight)
+            .cloned()
+            .collect();
+        Self { entries }
     }
 }
 
@@ -775,6 +894,19 @@ impl BlockSparsePostingList {
         postings: &[(DocId, f32)],
         quantization: WeightQuantization,
     ) -> io::Result<Self> {
+        Self::from_postings_with_pruning(postings, quantization, None)
+    }
+
+    /// Build from postings with static pruning (SEISMIC-style optimization)
+    ///
+    /// If `pruning_fraction` is Some(f), only the top f*len postings by weight are kept.
+    /// This exploits "concentration of importance" - top entries preserve most of inner product.
+    /// Applied only during initial segment build, not during merge.
+    pub fn from_postings_with_pruning(
+        postings: &[(DocId, f32)],
+        quantization: WeightQuantization,
+        pruning_fraction: Option<f32>,
+    ) -> io::Result<Self> {
         if postings.is_empty() {
             return Ok(Self {
                 quantization,
@@ -785,6 +917,28 @@ impl BlockSparsePostingList {
                 doc_count: 0,
             });
         }
+
+        // Apply static pruning if fraction is set (SEISMIC-style)
+        // Sort by weight descending, take top fraction, then re-sort by doc_id
+        let postings: std::borrow::Cow<'_, [(DocId, f32)]> = if let Some(fraction) =
+            pruning_fraction
+        {
+            let max = ((postings.len() as f32 * fraction).ceil() as usize).max(1);
+            if postings.len() > max {
+                let mut sorted: Vec<(DocId, f32)> = postings.to_vec();
+                // Sort by weight descending
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                // Take top fraction
+                sorted.truncate(max);
+                // Re-sort by doc_id for efficient iteration
+                sorted.sort_by_key(|(doc_id, _)| *doc_id);
+                std::borrow::Cow::Owned(sorted)
+            } else {
+                std::borrow::Cow::Borrowed(postings)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(postings)
+        };
 
         // Compute global min/max for quantization
         let weights: Vec<f32> = postings.iter().map(|(_, w)| *w).collect();

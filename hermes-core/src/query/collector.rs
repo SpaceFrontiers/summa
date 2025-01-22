@@ -121,7 +121,7 @@ pub async fn search_segment(
     query: &dyn Query,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    let mut scorer = query.scorer(reader).await?;
+    let mut scorer = query.scorer(reader, limit).await?;
     let mut collector = TopKCollector::new(limit);
 
     let mut doc = scorer.doc();

@@ -527,19 +527,6 @@ pub struct OptP4DPostingList {
 }
 
 impl OptP4DPostingList {
-    /// BM25F parameters for block-max score calculation
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    /// Compute BM25F upper bound score for a given max_tf and IDF
-    #[inline]
-    fn compute_bm25f_upper_bound(max_tf: u32, idf: f32) -> f32 {
-        let tf = max_tf as f32;
-        let min_length_norm = 1.0 - Self::B;
-        let tf_norm = (tf * (Self::K1 + 1.0)) / (tf + Self::K1 * min_length_norm);
-        idf * tf_norm
-    }
-
     /// Create from raw doc_ids and term frequencies
     pub fn from_postings(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> Self {
         assert_eq!(doc_ids.len(), term_freqs.len());
@@ -606,7 +593,7 @@ impl OptP4DPostingList {
             pack_with_exceptions(&tfs[..num_docs], tf_bit_width);
 
         // BM25F upper bound score
-        let max_block_score = Self::compute_bm25f_upper_bound(max_tf, idf);
+        let max_block_score = crate::query::bm25_upper_bound(max_tf as f32, idf);
 
         OptP4DBlock {
             first_doc_id,

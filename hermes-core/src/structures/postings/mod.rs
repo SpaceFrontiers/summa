@@ -60,9 +60,10 @@ pub use rounded_bp128::{
     ROUNDED_BP128_BLOCK_SIZE, RoundedBP128Block, RoundedBP128Iterator, RoundedBP128PostingList,
 };
 pub use sparse_vector::{
-    BlockSparsePostingIterator, BlockSparsePostingList, IndexSize, SPARSE_BLOCK_SIZE, SparseEntry,
-    SparsePosting, SparsePostingIterator, SparsePostingList, SparseSkipEntry, SparseSkipList,
-    SparseVector, SparseVectorConfig, WeightQuantization,
+    BlockSparsePostingIterator, BlockSparsePostingList, IndexSize, QueryWeighting,
+    SPARSE_BLOCK_SIZE, SparseEntry, SparsePosting, SparsePostingIterator, SparsePostingList,
+    SparseQueryConfig, SparseSkipEntry, SparseSkipList, SparseVector, SparseVectorConfig,
+    WeightQuantization,
 };
 pub use vertical_bp128::{
     VERTICAL_BP128_BLOCK_SIZE, VerticalBP128Block, VerticalBP128Iterator, VerticalBP128PostingList,

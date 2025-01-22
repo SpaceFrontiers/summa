@@ -20,7 +20,6 @@ pub mod query;
 pub mod segment;
 pub mod structures;
 pub mod tokenizer;
-pub mod wand;
 
 // Re-exports from dsl
 pub use dsl::{
@@ -66,8 +65,8 @@ pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 
 // Re-exports from query
 pub use query::{
-    BlockWand, Bm25Params, BooleanQuery, BoostQuery, MaxScoreWand, Query, Scorer, SearchHit,
-    SearchResponse, SearchResult, TermQuery, TopKCollector, WandResult, search_segment,
+    Bm25Params, BooleanQuery, BoostQuery, Query, ScoredDoc, Scorer, SearchHit, SearchResponse,
+    SearchResult, TermQuery, TopKCollector, WandExecutor, WandOrQuery, search_segment,
 };
 
 // Re-exports from tokenizer
@@ -82,6 +81,11 @@ pub use error::{Error, Result};
 pub use index::{Index, IndexConfig, SLICE_CACHE_FILENAME};
 #[cfg(feature = "native")]
 pub use index::{IndexWriter, warmup_and_save_slice_cache};
+#[cfg(feature = "native")]
+pub use index::{
+    IndexingStats, SchemaConfig, SchemaFieldConfig, create_index_at_path, create_index_from_sdl,
+    index_documents_from_reader, index_json_document, parse_schema,
+};
 
 // Re-exports from merge
 #[cfg(feature = "native")]

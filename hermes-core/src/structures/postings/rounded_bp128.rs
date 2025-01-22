@@ -205,20 +205,6 @@ impl RoundedBP128PostingList {
         }
     }
 
-    /// BM25F parameters for block-max score calculation
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    /// Compute BM25F upper bound score for a given max_tf and IDF
-    #[inline]
-    pub fn compute_bm25f_upper_bound(max_tf: u32, idf: f32, field_boost: f32) -> f32 {
-        let tf = max_tf as f32;
-        let min_length_norm = 1.0 - Self::B;
-        let tf_norm =
-            (tf * field_boost * (Self::K1 + 1.0)) / (tf * field_boost + Self::K1 * min_length_norm);
-        idf * tf_norm
-    }
-
     fn create_block(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> RoundedBP128Block {
         let num_docs = doc_ids.len();
         let first_doc_id = doc_ids[0];
@@ -242,7 +228,7 @@ impl RoundedBP128PostingList {
             max_tf = max_tf.max(tf);
         }
 
-        let max_block_score = Self::compute_bm25f_upper_bound(max_tf, idf, 1.0);
+        let max_block_score = crate::query::bm25_upper_bound(max_tf as f32, idf);
 
         // Use rounded bit widths for SIMD-friendly decoding
         let exact_doc_bits = simd::bits_needed(max_delta);

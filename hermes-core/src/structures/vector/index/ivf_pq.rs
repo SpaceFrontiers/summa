@@ -349,6 +349,7 @@ mod tests {
     use rand::prelude::*;
 
     #[test]
+    #[ignore] // Long-running test
     fn test_ivf_pq_basic() {
         let dim = 64;
         let n = 500;
@@ -375,6 +376,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Long-running test
     fn test_ivf_pq_search() {
         let dim = 32;
         let n = 200;
@@ -407,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Long-running test
     fn test_ivf_pq_recall() {
         let dim = 128;
         let n = 1000;

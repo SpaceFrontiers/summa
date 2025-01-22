@@ -934,19 +934,6 @@ pub struct VerticalBP128PostingList {
 }
 
 impl VerticalBP128PostingList {
-    /// BM25 parameters
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    /// Compute BM25 upper bound score
-    #[inline]
-    pub fn compute_bm25_upper_bound(max_tf: u32, idf: f32) -> f32 {
-        let tf = max_tf as f32;
-        let min_length_norm = 1.0 - Self::B;
-        let tf_norm = (tf * (Self::K1 + 1.0)) / (tf + Self::K1 * min_length_norm);
-        idf * tf_norm
-    }
-
     /// Create from raw postings
     pub fn from_postings(doc_ids: &[u32], term_freqs: &[u32], idf: f32) -> Self {
         assert_eq!(doc_ids.len(), term_freqs.len());
@@ -1013,7 +1000,7 @@ impl VerticalBP128PostingList {
         let mut tf_data = Vec::new();
         pack_vertical(&tfs, tf_bit_width, &mut tf_data);
 
-        let max_block_score = Self::compute_bm25_upper_bound(max_tf, idf);
+        let max_block_score = crate::query::bm25_upper_bound(max_tf as f32, idf);
 
         VerticalBP128Block {
             doc_data,

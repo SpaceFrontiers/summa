@@ -486,9 +486,9 @@ pub enum FieldValue {
     F64(f64),
     #[serde(rename = "bytes")]
     Bytes(Vec<u8>),
-    /// Sparse vector: (dimension_ids, weights)
+    /// Sparse vector: list of (dimension_id, weight) pairs
     #[serde(rename = "sparse_vector")]
-    SparseVector { indices: Vec<u32>, values: Vec<f32> },
+    SparseVector(Vec<(u32, f32)>),
     /// Dense vector: float32 values
     #[serde(rename = "dense_vector")]
     DenseVector(Vec<f32>),
@@ -533,9 +533,9 @@ impl FieldValue {
         }
     }
 
-    pub fn as_sparse_vector(&self) -> Option<(&[u32], &[f32])> {
+    pub fn as_sparse_vector(&self) -> Option<&[(u32, f32)]> {
         match self {
-            FieldValue::SparseVector { indices, values } => Some((indices, values)),
+            FieldValue::SparseVector(entries) => Some(entries),
             _ => None,
         }
     }
@@ -587,14 +587,9 @@ impl Document {
         self.field_values.push((field, FieldValue::Bytes(value)));
     }
 
-    pub fn add_sparse_vector(&mut self, field: Field, indices: Vec<u32>, values: Vec<f32>) {
-        debug_assert_eq!(
-            indices.len(),
-            values.len(),
-            "Sparse vector indices and values must have same length"
-        );
+    pub fn add_sparse_vector(&mut self, field: Field, entries: Vec<(u32, f32)>) {
         self.field_values
-            .push((field, FieldValue::SparseVector { indices, values }));
+            .push((field, FieldValue::SparseVector(entries)));
     }
 
     pub fn add_dense_vector(&mut self, field: Field, values: Vec<f32>) {
@@ -649,7 +644,9 @@ impl Document {
                             base64::engine::general_purpose::STANDARD.encode(b),
                         )
                     }
-                    FieldValue::SparseVector { indices, values } => {
+                    FieldValue::SparseVector(entries) => {
+                        let indices: Vec<u32> = entries.iter().map(|(i, _)| *i).collect();
+                        let values: Vec<f32> = entries.iter().map(|(_, v)| *v).collect();
                         serde_json::json!({
                             "indices": indices,
                             "values": values
@@ -770,7 +767,8 @@ impl Document {
                         })
                         .unwrap_or_default();
                     if indices.len() == values.len() {
-                        doc.add_sparse_vector(field, indices, values);
+                        let entries: Vec<(u32, f32)> = indices.into_iter().zip(values).collect();
+                        doc.add_sparse_vector(field, entries);
                     }
                 }
             }
@@ -977,17 +975,16 @@ mod tests {
 
         // Create document with sparse vector
         let mut doc = Document::new();
-        doc.add_sparse_vector(embedding, vec![0, 5, 10], vec![1.0, 2.5, 0.5]);
+        doc.add_sparse_vector(embedding, vec![(0, 1.0), (5, 2.5), (10, 0.5)]);
         doc.add_text(title, "Test Document");
 
         // Verify accessor
-        let (indices, values) = doc
+        let entries = doc
             .get_first(embedding)
             .unwrap()
             .as_sparse_vector()
             .unwrap();
-        assert_eq!(indices, &[0, 5, 10]);
-        assert_eq!(values, &[1.0, 2.5, 0.5]);
+        assert_eq!(entries, &[(0, 1.0), (5, 2.5), (10, 0.5)]);
 
         // Verify JSON roundtrip
         let json = doc.to_json(&schema);
@@ -1005,15 +1002,17 @@ mod tests {
 
         // Parse back from JSON
         let doc2 = Document::from_json(&json, &schema).unwrap();
-        let (indices2, values2) = doc2
+        let entries2 = doc2
             .get_first(embedding)
             .unwrap()
             .as_sparse_vector()
             .unwrap();
-        assert_eq!(indices2, &[0, 5, 10]);
-        assert!((values2[0] - 1.0).abs() < 1e-6);
-        assert!((values2[1] - 2.5).abs() < 1e-6);
-        assert!((values2[2] - 0.5).abs() < 1e-6);
+        assert_eq!(entries2[0].0, 0);
+        assert!((entries2[0].1 - 1.0).abs() < 1e-6);
+        assert_eq!(entries2[1].0, 5);
+        assert!((entries2[1].1 - 2.5).abs() < 1e-6);
+        assert_eq!(entries2[2].0, 10);
+        assert!((entries2[2].1 - 0.5).abs() < 1e-6);
     }
 
     #[test]

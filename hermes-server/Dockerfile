@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.92-slim-bookworm AS builder
+FROM rustlang/rust:nightly-slim-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -16,7 +16,7 @@ COPY hermes-core ./hermes-core
 COPY hermes-server ./hermes-server
 COPY hermes-tool ./hermes-tool
 COPY hermes-wasm ./hermes-wasm
-COPY hermes-core-python ./hermes-core-python
+COPY hermes-proto ./hermes-proto
 
 # Build release binary
 RUN cargo build --release -p hermes-server --bin hermes-server

@@ -88,7 +88,7 @@ use tracing::info;
 
 use hermes_core::{
     Document, FsDirectory, IndexConfig, IndexWriter, SLICE_CACHE_FILENAME, SliceCachingDirectory,
-    parse_single_index, schema::SchemaBuilder,
+    parse_schema,
 };
 
 #[derive(Parser)]
@@ -320,79 +320,14 @@ enum Commands {
 // Index Management Functions
 // ============================================================================
 
-#[derive(serde::Deserialize)]
-struct SchemaField {
-    name: String,
-    #[serde(rename = "type")]
-    field_type: String,
-    #[serde(default = "default_true")]
-    indexed: bool,
-    #[serde(default = "default_true")]
-    stored: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(serde::Deserialize)]
-struct SchemaConfig {
-    fields: Vec<SchemaField>,
-}
-
-fn build_schema(config: &SchemaConfig) -> Result<hermes_core::Schema> {
-    let mut builder = SchemaBuilder::default();
-
-    for field in &config.fields {
-        match field.field_type.as_str() {
-            "text" => {
-                builder.add_text_field(&field.name, field.indexed, field.stored);
-            }
-            "u64" => {
-                builder.add_u64_field(&field.name, field.indexed, field.stored);
-            }
-            "i64" => {
-                builder.add_i64_field(&field.name, field.indexed, field.stored);
-            }
-            "f64" => {
-                builder.add_f64_field(&field.name, field.indexed, field.stored);
-            }
-            "bytes" => {
-                builder.add_bytes_field(&field.name, field.stored);
-            }
-            "json" => {
-                builder.add_json_field(&field.name, field.stored);
-            }
-            other => {
-                anyhow::bail!("Unknown field type: {}", other);
-            }
-        }
-    }
-
-    Ok(builder.build())
-}
-
 async fn create_index(index_path: PathBuf, schema_path: PathBuf) -> Result<()> {
     let schema_content = fs::read_to_string(&schema_path)
         .with_context(|| format!("Failed to read schema file: {:?}", schema_path))?;
 
-    let schema = if schema_path.extension().map(|e| e == "sdl").unwrap_or(false)
-        || schema_content.trim().starts_with("index ")
-        || schema_content.trim().starts_with("#")
-    {
-        let index_def = parse_single_index(&schema_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse SDL: {}", e))?;
-        info!("Parsed SDL schema for index '{}'", index_def.name);
-        index_def.to_schema()
-    } else {
-        let schema_config: SchemaConfig =
-            serde_json::from_str(&schema_content).context("Failed to parse schema JSON")?;
-        info!(
-            "Parsed JSON schema with {} fields",
-            schema_config.fields.len()
-        );
-        build_schema(&schema_config)?
-    };
+    let schema = parse_schema(&schema_content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse schema: {}", e))?;
+
+    info!("Parsed schema with {} fields", schema.fields().count());
 
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("Failed to create index directory: {:?}", index_path))?;
@@ -408,10 +343,8 @@ async fn create_index(index_path: PathBuf, schema_path: PathBuf) -> Result<()> {
 }
 
 async fn init_index_from_sdl(index_path: PathBuf, sdl: String) -> Result<()> {
-    let index_def =
-        parse_single_index(&sdl).map_err(|e| anyhow::anyhow!("Failed to parse SDL: {}", e))?;
-
-    let schema = index_def.to_schema();
+    let schema =
+        parse_schema(&sdl).map_err(|e| anyhow::anyhow!("Failed to parse schema: {}", e))?;
 
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("Failed to create index directory: {:?}", index_path))?;
@@ -419,10 +352,10 @@ async fn init_index_from_sdl(index_path: PathBuf, sdl: String) -> Result<()> {
     let dir = FsDirectory::new(&index_path);
     let config = IndexConfig::default();
 
-    let _writer = IndexWriter::create(dir, schema, config).await?;
+    let _writer = IndexWriter::create(dir, schema.clone(), config).await?;
 
-    info!("Created index '{}' at {:?}", index_def.name, index_path);
-    info!("Schema has {} fields", index_def.fields.len());
+    info!("Created index at {:?}", index_path);
+    info!("Schema has {} fields", schema.fields().count());
 
     Ok(())
 }

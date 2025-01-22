@@ -109,9 +109,10 @@ attribute = { indexed_with_config | "indexed" | "stored" | "multi" }
 //   indexed<rabitq, centroids: "c.bin", nprobe: 64>
 //   indexed<scann, centroids: "c.bin", codebook: "pq.bin", mrl_dim: 256>
 //   indexed<quantization: uint8, weight_threshold: 0.1>  # for sparse vectors
+//   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | centroids_kwarg | codebook_kwarg | nprobe_kwarg | mrl_dim_kwarg | quantization_kwarg | weight_threshold_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | centroids_kwarg | codebook_kwarg | nprobe_kwarg | mrl_dim_kwarg | quantization_kwarg | weight_threshold_kwarg | query_config_block | index_type_spec }
 mrl_dim_kwarg = { "mrl_dim" ~ ":" ~ mrl_dim_spec }
 mrl_dim_spec = @{ ASCII_DIGIT+ }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
@@ -125,6 +126,16 @@ centroids_path = { "\"" ~ path_chars ~ "\"" }
 codebook_path = { "\"" ~ path_chars ~ "\"" }
 path_chars = @{ (!("\"" ) ~ ANY)* }
 nprobe_spec = @{ ASCII_DIGIT+ }
+
+// Query-time configuration for sparse vectors
+// Example: query<tokenizer: "model/name", weighting: idf>
+query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
+query_config_params = { query_config_param ~ ("," ~ query_config_param)* }
+query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg }
+query_tokenizer_kwarg = { "tokenizer" ~ ":" ~ tokenizer_path }
+query_weighting_kwarg = { "weighting" ~ ":" ~ weighting_spec }
+tokenizer_path = { "\"" ~ path_chars ~ "\"" }
+weighting_spec = { "one" | "idf" }
 
 // Identifier (field names, index names, tokenizer names)
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
