@@ -139,12 +139,17 @@ export function createDownloadManager(appConfig) {
    * Resumable fetch - continues interrupted downloads using Range requests
    */
   const resumableFetch = async (url, options = {}) => {
-    const { headers = {}, onProgress = null } = options
+    const { headers = {}, onProgress = null, signal = null } = options
     let downloadedBytes = new Uint8Array(0)
     let attempt = 0
     let totalSize = null
 
     while (attempt < MAX_RETRIES) {
+      // Check if aborted before each attempt
+      if (signal?.aborted) {
+        throw new Error('Download aborted')
+      }
+
       attempt++
       const startByte = downloadedBytes.length
 
@@ -157,7 +162,7 @@ export function createDownloadManager(appConfig) {
           console.log(`Resuming download from byte ${startByte}`)
         }
 
-        const response = await fetch(url, { headers: requestHeaders })
+        const response = await fetch(url, { headers: requestHeaders, signal })
 
         // Already complete
         if (response.status === 416) {
@@ -259,11 +264,15 @@ export function createDownloadManager(appConfig) {
    * Simple fetch for range requests (no resumption needed)
    * Includes retry logic for 503 errors
    */
-  const simpleFetch = async (url, headers) => {
+  const simpleFetch = async (url, headers, signal = null) => {
     let lastError
 
     for (let attempt = 0; attempt < MAX_503_RETRIES; attempt++) {
-      const response = await fetch(url, { headers })
+      // Check if aborted before fetch
+      if (signal?.aborted) {
+        throw new Error('Download aborted')
+      }
+      const response = await fetch(url, { headers, signal })
 
       // 206 Partial Content is expected for range requests
       if (response.ok || response.status === 206) {
@@ -289,7 +298,7 @@ export function createDownloadManager(appConfig) {
    * Download a file with gateway fallback and resumable support
    */
   const download = async (path, options = {}) => {
-    const { rangeStart, rangeEnd } = options
+    const { rangeStart, rangeEnd, signal } = options
     const hasRange = rangeStart !== undefined && rangeEnd !== undefined
     const fileName = path.split('/').pop()
 
@@ -322,8 +331,8 @@ export function createDownloadManager(appConfig) {
 
           // Use simple fetch for range requests, resumable fetch for full files
           const data = hasRange
-            ? await simpleFetch(url, headers)
-            : await resumableFetch(url, { headers, onProgress })
+            ? await simpleFetch(url, headers, signal)
+            : await resumableFetch(url, { headers, onProgress, signal })
 
           console.log(`Success: ${name} (${url})`)
 
@@ -364,14 +373,19 @@ export function createDownloadManager(appConfig) {
   /**
    * Get file size via HEAD request
    */
-  const getSize = async (path) => {
+  const getSize = async (path, options = {}) => {
+    const { signal } = options
     const urls = getGatewayUrls(path)
 
     for (const { url, name } of urls) {
+      // Check if aborted
+      if (signal?.aborted) {
+        throw new Error('Download aborted')
+      }
       try {
         const response = await fetch(url, {
           method: 'HEAD',
-          signal: AbortSignal.timeout(10000)
+          signal: signal || AbortSignal.timeout(10000)
         })
         if (response.ok) {
           const contentLength = response.headers.get('Content-Length')

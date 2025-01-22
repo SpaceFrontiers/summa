@@ -151,8 +151,9 @@ export function useIpfs() {
   /**
    * Create fetch function for IpfsIndex using HTTP gateways
    * Returns a function: (path: string, rangeStart?: number, rangeEnd?: number) => Promise<Uint8Array>
+   * @param {AbortSignal} signal - Optional abort signal to cancel downloads
    */
-  const createFetchFn = () => {
+  const createFetchFn = (signal = null) => {
     if (!isInitialized.value) {
       throw new Error('IPFS not initialized. Call init() first.')
     }
@@ -164,9 +165,13 @@ export function useIpfs() {
       console.log('IPFS fetch:', path, hasRange ? `[${rangeStart}-${rangeEnd}]` : '(full)')
 
       try {
-        const data = await dm.download(path, { rangeStart, rangeEnd })
+        const data = await dm.download(path, { rangeStart, rangeEnd, signal })
         return data
       } catch (e) {
+        // Don't wrap abort errors
+        if (e.message === 'Download aborted' || e.name === 'AbortError') {
+          throw e
+        }
         const friendlyError = parseIpfsError(e, path)
         console.error('IPFS fetch error:', friendlyError)
         throw new Error(friendlyError)
@@ -177,8 +182,9 @@ export function useIpfs() {
   /**
    * Create size function for IpfsIndex using HTTP gateways
    * Returns a function: (path: string) => Promise<number>
+   * @param {AbortSignal} signal - Optional abort signal to cancel requests
    */
-  const createSizeFn = () => {
+  const createSizeFn = (signal = null) => {
     if (!isInitialized.value) {
       throw new Error('IPFS not initialized. Call init() first.')
     }
@@ -194,10 +200,14 @@ export function useIpfs() {
       console.log('IPFS size:', path)
 
       try {
-        const size = await dm.getSize(path)
+        const size = await dm.getSize(path, { signal })
         sizeCache.set(path, size)
         return size
       } catch (e) {
+        // Don't wrap abort errors
+        if (e.message === 'Download aborted' || e.name === 'AbortError') {
+          throw e
+        }
         const friendlyError = parseIpfsError(e, path)
         console.error('IPFS size error:', friendlyError)
         throw new Error(friendlyError)

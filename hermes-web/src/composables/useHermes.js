@@ -56,10 +56,17 @@ export function useHermes() {
   }
 
   const connect = async (serverUrl) => {
+    // Abort any previous connection attempt
+    if (abortController) {
+      abortController.abort()
+      abortController = null
+    }
+
     error.value = null
     isLoading.value = true
     connectionProgress.value = null
     abortController = new AbortController()
+    const signal = abortController.signal
 
     try {
       // Check if aborted
@@ -111,29 +118,20 @@ export function useHermes() {
         // Reset download stats
         ipfs.resetStats()
 
-        const fetchFn = ipfs.createFetchFn()
-        const sizeFn = ipfs.createSizeFn()
+        const fetchFn = ipfs.createFetchFn(signal)
+        const sizeFn = ipfs.createSizeFn(signal)
 
         setProgress('Loading index files...')
-        await withAbort(newIndex.load(fetchFn, sizeFn))
+        // Use load_with_idb_cache to restore IndexedDB cache BEFORE loading index files
+        await withAbort(newIndex.load_with_idb_cache(fetchFn, sizeFn))
         connectionType.value = 'ipfs'
       } else {
         // Standard HTTP connection
         setProgress('Connecting to server...')
         newIndex = new RemoteIndex(normalizedUrl)
-        await withAbort(newIndex.load())
+        // For HTTP, also try to restore cache before loading
+        await withAbort(newIndex.load_with_idb_cache ? newIndex.load_with_idb_cache() : newIndex.load())
         connectionType.value = 'http'
-      }
-
-      // Try to restore cache from IndexedDB
-      setProgress('Restoring cache...')
-      try {
-        const restored = await newIndex.load_cache_from_idb()
-        if (restored) {
-          console.log('Restored slice cache from IndexedDB')
-        }
-      } catch (e) {
-        console.warn('Failed to restore cache from IndexedDB:', e)
       }
 
       index.value = newIndex
@@ -175,6 +173,11 @@ export function useHermes() {
       setProgress('Connected!')
       updateStats()
       connectionProgress.value = null
+
+      // Save cache to IndexedDB after initial load (non-blocking)
+      // This persists the index files downloaded during connection
+      saveCache()
+
       return true
     } catch (e) {
       const msg = e.message || String(e)

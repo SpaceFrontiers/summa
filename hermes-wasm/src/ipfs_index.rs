@@ -328,6 +328,68 @@ impl IpfsIndex {
         Ok(())
     }
 
+    /// Load index with IndexedDB cache pre-loaded
+    ///
+    /// This method first loads any cached data from IndexedDB, then opens the index.
+    /// This allows previously cached slices to be used during index loading,
+    /// reducing network requests on page refresh.
+    ///
+    /// @param fetch_fn - JS function: (path: string) => Promise<Uint8Array>
+    /// @param size_fn - JS function: (path: string) => Promise<number>
+    #[wasm_bindgen]
+    pub async fn load_with_idb_cache(
+        &mut self,
+        fetch_fn: js_sys::Function,
+        size_fn: js_sys::Function,
+    ) -> Result<(), JsValue> {
+        let js_dir = JsFetchDirectory::new(
+            self.base_path.clone(),
+            fetch_fn.clone(),
+            size_fn.clone(),
+            Arc::clone(&self.stats),
+        );
+        let cached_dir = SliceCachingDirectory::new(js_dir, self.cache_size);
+
+        // First, try to restore cache from IndexedDB (accumulated from previous sessions)
+        let idb_key = cache_key(&self.base_path);
+        let mut idb_restored = false;
+        if let Ok(Some(idb_data)) = idb_get(&idb_key).await {
+            if cached_dir.deserialize(&idb_data).is_ok() {
+                web_sys::console::log_1(&"Restored slice cache from IndexedDB".into());
+                idb_restored = true;
+            }
+        }
+
+        // Only fetch .slicecache from IPFS if we didn't restore from IndexedDB
+        // (IndexedDB cache is more up-to-date since it includes search-time data)
+        if !idb_restored {
+            let cache_path = format!(
+                "{}/{}",
+                self.base_path.trim_end_matches('/'),
+                SLICE_CACHE_FILENAME
+            );
+
+            let this = JsValue::NULL;
+            let cache_path_js = JsValue::from_str(&cache_path);
+            if let Ok(promise) = fetch_fn.call1(&this, &cache_path_js) {
+                if let Ok(result) = JsFuture::from(js_sys::Promise::from(promise)).await {
+                    let array = js_sys::Uint8Array::new(&result);
+                    let cache_data = array.to_vec();
+                    let _ = cached_dir.deserialize(&cache_data);
+                }
+            }
+        }
+
+        let config = IndexConfig::default();
+
+        let index = Index::open(cached_dir, config)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to open index: {}", e)))?;
+
+        self.index = Some(index);
+        Ok(())
+    }
+
     /// Get network statistics
     #[wasm_bindgen]
     pub fn network_stats(&self) -> JsValue {

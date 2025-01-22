@@ -71,6 +71,49 @@ impl RemoteIndex {
         Ok(())
     }
 
+    /// Load index with IndexedDB cache pre-loaded
+    ///
+    /// This method first loads any cached data from IndexedDB, then opens the index.
+    /// This allows previously cached slices to be used during index loading,
+    /// reducing network requests on page refresh.
+    #[wasm_bindgen]
+    pub async fn load_with_idb_cache(&mut self) -> Result<(), JsValue> {
+        // Create HTTP directory and wrap with slice caching
+        let http_dir = HttpDirectory::new(&self.base_url);
+        let cached_dir = SliceCachingDirectory::new(http_dir, self.cache_size);
+
+        // First, try to restore cache from IndexedDB (accumulated from previous sessions)
+        let idb_key = cache_key(&self.base_url);
+        let mut idb_restored = false;
+        if let Ok(Some(idb_data)) = idb_get(&idb_key).await {
+            if cached_dir.deserialize(&idb_data).is_ok() {
+                web_sys::console::log_1(&"Restored slice cache from IndexedDB".into());
+                idb_restored = true;
+            }
+        }
+
+        // Only fetch .slicecache from server if we didn't restore from IndexedDB
+        if !idb_restored {
+            let cache_url = format!(
+                "{}/{}",
+                self.base_url.trim_end_matches('/'),
+                SLICE_CACHE_FILENAME
+            );
+            if let Ok(cache_data) = fetch_bytes(&cache_url).await {
+                let _ = cached_dir.deserialize(&cache_data);
+            }
+        }
+
+        let config = IndexConfig::default();
+
+        let index = Index::open(cached_dir, config)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to open index: {}", e)))?;
+
+        self.index = Some(index);
+        Ok(())
+    }
+
     /// Get cache statistics
     #[wasm_bindgen]
     pub fn cache_stats(&self) -> JsValue {
