@@ -14,6 +14,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY hermes-core ./hermes-core
 COPY hermes-server ./hermes-server
+COPY hermes-tool ./hermes-tool
+COPY hermes-wasm ./hermes-wasm
+COPY hermes-core-python ./hermes-core-python
 
 # Build release binary
 RUN cargo build --release -p hermes-server --bin hermes-server
