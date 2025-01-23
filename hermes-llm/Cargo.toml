@@ -41,8 +41,8 @@ rayon = { workspace = true }
 # Progress bar
 indicatif = "0.18"
 
-# HuggingFace Hub for downloading models/tokenizers
-hf-hub = "0.4"
+# HuggingFace Hub for downloading models/tokenizers (use rustls to avoid openssl)
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 
 # Compression support
 flate2 = "1.1"
