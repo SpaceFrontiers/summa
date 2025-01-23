@@ -1103,6 +1103,7 @@ impl SegmentBuilder {
     /// - Position offsets are stored in TermInfo (no separate header needed)
     ///
     /// Returns: (positions_data, term_key -> (offset, len) mapping)
+    #[allow(clippy::type_complexity)]
     fn build_positions_file(&self) -> Result<(Vec<u8>, FxHashMap<Vec<u8>, (u64, u32)>)> {
         use crate::structures::PositionPostingList;
 

@@ -180,7 +180,7 @@ impl PositionPostingList {
 
         // If this is first posting or we need a new block
         let need_new_block =
-            self.skip_list.is_empty() || self.doc_count % POSITION_BLOCK_SIZE as u32 == 0;
+            self.skip_list.is_empty() || self.doc_count.is_multiple_of(POSITION_BLOCK_SIZE as u32);
 
         if need_new_block {
             // Start new block
@@ -511,20 +511,20 @@ impl<'a> PositionPostingIterator<'a> {
         }
 
         // Check if target is in current block
-        if let Some((_, last, _)) = self.list.skip_list.get(self.current_block) {
-            if target <= *last {
-                // Target might be in current block, scan forward
-                while self.position_in_block < self.block_postings.len()
-                    && self.block_postings[self.position_in_block].doc_id < target
-                {
-                    self.position_in_block += 1;
-                }
-                if self.position_in_block >= self.block_postings.len() {
-                    self.load_block(self.current_block + 1);
-                    self.seek(target); // Continue seeking in next block
-                }
-                return;
+        if let Some((_, last, _)) = self.list.skip_list.get(self.current_block)
+            && target <= *last
+        {
+            // Target might be in current block, scan forward
+            while self.position_in_block < self.block_postings.len()
+                && self.block_postings[self.position_in_block].doc_id < target
+            {
+                self.position_in_block += 1;
             }
+            if self.position_in_block >= self.block_postings.len() {
+                self.load_block(self.current_block + 1);
+                self.seek(target); // Continue seeking in next block
+            }
+            return;
         }
 
         // Binary search on skip list to find the right block
