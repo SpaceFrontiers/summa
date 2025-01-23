@@ -7,11 +7,11 @@ use anyhow::Result;
 use candle_core::Tensor;
 
 #[cfg(feature = "nccl")]
-use cudarc::driver::safe::CudaDevice;
+use cudarc::driver::safe::{CudaContext, CudaStream};
 #[cfg(feature = "nccl")]
 use cudarc::nccl::safe::{Comm, Id};
 #[cfg(feature = "nccl")]
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Distributed configuration for multi-GPU training
 #[derive(Debug, Clone)]
@@ -47,7 +47,8 @@ impl DistributedConfig {
 /// NCCL Communicator wrapper for gradient synchronization
 #[cfg(feature = "nccl")]
 pub struct NcclCommunicator {
-    comm: Rc<Comm>,
+    comm: Comm,
+    stream: Arc<CudaStream>,
     rank: usize,
     world_size: usize,
 }
@@ -102,13 +103,17 @@ impl NcclCommunicator {
             id
         };
 
-        // Create CUDA device for this rank
-        let cuda_device = CudaDevice::new(config.rank).map_err(|e| {
-            anyhow::anyhow!("Failed to create CUDA device {}: {:?}", config.rank, e)
+        // Create CUDA context and stream for this rank
+        let ctx = CudaContext::new(config.rank).map_err(|e| {
+            anyhow::anyhow!("Failed to create CUDA context {}: {:?}", config.rank, e)
         })?;
+        let stream = Arc::new(
+            ctx.default_stream()
+                .map_err(|e| anyhow::anyhow!("Failed to create CUDA stream: {:?}", e))?,
+        );
 
         // Create NCCL communicator
-        let comm = Comm::from_rank(cuda_device, config.rank, config.world_size, id)
+        let comm = Comm::from_rank(stream.clone(), config.rank, config.world_size, id)
             .map_err(|e| anyhow::anyhow!("Failed to create NCCL communicator: {:?}", e.0))?;
 
         // Rank 0 cleans up the comm file after all ranks have read it
@@ -123,7 +128,8 @@ impl NcclCommunicator {
         tracing::info!("Rank {}: NCCL communicator initialized", config.rank);
 
         Ok(Self {
-            comm: Rc::new(comm),
+            comm,
+            stream,
             rank: config.rank,
             world_size: config.world_size,
         })
@@ -142,25 +148,29 @@ impl NcclCommunicator {
     pub fn all_reduce_sum(&self, tensor: &Tensor) -> Result<Tensor> {
         use cudarc::nccl::safe::ReduceOp;
 
-        // Get the underlying CUDA storage
-        let storage = tensor.storage_and_layout().0;
-
-        // Perform all-reduce
-        // Note: This is a simplified implementation
-        // In practice, you'd need to handle the tensor's CUDA buffer directly
-
-        // For now, we'll use a workaround by converting to/from vec
-        // This is not optimal but works for demonstration
+        // Get the data from tensor
         let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
+        let ctx = self.comm.context();
 
-        // Create output buffer
-        let mut output = data.clone();
+        // Copy data to GPU
+        let gpu_data = ctx
+            .htod_copy(data)
+            .map_err(|e| anyhow::anyhow!("Failed to copy data to GPU: {:?}", e))?;
 
-        // Perform NCCL all-reduce
-        // Note: actual implementation would use comm.all_reduce directly on GPU buffers
+        // Allocate output buffer on GPU
+        let mut gpu_output = ctx
+            .alloc_zeros::<f32>(gpu_data.len())
+            .map_err(|e| anyhow::anyhow!("Failed to allocate GPU buffer: {:?}", e))?;
+
+        // Perform NCCL all-reduce on GPU buffers
         self.comm
-            .all_reduce(&data, &mut output, &ReduceOp::Sum)
+            .all_reduce(&gpu_data, &mut gpu_output, &ReduceOp::Sum)
             .map_err(|e| anyhow::anyhow!("NCCL all-reduce failed: {:?}", e.0))?;
+
+        // Copy result back to CPU
+        let output = ctx
+            .dtoh_sync_copy(&gpu_output)
+            .map_err(|e| anyhow::anyhow!("Failed to copy data from GPU: {:?}", e))?;
 
         // Convert back to tensor
         let result = Tensor::from_vec(output, tensor.shape(), tensor.device())?;
@@ -170,11 +180,31 @@ impl NcclCommunicator {
     /// Broadcast a tensor from rank 0 to all other ranks
     pub fn broadcast(&self, tensor: &Tensor) -> Result<Tensor> {
         let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
-        let mut output = data.clone();
+        let ctx = self.comm.context();
+
+        // Copy data to GPU (only rank 0 has meaningful data)
+        let gpu_data = if self.rank == 0 {
+            Some(
+                ctx.htod_copy(data.clone())
+                    .map_err(|e| anyhow::anyhow!("Failed to copy data to GPU: {:?}", e))?,
+            )
+        } else {
+            None
+        };
+
+        // Allocate output buffer on GPU
+        let mut gpu_output = ctx
+            .alloc_zeros::<f32>(data.len())
+            .map_err(|e| anyhow::anyhow!("Failed to allocate GPU buffer: {:?}", e))?;
 
         self.comm
-            .broadcast(&data, &mut output, 0)
+            .broadcast(gpu_data.as_ref(), &mut gpu_output, 0)
             .map_err(|e| anyhow::anyhow!("NCCL broadcast failed: {:?}", e.0))?;
+
+        // Copy result back to CPU
+        let output = ctx
+            .dtoh_sync_copy(&gpu_output)
+            .map_err(|e| anyhow::anyhow!("Failed to copy data from GPU: {:?}", e))?;
 
         let result = Tensor::from_vec(output, tensor.shape(), tensor.device())?;
         Ok(result)
@@ -182,11 +212,19 @@ impl NcclCommunicator {
 
     /// Synchronize all ranks (barrier)
     pub fn barrier(&self) -> Result<()> {
+        use cudarc::nccl::safe::ReduceOp;
+
         // Use a small all-reduce as a barrier
-        let dummy = vec![0.0f32];
-        let mut output = dummy.clone();
+        let ctx = self.comm.context();
+        let gpu_dummy = ctx
+            .htod_copy(vec![0.0f32])
+            .map_err(|e| anyhow::anyhow!("Failed to copy data to GPU: {:?}", e))?;
+        let mut gpu_output = ctx
+            .alloc_zeros::<f32>(1)
+            .map_err(|e| anyhow::anyhow!("Failed to allocate GPU buffer: {:?}", e))?;
+
         self.comm
-            .all_reduce(&dummy, &mut output, &cudarc::nccl::safe::ReduceOp::Sum)
+            .all_reduce(&gpu_dummy, &mut gpu_output, &ReduceOp::Sum)
             .map_err(|e| anyhow::anyhow!("NCCL barrier failed: {:?}", e.0))?;
         Ok(())
     }
