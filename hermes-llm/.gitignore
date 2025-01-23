@@ -1,0 +1,13 @@
+# Generated files
+*.safetensors
+tok.json
+nccl_id.txt
+
+# Training outputs
+checkpoints/
+corpus.jsonl
+corpus.jsonl.gz
+
+# Python
+__pycache__/
+*.pyc

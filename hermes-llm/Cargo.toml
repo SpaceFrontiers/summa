@@ -1,0 +1,61 @@
+[package]
+name = "hermes-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LLM training from scratch using Candle"
+keywords = ["llm", "transformer", "deep-learning", "gpt", "training"]
+categories = ["science", "machine-learning"]
+
+[dependencies]
+# Candle ML framework
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+candle-flash-attn = { version = "0.9", optional = true }
+cudarc = { version = "0.19", optional = true, features = ["nccl"] }
+
+# Tokenization
+tokenizers = { version = "0.22", features = ["http"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI and logging
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Utilities
+rand = { workspace = true }
+rayon = { workspace = true }
+
+# Progress bar
+indicatif = "0.18"
+
+# HuggingFace Hub for downloading models/tokenizers
+hf-hub = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+flash-attn = ["cuda", "candle-flash-attn"]
+nccl = ["cuda", "dep:cudarc"]
+
+[[bin]]
+name = "hermes-llm"
+path = "src/main.rs"

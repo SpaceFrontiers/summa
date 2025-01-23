@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "hermes-core",
+    "hermes-llm",
     "hermes-server",
     "hermes-tool",
     "hermes-wasm",

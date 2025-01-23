@@ -165,7 +165,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     ids.push(new_segment_id);
                 }
                 Err(e) => {
-                    eprintln!("Background merge failed: {:?}", e);
+                    eprintln!(
+                        "Background merge failed for segments {:?}: {:?}",
+                        segment_ids_to_merge, e
+                    );
                 }
             }
 
