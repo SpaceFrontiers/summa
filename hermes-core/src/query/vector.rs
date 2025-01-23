@@ -29,6 +29,8 @@ pub struct DenseVectorQuery {
     pub nprobe: usize,
     /// Re-ranking factor (multiplied by k for candidate selection)
     pub rerank_factor: usize,
+    /// How to combine scores for multi-valued documents
+    pub combiner: MultiValueCombiner,
 }
 
 impl DenseVectorQuery {
@@ -39,6 +41,7 @@ impl DenseVectorQuery {
             vector,
             nprobe: 32,
             rerank_factor: 3,
+            combiner: MultiValueCombiner::Max,
         }
     }
 
@@ -53,6 +56,12 @@ impl DenseVectorQuery {
         self.rerank_factor = factor;
         self
     }
+
+    /// Set the multi-value score combiner
+    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
+        self.combiner = combiner;
+        self
+    }
 }
 
 impl Query for DenseVectorQuery {
@@ -60,8 +69,10 @@ impl Query for DenseVectorQuery {
         let field = self.field;
         let vector = self.vector.clone();
         let rerank_factor = self.rerank_factor;
+        let combiner = self.combiner;
         Box::pin(async move {
-            let results = reader.search_dense_vector(field, &vector, limit, rerank_factor)?;
+            let results =
+                reader.search_dense_vector(field, &vector, limit, rerank_factor, combiner)?;
 
             Ok(Box::new(DenseVectorScorer::new(results)) as Box<dyn Scorer>)
         })
@@ -98,9 +109,7 @@ impl Scorer for DenseVectorScorer {
 
     fn score(&self) -> Score {
         if self.position < self.results.len() {
-            // Convert distance to score (smaller distance = higher score)
-            let distance = self.results[self.position].1;
-            1.0 / (1.0 + distance)
+            self.results[self.position].1
         } else {
             0.0
         }

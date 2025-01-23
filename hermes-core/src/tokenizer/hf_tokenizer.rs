@@ -8,8 +8,10 @@
 //! - WASM: Limited to `from_bytes()` loading (no HTTP, no onig regex)
 
 use std::collections::HashMap;
+#[cfg(feature = "native")]
 use std::sync::Arc;
 
+#[cfg(feature = "native")]
 use parking_lot::RwLock;
 use tokenizers::Tokenizer;
 

@@ -324,16 +324,19 @@ impl AsyncSegmentReader {
 
     /// Search dense vectors using RaBitQ
     ///
-    /// Returns (doc_id, distance) pairs sorted by distance (ascending).
+    /// Returns (doc_id, score) pairs sorted by score (descending).
     /// The doc_ids are adjusted by doc_id_offset for this segment.
     /// If mrl_dim is configured, the query vector is automatically trimmed.
+    /// For multi-valued documents, scores are combined using the specified combiner.
     pub fn search_dense_vector(
         &self,
         field: Field,
         query: &[f32],
         k: usize,
         rerank_factor: usize,
+        combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<(DocId, f32)>> {
+        use crate::query::MultiValueCombiner;
         let index = self
             .vector_indexes
             .get(&field.0)
@@ -381,11 +384,52 @@ impl AsyncSegmentReader {
             }
         };
 
-        // Adjust doc_ids by segment offset
-        Ok(results
+        // Convert distance to score (smaller distance = higher score)
+        // and adjust doc_ids by segment offset
+        let raw_results: Vec<(DocId, f32)> = results
             .into_iter()
-            .map(|(idx, dist)| (idx as DocId + self.doc_id_offset, dist))
-            .collect())
+            .map(|(idx, dist)| {
+                let doc_id = idx as DocId + self.doc_id_offset;
+                let score = 1.0 / (1.0 + dist); // Convert distance to similarity score
+                (doc_id, score)
+            })
+            .collect();
+
+        // Combine scores for duplicate doc_ids (multi-valued documents)
+        let mut combined: rustc_hash::FxHashMap<DocId, (f32, u32)> =
+            rustc_hash::FxHashMap::default();
+        for (doc_id, score) in raw_results {
+            combined
+                .entry(doc_id)
+                .and_modify(|(acc_score, count)| match combiner {
+                    MultiValueCombiner::Sum => *acc_score += score,
+                    MultiValueCombiner::Max => *acc_score = acc_score.max(score),
+                    MultiValueCombiner::Avg => {
+                        *acc_score += score;
+                        *count += 1;
+                    }
+                })
+                .or_insert((score, 1));
+        }
+
+        // Finalize averages and collect results
+        let mut final_results: Vec<(DocId, f32)> = combined
+            .into_iter()
+            .map(|(doc_id, (score, count))| {
+                let final_score = if combiner == MultiValueCombiner::Avg {
+                    score / count as f32
+                } else {
+                    score
+                };
+                (doc_id, final_score)
+            })
+            .collect();
+
+        // Sort by score descending and take top k
+        final_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        final_results.truncate(k);
+
+        Ok(final_results)
     }
 
     /// Check if this segment has a dense vector index for the given field
