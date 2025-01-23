@@ -44,6 +44,10 @@ indicatif = "0.18"
 # HuggingFace Hub for downloading models/tokenizers
 hf-hub = "0.4"
 
+# Compression support
+flate2 = "1.1"
+zstd = "0.13"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

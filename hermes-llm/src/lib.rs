@@ -1,6 +1,7 @@
 pub mod config;
 pub mod data;
 pub mod distributed;
+pub mod io;
 pub mod model;
 pub mod tokenizer;
 pub mod training;

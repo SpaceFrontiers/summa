@@ -117,7 +117,10 @@ impl BPETrainer {
         self
     }
 
+    /// Train tokenizer from files. Supports .gz and .zst/.zstd compressed files.
+    /// Uses streaming to avoid loading entire files into memory.
     pub fn train_from_files(&self, files: &[&str], output_path: &str) -> Result<Tokenizer> {
+        use std::io::BufRead;
         use tokenizers::models::bpe::{BPE, BpeTrainerBuilder};
         use tokenizers::pre_tokenizers::byte_level::ByteLevel;
         use tokenizers::tokenizer::Trainer;
@@ -136,12 +139,32 @@ impl BPETrainer {
 
         let mut model = BPE::default();
 
+        const BATCH_SIZE: usize = 10000;
+
         for file in files {
-            let content = std::fs::read_to_string(file)?;
-            let lines: Vec<&str> = content.lines().collect();
-            trainer
-                .feed(lines.iter().copied(), |s| Ok(vec![s.to_owned()]))
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let reader = crate::io::open_file(file)?;
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+
+            for line in reader.lines() {
+                let line = line?;
+                if !line.is_empty() {
+                    batch.push(line);
+                }
+
+                if batch.len() >= BATCH_SIZE {
+                    trainer
+                        .feed(batch.iter().map(|s| s.as_str()), |s| Ok(vec![s.to_owned()]))
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    batch.clear();
+                }
+            }
+
+            // Feed remaining lines
+            if !batch.is_empty() {
+                trainer
+                    .feed(batch.iter().map(|s| s.as_str()), |s| Ok(vec![s.to_owned()]))
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
         }
 
         trainer

@@ -3,10 +3,10 @@ use candle_core::{Device, Tensor};
 use rand::Rng;
 use rand::seq::SliceRandom;
 use serde::Deserialize;
-use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
+use crate::io as file_io;
 use crate::tokenizer::Tokenizer;
 
 #[derive(Deserialize)]
@@ -45,13 +45,14 @@ impl Dataset {
     }
 
     /// Load dataset from a JSONL file where each line has a "text" field.
+    /// Supports .gz and .zst/.zstd compressed files.
     pub fn from_file<P: AsRef<Path>>(
         path: P,
         tokenizer: &Tokenizer,
         seq_len: usize,
     ) -> Result<Self> {
-        let file = File::open(path)?;
-        let tokens = Self::from_reader(file, tokenizer)?;
+        let reader = file_io::open_file(path)?;
+        let tokens = Self::from_reader(reader, tokenizer)?;
         Ok(Self::new(tokens, seq_len))
     }
 
@@ -63,6 +64,7 @@ impl Dataset {
     }
 
     /// Load dataset from multiple JSONL files.
+    /// Supports .gz and .zst/.zstd compressed files.
     pub fn from_files<P: AsRef<Path>>(
         paths: &[P],
         tokenizer: &Tokenizer,
@@ -71,8 +73,7 @@ impl Dataset {
         let mut all_tokens = Vec::new();
 
         for path in paths {
-            let file = File::open(path)?;
-            let reader = BufReader::new(file);
+            let reader = file_io::open_file(path)?;
 
             for line in reader.lines() {
                 let line = line?;
