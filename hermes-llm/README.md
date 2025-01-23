@@ -76,7 +76,7 @@ For distributed training, just add `--num-gpus`:
 
 ```bash
 # Build with NCCL support
-cargo build --release -p hermes-llm --features nccl
+cargo build --release -p hermes-llm --features cuda --features nccl
 
 # Single GPU
 hermes-llm train --data corpus.jsonl --tokenizer tok.json --model gpt2-small
@@ -84,6 +84,23 @@ hermes-llm train --data corpus.jsonl --tokenizer tok.json --model gpt2-small
 # 4 GPUs (automatically uses NCCL)
 hermes-llm train --data corpus.jsonl --tokenizer tok.json --model gpt2-small --num-gpus 4
 ```
+
+### Consumer GPUs (RTX 3090, 4090, etc.)
+
+Consumer GPUs without NVLink don't support GPU peer-to-peer access. If you see errors like `peer access is not supported between these two devices`, disable P2P and SHM:
+
+```bash
+NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 hermes-llm train \
+  --data corpus.jsonl --tokenizer tok.json --model gpt2-medium --num-gpus 3
+```
+
+| Variable             | Description                                                   |
+| -------------------- | ------------------------------------------------------------- |
+| `NCCL_P2P_DISABLE=1` | Disable direct GPU-to-GPU communication                       |
+| `NCCL_SHM_DISABLE=1` | Disable shared memory (uses CUDA IPC which needs peer access) |
+| `NCCL_DEBUG=INFO`    | Enable debug logging (troubleshooting)                        |
+
+**Note:** With both disabled, NCCL uses socket-based communication which is slower but works on any multi-GPU setup.
 
 ### Training Options
 

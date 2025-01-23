@@ -90,18 +90,30 @@ impl Trainer {
         train_loader: &mut DataLoader,
         comm: Option<&crate::distributed::NcclCommunicator>,
     ) -> Result<f64> {
+        let is_main = comm.is_none_or(|c| c.rank() == 0);
         let num_batches = train_loader.num_batches();
-        let pb = ProgressBar::new(num_batches as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} loss: {msg}")
-                .unwrap()
-                .progress_chars("##-"),
-        );
+
+        // Only show progress bar on main rank (use hidden for distributed - no TTY)
+        let use_progress_bar = is_main && comm.is_none();
+        let pb = if use_progress_bar {
+            let pb = ProgressBar::new(num_batches as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} loss: {msg}")
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
+            pb
+        } else {
+            ProgressBar::hidden()
+        };
 
         let mut total_loss = 0.0;
         let mut num_steps = 0;
+        let mut batch_count = 0usize;
+        let mut last_loss = 0.0f64;
         let mut accumulated_loss = 0.0;
+        let start_time = std::time::Instant::now();
 
         train_loader.reset();
 
@@ -140,6 +152,7 @@ impl Trainer {
                 accumulated_loss = 0.0;
                 self.global_step += 1;
 
+                last_loss = avg_loss;
                 if self
                     .global_step
                     .is_multiple_of(self.training_config.log_every)
@@ -149,6 +162,22 @@ impl Trainer {
             }
 
             pb.inc(1);
+            batch_count += 1;
+
+            // Simple text progress for distributed mode (child processes have no TTY)
+            if is_main && comm.is_some() && (batch_count == 1 || batch_count.is_multiple_of(100)) {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let pct = (batch_count * 100) / num_batches;
+                eprint!(
+                    "\r[{:.1}s] {}/{} ({}%) loss: {:.4}        ",
+                    elapsed, batch_count, num_batches, pct, last_loss
+                );
+            }
+        }
+
+        // Final newline for distributed mode
+        if is_main && comm.is_some() {
+            eprintln!();
         }
 
         pb.finish_with_message("done");
@@ -200,23 +229,30 @@ impl Trainer {
         checkpoint_dir: Option<&str>,
         comm: Option<&crate::distributed::NcclCommunicator>,
     ) -> Result<()> {
-        let _is_distributed = comm.is_some();
         let is_main = comm.is_none_or(|c| c.rank() == 0);
 
-        info!(
-            "Starting training for {} epochs",
-            self.training_config.epochs
-        );
+        if is_main {
+            info!(
+                "Starting training for {} epochs",
+                self.training_config.epochs
+            );
+        }
 
         for epoch in 0..self.training_config.epochs {
-            info!("Epoch {}/{}", epoch + 1, self.training_config.epochs);
+            if is_main {
+                info!("Epoch {}/{}", epoch + 1, self.training_config.epochs);
+            }
 
             let train_loss = self.train_epoch_distributed(train_loader, comm)?;
-            info!("Epoch {} train loss: {:.4}", epoch + 1, train_loss);
+            if is_main {
+                info!("Epoch {} train loss: {:.4}", epoch + 1, train_loss);
+            }
 
             if let Some(ref mut eval) = eval_loader {
                 let eval_loss = self.evaluate(eval)?;
-                info!("Epoch {} eval loss: {:.4}", epoch + 1, eval_loss);
+                if is_main {
+                    info!("Epoch {} eval loss: {:.4}", epoch + 1, eval_loss);
+                }
             }
 
             // Only main process saves checkpoints
@@ -305,7 +341,11 @@ impl<'a> TextGenerator<'a> {
                 .to_dtype(DType::U32)?;
 
             let logits = self.model.forward(&input, 0, false)?;
-            let logits = logits.narrow(1, context_len - 1, 1)?.squeeze(1)?;
+            // Shape: [1, seq_len, vocab] -> [1, 1, vocab] -> [vocab]
+            let logits = logits
+                .narrow(1, context_len - 1, 1)?
+                .squeeze(1)?
+                .squeeze(0)?;
 
             let logits = if temperature != 1.0 {
                 logits.affine(1.0 / temperature, 0.0)?

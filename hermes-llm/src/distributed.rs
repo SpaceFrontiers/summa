@@ -115,16 +115,16 @@ impl NcclCommunicator {
         let comm = Comm::from_rank(stream.clone(), config.rank, config.world_size, id)
             .map_err(|e| anyhow::anyhow!("Failed to create NCCL communicator: {:?}", e.0))?;
 
-        // Rank 0 cleans up the comm file after all ranks have read it
+        tracing::info!("Rank {}: NCCL communicator initialized", config.rank);
+
+        // Clean up comm file after all ranks have created communicator
+        // Rank 0 waits a bit then cleans up (other ranks already have the ID)
         if config.rank == 0 {
-            // Wait a bit for other ranks to read the file
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(500));
             if comm_file.exists() {
                 let _ = std::fs::remove_file(&comm_file);
             }
         }
-
-        tracing::info!("Rank {}: NCCL communicator initialized", config.rank);
 
         Ok(Self {
             comm,
@@ -168,6 +168,11 @@ impl NcclCommunicator {
             .all_reduce(&gpu_data, &mut gpu_output, &ReduceOp::Sum)
             .map_err(|e| anyhow::anyhow!("NCCL all-reduce failed: {:?}", e.0))?;
 
+        // Synchronize stream before reading results
+        self.stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("Stream sync failed: {:?}", e))?;
+
         // Copy result back to CPU
         let output = self
             .stream
@@ -205,6 +210,11 @@ impl NcclCommunicator {
             .broadcast(gpu_data.as_ref(), &mut gpu_output, 0)
             .map_err(|e| anyhow::anyhow!("NCCL broadcast failed: {:?}", e.0))?;
 
+        // Synchronize stream before reading results
+        self.stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("Stream sync failed: {:?}", e))?;
+
         // Copy result back to CPU
         let output = self
             .stream
@@ -233,6 +243,11 @@ impl NcclCommunicator {
         self.comm
             .all_reduce(&gpu_dummy, &mut gpu_output, &ReduceOp::Sum)
             .map_err(|e| anyhow::anyhow!("NCCL barrier failed: {:?}", e.0))?;
+
+        // Synchronize to ensure barrier completes
+        self.stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("Stream sync failed: {:?}", e))?;
         Ok(())
     }
 

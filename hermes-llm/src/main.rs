@@ -345,7 +345,11 @@ fn main() -> Result<()> {
             };
 
             if dist_config.is_distributed() {
-                info!("Distributed training: rank {}/{}", actual_rank, num_gpus);
+                info!(
+                    "Distributed training: rank {}/{}",
+                    actual_rank + 1,
+                    num_gpus
+                );
             }
             info!("Using GPU {}", actual_rank);
             info!("Using device: {:?}", device);
@@ -409,6 +413,13 @@ fn main() -> Result<()> {
 
             if dist_config.is_distributed() && comm.is_none() {
                 anyhow::bail!("Distributed training requires --features nccl");
+            }
+
+            // Synchronize all ranks before training starts
+            if let Some(ref c) = comm {
+                info!("Waiting for all ranks to synchronize...");
+                c.barrier()?;
+                info!("All ranks synchronized, starting training");
             }
 
             let mut trainer = Trainer::new(config.clone(), training_config, device)?;
