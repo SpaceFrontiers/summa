@@ -13,6 +13,7 @@ WORKDIR /app
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
 COPY hermes-core ./hermes-core
+COPY hermes-llm ./hermes-llm
 COPY hermes-server ./hermes-server
 COPY hermes-tool ./hermes-tool
 COPY hermes-wasm ./hermes-wasm
