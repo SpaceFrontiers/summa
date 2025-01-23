@@ -1802,6 +1802,7 @@ dependencies = [
  "candle-transformers",
  "clap",
  "cudarc 0.19.0",
+ "flate2",
  "hf-hub",
  "indicatif 0.18.3",
  "rand 0.9.2",
@@ -1813,6 +1814,7 @@ dependencies = [
  "tokenizers",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]
