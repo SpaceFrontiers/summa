@@ -109,14 +109,16 @@ Example: `--batch-size 32 --grad-accum 4 --num-gpus 4` = 512 effective batch
 
 ## Model Configurations
 
-| Config      | Layers | Hidden | Heads | Params |
-| ----------- | ------ | ------ | ----- | ------ |
-| nano        | 2      | 64     | 2     | ~500K  |
-| tiny        | 4      | 128    | 4     | ~1M    |
-| gpt2-small  | 12     | 768    | 12    | ~124M  |
-| gpt2-medium | 24     | 1024   | 16    | ~355M  |
-| gpt2-large  | 36     | 1280   | 20    | ~774M  |
-| llama-small | 16     | 1024   | 16    | ~150M  |
+| Config      | Layers | Hidden | Heads | Params (32K vocab) |
+| ----------- | ------ | ------ | ----- | ------------------ |
+| nano        | 2      | 64     | 2     | ~4M                |
+| tiny        | 4      | 128    | 4     | ~9M                |
+| gpt2-small  | 12     | 768    | 12    | ~124M              |
+| gpt2-medium | 24     | 1024   | 16    | ~355M              |
+| gpt2-large  | 36     | 1280   | 20    | ~774M              |
+| llama-small | 16     | 1024   | 16    | ~268M              |
+
+_Note: Parameter count depends heavily on vocab size. Run `hermes-llm info --model <name>` for exact counts._
 
 ## Architecture
 
