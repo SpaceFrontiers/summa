@@ -198,14 +198,21 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         for id_str in segment_ids_to_merge {
             let segment_id = SegmentId::from_hex(id_str)
                 .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = SegmentReader::open(
+            let reader = match SegmentReader::open(
                 directory,
                 segment_id,
                 Arc::new(schema.clone()),
                 doc_offset,
                 term_cache_blocks,
             )
-            .await?;
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[merge] Failed to open segment {}: {:?}", id_str, e);
+                    return Err(e);
+                }
+            };
             doc_offset += reader.meta().num_docs;
             readers.push(reader);
         }
@@ -213,7 +220,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // Merge into new segment
         let merger = SegmentMerger::new(Arc::new(schema.clone()));
         let new_segment_id = SegmentId::new();
-        merger.merge(directory, &readers, new_segment_id).await?;
+        if let Err(e) = merger.merge(directory, &readers, new_segment_id).await {
+            eprintln!(
+                "[merge] Merge failed for segments {:?} -> {}: {:?}",
+                segment_ids_to_merge,
+                new_segment_id.to_hex(),
+                e
+            );
+            return Err(e);
+        }
 
         // Delete old segments
         for id_str in segment_ids_to_merge {

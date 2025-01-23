@@ -241,21 +241,27 @@ fn main() -> Result<()> {
             rank,
             comm_file,
         } => {
-            // If num_gpus > 1 and rank is MAX (launcher), spawn child processes
-            if num_gpus > 1 && rank == usize::MAX {
+            // Launcher mode: spawn child processes for ranks 1..n
+            // Launcher becomes rank 0 to keep TTY for progress bar
+            let children_handle = if num_gpus > 1 && rank == usize::MAX {
                 use std::process::{Command, Stdio};
+
+                // CRITICAL: Set CUDA_VISIBLE_DEVICES=0 BEFORE any CUDA operations
+                unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", "0") };
 
                 let data_path = data
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--data is required for multi-GPU training"))?;
 
-                let effective_batch = batch_size * grad_accum * num_gpus;
                 println!("=== Distributed Training ===");
                 println!("GPUs: {}", num_gpus);
                 println!("Model: {}", model);
                 println!(
                     "Effective batch: {} ({} x {} x {})",
-                    effective_batch, batch_size, grad_accum, num_gpus
+                    batch_size * grad_accum * num_gpus,
+                    batch_size,
+                    grad_accum,
+                    num_gpus
                 );
                 println!();
 
@@ -263,7 +269,7 @@ fn main() -> Result<()> {
                 let _ = std::fs::remove_file(&comm_file);
 
                 let mut children = Vec::new();
-                for r in 0..num_gpus {
+                for r in 1..num_gpus {
                     println!("Launching rank {} on GPU {}...", r, r);
 
                     let mut child_cmd = Command::new(&exe);
@@ -303,40 +309,33 @@ fn main() -> Result<()> {
 
                     let child = child_cmd
                         .current_dir(std::env::current_dir()?)
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
                         .spawn()?;
 
-                    children.push(child);
-                    if r == 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    children.push((r, child));
+                }
+
+                std::thread::sleep(std::time::Duration::from_secs(2));
+
+                // Spawn thread to wait for children
+                Some(std::thread::spawn(move || {
+                    let mut all_ok = true;
+                    for (r, mut c) in children {
+                        if !c.wait().map(|s| s.success()).unwrap_or(false) {
+                            eprintln!("Rank {} failed", r);
+                            all_ok = false;
+                        }
                     }
-                }
+                    all_ok
+                }))
+            } else {
+                None
+            };
 
-                println!("\nWaiting for all processes...");
-                let mut all_ok = true;
-                for (r, mut c) in children.into_iter().enumerate() {
-                    if !c.wait()?.success() {
-                        eprintln!("Rank {} failed", r);
-                        all_ok = false;
-                    }
-                }
-                let _ = std::fs::remove_file(&comm_file);
-
-                if all_ok {
-                    println!("\n=== Training complete ===");
-                } else {
-                    anyhow::bail!("Distributed training failed");
-                }
-                return Ok(());
-            }
-
-            // Single GPU or worker process
-            // When CUDA_VISIBLE_DEVICES is set (distributed mode), GPU becomes device 0
-            // For single GPU mode, rank is usize::MAX (sentinel), so use 0
+            // Determine actual rank and device
             let actual_rank = if rank == usize::MAX { 0 } else { rank };
-            let gpu_id = if num_gpus > 1 { 0 } else { actual_rank };
-            let device = get_device(true, gpu_id)?;
+            let device = get_device(true, if num_gpus > 1 { 0 } else { actual_rank })?;
 
             let dist_config = hermes_llm::DistributedConfig {
                 world_size: num_gpus,
@@ -346,35 +345,33 @@ fn main() -> Result<()> {
 
             if dist_config.is_distributed() {
                 info!(
-                    "Distributed training: rank {}/{}",
+                    "Rank {}/{} on GPU {}",
                     actual_rank + 1,
-                    num_gpus
+                    num_gpus,
+                    actual_rank
                 );
             }
-            info!("Using GPU {}", actual_rank);
             info!("Using device: {:?}", device);
 
+            // Load or train tokenizer
             let tokenizer = if std::path::Path::new(&tokenizer_path).exists() {
                 info!("Loading tokenizer from {}", tokenizer_path);
                 Tokenizer::from_file(&tokenizer_path)?
             } else {
-                if data.is_none() {
-                    anyhow::bail!(
-                        "Cannot train tokenizer from stdin. Provide --data or pre-trained --tokenizer"
-                    );
-                }
+                let data_path = data
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--data required to train tokenizer"))?;
                 info!("Training new tokenizer...");
-                let trainer = BPETrainer::new(32000);
-                trainer.train_from_files(&[data.as_ref().unwrap().as_str()], &tokenizer_path)?
+                BPETrainer::new(32000).train_from_files(&[data_path.as_str()], &tokenizer_path)?
             };
-
             info!("Tokenizer vocab size: {}", tokenizer.vocab_size());
 
+            // Model config
             let mut config = get_config(&model);
             config.vocab_size = tokenizer.vocab_size();
-
             info!("Model config: {:?}", config);
 
+            // Load dataset
             let dataset = match &data {
                 Some(path) => {
                     info!("Loading dataset from {}", path);
@@ -387,7 +384,12 @@ fn main() -> Result<()> {
             };
             info!("Dataset size: {} tokens", dataset.tokens().len());
 
-            let mut train_loader = DataLoader::new(dataset, batch_size, true);
+            // Create data loader (distributed if multi-GPU)
+            let mut train_loader = if num_gpus > 1 {
+                DataLoader::new_distributed(dataset, batch_size, true, actual_rank, num_gpus)
+            } else {
+                DataLoader::new(dataset, batch_size, true)
+            };
             info!("Number of batches: {}", train_loader.num_batches());
 
             let training_config = TrainingConfig {
@@ -415,40 +417,63 @@ fn main() -> Result<()> {
                 anyhow::bail!("Distributed training requires --features nccl");
             }
 
-            // Synchronize all ranks before training starts
+            // Barrier before training
             if let Some(ref c) = comm {
                 info!("Waiting for all ranks to synchronize...");
                 c.barrier()?;
-                info!("All ranks synchronized, starting training");
+                info!("All ranks synchronized");
             }
 
+            // Initialize trainer
             let mut trainer = Trainer::new(config.clone(), training_config, device)?;
 
-            // Load checkpoint for fine-tuning if provided
             if let Some(ref ckpt_path) = checkpoint {
-                info!("Loading checkpoint for fine-tuning: {}", ckpt_path);
+                info!("Loading checkpoint: {}", ckpt_path);
                 trainer.load_checkpoint(ckpt_path)?;
-                info!(
-                    "Fine-tuning mode: lr={}, freeze_layers={}",
-                    lr, freeze_layers
-                );
             }
 
-            // Freeze layers if requested
             if freeze_layers > 0 {
-                info!("Freezing {} layers from the bottom", freeze_layers);
+                info!("Freezing {} layers", freeze_layers);
                 trainer.freeze_layers(freeze_layers)?;
             }
 
-            // Only rank 0 saves config
+            // Sync model weights from rank 0 to all ranks
+            if let Some(ref c) = comm {
+                info!("Broadcasting model weights...");
+                hermes_llm::distributed::sync_model(trainer.var_map(), c)?;
+            }
+
+            // Save config (rank 0 only)
             if dist_config.is_main_process() {
                 config.save_json(&format!("{}/config.json", output))?;
                 info!("Saved config to {}/config.json", output);
             }
 
+            // Train
             trainer.train_distributed(&mut train_loader, None, Some(&output), comm.as_ref())?;
 
-            if dist_config.is_main_process() {
+            // Finalize NCCL communicator properly before exit
+            let is_worker = children_handle.is_none() && dist_config.is_distributed();
+            if let Some(c) = comm {
+                c.barrier()?;
+                c.finalize()?;
+            }
+
+            // Worker processes exit immediately to avoid ncclCommDestroy hang
+            if is_worker {
+                std::process::exit(0);
+            }
+
+            // Cleanup for launcher
+            if let Some(handle) = children_handle {
+                let all_ok = handle.join().unwrap_or(false);
+                let _ = std::fs::remove_file(&dist_config.comm_file);
+                if all_ok {
+                    println!("\n=== Training complete ===");
+                } else {
+                    anyhow::bail!("Some worker processes failed");
+                }
+            } else if dist_config.is_main_process() {
                 info!("Training complete!");
             }
         }

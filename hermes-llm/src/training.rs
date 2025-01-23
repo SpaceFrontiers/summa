@@ -93,9 +93,8 @@ impl Trainer {
         let is_main = comm.is_none_or(|c| c.rank() == 0);
         let num_batches = train_loader.num_batches();
 
-        // Only show progress bar on main rank (use hidden for distributed - no TTY)
-        let use_progress_bar = is_main && comm.is_none();
-        let pb = if use_progress_bar {
+        // Show progress bar on main rank (rank 0 now has TTY)
+        let pb = if is_main {
             let pb = ProgressBar::new(num_batches as u64);
             pb.set_style(
                 ProgressStyle::default_bar()
@@ -103,6 +102,8 @@ impl Trainer {
                     .unwrap()
                     .progress_chars("##-"),
             );
+            // Enable steady tick for continuous updates even during long operations
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
             pb
         } else {
             ProgressBar::hidden()
@@ -110,10 +111,7 @@ impl Trainer {
 
         let mut total_loss = 0.0;
         let mut num_steps = 0;
-        let mut batch_count = 0usize;
-        let mut last_loss = 0.0f64;
         let mut accumulated_loss = 0.0;
-        let start_time = std::time::Instant::now();
 
         train_loader.reset();
 
@@ -152,7 +150,6 @@ impl Trainer {
                 accumulated_loss = 0.0;
                 self.global_step += 1;
 
-                last_loss = avg_loss;
                 if self
                     .global_step
                     .is_multiple_of(self.training_config.log_every)
@@ -162,22 +159,6 @@ impl Trainer {
             }
 
             pb.inc(1);
-            batch_count += 1;
-
-            // Simple text progress for distributed mode (child processes have no TTY)
-            if is_main && comm.is_some() && (batch_count == 1 || batch_count.is_multiple_of(100)) {
-                let elapsed = start_time.elapsed().as_secs_f32();
-                let pct = (batch_count * 100) / num_batches;
-                eprint!(
-                    "\r[{:.1}s] {}/{} ({}%) loss: {:.4}        ",
-                    elapsed, batch_count, num_batches, pct, last_loss
-                );
-            }
-        }
-
-        // Final newline for distributed mode
-        if is_main && comm.is_some() {
-            eprintln!();
         }
 
         pb.finish_with_message("done");
@@ -283,6 +264,10 @@ impl Trainer {
 
     pub fn model(&self) -> &GPT {
         &self.model
+    }
+
+    pub fn var_map(&self) -> &VarMap {
+        &self.var_map
     }
 
     pub fn device(&self) -> &Device {

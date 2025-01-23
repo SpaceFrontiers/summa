@@ -140,44 +140,86 @@ pub struct DataLoader {
     shuffle: bool,
     indices: Vec<usize>,
     current_pos: usize,
+    rank: usize,
+    world_size: usize,
+    batches_yielded: usize,
+    max_batches: usize,
 }
 
 impl DataLoader {
     pub fn new(dataset: Dataset, batch_size: usize, shuffle: bool) -> Self {
+        Self::new_distributed(dataset, batch_size, shuffle, 0, 1)
+    }
+
+    /// Create a distributed data loader that shards data across ranks
+    /// Each rank processes 1/world_size of the data
+    pub fn new_distributed(
+        dataset: Dataset,
+        batch_size: usize,
+        shuffle: bool,
+        rank: usize,
+        world_size: usize,
+    ) -> Self {
         let len = dataset.len();
         let indices: Vec<usize> = (0..len).collect();
+        // Ensure all ranks process exactly the same number of batches
+        let total_batches = len / batch_size;
+        let max_batches = total_batches / world_size;
         Self {
             dataset,
             batch_size,
             shuffle,
             indices,
             current_pos: 0,
+            rank,
+            world_size,
+            batches_yielded: 0,
+            max_batches,
         }
     }
 
     pub fn reset(&mut self) {
         self.current_pos = 0;
+        self.batches_yielded = 0;
         if self.shuffle {
-            let mut rng = rand::rng();
+            // Use fixed seed for deterministic shuffle across all ranks
+            // This ensures consistent sharding after shuffle
+            use rand::SeedableRng;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
             self.indices.shuffle(&mut rng);
         }
     }
 
     pub fn num_batches(&self) -> usize {
-        self.dataset.len() / self.batch_size
+        // Each rank processes 1/world_size of batches
+        (self.dataset.len() / self.batch_size) / self.world_size
     }
 
     pub fn next_batch(&mut self, device: &Device) -> Result<Option<(Tensor, Tensor)>> {
-        if self.current_pos + self.batch_size > self.indices.len() {
+        // Stop if we've yielded max_batches (ensures all ranks process same count)
+        if self.batches_yielded >= self.max_batches {
             return Ok(None);
         }
 
-        let batch_indices: Vec<usize> =
-            self.indices[self.current_pos..self.current_pos + self.batch_size].to_vec();
-        self.current_pos += self.batch_size;
+        // In distributed mode, each rank processes every world_size-th batch
+        loop {
+            if self.current_pos + self.batch_size > self.indices.len() {
+                return Ok(None);
+            }
 
-        let (input, target) = self.dataset.get_batch(&batch_indices, device)?;
-        Ok(Some((input, target)))
+            let batch_num = self.current_pos / self.batch_size;
+            let batch_indices: Vec<usize> =
+                self.indices[self.current_pos..self.current_pos + self.batch_size].to_vec();
+            self.current_pos += self.batch_size;
+
+            // Only process batches assigned to this rank
+            if batch_num % self.world_size == self.rank {
+                self.batches_yielded += 1;
+                let (input, target) = self.dataset.get_batch(&batch_indices, device)?;
+                return Ok(Some((input, target)));
+            }
+            // Skip batches assigned to other ranks
+        }
     }
 
     pub fn iter<'a>(&'a mut self, device: &'a Device) -> DataLoaderIterator<'a> {

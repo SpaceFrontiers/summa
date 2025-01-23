@@ -258,6 +258,16 @@ impl NcclCommunicator {
     pub fn world_size(&self) -> usize {
         self.world_size
     }
+
+    /// Finalize the NCCL communicator - sync stream before drop
+    pub fn finalize(self) -> Result<()> {
+        // Sync stream to ensure all NCCL operations complete before Drop
+        self.stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("Stream sync failed: {:?}", e))?;
+        // comm will be dropped here
+        Ok(())
+    }
 }
 
 /// Stub communicator for non-NCCL builds
@@ -296,14 +306,90 @@ impl NcclCommunicator {
     pub fn world_size(&self) -> usize {
         self.world_size
     }
+
+    pub fn finalize(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Broadcast model weights from rank 0 to all other ranks
+/// Must be called after model initialization to ensure all ranks have identical weights
+pub fn sync_model(var_map: &candle_nn::VarMap, comm: &NcclCommunicator) -> Result<()> {
+    use candle_core::Shape;
+
+    let vars: Vec<candle_core::Var> = var_map.all_vars();
+    if vars.is_empty() {
+        return Ok(());
+    }
+
+    // Collect shapes and flatten all tensors into one
+    let mut shapes: Vec<Shape> = Vec::with_capacity(vars.len());
+    let mut flat_data: Vec<f32> = Vec::new();
+
+    for var in &vars {
+        let tensor = var.as_tensor();
+        shapes.push(tensor.shape().clone());
+        let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
+        flat_data.extend(data);
+    }
+
+    // Broadcast from rank 0 to all other ranks
+    let device = vars[0].as_tensor().device();
+    let len = flat_data.len();
+    let flat_tensor = Tensor::from_vec(flat_data, len, device)?;
+    let synced = comm.broadcast(&flat_tensor)?;
+    let synced_data: Vec<f32> = synced.to_vec1()?;
+
+    // Unflatten and update each variable
+    let mut offset = 0;
+    for (var, shape) in vars.iter().zip(shapes.iter()) {
+        let size = shape.elem_count();
+        let data = &synced_data[offset..offset + size];
+        let tensor = Tensor::from_vec(data.to_vec(), shape.dims(), device)?;
+        var.set(&tensor)?;
+        offset += size;
+    }
+
+    Ok(())
 }
 
 /// Synchronize gradients across all ranks using NCCL
+/// Flattens all gradients into a single tensor for efficient all-reduce
 pub fn sync_gradients(var_map: &candle_nn::VarMap, comm: &NcclCommunicator) -> Result<()> {
-    for var in var_map.all_vars() {
-        let tensor = var.as_tensor();
-        let synced = comm.all_reduce_avg(tensor)?;
-        var.set(&synced)?;
+    use candle_core::Shape;
+
+    let vars: Vec<candle_core::Var> = var_map.all_vars();
+    if vars.is_empty() {
+        return Ok(());
     }
+
+    // Collect shapes and flatten all tensors into one
+    let mut shapes: Vec<Shape> = Vec::with_capacity(vars.len());
+    let mut flat_data: Vec<f32> = Vec::new();
+
+    for var in &vars {
+        let tensor = var.as_tensor();
+        shapes.push(tensor.shape().clone());
+        let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
+        flat_data.extend(data);
+    }
+
+    // Single all-reduce for all gradients
+    let device = vars[0].as_tensor().device();
+    let len = flat_data.len();
+    let flat_tensor = Tensor::from_vec(flat_data, len, device)?;
+    let synced = comm.all_reduce_avg(&flat_tensor)?;
+    let synced_data: Vec<f32> = synced.to_vec1()?;
+
+    // Unflatten and update each variable
+    let mut offset = 0;
+    for (var, shape) in vars.iter().zip(shapes.iter()) {
+        let size = shape.elem_count();
+        let data = &synced_data[offset..offset + size];
+        let tensor = Tensor::from_vec(data.to_vec(), shape.dims(), device)?;
+        var.set(&tensor)?;
+        offset += size;
+    }
+
     Ok(())
 }
