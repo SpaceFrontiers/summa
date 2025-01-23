@@ -16,10 +16,10 @@ candle-core = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
 candle-flash-attn = { version = "0.9", optional = true }
-cudarc = { version = "0.19", optional = true, features = ["nccl"] }
+cudarc = { version = "0.19", optional = true, features = ["nccl", "cuda-version-from-build-system"] }
 
-# Tokenization
-tokenizers = { version = "0.22", features = ["http"] }
+# Tokenization (no http feature to avoid openssl)
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
 
 # Serialization
 serde = { workspace = true }

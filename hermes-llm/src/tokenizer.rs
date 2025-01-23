@@ -22,15 +22,13 @@ impl Tokenizer {
     }
 
     pub fn from_pretrained(identifier: &str) -> Result<Self> {
-        let inner =
-            HfTokenizer::from_pretrained(identifier, None).map_err(|e| anyhow::anyhow!("{}", e))?;
-        let vocab_size = inner.get_vocab_size(true) as u32;
-        Ok(Self {
-            inner,
-            pad_token_id: 0,
-            bos_token_id: 1,
-            eos_token_id: 2.min(vocab_size - 1),
-        })
+        // Use hf-hub to download the tokenizer file (uses rustls, no openssl)
+        let api = hf_hub::api::sync::Api::new()?;
+        let repo = api.model(identifier.to_string());
+        let tokenizer_path = repo
+            .get("tokenizer.json")
+            .map_err(|e| anyhow::anyhow!("Failed to download tokenizer: {}", e))?;
+        Self::from_file(tokenizer_path)
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {

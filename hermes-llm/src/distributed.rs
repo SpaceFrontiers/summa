@@ -104,13 +104,12 @@ impl NcclCommunicator {
         };
 
         // Create CUDA context and stream for this rank
-        let ctx = CudaContext::new(config.rank).map_err(|e| {
-            anyhow::anyhow!("Failed to create CUDA context {}: {:?}", config.rank, e)
+        // When CUDA_VISIBLE_DEVICES is set, the visible GPU is always device 0
+        let gpu_ordinal = 0;
+        let ctx = CudaContext::new(gpu_ordinal).map_err(|e| {
+            anyhow::anyhow!("Failed to create CUDA context {}: {:?}", gpu_ordinal, e)
         })?;
-        let stream = Arc::new(
-            ctx.default_stream()
-                .map_err(|e| anyhow::anyhow!("Failed to create CUDA stream: {:?}", e))?,
-        );
+        let stream = ctx.default_stream();
 
         // Create NCCL communicator
         let comm = Comm::from_rank(stream.clone(), config.rank, config.world_size, id)
@@ -150,16 +149,18 @@ impl NcclCommunicator {
 
         // Get the data from tensor
         let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
-        let ctx = self.comm.context();
+        let len = data.len();
 
-        // Copy data to GPU
-        let gpu_data = ctx
-            .htod_copy(data)
+        // Copy data to GPU using stream
+        let gpu_data = self
+            .stream
+            .clone_htod(&data)
             .map_err(|e| anyhow::anyhow!("Failed to copy data to GPU: {:?}", e))?;
 
         // Allocate output buffer on GPU
-        let mut gpu_output = ctx
-            .alloc_zeros::<f32>(gpu_data.len())
+        let mut gpu_output = self
+            .stream
+            .alloc_zeros::<f32>(len)
             .map_err(|e| anyhow::anyhow!("Failed to allocate GPU buffer: {:?}", e))?;
 
         // Perform NCCL all-reduce on GPU buffers
@@ -168,8 +169,9 @@ impl NcclCommunicator {
             .map_err(|e| anyhow::anyhow!("NCCL all-reduce failed: {:?}", e.0))?;
 
         // Copy result back to CPU
-        let output = ctx
-            .dtoh_sync_copy(&gpu_output)
+        let output = self
+            .stream
+            .clone_dtoh(&gpu_output)
             .map_err(|e| anyhow::anyhow!("Failed to copy data from GPU: {:?}", e))?;
 
         // Convert back to tensor
@@ -180,12 +182,13 @@ impl NcclCommunicator {
     /// Broadcast a tensor from rank 0 to all other ranks
     pub fn broadcast(&self, tensor: &Tensor) -> Result<Tensor> {
         let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
-        let ctx = self.comm.context();
+        let len = data.len();
 
         // Copy data to GPU (only rank 0 has meaningful data)
         let gpu_data = if self.rank == 0 {
             Some(
-                ctx.htod_copy(data.clone())
+                self.stream
+                    .clone_htod(&data)
                     .map_err(|e| anyhow::anyhow!("Failed to copy data to GPU: {:?}", e))?,
             )
         } else {
@@ -193,8 +196,9 @@ impl NcclCommunicator {
         };
 
         // Allocate output buffer on GPU
-        let mut gpu_output = ctx
-            .alloc_zeros::<f32>(data.len())
+        let mut gpu_output = self
+            .stream
+            .alloc_zeros::<f32>(len)
             .map_err(|e| anyhow::anyhow!("Failed to allocate GPU buffer: {:?}", e))?;
 
         self.comm
@@ -202,8 +206,9 @@ impl NcclCommunicator {
             .map_err(|e| anyhow::anyhow!("NCCL broadcast failed: {:?}", e.0))?;
 
         // Copy result back to CPU
-        let output = ctx
-            .dtoh_sync_copy(&gpu_output)
+        let output = self
+            .stream
+            .clone_dtoh(&gpu_output)
             .map_err(|e| anyhow::anyhow!("Failed to copy data from GPU: {:?}", e))?;
 
         let result = Tensor::from_vec(output, tensor.shape(), tensor.device())?;
@@ -215,11 +220,13 @@ impl NcclCommunicator {
         use cudarc::nccl::safe::ReduceOp;
 
         // Use a small all-reduce as a barrier
-        let ctx = self.comm.context();
-        let gpu_dummy = ctx
-            .htod_copy(vec![0.0f32])
+        let dummy = [0.0f32];
+        let gpu_dummy = self
+            .stream
+            .clone_htod(&dummy)
             .map_err(|e| anyhow::anyhow!("Failed to copy data to GPU: {:?}", e))?;
-        let mut gpu_output = ctx
+        let mut gpu_output = self
+            .stream
             .alloc_zeros::<f32>(1)
             .map_err(|e| anyhow::anyhow!("Failed to allocate GPU buffer: {:?}", e))?;
 

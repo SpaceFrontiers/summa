@@ -70,7 +70,8 @@ enum Commands {
         freeze_layers: usize,
 
         // Internal flags for distributed training (set automatically)
-        #[arg(long, hide = true, default_value = "0")]
+        // usize::MAX means "launcher mode" - will spawn workers
+        #[arg(long, hide = true, default_value_t = usize::MAX)]
         rank: usize,
 
         #[arg(long, hide = true, default_value = "nccl_id.txt")]
@@ -240,8 +241,8 @@ fn main() -> Result<()> {
             rank,
             comm_file,
         } => {
-            // If num_gpus > 1 and rank == 0, spawn child processes for distributed training
-            if num_gpus > 1 && rank == 0 {
+            // If num_gpus > 1 and rank is MAX (launcher), spawn child processes
+            if num_gpus > 1 && rank == usize::MAX {
                 use std::process::{Command, Stdio};
 
                 let data_path = data
@@ -301,6 +302,7 @@ fn main() -> Result<()> {
                     }
 
                     let child = child_cmd
+                        .current_dir(std::env::current_dir()?)
                         .stdout(Stdio::inherit())
                         .stderr(Stdio::inherit())
                         .spawn()?;
@@ -330,18 +332,22 @@ fn main() -> Result<()> {
             }
 
             // Single GPU or worker process
-            let device = get_device(true, rank)?;
+            // When CUDA_VISIBLE_DEVICES is set (distributed mode), GPU becomes device 0
+            // For single GPU mode, rank is usize::MAX (sentinel), so use 0
+            let actual_rank = if rank == usize::MAX { 0 } else { rank };
+            let gpu_id = if num_gpus > 1 { 0 } else { actual_rank };
+            let device = get_device(true, gpu_id)?;
 
             let dist_config = hermes_llm::DistributedConfig {
                 world_size: num_gpus,
-                rank,
+                rank: actual_rank,
                 comm_file,
             };
 
             if dist_config.is_distributed() {
-                info!("Distributed training: rank {}/{}", rank, num_gpus);
+                info!("Distributed training: rank {}/{}", actual_rank, num_gpus);
             }
-            info!("Using GPU {}", rank);
+            info!("Using GPU {}", actual_rank);
             info!("Using device: {:?}", device);
 
             let tokenizer = if std::path::Path::new(&tokenizer_path).exists() {
