@@ -52,6 +52,35 @@ impl Trainer {
         })
     }
 
+    /// Freeze the first N layers (embeddings count as layer 0)
+    /// Frozen layers will not be updated during training
+    pub fn freeze_layers(&mut self, num_layers: usize) -> Result<()> {
+        let frozen_prefixes: Vec<String> =
+            (0..num_layers).map(|i| format!("layers.{}", i)).collect();
+
+        // Also freeze embeddings if num_layers > 0
+        let mut prefixes = frozen_prefixes;
+        if num_layers > 0 {
+            prefixes.push("tok_emb".to_string());
+        }
+
+        let mut frozen_count = 0;
+        for (name, var) in self.var_map.data().lock().unwrap().iter() {
+            for prefix in &prefixes {
+                if name.starts_with(prefix) {
+                    // Detach tensor to prevent gradient computation
+                    let tensor = var.as_tensor();
+                    let _ = var.set(&tensor.detach());
+                    frozen_count += 1;
+                    break;
+                }
+            }
+        }
+
+        info!("Frozen {} parameter tensors", frozen_count);
+        Ok(())
+    }
+
     pub fn train_epoch(&mut self, train_loader: &mut DataLoader) -> Result<f64> {
         self.train_epoch_distributed(train_loader, None)
     }

@@ -134,6 +134,13 @@ jobs:
       - name: Wait for crates.io index
         run: sleep 30
 
+      - name: Publish hermes-llm
+        run: cargo publish -p hermes-llm --no-verify
+        continue-on-error: true
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
       - name: Publish hermes-server
         run: cargo publish -p hermes-server --no-verify
         continue-on-error: true

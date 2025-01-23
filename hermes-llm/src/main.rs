@@ -19,7 +19,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Train a new model from scratch
+    /// Train a new model from scratch or fine-tune from checkpoint
     Train {
         /// Path to training data file (required for multi-GPU, optional for single GPU)
         #[arg(short, long)]
@@ -49,7 +49,7 @@ enum Commands {
         #[arg(long, default_value = "256")]
         seq_len: usize,
 
-        /// Learning rate
+        /// Learning rate (use lower values like 1e-5 for fine-tuning)
         #[arg(long, default_value = "3e-4")]
         lr: f64,
 
@@ -60,6 +60,14 @@ enum Commands {
         /// Gradient accumulation steps
         #[arg(long, default_value = "1")]
         grad_accum: usize,
+
+        /// Path to pre-trained checkpoint for fine-tuning (optional)
+        #[arg(long)]
+        checkpoint: Option<String>,
+
+        /// Number of layers to freeze from the bottom (for fine-tuning)
+        #[arg(long, default_value = "0")]
+        freeze_layers: usize,
 
         // Internal flags for distributed training (set automatically)
         #[arg(long, hide = true, default_value = "0")]
@@ -125,6 +133,49 @@ enum Commands {
         #[arg(short, long, default_value = "gpt2-small")]
         model: String,
     },
+
+    /// Direct Preference Optimization (DPO) training
+    Dpo {
+        /// Path to preference pairs file (JSONL with chosen/rejected)
+        #[arg(short, long)]
+        data: String,
+
+        /// Path to tokenizer file
+        #[arg(short, long)]
+        tokenizer: String,
+
+        /// Path to SFT checkpoint to start from
+        #[arg(short, long)]
+        checkpoint: String,
+
+        /// Path to model config
+        #[arg(long)]
+        config: String,
+
+        /// Output directory for checkpoints
+        #[arg(short, long, default_value = "checkpoints-dpo")]
+        output: String,
+
+        /// Batch size
+        #[arg(short, long, default_value = "4")]
+        batch_size: usize,
+
+        /// Number of epochs
+        #[arg(short, long, default_value = "1")]
+        epochs: usize,
+
+        /// Learning rate
+        #[arg(long, default_value = "5e-7")]
+        lr: f64,
+
+        /// DPO beta parameter (controls divergence from reference)
+        #[arg(long, default_value = "0.1")]
+        beta: f64,
+
+        /// Maximum sequence length
+        #[arg(long, default_value = "512")]
+        max_len: usize,
+    },
 }
 
 #[allow(unused_variables)]
@@ -184,6 +235,8 @@ fn main() -> Result<()> {
             lr,
             num_gpus,
             grad_accum,
+            checkpoint,
+            freeze_layers,
             rank,
             comm_file,
         } => {
@@ -212,7 +265,8 @@ fn main() -> Result<()> {
                 for r in 0..num_gpus {
                     println!("Launching rank {} on GPU {}...", r, r);
 
-                    let child = Command::new(&exe)
+                    let mut child_cmd = Command::new(&exe);
+                    child_cmd
                         .env("CUDA_VISIBLE_DEVICES", r.to_string())
                         .arg("train")
                         .arg("--data")
@@ -235,10 +289,18 @@ fn main() -> Result<()> {
                         .arg(num_gpus.to_string())
                         .arg("--grad-accum")
                         .arg(grad_accum.to_string())
+                        .arg("--freeze-layers")
+                        .arg(freeze_layers.to_string())
                         .arg("--rank")
                         .arg(r.to_string())
                         .arg("--comm-file")
-                        .arg(&comm_file)
+                        .arg(&comm_file);
+
+                    if let Some(ref ckpt) = checkpoint {
+                        child_cmd.arg("--checkpoint").arg(ckpt);
+                    }
+
+                    let child = child_cmd
                         .stdout(Stdio::inherit())
                         .stderr(Stdio::inherit())
                         .spawn()?;
@@ -345,6 +407,22 @@ fn main() -> Result<()> {
 
             let mut trainer = Trainer::new(config.clone(), training_config, device)?;
 
+            // Load checkpoint for fine-tuning if provided
+            if let Some(ref ckpt_path) = checkpoint {
+                info!("Loading checkpoint for fine-tuning: {}", ckpt_path);
+                trainer.load_checkpoint(ckpt_path)?;
+                info!(
+                    "Fine-tuning mode: lr={}, freeze_layers={}",
+                    lr, freeze_layers
+                );
+            }
+
+            // Freeze layers if requested
+            if freeze_layers > 0 {
+                info!("Freezing {} layers from the bottom", freeze_layers);
+                trainer.freeze_layers(freeze_layers)?;
+            }
+
             // Only rank 0 saves config
             if dist_config.is_main_process() {
                 config.save_json(&format!("{}/config.json", output))?;
@@ -431,6 +509,38 @@ fn main() -> Result<()> {
                 total,
                 total as f64 / 1_000_000.0
             );
+        }
+
+        Commands::Dpo {
+            data,
+            tokenizer: tokenizer_path,
+            checkpoint,
+            config: config_path,
+            output,
+            batch_size,
+            epochs,
+            lr,
+            beta,
+            max_len,
+        } => {
+            let device = get_device(true, 0)?;
+            info!("Using device: {:?}", device);
+
+            let config = Config::from_json(&config_path)?;
+            let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+
+            info!("Loading preference dataset from {}", data);
+            let dataset = hermes_llm::dpo::PreferenceDataset::from_file(&data)?;
+
+            info!("Initializing DPO trainer...");
+            let mut trainer =
+                hermes_llm::dpo::DpoTrainer::new(config, &checkpoint, device, lr, beta, max_len)?;
+
+            std::fs::create_dir_all(&output)?;
+
+            trainer.train(&dataset, &tokenizer, epochs, batch_size, Some(&output))?;
+
+            info!("DPO training complete!");
         }
     }
 

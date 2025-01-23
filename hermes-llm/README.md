@@ -107,6 +107,77 @@ effective_batch = batch_size × grad_accum × num_gpus
 
 Example: `--batch-size 32 --grad-accum 4 --num-gpus 4` = 512 effective batch
 
+## Fine-tuning
+
+Continue training from a pre-trained checkpoint:
+
+```bash
+hermes-llm train \
+  --checkpoint pretrained.safetensors \
+  --data finetune-data.jsonl \
+  --tokenizer tok.json \
+  --model gpt2-small \
+  --lr 1e-5 \
+  --epochs 3
+```
+
+### Fine-tuning Options
+
+| Option            | Description                                         |
+| ----------------- | --------------------------------------------------- |
+| `--checkpoint`    | Path to pre-trained weights (.safetensors)          |
+| `--freeze-layers` | Number of layers to freeze from bottom (default: 0) |
+| `--lr`            | Use lower LR for fine-tuning (e.g., 1e-5)           |
+
+### Freezing Layers
+
+Freeze early layers to preserve general knowledge while adapting top layers:
+
+```bash
+hermes-llm train \
+  --checkpoint pretrained.safetensors \
+  --data domain-data.jsonl \
+  --tokenizer tok.json \
+  --freeze-layers 8 \
+  --lr 5e-5
+```
+
+## Direct Preference Optimization (DPO)
+
+Align your model to human preferences without a separate reward model:
+
+```bash
+hermes-llm dpo \
+  --checkpoint sft-model.safetensors \
+  --config checkpoints/config.json \
+  --data preferences.jsonl \
+  --tokenizer tok.json \
+  --beta 0.1 \
+  --lr 5e-7 \
+  --epochs 1
+```
+
+### Preference Data Format
+
+JSONL file with `prompt`, `chosen`, and `rejected` fields:
+
+```json
+{"prompt": "What is 2+2?", "chosen": "4", "rejected": "5"}
+{"prompt": "Explain gravity:", "chosen": "Gravity is...", "rejected": "Idk lol"}
+```
+
+### DPO Options
+
+| Option         | Default         | Description                      |
+| -------------- | --------------- | -------------------------------- |
+| `--checkpoint` | required        | SFT model to start from          |
+| `--config`     | required        | Model config JSON                |
+| `--data`       | required        | Preference pairs (JSONL)         |
+| `--beta`       | 0.1             | KL divergence penalty            |
+| `--lr`         | 5e-7            | Learning rate (very low for DPO) |
+| `--max-len`    | 512             | Max sequence length              |
+| `--output`     | checkpoints-dpo | Output directory                 |
+
 ## Model Configurations
 
 | Config      | Layers | Hidden | Heads | Params (32K vocab) |
