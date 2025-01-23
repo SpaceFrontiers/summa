@@ -33,10 +33,48 @@ impl DocAddress {
 }
 
 /// Search result with doc_id and score (internal use)
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub doc_id: DocId,
     pub score: Score,
+    /// Matched positions per field: (field_id, encoded_positions)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub positions: Vec<(u32, Vec<u32>)>,
+}
+
+/// Matched field info with ordinals (for multi-valued fields)
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MatchedField {
+    /// Field ID
+    pub field_id: u32,
+    /// Matched element ordinals (for multi-valued fields with position tracking)
+    /// Empty if position tracking is not enabled for this field
+    pub ordinals: Vec<u32>,
+}
+
+impl SearchResult {
+    /// Extract unique ordinals from positions for each field
+    /// Uses the position encoding: ordinal = position >> 20
+    pub fn extract_ordinals(&self) -> Vec<MatchedField> {
+        use rustc_hash::FxHashSet;
+
+        self.positions
+            .iter()
+            .map(|(field_id, positions)| {
+                let mut ordinals: FxHashSet<u32> = FxHashSet::default();
+                for &pos in positions {
+                    let ordinal = pos >> 20; // Extract ordinal from encoded position
+                    ordinals.insert(ordinal);
+                }
+                let mut ordinals: Vec<u32> = ordinals.into_iter().collect();
+                ordinals.sort_unstable();
+                MatchedField {
+                    field_id: *field_id,
+                    ordinals,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Search hit with unique document address and score
@@ -45,6 +83,9 @@ pub struct SearchHit {
     /// Unique document address (segment_id + local doc_id)
     pub address: DocAddress,
     pub score: Score,
+    /// Matched fields with element ordinals (populated when position tracking is enabled)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_fields: Vec<MatchedField>,
 }
 
 /// Search response with hits (IDs only, no documents)
@@ -93,13 +134,30 @@ impl TopKCollector {
     }
 
     pub fn collect(&mut self, doc_id: DocId, score: Score) {
+        self.collect_with_positions(doc_id, score, Vec::new());
+    }
+
+    pub fn collect_with_positions(
+        &mut self,
+        doc_id: DocId,
+        score: Score,
+        positions: Vec<(u32, Vec<u32>)>,
+    ) {
         if self.heap.len() < self.k {
-            self.heap.push(SearchResult { doc_id, score });
+            self.heap.push(SearchResult {
+                doc_id,
+                score,
+                positions,
+            });
         } else if let Some(min) = self.heap.peek()
             && score > min.score
         {
             self.heap.pop();
-            self.heap.push(SearchResult { doc_id, score });
+            self.heap.push(SearchResult {
+                doc_id,
+                score,
+                positions,
+            });
         }
     }
 
@@ -121,13 +179,28 @@ pub async fn search_segment(
     query: &dyn Query,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
+    search_segment_with_positions(reader, query, limit, false).await
+}
+
+/// Execute a search query on a single segment with optional position collection (async)
+pub async fn search_segment_with_positions(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+    collect_positions: bool,
+) -> Result<Vec<SearchResult>> {
     let mut scorer = query.scorer(reader, limit).await?;
     let mut collector = TopKCollector::new(limit);
 
     let mut doc = scorer.doc();
 
     while doc != TERMINATED {
-        collector.collect(doc, scorer.score());
+        let positions = if collect_positions {
+            scorer.matched_positions().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        collector.collect_with_positions(doc, scorer.score(), positions);
         doc = scorer.advance();
     }
 

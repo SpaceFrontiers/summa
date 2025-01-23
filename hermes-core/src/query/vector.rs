@@ -6,6 +6,18 @@ use crate::{DocId, Score, TERMINATED};
 
 use super::traits::{CountFuture, Query, Scorer, ScorerFuture};
 
+/// Strategy for combining scores when a document has multiple values for the same field
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MultiValueCombiner {
+    /// Sum all scores (default for sparse vectors - accumulates dot product contributions)
+    #[default]
+    Sum,
+    /// Take the maximum score
+    Max,
+    /// Take the average score
+    Avg,
+}
+
 /// Dense vector query for similarity search
 #[derive(Debug, Clone)]
 pub struct DenseVectorQuery {
@@ -44,16 +56,18 @@ impl DenseVectorQuery {
 }
 
 impl Query for DenseVectorQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        let field = self.field;
+        let vector = self.vector.clone();
+        let rerank_factor = self.rerank_factor;
         Box::pin(async move {
-            let results =
-                reader.search_dense_vector(self.field, &self.vector, limit, self.rerank_factor)?;
+            let results = reader.search_dense_vector(field, &vector, limit, rerank_factor)?;
 
             Ok(Box::new(DenseVectorScorer::new(results)) as Box<dyn Scorer>)
         })
     }
 
-    fn count_estimate<'a>(&'a self, _reader: &'a SegmentReader) -> CountFuture<'a> {
+    fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
         Box::pin(async move { Ok(u32::MAX) })
     }
 }
@@ -116,12 +130,24 @@ pub struct SparseVectorQuery {
     pub field: Field,
     /// Query vector as (dimension_id, weight) pairs
     pub vector: Vec<(u32, f32)>,
+    /// How to combine scores for multi-valued documents
+    pub combiner: MultiValueCombiner,
 }
 
 impl SparseVectorQuery {
     /// Create a new sparse vector query
     pub fn new(field: Field, vector: Vec<(u32, f32)>) -> Self {
-        Self { field, vector }
+        Self {
+            field,
+            vector,
+            combiner: MultiValueCombiner::Sum,
+        }
+    }
+
+    /// Set the multi-value score combiner
+    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
+        self.combiner = combiner;
+        self
     }
 
     /// Create from separate indices and weights vectors
@@ -250,17 +276,20 @@ impl SparseVectorQuery {
 }
 
 impl Query for SparseVectorQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        let field = self.field;
+        let vector = self.vector.clone();
+        let combiner = self.combiner;
         Box::pin(async move {
             let results = reader
-                .search_sparse_vector(self.field, &self.vector, limit)
+                .search_sparse_vector(field, &vector, limit, combiner)
                 .await?;
 
             Ok(Box::new(SparseVectorScorer::new(results)) as Box<dyn Scorer>)
         })
     }
 
-    fn count_estimate<'a>(&'a self, _reader: &'a SegmentReader) -> CountFuture<'a> {
+    fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
         Box::pin(async move { Ok(u32::MAX) })
     }
 }

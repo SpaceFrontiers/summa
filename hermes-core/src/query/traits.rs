@@ -45,16 +45,23 @@ pub struct TermQueryInfo {
 }
 
 /// A search query (async)
+///
+/// Note: `scorer` takes `&self` (not `&'a self`) so that scorers don't borrow the query.
+/// This enables query composition - queries can create sub-queries locally and get their scorers.
+/// Implementations must clone/capture any data they need during scorer creation.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait Query: Send + Sync {
     /// Create a scorer for this query against a single segment (async)
     ///
     /// The `limit` parameter specifies the maximum number of results to return.
     /// This is passed from the top-level search limit.
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a>;
+    ///
+    /// Note: The scorer borrows only the reader, not the query. Implementations
+    /// should capture any needed query data (field, terms, etc.) during creation.
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a>;
 
     /// Estimated number of matching documents in a segment (async)
-    fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a>;
+    fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a>;
 
     /// Return term info if this is a simple term query eligible for WAND optimization
     ///
@@ -71,10 +78,10 @@ pub trait Query {
     ///
     /// The `limit` parameter specifies the maximum number of results to return.
     /// This is passed from the top-level search limit.
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a>;
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a>;
 
     /// Estimated number of matching documents in a segment (async)
-    fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a>;
+    fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a>;
 
     /// Return term info if this is a simple term query eligible for WAND optimization
     fn as_term_query_info(&self) -> Option<TermQueryInfo> {
@@ -83,11 +90,11 @@ pub trait Query {
 }
 
 impl Query for Box<dyn Query> {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         (**self).scorer(reader, limit)
     }
 
-    fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a> {
+    fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         (**self).count_estimate(reader)
     }
 
@@ -95,6 +102,9 @@ impl Query for Box<dyn Query> {
         (**self).as_term_query_info()
     }
 }
+
+/// Matched positions for a field (field_id, list of encoded positions)
+pub type MatchedPositions = Vec<(u32, Vec<u32>)>;
 
 /// Scorer that iterates over matching documents and computes scores
 #[cfg(not(target_arch = "wasm32"))]
@@ -113,6 +123,12 @@ pub trait Scorer: Send {
 
     /// Size hint for remaining documents
     fn size_hint(&self) -> u32;
+
+    /// Get matched positions for the current document (if available)
+    /// Returns (field_id, positions) pairs where positions are encoded as per PositionMode
+    fn matched_positions(&self) -> Option<MatchedPositions> {
+        None
+    }
 }
 
 /// Scorer that iterates over matching documents and computes scores (WASM version)
@@ -132,6 +148,11 @@ pub trait Scorer {
 
     /// Size hint for remaining documents
     fn size_hint(&self) -> u32;
+
+    /// Get matched positions for the current document (if available)
+    fn matched_positions(&self) -> Option<MatchedPositions> {
+        None
+    }
 }
 
 /// Empty scorer for terms that don't exist

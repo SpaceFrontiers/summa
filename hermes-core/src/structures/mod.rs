@@ -37,6 +37,9 @@ pub use postings::{
     INLINE_THRESHOLD,
     IndexOptimization,
     IndexSize,
+    // Positions
+    MAX_ELEMENT_ORDINAL,
+    MAX_TOKEN_POSITION,
     // OptP4D
     OPT_P4D_BLOCK_SIZE,
     OptP4DBlock,
@@ -51,10 +54,13 @@ pub use postings::{
     PartitionedEFPostingIterator,
     PartitionedEFPostingList,
     PartitionedEliasFano,
+    PositionPostingIterator,
+    PositionPostingList,
     Posting,
     PostingFormat,
     PostingList,
     PostingListIterator,
+    PostingWithPositions,
     QueryWeighting,
     // Roaring
     ROARING_BLOCK_SIZE,
@@ -92,6 +98,9 @@ pub use postings::{
     VerticalBP128PostingList,
     WeightQuantization,
     binary_search_block,
+    decode_element_ordinal,
+    decode_token_position,
+    encode_position,
     pack_block,
     pack_deltas_fixed,
     pack_vertical,

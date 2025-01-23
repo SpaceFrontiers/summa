@@ -5,6 +5,7 @@ mod boolean;
 mod boost;
 mod collector;
 mod global_stats;
+mod phrase;
 mod scoring;
 #[cfg(test)]
 mod scoring_tests;
@@ -18,6 +19,7 @@ pub use boolean::*;
 pub use boost::*;
 pub use collector::*;
 pub use global_stats::*;
+pub use phrase::*;
 pub use scoring::*;
 pub use term::*;
 pub use traits::*;

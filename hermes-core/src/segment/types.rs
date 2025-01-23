@@ -153,6 +153,8 @@ pub struct SegmentFiles {
     pub vectors: PathBuf,
     /// Sparse vector posting lists (per field, per dimension)
     pub sparse: PathBuf,
+    /// Token positions for phrase queries (fields with record_positions=true)
+    pub positions: PathBuf,
 }
 
 impl SegmentFiles {
@@ -165,6 +167,7 @@ impl SegmentFiles {
             meta: PathBuf::from(format!("{}.meta", prefix)),
             vectors: PathBuf::from(format!("{}.vectors", prefix)),
             sparse: PathBuf::from(format!("{}.sparse", prefix)),
+            positions: PathBuf::from(format!("{}.pos", prefix)),
         }
     }
 }

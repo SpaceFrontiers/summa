@@ -1,5 +1,7 @@
 //! Boolean query with MUST, SHOULD, and MUST_NOT clauses
 
+use std::sync::Arc;
+
 use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
 use crate::{DocId, Score};
@@ -7,11 +9,11 @@ use crate::{DocId, Score};
 use super::{CountFuture, Query, ScoredDoc, Scorer, ScorerFuture, TextTermScorer, WandExecutor};
 
 /// Boolean query with MUST, SHOULD, and MUST_NOT clauses
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BooleanQuery {
-    pub must: Vec<Box<dyn Query>>,
-    pub should: Vec<Box<dyn Query>>,
-    pub must_not: Vec<Box<dyn Query>>,
+    pub must: Vec<Arc<dyn Query>>,
+    pub should: Vec<Arc<dyn Query>>,
+    pub must_not: Vec<Arc<dyn Query>>,
 }
 
 impl std::fmt::Debug for BooleanQuery {
@@ -30,98 +32,99 @@ impl BooleanQuery {
     }
 
     pub fn must(mut self, query: impl Query + 'static) -> Self {
-        self.must.push(Box::new(query));
+        self.must.push(Arc::new(query));
         self
     }
 
     pub fn should(mut self, query: impl Query + 'static) -> Self {
-        self.should.push(Box::new(query));
+        self.should.push(Arc::new(query));
         self
     }
 
     pub fn must_not(mut self, query: impl Query + 'static) -> Self {
-        self.must_not.push(Box::new(query));
+        self.must_not.push(Arc::new(query));
         self
-    }
-
-    /// Try to create a WAND-optimized scorer for pure OR queries
-    ///
-    /// Returns Some(scorer) if all SHOULD clauses are term queries for the same field.
-    /// Returns None if WAND optimization is not applicable.
-    async fn try_wand_scorer<'a>(
-        &'a self,
-        reader: &'a SegmentReader,
-        limit: usize,
-    ) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
-        // Extract term info from all SHOULD clauses
-        let mut term_infos: Vec<_> = self
-            .should
-            .iter()
-            .filter_map(|q| q.as_term_query_info())
-            .collect();
-
-        // Check if all clauses are term queries
-        if term_infos.len() != self.should.len() {
-            return Ok(None);
-        }
-
-        // Check if all terms are for the same field
-        let first_field = term_infos[0].field;
-        if !term_infos.iter().all(|t| t.field == first_field) {
-            return Ok(None);
-        }
-
-        // Build WAND scorers for each term
-        let mut scorers: Vec<TextTermScorer> = Vec::with_capacity(term_infos.len());
-        let avg_field_len = reader.avg_field_len(first_field);
-        let num_docs = reader.num_docs() as f32;
-
-        for info in term_infos.drain(..) {
-            if let Some(posting_list) = reader.get_postings(info.field, &info.term).await? {
-                let doc_freq = posting_list.doc_count() as f32;
-                let idf = super::bm25_idf(doc_freq, num_docs);
-                scorers.push(TextTermScorer::new(posting_list, idf, avg_field_len));
-            }
-        }
-
-        if scorers.is_empty() {
-            return Ok(Some(Box::new(EmptyWandScorer) as Box<dyn Scorer + 'a>));
-        }
-
-        // Use WAND executor for efficient top-k
-        let results = WandExecutor::new(scorers, limit).execute();
-        Ok(Some(
-            Box::new(WandResultScorer::new(results)) as Box<dyn Scorer + 'a>
-        ))
     }
 }
 
+/// Try to create a WAND-optimized scorer for pure OR queries
+async fn try_wand_scorer<'a>(
+    should: &[Arc<dyn Query>],
+    reader: &'a SegmentReader,
+    limit: usize,
+) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
+    // Extract term info from all SHOULD clauses
+    let mut term_infos: Vec<_> = should
+        .iter()
+        .filter_map(|q| q.as_term_query_info())
+        .collect();
+
+    // Check if all clauses are term queries
+    if term_infos.len() != should.len() {
+        return Ok(None);
+    }
+
+    // Check if all terms are for the same field
+    let first_field = term_infos[0].field;
+    if !term_infos.iter().all(|t| t.field == first_field) {
+        return Ok(None);
+    }
+
+    // Build WAND scorers for each term
+    let mut scorers: Vec<TextTermScorer> = Vec::with_capacity(term_infos.len());
+    let avg_field_len = reader.avg_field_len(first_field);
+    let num_docs = reader.num_docs() as f32;
+
+    for info in term_infos.drain(..) {
+        if let Some(posting_list) = reader.get_postings(info.field, &info.term).await? {
+            let doc_freq = posting_list.doc_count() as f32;
+            let idf = super::bm25_idf(doc_freq, num_docs);
+            scorers.push(TextTermScorer::new(posting_list, idf, avg_field_len));
+        }
+    }
+
+    if scorers.is_empty() {
+        return Ok(Some(Box::new(EmptyWandScorer) as Box<dyn Scorer + 'a>));
+    }
+
+    // Use WAND executor for efficient top-k
+    let results = WandExecutor::new(scorers, limit).execute();
+    Ok(Some(
+        Box::new(WandResultScorer::new(results)) as Box<dyn Scorer + 'a>
+    ))
+}
+
 impl Query for BooleanQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        // Clone Arc vectors - cheap reference counting
+        let must = self.must.clone();
+        let should = self.should.clone();
+        let must_not = self.must_not.clone();
+
         Box::pin(async move {
             // Check if this is a pure OR query eligible for WAND optimization
             // Conditions: no MUST, no MUST_NOT, multiple SHOULD clauses, all same field
-            if self.must.is_empty()
-                && self.must_not.is_empty()
-                && self.should.len() >= 2
-                && let Some(scorer) = self.try_wand_scorer(reader, limit).await?
+            if must.is_empty()
+                && must_not.is_empty()
+                && should.len() >= 2
+                && let Some(scorer) = try_wand_scorer(&should, reader, limit).await?
             {
                 return Ok(scorer);
             }
 
             // Fall back to standard boolean scoring
-            let mut must_scorers = Vec::with_capacity(self.must.len());
-            for q in &self.must {
+            let mut must_scorers = Vec::with_capacity(must.len());
+            for q in &must {
                 must_scorers.push(q.scorer(reader, limit).await?);
             }
 
-            let mut should_scorers = Vec::with_capacity(self.should.len());
-            for q in &self.should {
+            let mut should_scorers = Vec::with_capacity(should.len());
+            for q in &should {
                 should_scorers.push(q.scorer(reader, limit).await?);
             }
 
-            let mut must_not_scorers = Vec::with_capacity(self.must_not.len());
-            for q in &self.must_not {
+            let mut must_not_scorers = Vec::with_capacity(must_not.len());
+            for q in &must_not {
                 must_not_scorers.push(q.scorer(reader, limit).await?);
             }
 
@@ -137,20 +140,23 @@ impl Query for BooleanQuery {
         })
     }
 
-    fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a> {
+    fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
+        let must = self.must.clone();
+        let should = self.should.clone();
+
         Box::pin(async move {
-            if !self.must.is_empty() {
-                let mut estimates = Vec::with_capacity(self.must.len());
-                for q in &self.must {
+            if !must.is_empty() {
+                let mut estimates = Vec::with_capacity(must.len());
+                for q in &must {
                     estimates.push(q.count_estimate(reader).await?);
                 }
                 estimates
                     .into_iter()
                     .min()
                     .ok_or_else(|| crate::Error::Corruption("Empty must clause".to_string()))
-            } else if !self.should.is_empty() {
+            } else if !should.is_empty() {
                 let mut sum = 0u32;
-                for q in &self.should {
+                for q in &should {
                     sum += q.count_estimate(reader).await?;
                 }
                 Ok(sum)

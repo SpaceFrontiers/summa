@@ -237,6 +237,10 @@ pub enum TermInfo {
         posting_offset: u64,
         posting_len: u32,
         doc_freq: u32,
+        /// Position data offset (0 if no positions)
+        position_offset: u64,
+        /// Position data length (0 if no positions)
+        position_len: u32,
     },
 }
 
@@ -247,6 +251,25 @@ impl TermInfo {
             posting_offset,
             posting_len,
             doc_freq,
+            position_offset: 0,
+            position_len: 0,
+        }
+    }
+
+    /// Create an external reference with position info
+    pub fn external_with_positions(
+        posting_offset: u64,
+        posting_len: u32,
+        doc_freq: u32,
+        position_offset: u64,
+        position_len: u32,
+    ) -> Self {
+        TermInfo::External {
+            posting_offset,
+            posting_len,
+            doc_freq,
+            position_offset,
+            position_len,
         }
     }
 
@@ -309,6 +332,18 @@ impl TermInfo {
         }
     }
 
+    /// Get position info (offset, len) - returns None for inline or if no positions
+    pub fn position_info(&self) -> Option<(u64, u32)> {
+        match self {
+            TermInfo::External {
+                position_offset,
+                position_len,
+                ..
+            } if *position_len > 0 => Some((*position_offset, *position_len)),
+            _ => None,
+        }
+    }
+
     /// Decode inline postings into (doc_ids, term_freqs)
     /// Returns None if this is an external reference
     pub fn decode_inline(&self) -> Option<(Vec<u32>, Vec<u32>)> {
@@ -357,12 +392,24 @@ impl SSTableValue for TermInfo {
                 posting_offset,
                 posting_len,
                 doc_freq,
+                position_offset,
+                position_len,
             } => {
-                // Tag byte 0x00 = external marker
-                writer.write_u8(0x00)?;
-                write_vint(writer, *doc_freq as u64)?;
-                write_vint(writer, *posting_offset)?;
-                write_vint(writer, *posting_len as u64)?;
+                // Tag byte 0x00 = external marker (no positions)
+                // Tag byte 0x01 = external with positions
+                if *position_len > 0 {
+                    writer.write_u8(0x01)?;
+                    write_vint(writer, *doc_freq as u64)?;
+                    write_vint(writer, *posting_offset)?;
+                    write_vint(writer, *posting_len as u64)?;
+                    write_vint(writer, *position_offset)?;
+                    write_vint(writer, *position_len as u64)?;
+                } else {
+                    writer.write_u8(0x00)?;
+                    write_vint(writer, *doc_freq as u64)?;
+                    write_vint(writer, *posting_offset)?;
+                    write_vint(writer, *posting_len as u64)?;
+                }
             }
         }
         Ok(())
@@ -383,7 +430,7 @@ impl SSTableValue for TermInfo {
                 data_len,
             })
         } else if tag == 0x00 {
-            // External
+            // External (no positions)
             let doc_freq = read_vint(reader)? as u32;
             let posting_offset = read_vint(reader)?;
             let posting_len = read_vint(reader)? as u32;
@@ -391,6 +438,22 @@ impl SSTableValue for TermInfo {
                 posting_offset,
                 posting_len,
                 doc_freq,
+                position_offset: 0,
+                position_len: 0,
+            })
+        } else if tag == 0x01 {
+            // External with positions
+            let doc_freq = read_vint(reader)? as u32;
+            let posting_offset = read_vint(reader)?;
+            let posting_len = read_vint(reader)? as u32;
+            let position_offset = read_vint(reader)?;
+            let position_len = read_vint(reader)? as u32;
+            Ok(TermInfo::External {
+                posting_offset,
+                posting_len,
+                doc_freq,
+                position_offset,
+                position_len,
             })
         } else {
             Err(io::Error::new(

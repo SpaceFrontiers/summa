@@ -77,27 +77,30 @@ impl WandOrQuery {
 }
 
 impl Query for WandOrQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        let field = self.field;
+        let terms = self.terms.clone();
+        let global_stats = self.global_stats.clone();
+
         Box::pin(async move {
-            let mut scorers: Vec<TextTermScorer> = Vec::with_capacity(self.terms.len());
+            let mut scorers: Vec<TextTermScorer> = Vec::with_capacity(terms.len());
 
             // Get avg field length (from global stats or segment)
-            let avg_field_len = self
-                .global_stats
+            let avg_field_len = global_stats
                 .as_ref()
-                .map(|s| s.avg_field_len(self.field))
-                .unwrap_or_else(|| reader.avg_field_len(self.field));
+                .map(|s| s.avg_field_len(field))
+                .unwrap_or_else(|| reader.avg_field_len(field));
 
             let num_docs = reader.num_docs() as f32;
 
-            for term in &self.terms {
+            for term in &terms {
                 let term_bytes = term.as_bytes();
 
-                if let Some(posting_list) = reader.get_postings(self.field, term_bytes).await? {
+                if let Some(posting_list) = reader.get_postings(field, term_bytes).await? {
                     // Compute IDF
                     let doc_freq = posting_list.doc_count() as f32;
-                    let idf = if let Some(ref stats) = self.global_stats {
-                        let global_idf = stats.text_idf(self.field, term);
+                    let idf = if let Some(ref stats) = global_stats {
+                        let global_idf = stats.text_idf(field, term);
                         if global_idf > 0.0 {
                             global_idf
                         } else {
@@ -122,12 +125,14 @@ impl Query for WandOrQuery {
         })
     }
 
-    fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a> {
+    fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
+        let field = self.field;
+        let terms = self.terms.clone();
+
         Box::pin(async move {
             let mut sum = 0u32;
-            for term in &self.terms {
-                if let Some(posting_list) = reader.get_postings(self.field, term.as_bytes()).await?
-                {
+            for term in &terms {
+                if let Some(posting_list) = reader.get_postings(field, term.as_bytes()).await? {
                     sum += posting_list.doc_count();
                 }
             }

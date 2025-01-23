@@ -357,6 +357,27 @@ impl<D: Directory> Index<D> {
         limit: usize,
         offset: usize,
     ) -> Result<crate::query::SearchResponse> {
+        self.search_internal(query, limit, offset, false).await
+    }
+
+    /// Search with matched field ordinals (for multi-valued fields with position tracking)
+    ///
+    /// Returns which array elements matched for each field with position tracking enabled.
+    pub async fn search_with_matched_fields(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+    ) -> Result<crate::query::SearchResponse> {
+        self.search_internal(query, limit, 0, true).await
+    }
+
+    async fn search_internal(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+        offset: usize,
+        collect_positions: bool,
+    ) -> Result<crate::query::SearchResponse> {
         let segments = self.segments.read().clone();
         let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
 
@@ -364,8 +385,13 @@ impl<D: Directory> Index<D> {
         let fetch_limit = offset + limit;
         for segment in &segments {
             let segment_id = segment.meta().id;
-            let results =
-                crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?;
+            let results = crate::query::search_segment_with_positions(
+                segment.as_ref(),
+                query,
+                fetch_limit,
+                collect_positions,
+            )
+            .await?;
             for result in results {
                 all_results.push((segment_id, result));
             }
@@ -389,6 +415,7 @@ impl<D: Directory> Index<D> {
             .map(|(segment_id, result)| crate::query::SearchHit {
                 address: crate::query::DocAddress::new(segment_id, result.doc_id),
                 score: result.score,
+                matched_fields: result.extract_ordinals(),
             })
             .collect();
 

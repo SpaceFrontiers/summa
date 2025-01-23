@@ -90,6 +90,8 @@ pub struct AsyncSegmentReader {
     coarse_centroids: Option<Arc<CoarseCentroids>>,
     /// Sparse vector indexes per field
     sparse_indexes: FxHashMap<u32, SparseIndex>,
+    /// Position file handle for phrase queries (lazy loading)
+    positions_handle: Option<LazyFileHandle>,
 }
 
 impl AsyncSegmentReader {
@@ -127,6 +129,9 @@ impl AsyncSegmentReader {
         // Load sparse vector indexes from .sparse file
         let sparse_indexes = Self::load_sparse_file(dir, &files, meta.num_docs).await?;
 
+        // Open positions file handle (if exists) - offsets are now in TermInfo
+        let positions_handle = Self::open_positions_file(dir, &files).await?;
+
         Ok(Self {
             meta,
             term_dict: Arc::new(term_dict),
@@ -137,6 +142,7 @@ impl AsyncSegmentReader {
             vector_indexes,
             coarse_centroids,
             sparse_indexes,
+            positions_handle,
         })
     }
 
@@ -433,8 +439,9 @@ impl AsyncSegmentReader {
         field: Field,
         vector: &[(u32, f32)],
         limit: usize,
+        combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<(u32, f32)>> {
-        use crate::query::{SparseTermScorer, WandExecutor};
+        use crate::query::{MultiValueCombiner, SparseTermScorer, WandExecutor};
 
         // Get sparse index for this field
         let sparse_index = match self.sparse_indexes.get(&field.0) {
@@ -460,9 +467,44 @@ impl AsyncSegmentReader {
         }
 
         // Use shared WandExecutor for top-k retrieval
-        let results = WandExecutor::new(scorers, limit).execute();
+        // Note: For multi-valued fields, same doc_id may appear multiple times
+        // with different scores that need to be combined
+        let raw_results = WandExecutor::new(scorers, limit * 2).execute(); // Over-fetch for combining
 
-        Ok(results.into_iter().map(|r| (r.doc_id, r.score)).collect())
+        // Combine scores for duplicate doc_ids based on combiner strategy
+        let mut combined: rustc_hash::FxHashMap<u32, (f32, u32)> = rustc_hash::FxHashMap::default();
+        for r in raw_results {
+            combined
+                .entry(r.doc_id)
+                .and_modify(|(score, count)| match combiner {
+                    MultiValueCombiner::Sum => *score += r.score,
+                    MultiValueCombiner::Max => *score = score.max(r.score),
+                    MultiValueCombiner::Avg => {
+                        *score += r.score;
+                        *count += 1;
+                    }
+                })
+                .or_insert((r.score, 1));
+        }
+
+        // Finalize averages and collect results
+        let mut results: Vec<(u32, f32)> = combined
+            .into_iter()
+            .map(|(doc_id, (score, count))| {
+                let final_score = if combiner == MultiValueCombiner::Avg {
+                    score / count as f32
+                } else {
+                    score
+                };
+                (doc_id, final_score)
+            })
+            .collect();
+
+        // Sort by score descending and take top limit
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+
+        Ok(results)
     }
 
     /// Load dense vector indexes from unified .vectors file
@@ -716,6 +758,76 @@ impl AsyncSegmentReader {
         }
 
         Ok(indexes)
+    }
+
+    /// Load position index header from .pos file
+    ///
+    /// File format:
+    /// Open positions file handle (no header parsing needed - offsets are in TermInfo)
+    async fn open_positions_file<D: Directory>(
+        dir: &D,
+        files: &SegmentFiles,
+    ) -> Result<Option<LazyFileHandle>> {
+        // Try to open positions file (may not exist if no positions were indexed)
+        match dir.open_lazy(&files.positions).await {
+            Ok(h) => Ok(Some(h)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Get positions for a term (for phrase queries)
+    ///
+    /// Position offsets are now embedded in TermInfo, so we first look up
+    /// the term to get its TermInfo, then use position_info() to get the offset.
+    pub async fn get_positions(
+        &self,
+        field: Field,
+        term: &[u8],
+    ) -> Result<Option<crate::structures::PositionPostingList>> {
+        use std::io::Cursor;
+
+        // Get positions handle
+        let handle = match &self.positions_handle {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        // Build key: field_id + term
+        let mut key = Vec::with_capacity(4 + term.len());
+        key.extend_from_slice(&field.0.to_le_bytes());
+        key.extend_from_slice(term);
+
+        // Look up term in dictionary to get TermInfo with position offset
+        let term_info = match self.term_dict.get(&key).await? {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        // Get position offset from TermInfo
+        let (offset, length) = match term_info.position_info() {
+            Some((o, l)) => (o, l),
+            None => return Ok(None),
+        };
+
+        // Read the position data
+        let slice = handle.slice(offset..offset + length as u64);
+        let data = slice.read_bytes().await?;
+
+        // Deserialize
+        let mut cursor = Cursor::new(data.as_slice());
+        let pos_list = crate::structures::PositionPostingList::deserialize(&mut cursor)?;
+
+        Ok(Some(pos_list))
+    }
+
+    /// Check if positions are available for a field
+    pub fn has_positions(&self, field: Field) -> bool {
+        // Check schema for position mode on this field
+        if let Some(entry) = self.schema.get_field_entry(field) {
+            entry.positions.is_some()
+        } else {
+            false
+        }
     }
 }
 

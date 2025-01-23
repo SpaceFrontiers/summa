@@ -7,9 +7,7 @@ use crate::segment::SegmentReader;
 use crate::structures::BlockPostingList;
 use crate::{DocId, Score};
 
-use super::{
-    Bm25Params, CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture, TermQueryInfo,
-};
+use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture, TermQueryInfo};
 
 /// Term query - matches documents containing a specific term
 #[derive(Clone)]
@@ -63,52 +61,65 @@ impl TermQuery {
 }
 
 impl Query for TermQuery {
-    fn scorer<'a>(&'a self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+        let field = self.field;
+        let term = self.term.clone();
+        let global_stats = self.global_stats.clone();
         Box::pin(async move {
-            let postings = reader.get_postings(self.field, &self.term).await?;
+            let postings = reader.get_postings(field, &term).await?;
 
             match postings {
                 Some(posting_list) => {
                     // Use global stats IDF if available, otherwise segment-local
-                    let (idf, avg_field_len) = if let Some(ref stats) = self.global_stats {
-                        let term_str = String::from_utf8_lossy(&self.term);
-                        let global_idf = stats.text_idf(self.field, &term_str);
+                    let (idf, avg_field_len) = if let Some(ref stats) = global_stats {
+                        let term_str = String::from_utf8_lossy(&term);
+                        let global_idf = stats.text_idf(field, &term_str);
 
                         // If global stats has this term, use global IDF
                         // Otherwise fall back to segment-local
                         if global_idf > 0.0 {
-                            (global_idf, stats.avg_field_len(self.field))
+                            (global_idf, stats.avg_field_len(field))
                         } else {
                             // Fall back to segment-local IDF
                             let num_docs = reader.num_docs() as f32;
                             let doc_freq = posting_list.doc_count() as f32;
                             let idf = super::bm25_idf(doc_freq, num_docs);
-                            (idf, reader.avg_field_len(self.field))
+                            (idf, reader.avg_field_len(field))
                         }
                     } else {
                         // Compute IDF from segment statistics
                         let num_docs = reader.num_docs() as f32;
                         let doc_freq = posting_list.doc_count() as f32;
                         let idf = super::bm25_idf(doc_freq, num_docs);
-                        (idf, reader.avg_field_len(self.field))
+                        (idf, reader.avg_field_len(field))
                     };
 
-                    Ok(Box::new(TermScorer::new(
+                    // Try to load positions if available
+                    let positions = reader.get_positions(field, &term).await.ok().flatten();
+
+                    let mut scorer = TermScorer::new(
                         posting_list,
                         idf,
                         avg_field_len,
-                        Bm25Params::default(),
                         1.0, // default field boost
-                    )) as Box<dyn Scorer + 'a>)
+                    );
+
+                    if let Some(pos) = positions {
+                        scorer = scorer.with_positions(field.0, pos);
+                    }
+
+                    Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
                 }
                 None => Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
             }
         })
     }
 
-    fn count_estimate<'a>(&'a self, reader: &'a SegmentReader) -> CountFuture<'a> {
+    fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
+        let field = self.field;
+        let term = self.term.clone();
         Box::pin(async move {
-            match reader.get_postings(self.field, &self.term).await? {
+            match reader.get_postings(field, &term).await? {
                 Some(list) => Ok(list.doc_count()),
                 None => Ok(0),
             }
@@ -126,12 +137,14 @@ impl Query for TermQuery {
 struct TermScorer {
     iterator: crate::structures::BlockPostingIterator<'static>,
     idf: f32,
-    /// BM25 parameters
-    params: Bm25Params,
     /// Average field length for this field
     avg_field_len: f32,
     /// Field boost/weight for BM25F
     field_boost: f32,
+    /// Field ID for position reporting
+    field_id: u32,
+    /// Position posting list (if positions are enabled)
+    positions: Option<crate::structures::PositionPostingList>,
 }
 
 impl TermScorer {
@@ -139,16 +152,26 @@ impl TermScorer {
         posting_list: BlockPostingList,
         idf: f32,
         avg_field_len: f32,
-        params: Bm25Params,
         field_boost: f32,
     ) -> Self {
         Self {
             iterator: posting_list.into_iterator(),
             idf,
-            params,
             avg_field_len,
             field_boost,
+            field_id: 0,
+            positions: None,
         }
+    }
+
+    pub fn with_positions(
+        mut self,
+        field_id: u32,
+        positions: crate::structures::PositionPostingList,
+    ) -> Self {
+        self.field_id = field_id;
+        self.positions = Some(positions);
+        self
     }
 }
 
@@ -159,15 +182,9 @@ impl Scorer for TermScorer {
 
     fn score(&self) -> Score {
         let tf = self.iterator.term_freq() as f32;
-        let k1 = self.params.k1;
-        let b = self.params.b;
-
-        // BM25F: apply field boost and length normalization
-        let length_norm = 1.0 - b + b * (tf / self.avg_field_len.max(1.0));
-        let tf_norm =
-            (tf * self.field_boost * (k1 + 1.0)) / (tf * self.field_boost + k1 * length_norm);
-
-        self.idf * tf_norm
+        // Note: Using tf as doc_len proxy since we don't store per-doc field lengths.
+        // This is a common approximation - longer docs tend to have higher TF.
+        super::bm25f_score(tf, self.idf, tf, self.avg_field_len, self.field_boost)
     }
 
     fn advance(&mut self) -> DocId {
@@ -180,5 +197,12 @@ impl Scorer for TermScorer {
 
     fn size_hint(&self) -> u32 {
         0
+    }
+
+    fn matched_positions(&self) -> Option<super::MatchedPositions> {
+        let positions = self.positions.as_ref()?;
+        let doc_id = self.iterator.doc();
+        let pos = positions.get_positions(doc_id)?;
+        Some(vec![(self.field_id, pos.to_vec())])
     }
 }

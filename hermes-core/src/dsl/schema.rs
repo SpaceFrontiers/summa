@@ -48,12 +48,42 @@ pub struct FieldEntry {
     /// Whether this field can have multiple values (serialized as array in JSON)
     #[serde(default)]
     pub multi: bool,
+    /// Position tracking mode for phrase queries and multi-field element tracking
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<PositionMode>,
     /// Configuration for sparse vector fields (index size, weight quantization)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sparse_vector_config: Option<crate::structures::SparseVectorConfig>,
     /// Configuration for dense vector fields (dimension, quantization)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dense_vector_config: Option<DenseVectorConfig>,
+}
+
+/// Position tracking mode for text fields
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionMode {
+    /// Track only element ordinal for multi-valued fields (which array element)
+    /// Useful for returning which element matched without full phrase query support
+    Ordinal,
+    /// Track only token position within text (for phrase queries)
+    /// Does not track element ordinal - all positions are relative to concatenated text
+    TokenPosition,
+    /// Track both element ordinal and token position (full support)
+    /// Position format: (element_ordinal << 20) | token_position
+    Full,
+}
+
+impl PositionMode {
+    /// Whether this mode tracks element ordinals
+    pub fn tracks_ordinal(&self) -> bool {
+        matches!(self, PositionMode::Ordinal | PositionMode::Full)
+    }
+
+    /// Whether this mode tracks token positions
+    pub fn tracks_token_position(&self) -> bool {
+        matches!(self, PositionMode::TokenPosition | PositionMode::Full)
+    }
 }
 
 /// Vector index algorithm type
@@ -337,6 +367,7 @@ impl SchemaBuilder {
             stored,
             tokenizer: None,
             multi: false,
+            positions: None,
             sparse_vector_config: Some(config),
             dense_vector_config: None,
         });
@@ -384,6 +415,7 @@ impl SchemaBuilder {
             stored,
             tokenizer: None,
             multi: false,
+            positions: None,
             sparse_vector_config: None,
             dense_vector_config: Some(config),
         });
@@ -428,6 +460,7 @@ impl SchemaBuilder {
             stored,
             tokenizer,
             multi,
+            positions: None,
             sparse_vector_config: None,
             dense_vector_config: None,
         });
@@ -438,6 +471,13 @@ impl SchemaBuilder {
     pub fn set_multi(&mut self, field: Field, multi: bool) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.multi = multi;
+        }
+    }
+
+    /// Set position tracking mode for phrase queries and multi-field element tracking
+    pub fn set_positions(&mut self, field: Field, mode: PositionMode) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.positions = Some(mode);
         }
     }
 

@@ -96,23 +96,37 @@ dimension_spec = @{ ASCII_DIGIT+ }
 // Tokenizer specification: <tokenizer_name>
 tokenizer_spec = { "<" ~ identifier ~ ">" }
 
-// Attributes like [indexed, stored, multi]
-// indexed can have optional index config for dense vectors: indexed<rabitq, centroids: "path">
+// Attributes like [indexed, stored]
+// indexed can have optional index config: indexed<positions> or indexed<rabitq, centroids: "path">
+// stored can have optional multi config: stored<multi> for array fields
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { indexed_with_config | "indexed" | "stored" | "multi" }
+attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" }
+
+// Stored attribute with optional multi flag
+// Examples:
+//   stored
+//   stored<multi>  # for array fields
+stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 
 // Indexed attribute with optional vector index configuration
 // Examples:
 //   indexed
+//   indexed<positions>  # for phrase queries
 //   indexed<rabitq>
 //   indexed<rabitq, centroids: "centroids.bin">
 //   indexed<rabitq, centroids: "c.bin", nprobe: 64>
 //   indexed<scann, centroids: "c.bin", codebook: "pq.bin", mrl_dim: 256>
 //   indexed<quantization: uint8, weight_threshold: 0.1>  # for sparse vectors
+//   indexed<positions, quantization: uint8>  # sparse with positions
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | centroids_kwarg | codebook_kwarg | nprobe_kwarg | mrl_dim_kwarg | quantization_kwarg | weight_threshold_kwarg | query_config_block | index_type_spec }
+index_config_param = { index_type_kwarg | centroids_kwarg | codebook_kwarg | nprobe_kwarg | mrl_dim_kwarg | quantization_kwarg | weight_threshold_kwarg | query_config_block | positions_kwarg | index_type_spec }
+// Position tracking modes:
+//   positions - full tracking (element ordinal + token position)
+//   ordinal - only element ordinal for multi-valued fields
+//   token_position - only token position within text for phrase queries
+positions_kwarg = { "positions" | "ordinal" | "token_position" }
 mrl_dim_kwarg = { "mrl_dim" ~ ":" ~ mrl_dim_spec }
 mrl_dim_spec = @{ ASCII_DIGIT+ }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }

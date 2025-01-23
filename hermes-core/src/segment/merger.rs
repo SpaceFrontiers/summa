@@ -113,7 +113,14 @@ impl SegmentMerger {
         // Check if we can use optimized store stacking (no dictionaries)
         let can_stack_stores = segments.iter().all(|s| !s.store_has_dict());
 
-        if can_stack_stores {
+        // Check if any segment has positions - if so, use rebuild merge
+        // (positions require doc ID remapping which optimized merge doesn't handle)
+        let has_positions = self
+            .schema
+            .fields()
+            .any(|(_, entry)| entry.positions.is_some());
+
+        if can_stack_stores && !has_positions {
             self.merge_optimized_with_stats(dir, segments, new_segment_id)
                 .await
         } else {

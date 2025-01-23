@@ -463,15 +463,15 @@ fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Query>
             let mut bq = BooleanQuery::new();
             for q in &bool_query.must {
                 let inner = convert_query(q, schema)?;
-                bq.must.push(inner);
+                bq.must.push(inner.into());
             }
             for q in &bool_query.should {
                 let inner = convert_query(q, schema)?;
-                bq.should.push(inner);
+                bq.should.push(inner.into());
             }
             for q in &bool_query.must_not {
                 let inner = convert_query(q, schema)?;
-                bq.must_not.push(inner);
+                bq.must_not.push(inner.into());
             }
             Ok(Box::new(bq))
         }
@@ -482,7 +482,7 @@ fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Query>
                 .ok_or_else(|| "Boost query requires inner query".to_string())?;
             let inner_query = convert_query(inner, schema)?;
             Ok(Box::new(BoostQuery {
-                inner: inner_query,
+                inner: inner_query.into(),
                 boost: boost_query.boost,
             }))
         }

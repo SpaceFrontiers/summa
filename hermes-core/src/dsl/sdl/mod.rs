@@ -73,6 +73,8 @@ pub struct FieldDef {
     pub tokenizer: Option<String>,
     /// Whether this field can have multiple values (serialized as array in JSON)
     pub multi: bool,
+    /// Position tracking mode for phrase queries and multi-field element tracking
+    pub positions: Option<super::schema::PositionMode>,
     /// Configuration for sparse vector fields
     pub sparse_vector_config: Option<SparseVectorConfig>,
     /// Configuration for dense vector fields
@@ -139,6 +141,23 @@ impl IndexDef {
             if field.multi {
                 builder.set_multi(f, true);
             }
+            // Set positions: explicit > auto (ordinal for multi vectors)
+            let positions = field.positions.or({
+                // Auto-set ordinal positions for multi-valued vector fields
+                if field.multi
+                    && matches!(
+                        field.field_type,
+                        FieldType::SparseVector | FieldType::DenseVector
+                    )
+                {
+                    Some(super::schema::PositionMode::Ordinal)
+                } else {
+                    None
+                }
+            });
+            if let Some(mode) = positions {
+                builder.set_positions(f, mode);
+            }
         }
 
         // Set default fields if specified
@@ -198,10 +217,14 @@ struct IndexConfig {
     // Sparse vector query-time config
     query_tokenizer: Option<String>,
     query_weighting: Option<QueryWeighting>,
+    // Position tracking mode for phrase queries
+    positions: Option<super::schema::PositionMode>,
 }
 
 /// Parse attributes from pest pair
 /// Returns (indexed, stored, multi, index_config)
+/// positions is now inside index_config (via indexed<positions> or indexed<ordinal> etc.)
+/// multi is now inside stored<multi>
 fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> (bool, bool, bool, Option<IndexConfig>) {
     let mut indexed = false;
     let mut stored = false;
@@ -210,23 +233,30 @@ fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> (bool, bool, bool, Opt
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::attribute {
-            // attribute = { indexed_with_config | "indexed" | "stored" | "multi" }
-            // Check if it contains indexed_with_config
-            let mut found_indexed_with_config = false;
+            // attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" }
+            let mut found_config = false;
             for inner in attr.clone().into_inner() {
-                if inner.as_rule() == Rule::indexed_with_config {
-                    indexed = true;
-                    index_config = Some(parse_index_config(inner));
-                    found_indexed_with_config = true;
-                    break;
+                match inner.as_rule() {
+                    Rule::indexed_with_config => {
+                        indexed = true;
+                        index_config = Some(parse_index_config(inner));
+                        found_config = true;
+                        break;
+                    }
+                    Rule::stored_with_config => {
+                        stored = true;
+                        multi = true; // stored<multi>
+                        found_config = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            if !found_indexed_with_config {
+            if !found_config {
                 // Simple attribute
                 match attr.as_str() {
                     "indexed" => indexed = true,
                     "stored" => stored = true,
-                    "multi" => multi = true,
                     _ => {}
                 }
             }
@@ -332,6 +362,15 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             // query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
             parse_query_config_block(config, p);
         }
+        Rule::positions_kwarg => {
+            // positions_kwarg = { "positions" | "ordinal" | "token_position" }
+            use super::schema::PositionMode;
+            config.positions = Some(match p.as_str() {
+                "ordinal" => PositionMode::Ordinal,
+                "token_position" => PositionMode::TokenPosition,
+                _ => PositionMode::Full, // "positions" or any other value defaults to Full
+            });
+        }
         _ => {}
     }
 }
@@ -425,7 +464,9 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     }
 
     // Merge index config into vector configs if both exist
+    let mut positions = None;
     if let Some(idx_cfg) = index_config {
+        positions = idx_cfg.positions;
         if let Some(ref mut dv_config) = dense_vector_config {
             apply_index_config_to_dense_vector(dv_config, idx_cfg);
         } else if field_type == FieldType::SparseVector {
@@ -442,6 +483,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         stored,
         tokenizer,
         multi,
+        positions,
         sparse_vector_config,
         dense_vector_config,
     })
@@ -1030,7 +1072,7 @@ mod tests {
     fn test_multi_attribute() {
         let sdl = r#"
             index documents {
-                field uris: text [indexed, stored, multi]
+                field uris: text [indexed, stored<multi>]
                 field title: text [indexed, stored]
             }
         "#;

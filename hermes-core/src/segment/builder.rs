@@ -76,6 +76,32 @@ impl PostingListBuilder {
     }
 }
 
+/// In-memory position posting list for a term (for fields with record_positions=true)
+struct PositionPostingListBuilder {
+    /// Doc ID -> list of positions (encoded as element_ordinal << 20 | token_position)
+    postings: Vec<(DocId, Vec<u32>)>,
+}
+
+impl PositionPostingListBuilder {
+    fn new() -> Self {
+        Self {
+            postings: Vec::new(),
+        }
+    }
+
+    /// Add a position for a document
+    #[inline]
+    fn add_position(&mut self, doc_id: DocId, position: u32) {
+        if let Some((last_doc, positions)) = self.postings.last_mut()
+            && *last_doc == doc_id
+        {
+            positions.push(position);
+            return;
+        }
+        self.postings.push((doc_id, vec![position]));
+    }
+}
+
 /// Intermediate result for parallel posting serialization
 enum SerializedPosting {
     /// Inline posting (small enough to fit in TermInfo)
@@ -195,6 +221,16 @@ pub struct SegmentBuilder {
     /// Sparse vector storage per field: field -> SparseVectorBuilder
     /// Uses proper BlockSparsePostingList with configurable quantization
     sparse_vectors: FxHashMap<u32, SparseVectorBuilder>,
+
+    /// Position index for fields with positions enabled
+    /// term key -> position posting list
+    position_index: HashMap<TermKey, PositionPostingListBuilder>,
+
+    /// Fields that have position tracking enabled, with their mode
+    position_enabled_fields: FxHashMap<u32, Option<crate::dsl::PositionMode>>,
+
+    /// Current element ordinal for multi-valued fields (reset per document)
+    current_element_ordinal: FxHashMap<u32, u32>,
 }
 
 /// Builder for dense vector index using RaBitQ
@@ -300,12 +336,17 @@ impl SegmentBuilder {
         );
 
         // Count indexed fields for compact field length storage
+        // Also track which fields have position recording enabled
         let mut num_indexed_fields = 0;
         let mut field_to_slot = FxHashMap::default();
+        let mut position_enabled_fields = FxHashMap::default();
         for (field, entry) in schema.fields() {
             if entry.indexed && matches!(entry.field_type, FieldType::Text) {
                 field_to_slot.insert(field.0, num_indexed_fields);
                 num_indexed_fields += 1;
+                if entry.positions.is_some() {
+                    position_enabled_fields.insert(field.0, entry.positions);
+                }
             }
         }
 
@@ -326,6 +367,9 @@ impl SegmentBuilder {
             config,
             dense_vectors: FxHashMap::default(),
             sparse_vectors: FxHashMap::default(),
+            position_index: HashMap::new(),
+            position_enabled_fields,
+            current_element_ordinal: FxHashMap::default(),
         })
     }
 
@@ -431,6 +475,9 @@ impl SegmentBuilder {
         self.doc_field_lengths
             .resize(base_idx + self.num_indexed_fields, 0);
 
+        // Reset element ordinals for this document (for multi-valued fields)
+        self.current_element_ordinal.clear();
+
         for (field, value) in doc.field_values() {
             let entry = self.schema.get_field_entry(*field);
             if entry.is_none() || !entry.unwrap().indexed {
@@ -440,7 +487,12 @@ impl SegmentBuilder {
             let entry = entry.unwrap();
             match (&entry.field_type, value) {
                 (FieldType::Text, FieldValue::Text(text)) => {
-                    let token_count = self.index_text_field(*field, doc_id, text)?;
+                    // Get current element ordinal for multi-valued fields
+                    let element_ordinal = *self.current_element_ordinal.get(&field.0).unwrap_or(&0);
+                    let token_count =
+                        self.index_text_field(*field, doc_id, text, element_ordinal)?;
+                    // Increment element ordinal for next value of this field
+                    *self.current_element_ordinal.entry(field.0).or_insert(0) += 1;
 
                     // Update field statistics
                     let stats = self.field_stats.entry(field.0).or_default();
@@ -484,12 +536,34 @@ impl SegmentBuilder {
     /// 1. Iterate over whitespace-split words
     /// 2. Build lowercase token in a reusable buffer
     /// 3. Intern directly from the buffer
-    fn index_text_field(&mut self, field: Field, doc_id: DocId, text: &str) -> Result<u32> {
+    ///
+    /// If position recording is enabled for this field, also records token positions
+    /// encoded as (element_ordinal << 20) | token_position.
+    fn index_text_field(
+        &mut self,
+        field: Field,
+        doc_id: DocId,
+        text: &str,
+        element_ordinal: u32,
+    ) -> Result<u32> {
+        use crate::dsl::PositionMode;
+
+        let field_id = field.0;
+        let position_mode = self
+            .position_enabled_fields
+            .get(&field_id)
+            .copied()
+            .flatten();
+
         // Phase 1: Aggregate term frequencies within this document
+        // Also collect positions if enabled
         // Reuse buffer to avoid allocations
         self.local_tf_buffer.clear();
 
-        let mut token_count = 0u32;
+        // For position tracking: term -> list of positions in this text
+        let mut local_positions: FxHashMap<Spur, Vec<u32>> = FxHashMap::default();
+
+        let mut token_position = 0u32;
 
         // Zero-allocation tokenization: iterate words, lowercase inline, intern directly
         for word in text.split_whitespace() {
@@ -507,17 +581,31 @@ impl SegmentBuilder {
                 continue;
             }
 
-            token_count += 1;
-
             // Intern the term directly from buffer - O(1) amortized
             let term_spur = self.term_interner.get_or_intern(&self.token_buffer);
             *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
+
+            // Record position based on mode
+            if let Some(mode) = position_mode {
+                let encoded_pos = match mode {
+                    // Ordinal only: just store element ordinal (token position = 0)
+                    PositionMode::Ordinal => element_ordinal << 20,
+                    // Token position only: just store token position (ordinal = 0)
+                    PositionMode::TokenPosition => token_position,
+                    // Full: encode both
+                    PositionMode::Full => (element_ordinal << 20) | token_position,
+                };
+                local_positions
+                    .entry(term_spur)
+                    .or_default()
+                    .push(encoded_pos);
+            }
+
+            token_position += 1;
         }
 
         // Phase 2: Insert aggregated terms into inverted index
         // Now we only do one inverted_index lookup per unique term in doc
-        let field_id = field.0;
-
         for (&term_spur, &tf) in &self.local_tf_buffer {
             let term_key = TermKey {
                 field: field_id,
@@ -529,9 +617,22 @@ impl SegmentBuilder {
                 .entry(term_key)
                 .or_insert_with(PostingListBuilder::new);
             posting.add(doc_id, tf);
+
+            // Add positions if enabled
+            if position_mode.is_some()
+                && let Some(positions) = local_positions.get(&term_spur)
+            {
+                let pos_posting = self
+                    .position_index
+                    .entry(term_key)
+                    .or_insert_with(PositionPostingListBuilder::new);
+                for &pos in positions {
+                    pos_posting.add_position(doc_id, pos);
+                }
+            }
         }
 
-        Ok(token_count)
+        Ok(token_position)
     }
 
     fn index_numeric_field(&mut self, field: Field, doc_id: DocId, value: u64) -> Result<()> {
@@ -640,6 +741,9 @@ impl SegmentBuilder {
 
         let files = SegmentFiles::new(segment_id.0);
 
+        // Build positions FIRST to get offsets for TermInfo
+        let (positions_data, position_offsets) = self.build_positions_file()?;
+
         // Extract data needed for parallel processing
         let store_path = self.store_path.clone();
         let schema = self.schema.clone();
@@ -648,7 +752,7 @@ impl SegmentBuilder {
 
         // Build postings and document store in parallel
         let (postings_result, store_result) = rayon::join(
-            || self.build_postings(),
+            || self.build_postings(&position_offsets),
             || {
                 Self::build_store_parallel(
                     &store_path,
@@ -666,6 +770,11 @@ impl SegmentBuilder {
         dir.write(&files.term_dict, &term_dict_data).await?;
         dir.write(&files.postings, &postings_data).await?;
         dir.write(&files.store, &store_data).await?;
+
+        // Write positions file (data only, offsets are in TermInfo)
+        if !positions_data.is_empty() {
+            dir.write(&files.positions, &positions_data).await?;
+        }
 
         // Build and write dense vector indexes (RaBitQ) - all in one file
         if !self.dense_vectors.is_empty() {
@@ -987,10 +1096,66 @@ impl SegmentBuilder {
         Ok(output)
     }
 
+    /// Build positions file for phrase queries
+    ///
+    /// File format:
+    /// - Data only: concatenated serialized PositionPostingList
+    /// - Position offsets are stored in TermInfo (no separate header needed)
+    ///
+    /// Returns: (positions_data, term_key -> (offset, len) mapping)
+    fn build_positions_file(&self) -> Result<(Vec<u8>, FxHashMap<Vec<u8>, (u64, u32)>)> {
+        use crate::structures::PositionPostingList;
+
+        let mut position_offsets: FxHashMap<Vec<u8>, (u64, u32)> = FxHashMap::default();
+
+        if self.position_index.is_empty() {
+            return Ok((Vec::new(), position_offsets));
+        }
+
+        // Collect and sort entries by key
+        let mut entries: Vec<(Vec<u8>, &PositionPostingListBuilder)> = self
+            .position_index
+            .iter()
+            .map(|(term_key, pos_list)| {
+                let term_str = self.term_interner.resolve(&term_key.term);
+                let mut key = Vec::with_capacity(4 + term_str.len());
+                key.extend_from_slice(&term_key.field.to_le_bytes());
+                key.extend_from_slice(term_str.as_bytes());
+                (key, pos_list)
+            })
+            .collect();
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Serialize all position lists and track offsets
+        let mut output = Vec::new();
+
+        for (key, pos_builder) in entries {
+            // Convert builder to PositionPostingList
+            let mut pos_list = PositionPostingList::with_capacity(pos_builder.postings.len());
+            for (doc_id, positions) in &pos_builder.postings {
+                pos_list.push(*doc_id, positions.clone());
+            }
+
+            // Serialize and track offset
+            let offset = output.len() as u64;
+            pos_list.serialize(&mut output).map_err(crate::Error::Io)?;
+            let len = (output.len() as u64 - offset) as u32;
+
+            position_offsets.insert(key, (offset, len));
+        }
+
+        Ok((output, position_offsets))
+    }
+
     /// Build postings from inverted index
     ///
     /// Uses parallel processing to serialize posting lists concurrently.
-    fn build_postings(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// Position offsets are looked up and embedded in TermInfo.
+    fn build_postings(
+        &mut self,
+        position_offsets: &FxHashMap<Vec<u8>, (u64, u32)>,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         // Phase 1: Collect and sort term keys (parallel key generation)
         // Key format: field_id (4 bytes) + term bytes
         let mut term_entries: Vec<(Vec<u8>, &PostingListBuilder)> = self
@@ -1023,7 +1188,11 @@ impl SegmentBuilder {
                 let doc_ids: Vec<u32> = full_postings.iter().map(|p| p.doc_id).collect();
                 let term_freqs: Vec<u32> = full_postings.iter().map(|p| p.term_freq).collect();
 
-                let result = if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
+                // Don't inline if term has positions (inline format doesn't support position offsets)
+                let has_positions = position_offsets.contains_key(&key);
+                let result = if !has_positions
+                    && let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs)
+                {
                     SerializedPosting::Inline(inline)
                 } else {
                     // Serialize to local buffer
@@ -1056,7 +1225,19 @@ impl SegmentBuilder {
                     let posting_offset = postings.len() as u64;
                     let posting_len = bytes.len() as u32;
                     postings.extend_from_slice(&bytes);
-                    TermInfo::external(posting_offset, posting_len, doc_count)
+
+                    // Look up position offset for this term
+                    if let Some(&(pos_offset, pos_len)) = position_offsets.get(&key) {
+                        TermInfo::external_with_positions(
+                            posting_offset,
+                            posting_len,
+                            doc_count,
+                            pos_offset,
+                            pos_len,
+                        )
+                    } else {
+                        TermInfo::external(posting_offset, posting_len, doc_count)
+                    }
                 }
             };
 
