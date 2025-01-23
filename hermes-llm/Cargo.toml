@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 description = "LLM training from scratch using Candle"
 keywords = ["llm", "transformer", "deep-learning", "gpt", "training"]
-categories = ["science", "machine-learning"]
+categories = ["science"]
 
 [dependencies]
 # Candle ML framework
