@@ -21,11 +21,11 @@ struct Cli {
 enum Commands {
     /// Train a new model from scratch
     Train {
-        /// Path to training data file (reads from stdin if not provided)
+        /// Path to training data file (required for multi-GPU, optional for single GPU)
         #[arg(short, long)]
         data: Option<String>,
 
-        /// Path to tokenizer file (will train new one if not exists)
+        /// Path to tokenizer file
         #[arg(short, long)]
         tokenizer: String,
 
@@ -36,10 +36,6 @@ enum Commands {
         /// Output directory for checkpoints
         #[arg(short, long, default_value = "checkpoints")]
         output: String,
-
-        /// Learning rate
-        #[arg(long, default_value = "3e-4")]
-        lr: f64,
 
         /// Batch size
         #[arg(short, long, default_value = "32")]
@@ -53,28 +49,23 @@ enum Commands {
         #[arg(long, default_value = "256")]
         seq_len: usize,
 
-        /// Use GPU (Metal on macOS, CUDA on Linux/Windows)
-        #[arg(long, default_value = "true")]
-        gpu: bool,
+        /// Learning rate
+        #[arg(long, default_value = "3e-4")]
+        lr: f64,
 
-        /// GPU device index (for multi-GPU systems)
-        #[arg(long, default_value = "0")]
-        gpu_id: usize,
+        /// Number of GPUs (1 = single GPU, >1 = distributed with NCCL)
+        #[arg(long, default_value = "1")]
+        num_gpus: usize,
 
         /// Gradient accumulation steps
         #[arg(long, default_value = "1")]
         grad_accum: usize,
 
-        /// World size for distributed training (number of GPUs)
-        #[arg(long, default_value = "1")]
-        world_size: usize,
-
-        /// Rank for distributed training (0 to world_size-1)
-        #[arg(long, default_value = "0")]
+        // Internal flags for distributed training (set automatically)
+        #[arg(long, hide = true, default_value = "0")]
         rank: usize,
 
-        /// Communication file for NCCL ID exchange
-        #[arg(long, default_value = "nccl_id.txt")]
+        #[arg(long, hide = true, default_value = "nccl_id.txt")]
         comm_file: String,
     },
 
@@ -187,32 +178,108 @@ fn main() -> Result<()> {
             tokenizer: tokenizer_path,
             model,
             output,
-            lr,
             batch_size,
             epochs,
             seq_len,
-            gpu,
-            gpu_id,
+            lr,
+            num_gpus,
             grad_accum,
-            world_size,
             rank,
             comm_file,
         } => {
-            // For distributed training, use rank as GPU ID
-            let actual_gpu_id = if world_size > 1 { rank } else { gpu_id };
-            let device = get_device(gpu, actual_gpu_id)?;
+            // If num_gpus > 1 and rank == 0, spawn child processes for distributed training
+            if num_gpus > 1 && rank == 0 {
+                use std::process::{Command, Stdio};
 
-            // Setup distributed config
+                let data_path = data
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--data is required for multi-GPU training"))?;
+
+                let effective_batch = batch_size * grad_accum * num_gpus;
+                println!("=== Distributed Training ===");
+                println!("GPUs: {}", num_gpus);
+                println!("Model: {}", model);
+                println!(
+                    "Effective batch: {} ({} x {} x {})",
+                    effective_batch, batch_size, grad_accum, num_gpus
+                );
+                println!();
+
+                let exe = std::env::current_exe()?;
+                let _ = std::fs::remove_file(&comm_file);
+
+                let mut children = Vec::new();
+                for r in 0..num_gpus {
+                    println!("Launching rank {} on GPU {}...", r, r);
+
+                    let child = Command::new(&exe)
+                        .env("CUDA_VISIBLE_DEVICES", r.to_string())
+                        .arg("train")
+                        .arg("--data")
+                        .arg(data_path)
+                        .arg("--tokenizer")
+                        .arg(&tokenizer_path)
+                        .arg("--model")
+                        .arg(&model)
+                        .arg("--output")
+                        .arg(&output)
+                        .arg("--batch-size")
+                        .arg(batch_size.to_string())
+                        .arg("--epochs")
+                        .arg(epochs.to_string())
+                        .arg("--seq-len")
+                        .arg(seq_len.to_string())
+                        .arg("--lr")
+                        .arg(lr.to_string())
+                        .arg("--num-gpus")
+                        .arg(num_gpus.to_string())
+                        .arg("--grad-accum")
+                        .arg(grad_accum.to_string())
+                        .arg("--rank")
+                        .arg(r.to_string())
+                        .arg("--comm-file")
+                        .arg(&comm_file)
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+
+                    children.push(child);
+                    if r == 0 {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+
+                println!("\nWaiting for all processes...");
+                let mut all_ok = true;
+                for (r, mut c) in children.into_iter().enumerate() {
+                    if !c.wait()?.success() {
+                        eprintln!("Rank {} failed", r);
+                        all_ok = false;
+                    }
+                }
+                let _ = std::fs::remove_file(&comm_file);
+
+                if all_ok {
+                    println!("\n=== Training complete ===");
+                } else {
+                    anyhow::bail!("Distributed training failed");
+                }
+                return Ok(());
+            }
+
+            // Single GPU or worker process
+            let device = get_device(true, rank)?;
+
             let dist_config = hermes_llm::DistributedConfig {
-                world_size,
+                world_size: num_gpus,
                 rank,
                 comm_file,
             };
 
             if dist_config.is_distributed() {
-                info!("Distributed training: rank {}/{}", rank, world_size);
+                info!("Distributed training: rank {}/{}", rank, num_gpus);
             }
-            info!("Using GPU {}", actual_gpu_id);
+            info!("Using GPU {}", rank);
             info!("Using device: {:?}", device);
 
             let tokenizer = if std::path::Path::new(&tokenizer_path).exists() {

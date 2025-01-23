@@ -72,56 +72,46 @@ hermes-llm info --model gpt2-small
 
 ## Multi-GPU Training (NCCL)
 
-For distributed training across multiple NVIDIA GPUs with gradient synchronization:
-
-### Quick Start
+For distributed training, just add `--num-gpus`:
 
 ```bash
 # Build with NCCL support
 cargo build --release -p hermes-llm --features nccl
 
-# Launch on 4 GPUs
-./scripts/train_nccl.sh 4 corpus.jsonl tokenizer.json gpt2-small
+# Single GPU
+hermes-llm train --data corpus.jsonl --tokenizer tok.json --model gpt2-small
+
+# 4 GPUs (automatically uses NCCL)
+hermes-llm train --data corpus.jsonl --tokenizer tok.json --model gpt2-small --num-gpus 4
 ```
 
-### Manual Launch
+### Training Options
 
-```bash
-# Terminal 1 (GPU 0, rank 0 - creates NCCL ID)
-CUDA_VISIBLE_DEVICES=0 cargo run --release -p hermes-llm --features nccl -- train \
-  --data corpus.jsonl --tokenizer tokenizer.json --model gpt2-small \
-  --world-size 4 --rank 0 --batch-size 32 --grad-accum 4
-
-# Terminal 2 (GPU 1, rank 1)
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p hermes-llm --features nccl -- train \
-  --data corpus.jsonl --tokenizer tokenizer.json --model gpt2-small \
-  --world-size 4 --rank 1 --batch-size 32 --grad-accum 4
-
-# ... repeat for ranks 2, 3
-```
-
-### CLI Options for Distributed Training
-
-| Option             | Description                                               |
-| ------------------ | --------------------------------------------------------- |
-| `--world-size N`   | Total number of GPUs/processes                            |
-| `--rank N`         | This process's rank (0 to N-1)                            |
-| `--gpu-id N`       | GPU device index (auto-set from rank in distributed mode) |
-| `--grad-accum N`   | Gradient accumulation steps                               |
-| `--comm-file PATH` | File for NCCL ID exchange (default: nccl_id.txt)          |
+| Option         | Default     | Description                      |
+| -------------- | ----------- | -------------------------------- |
+| `--data`       | (stdin)     | Training data file               |
+| `--tokenizer`  | required    | Tokenizer file path              |
+| `--model`      | tiny        | Model preset                     |
+| `--num-gpus`   | 1           | Number of GPUs (>1 enables NCCL) |
+| `--batch-size` | 32          | Batch size per GPU               |
+| `--grad-accum` | 1           | Gradient accumulation steps      |
+| `--epochs`     | 1           | Training epochs                  |
+| `--lr`         | 3e-4        | Learning rate                    |
+| `--output`     | checkpoints | Output directory                 |
 
 ### Effective Batch Size
 
 ```
-effective_batch = batch_size × grad_accum × world_size
+effective_batch = batch_size × grad_accum × num_gpus
 ```
 
-Example: `--batch-size 32 --grad-accum 4 --world-size 4` = 512 effective batch
+Example: `--batch-size 32 --grad-accum 4 --num-gpus 4` = 512 effective batch
 
 ## Model Configurations
 
 | Config      | Layers | Hidden | Heads | Params |
 | ----------- | ------ | ------ | ----- | ------ |
+| nano        | 2      | 64     | 2     | ~500K  |
 | tiny        | 4      | 128    | 4     | ~1M    |
 | gpt2-small  | 12     | 768    | 12    | ~124M  |
 | gpt2-medium | 24     | 1024   | 16    | ~355M  |
