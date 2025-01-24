@@ -705,6 +705,258 @@ impl SegmentMerger {
     }
 }
 
+/// Trained vector index structures for rebuilding segments with ANN indexes
+pub struct TrainedVectorStructures {
+    /// Trained centroids per field_id
+    pub centroids: rustc_hash::FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
+    /// Trained PQ codebooks per field_id (for ScaNN)
+    pub codebooks: rustc_hash::FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
+}
+
+impl SegmentMerger {
+    /// Merge segments and rebuild dense vectors with ANN indexes using trained structures
+    ///
+    /// This is called after centroids/codebooks are trained at index level.
+    /// It collects Flat vectors from all segments and builds IVF-RaBitQ or ScaNN indexes.
+    pub async fn merge_with_ann<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        new_segment_id: SegmentId,
+        trained: &TrainedVectorStructures,
+    ) -> Result<SegmentMeta> {
+        let files = SegmentFiles::new(new_segment_id.0);
+
+        // Build merged term dictionary and postings
+        let mut term_dict_data = Vec::new();
+        let mut postings_data = Vec::new();
+        let mut stats = MergeStats::default();
+        self.merge_postings_with_stats(
+            segments,
+            &mut term_dict_data,
+            &mut postings_data,
+            &mut stats,
+        )
+        .await?;
+
+        // Stack store files
+        let mut store_data = Vec::new();
+        {
+            let mut store_merger = StoreMerger::new(&mut store_data);
+            for segment in segments {
+                let raw_blocks = segment.store_raw_blocks();
+                let data_slice = segment.store_data_slice();
+                store_merger.append_store(data_slice, &raw_blocks).await?;
+            }
+            store_merger.finish()?;
+        }
+
+        // Write text index files
+        dir.write(&files.term_dict, &term_dict_data).await?;
+        dir.write(&files.postings, &postings_data).await?;
+        dir.write(&files.store, &store_data).await?;
+
+        drop(term_dict_data);
+        drop(postings_data);
+        drop(store_data);
+
+        // Build ANN indexes using trained centroids
+        let vectors_bytes = self
+            .build_ann_vectors(dir, segments, &files, trained)
+            .await?;
+
+        // Merge field stats
+        let mut merged_field_stats: rustc_hash::FxHashMap<u32, FieldStats> =
+            rustc_hash::FxHashMap::default();
+        for segment in segments {
+            for (&field_id, field_stats) in &segment.meta().field_stats {
+                let entry = merged_field_stats.entry(field_id).or_default();
+                entry.total_tokens += field_stats.total_tokens;
+                entry.doc_count += field_stats.doc_count;
+            }
+        }
+
+        let total_docs: u32 = segments.iter().map(|s| s.num_docs()).sum();
+        let meta = SegmentMeta {
+            id: new_segment_id.0,
+            num_docs: total_docs,
+            field_stats: merged_field_stats,
+        };
+
+        dir.write(&files.meta, &meta.serialize()?).await?;
+
+        log::info!(
+            "ANN merge complete: {} docs, vectors={}",
+            total_docs,
+            MergeStats::format_memory(vectors_bytes)
+        );
+
+        Ok(meta)
+    }
+
+    /// Build ANN indexes from Flat vectors using trained centroids
+    async fn build_ann_vectors<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        files: &SegmentFiles,
+        trained: &TrainedVectorStructures,
+    ) -> Result<usize> {
+        use crate::dsl::VectorIndexType;
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
+
+        for (field, entry) in self.schema.fields() {
+            if !matches!(entry.field_type, FieldType::DenseVector) || !entry.indexed {
+                continue;
+            }
+
+            let config = match &entry.dense_vector_config {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Collect all Flat vectors from segments
+            let mut all_vectors: Vec<Vec<f32>> = Vec::new();
+            let mut all_doc_ids: Vec<u32> = Vec::new();
+            let mut doc_offset = 0u32;
+
+            for segment in segments {
+                if let Some(super::VectorIndex::Flat(flat_data)) =
+                    segment.vector_indexes().get(&field.0)
+                {
+                    for (vec, &local_doc_id) in
+                        flat_data.vectors.iter().zip(flat_data.doc_ids.iter())
+                    {
+                        all_vectors.push(vec.clone());
+                        all_doc_ids.push(doc_offset + local_doc_id);
+                    }
+                }
+                doc_offset += segment.num_docs();
+            }
+
+            if all_vectors.is_empty() {
+                continue;
+            }
+
+            let dim = config.index_dim();
+
+            // Build ANN index based on index type and available trained structures
+            match config.index_type {
+                VectorIndexType::IvfRaBitQ => {
+                    if let Some(centroids) = trained.centroids.get(&field.0) {
+                        // Create RaBitQ codebook for the dimension
+                        let rabitq_config = crate::structures::RaBitQConfig::new(dim);
+                        let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
+
+                        // Build IVF-RaBitQ index
+                        let ivf_config = crate::structures::IVFRaBitQConfig::new(dim)
+                            .with_store_raw(config.store_raw);
+                        let ivf_index = crate::structures::IVFRaBitQIndex::build(
+                            ivf_config,
+                            centroids,
+                            &codebook,
+                            &all_vectors,
+                            Some(&all_doc_ids),
+                        );
+
+                        let index_data = super::builder::IVFRaBitQIndexData {
+                            centroids: (**centroids).clone(),
+                            codebook,
+                            index: ivf_index,
+                        };
+                        let bytes = index_data
+                            .to_bytes()
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                        field_indexes.push((field.0, 1u8, bytes)); // 1 = IVF-RaBitQ
+
+                        log::info!(
+                            "Built IVF-RaBitQ index for field {} with {} vectors",
+                            field.0,
+                            all_vectors.len()
+                        );
+                        continue;
+                    }
+                }
+                VectorIndexType::ScaNN => {
+                    if let (Some(centroids), Some(codebook)) = (
+                        trained.centroids.get(&field.0),
+                        trained.codebooks.get(&field.0),
+                    ) {
+                        // Build ScaNN (IVF-PQ) index
+                        let ivf_pq_config = crate::structures::IVFPQConfig::new(dim);
+                        let ivf_pq_index = crate::structures::IVFPQIndex::build(
+                            ivf_pq_config,
+                            centroids,
+                            codebook,
+                            &all_vectors,
+                            Some(&all_doc_ids),
+                        );
+
+                        let index_data = super::builder::ScaNNIndexData {
+                            centroids: (**centroids).clone(),
+                            codebook: (**codebook).clone(),
+                            index: ivf_pq_index,
+                        };
+                        let bytes = index_data
+                            .to_bytes()
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                        field_indexes.push((field.0, 2u8, bytes)); // 2 = ScaNN
+
+                        log::info!(
+                            "Built ScaNN index for field {} with {} vectors",
+                            field.0,
+                            all_vectors.len()
+                        );
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+
+            // Fallback: keep as Flat if no trained structures available
+            let flat_data = super::builder::FlatVectorData {
+                dim,
+                vectors: all_vectors,
+                doc_ids: all_doc_ids,
+            };
+            let bytes = serde_json::to_vec(&flat_data)
+                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+            field_indexes.push((field.0, 3u8, bytes)); // 3 = Flat
+        }
+
+        // Write vectors file
+        if !field_indexes.is_empty() {
+            field_indexes.sort_by_key(|(id, _, _)| *id);
+
+            let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
+            let mut output = Vec::new();
+
+            output.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
+
+            let mut current_offset = header_size as u64;
+            for (field_id, index_type, data) in &field_indexes {
+                output.write_u32::<LittleEndian>(*field_id)?;
+                output.write_u8(*index_type)?;
+                output.write_u64::<LittleEndian>(current_offset)?;
+                output.write_u64::<LittleEndian>(data.len() as u64)?;
+                current_offset += data.len() as u64;
+            }
+
+            for (_, _, data) in field_indexes {
+                output.extend_from_slice(&data);
+            }
+
+            let output_size = output.len();
+            dir.write(&files.vectors, &output).await?;
+            return Ok(output_size);
+        }
+
+        Ok(0)
+    }
+}
+
 /// Delete segment files from directory
 pub async fn delete_segment<D: Directory + DirectoryWriter>(
     dir: &D,

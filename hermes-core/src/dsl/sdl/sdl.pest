@@ -47,8 +47,10 @@ string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 //   field title: text [indexed, stored]
 //   field body: text<en_stem> [indexed]
 //   field name: text<default> [indexed, stored]
-//   field embedding: dense_vector<768> [indexed<rabitq, centroids: "c.bin">]
-//   field embedding: dense_vector<dims: 768, mrl_dim: 256> [indexed<scann, centroids: "c.bin", codebook: "pq.bin">]
+//   field embedding: dense_vector<768> [indexed<rabitq>]
+//   field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>]
+//   field embedding: dense_vector<768> [indexed<scann, num_clusters: 1024, nprobe: 64, mrl_dim: 256>]
+//   field embedding: dense_vector<768> [indexed<flat>]  # brute-force, no ANN index
 field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (sparse_vector_config | dense_vector_config | tokenizer_spec)? ~ attributes? }
 
 // Field types
@@ -75,12 +77,15 @@ quantization_spec = { "float32" | "float16" | "uint8" | "uint4" | "f32" | "f16" 
 weight_threshold_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 
 // Dense vector configuration - only dimension
-// All index-related params (index type, centroids, codebook, nprobe, mrl_dim) are in indexed<...>
+// All index-related params (index type, num_clusters, nprobe, mrl_dim, build_threshold) are in indexed<...>
 // Examples:
-//   field embedding: dense_vector<768> [indexed]
-//   field embedding: dense_vector<768> [indexed<rabitq, centroids: "c.bin">]
-//   field embedding: dense_vector<768> [indexed<scann, centroids: "c.bin", codebook: "pq.bin", nprobe: 64, mrl_dim: 256>]
-//   field embedding: dense_vector<768> [stored]  # not indexed, just stored
+//   field embedding: dense_vector<768> [indexed]                           # default RaBitQ
+//   field embedding: dense_vector<768> [indexed<rabitq>]                   # explicit RaBitQ
+//   field embedding: dense_vector<768> [indexed<ivf_rabitq>]               # IVF-RaBitQ (auto clusters)
+//   field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>]
+//   field embedding: dense_vector<768> [indexed<scann, num_clusters: 1024, nprobe: 64>]
+//   field embedding: dense_vector<768> [indexed<flat>]                     # brute-force only
+//   field embedding: dense_vector<768> [stored]                            # not indexed, just stored
 dense_vector_config = { "<" ~ dense_vector_params ~ ">" }
 dense_vector_params = { dense_vector_keyword_params | dense_vector_positional_params }
 
@@ -112,16 +117,18 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 // Examples:
 //   indexed
 //   indexed<positions>  # for phrase queries
-//   indexed<rabitq>
-//   indexed<rabitq, centroids: "centroids.bin">
-//   indexed<rabitq, centroids: "c.bin", nprobe: 64>
-//   indexed<scann, centroids: "c.bin", codebook: "pq.bin", mrl_dim: 256>
+//   indexed<flat>       # brute-force search (no ANN index)
+//   indexed<rabitq>     # RaBitQ binary quantization
+//   indexed<ivf_rabitq> # IVF-RaBitQ (centroids trained from data)
+//   indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>
+//   indexed<scann, num_clusters: 1024, nprobe: 64, mrl_dim: 256>
+//   indexed<rabitq, build_threshold: 5000>  # build ANN after 5000 vectors
 //   indexed<quantization: uint8, weight_threshold: 0.1>  # for sparse vectors
 //   indexed<positions, quantization: uint8>  # sparse with positions
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | centroids_kwarg | codebook_kwarg | nprobe_kwarg | mrl_dim_kwarg | quantization_kwarg | weight_threshold_kwarg | query_config_block | positions_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | mrl_dim_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | query_config_block | positions_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -130,16 +137,16 @@ positions_kwarg = { "positions" | "ordinal" | "token_position" }
 mrl_dim_kwarg = { "mrl_dim" ~ ":" ~ mrl_dim_spec }
 mrl_dim_spec = @{ ASCII_DIGIT+ }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
-index_type_spec = { "scann" | "rabitq" }
-centroids_kwarg = { "centroids" ~ ":" ~ centroids_path }
-codebook_kwarg = { "codebook" ~ ":" ~ codebook_path }
+index_type_spec = { "flat" | "scann" | "ivf_rabitq" | "rabitq" }
+num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }
+num_clusters_spec = @{ ASCII_DIGIT+ }
+build_threshold_kwarg = { "build_threshold" ~ ":" ~ build_threshold_spec }
+build_threshold_spec = @{ ASCII_DIGIT+ }
 nprobe_kwarg = { "nprobe" ~ ":" ~ nprobe_spec }
 quantization_kwarg = { "quantization" ~ ":" ~ quantization_spec }
 weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
-centroids_path = { "\"" ~ path_chars ~ "\"" }
-codebook_path = { "\"" ~ path_chars ~ "\"" }
-path_chars = @{ (!("\"" ) ~ ANY)* }
 nprobe_spec = @{ ASCII_DIGIT+ }
+path_chars = @{ (!("\"" ) ~ ANY)* }
 
 // Query-time configuration for sparse vectors
 // Example: query<tokenizer: "model/name", weighting: idf>

@@ -17,6 +17,8 @@ use lasso::{Rodeo, Spur};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::compression::CompressionLevel;
 use crate::directories::{Directory, DirectoryWriter};
@@ -24,6 +26,54 @@ use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
 use crate::tokenizer::BoxedTokenizer;
 use crate::{DocId, Result};
+
+/// Flat vector data for brute-force search (accumulating state)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlatVectorData {
+    pub dim: usize,
+    pub vectors: Vec<Vec<f32>>,
+    pub doc_ids: Vec<u32>,
+}
+
+/// IVF-RaBitQ index data with embedded centroids and codebook
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IVFRaBitQIndexData {
+    pub index: crate::structures::IVFRaBitQIndex,
+    pub centroids: crate::structures::CoarseCentroids,
+    pub codebook: crate::structures::RaBitQCodebook,
+}
+
+impl IVFRaBitQIndexData {
+    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
+        serde_json::from_slice(data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// ScaNN index data with embedded centroids and codebook
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScaNNIndexData {
+    pub index: crate::structures::IVFPQIndex,
+    pub centroids: crate::structures::CoarseCentroids,
+    pub codebook: crate::structures::PQCodebook,
+}
+
+impl ScaNNIndexData {
+    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
+        serde_json::from_slice(data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
 
 /// Size of the document store buffer before writing to disk
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
@@ -813,7 +863,6 @@ impl SegmentBuilder {
     /// - For each field: field_id (u32), index_type (u8), offset (u64), length (u64)
     /// - Data: concatenated serialized indexes (RaBitQ, IVF-RaBitQ, or ScaNN)
     fn build_vectors_file(&self) -> Result<Vec<u8>> {
-        use crate::dsl::VectorIndexType;
         use byteorder::{LittleEndian, WriteBytesExt};
 
         // Build all indexes first: (field_id, index_type, data)
@@ -841,95 +890,17 @@ impl SegmentBuilder {
                 builder.get_vectors()
             };
 
-            let (index_type, index_bytes) = match dense_config.map(|c| c.index_type) {
-                Some(VectorIndexType::ScaNN) => {
-                    // ScaNN (IVF-PQ) index
-                    let config = dense_config.unwrap();
-                    let centroids_path =
-                        config.coarse_centroids_path.as_ref().ok_or_else(|| {
-                            crate::Error::Schema("ScaNN requires coarse_centroids_path".into())
-                        })?;
-                    let codebook_path = config.pq_codebook_path.as_ref().ok_or_else(|| {
-                        crate::Error::Schema("ScaNN requires pq_codebook_path".into())
-                    })?;
-
-                    let coarse_centroids = crate::structures::CoarseCentroids::load(
-                        std::path::Path::new(centroids_path),
-                    )
-                    .map_err(crate::Error::Io)?;
-
-                    let pq_codebook =
-                        crate::structures::PQCodebook::load(std::path::Path::new(codebook_path))
-                            .map_err(crate::Error::Io)?;
-
-                    let doc_ids: Vec<u32> = builder.doc_ids.clone();
-                    let ivfpq_config = crate::structures::IVFPQConfig::new(index_dim)
-                        .with_store_raw(config.store_raw);
-
-                    let ivfpq_index = crate::structures::IVFPQIndex::build(
-                        ivfpq_config,
-                        &coarse_centroids,
-                        &pq_codebook,
-                        &vectors,
-                        Some(doc_ids.as_slice()),
-                    );
-
-                    // Serialize ScaNN index (IVFPQIndex only - codebook loaded separately)
-                    let bytes = ivfpq_index
-                        .to_bytes()
-                        .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                    (2u8, bytes) // 2 = ScaNN
-                }
-                Some(VectorIndexType::IvfRaBitQ) => {
-                    // IVF-RaBitQ index
-                    let config = dense_config.unwrap();
-                    let centroids_path =
-                        config.coarse_centroids_path.as_ref().ok_or_else(|| {
-                            crate::Error::Schema("IVF-RaBitQ requires coarse_centroids_path".into())
-                        })?;
-
-                    match crate::structures::CoarseCentroids::load(std::path::Path::new(
-                        centroids_path,
-                    )) {
-                        Ok(coarse_centroids) => {
-                            let ivf_cfg = crate::structures::IVFRaBitQConfig::new(index_dim)
-                                .with_store_raw(config.store_raw);
-                            let rabitq_codebook = crate::structures::RaBitQCodebook::new(
-                                crate::structures::RaBitQConfig::new(index_dim),
-                            );
-                            let doc_ids: Vec<u32> = builder.doc_ids.clone();
-                            let ivf_index = crate::structures::IVFRaBitQIndex::build(
-                                ivf_cfg,
-                                &coarse_centroids,
-                                &rabitq_codebook,
-                                &vectors,
-                                Some(doc_ids.as_slice()),
-                            );
-                            let bytes = ivf_index
-                                .to_bytes()
-                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                            (1u8, bytes) // 1 = IVF-RaBitQ
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to load centroids: {}, falling back to RaBitQ", e);
-                            let cfg = crate::structures::RaBitQConfig::new(index_dim);
-                            let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, true);
-                            let bytes = serde_json::to_vec(&idx)
-                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                            (0u8, bytes) // 0 = RaBitQ
-                        }
-                    }
-                }
-                _ => {
-                    // Default: RaBitQ
-                    let store_raw = dense_config.map(|c| c.store_raw).unwrap_or(true);
-                    let cfg = crate::structures::RaBitQConfig::new(index_dim);
-                    let idx = crate::structures::RaBitQIndex::build(cfg, &vectors, store_raw);
-                    let bytes = serde_json::to_vec(&idx)
-                        .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                    (0u8, bytes) // 0 = RaBitQ
-                }
+            // During normal indexing, segments always store Flat (raw vectors).
+            // ANN indexes are built at index-level via build_vector_index() which
+            // trains centroids/codebooks once from all vectors and triggers rebuild.
+            let flat_data = FlatVectorData {
+                dim: index_dim,
+                vectors: vectors.clone(),
+                doc_ids: builder.doc_ids.clone(),
             };
+            let index_bytes = serde_json::to_vec(&flat_data)
+                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+            let index_type = 3u8; // 3 = Flat
 
             field_indexes.push((field_id, index_type, index_bytes));
         }

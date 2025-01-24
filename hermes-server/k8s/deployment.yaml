@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-server
+  namespace: hermes
+  labels:
+    app.kubernetes.io/name: hermes-server
+    app.kubernetes.io/component: server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hermes-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hermes-server
+    spec:
+      containers:
+        - name: hermes-server
+          image: ghcr.io/spacefrontiers/hermes/hermes-server:latest
+          imagePullPolicy: Always
+          args:
+            - "--addr"
+            - "0.0.0.0:50051"
+            - "--data-dir"
+            - "/data"
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hermes-data

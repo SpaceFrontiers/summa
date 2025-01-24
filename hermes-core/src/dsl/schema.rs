@@ -90,6 +90,8 @@ impl PositionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorIndexType {
+    /// Flat - brute-force search over raw vectors (accumulating state)
+    Flat,
     /// RaBitQ - binary quantization, good for small datasets (<100K)
     #[default]
     RaBitQ,
@@ -99,24 +101,28 @@ pub enum VectorIndexType {
     ScaNN,
 }
 
-/// Configuration for dense vector fields using RaBitQ, IVF-RaBitQ, or ScaNN
+/// Configuration for dense vector fields using Flat, RaBitQ, IVF-RaBitQ, or ScaNN
+///
+/// Indexes operate in two states:
+/// - **Flat (accumulating)**: Brute-force search over raw vectors. Used when vector count
+///   is below `build_threshold` or before `build_index` is called.
+/// - **Built (ANN)**: Fast approximate nearest neighbor search using trained structures.
+///   Centroids and codebooks are trained from data and stored within the segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenseVectorConfig {
     /// Dimensionality of vectors
     pub dim: usize,
-    /// Vector index algorithm to use
+    /// Target vector index algorithm (Flat, RaBitQ, IVF-RaBitQ, or ScaNN)
+    /// When in accumulating state, search uses brute-force regardless of this setting.
     #[serde(default)]
     pub index_type: VectorIndexType,
     /// Whether to store raw vectors for re-ranking (increases storage but improves accuracy)
     #[serde(default = "default_store_raw")]
     pub store_raw: bool,
-    /// Path to pre-trained coarse centroids file for IVF indexes
-    /// Required for IVF-RaBitQ and ScaNN
+    /// Number of IVF clusters for IVF-RaBitQ and ScaNN (default: sqrt(n) capped at 4096)
+    /// If None, automatically determined based on dataset size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coarse_centroids_path: Option<String>,
-    /// Path to pre-trained PQ codebook file for ScaNN
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pq_codebook_path: Option<String>,
+    pub num_clusters: Option<usize>,
     /// Number of clusters to probe during search (default: 32)
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
@@ -125,6 +131,11 @@ pub struct DenseVectorConfig {
     /// Must be <= dim. If None, uses full dim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mrl_dim: Option<usize>,
+    /// Minimum number of vectors required before building ANN index.
+    /// Below this threshold, brute-force (Flat) search is used.
+    /// Default: 1000 for RaBitQ, 10000 for IVF-RaBitQ/ScaNN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_threshold: Option<usize>,
 }
 
 fn default_store_raw() -> bool {
@@ -141,40 +152,49 @@ impl DenseVectorConfig {
             dim,
             index_type: VectorIndexType::RaBitQ,
             store_raw: true,
-            coarse_centroids_path: None,
-            pq_codebook_path: None,
+            num_clusters: None,
             nprobe: 32,
             mrl_dim: None,
+            build_threshold: None,
         }
     }
 
-    pub fn with_ivf(dim: usize, centroids_path: String, nprobe: usize) -> Self {
+    /// Create IVF-RaBitQ configuration
+    pub fn with_ivf(dim: usize, num_clusters: Option<usize>, nprobe: usize) -> Self {
         Self {
             dim,
             index_type: VectorIndexType::IvfRaBitQ,
             store_raw: true,
-            coarse_centroids_path: Some(centroids_path),
-            pq_codebook_path: None,
+            num_clusters,
             nprobe,
             mrl_dim: None,
+            build_threshold: None,
         }
     }
 
-    /// Create ScaNN configuration with pre-trained centroids and codebook
-    pub fn with_scann(
-        dim: usize,
-        centroids_path: String,
-        codebook_path: String,
-        nprobe: usize,
-    ) -> Self {
+    /// Create ScaNN configuration
+    pub fn with_scann(dim: usize, num_clusters: Option<usize>, nprobe: usize) -> Self {
         Self {
             dim,
             index_type: VectorIndexType::ScaNN,
             store_raw: true,
-            coarse_centroids_path: Some(centroids_path),
-            pq_codebook_path: Some(codebook_path),
+            num_clusters,
             nprobe,
             mrl_dim: None,
+            build_threshold: None,
+        }
+    }
+
+    /// Create Flat (brute-force) configuration - no ANN index
+    pub fn flat(dim: usize) -> Self {
+        Self {
+            dim,
+            index_type: VectorIndexType::Flat,
+            store_raw: true,
+            num_clusters: None,
+            nprobe: 0,
+            mrl_dim: None,
+            build_threshold: None,
         }
     }
 
@@ -183,10 +203,10 @@ impl DenseVectorConfig {
             dim,
             index_type: VectorIndexType::RaBitQ,
             store_raw: false,
-            coarse_centroids_path: None,
-            pq_codebook_path: None,
+            num_clusters: None,
             nprobe: 32,
             mrl_dim: None,
+            build_threshold: None,
         }
     }
 
@@ -196,19 +216,57 @@ impl DenseVectorConfig {
         self
     }
 
+    /// Set build threshold for auto-building ANN index
+    pub fn with_build_threshold(mut self, threshold: usize) -> Self {
+        self.build_threshold = Some(threshold);
+        self
+    }
+
+    /// Set number of IVF clusters
+    pub fn with_num_clusters(mut self, num_clusters: usize) -> Self {
+        self.num_clusters = Some(num_clusters);
+        self
+    }
+
     /// Get the effective dimension for indexing (mrl_dim if set, otherwise dim)
     pub fn index_dim(&self) -> usize {
         self.mrl_dim.unwrap_or(self.dim)
     }
 
-    /// Check if this config uses IVF (has coarse centroids)
+    /// Check if this config uses IVF
     pub fn uses_ivf(&self) -> bool {
-        self.coarse_centroids_path.is_some()
+        matches!(
+            self.index_type,
+            VectorIndexType::IvfRaBitQ | VectorIndexType::ScaNN
+        )
     }
 
     /// Check if this config uses ScaNN
     pub fn uses_scann(&self) -> bool {
         self.index_type == VectorIndexType::ScaNN
+    }
+
+    /// Check if this config is flat (brute-force)
+    pub fn is_flat(&self) -> bool {
+        self.index_type == VectorIndexType::Flat
+    }
+
+    /// Get the default build threshold for this index type
+    pub fn default_build_threshold(&self) -> usize {
+        self.build_threshold.unwrap_or(match self.index_type {
+            VectorIndexType::Flat => usize::MAX, // Never auto-build
+            VectorIndexType::RaBitQ => 1000,
+            VectorIndexType::IvfRaBitQ | VectorIndexType::ScaNN => 10000,
+        })
+    }
+
+    /// Calculate optimal number of clusters for given vector count
+    pub fn optimal_num_clusters(&self, num_vectors: usize) -> usize {
+        self.num_clusters.unwrap_or_else(|| {
+            // sqrt(n) heuristic, capped at 4096
+            let optimal = (num_vectors as f64).sqrt() as usize;
+            optimal.clamp(16, 4096)
+        })
     }
 }
 

@@ -15,10 +15,14 @@ use crate::{DocId, Error, Result};
 use super::store::{AsyncStoreReader, RawStoreBlock};
 use super::types::{SegmentFiles, SegmentId, SegmentMeta};
 
-/// Vector index type - RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
+use super::builder::FlatVectorData;
+
+/// Vector index type - Flat, RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
+    /// Flat - brute-force search over raw vectors (accumulating state)
+    Flat(Arc<FlatVectorData>),
     /// RaBitQ - binary quantization, good for small datasets
     RaBitQ(Arc<RaBitQIndex>),
     /// IVF-RaBitQ - inverted file with RaBitQ, good for medium datasets
@@ -170,6 +174,11 @@ impl AsyncSegmentReader {
     /// Get sparse indexes for all fields
     pub fn sparse_indexes(&self) -> &FxHashMap<u32, SparseIndex> {
         &self.sparse_indexes
+    }
+
+    /// Get vector indexes for all fields
+    pub fn vector_indexes(&self) -> &FxHashMap<u32, VectorIndex> {
+        &self.vector_indexes
     }
 
     /// Get term dictionary stats for debugging
@@ -363,6 +372,24 @@ impl AsyncSegmentReader {
         };
 
         let results: Vec<(u32, f32)> = match index {
+            VectorIndex::Flat(flat_data) => {
+                // Brute-force search over raw vectors using SIMD-accelerated distance
+                use crate::structures::simd::squared_euclidean_distance;
+
+                let mut candidates: Vec<(u32, f32)> = flat_data
+                    .vectors
+                    .iter()
+                    .zip(flat_data.doc_ids.iter())
+                    .map(|(vec, &doc_id)| {
+                        let dist = squared_euclidean_distance(effective_query, vec);
+                        (doc_id, dist)
+                    })
+                    .collect();
+                candidates
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                candidates.truncate(k);
+                candidates
+            }
             VectorIndex::RaBitQ(rabitq) => rabitq
                 .search(effective_query, k, rerank_factor)
                 .into_iter()
@@ -620,93 +647,56 @@ impl AsyncSegmentReader {
         for (field_id, index_type, offset, length) in entries {
             // Read only this index's data
             let data = handle.read_bytes_range(offset..offset + length).await?;
-            let field = crate::dsl::Field(field_id);
+            let _field = crate::dsl::Field(field_id);
 
             match index_type {
+                3 => {
+                    // Flat (brute-force) - raw vectors for accumulating state
+                    if let Ok(flat_data) = serde_json::from_slice::<FlatVectorData>(data.as_slice())
+                    {
+                        indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
+                    }
+                }
                 2 => {
-                    // ScaNN (IVF-PQ)
-                    if let Ok(ivfpq_index) = IVFPQIndex::from_bytes(data.as_slice()) {
-                        // Load coarse centroids if not already loaded
-                        if coarse_centroids.is_none()
-                            && let Some(entry) = schema.get_field_entry(field)
-                            && let Some(ref config) = entry.dense_vector_config
-                            && let Some(ref path) = config.coarse_centroids_path
-                            && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
-                        {
-                            coarse_centroids = Some(Arc::new(c));
-                        }
-
-                        // Load PQ codebook
-                        if let Some(entry) = schema.get_field_entry(field)
-                            && let Some(ref config) = entry.dense_vector_config
-                            && let Some(ref path) = config.pq_codebook_path
-                            && let Ok(codebook) = PQCodebook::load(std::path::Path::new(path))
-                        {
-                            indexes.insert(
-                                field_id,
-                                VectorIndex::ScaNN {
-                                    index: Arc::new(ivfpq_index),
-                                    codebook: Arc::new(codebook),
-                                },
-                            );
-                        }
+                    // ScaNN (IVF-PQ) with embedded centroids and codebook
+                    use super::builder::ScaNNIndexData;
+                    if let Ok(scann_data) = ScaNNIndexData::from_bytes(data.as_slice()) {
+                        coarse_centroids = Some(Arc::new(scann_data.centroids));
+                        indexes.insert(
+                            field_id,
+                            VectorIndex::ScaNN {
+                                index: Arc::new(scann_data.index),
+                                codebook: Arc::new(scann_data.codebook),
+                            },
+                        );
                     }
                 }
                 1 => {
-                    // IVF-RaBitQ
-                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data.as_slice())
-                    {
-                        if coarse_centroids.is_none()
-                            && let Some(entry) = schema.get_field_entry(field)
-                            && let Some(ref config) = entry.dense_vector_config
-                            && let Some(ref path) = config.coarse_centroids_path
-                            && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
-                        {
-                            coarse_centroids = Some(Arc::new(c));
-                        }
-                        // Create a codebook for the IVF index
-                        let codebook = Arc::new(RaBitQCodebook::new(
-                            crate::structures::RaBitQConfig::new(ivf_index.config.dim),
-                        ));
+                    // IVF-RaBitQ with embedded centroids and codebook
+                    use super::builder::IVFRaBitQIndexData;
+                    if let Ok(ivf_data) = IVFRaBitQIndexData::from_bytes(data.as_slice()) {
+                        coarse_centroids = Some(Arc::new(ivf_data.centroids));
                         indexes.insert(
                             field_id,
                             VectorIndex::IVF {
-                                index: Arc::new(ivf_index),
-                                codebook,
+                                index: Arc::new(ivf_data.index),
+                                codebook: Arc::new(ivf_data.codebook),
                             },
                         );
                     }
                 }
                 0 => {
-                    // RaBitQ
+                    // RaBitQ (standalone)
                     if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data.as_slice())
                     {
                         indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
                     }
                 }
                 _ => {
-                    // Legacy format without type - try to auto-detect
-                    if let Ok(ivf_index) = serde_json::from_slice::<IVFRaBitQIndex>(data.as_slice())
+                    // Unknown type - try Flat first (most common in new indexes)
+                    if let Ok(flat_data) = serde_json::from_slice::<FlatVectorData>(data.as_slice())
                     {
-                        if coarse_centroids.is_none()
-                            && let Some(entry) = schema.get_field_entry(field)
-                            && let Some(ref config) = entry.dense_vector_config
-                            && let Some(ref path) = config.coarse_centroids_path
-                            && let Ok(c) = CoarseCentroids::load(std::path::Path::new(path))
-                        {
-                            coarse_centroids = Some(Arc::new(c));
-                        }
-                        // Create a codebook for the IVF index
-                        let codebook = Arc::new(RaBitQCodebook::new(
-                            crate::structures::RaBitQConfig::new(ivf_index.config.dim),
-                        ));
-                        indexes.insert(
-                            field_id,
-                            VectorIndex::IVF {
-                                index: Arc::new(ivf_index),
-                                codebook,
-                            },
-                        );
+                        indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
                     } else if let Ok(rabitq_index) =
                         serde_json::from_slice::<RaBitQIndex>(data.as_slice())
                     {

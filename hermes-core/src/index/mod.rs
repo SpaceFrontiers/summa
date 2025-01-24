@@ -10,17 +10,25 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use rustc_hash::FxHashMap;
+
 use crate::DocId;
 use crate::directories::{Directory, SliceCachingDirectory};
 use crate::dsl::{Document, Field, Schema};
 use crate::error::{Error, Result};
 use crate::segment::{SegmentId, SegmentReader};
 use crate::structures::BlockPostingList;
+use crate::structures::{CoarseCentroids, PQCodebook};
 
 #[cfg(feature = "native")]
 mod writer;
 #[cfg(feature = "native")]
 pub use writer::IndexWriter;
+
+#[cfg(feature = "native")]
+mod metadata;
+#[cfg(feature = "native")]
+pub use metadata::{FieldVectorMeta, INDEX_META_FILENAME, IndexMetadata, VectorIndexState};
 
 #[cfg(feature = "native")]
 mod helpers;
@@ -87,6 +95,10 @@ pub struct Index<D: Directory> {
     tokenizers: Arc<crate::tokenizer::TokenizerRegistry>,
     /// Cached global statistics for cross-segment IDF computation
     global_stats: crate::query::GlobalStatsCache,
+    /// Index-level trained centroids per field (loaded from metadata)
+    trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+    /// Index-level trained PQ codebooks per field (for ScaNN)
+    trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
     #[cfg(feature = "native")]
     thread_pool: Arc<rayon::ThreadPool>,
 }
@@ -103,8 +115,9 @@ impl<D: Directory> Index<D> {
             .map_err(|e| Error::Serialization(e.to_string()))?;
         let schema = Arc::new(schema);
 
-        // Read segment list
-        let segments = Self::load_segments(&directory, &schema, &config).await?;
+        // Load metadata and trained structures
+        let (segments, trained_centroids, trained_codebooks) =
+            Self::load_segments_and_trained(&directory, &schema, &config).await?;
 
         #[cfg(feature = "native")]
         let thread_pool = {
@@ -136,31 +149,35 @@ impl<D: Directory> Index<D> {
             default_fields,
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
             global_stats: crate::query::GlobalStatsCache::new(),
+            trained_centroids,
+            trained_codebooks,
             #[cfg(feature = "native")]
             thread_pool,
         })
     }
 
-    async fn load_segments(
+    /// Load segments and trained structures from metadata
+    async fn load_segments_and_trained(
         directory: &Arc<D>,
         schema: &Arc<Schema>,
         config: &IndexConfig,
-    ) -> Result<Vec<Arc<SegmentReader>>> {
-        // Read segments.json which lists all segment IDs
-        let segments_path = Path::new("segments.json");
-        if !directory.exists(segments_path).await? {
-            return Ok(Vec::new());
-        }
+    ) -> Result<(
+        Vec<Arc<SegmentReader>>,
+        FxHashMap<u32, Arc<CoarseCentroids>>,
+        FxHashMap<u32, Arc<PQCodebook>>,
+    )> {
+        // Load metadata
+        let meta = Self::load_metadata(directory).await?;
 
-        let segments_slice = directory.open_read(segments_path).await?;
-        let segments_bytes = segments_slice.read_bytes().await?;
-        let segment_ids: Vec<String> = serde_json::from_slice(segments_bytes.as_slice())
-            .map_err(|e| Error::Serialization(e.to_string()))?;
+        // Load trained centroids and codebooks
+        let (trained_centroids, trained_codebooks) =
+            meta.load_trained_structures(directory.as_ref()).await;
 
+        // Load segments
         let mut segments = Vec::new();
         let mut doc_id_offset = 0u32;
 
-        for id_str in segment_ids {
+        for id_str in meta.segments {
             let segment_id = SegmentId::from_hex(&id_str)
                 .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
             let reader = SegmentReader::open(
@@ -176,7 +193,20 @@ impl<D: Directory> Index<D> {
             segments.push(Arc::new(reader));
         }
 
-        Ok(segments)
+        Ok((segments, trained_centroids, trained_codebooks))
+    }
+
+    /// Load metadata from metadata.json
+    async fn load_metadata(directory: &Arc<D>) -> Result<IndexMetadata> {
+        let meta_path = Path::new(INDEX_META_FILENAME);
+        if directory.exists(meta_path).await.unwrap_or(false) {
+            let slice = directory.open_read(meta_path).await?;
+            let bytes = slice.read_bytes().await?;
+            let meta: IndexMetadata = serde_json::from_slice(bytes.as_slice())
+                .map_err(|e| Error::Serialization(e.to_string()))?;
+            return Ok(meta);
+        }
+        Ok(IndexMetadata::new())
     }
 
     /// Get the schema
@@ -250,8 +280,10 @@ impl<D: Directory> Index<D> {
     }
 
     /// Reload segments from directory (after new segments added)
+    /// Note: This only reloads segments, not trained structures (they are immutable once built)
     pub async fn reload(&self) -> Result<()> {
-        let new_segments = Self::load_segments(&self.directory, &self.schema, &self.config).await?;
+        let (new_segments, _, _) =
+            Self::load_segments_and_trained(&self.directory, &self.schema, &self.config).await?;
         *self.segments.write() = new_segments;
         // Invalidate global stats cache since segments changed
         self.global_stats.invalidate();
@@ -596,6 +628,8 @@ impl<D: Directory> Clone for Index<D> {
             default_fields: self.default_fields.clone(),
             tokenizers: Arc::clone(&self.tokenizers),
             global_stats: crate::query::GlobalStatsCache::new(),
+            trained_centroids: self.trained_centroids.clone(),
+            trained_codebooks: self.trained_codebooks.clone(),
             thread_pool: Arc::clone(&self.thread_pool),
         }
     }
@@ -1086,5 +1120,125 @@ mod tests {
             wand_docs, bool_docs,
             "WAND and Boolean should find same documents"
         );
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_threshold_switch() {
+        use crate::dsl::{DenseVectorConfig, VectorIndexType};
+
+        // Create schema with dense vector field configured for IVF-RaBitQ
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let embedding = schema_builder.add_dense_vector_field_with_config(
+            "embedding",
+            true, // indexed
+            true, // stored
+            DenseVectorConfig {
+                dim: 8,
+                index_type: VectorIndexType::IvfRaBitQ,
+                store_raw: true,
+                num_clusters: Some(4), // Small for test
+                nprobe: 2,
+                mrl_dim: None,
+                build_threshold: Some(50), // Build when we have 50+ vectors
+            },
+        );
+        let schema = schema_builder.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig::default();
+
+        // Phase 1: Add vectors below threshold (should use Flat index)
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Add 30 documents (below threshold of 50)
+        for i in 0..30 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("Document {}", i));
+            // Simple embedding: [i, i, i, i, i, i, i, i] normalized
+            let vec: Vec<f32> = (0..8).map(|_| (i as f32) / 30.0).collect();
+            doc.add_dense_vector(embedding, vec);
+            writer.add_document(doc).await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        // Open index and verify it's using Flat (not built yet)
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        assert!(
+            index.trained_centroids.is_empty(),
+            "Should not have trained centroids below threshold"
+        );
+
+        // Search should work with Flat index
+        let query_vec: Vec<f32> = vec![0.5; 8];
+        let segments = index.segment_readers();
+        assert!(!segments.is_empty());
+
+        let results = segments[0]
+            .search_dense_vector(
+                embedding,
+                &query_vec,
+                5,
+                1,
+                crate::query::MultiValueCombiner::Max,
+            )
+            .unwrap();
+        assert!(!results.is_empty(), "Flat search should return results");
+
+        // Phase 2: Add more vectors to cross threshold
+        let writer = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Add 30 more documents (total 60, above threshold of 50)
+        for i in 30..60 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("Document {}", i));
+            let vec: Vec<f32> = (0..8).map(|_| (i as f32) / 60.0).collect();
+            doc.add_dense_vector(embedding, vec);
+            writer.add_document(doc).await.unwrap();
+        }
+        // Commit auto-triggers vector index build when threshold is crossed
+        writer.commit().await.unwrap();
+
+        // Verify centroids were trained (auto-triggered)
+        assert!(
+            writer.is_vector_index_built(embedding).await,
+            "Vector index should be built after crossing threshold"
+        );
+
+        // Reopen index and verify trained structures are loaded
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        assert!(
+            index.trained_centroids.contains_key(&embedding.0),
+            "Should have loaded trained centroids for embedding field"
+        );
+
+        // Search should still work
+        let segments = index.segment_readers();
+        let results = segments[0]
+            .search_dense_vector(
+                embedding,
+                &query_vec,
+                5,
+                1,
+                crate::query::MultiValueCombiner::Max,
+            )
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "Search should return results after build"
+        );
+
+        // Phase 3: Verify calling build_vector_index again is a no-op
+        let writer = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        writer.build_vector_index().await.unwrap(); // Should skip training
+
+        // Still built
+        assert!(writer.is_vector_index_built(embedding).await);
     }
 }

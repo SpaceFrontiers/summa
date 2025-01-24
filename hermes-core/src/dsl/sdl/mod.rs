@@ -207,10 +207,10 @@ fn parse_field_type(type_str: &str) -> Result<FieldType> {
 #[derive(Debug, Clone, Default)]
 struct IndexConfig {
     index_type: Option<super::schema::VectorIndexType>,
-    centroids_path: Option<String>,
-    codebook_path: Option<String>,
+    num_clusters: Option<usize>,
     nprobe: Option<usize>,
     mrl_dim: Option<usize>,
+    build_threshold: Option<usize>,
     // Sparse vector index params
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
@@ -296,36 +296,35 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
     match p.as_rule() {
         Rule::index_type_spec => {
             config.index_type = Some(match p.as_str() {
+                "flat" => VectorIndexType::Flat,
+                "rabitq" => VectorIndexType::RaBitQ,
+                "ivf_rabitq" => VectorIndexType::IvfRaBitQ,
                 "scann" => VectorIndexType::ScaNN,
-                "rabitq" => VectorIndexType::IvfRaBitQ,
-                _ => VectorIndexType::IvfRaBitQ,
+                _ => VectorIndexType::RaBitQ,
             });
         }
         Rule::index_type_kwarg => {
             // index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
             if let Some(t) = p.into_inner().next() {
                 config.index_type = Some(match t.as_str() {
+                    "flat" => VectorIndexType::Flat,
+                    "rabitq" => VectorIndexType::RaBitQ,
+                    "ivf_rabitq" => VectorIndexType::IvfRaBitQ,
                     "scann" => VectorIndexType::ScaNN,
-                    "rabitq" => VectorIndexType::IvfRaBitQ,
-                    _ => VectorIndexType::IvfRaBitQ,
+                    _ => VectorIndexType::RaBitQ,
                 });
             }
         }
-        Rule::centroids_kwarg => {
-            // centroids_kwarg = { "centroids" ~ ":" ~ centroids_path }
-            // centroids_path = { "\"" ~ path_chars ~ "\"" }
-            if let Some(path) = p.into_inner().next()
-                && let Some(inner_path) = path.into_inner().next()
-            {
-                config.centroids_path = Some(inner_path.as_str().to_string());
+        Rule::num_clusters_kwarg => {
+            // num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }
+            if let Some(n) = p.into_inner().next() {
+                config.num_clusters = Some(n.as_str().parse().unwrap_or(256));
             }
         }
-        Rule::codebook_kwarg => {
-            // codebook_kwarg = { "codebook" ~ ":" ~ codebook_path }
-            if let Some(path) = p.into_inner().next()
-                && let Some(inner_path) = path.into_inner().next()
-            {
-                config.codebook_path = Some(inner_path.as_str().to_string());
+        Rule::build_threshold_kwarg => {
+            // build_threshold_kwarg = { "build_threshold" ~ ":" ~ build_threshold_spec }
+            if let Some(n) = p.into_inner().next() {
+                config.build_threshold = Some(n.as_str().parse().unwrap_or(10000));
             }
         }
         Rule::nprobe_kwarg => {
@@ -491,36 +490,29 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
 
 /// Apply index configuration from indexed<...> to DenseVectorConfig
 fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: IndexConfig) {
-    use super::schema::VectorIndexType;
+    // Apply index type if specified
+    if let Some(index_type) = idx_cfg.index_type {
+        config.index_type = index_type;
+    }
 
-    let nprobe = idx_cfg.nprobe.unwrap_or(32);
+    // Apply num_clusters for IVF-based indexes
+    if idx_cfg.num_clusters.is_some() {
+        config.num_clusters = idx_cfg.num_clusters;
+    }
 
-    match idx_cfg.index_type {
-        Some(VectorIndexType::ScaNN) => {
-            config.index_type = VectorIndexType::ScaNN;
-            config.coarse_centroids_path = idx_cfg.centroids_path;
-            config.pq_codebook_path = idx_cfg.codebook_path;
-            config.nprobe = nprobe;
-        }
-        Some(VectorIndexType::IvfRaBitQ) => {
-            config.index_type = VectorIndexType::IvfRaBitQ;
-            config.coarse_centroids_path = idx_cfg.centroids_path;
-            config.nprobe = nprobe;
-        }
-        Some(VectorIndexType::RaBitQ) | None => {
-            // If centroids provided, use IVF-RaBitQ, otherwise plain RaBitQ
-            if idx_cfg.centroids_path.is_some() {
-                config.index_type = VectorIndexType::IvfRaBitQ;
-                config.coarse_centroids_path = idx_cfg.centroids_path;
-                config.nprobe = nprobe;
-            }
-            // else keep default RaBitQ
-        }
+    // Apply nprobe if specified
+    if let Some(nprobe) = idx_cfg.nprobe {
+        config.nprobe = nprobe;
     }
 
     // Apply mrl_dim if specified
     if idx_cfg.mrl_dim.is_some() {
         config.mrl_dim = idx_cfg.mrl_dim;
+    }
+
+    // Apply build_threshold if specified
+    if idx_cfg.build_threshold.is_some() {
+        config.build_threshold = idx_cfg.build_threshold;
     }
 }
 
@@ -1213,10 +1205,10 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_vector_with_centroids() {
+    fn test_dense_vector_with_num_clusters() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<centroids: "centroids.bin">, stored]
+                field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256>, stored]
             }
         "#;
 
@@ -1229,18 +1221,15 @@ mod tests {
 
         let config = f.dense_vector_config.as_ref().unwrap();
         assert_eq!(config.dim, 768);
-        assert_eq!(
-            config.coarse_centroids_path.as_deref(),
-            Some("centroids.bin")
-        );
+        assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 32); // default
     }
 
     #[test]
-    fn test_dense_vector_with_centroids_and_nprobe() {
+    fn test_dense_vector_with_num_clusters_and_nprobe() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<1536> [indexed<centroids: "/path/to/centroids.bin", nprobe: 64>]
+                field embedding: dense_vector<1536> [indexed<ivf_rabitq, num_clusters: 512, nprobe: 64>]
             }
         "#;
 
@@ -1248,10 +1237,7 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 1536);
-        assert_eq!(
-            config.coarse_centroids_path.as_deref(),
-            Some("/path/to/centroids.bin")
-        );
+        assert_eq!(config.num_clusters, Some(512));
         assert_eq!(config.nprobe, 64);
     }
 
@@ -1267,14 +1253,14 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 1536);
-        assert!(config.coarse_centroids_path.is_none());
+        assert!(config.num_clusters.is_none());
     }
 
     #[test]
     fn test_dense_vector_keyword_syntax_full() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 1536> [indexed<centroids: "/path/to/centroids.bin", nprobe: 64>]
+                field embedding: dense_vector<dims: 1536> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 64>]
             }
         "#;
 
@@ -1282,10 +1268,7 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 1536);
-        assert_eq!(
-            config.coarse_centroids_path.as_deref(),
-            Some("/path/to/centroids.bin")
-        );
+        assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 64);
     }
 
@@ -1293,7 +1276,7 @@ mod tests {
     fn test_dense_vector_keyword_syntax_partial() {
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<centroids: "centroids.bin">]
+                field embedding: dense_vector<dims: 768> [indexed<ivf_rabitq, num_clusters: 128>]
             }
         "#;
 
@@ -1301,10 +1284,7 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(
-            config.coarse_centroids_path.as_deref(),
-            Some("centroids.bin")
-        );
+        assert_eq!(config.num_clusters, Some(128));
         assert_eq!(config.nprobe, 32); // default
     }
 
@@ -1314,7 +1294,7 @@ mod tests {
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed<scann, centroids: "centroids.bin", codebook: "pq_codebook.bin", nprobe: 64>]
+                field embedding: dense_vector<dims: 768> [indexed<scann, num_clusters: 256, nprobe: 64>]
             }
         "#;
 
@@ -1323,21 +1303,17 @@ mod tests {
 
         assert_eq!(config.dim, 768);
         assert_eq!(config.index_type, VectorIndexType::ScaNN);
-        assert_eq!(
-            config.coarse_centroids_path.as_deref(),
-            Some("centroids.bin")
-        );
-        assert_eq!(config.pq_codebook_path.as_deref(), Some("pq_codebook.bin"));
+        assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 64);
     }
 
     #[test]
-    fn test_dense_vector_rabitq_index() {
+    fn test_dense_vector_ivf_rabitq_index() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 1536> [indexed<rabitq, centroids: "centroids.bin">]
+                field embedding: dense_vector<dims: 1536> [indexed<ivf_rabitq, num_clusters: 512>]
             }
         "#;
 
@@ -1346,15 +1322,11 @@ mod tests {
 
         assert_eq!(config.dim, 1536);
         assert_eq!(config.index_type, VectorIndexType::IvfRaBitQ);
-        assert_eq!(
-            config.coarse_centroids_path.as_deref(),
-            Some("centroids.bin")
-        );
-        assert!(config.pq_codebook_path.is_none());
+        assert_eq!(config.num_clusters, Some(512));
     }
 
     #[test]
-    fn test_dense_vector_rabitq_no_centroids() {
+    fn test_dense_vector_rabitq_no_clusters() {
         use crate::dsl::schema::VectorIndexType;
 
         let sdl = r#"
@@ -1367,8 +1339,25 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.index_type, VectorIndexType::IvfRaBitQ);
-        assert!(config.coarse_centroids_path.is_none());
+        assert_eq!(config.index_type, VectorIndexType::RaBitQ);
+        assert!(config.num_clusters.is_none());
+    }
+
+    #[test]
+    fn test_dense_vector_flat_index() {
+        use crate::dsl::schema::VectorIndexType;
+
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<dims: 768> [indexed<flat>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 768);
+        assert_eq!(config.index_type, VectorIndexType::Flat);
     }
 
     #[test]
@@ -1407,11 +1396,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_vector_mrl_dim_with_centroids() {
+    fn test_dense_vector_mrl_dim_with_num_clusters() {
         // Test mrl_dim combined with other index options
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<768> [indexed<centroids: "centroids.bin", nprobe: 64, mrl_dim: 128>]
+                field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 64, mrl_dim: 128>]
             }
         "#;
 
@@ -1421,10 +1410,7 @@ mod tests {
         assert_eq!(config.dim, 768);
         assert_eq!(config.mrl_dim, Some(128));
         assert_eq!(config.index_dim(), 128);
-        assert_eq!(
-            config.coarse_centroids_path.as_deref(),
-            Some("centroids.bin")
-        );
+        assert_eq!(config.num_clusters, Some(256));
         assert_eq!(config.nprobe, 64);
     }
 

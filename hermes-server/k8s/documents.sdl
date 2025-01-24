@@ -1,0 +1,33 @@
+# Document index schema for hermes
+# Fields: id, title, abstract, content, uris, sparse/dense vectors with spans
+
+index documents {
+    # Unique document identifier
+    field id: text<raw> [indexed, stored]
+
+    # Title with English stemming for full-text search
+    field title: text<en_stem> [indexed, stored]
+
+    # Abstract with English stemming for full-text search
+    field abstract: text<en_stem> [indexed, stored]
+
+    # Main content with English stemming for full-text search
+    field content: text<en_stem> [indexed, stored]
+
+    # List of URIs - multi-valued, lowercase tokenizer for exact matching
+    field uris: text<default> [indexed, stored<multi>]
+
+    # Multi sparse vectors for title (e.g., SPLADE embeddings)
+    field title_sparse_vectors: sparse_vector [indexed, stored<multi>]
+
+    # Span metadata for title sparse vectors - stored JSON list, not indexed
+    field title_sparse_span: json [stored<multi>]
+
+    # Multi dense vectors (e.g., sentence embeddings)
+    # Adjust dimension (128) to match your embedding model
+    # Index starts as Flat (brute-force), call build_vector_index() to train IVF-RaBitQ
+    field dense_vectors: dense_vector<128> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>, stored<multi>]
+
+    # Span metadata for dense vectors - stored JSON list, not indexed
+    field dense_span: json [stored<multi>]
+}

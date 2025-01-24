@@ -7,10 +7,13 @@ mod store;
 mod types;
 
 #[cfg(feature = "native")]
-pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
+pub use builder::{
+    FlatVectorData, IVFRaBitQIndexData, MemoryBreakdown, ScaNNIndexData, SegmentBuilder,
+    SegmentBuilderConfig, SegmentBuilderStats,
+};
 #[cfg(feature = "native")]
-pub use merger::{MergeStats, SegmentMerger, delete_segment};
-pub use reader::{AsyncSegmentReader, SegmentReader, SparseIndex};
+pub use merger::{MergeStats, SegmentMerger, TrainedVectorStructures, delete_segment};
+pub use reader::{AsyncSegmentReader, SegmentReader, SparseIndex, VectorIndex};
 pub use store::*;
 pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 
