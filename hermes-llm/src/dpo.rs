@@ -2,7 +2,6 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarMap;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use std::io::BufRead;
 use std::path::Path;
@@ -11,6 +10,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::model::GPT;
 use crate::tokenizer::Tokenizer;
+use crate::training::create_progress_bar;
 
 /// A preference pair for DPO training
 #[derive(Debug, Deserialize)]
@@ -202,13 +202,7 @@ impl DpoTrainer {
         batch_size: usize,
     ) -> Result<f64> {
         let num_batches = dataset.len().div_ceil(batch_size);
-        let pb = ProgressBar::new(num_batches as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} loss: {msg}")
-                .unwrap()
-                .progress_chars("##-"),
-        );
+        let pb = create_progress_bar(num_batches as u64, true);
 
         let mut total_loss = 0.0;
         let mut num_steps = 0;

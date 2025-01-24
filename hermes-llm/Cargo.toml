@@ -41,6 +41,9 @@ rayon = { workspace = true }
 # Progress bar
 indicatif = "0.18"
 
+# Signal handling for graceful shutdown
+ctrlc = "3.4"
+
 # HuggingFace Hub for downloading models/tokenizers (use rustls to avoid openssl)
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 

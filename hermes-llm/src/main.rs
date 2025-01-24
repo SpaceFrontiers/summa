@@ -1,7 +1,7 @@
 use anyhow::Result;
 use candle_core::Device;
 use clap::{Parser, Subcommand};
-use tracing::{Level, info};
+use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use hermes_llm::config::{Config, TrainingConfig};
@@ -68,6 +68,10 @@ enum Commands {
         /// Number of layers to freeze from the bottom (for fine-tuning)
         #[arg(long, default_value = "0")]
         freeze_layers: usize,
+
+        /// Resume training from interrupted checkpoint
+        #[arg(long)]
+        resume: bool,
 
         // Internal flags for distributed training (set automatically)
         // usize::MAX means "launcher mode" - will spawn workers
@@ -210,7 +214,7 @@ fn get_config(name: &str) -> Config {
         "gpt2-large" => Config::gpt2_large(),
         "llama-small" => Config::llama_small(),
         _ => {
-            eprintln!("Unknown model config '{}', using tiny", name);
+            warn!("Unknown model config '{}', using tiny", name);
             Config::tiny()
         }
     }
@@ -238,6 +242,7 @@ fn main() -> Result<()> {
             grad_accum,
             checkpoint,
             freeze_layers,
+            resume,
             rank,
             comm_file,
         } => {
@@ -253,24 +258,23 @@ fn main() -> Result<()> {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("--data is required for multi-GPU training"))?;
 
-                println!("=== Distributed Training ===");
-                println!("GPUs: {}", num_gpus);
-                println!("Model: {}", model);
-                println!(
+                info!("=== Distributed Training ===");
+                info!("GPUs: {}", num_gpus);
+                info!("Model: {}", model);
+                info!(
                     "Effective batch: {} ({} x {} x {})",
                     batch_size * grad_accum * num_gpus,
                     batch_size,
                     grad_accum,
                     num_gpus
                 );
-                println!();
 
                 let exe = std::env::current_exe()?;
                 let _ = std::fs::remove_file(&comm_file);
 
                 let mut children = Vec::new();
                 for r in 1..num_gpus {
-                    println!("Launching rank {} on GPU {}...", r, r);
+                    info!("Launching rank {} on GPU {}...", r, r);
 
                     let mut child_cmd = Command::new(&exe);
                     child_cmd
@@ -323,7 +327,7 @@ fn main() -> Result<()> {
                     let mut all_ok = true;
                     for (r, mut c) in children {
                         if !c.wait().map(|s| s.success()).unwrap_or(false) {
-                            eprintln!("Rank {} failed", r);
+                            warn!("Rank {} failed", r);
                             all_ok = false;
                         }
                     }
@@ -427,10 +431,28 @@ fn main() -> Result<()> {
             // Initialize trainer
             let mut trainer = Trainer::new(config.clone(), training_config, device)?;
 
-            if let Some(ref ckpt_path) = checkpoint {
+            // Load checkpoint or resume state
+            let resume_state = if resume {
+                // Try to load interrupted training state
+                let state = trainer.load_training_state(&output)?;
+                if state.global_step > 0 {
+                    info!(
+                        "Resuming from epoch {}, step {}, batch {}",
+                        state.epoch + 1,
+                        state.global_step,
+                        state.batch_position
+                    );
+                    Some(state)
+                } else {
+                    None
+                }
+            } else if let Some(ref ckpt_path) = checkpoint {
                 info!("Loading checkpoint: {}", ckpt_path);
                 trainer.load_checkpoint(ckpt_path)?;
-            }
+                None
+            } else {
+                None
+            };
 
             if freeze_layers > 0 {
                 info!("Freezing {} layers", freeze_layers);
@@ -449,8 +471,14 @@ fn main() -> Result<()> {
                 info!("Saved config to {}/config.json", output);
             }
 
-            // Train
-            trainer.train_distributed(&mut train_loader, None, Some(&output), comm.as_ref())?;
+            // Train (with resume support)
+            let completed = trainer.train_resumable(
+                &mut train_loader,
+                None,
+                Some(&output),
+                comm.as_ref(),
+                resume_state,
+            )?;
 
             // Finalize NCCL communicator properly before exit
             let is_worker = children_handle.is_none() && dist_config.is_distributed();
@@ -469,12 +497,22 @@ fn main() -> Result<()> {
                 let all_ok = handle.join().unwrap_or(false);
                 let _ = std::fs::remove_file(&dist_config.comm_file);
                 if all_ok {
-                    println!("\n=== Training complete ===");
+                    if completed {
+                        println!("\n=== Training complete ===");
+                    } else {
+                        println!("\n=== Training interrupted, checkpoint saved ===");
+                        println!("Resume with: hermes-llm train --resume --output {}", output);
+                    }
                 } else {
                     anyhow::bail!("Some worker processes failed");
                 }
             } else if dist_config.is_main_process() {
-                info!("Training complete!");
+                if completed {
+                    info!("Training complete!");
+                } else {
+                    info!("Training interrupted, checkpoint saved to {}", output);
+                    info!("Resume with: hermes-llm train --resume --output {}", output);
+                }
             }
         }
 

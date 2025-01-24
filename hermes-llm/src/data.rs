@@ -144,6 +144,8 @@ pub struct DataLoader {
     world_size: usize,
     batches_yielded: usize,
     max_batches: usize,
+    /// Seed used for shuffling (for reproducibility on resume)
+    shuffle_seed: u64,
 }
 
 impl DataLoader {
@@ -175,6 +177,7 @@ impl DataLoader {
             world_size,
             batches_yielded: 0,
             max_batches,
+            shuffle_seed: 42,
         }
     }
 
@@ -182,12 +185,28 @@ impl DataLoader {
         self.current_pos = 0;
         self.batches_yielded = 0;
         if self.shuffle {
-            // Use fixed seed for deterministic shuffle across all ranks
-            // This ensures consistent sharding after shuffle
+            // Use deterministic seed for reproducible shuffle across all ranks
             use rand::SeedableRng;
-            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            let mut rng = rand::rngs::StdRng::seed_from_u64(self.shuffle_seed);
             self.indices.shuffle(&mut rng);
         }
+    }
+
+    /// Reset with a specific seed (for reproducibility across epochs)
+    pub fn reset_with_seed(&mut self, seed: u64) {
+        self.shuffle_seed = seed;
+        self.reset();
+    }
+
+    /// Get current position for checkpointing
+    pub fn position(&self) -> usize {
+        self.current_pos
+    }
+
+    /// Set position (for resuming from checkpoint)
+    pub fn set_position(&mut self, pos: usize) {
+        self.current_pos = pos;
+        self.batches_yielded = pos / self.batch_size / self.world_size;
     }
 
     pub fn num_batches(&self) -> usize {

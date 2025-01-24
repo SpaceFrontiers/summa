@@ -1,14 +1,54 @@
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device};
 use candle_nn::VarMap;
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
 use crate::config::{Config, TrainingConfig};
 use crate::data::DataLoader;
 use crate::model::{GPT, cross_entropy_loss};
+
+/// Create a styled progress bar for training.
+pub fn create_progress_bar(total: u64, show: bool) -> ProgressBar {
+    if show {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} loss: {msg}")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        pb
+    } else {
+        ProgressBar::hidden()
+    }
+}
+
+/// Training state for checkpointing and resume
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TrainingState {
+    pub epoch: usize,
+    pub batch_position: usize,
+    pub global_step: usize,
+    pub shuffle_seed: u64,
+}
+
+impl Default for TrainingState {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            batch_position: 0,
+            global_step: 0,
+            shuffle_seed: 42,
+        }
+    }
+}
 
 pub struct Trainer {
     model: GPT,
@@ -19,6 +59,8 @@ pub struct Trainer {
     training_config: TrainingConfig,
     device: Device,
     global_step: usize,
+    /// Signal for graceful shutdown on Ctrl+C
+    interrupted: Arc<AtomicBool>,
 }
 
 impl Trainer {
@@ -41,6 +83,15 @@ impl Trainer {
             model.num_parameters()
         );
 
+        // Set up Ctrl+C handler
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupted_clone = Arc::clone(&interrupted);
+        let _ = ctrlc::set_handler(move || {
+            // Use eprintln here since tracing may not be flushed before exit
+            eprintln!("\nInterrupt received, saving checkpoint...");
+            interrupted_clone.store(true, Ordering::SeqCst);
+        });
+
         Ok(Self {
             model,
             optimizer,
@@ -49,7 +100,18 @@ impl Trainer {
             training_config,
             device,
             global_step: 0,
+            interrupted,
         })
+    }
+
+    /// Check if training was interrupted
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
+    }
+
+    /// Reset interrupt flag
+    pub fn clear_interrupt(&self) {
+        self.interrupted.store(false, Ordering::SeqCst);
     }
 
     /// Freeze the first N layers (embeddings count as layer 0)
@@ -93,21 +155,7 @@ impl Trainer {
         let is_main = comm.is_none_or(|c| c.rank() == 0);
         let num_batches = train_loader.num_batches();
 
-        // Show progress bar on main rank (rank 0 now has TTY)
-        let pb = if is_main {
-            let pb = ProgressBar::new(num_batches as u64);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} loss: {msg}")
-                    .unwrap()
-                    .progress_chars("##-"),
-            );
-            // Enable steady tick for continuous updates even during long operations
-            pb.enable_steady_tick(std::time::Duration::from_millis(100));
-            pb
-        } else {
-            ProgressBar::hidden()
-        };
+        let pb = create_progress_bar(num_batches as u64, is_main);
 
         let mut total_loss = 0.0;
         let mut num_steps = 0;
@@ -199,18 +247,48 @@ impl Trainer {
         train_loader: &mut DataLoader,
         eval_loader: Option<&mut DataLoader>,
         checkpoint_dir: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.train_distributed(train_loader, eval_loader, checkpoint_dir, None)
     }
 
     pub fn train_distributed(
         &mut self,
         train_loader: &mut DataLoader,
+        eval_loader: Option<&mut DataLoader>,
+        checkpoint_dir: Option<&str>,
+        comm: Option<&crate::distributed::NcclCommunicator>,
+    ) -> Result<bool> {
+        self.train_resumable(train_loader, eval_loader, checkpoint_dir, comm, None)
+    }
+
+    /// Train with support for interruption and resume
+    /// Returns true if training completed, false if interrupted
+    pub fn train_resumable(
+        &mut self,
+        train_loader: &mut DataLoader,
         mut eval_loader: Option<&mut DataLoader>,
         checkpoint_dir: Option<&str>,
         comm: Option<&crate::distributed::NcclCommunicator>,
-    ) -> Result<()> {
+        resume_state: Option<TrainingState>,
+    ) -> Result<bool> {
         let is_main = comm.is_none_or(|c| c.rank() == 0);
+
+        // Resume from saved state if provided
+        let (start_epoch, start_position) = match resume_state {
+            Some(ref state) => {
+                self.global_step = state.global_step;
+                if is_main {
+                    info!(
+                        "Resuming from epoch {}, batch position {}, global step {}",
+                        state.epoch + 1,
+                        state.batch_position,
+                        state.global_step
+                    );
+                }
+                (state.epoch, state.batch_position)
+            }
+            None => (0, 0),
+        };
 
         if is_main {
             info!(
@@ -219,12 +297,40 @@ impl Trainer {
             );
         }
 
-        for epoch in 0..self.training_config.epochs {
+        for epoch in start_epoch..self.training_config.epochs {
             if is_main {
                 info!("Epoch {}/{}", epoch + 1, self.training_config.epochs);
             }
 
-            let train_loss = self.train_epoch_distributed(train_loader, comm)?;
+            // Use epoch as shuffle seed for reproducibility
+            let shuffle_seed = epoch as u64;
+            train_loader.reset_with_seed(shuffle_seed);
+
+            // Resume from position if this is the starting epoch
+            if epoch == start_epoch && start_position > 0 {
+                train_loader.set_position(start_position);
+                if is_main {
+                    info!("Resuming from batch position {}", start_position);
+                }
+            }
+
+            let (train_loss, interrupted) = self.train_epoch_interruptible(train_loader, comm)?;
+
+            // Handle interrupt
+            if interrupted {
+                if is_main && let Some(dir) = checkpoint_dir {
+                    let state = TrainingState {
+                        epoch,
+                        batch_position: train_loader.position(),
+                        global_step: self.global_step,
+                        shuffle_seed,
+                    };
+                    self.save_training_state(dir, &state)?;
+                    info!("Saved interrupt checkpoint to {}", dir);
+                }
+                return Ok(false);
+            }
+
             if is_main {
                 info!("Epoch {} train loss: {:.4}", epoch + 1, train_loss);
             }
@@ -249,7 +355,84 @@ impl Trainer {
             }
         }
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Train epoch with interrupt checking
+    /// Returns (loss, was_interrupted)
+    fn train_epoch_interruptible(
+        &mut self,
+        train_loader: &mut DataLoader,
+        comm: Option<&crate::distributed::NcclCommunicator>,
+    ) -> Result<(f64, bool)> {
+        let is_main = comm.is_none_or(|c| c.rank() == 0);
+        let num_batches = train_loader.num_batches();
+
+        let pb = create_progress_bar(num_batches as u64, is_main);
+
+        let mut total_loss = 0.0;
+        let mut num_steps = 0;
+        let mut accumulated_loss = 0.0;
+
+        while let Some(batch_result) = train_loader.next_batch(&self.device)? {
+            // Check for interrupt
+            if self.is_interrupted() {
+                pb.finish_with_message("interrupted");
+                return Ok((total_loss / num_steps.max(1) as f64, true));
+            }
+
+            let (input, target) = (batch_result.0, batch_result.1);
+
+            let logits = self.model.forward(&input, 0, true)?;
+            let loss = cross_entropy_loss(&logits, &target)?;
+
+            accumulated_loss += loss.to_scalar::<f32>()? as f64;
+            num_steps += 1;
+
+            if num_steps % self.training_config.gradient_accumulation_steps == 0 {
+                let avg_loss =
+                    accumulated_loss / self.training_config.gradient_accumulation_steps as f64;
+
+                self.optimizer.backward_step(&loss)?;
+
+                if let Some(c) = comm {
+                    crate::distributed::sync_gradients(&self.var_map, c)?;
+                }
+
+                if self.training_config.grad_clip > 0.0 {
+                    for var in self.var_map.all_vars() {
+                        let grad = var.as_tensor();
+                        let norm = grad.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+                        if norm > self.training_config.grad_clip as f32 {
+                            let scale = self.training_config.grad_clip as f32 / norm;
+                            let _ = var.set(&grad.affine(scale as f64, 0.0)?);
+                        }
+                    }
+                }
+
+                total_loss += avg_loss;
+                accumulated_loss = 0.0;
+                self.global_step += 1;
+
+                if self
+                    .global_step
+                    .is_multiple_of(self.training_config.log_every)
+                {
+                    pb.set_message(format!("{:.4}", avg_loss));
+                }
+            }
+
+            pb.inc(1);
+        }
+
+        pb.finish_with_message("done");
+
+        let effective_steps = self.global_step;
+        if effective_steps > 0 {
+            Ok((total_loss / effective_steps as f64, false))
+        } else {
+            Ok((0.0, false))
+        }
     }
 
     pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P) -> Result<()> {
@@ -260,6 +443,46 @@ impl Trainer {
     pub fn load_checkpoint<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         self.var_map.load(path)?;
         Ok(())
+    }
+
+    /// Save full training state (weights + progress) for resumable training
+    pub fn save_training_state<P: AsRef<Path>>(&self, dir: P, state: &TrainingState) -> Result<()> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+
+        // Save model weights
+        let weights_path = dir.join("weights.safetensors");
+        self.var_map.save(&weights_path)?;
+
+        // Save training state
+        let state_path = dir.join("training_state.json");
+        let state_json = serde_json::to_string_pretty(state)?;
+        std::fs::write(&state_path, state_json)?;
+
+        Ok(())
+    }
+
+    /// Load full training state (weights + progress) for resuming
+    pub fn load_training_state<P: AsRef<Path>>(&mut self, dir: P) -> Result<TrainingState> {
+        let dir = dir.as_ref();
+
+        // Load model weights
+        let weights_path = dir.join("weights.safetensors");
+        if weights_path.exists() {
+            self.var_map.load(&weights_path)?;
+        }
+
+        // Load training state
+        let state_path = dir.join("training_state.json");
+        let state = if state_path.exists() {
+            let state_json = std::fs::read_to_string(&state_path)?;
+            serde_json::from_str(&state_json)?
+        } else {
+            TrainingState::default()
+        };
+
+        self.global_step = state.global_step;
+        Ok(state)
     }
 
     pub fn model(&self) -> &GPT {
@@ -279,96 +502,5 @@ impl Trainer {
     }
 }
 
-pub fn get_lr_with_warmup(
-    step: usize,
-    warmup_steps: usize,
-    max_lr: f64,
-    min_lr: f64,
-    total_steps: usize,
-) -> f64 {
-    if step < warmup_steps {
-        max_lr * (step as f64 / warmup_steps as f64)
-    } else {
-        let decay_ratio = (step - warmup_steps) as f64 / (total_steps - warmup_steps) as f64;
-        let coeff = 0.5 * (1.0 + (std::f64::consts::PI * decay_ratio).cos());
-        min_lr + coeff * (max_lr - min_lr)
-    }
-}
-
-pub struct TextGenerator<'a> {
-    model: &'a GPT,
-    device: &'a Device,
-}
-
-impl<'a> TextGenerator<'a> {
-    pub fn new(model: &'a GPT, device: &'a Device) -> Self {
-        Self { model, device }
-    }
-
-    pub fn generate(
-        &self,
-        prompt_tokens: &[u32],
-        max_new_tokens: usize,
-        temperature: f64,
-        top_k: Option<usize>,
-    ) -> Result<Vec<u32>> {
-        use rand::Rng;
-
-        let mut tokens = prompt_tokens.to_vec();
-        let mut rng = rand::rng();
-
-        for _ in 0..max_new_tokens {
-            let context_len = tokens.len().min(self.model.config().max_seq_len);
-            let context: Vec<u32> = tokens[tokens.len() - context_len..].to_vec();
-
-            let input = Tensor::new(context.as_slice(), self.device)?
-                .unsqueeze(0)?
-                .to_dtype(DType::U32)?;
-
-            let logits = self.model.forward(&input, 0, false)?;
-            // Shape: [1, seq_len, vocab] -> [1, 1, vocab] -> [vocab]
-            let logits = logits
-                .narrow(1, context_len - 1, 1)?
-                .squeeze(1)?
-                .squeeze(0)?;
-
-            let logits = if temperature != 1.0 {
-                logits.affine(1.0 / temperature, 0.0)?
-            } else {
-                logits
-            };
-
-            let logits = if let Some(k) = top_k {
-                let logits_vec: Vec<f32> = logits.to_vec1()?;
-                let mut indexed: Vec<(usize, f32)> =
-                    logits_vec.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                let mut masked = vec![f32::NEG_INFINITY; logits_vec.len()];
-                for i in 0..k.min(indexed.len()) {
-                    masked[indexed[i].0] = indexed[i].1;
-                }
-                Tensor::new(masked, self.device)?
-            } else {
-                logits
-            };
-
-            let probs = candle_nn::ops::softmax_last_dim(&logits)?;
-            let probs_vec: Vec<f32> = probs.to_vec1()?;
-
-            let cumsum: Vec<f32> = probs_vec
-                .iter()
-                .scan(0.0, |acc, &x| {
-                    *acc += x;
-                    Some(*acc)
-                })
-                .collect();
-
-            let r: f32 = rng.random();
-            let next_token = cumsum.iter().position(|&p| p > r).unwrap_or(0) as u32;
-
-            tokens.push(next_token);
-        }
-
-        Ok(tokens)
-    }
-}
+// Re-export from generate module for backward compatibility
+pub use crate::generate::TextGenerator;
