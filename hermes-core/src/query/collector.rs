@@ -296,7 +296,8 @@ pub async fn collect_segment<C: Collector>(
     collector: &mut C,
 ) -> Result<()> {
     let needs_positions = collector.needs_positions();
-    let mut scorer = query.scorer(reader, usize::MAX).await?;
+    // Use large limit to disable WAND skipping, but not usize::MAX to avoid overflow
+    let mut scorer = query.scorer(reader, usize::MAX / 2).await?;
 
     let mut doc = scorer.doc();
     while doc != TERMINATED {

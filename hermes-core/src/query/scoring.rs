@@ -96,8 +96,10 @@ pub struct ScoreCollector {
 impl ScoreCollector {
     /// Create a new collector for top-k results
     pub fn new(k: usize) -> Self {
+        // Cap capacity to avoid allocation overflow for very large k
+        let capacity = k.saturating_add(1).min(1_000_000);
         Self {
-            heap: BinaryHeap::with_capacity(k + 1),
+            heap: BinaryHeap::with_capacity(capacity),
             k,
         }
     }

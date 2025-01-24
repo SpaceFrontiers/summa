@@ -17,8 +17,6 @@ use lasso::{Rodeo, Spur};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use serde::Deserialize;
-
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::compression::CompressionLevel;
 use crate::directories::{Directory, DirectoryWriter};
