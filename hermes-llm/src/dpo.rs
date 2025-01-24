@@ -7,8 +7,8 @@ use std::io::BufRead;
 use std::path::Path;
 use tracing::info;
 
-use crate::config::Config;
-use crate::model::GPT;
+use crate::mal::ModelDef;
+use crate::model::Transformer;
 use crate::tokenizer::Tokenizer;
 use crate::training::create_progress_bar;
 
@@ -66,8 +66,8 @@ impl PreferenceDataset {
 
 /// DPO Trainer
 pub struct DpoTrainer {
-    policy_model: GPT,
-    reference_model: GPT,
+    policy_model: Transformer,
+    reference_model: Transformer,
     optimizer: AdamW,
     var_map: VarMap,
     device: Device,
@@ -77,7 +77,7 @@ pub struct DpoTrainer {
 
 impl DpoTrainer {
     pub fn new(
-        config: Config,
+        config: ModelDef,
         checkpoint_path: &str,
         device: Device,
         lr: f64,
@@ -87,13 +87,13 @@ impl DpoTrainer {
         // Create policy model (will be trained)
         let mut var_map = VarMap::new();
         let vb = candle_nn::VarBuilder::from_varmap(&var_map, DType::F32, &device);
-        let policy_model = GPT::new(&config, vb)?;
+        let policy_model = Transformer::new(&config, vb)?;
         var_map.load(checkpoint_path)?;
 
         // Create reference model (frozen copy)
         let mut ref_var_map = VarMap::new();
         let ref_vb = candle_nn::VarBuilder::from_varmap(&ref_var_map, DType::F32, &device);
-        let reference_model = GPT::new(&config, ref_vb)?;
+        let reference_model = Transformer::new(&config, ref_vb)?;
         ref_var_map.load(checkpoint_path)?;
 
         let params = ParamsAdamW {
@@ -124,7 +124,7 @@ impl DpoTrainer {
     /// Compute log probabilities for a sequence
     fn compute_log_probs(
         &self,
-        model: &GPT,
+        model: &Transformer,
         input_ids: &Tensor,
         target_ids: &Tensor,
     ) -> Result<Tensor> {

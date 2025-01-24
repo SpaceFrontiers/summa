@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use hermes_llm::config::{Config, TrainingConfig};
+use hermes_llm::config::TrainingConfig;
 use hermes_llm::data::{DataLoader, Dataset};
 use hermes_llm::tokenizer::{BPETrainer, Tokenizer};
 use hermes_llm::training::{TextGenerator, Trainer};
@@ -29,7 +29,7 @@ enum Commands {
         #[arg(short, long)]
         tokenizer: String,
 
-        /// Model configuration preset (nano, tiny, gpt2-small, gpt2-medium, llama-small)
+        /// Model configuration: preset name (nano, tiny, gpt2-small, llama-7b) or path to .mal file
         #[arg(short, long, default_value = "tiny")]
         model: String,
 
@@ -205,19 +205,27 @@ fn get_device(use_gpu: bool, gpu_id: usize) -> Result<Device> {
     Ok(Device::Cpu)
 }
 
-fn get_config(name: &str) -> Config {
-    match name {
-        "nano" => Config::nano(),
-        "tiny" => Config::tiny(),
-        "gpt2-small" => Config::gpt2_small(),
-        "gpt2-medium" => Config::gpt2_medium(),
-        "gpt2-large" => Config::gpt2_large(),
-        "llama-small" => Config::llama_small(),
-        _ => {
-            warn!("Unknown model config '{}', using tiny", name);
-            Config::tiny()
+fn get_model_def(name: &str) -> hermes_llm::ModelDef {
+    // First try builtin models
+    if let Some(model_def) = hermes_llm::get_builtin_model(name) {
+        return model_def;
+    }
+
+    // Try to load from .mal file if it exists
+    if std::path::Path::new(name).exists() {
+        match hermes_llm::parse_mal_file(name) {
+            Ok(model_def) => return model_def,
+            Err(e) => {
+                warn!("Failed to parse MAL file '{}': {}", name, e);
+            }
         }
     }
+
+    panic!(
+        "Unknown model '{}'. Available: {:?}",
+        name,
+        hermes_llm::list_wellknown_models()
+    );
 }
 
 fn main() -> Result<()> {
@@ -371,9 +379,9 @@ fn main() -> Result<()> {
             info!("Tokenizer vocab size: {}", tokenizer.vocab_size());
 
             // Model config
-            let mut config = get_config(&model);
+            let mut config = get_model_def(&model);
             config.vocab_size = tokenizer.vocab_size();
-            info!("Model config: {:?}", config);
+            info!("Model: {}", config.name);
 
             // Load dataset
             let dataset = match &data {
@@ -545,12 +553,12 @@ fn main() -> Result<()> {
             let device = get_device(gpu, 0)?;
             info!("Using device: {:?}", device);
 
-            let config = Config::from_json(&config_path)?;
+            let config = hermes_llm::ModelDef::from_json(&config_path)?;
             let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
 
             let mut var_map = candle_nn::VarMap::new();
             let vb = candle_nn::VarBuilder::from_varmap(&var_map, candle_core::DType::F32, &device);
-            let model = hermes_llm::GPT::new(&config, vb)?;
+            let model = hermes_llm::Transformer::new(&config, vb)?;
             var_map.load(&checkpoint)?;
 
             info!("Loaded model from {}", checkpoint);
@@ -567,28 +575,8 @@ fn main() -> Result<()> {
         }
 
         Commands::Info { model } => {
-            let config = get_config(&model);
-            println!("Model: {}", model);
-            println!("  Vocab size: {}", config.vocab_size);
-            println!("  Max sequence length: {}", config.max_seq_len);
-            println!("  Hidden size: {}", config.hidden_size);
-            println!("  Num layers: {}", config.num_layers);
-            println!("  Num heads: {}", config.num_heads);
-            println!("  Intermediate size: {}", config.intermediate_size);
-            println!("  Head dimension: {}", config.head_dim());
-
-            let dummy_config = config.clone();
-            let embed_params = dummy_config.vocab_size * dummy_config.hidden_size;
-            let attn_params = 4 * dummy_config.hidden_size * dummy_config.hidden_size;
-            let ff_params = 3 * dummy_config.hidden_size * dummy_config.intermediate_size;
-            let layer_params = attn_params + ff_params + 2 * dummy_config.hidden_size;
-            let head_params = dummy_config.hidden_size * dummy_config.vocab_size;
-            let total = embed_params + dummy_config.num_layers * layer_params + head_params;
-            println!(
-                "  Estimated parameters: {} ({:.2}M)",
-                total,
-                total as f64 / 1_000_000.0
-            );
+            let model_def = get_model_def(&model);
+            print!("{}", model_def);
         }
 
         Commands::Dpo {
@@ -606,7 +594,7 @@ fn main() -> Result<()> {
             let device = get_device(true, 0)?;
             info!("Using device: {:?}", device);
 
-            let config = Config::from_json(&config_path)?;
+            let config = hermes_llm::ModelDef::from_json(&config_path)?;
             let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
 
             info!("Loading preference dataset from {}", data);

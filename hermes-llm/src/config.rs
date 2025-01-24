@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+/// Activation function type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ActivationType {
+    #[default]
+    SwiGLU,
+    GELU,
+}
+
+/// Normalization type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NormType {
+    #[default]
+    RmsNorm,
+    LayerNorm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Vocabulary size
@@ -12,6 +28,9 @@ pub struct Config {
     pub num_layers: usize,
     /// Number of attention heads
     pub num_heads: usize,
+    /// Number of key-value heads (for GQA, defaults to num_heads)
+    #[serde(default)]
+    pub num_kv_heads: Option<usize>,
     /// Intermediate size in FFN (typically 4x hidden_size)
     pub intermediate_size: usize,
     /// Dropout probability
@@ -22,6 +41,12 @@ pub struct Config {
     pub use_bias: bool,
     /// RoPE base frequency
     pub rope_theta: f64,
+    /// Activation function (SwiGLU or GELU)
+    #[serde(default)]
+    pub activation: ActivationType,
+    /// Normalization type (RmsNorm or LayerNorm)
+    #[serde(default)]
+    pub norm_type: NormType,
 }
 
 impl Config {
@@ -33,11 +58,14 @@ impl Config {
             hidden_size: 768,
             num_layers: 12,
             num_heads: 12,
+            num_kv_heads: None,
             intermediate_size: 3072,
             dropout: 0.1,
             layer_norm_eps: 1e-5,
             use_bias: true,
             rope_theta: 10000.0,
+            activation: ActivationType::GELU,
+            norm_type: NormType::LayerNorm,
         }
     }
 
@@ -49,11 +77,14 @@ impl Config {
             hidden_size: 1024,
             num_layers: 24,
             num_heads: 16,
+            num_kv_heads: None,
             intermediate_size: 4096,
             dropout: 0.1,
             layer_norm_eps: 1e-5,
             use_bias: true,
             rope_theta: 10000.0,
+            activation: ActivationType::GELU,
+            norm_type: NormType::LayerNorm,
         }
     }
 
@@ -65,11 +96,14 @@ impl Config {
             hidden_size: 1280,
             num_layers: 36,
             num_heads: 20,
+            num_kv_heads: None,
             intermediate_size: 5120,
             dropout: 0.1,
             layer_norm_eps: 1e-5,
             use_bias: true,
             rope_theta: 10000.0,
+            activation: ActivationType::GELU,
+            norm_type: NormType::LayerNorm,
         }
     }
 
@@ -81,11 +115,14 @@ impl Config {
             hidden_size: 64,
             num_layers: 2,
             num_heads: 2,
+            num_kv_heads: None,
             intermediate_size: 256,
             dropout: 0.1,
             layer_norm_eps: 1e-5,
-            use_bias: true,
+            use_bias: false,
             rope_theta: 10000.0,
+            activation: ActivationType::GELU,
+            norm_type: NormType::RmsNorm,
         }
     }
 
@@ -97,11 +134,14 @@ impl Config {
             hidden_size: 128,
             num_layers: 4,
             num_heads: 4,
+            num_kv_heads: None,
             intermediate_size: 512,
             dropout: 0.1,
             layer_norm_eps: 1e-5,
-            use_bias: true,
+            use_bias: false,
             rope_theta: 10000.0,
+            activation: ActivationType::GELU,
+            norm_type: NormType::RmsNorm,
         }
     }
 
@@ -113,11 +153,14 @@ impl Config {
             hidden_size: 1024,
             num_layers: 16,
             num_heads: 16,
-            intermediate_size: 2752, // 8/3 * hidden_size for SwiGLU
+            num_kv_heads: None,
+            intermediate_size: 2752,
             dropout: 0.0,
             layer_norm_eps: 1e-6,
             use_bias: false,
             rope_theta: 10000.0,
+            activation: ActivationType::SwiGLU,
+            norm_type: NormType::RmsNorm,
         }
     }
 

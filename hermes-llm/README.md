@@ -4,11 +4,13 @@ Train Large Language Models from scratch in Rust using [Candle](https://github.c
 
 ## Features
 
-- **GPT-style Transformer Architecture** with RoPE positional embeddings
+- **Model Architecture Language (MAL)**: Define any transformer architecture using a composable DSL
+- **Transformer Architecture** with configurable attention (GQA, sliding window), normalization, and FFN
+- **Well-Known Models**: Bundled architectures (nano, tiny, GPT-2, LLaMA, Mistral)
 - **BPE Tokenizer Training** using HuggingFace tokenizers
-- **Multiple Model Configurations**: tiny, GPT-2 small/medium/large, LLaMA-style
-- **Training Infrastructure**: AdamW optimizer, gradient clipping, checkpointing
+- **Training Infrastructure**: AdamW optimizer, gradient clipping, checkpointing, interruptible training
 - **Text Generation**: Temperature sampling, top-k sampling
+- **Distributed Training**: Multi-GPU support with NCCL
 - **Backend Support**: CPU, CUDA, Metal (Apple Silicon), Accelerate
 
 ## Installation
@@ -41,16 +43,25 @@ hermes-llm train-tokenizer \
 ### Train a model
 
 ```bash
+# Using a well-known model
 hermes-llm train \
   --data data/corpus.txt \
   --tokenizer tokenizer.json \
   --model tiny \
-  --output checkpoints \
-  --lr 3e-4 \
-  --batch-size 32 \
-  --epochs 10 \
-  --seq-len 256
+  --output checkpoints
+
+# Or use full well-known path
+hermes-llm train \
+  --model well-known/mistral-7b.mal \
+  ...
+
+# Or use a custom .mal file
+hermes-llm train \
+  --model my_custom_model.mal \
+  ...
 ```
+
+**Well-known models:** `nano`, `tiny`, `gpt2-small`, `gpt2-medium`, `gpt2-large`, `llama-small`, `llama-7b`, `mistral-7b`
 
 ### Generate text
 
@@ -205,8 +216,67 @@ JSONL file with `prompt`, `chosen`, and `rejected` fields:
 | gpt2-medium | 24     | 1024   | 16    | ~355M              |
 | gpt2-large  | 36     | 1280   | 20    | ~774M              |
 | llama-small | 16     | 1024   | 16    | ~268M              |
+| llama-7b    | 32     | 4096   | 32    | ~7B                |
 
 _Note: Parameter count depends heavily on vocab size. Run `hermes-llm info --model <name>` for exact counts._
+
+## Model Architecture Language (MAL)
+
+MAL is a composable DSL for defining LLM architectures. Models are built from reusable components: **attention**, **ffn**, and **block**.
+
+### Example
+
+```mal
+# my_model.mal
+
+# Define attention mechanism
+attention my_attn {
+    num_heads: 16
+    num_kv_heads: 4      # Grouped Query Attention
+    bias: false
+}
+
+# Define FFN
+ffn my_ffn {
+    hidden_dim: 4096
+    activation: swiglu
+    bias: false
+}
+
+# Define transformer block
+block my_block {
+    attention: my_attn
+    ffn: my_ffn
+    norm: rmsnorm { eps: 1e-5 }
+    norm_position: pre
+    residual: true
+}
+
+# Define complete model
+model my_model {
+    description: "Custom model"
+    vocab_size: 32000
+    max_seq_len: 4096
+    hidden_size: 1024
+    num_layers: 16
+    block: my_block
+}
+```
+
+Use it with:
+
+```bash
+hermes-llm train --model my_model.mal --data corpus.jsonl --tokenizer tok.json
+```
+
+### MAL Components
+
+| Component     | Properties                                                                             |
+| ------------- | -------------------------------------------------------------------------------------- |
+| **attention** | `num_heads`, `num_kv_heads`, `head_dim`, `bias`, `dropout`, `causal`, `window_size`    |
+| **ffn**       | `hidden_dim`, `activation` (swiglu/gelu/silu/relu), `bias`, `dropout`, `gate`          |
+| **block**     | `attention`, `ffn`, `norm` (rmsnorm/layernorm), `norm_position` (pre/post), `residual` |
+| **model**     | `vocab_size`, `hidden_size`, `max_seq_len`, `num_layers`, `block`, `description`       |
 
 ## Architecture
 

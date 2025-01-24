@@ -1,0 +1,37 @@
+# Mistral 7B Architecture
+# Demonstrates Grouped Query Attention (GQA) and Sliding Window Attention
+
+# Grouped Query Attention - 8 KV heads shared across 32 query heads
+attention gqa {
+    num_heads: 32
+    num_kv_heads: 8
+    head_dim: 128
+    bias: false
+    causal: true
+    window_size: 4096    # Sliding window attention
+}
+
+# FFN with SwiGLU
+ffn swiglu_mlp {
+    hidden_dim: 14336
+    activation: swiglu
+    bias: false
+}
+
+# Transformer block
+block mistral_block {
+    attention: gqa
+    ffn: swiglu_mlp
+    norm_position: pre
+    residual: true
+}
+
+# Complete Mistral 7B model
+model mistral_7b {
+    description: "Mistral 7B with GQA and Sliding Window Attention"
+    vocab_size: 32000
+    max_seq_len: 32768
+    hidden_size: 4096
+    num_layers: 32
+    block: mistral_block
+}

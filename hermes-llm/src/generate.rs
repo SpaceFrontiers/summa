@@ -4,16 +4,16 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use rand::Rng;
 
-use crate::model::GPT;
+use crate::model::Transformer;
 
 /// Text generator for autoregressive text generation.
 pub struct TextGenerator<'a> {
-    model: &'a GPT,
+    model: &'a Transformer,
     device: &'a Device,
 }
 
 impl<'a> TextGenerator<'a> {
-    pub fn new(model: &'a GPT, device: &'a Device) -> Self {
+    pub fn new(model: &'a Transformer, device: &'a Device) -> Self {
         Self { model, device }
     }
 

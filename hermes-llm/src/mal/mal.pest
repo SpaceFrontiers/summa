@@ -1,0 +1,225 @@
+// Model Architecture Language (MAL) Grammar
+// A DSL for defining LLM model architectures with composable components
+//
+// Example:
+// ```
+// # Define a custom attention mechanism
+// attention mha {
+//     num_heads: 16
+//     num_kv_heads: 4        # GQA with 4 KV heads
+//     head_dim: 64
+//     dropout: 0.0
+//     bias: false
+//     position_encoding: rope { theta: 10000.0 }
+// }
+//
+// # Define FFN block
+// ffn swiglu_ffn {
+//     hidden_dim: 4096
+//     activation: swiglu
+//     bias: false
+//     dropout: 0.0
+// }
+//
+// # Define a transformer block combining attention and FFN
+// block llama_block {
+//     attention: mha
+//     ffn: swiglu_ffn
+//     norm: rmsnorm { eps: 1e-5 }
+//     norm_position: pre       # pre or post
+//     residual: true
+// }
+//
+// # Define the full model using the block
+// model llama_7b {
+//     vocab_size: 32000
+//     max_seq_len: 4096
+//     hidden_size: 4096
+//     block: llama_block
+//     num_layers: 32
+//     embeddings {
+//         tie_weights: true
+//         dropout: 0.0
+//     }
+// }
+// ```
+
+// Main entry point - a file can contain multiple definitions
+file = { SOI ~ definition+ ~ EOI }
+
+// Top-level definitions
+definition = { attention_def | ffn_def | block_def | model_def }
+
+// ============================================================================
+// ATTENTION DEFINITION
+// ============================================================================
+// Defines attention mechanism parameters
+attention_def = { "attention" ~ identifier ~ "{" ~ attention_prop* ~ "}" }
+
+attention_prop = {
+    num_heads_prop |
+    num_kv_heads_prop |
+    head_dim_prop |
+    dropout_prop |
+    bias_prop |
+    position_encoding_prop |
+    window_size_prop |
+    causal_prop
+}
+
+head_dim_prop = { "head_dim" ~ ":" ~ integer }
+window_size_prop = { "window_size" ~ ":" ~ integer }
+causal_prop = { "causal" ~ ":" ~ boolean }
+
+// Position encoding: rope, alibi, learned, or none
+position_encoding_prop = { "position_encoding" ~ ":" ~ position_encoding_config }
+position_encoding_config = {
+    rope_config |
+    alibi_config |
+    learned_config |
+    "none"
+}
+
+rope_config = { "rope" ~ "{" ~ rope_param* ~ "}" }
+rope_param = { rope_theta_prop | rope_scaling_prop | rope_base_prop }
+rope_base_prop = { "base" ~ ":" ~ number }
+
+alibi_config = { "alibi" ~ "{" ~ alibi_param* ~ "}" }
+alibi_param = { alibi_slopes_prop }
+alibi_slopes_prop = { "slopes" ~ ":" ~ ("learned" | "fixed") }
+
+learned_config = { "learned" ~ "{" ~ learned_param* ~ "}" }
+learned_param = { max_positions_prop }
+max_positions_prop = { "max_positions" ~ ":" ~ integer }
+
+// ============================================================================
+// FFN DEFINITION
+// ============================================================================
+// Defines feed-forward network parameters
+ffn_def = { "ffn" ~ identifier ~ "{" ~ ffn_prop* ~ "}" }
+
+ffn_prop = {
+    hidden_dim_prop |
+    activation_prop |
+    bias_prop |
+    dropout_prop |
+    gate_prop
+}
+
+hidden_dim_prop = { ("hidden_dim" | "intermediate_size") ~ ":" ~ integer }
+gate_prop = { "gate" ~ ":" ~ boolean }
+
+// ============================================================================
+// BLOCK DEFINITION
+// ============================================================================
+// Defines a transformer block combining attention and FFN
+block_def = { "block" ~ identifier ~ "{" ~ block_prop* ~ "}" }
+
+block_prop = {
+    attention_ref_prop |
+    ffn_ref_prop |
+    norm_prop |
+    norm_position_prop |
+    residual_prop |
+    dropout_prop
+}
+
+// Reference to defined attention/ffn or inline definition
+attention_ref_prop = { "attention" ~ ":" ~ (identifier | inline_attention) }
+ffn_ref_prop = { "ffn" ~ ":" ~ (identifier | inline_ffn) }
+
+// Inline definitions (anonymous)
+inline_attention = { "{" ~ attention_prop* ~ "}" }
+inline_ffn = { "{" ~ ffn_prop* ~ "}" }
+
+// Normalization configuration
+norm_prop = { "norm" ~ ":" ~ norm_config }
+norm_config = { rmsnorm_config | layernorm_config | "none" }
+rmsnorm_config = { "rmsnorm" ~ "{" ~ norm_param* ~ "}" }
+layernorm_config = { "layernorm" ~ "{" ~ norm_param* ~ "}" }
+norm_param = { norm_eps_prop }
+
+norm_position_prop = { "norm_position" ~ ":" ~ ("pre" | "post") }
+residual_prop = { "residual" ~ ":" ~ boolean }
+
+// ============================================================================
+// MODEL DEFINITION
+// ============================================================================
+// Defines the complete model using blocks (block is required)
+model_def = { "model" ~ identifier ~ "{" ~ model_prop* ~ "}" }
+
+model_prop = {
+    vocab_size_prop |
+    max_seq_len_prop |
+    hidden_size_prop |
+    block_ref_prop |
+    num_layers_prop |
+    embeddings_prop |
+    output_prop |
+    description_prop
+}
+
+// Block reference or inline block definition (required for model)
+block_ref_prop = { "block" ~ ":" ~ (identifier | inline_block) }
+inline_block = { "{" ~ block_prop* ~ "}" }
+
+// Embeddings configuration
+embeddings_prop = { "embeddings" ~ "{" ~ embedding_param* ~ "}" }
+embedding_param = { tie_weights_prop | dropout_prop | scale_prop }
+tie_weights_prop = { "tie_weights" ~ ":" ~ boolean }
+scale_prop = { "scale" ~ ":" ~ number }
+
+// Output head configuration
+output_prop = { "output" ~ "{" ~ output_param* ~ "}" }
+output_param = { bias_prop | norm_prop }
+
+// ============================================================================
+// SHARED PROPERTIES
+// ============================================================================
+
+// Core model dimensions
+vocab_size_prop = { "vocab_size" ~ ":" ~ integer }
+max_seq_len_prop = { ("max_seq_len" | "context_length" | "seq_len") ~ ":" ~ integer }
+hidden_size_prop = { ("hidden_size" | "d_model" | "embed_dim") ~ ":" ~ integer }
+num_layers_prop = { ("num_layers" | "n_layers" | "depth") ~ ":" ~ integer }
+
+// Attention properties
+num_heads_prop = { ("num_heads" | "n_heads" | "attention_heads") ~ ":" ~ integer }
+num_kv_heads_prop = { ("num_kv_heads" | "kv_heads") ~ ":" ~ integer }
+
+// RoPE configuration
+rope_theta_prop = { "rope_theta" ~ ":" ~ number }
+rope_scaling_prop = { "rope_scaling" ~ ":" ~ number }
+
+// Normalization
+norm_eps_prop = { ("norm_eps" | "eps") ~ ":" ~ number }
+
+// Activation function
+activation_prop = { "activation" ~ ":" ~ activation_type }
+activation_type = { "swiglu" | "gelu" | "silu" | "relu" | "gelu_new" | "gelu_tanh" }
+
+// Regularization
+dropout_prop = { "dropout" ~ ":" ~ number }
+
+// Bias in linear layers
+bias_prop = { "bias" ~ ":" ~ boolean }
+
+// Description
+description_prop = { "description" ~ ":" ~ quoted_string }
+
+// ============================================================================
+// PRIMITIVES
+// ============================================================================
+
+integer = @{ ASCII_DIGIT+ }
+number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+boolean = { "true" | "false" }
+quoted_string = @{ "\"" ~ string_inner ~ "\"" }
+string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
+
+// Identifier (names for definitions)
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+
+// Whitespace and comments
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }

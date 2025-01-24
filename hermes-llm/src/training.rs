@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
-use crate::config::{Config, TrainingConfig};
+use crate::config::TrainingConfig;
 use crate::data::DataLoader;
-use crate::model::{GPT, cross_entropy_loss};
+use crate::mal::ModelDef;
+use crate::model::{Transformer, cross_entropy_loss};
 
 /// Create a styled progress bar for training.
 pub fn create_progress_bar(total: u64, show: bool) -> ProgressBar {
@@ -51,11 +52,11 @@ impl Default for TrainingState {
 }
 
 pub struct Trainer {
-    model: GPT,
+    model: Transformer,
     optimizer: AdamW,
     var_map: VarMap,
     #[allow(dead_code)]
-    config: Config,
+    config: ModelDef,
     training_config: TrainingConfig,
     device: Device,
     global_step: usize,
@@ -64,10 +65,10 @@ pub struct Trainer {
 }
 
 impl Trainer {
-    pub fn new(config: Config, training_config: TrainingConfig, device: Device) -> Result<Self> {
+    pub fn new(config: ModelDef, training_config: TrainingConfig, device: Device) -> Result<Self> {
         let var_map = VarMap::new();
         let vb = candle_nn::VarBuilder::from_varmap(&var_map, DType::F32, &device);
-        let model = GPT::new(&config, vb)?;
+        let model = Transformer::new(&config, vb)?;
 
         let params = ParamsAdamW {
             lr: training_config.learning_rate,
@@ -485,7 +486,7 @@ impl Trainer {
         Ok(state)
     }
 
-    pub fn model(&self) -> &GPT {
+    pub fn model(&self) -> &Transformer {
         &self.model
     }
 

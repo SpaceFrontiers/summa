@@ -25,6 +25,13 @@ tokenizers = { version = "0.22", default-features = false, features = ["progress
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Parser for Model Architecture Language (MAL)
+pest = "2.7"
+pest_derive = "2.7"
+
+# Embed well-known model files
+rust-embed = { version = "8", features = ["include-exclude"] }
+
 # CLI and logging
 clap = { workspace = true }
 tracing = { workspace = true }
