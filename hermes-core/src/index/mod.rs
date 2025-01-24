@@ -21,6 +21,8 @@ use crate::structures::BlockPostingList;
 use crate::structures::{CoarseCentroids, PQCodebook};
 
 #[cfg(feature = "native")]
+mod vector_builder;
+#[cfg(feature = "native")]
 mod writer;
 #[cfg(feature = "native")]
 pub use writer::IndexWriter;
@@ -279,15 +281,78 @@ impl<D: Directory> Index<D> {
         self.segments.read().clone()
     }
 
-    /// Reload segments from directory (after new segments added)
+    /// Reload segments from directory (after new segments added or merges completed)
+    ///
+    /// This reads the current metadata.json and loads only segments that exist.
+    /// Safe to call at any time - will not reference deleted segments.
+    ///
     /// Note: This only reloads segments, not trained structures (they are immutable once built)
     pub async fn reload(&self) -> Result<()> {
-        let (new_segments, _, _) =
-            Self::load_segments_and_trained(&self.directory, &self.schema, &self.config).await?;
+        // Load fresh metadata from disk
+        let meta = Self::load_metadata(&self.directory).await?;
+
+        // Load only segments that exist in current metadata
+        let mut new_segments = Vec::new();
+        let mut doc_id_offset = 0u32;
+
+        for id_str in meta.segments {
+            let segment_id = match SegmentId::from_hex(&id_str) {
+                Some(id) => id,
+                None => {
+                    log::warn!("Invalid segment ID in metadata: {}", id_str);
+                    continue;
+                }
+            };
+
+            // Try to open segment - skip if files don't exist (may have been deleted by merge)
+            match SegmentReader::open(
+                self.directory.as_ref(),
+                segment_id,
+                Arc::clone(&self.schema),
+                doc_id_offset,
+                self.config.term_cache_blocks,
+            )
+            .await
+            {
+                Ok(reader) => {
+                    doc_id_offset += reader.meta().num_docs;
+                    new_segments.push(Arc::new(reader));
+                }
+                Err(e) => {
+                    // Segment files may have been deleted by concurrent merge - skip it
+                    log::warn!(
+                        "Could not open segment {}: {:?} (may have been merged)",
+                        id_str,
+                        e
+                    );
+                }
+            }
+        }
+
         *self.segments.write() = new_segments;
         // Invalidate global stats cache since segments changed
         self.global_stats.invalidate();
         Ok(())
+    }
+
+    /// Check if segments need reloading (metadata changed since last load)
+    pub async fn needs_reload(&self) -> Result<bool> {
+        let meta = Self::load_metadata(&self.directory).await?;
+        let current_segments = self.segments.read();
+
+        // Compare segment count and IDs
+        if meta.segments.len() != current_segments.len() {
+            return Ok(true);
+        }
+
+        for (meta_id, reader) in meta.segments.iter().zip(current_segments.iter()) {
+            let reader_id = SegmentId::from_u128(reader.meta().id).to_hex();
+            if meta_id != &reader_id {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Get global statistics for cross-segment IDF computation (sync, basic stats only)
@@ -417,13 +482,12 @@ impl<D: Directory> Index<D> {
         let fetch_limit = offset + limit;
         for segment in &segments {
             let segment_id = segment.meta().id;
-            let results = crate::query::search_segment_with_positions(
-                segment.as_ref(),
-                query,
-                fetch_limit,
-                collect_positions,
-            )
-            .await?;
+            let results = if collect_positions {
+                crate::query::search_segment_with_positions(segment.as_ref(), query, fetch_limit)
+                    .await?
+            } else {
+                crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?
+            };
             for result in results {
                 all_results.push((segment_id, result));
             }

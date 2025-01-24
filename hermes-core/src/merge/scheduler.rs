@@ -1,6 +1,25 @@
 //! Segment manager - coordinates segment registration and background merging
 //!
 //! This module is only compiled with the "native" feature.
+//!
+//! The SegmentManager is the SOLE owner of `metadata.json`. All writes to metadata
+//! go through this manager, ensuring linearized access and consistency between
+//! the in-memory segment list and persisted state.
+//!
+//! **State separation:**
+//! - Building segments: Managed by IndexWriter (pending_builds)
+//! - Committed segments: Managed by SegmentManager (metadata.segments)
+//! - Merging segments: Subset of committed, tracked here (merging_segments)
+//!
+//! **Commit workflow:**
+//! 1. IndexWriter flushes builders, waits for builds to complete
+//! 2. Calls `register_segment()` for each completed segment
+//! 3. SegmentManager updates metadata atomically, triggers merge check (non-blocking)
+//!
+//! **Merge workflow (background):**
+//! 1. Acquires segments to merge (marks as merging)
+//! 2. Merges into new segment
+//! 3. Calls internal `complete_merge()` which atomically updates metadata
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -10,24 +29,22 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::directories::DirectoryWriter;
 use crate::error::{Error, Result};
+use crate::index::IndexMetadata;
 use crate::segment::{SegmentId, SegmentMerger, SegmentReader};
 
 use super::{MergePolicy, SegmentInfo};
 
 /// Segment manager - coordinates segment registration and background merging
 ///
-/// This is the central point for:
-/// - Tracking all segment IDs
-/// - Registering new segments (from builds or merges)
-/// - Triggering merge checks when segments are added
-/// - Coordinating background merge tasks
+/// This is the SOLE owner of `metadata.json` ensuring linearized access.
+/// All segment list modifications and metadata updates go through here.
 pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Directory for segment operations
     directory: Arc<D>,
     /// Schema for segment operations
     schema: Arc<crate::dsl::Schema>,
-    /// List of committed segment IDs (hex strings)
-    segment_ids: Arc<AsyncMutex<Vec<String>>>,
+    /// Unified metadata (segments + vector index state) - SOLE owner
+    metadata: Arc<AsyncMutex<IndexMetadata>>,
     /// The merge policy to use
     merge_policy: Box<dyn MergePolicy>,
     /// Count of in-flight background merges
@@ -41,18 +58,18 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
 }
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
-    /// Create a new segment manager
+    /// Create a new segment manager with existing metadata
     pub fn new(
         directory: Arc<D>,
         schema: Arc<crate::dsl::Schema>,
-        segment_ids: Vec<String>,
+        metadata: IndexMetadata,
         merge_policy: Box<dyn MergePolicy>,
         term_cache_blocks: usize,
     ) -> Self {
         Self {
             directory,
             schema,
-            segment_ids: Arc::new(AsyncMutex::new(segment_ids)),
+            metadata: Arc::new(AsyncMutex::new(metadata)),
             merge_policy,
             pending_merges: Arc::new(AtomicUsize::new(0)),
             merging_segments: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -61,29 +78,30 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Get a clone of the segment_ids Arc for sharing with background tasks
-    pub fn segment_ids(&self) -> Arc<AsyncMutex<Vec<String>>> {
-        Arc::clone(&self.segment_ids)
-    }
-
-    /// Get the current segment IDs
+    /// Get the current segment IDs (snapshot)
     pub async fn get_segment_ids(&self) -> Vec<String> {
-        self.segment_ids.lock().await.clone()
+        self.metadata.lock().await.segments.clone()
     }
 
-    /// Register a new segment and trigger merge check
+    /// Register a new segment, persist metadata, and trigger merge check
     ///
-    /// This is the main entry point for adding segments. It:
+    /// This is the main entry point for adding segments after builds complete.
+    /// It atomically:
     /// 1. Adds the segment ID to the list
-    /// 2. Checks the merge policy and spawns background merges if needed
-    pub async fn register_segment(&self, segment_id: String) {
+    /// 2. Persists metadata to disk
+    /// 3. Triggers merge check (spawns background merges if needed)
+    pub async fn register_segment(&self, segment_id: String) -> Result<()> {
         {
-            let mut ids = self.segment_ids.lock().await;
-            ids.push(segment_id);
+            let mut meta = self.metadata.lock().await;
+            if !meta.segments.contains(&segment_id) {
+                meta.segments.push(segment_id);
+            }
+            meta.save(self.directory.as_ref()).await?;
         }
 
-        // Check if we should trigger a merge
+        // Check if we should trigger a merge (non-blocking)
         self.maybe_merge().await;
+        Ok(())
     }
 
     /// Get the number of pending background merges
@@ -94,18 +112,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Check merge policy and spawn background merges if needed
     pub async fn maybe_merge(&self) {
         // Get current segment info (excluding segments being merged)
-        let ids = self.segment_ids.lock().await;
+        let meta = self.metadata.lock().await;
         let merging = self.merging_segments.lock().await;
 
         // Filter out segments currently being merged
-        let available_segments: Vec<String> = ids
+        let available_segments: Vec<String> = meta
+            .segments
             .iter()
             .filter(|id| !merging.contains(*id))
             .cloned()
             .collect();
 
         drop(merging);
-        drop(ids);
+        drop(meta);
 
         // Build segment info - we estimate doc count based on segment age (newer = smaller)
         let segments: Vec<SegmentInfo> = available_segments
@@ -140,7 +159,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let directory = Arc::clone(&self.directory);
         let schema = Arc::clone(&self.schema);
-        let segment_ids = Arc::clone(&self.segment_ids);
+        let metadata = Arc::clone(&self.metadata);
         let merging_segments = Arc::clone(&self.merging_segments);
         let pending_merges = Arc::clone(&self.pending_merges);
         let merge_complete = Arc::clone(&self.merge_complete);
@@ -159,10 +178,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             match result {
                 Ok(new_segment_id) => {
-                    // Update segment list: remove merged segments, add new one
-                    let mut ids = segment_ids.lock().await;
-                    ids.retain(|id| !segment_ids_to_merge.contains(id));
-                    ids.push(new_segment_id);
+                    // Atomically update metadata: remove merged segments, add new one, persist
+                    let mut meta = metadata.lock().await;
+                    meta.segments
+                        .retain(|id| !segment_ids_to_merge.contains(id));
+                    meta.segments.push(new_segment_id);
+                    if let Err(e) = meta.save(directory.as_ref()).await {
+                        eprintln!("[merge] Failed to save metadata after merge: {:?}", e);
+                    }
                 }
                 Err(e) => {
                     eprintln!(
@@ -247,17 +270,53 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
+    /// Get a clone of the metadata Arc for read access
+    pub fn metadata(&self) -> Arc<AsyncMutex<IndexMetadata>> {
+        Arc::clone(&self.metadata)
+    }
+
+    /// Update metadata with a closure and persist atomically
+    pub async fn update_metadata<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut IndexMetadata),
+    {
+        let mut meta = self.metadata.lock().await;
+        f(&mut meta);
+        meta.save(self.directory.as_ref()).await
+    }
+
+    /// Replace segment list atomically (for force merge / rebuild)
+    pub async fn replace_segments(
+        &self,
+        new_segments: Vec<String>,
+        old_to_delete: Vec<String>,
+    ) -> Result<()> {
+        {
+            let mut meta = self.metadata.lock().await;
+            meta.segments = new_segments;
+            meta.save(self.directory.as_ref()).await?;
+        }
+
+        // Delete old segment files
+        for id_str in old_to_delete {
+            if let Some(segment_id) = SegmentId::from_hex(&id_str) {
+                let _ = crate::segment::delete_segment(self.directory.as_ref(), segment_id).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Clean up orphan segment files that are not registered
     ///
     /// This can happen if the process halts after segment files are written
-    /// but before they are registered in segments.json. Call this on startup
+    /// but before they are registered in metadata.json. Call this on startup
     /// to reclaim disk space from incomplete operations.
     ///
     /// Returns the number of orphan segments deleted.
     pub async fn cleanup_orphan_segments(&self) -> Result<usize> {
         let registered_set: HashSet<String> = {
-            let registered_ids = self.segment_ids.lock().await;
-            registered_ids.iter().cloned().collect()
+            let meta = self.metadata.lock().await;
+            meta.segments.iter().cloned().collect()
         };
 
         // Find all segment files in directory
