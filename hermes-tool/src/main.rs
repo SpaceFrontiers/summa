@@ -435,6 +435,17 @@ async fn index_from_reader<R: BufRead>(
     }
 
     writer.commit().await?;
+
+    // Wait for any in-flight background merges to complete before returning
+    // Otherwise they will be cancelled when the IndexWriter/runtime is dropped
+    if writer.pending_merge_count() > 0 {
+        info!(
+            "Waiting for {} background merges to complete...",
+            writer.pending_merge_count()
+        );
+        writer.wait_for_merges().await;
+    }
+
     release_memory_to_os();
 
     let elapsed = start_time.elapsed();
