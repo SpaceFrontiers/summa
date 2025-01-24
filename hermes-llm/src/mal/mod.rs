@@ -896,7 +896,7 @@ mod tests {
     #[test]
     fn test_wellknown_models() {
         for name in list_wellknown_models() {
-            let def = get_builtin_model(&name).expect(&format!("Failed to get {}", name));
+            let def = get_builtin_model(&name).unwrap_or_else(|| panic!("Failed to get {}", name));
             // Verify computed properties work
             assert!(def.num_heads() > 0);
             assert!(def.intermediate_size() > 0);
