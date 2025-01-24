@@ -18,15 +18,16 @@ index documents {
     field uris: text<default> [indexed, stored<multi>]
 
     # Multi sparse vectors for title (e.g., SPLADE embeddings)
-    field title_sparse_vectors: sparse_vector [indexed, stored<multi>]
+    # uint8 quantization reduces memory ~4x vs float32, weight_threshold prunes low values
+    field title_sparse_vectors: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
 
     # Span metadata for title sparse vectors - stored JSON list, not indexed
     field title_sparse_span: json [stored<multi>]
 
     # Multi dense vectors (e.g., sentence embeddings)
-    # Adjust dimension (128) to match your embedding model
+    # IVF-RaBitQ uses binary quantization (~32x compression), MRL truncates to 128 dims at query time
     # Index starts as Flat (brute-force), call build_vector_index() to train IVF-RaBitQ
-    field dense_vectors: dense_vector<128> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>, stored<multi>]
+    field dense_vectors: dense_vector<1024> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32, mrl_dims: 128>, stored<multi>]
 
     # Span metadata for dense vectors - stored JSON list, not indexed
     field dense_span: json [stored<multi>]
