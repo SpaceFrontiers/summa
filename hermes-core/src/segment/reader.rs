@@ -14,8 +14,7 @@ use crate::{DocId, Error, Result};
 
 use super::store::{AsyncStoreReader, RawStoreBlock};
 use super::types::{SegmentFiles, SegmentId, SegmentMeta};
-
-use super::builder::FlatVectorData;
+use super::vector_data::FlatVectorData;
 
 /// Vector index type - Flat, RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
 #[derive(Clone)]
@@ -659,7 +658,7 @@ impl AsyncSegmentReader {
                 }
                 2 => {
                     // ScaNN (IVF-PQ) with embedded centroids and codebook
-                    use super::builder::ScaNNIndexData;
+                    use super::vector_data::ScaNNIndexData;
                     if let Ok(scann_data) = ScaNNIndexData::from_bytes(data.as_slice()) {
                         coarse_centroids = Some(Arc::new(scann_data.centroids));
                         indexes.insert(
@@ -673,7 +672,7 @@ impl AsyncSegmentReader {
                 }
                 1 => {
                     // IVF-RaBitQ with embedded centroids and codebook
-                    use super::builder::IVFRaBitQIndexData;
+                    use super::vector_data::IVFRaBitQIndexData;
                     if let Ok(ivf_data) = IVFRaBitQIndexData::from_bytes(data.as_slice()) {
                         coarse_centroids = Some(Arc::new(ivf_data.centroids));
                         indexes.insert(

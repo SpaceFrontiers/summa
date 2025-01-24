@@ -27,9 +27,7 @@ mod writer;
 #[cfg(feature = "native")]
 pub use writer::IndexWriter;
 
-#[cfg(feature = "native")]
 mod metadata;
-#[cfg(feature = "native")]
 pub use metadata::{FieldVectorMeta, INDEX_META_FILENAME, IndexMetadata, VectorIndexState};
 
 #[cfg(feature = "native")]

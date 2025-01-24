@@ -5,17 +5,16 @@ mod merger;
 mod reader;
 mod store;
 mod types;
+mod vector_data;
 
 #[cfg(feature = "native")]
-pub use builder::{
-    FlatVectorData, IVFRaBitQIndexData, MemoryBreakdown, ScaNNIndexData, SegmentBuilder,
-    SegmentBuilderConfig, SegmentBuilderStats,
-};
+pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, TrainedVectorStructures, delete_segment};
 pub use reader::{AsyncSegmentReader, SegmentReader, SparseIndex, VectorIndex};
 pub use store::*;
 pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
+pub use vector_data::{FlatVectorData, IVFRaBitQIndexData, ScaNNIndexData};
 
 #[cfg(test)]
 #[cfg(feature = "native")]
