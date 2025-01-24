@@ -20,22 +20,22 @@ index <index_name> {
 index articles {
     # Primary text field with English stemming
     field title: text<en_stem> [indexed, stored]
-    
+
     # Body content with default tokenizer
     field body: text<default> [indexed]
-    
+
     # Author name - no stemming needed
     field author: text [indexed, stored]
-    
+
     # Publication timestamp
     field published_at: i64 [indexed, stored]
-    
+
     # View count
     field views: u64 [indexed, stored]
-    
+
     # Rating score
     field rating: f64 [indexed, stored]
-    
+
     # Raw content hash (not indexed, just stored)
     field content_hash: bytes [stored]
 }
@@ -43,22 +43,22 @@ index articles {
 
 ## Field Types
 
-| Type | Aliases | Description |
-|------|---------|-------------|
-| `text` | `string`, `str` | UTF-8 text, tokenized for full-text search |
-| `u64` | `uint`, `unsigned` | Unsigned 64-bit integer |
-| `i64` | `int`, `integer` | Signed 64-bit integer |
-| `f64` | `float`, `double` | 64-bit floating point number |
-| `bytes` | `binary`, `blob` | Raw binary data |
+| Type    | Aliases            | Description                                |
+| ------- | ------------------ | ------------------------------------------ |
+| `text`  | `string`, `str`    | UTF-8 text, tokenized for full-text search |
+| `u64`   | `uint`, `unsigned` | Unsigned 64-bit integer                    |
+| `i64`   | `int`, `integer`   | Signed 64-bit integer                      |
+| `f64`   | `float`, `double`  | 64-bit floating point number               |
+| `bytes` | `binary`, `blob`   | Raw binary data                            |
 
 ## Attributes
 
 Attributes control how fields are processed and stored:
 
-| Attribute | Description |
-|-----------|-------------|
-| `indexed` | Field is indexed for searching |
-| `stored` | Field value is stored and can be retrieved |
+| Attribute | Description                                |
+| --------- | ------------------------------------------ |
+| `indexed` | Field is indexed for searching             |
+| `stored`  | Field value is stored and can be retrieved |
 
 ### Attribute Syntax
 
@@ -88,28 +88,28 @@ field raw: text [indexed, stored]               # Default tokenizer
 
 ### Available Tokenizers
 
-| Name | Aliases | Description |
-|------|---------|-------------|
-| `default` | `lowercase` | Lowercase tokenizer (splits on whitespace, lowercases) |
-| `simple` | `raw` | Simple whitespace tokenizer (no lowercasing) |
-| `en_stem` | `english` | English Snowball stemmer |
-| `de_stem` | `german` | German Snowball stemmer |
-| `fr_stem` | `french` | French Snowball stemmer |
-| `es_stem` | `spanish` | Spanish Snowball stemmer |
-| `it_stem` | `italian` | Italian Snowball stemmer |
-| `pt_stem` | `portuguese` | Portuguese Snowball stemmer |
-| `ru_stem` | `russian` | Russian Snowball stemmer |
-| `ar_stem` | `arabic` | Arabic Snowball stemmer |
-| `da_stem` | `danish` | Danish Snowball stemmer |
-| `nl_stem` | `dutch` | Dutch Snowball stemmer |
-| `fi_stem` | `finnish` | Finnish Snowball stemmer |
-| `el_stem` | `greek` | Greek Snowball stemmer |
-| `hu_stem` | `hungarian` | Hungarian Snowball stemmer |
-| `no_stem` | `norwegian` | Norwegian Snowball stemmer |
-| `ro_stem` | `romanian` | Romanian Snowball stemmer |
-| `sv_stem` | `swedish` | Swedish Snowball stemmer |
-| `ta_stem` | `tamil` | Tamil Snowball stemmer |
-| `tr_stem` | `turkish` | Turkish Snowball stemmer |
+| Name      | Aliases      | Description                                            |
+| --------- | ------------ | ------------------------------------------------------ |
+| `default` | `lowercase`  | Lowercase tokenizer (splits on whitespace, lowercases) |
+| `simple`  | `raw`        | Simple whitespace tokenizer (no lowercasing)           |
+| `en_stem` | `english`    | English Snowball stemmer                               |
+| `de_stem` | `german`     | German Snowball stemmer                                |
+| `fr_stem` | `french`     | French Snowball stemmer                                |
+| `es_stem` | `spanish`    | Spanish Snowball stemmer                               |
+| `it_stem` | `italian`    | Italian Snowball stemmer                               |
+| `pt_stem` | `portuguese` | Portuguese Snowball stemmer                            |
+| `ru_stem` | `russian`    | Russian Snowball stemmer                               |
+| `ar_stem` | `arabic`     | Arabic Snowball stemmer                                |
+| `da_stem` | `danish`     | Danish Snowball stemmer                                |
+| `nl_stem` | `dutch`      | Dutch Snowball stemmer                                 |
+| `fi_stem` | `finnish`    | Finnish Snowball stemmer                               |
+| `el_stem` | `greek`      | Greek Snowball stemmer                                 |
+| `hu_stem` | `hungarian`  | Hungarian Snowball stemmer                             |
+| `no_stem` | `norwegian`  | Norwegian Snowball stemmer                             |
+| `ro_stem` | `romanian`   | Romanian Snowball stemmer                              |
+| `sv_stem` | `swedish`    | Swedish Snowball stemmer                               |
+| `ta_stem` | `tamil`      | Tamil Snowball stemmer                                 |
+| `tr_stem` | `turkish`    | Turkish Snowball stemmer                               |
 
 ### Custom Tokenizers
 
@@ -176,7 +176,7 @@ index_def = { "index" ~ identifier ~ "{" ~ field_def* ~ "}" }
 
 field_def = { "field" ~ identifier ~ ":" ~ field_type ~ tokenizer_spec? ~ attributes? }
 
-field_type = { 
+field_type = {
     "text" | "string" | "str" |
     "u64" | "uint" | "unsigned" |
     "i64" | "int" | "integer" |

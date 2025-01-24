@@ -6,28 +6,28 @@ package hermes;
 service SearchService {
   // Search for documents
   rpc Search(SearchRequest) returns (SearchResponse);
-  
+
   // Get document by ID
   rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
-  
+
   // Get index info
   rpc GetIndexInfo(GetIndexInfoRequest) returns (GetIndexInfoResponse);
 }
 
-// Index service  
+// Index service
 service IndexService {
   // Create a new index
   rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
-  
+
   // Add documents to index
   rpc IndexDocuments(stream IndexDocumentRequest) returns (IndexDocumentsResponse);
-  
+
   // Commit pending changes
   rpc Commit(CommitRequest) returns (CommitResponse);
-  
+
   // Force merge segments
   rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
-  
+
   // Delete an index
   rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
 }

@@ -39,17 +39,17 @@ log_step() {
 
 check_prerequisites() {
     local missing=0
-    
+
     if ! command -v pnpm &> /dev/null; then
         log_error "pnpm not found. Install with: npm install -g pnpm"
         missing=1
     fi
-    
+
     if ! command -v wasm-pack &> /dev/null; then
         log_error "wasm-pack not found. Install with: cargo install wasm-pack"
         missing=1
     fi
-    
+
     if [[ $missing -eq 1 ]]; then
         exit 1
     fi
@@ -57,7 +57,7 @@ check_prerequisites() {
 
 build_wasm() {
     log_step "Building WASM package"
-    
+
     cd "$WASM_DIR"
     ./build.sh
     log_success "WASM package built at $WASM_DIR/pkg"
@@ -72,12 +72,12 @@ install_deps() {
 
 start_dev() {
     log_step "Starting dev server"
-    
+
     echo ""
     echo -e "  Dev Server: ${BLUE}http://localhost:5173${NC}"
     echo -e "  Press ${YELLOW}Ctrl+C${NC} to stop"
     echo ""
-    
+
     pnpm dev
 }
 

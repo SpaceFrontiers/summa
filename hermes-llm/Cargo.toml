@@ -18,8 +18,8 @@ candle-transformers = "0.9"
 candle-flash-attn = { version = "0.9", optional = true }
 cudarc = { version = "0.19", optional = true, features = ["nccl", "cuda-version-from-build-system"] }
 
-# Tokenization (no http feature to avoid openssl)
-tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
+# Tokenization (fancy-regex instead of onig to avoid objc2 on Linux)
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex"] }
 
 # Serialization
 serde = { workspace = true }
