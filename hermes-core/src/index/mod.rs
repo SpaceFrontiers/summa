@@ -1,29 +1,28 @@
 //! Index - multi-segment async search index
 //!
-//! Components:
-//! - Index: main entry point for searching
-//! - IndexWriter: for adding documents and committing segments (native only)
-//! - Supports multiple segments with merge
+//! The `Index` is the central concept that provides:
+//! - `Index::create()` / `Index::open()` - create or open an index
+//! - `index.writer()` - get an IndexWriter for adding documents
+//! - `index.reader()` - get an IndexReader for searching (with reload policy)
+//!
+//! The Index owns the SegmentManager which handles segment lifecycle and tracking.
 
-use std::path::Path;
 use std::sync::Arc;
-
-use parking_lot::RwLock;
 
 use rustc_hash::FxHashMap;
 
-use crate::DocId;
-use crate::directories::{Directory, SliceCachingDirectory};
-use crate::dsl::{Document, Field, Schema};
-use crate::error::{Error, Result};
-use crate::segment::{SegmentId, SegmentReader};
-use crate::structures::BlockPostingList;
+use crate::dsl::Schema;
+use crate::error::Result;
 use crate::structures::{CoarseCentroids, PQCodebook};
 
+#[cfg(feature = "native")]
+mod reader;
 #[cfg(feature = "native")]
 mod vector_builder;
 #[cfg(feature = "native")]
 mod writer;
+#[cfg(feature = "native")]
+pub use reader::{IndexReader, Searcher};
 #[cfg(feature = "native")]
 pub use writer::IndexWriter;
 
@@ -84,131 +83,82 @@ impl Default for IndexConfig {
 
 /// Multi-segment async Index
 ///
-/// The main entry point for searching. Manages multiple segments
-/// and provides unified search across all of them.
-pub struct Index<D: Directory> {
+/// The central concept for search. Owns segment lifecycle and provides:
+/// - `Index::create()` / `Index::open()` - create or open an index
+/// - `index.writer()` - get an IndexWriter for adding documents
+/// - `index.reader()` - get an IndexReader for searching with reload policy
+///
+/// All segment management is delegated to SegmentManager.
+#[cfg(feature = "native")]
+pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
     directory: Arc<D>,
     schema: Arc<Schema>,
     config: IndexConfig,
-    segments: RwLock<Vec<Arc<SegmentReader>>>,
-    default_fields: Vec<crate::Field>,
-    tokenizers: Arc<crate::tokenizer::TokenizerRegistry>,
-    /// Cached global statistics for cross-segment IDF computation
-    global_stats: crate::query::GlobalStatsCache,
-    /// Index-level trained centroids per field (loaded from metadata)
-    #[allow(dead_code)] // Used in native builds for clone_for_builder
+    /// Segment manager - owns segments, tracker, and metadata
+    segment_manager: Arc<crate::merge::SegmentManager<D>>,
+    /// Trained centroids for vector search
     trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-    /// Index-level trained PQ codebooks per field (for ScaNN)
-    #[allow(dead_code)] // Used in native builds for clone_for_builder
+    /// Trained codebooks for vector search
     trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
-    #[cfg(feature = "native")]
-    thread_pool: Arc<rayon::ThreadPool>,
 }
 
-impl<D: Directory> Index<D> {
-    /// Open an existing index from a directory
-    pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
+#[cfg(feature = "native")]
+impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
+    /// Create a new index in the directory
+    pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
         let directory = Arc::new(directory);
-
-        // Read schema
-        let schema_slice = directory.open_read(Path::new("schema.json")).await?;
-        let schema_bytes = schema_slice.read_bytes().await?;
-        let schema: Schema = serde_json::from_slice(schema_bytes.as_slice())
-            .map_err(|e| Error::Serialization(e.to_string()))?;
         let schema = Arc::new(schema);
+        let metadata = IndexMetadata::new((*schema).clone());
 
-        // Load metadata and trained structures
-        let (segments, trained_centroids, trained_codebooks) =
-            Self::load_segments_and_trained(&directory, &schema, &config).await?;
+        let segment_manager = Arc::new(crate::merge::SegmentManager::new(
+            Arc::clone(&directory),
+            Arc::clone(&schema),
+            metadata,
+            config.merge_policy.clone_box(),
+            config.term_cache_blocks,
+        ));
 
-        #[cfg(feature = "native")]
-        let thread_pool = {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(config.num_threads)
-                .build()
-                .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-            Arc::new(pool)
-        };
-
-        // Use schema's default_fields if specified, otherwise fall back to all indexed text fields
-        let default_fields: Vec<crate::Field> = if !schema.default_fields().is_empty() {
-            schema.default_fields().to_vec()
-        } else {
-            schema
-                .fields()
-                .filter(|(_, entry)| {
-                    entry.indexed && entry.field_type == crate::dsl::FieldType::Text
-                })
-                .map(|(field, _)| field)
-                .collect()
-        };
+        // Save initial metadata
+        segment_manager.update_metadata(|_| {}).await?;
 
         Ok(Self {
             directory,
             schema,
             config,
-            segments: RwLock::new(segments),
-            default_fields,
-            tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
-            global_stats: crate::query::GlobalStatsCache::new(),
-            trained_centroids,
-            trained_codebooks,
-            #[cfg(feature = "native")]
-            thread_pool,
+            segment_manager,
+            trained_centroids: FxHashMap::default(),
+            trained_codebooks: FxHashMap::default(),
         })
     }
 
-    /// Load segments and trained structures from metadata
-    async fn load_segments_and_trained(
-        directory: &Arc<D>,
-        schema: &Arc<Schema>,
-        config: &IndexConfig,
-    ) -> Result<(
-        Vec<Arc<SegmentReader>>,
-        FxHashMap<u32, Arc<CoarseCentroids>>,
-        FxHashMap<u32, Arc<PQCodebook>>,
-    )> {
-        // Load metadata
-        let meta = Self::load_metadata(directory).await?;
+    /// Open an existing index from a directory
+    pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
+        let directory = Arc::new(directory);
 
-        // Load trained centroids and codebooks
+        // Load metadata (includes schema)
+        let metadata = IndexMetadata::load(directory.as_ref()).await?;
+        let schema = Arc::new(metadata.schema.clone());
+
+        // Load trained structures
         let (trained_centroids, trained_codebooks) =
-            meta.load_trained_structures(directory.as_ref()).await;
+            metadata.load_trained_structures(directory.as_ref()).await;
 
-        // Load segments
-        let mut segments = Vec::new();
-        let mut doc_id_offset = 0u32;
+        let segment_manager = Arc::new(crate::merge::SegmentManager::new(
+            Arc::clone(&directory),
+            Arc::clone(&schema),
+            metadata,
+            config.merge_policy.clone_box(),
+            config.term_cache_blocks,
+        ));
 
-        for id_str in meta.segments {
-            let segment_id = SegmentId::from_hex(&id_str)
-                .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = SegmentReader::open(
-                directory.as_ref(),
-                segment_id,
-                Arc::clone(schema),
-                doc_id_offset,
-                config.term_cache_blocks,
-            )
-            .await?;
-
-            doc_id_offset += reader.meta().num_docs;
-            segments.push(Arc::new(reader));
-        }
-
-        Ok((segments, trained_centroids, trained_codebooks))
-    }
-
-    /// Load metadata from metadata.json
-    async fn load_metadata(directory: &Arc<D>) -> Result<IndexMetadata> {
-        let meta_path = Path::new(INDEX_META_FILENAME);
-        if directory.exists(meta_path).await.unwrap_or(false) {
-            let slice = directory.open_read(meta_path).await?;
-            let bytes = slice.read_bytes().await?;
-            let meta: IndexMetadata = serde_json::from_slice(bytes.as_slice())
-                .map_err(|e| Error::Serialization(e.to_string()))?;
-            return Ok(meta);
-        }
-        Ok(IndexMetadata::new())
+        Ok(Self {
+            directory,
+            schema,
+            config,
+            segment_manager,
+            trained_centroids,
+            trained_codebooks,
+        })
     }
 
     /// Get the schema
@@ -221,369 +171,107 @@ impl<D: Directory> Index<D> {
         &self.directory
     }
 
+    /// Get the segment manager
+    pub fn segment_manager(&self) -> &Arc<crate::merge::SegmentManager<D>> {
+        &self.segment_manager
+    }
+
+    /// Get an IndexWriter for adding documents
+    pub fn writer(&self) -> writer::IndexWriter<D> {
+        writer::IndexWriter::from_index(self)
+    }
+
+    /// Get an IndexReader for searching (with reload policy)
+    pub async fn reader(&self) -> Result<IndexReader<D>> {
+        IndexReader::from_segment_manager(
+            Arc::clone(&self.schema),
+            Arc::clone(&self.segment_manager),
+            self.trained_centroids.clone(),
+            self.trained_codebooks.clone(),
+            self.config.term_cache_blocks,
+        )
+        .await
+    }
+
+    /// Get the config
+    pub fn config(&self) -> &IndexConfig {
+        &self.config
+    }
+
+    /// Get trained centroids
+    pub fn trained_centroids(&self) -> &FxHashMap<u32, Arc<CoarseCentroids>> {
+        &self.trained_centroids
+    }
+
+    /// Get trained codebooks
+    pub fn trained_codebooks(&self) -> &FxHashMap<u32, Arc<PQCodebook>> {
+        &self.trained_codebooks
+    }
+
+    // ========== Convenience methods delegating to IndexReader/Searcher ==========
+
+    /// Get segment readers for query execution (convenience method)
+    pub async fn segment_readers(&self) -> Result<Vec<Arc<crate::segment::SegmentReader>>> {
+        let reader = self.reader().await?;
+        let searcher = reader.searcher().await?;
+        Ok(searcher.segment_readers().to_vec())
+    }
+
     /// Total number of documents across all segments
-    pub fn num_docs(&self) -> u32 {
-        self.segments.read().iter().map(|s| s.num_docs()).sum()
+    pub async fn num_docs(&self) -> Result<u32> {
+        let reader = self.reader().await?;
+        let searcher = reader.searcher().await?;
+        Ok(searcher.num_docs())
     }
 
-    /// Get a document by global doc_id (async)
-    pub async fn doc(&self, doc_id: DocId) -> Result<Option<Document>> {
-        let segments = self.segments.read().clone();
+    /// Get a document by global doc_id
+    pub async fn doc(&self, doc_id: crate::DocId) -> Result<Option<crate::dsl::Document>> {
+        let reader = self.reader().await?;
+        let searcher = reader.searcher().await?;
+        searcher.doc(doc_id).await
+    }
 
-        let mut offset = 0u32;
-        for segment in segments.iter() {
-            let segment_docs = segment.meta().num_docs;
-            if doc_id < offset + segment_docs {
-                let local_doc_id = doc_id - offset;
-                return segment.doc(local_doc_id).await;
-            }
-            offset += segment_docs;
+    /// Get default fields for search
+    pub fn default_fields(&self) -> Vec<crate::Field> {
+        if !self.schema.default_fields().is_empty() {
+            self.schema.default_fields().to_vec()
+        } else {
+            self.schema
+                .fields()
+                .filter(|(_, entry)| {
+                    entry.indexed && entry.field_type == crate::dsl::FieldType::Text
+                })
+                .map(|(field, _)| field)
+                .collect()
         }
-
-        Ok(None)
     }
 
-    /// Get posting lists for a term across all segments (async)
-    pub async fn get_postings(
-        &self,
-        field: Field,
-        term: &[u8],
-    ) -> Result<Vec<(Arc<SegmentReader>, BlockPostingList)>> {
-        let segments = self.segments.read().clone();
-        let mut results = Vec::new();
-
-        for segment in segments.iter() {
-            if let Some(postings) = segment.get_postings(field, term).await? {
-                results.push((Arc::clone(segment), postings));
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Execute CPU-intensive work on thread pool (native only)
-    #[cfg(feature = "native")]
-    pub async fn spawn_blocking<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.thread_pool.spawn(move || {
-            let result = f();
-            let _ = tx.send(result);
-        });
-        rx.await.expect("Thread pool task panicked")
-    }
-
-    /// Get segment readers for query execution
-    pub fn segment_readers(&self) -> Vec<Arc<SegmentReader>> {
-        self.segments.read().clone()
-    }
-
-    /// Reload segments from directory (after new segments added or merges completed)
-    ///
-    /// This reads the current metadata.json and loads only segments that exist.
-    /// Safe to call at any time - will not reference deleted segments.
-    ///
-    /// Note: This only reloads segments, not trained structures (they are immutable once built)
-    pub async fn reload(&self) -> Result<()> {
-        // Load fresh metadata from disk
-        let meta = Self::load_metadata(&self.directory).await?;
-
-        // Load only segments that exist in current metadata
-        let mut new_segments = Vec::new();
-        let mut doc_id_offset = 0u32;
-
-        for id_str in meta.segments {
-            let segment_id = match SegmentId::from_hex(&id_str) {
-                Some(id) => id,
-                None => {
-                    log::warn!("Invalid segment ID in metadata: {}", id_str);
-                    continue;
-                }
-            };
-
-            // Try to open segment - skip if files don't exist (may have been deleted by merge)
-            match SegmentReader::open(
-                self.directory.as_ref(),
-                segment_id,
-                Arc::clone(&self.schema),
-                doc_id_offset,
-                self.config.term_cache_blocks,
-            )
-            .await
-            {
-                Ok(reader) => {
-                    doc_id_offset += reader.meta().num_docs;
-                    new_segments.push(Arc::new(reader));
-                }
-                Err(e) => {
-                    // Segment files may have been deleted by concurrent merge - skip it
-                    log::warn!(
-                        "Could not open segment {}: {:?} (may have been merged)",
-                        id_str,
-                        e
-                    );
-                }
-            }
-        }
-
-        *self.segments.write() = new_segments;
-        // Invalidate global stats cache since segments changed
-        self.global_stats.invalidate();
-        Ok(())
-    }
-
-    /// Check if segments need reloading (metadata changed since last load)
-    pub async fn needs_reload(&self) -> Result<bool> {
-        let meta = Self::load_metadata(&self.directory).await?;
-        let current_segments = self.segments.read();
-
-        // Compare segment count and IDs
-        if meta.segments.len() != current_segments.len() {
-            return Ok(true);
-        }
-
-        for (meta_id, reader) in meta.segments.iter().zip(current_segments.iter()) {
-            let reader_id = SegmentId::from_u128(reader.meta().id).to_hex();
-            if meta_id != &reader_id {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// Get global statistics for cross-segment IDF computation (sync, basic stats only)
-    ///
-    /// Returns cached stats if available. For full stats including term frequencies,
-    /// call `build_global_stats().await` first.
-    ///
-    /// This sync version only includes:
-    /// - Total docs
-    /// - Sparse vector dimension document frequencies
-    /// - Average field lengths
-    pub fn global_stats(&self) -> Option<Arc<crate::query::GlobalStats>> {
-        self.global_stats.get()
-    }
-
-    /// Build and cache global statistics (async, includes term frequencies)
-    ///
-    /// This iterates term dictionaries across all segments to compute
-    /// accurate cross-segment IDF values for full-text queries.
-    ///
-    /// Call this once after opening the index or after reload().
-    pub async fn build_global_stats(&self) -> Result<Arc<crate::query::GlobalStats>> {
-        // Return cached if available
-        if let Some(stats) = self.global_stats.get() {
-            return Ok(stats);
-        }
-
-        let segments = self.segments.read().clone();
-        let schema = &self.schema;
-        let mut builder = crate::query::GlobalStatsBuilder::new();
-
-        // Track field length sums for computing global avg
-        let mut field_len_sums: rustc_hash::FxHashMap<u32, (u64, u64)> =
-            rustc_hash::FxHashMap::default();
-
-        for segment in &segments {
-            let num_docs = segment.num_docs() as u64;
-            builder.total_docs += num_docs;
-
-            // Aggregate sparse vector statistics
-            for (&field_id, sparse_index) in segment.sparse_indexes() {
-                for (dim_id, posting_list) in sparse_index.postings.iter().enumerate() {
-                    if let Some(pl) = posting_list {
-                        builder.add_sparse_df(
-                            crate::dsl::Field(field_id),
-                            dim_id as u32,
-                            pl.doc_count() as u64,
-                        );
-                    }
-                }
-            }
-
-            // Aggregate text field average lengths
-            for (field, entry) in schema.fields() {
-                if entry.indexed && entry.field_type == crate::dsl::FieldType::Text {
-                    let avg_len = segment.avg_field_len(field);
-                    let (sum, count) = field_len_sums.entry(field.0).or_insert((0, 0));
-                    *sum += (avg_len * num_docs as f32) as u64;
-                    *count += num_docs;
-                }
-            }
-
-            // Iterate term dictionary to get term document frequencies
-            for (field, term, doc_freq) in segment.all_terms_with_stats().await? {
-                builder.add_text_df(field, term, doc_freq as u64);
-            }
-        }
-
-        // Set global average field lengths
-        for (field_id, (sum, count)) in field_len_sums {
-            if count > 0 {
-                let global_avg = sum as f32 / count as f32;
-                builder.set_avg_field_len(crate::dsl::Field(field_id), global_avg);
-            }
-        }
-
-        let generation = self.global_stats.generation();
-        let stats = builder.build(generation);
-        self.global_stats.set_stats(stats);
-
-        Ok(self.global_stats.get().unwrap())
-    }
-
-    /// Search and return results with document addresses (no document content)
-    ///
-    /// This is the primary search method. Use `get_document` to fetch document content.
-    pub async fn search(
-        &self,
-        query: &dyn crate::query::Query,
-        limit: usize,
-    ) -> Result<crate::query::SearchResponse> {
-        self.search_offset(query, limit, 0).await
-    }
-
-    /// Search with offset for pagination
-    pub async fn search_offset(
-        &self,
-        query: &dyn crate::query::Query,
-        limit: usize,
-        offset: usize,
-    ) -> Result<crate::query::SearchResponse> {
-        self.search_internal(query, limit, offset, false).await
-    }
-
-    /// Search with matched field ordinals (for multi-valued fields with position tracking)
-    ///
-    /// Returns which array elements matched for each field with position tracking enabled.
-    pub async fn search_with_matched_fields(
-        &self,
-        query: &dyn crate::query::Query,
-        limit: usize,
-    ) -> Result<crate::query::SearchResponse> {
-        self.search_internal(query, limit, 0, true).await
-    }
-
-    async fn search_internal(
-        &self,
-        query: &dyn crate::query::Query,
-        limit: usize,
-        offset: usize,
-        collect_positions: bool,
-    ) -> Result<crate::query::SearchResponse> {
-        let segments = self.segments.read().clone();
-        let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
-
-        // Fetch enough results to cover offset + limit
-        let fetch_limit = offset + limit;
-        for segment in &segments {
-            let segment_id = segment.meta().id;
-            let results = if collect_positions {
-                crate::query::search_segment_with_positions(segment.as_ref(), query, fetch_limit)
-                    .await?
-            } else {
-                crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?
-            };
-            for result in results {
-                all_results.push((segment_id, result));
-            }
-        }
-
-        // Sort by score descending
-        all_results.sort_by(|a, b| {
-            b.1.score
-                .partial_cmp(&a.1.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Total hits before pagination
-        let total_hits = all_results.len() as u32;
-
-        // Apply offset and limit
-        let hits: Vec<crate::query::SearchHit> = all_results
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(segment_id, result)| crate::query::SearchHit {
-                address: crate::query::DocAddress::new(segment_id, result.doc_id),
-                score: result.score,
-                matched_fields: result.extract_ordinals(),
-            })
-            .collect();
-
-        Ok(crate::query::SearchResponse { hits, total_hits })
-    }
-
-    /// Get a document by its unique address (segment_id + local doc_id)
-    pub async fn get_document(
-        &self,
-        address: &crate::query::DocAddress,
-    ) -> Result<Option<Document>> {
-        let segment_id = address
-            .segment_id_u128()
-            .ok_or_else(|| Error::Query(format!("Invalid segment ID: {}", address.segment_id)))?;
-
-        let segments = self.segments.read().clone();
-        for segment in &segments {
-            if segment.meta().id == segment_id {
-                return segment.doc(address.doc_id).await;
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Get the default fields for this index
-    pub fn default_fields(&self) -> &[crate::Field] {
-        &self.default_fields
-    }
-
-    /// Set the default fields for query parsing
-    pub fn set_default_fields(&mut self, fields: Vec<crate::Field>) {
-        self.default_fields = fields;
-    }
-
-    /// Get the tokenizer registry
-    pub fn tokenizers(&self) -> &Arc<crate::tokenizer::TokenizerRegistry> {
-        &self.tokenizers
+    /// Get tokenizer registry
+    pub fn tokenizers(&self) -> Arc<crate::tokenizer::TokenizerRegistry> {
+        Arc::new(crate::tokenizer::TokenizerRegistry::default())
     }
 
     /// Create a query parser for this index
-    ///
-    /// If the schema contains query router rules, they will be used to route
-    /// queries to specific fields based on regex patterns.
     pub fn query_parser(&self) -> crate::dsl::QueryLanguageParser {
-        // Check if schema has query routers
+        let default_fields = self.default_fields();
+        let tokenizers = self.tokenizers();
+
         let query_routers = self.schema.query_routers();
-        if !query_routers.is_empty() {
-            // Try to create a router from the schema's rules
-            if let Ok(router) = crate::dsl::QueryFieldRouter::from_rules(query_routers) {
-                return crate::dsl::QueryLanguageParser::with_router(
-                    Arc::clone(&self.schema),
-                    self.default_fields.clone(),
-                    Arc::clone(&self.tokenizers),
-                    router,
-                );
-            }
+        if !query_routers.is_empty()
+            && let Ok(router) = crate::dsl::QueryFieldRouter::from_rules(query_routers)
+        {
+            return crate::dsl::QueryLanguageParser::with_router(
+                Arc::clone(&self.schema),
+                default_fields,
+                tokenizers,
+                router,
+            );
         }
 
-        // Fall back to parser without router
-        crate::dsl::QueryLanguageParser::new(
-            Arc::clone(&self.schema),
-            self.default_fields.clone(),
-            Arc::clone(&self.tokenizers),
-        )
+        crate::dsl::QueryLanguageParser::new(Arc::clone(&self.schema), default_fields, tokenizers)
     }
 
     /// Parse and search using a query string
-    ///
-    /// Accepts both query language syntax (field:term, AND, OR, NOT, grouping)
-    /// and simple text (tokenized and searched across default fields).
-    /// Returns document addresses (segment_id + doc_id) without document content.
     pub async fn query(
         &self,
         query_str: &str,
@@ -600,110 +288,124 @@ impl<D: Directory> Index<D> {
         offset: usize,
     ) -> Result<crate::query::SearchResponse> {
         let parser = self.query_parser();
-        let query = parser.parse(query_str).map_err(Error::Query)?;
+        let query = parser
+            .parse(query_str)
+            .map_err(crate::error::Error::Query)?;
         self.search_offset(query.as_ref(), limit, offset).await
     }
-}
 
-/// Methods for opening index with slice caching
-impl<D: Directory> Index<SliceCachingDirectory<D>> {
-    /// Open an index with slice caching, automatically loading the cache file if present
-    ///
-    /// This wraps the directory in a SliceCachingDirectory and attempts to load
-    /// any existing slice cache file to prefill the cache with hot data.
-    pub async fn open_with_cache(
-        directory: D,
-        config: IndexConfig,
-        cache_max_bytes: usize,
-    ) -> Result<Self> {
-        let caching_dir = SliceCachingDirectory::new(directory, cache_max_bytes);
-
-        // Try to load existing slice cache
-        let cache_path = Path::new(SLICE_CACHE_FILENAME);
-        if let Ok(true) = caching_dir.inner().exists(cache_path).await
-            && let Ok(slice) = caching_dir.inner().open_read(cache_path).await
-            && let Ok(bytes) = slice.read_bytes().await
-        {
-            let _ = caching_dir.deserialize(bytes.as_slice());
-        }
-
-        Self::open(caching_dir, config).await
+    /// Search and return results
+    pub async fn search(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+    ) -> Result<crate::query::SearchResponse> {
+        self.search_offset(query, limit, 0).await
     }
 
-    /// Serialize the current slice cache to the index directory
-    ///
-    /// This saves all cached slices to a single file that can be loaded
-    /// on subsequent index opens for faster startup.
-    #[cfg(feature = "native")]
-    pub async fn save_slice_cache(&self) -> Result<()>
-    where
-        D: crate::directories::DirectoryWriter,
-    {
-        let cache_data = self.directory.serialize();
-        let cache_path = Path::new(SLICE_CACHE_FILENAME);
-        self.directory
-            .inner()
-            .write(cache_path, &cache_data)
-            .await?;
+    /// Search with offset for pagination
+    pub async fn search_offset(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+        offset: usize,
+    ) -> Result<crate::query::SearchResponse> {
+        let reader = self.reader().await?;
+        let searcher = reader.searcher().await?;
+        let segments = searcher.segment_readers();
+
+        let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
+        let fetch_limit = offset + limit;
+
+        for segment in segments {
+            let segment_id = segment.meta().id;
+            let results =
+                crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?;
+            for result in results {
+                all_results.push((segment_id, result));
+            }
+        }
+
+        all_results.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total_hits = all_results.len() as u32;
+
+        let hits: Vec<crate::query::SearchHit> = all_results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(segment_id, result)| crate::query::SearchHit {
+                address: crate::query::DocAddress::new(segment_id, result.doc_id),
+                score: result.score,
+                matched_fields: result.extract_ordinals(),
+            })
+            .collect();
+
+        Ok(crate::query::SearchResponse { hits, total_hits })
+    }
+
+    /// Get a document by its unique address
+    pub async fn get_document(
+        &self,
+        address: &crate::query::DocAddress,
+    ) -> Result<Option<crate::dsl::Document>> {
+        let segment_id = address.segment_id_u128().ok_or_else(|| {
+            crate::error::Error::Query(format!("Invalid segment ID: {}", address.segment_id))
+        })?;
+
+        let reader = self.reader().await?;
+        let searcher = reader.searcher().await?;
+
+        for segment in searcher.segment_readers() {
+            if segment.meta().id == segment_id {
+                return segment.doc(address.doc_id).await;
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Reload is no longer needed - reader handles this automatically
+    pub async fn reload(&self) -> Result<()> {
+        // No-op - reader reloads automatically based on policy
         Ok(())
     }
 
-    /// Get slice cache statistics
-    pub fn slice_cache_stats(&self) -> crate::directories::SliceCacheStats {
-        self.directory.stats()
-    }
-}
+    /// Get posting lists for a term across all segments
+    pub async fn get_postings(
+        &self,
+        field: crate::Field,
+        term: &[u8],
+    ) -> Result<
+        Vec<(
+            Arc<crate::segment::SegmentReader>,
+            crate::structures::BlockPostingList,
+        )>,
+    > {
+        let segments = self.segment_readers().await?;
+        let mut results = Vec::new();
 
-/// Warm up the slice cache by opening an index and performing typical read operations
-///
-/// This function opens an index using a SliceCachingDirectory, performs operations
-/// that would typically be done during search (reading term dictionaries, posting lists),
-/// and then serializes the cache to a file for future use.
-///
-/// The resulting cache file contains all the "hot" data that was read during warmup,
-/// allowing subsequent index opens to prefill the cache and avoid cold-start latency.
-#[cfg(feature = "native")]
-pub async fn warmup_and_save_slice_cache<D: crate::directories::DirectoryWriter>(
-    directory: D,
-    config: IndexConfig,
-    cache_max_bytes: usize,
-) -> Result<()> {
-    let caching_dir = SliceCachingDirectory::new(directory, cache_max_bytes);
-    let index = Index::open(caching_dir, config).await?;
-
-    // Warm up by loading segment metadata and term dictionaries
-    // The SegmentReader::open already reads essential metadata
-    // Additional warmup can be done by iterating terms or doing sample queries
-
-    // Save the cache
-    index.save_slice_cache().await?;
-
-    Ok(())
-}
-
-#[cfg(feature = "native")]
-impl<D: Directory> Clone for Index<D> {
-    fn clone(&self) -> Self {
-        Self {
-            directory: Arc::clone(&self.directory),
-            schema: Arc::clone(&self.schema),
-            config: self.config.clone(),
-            segments: RwLock::new(self.segments.read().clone()),
-            default_fields: self.default_fields.clone(),
-            tokenizers: Arc::clone(&self.tokenizers),
-            global_stats: crate::query::GlobalStatsCache::new(),
-            trained_centroids: self.trained_centroids.clone(),
-            trained_codebooks: self.trained_codebooks.clone(),
-            thread_pool: Arc::clone(&self.thread_pool),
+        for segment in segments {
+            if let Some(postings) = segment.get_postings(field, term).await? {
+                results.push((segment, postings));
+            }
         }
+
+        Ok(results)
     }
 }
+
+// TODO: Add back warmup_and_save_slice_cache when slice caching is re-integrated
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::directories::RamDirectory;
-    use crate::dsl::SchemaBuilder;
+    use crate::dsl::{Document, SchemaBuilder};
 
     #[tokio::test]
     async fn test_index_create_and_search() {
@@ -734,7 +436,7 @@ mod tests {
 
         // Open for reading
         let index = Index::open(dir, config).await.unwrap();
-        assert_eq!(index.num_docs(), 2);
+        assert_eq!(index.num_docs().await.unwrap(), 2);
 
         // Check postings
         let postings = index.get_postings(title, b"world").await.unwrap();
@@ -774,10 +476,10 @@ mod tests {
 
         // Open and check
         let index = Index::open(dir, config).await.unwrap();
-        assert_eq!(index.num_docs(), 15);
+        assert_eq!(index.num_docs().await.unwrap(), 15);
         // With queue-based indexing, exact segment count varies
         assert!(
-            index.segment_readers().len() >= 2,
+            index.segment_readers().await.unwrap().len() >= 2,
             "Expected multiple segments"
         );
     }
@@ -812,7 +514,7 @@ mod tests {
         // Should have multiple segments (at least 2, one per flush with docs)
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
         assert!(
-            index.segment_readers().len() >= 2,
+            index.segment_readers().await.unwrap().len() >= 2,
             "Expected multiple segments"
         );
 
@@ -824,8 +526,8 @@ mod tests {
 
         // Should have 1 segment now
         let index = Index::open(dir, config).await.unwrap();
-        assert_eq!(index.segment_readers().len(), 1);
-        assert_eq!(index.num_docs(), 9);
+        assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+        assert_eq!(index.num_docs().await.unwrap(), 9);
 
         // Verify all documents accessible (order may vary with queue-based indexing)
         let mut found_docs = 0;
@@ -926,30 +628,8 @@ mod tests {
         assert!(!results.hits.is_empty());
 
         // Check cache stats - should have cached some data
-        let stats = index.slice_cache_stats();
+        let stats = index.directory.stats();
         assert!(stats.total_bytes > 0, "Cache should have data after search");
-
-        // Save the cache
-        index.save_slice_cache().await.unwrap();
-
-        // Verify cache file was written
-        assert!(dir.exists(Path::new(SLICE_CACHE_FILENAME)).await.unwrap());
-
-        // Now open with cache loading
-        let index2 = Index::open_with_cache(dir.clone(), config.clone(), 1024 * 1024)
-            .await
-            .unwrap();
-
-        // Cache should be prefilled
-        let stats2 = index2.slice_cache_stats();
-        assert!(
-            stats2.total_bytes > 0,
-            "Cache should be prefilled from file"
-        );
-
-        // Search should still work
-        let results2 = index2.query("rust", 10).await.unwrap();
-        assert_eq!(results.hits.len(), results2.hits.len());
     }
 
     #[tokio::test]
@@ -983,7 +663,7 @@ mod tests {
 
         // Open for reading
         let index = Index::open(dir, config).await.unwrap();
-        assert_eq!(index.num_docs(), 2);
+        assert_eq!(index.num_docs().await.unwrap(), 2);
 
         // Verify document retrieval preserves all values
         let doc = index.doc(0).await.unwrap().unwrap();
@@ -1247,7 +927,7 @@ mod tests {
 
         // Search should work with Flat index
         let query_vec: Vec<f32> = vec![0.5; 8];
-        let segments = index.segment_readers();
+        let segments = index.segment_readers().await.unwrap();
         assert!(!segments.is_empty());
 
         let results = segments[0]
@@ -1291,7 +971,7 @@ mod tests {
         );
 
         // Search should still work
-        let segments = index.segment_readers();
+        let segments = index.segment_readers().await.unwrap();
         let results = segments[0]
             .search_dense_vector(
                 embedding,

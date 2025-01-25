@@ -30,7 +30,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::directories::DirectoryWriter;
 use crate::error::{Error, Result};
 use crate::index::IndexMetadata;
-use crate::segment::{SegmentId, SegmentMerger, SegmentReader};
+use crate::segment::{SegmentId, SegmentMerger, SegmentReader, SegmentSnapshot, SegmentTracker};
 
 use super::{MergePolicy, SegmentInfo};
 
@@ -55,6 +55,8 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     term_cache_blocks: usize,
     /// Notifier for merge completion (avoids busy-waiting)
     merge_complete: Arc<Notify>,
+    /// Segment lifecycle tracker for reference counting
+    tracker: Arc<SegmentTracker>,
 }
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
@@ -66,6 +68,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         merge_policy: Box<dyn MergePolicy>,
         term_cache_blocks: usize,
     ) -> Self {
+        // Initialize tracker and register existing segments
+        let tracker = Arc::new(SegmentTracker::new());
+        for seg_id in &metadata.segments {
+            tracker.register(seg_id);
+        }
+
         Self {
             directory,
             schema,
@@ -75,6 +83,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             merging_segments: Arc::new(AsyncMutex::new(HashSet::new())),
             term_cache_blocks,
             merge_complete: Arc::new(Notify::new()),
+            tracker,
         }
     }
 
@@ -88,13 +97,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// This is the main entry point for adding segments after builds complete.
     /// It atomically:
     /// 1. Adds the segment ID to the list
-    /// 2. Persists metadata to disk
-    /// 3. Triggers merge check (spawns background merges if needed)
+    /// 2. Registers with tracker for reference counting
+    /// 3. Persists metadata to disk
+    /// 4. Triggers merge check (spawns background merges if needed)
     pub async fn register_segment(&self, segment_id: String) -> Result<()> {
         {
             let mut meta = self.metadata.lock().await;
             if !meta.segments.contains(&segment_id) {
-                meta.segments.push(segment_id);
+                meta.segments.push(segment_id.clone());
+                self.tracker.register(&segment_id);
             }
             meta.save(self.directory.as_ref()).await?;
         }
@@ -111,15 +122,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Check merge policy and spawn background merges if needed
     pub async fn maybe_merge(&self) {
-        // Get current segment info (excluding segments being merged)
+        // Get current segment info (excluding segments being merged or pending deletion)
         let meta = self.metadata.lock().await;
         let merging = self.merging_segments.lock().await;
 
-        // Filter out segments currently being merged
+        // Filter out segments currently being merged or pending deletion
         let available_segments: Vec<String> = meta
             .segments
             .iter()
-            .filter(|id| !merging.contains(*id))
+            .filter(|id| !merging.contains(*id) && !self.tracker.is_pending_deletion(id))
             .cloned()
             .collect();
 
@@ -163,6 +174,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let merging_segments = Arc::clone(&self.merging_segments);
         let pending_merges = Arc::clone(&self.pending_merges);
         let merge_complete = Arc::clone(&self.merge_complete);
+        let tracker = Arc::clone(&self.tracker);
         let term_cache_blocks = self.term_cache_blocks;
 
         pending_merges.fetch_add(1, Ordering::SeqCst);
@@ -178,6 +190,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             match result {
                 Ok(new_segment_id) => {
+                    // Register new segment with tracker
+                    tracker.register(&new_segment_id);
+
                     // Atomically update metadata: remove merged segments, add new one, persist
                     let mut meta = metadata.lock().await;
                     meta.segments
@@ -185,6 +200,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     meta.segments.push(new_segment_id);
                     if let Err(e) = meta.save(directory.as_ref()).await {
                         eprintln!("[merge] Failed to save metadata after merge: {:?}", e);
+                    }
+                    drop(meta);
+
+                    // Mark old segments for deletion via tracker (deferred if refs exist)
+                    let ready_to_delete = tracker.mark_for_deletion(&segment_ids_to_merge);
+                    for segment_id in ready_to_delete {
+                        let _ =
+                            crate::segment::delete_segment(directory.as_ref(), segment_id).await;
                     }
                 }
                 Err(e) => {
@@ -253,13 +276,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             return Err(e);
         }
 
-        // Delete old segments
-        for id_str in segment_ids_to_merge {
-            if let Some(segment_id) = SegmentId::from_hex(id_str) {
-                let _ = crate::segment::delete_segment(directory, segment_id).await;
-            }
-        }
-
+        // Note: Segment deletion is handled by the caller via tracker
         Ok(new_segment_id.to_hex())
     }
 
@@ -291,19 +308,51 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         new_segments: Vec<String>,
         old_to_delete: Vec<String>,
     ) -> Result<()> {
+        // Register new segments with tracker
+        for seg_id in &new_segments {
+            self.tracker.register(seg_id);
+        }
+
         {
             let mut meta = self.metadata.lock().await;
             meta.segments = new_segments;
             meta.save(self.directory.as_ref()).await?;
         }
 
-        // Delete old segment files
-        for id_str in old_to_delete {
-            if let Some(segment_id) = SegmentId::from_hex(&id_str) {
-                let _ = crate::segment::delete_segment(self.directory.as_ref(), segment_id).await;
-            }
+        // Mark old segments for deletion via tracker (deferred if refs exist)
+        let ready_to_delete = self.tracker.mark_for_deletion(&old_to_delete);
+        for segment_id in ready_to_delete {
+            let _ = crate::segment::delete_segment(self.directory.as_ref(), segment_id).await;
         }
         Ok(())
+    }
+
+    /// Acquire a snapshot of current segments for reading
+    /// The snapshot holds references - segments won't be deleted while snapshot exists
+    ///
+    /// This is atomic: we hold the metadata lock while acquiring refs to prevent
+    /// a race where a merge completes between getting segment IDs and acquiring refs.
+    pub async fn acquire_snapshot(&self) -> SegmentSnapshot<D> {
+        // Hold metadata lock while acquiring refs - this prevents race with merge completion
+        let meta = self.metadata.lock().await;
+        let acquired = self.tracker.acquire(&meta.segments);
+        drop(meta); // Safe to drop now - refs are acquired
+
+        SegmentSnapshot::new(
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.directory),
+            acquired,
+        )
+    }
+
+    /// Get the segment tracker
+    pub fn tracker(&self) -> Arc<SegmentTracker> {
+        Arc::clone(&self.tracker)
+    }
+
+    /// Get the directory
+    pub fn directory(&self) -> Arc<D> {
+        Arc::clone(&self.directory)
     }
 
     /// Clean up orphan segment files that are not registered

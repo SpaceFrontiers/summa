@@ -438,10 +438,11 @@ mod tests {
         }
 
         let index = Index::open(dir, config).await.unwrap();
+        let seg_count = index.segment_readers().await.unwrap().len();
         assert!(
-            index.segment_readers().len() >= 2,
+            seg_count >= 2,
             "Should have multiple segments, got {}",
-            index.segment_readers().len()
+            seg_count
         );
 
         let results = index.query("content:searchterm", 50).await.unwrap();

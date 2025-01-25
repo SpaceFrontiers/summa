@@ -2,7 +2,6 @@
 //!
 //! This module is only compiled with the "native" feature.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -102,25 +101,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
 
-        // Write schema
-        let schema_bytes =
-            serde_json::to_vec(&*schema).map_err(|e| Error::Serialization(e.to_string()))?;
-        directory
-            .write(Path::new("schema.json"), &schema_bytes)
-            .await?;
-
-        // Write empty segments list
-        let segments_bytes = serde_json::to_vec(&Vec::<String>::new())
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        directory
-            .write(Path::new("segments.json"), &segments_bytes)
-            .await?;
-
         // Create channel for background builds to report completed segment IDs
         let (segment_id_sender, segment_id_receiver) = mpsc::unbounded_channel();
 
-        // Initialize empty metadata for new index
-        let metadata = super::IndexMetadata::new();
+        // Initialize metadata with schema
+        let metadata = super::IndexMetadata::new((*schema).clone());
 
         // Create segment manager - owns metadata.json
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
@@ -195,15 +180,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ) -> Result<Self> {
         let directory = Arc::new(directory);
 
-        // Read schema
-        let schema_slice = directory.open_read(Path::new("schema.json")).await?;
-        let schema_bytes = schema_slice.read_bytes().await?;
-        let schema: Schema = serde_json::from_slice(schema_bytes.as_slice())
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        let schema = Arc::new(schema);
-
-        // Load unified metadata
+        // Load unified metadata (includes schema)
         let metadata = super::IndexMetadata::load(directory.as_ref()).await?;
+        let schema = Arc::new(metadata.schema.clone());
 
         // Create channel for background builds to report completed segment IDs
         let (segment_id_sender, segment_id_receiver) = mpsc::unbounded_channel();
@@ -263,6 +242,68 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             pending_builds,
             global_memory_bytes,
         })
+    }
+
+    /// Create an IndexWriter from an existing Index
+    ///
+    /// This shares the SegmentManager with the Index, ensuring consistent
+    /// segment lifecycle management.
+    pub fn from_index(index: &super::Index<D>) -> Self {
+        let segment_manager = Arc::clone(&index.segment_manager);
+        let directory = Arc::clone(&index.directory);
+        let schema = Arc::clone(&index.schema);
+        let config = index.config.clone();
+        let builder_config = crate::segment::SegmentBuilderConfig::default();
+
+        // Create channel for background builds
+        let (segment_id_sender, segment_id_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let pending_builds = Arc::new(AtomicUsize::new(0));
+        let global_memory_bytes = Arc::new(AtomicUsize::new(0));
+
+        // Create shared worker state
+        let worker_state = Arc::new(WorkerState {
+            directory: Arc::clone(&directory),
+            schema: Arc::clone(&schema),
+            config: config.clone(),
+            builder_config: builder_config.clone(),
+            tokenizers: FxHashMap::default(),
+            segment_id_sender,
+            segment_manager: Arc::clone(&segment_manager),
+            pending_builds: Arc::clone(&pending_builds),
+        });
+
+        // Create per-worker channels and spawn workers
+        let num_workers = config.num_indexing_threads.max(1);
+        let mut worker_senders = Vec::with_capacity(num_workers);
+        let mut workers = Vec::with_capacity(num_workers);
+
+        for _ in 0..num_workers {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WorkerMessage>();
+            worker_senders.push(tx);
+
+            let state = Arc::clone(&worker_state);
+            let handle = tokio::spawn(async move {
+                Self::worker_loop(state, rx).await;
+            });
+            workers.push(handle);
+        }
+
+        Self {
+            directory,
+            schema,
+            config,
+            builder_config,
+            tokenizers: FxHashMap::default(),
+            worker_senders,
+            next_worker: AtomicUsize::new(0),
+            workers,
+            worker_state,
+            segment_manager,
+            segment_id_receiver: AsyncMutex::new(segment_id_receiver),
+            pending_builds,
+            global_memory_bytes,
+        }
     }
 
     /// Get the schema
@@ -447,6 +488,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.wait_for_merges().await;
     }
 
+    /// Get the segment tracker for sharing with readers
+    /// This allows readers to acquire snapshots that prevent segment deletion
+    pub fn tracker(&self) -> std::sync::Arc<crate::segment::SegmentTracker> {
+        self.segment_manager.tracker()
+    }
+
+    /// Acquire a snapshot of current segments for reading
+    /// The snapshot holds references - segments won't be deleted while snapshot exists
+    pub async fn acquire_snapshot(&self) -> crate::segment::SegmentSnapshot<D> {
+        self.segment_manager.acquire_snapshot().await
+    }
+
     /// Clean up orphan segment files that are not registered
     ///
     /// This can happen if the process halts after segment files are written
@@ -562,6 +615,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     pub async fn force_merge(&self) -> Result<()> {
         // First commit all pending documents (waits for completion)
         self.commit().await?;
+        // Wait for any background merges to complete (avoid race with segment deletion)
+        self.wait_for_merges().await;
         // Then merge all segments
         self.do_merge().await
     }

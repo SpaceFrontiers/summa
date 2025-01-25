@@ -14,9 +14,7 @@ use parking_lot::RwLock;
 use tonic::{Request, Response, Status, codec::CompressionEncoding, transport::Server};
 use tracing::info;
 
-use hermes_core::{
-    FsDirectory, Index, IndexConfig, IndexWriter, Schema, parse_schema, search_segment,
-};
+use hermes_core::{FsDirectory, Index, IndexConfig, IndexWriter, Schema, parse_schema};
 
 pub mod proto {
     tonic::include_proto!("hermes");
@@ -55,8 +53,8 @@ struct Args {
 
 /// Index registry holding all open indexes
 struct IndexRegistry {
+    /// Open indexes (Index is the central concept)
     indexes: RwLock<HashMap<String, Arc<Index<FsDirectory>>>>,
-    writers: RwLock<HashMap<String, Arc<IndexWriter<FsDirectory>>>>,
     data_dir: PathBuf,
     config: IndexConfig,
 }
@@ -65,26 +63,25 @@ impl IndexRegistry {
     fn new(data_dir: PathBuf, config: IndexConfig) -> Self {
         Self {
             indexes: RwLock::new(HashMap::new()),
-            writers: RwLock::new(HashMap::new()),
             data_dir,
             config,
         }
     }
 
+    /// Get or open an index
     async fn get_or_open_index(&self, name: &str) -> Result<Arc<Index<FsDirectory>>, Status> {
         // Check if already open
         if let Some(index) = self.indexes.read().get(name) {
             return Ok(Arc::clone(index));
         }
 
-        // Try to open from disk
+        // Open from disk
         let index_path = self.data_dir.join(name);
         if !index_path.exists() {
             return Err(Status::not_found(format!("Index '{}' not found", name)));
         }
 
         let dir = FsDirectory::new(&index_path);
-
         let index = Index::open(dir, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to open index: {}", e)))?;
@@ -96,6 +93,7 @@ impl IndexRegistry {
         Ok(index)
     }
 
+    /// Create a new index
     async fn create_index(&self, name: &str, schema: Schema) -> Result<(), Status> {
         let index_path = self.data_dir.join(name);
 
@@ -110,48 +108,14 @@ impl IndexRegistry {
             .map_err(|e| Status::internal(format!("Failed to create directory: {}", e)))?;
 
         let dir = FsDirectory::new(&index_path);
-
-        let writer = IndexWriter::create(dir.clone(), schema, self.config.clone())
+        let index = Index::create(dir, schema, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
-
-        // Open the index for reading
-        let index = Index::open(dir, self.config.clone())
-            .await
-            .map_err(|e| Status::internal(format!("Failed to open created index: {}", e)))?;
 
         self.indexes
             .write()
             .insert(name.to_string(), Arc::new(index));
-        self.writers
-            .write()
-            .insert(name.to_string(), Arc::new(writer));
-
         Ok(())
-    }
-
-    async fn get_writer(&self, name: &str) -> Result<Arc<IndexWriter<FsDirectory>>, Status> {
-        if let Some(writer) = self.writers.read().get(name) {
-            return Ok(Arc::clone(writer));
-        }
-
-        // Need to open writer
-        let index_path = self.data_dir.join(name);
-        if !index_path.exists() {
-            return Err(Status::not_found(format!("Index '{}' not found", name)));
-        }
-
-        let dir = FsDirectory::new(&index_path);
-
-        let writer = IndexWriter::open(dir, self.config.clone())
-            .await
-            .map_err(|e| Status::internal(format!("Failed to open writer: {}", e)))?;
-
-        let writer = Arc::new(writer);
-        self.writers
-            .write()
-            .insert(name.to_string(), Arc::clone(&writer));
-        Ok(writer)
     }
 }
 
@@ -170,12 +134,20 @@ impl SearchService for SearchServiceImpl {
         let req = request.into_inner();
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let reader = index
+            .reader()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+        let searcher = reader
+            .searcher()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
         let query = req
             .query
             .ok_or_else(|| Status::invalid_argument("Query is required"))?;
 
-        let core_query = convert_query(&query, index.schema())
+        let core_query = convert_query(&query, reader.schema())
             .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
 
         let limit = if req.limit == 0 {
@@ -184,37 +156,22 @@ impl SearchService for SearchServiceImpl {
             req.limit as usize
         };
 
-        // Search across all segments
-        let mut all_results = Vec::new();
-        for segment in index.segment_readers() {
-            let results = search_segment(&segment, core_query.as_ref(), limit)
-                .await
-                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
+        // Search using Searcher
+        let results = searcher
+            .search(core_query.as_ref(), limit)
+            .await
+            .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
 
-            for result in results {
-                all_results.push((
-                    result.doc_id + segment.doc_id_offset(),
-                    result.score,
-                    segment.clone(),
-                ));
-            }
-        }
-
-        // Sort by score descending
-        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        all_results.truncate(limit);
-
-        // Convert to response
+        // Convert to response with optional field loading
         let mut hits = Vec::new();
-        for (doc_id, score, segment) in all_results {
-            let local_doc_id = doc_id - segment.doc_id_offset();
+        for result in results {
             let mut fields = HashMap::new();
 
             if !req.fields_to_load.is_empty()
-                && let Ok(Some(doc)) = segment.doc(local_doc_id).await
+                && let Ok(Some(doc)) = searcher.doc(result.doc_id).await
             {
                 for field_name in &req.fields_to_load {
-                    if let Some(field) = index.schema().get_field(field_name)
+                    if let Some(field) = searcher.schema().get_field(field_name)
                         && let Some(value) = doc.get_first(field)
                     {
                         fields.insert(field_name.clone(), convert_field_value(value));
@@ -223,8 +180,8 @@ impl SearchService for SearchServiceImpl {
             }
 
             hits.push(SearchHit {
-                doc_id,
-                score,
+                doc_id: result.doc_id,
+                score: result.score,
                 fields,
             });
         }
@@ -233,7 +190,7 @@ impl SearchService for SearchServiceImpl {
 
         Ok(Response::new(SearchResponse {
             hits,
-            total_hits: index.num_docs(),
+            total_hits: searcher.num_docs(),
             took_ms,
         }))
     }
@@ -244,8 +201,16 @@ impl SearchService for SearchServiceImpl {
     ) -> Result<Response<GetDocumentResponse>, Status> {
         let req = request.into_inner();
         let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let reader = index
+            .reader()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+        let searcher = reader
+            .searcher()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
-        let doc = index
+        let doc = searcher
             .doc(req.doc_id)
             .await
             .map_err(|e| Status::internal(format!("Failed to get document: {}", e)))?
@@ -267,14 +232,22 @@ impl SearchService for SearchServiceImpl {
     ) -> Result<Response<GetIndexInfoResponse>, Status> {
         let req = request.into_inner();
         let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let reader = index
+            .reader()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+        let searcher = reader
+            .searcher()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
         // Convert schema to SDL string
         let schema_str = schema_to_sdl(index.schema());
 
         Ok(Response::new(GetIndexInfoResponse {
             index_name: req.index_name,
-            num_docs: index.num_docs(),
-            num_segments: index.segment_readers().len() as u32,
+            num_docs: searcher.num_docs(),
+            num_segments: searcher.segment_readers().len() as u32,
             schema: schema_str,
         }))
     }
@@ -313,8 +286,8 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<BatchIndexDocumentsResponse>, Status> {
         let req = request.into_inner();
 
-        let writer = self.registry.get_writer(&req.index_name).await?;
         let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let writer = index.writer();
         let schema = index.schema();
 
         // Convert all documents first (this is CPU-bound, could be parallelized further)
@@ -355,18 +328,21 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<IndexDocumentsResponse>, Status> {
         let mut stream = request.into_inner();
         let mut indexed_count = 0u32;
-        let mut current_index: Option<String> = None;
-        let mut writer: Option<Arc<IndexWriter<FsDirectory>>> = None;
+        let mut current_index: Option<Arc<Index<FsDirectory>>> = None;
+        let mut writer: Option<IndexWriter<FsDirectory>> = None;
 
         while let Some(req) = stream.message().await? {
-            // Get or switch writer if index changed
-            if current_index.as_ref() != Some(&req.index_name) {
-                current_index = Some(req.index_name.clone());
-                writer = Some(self.registry.get_writer(&req.index_name).await?);
+            // Get or switch index/writer if index changed
+            let needs_switch = current_index.is_none();
+
+            if needs_switch {
+                let index = self.registry.get_or_open_index(&req.index_name).await?;
+                writer = Some(index.writer());
+                current_index = Some(index);
             }
 
             let w = writer.as_ref().unwrap();
-            let index = self.registry.get_or_open_index(&req.index_name).await?;
+            let index = current_index.as_ref().unwrap();
 
             let doc = convert_proto_to_document(&req.fields, index.schema())
                 .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
@@ -385,25 +361,29 @@ impl IndexService for IndexServiceImpl {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
-        let writer = self.registry.get_writer(&req.index_name).await?;
+        let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let writer = index.writer();
 
         writer
             .commit()
             .await
             .map_err(|e| Status::internal(format!("Commit failed: {}", e)))?;
 
-        // Reload index to see new segments
-        let index = self.registry.get_or_open_index(&req.index_name).await?;
-        index
-            .reload()
+        // Get doc count from fresh searcher
+        let reader = index
+            .reader()
             .await
-            .map_err(|e| Status::internal(format!("Reload failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+        let searcher = reader
+            .searcher()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
         info!(index_name = %req.index_name, "Committed");
 
         Ok(Response::new(CommitResponse {
             success: true,
-            num_docs: index.num_docs(),
+            num_docs: searcher.num_docs(),
         }))
     }
 
@@ -412,24 +392,29 @@ impl IndexService for IndexServiceImpl {
         request: Request<ForceMergeRequest>,
     ) -> Result<Response<ForceMergeResponse>, Status> {
         let req = request.into_inner();
-        let writer = self.registry.get_writer(&req.index_name).await?;
+        let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let writer = index.writer();
 
         writer
             .force_merge()
             .await
             .map_err(|e| Status::internal(format!("Merge failed: {}", e)))?;
 
-        let index = self.registry.get_or_open_index(&req.index_name).await?;
-        index
-            .reload()
+        // Get segment count from fresh searcher
+        let reader = index
+            .reader()
             .await
-            .map_err(|e| Status::internal(format!("Reload failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+        let searcher = reader
+            .searcher()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
         info!(index_name = %req.index_name, "Force merged");
 
         Ok(Response::new(ForceMergeResponse {
             success: true,
-            num_segments: index.segment_readers().len() as u32,
+            num_segments: searcher.segment_readers().len() as u32,
         }))
     }
 
@@ -439,9 +424,14 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<DeleteIndexResponse>, Status> {
         let req = request.into_inner();
 
+        // Wait for any pending merges to complete before deleting
+        let index_to_wait = self.registry.indexes.read().get(&req.index_name).cloned();
+        if let Some(index) = index_to_wait {
+            index.writer().wait_for_merges().await;
+        }
+
         // Remove from registry
         self.registry.indexes.write().remove(&req.index_name);
-        self.registry.writers.write().remove(&req.index_name);
 
         // Delete directory
         let index_path = self.registry.data_dir.join(&req.index_name);

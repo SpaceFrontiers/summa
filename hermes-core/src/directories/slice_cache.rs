@@ -726,6 +726,71 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
     }
 }
 
+/// DirectoryWriter implementation for SliceCachingDirectory
+/// Delegates to inner directory and invalidates cache entries as needed
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl<D: super::DirectoryWriter> super::DirectoryWriter for SliceCachingDirectory<D> {
+    async fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        // Invalidate cache for this file
+        {
+            let mut caches = self.caches.write();
+            if let Some(file_cache) = caches.remove(path) {
+                let mut current = self.current_bytes.write();
+                *current = current.saturating_sub(file_cache.total_bytes);
+            }
+        }
+        // Invalidate file size cache
+        {
+            let mut file_sizes = self.file_sizes.write();
+            file_sizes.remove(path);
+        }
+        // Delegate to inner
+        self.inner.write(path, data).await
+    }
+
+    async fn delete(&self, path: &Path) -> io::Result<()> {
+        // Invalidate cache for this file
+        {
+            let mut caches = self.caches.write();
+            if let Some(file_cache) = caches.remove(path) {
+                let mut current = self.current_bytes.write();
+                *current = current.saturating_sub(file_cache.total_bytes);
+            }
+        }
+        // Invalidate file size cache
+        {
+            let mut file_sizes = self.file_sizes.write();
+            file_sizes.remove(path);
+        }
+        // Delegate to inner
+        self.inner.delete(path).await
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // Move cache entries from old path to new path
+        {
+            let mut caches = self.caches.write();
+            if let Some(file_cache) = caches.remove(from) {
+                caches.insert(to.to_path_buf(), file_cache);
+            }
+        }
+        // Move file size cache
+        {
+            let mut file_sizes = self.file_sizes.write();
+            if let Some(size) = file_sizes.remove(from) {
+                file_sizes.insert(to.to_path_buf(), size);
+            }
+        }
+        // Delegate to inner
+        self.inner.rename(from, to).await
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        self.inner.sync().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

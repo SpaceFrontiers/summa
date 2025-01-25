@@ -86,10 +86,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
-use hermes_core::{
-    Document, FsDirectory, IndexConfig, IndexWriter, SLICE_CACHE_FILENAME, SliceCachingDirectory,
-    parse_schema,
-};
+use hermes_core::{Document, FsDirectory, IndexConfig, IndexWriter, parse_schema};
 
 #[derive(Parser)]
 #[command(name = "hermes-tool")]
@@ -539,8 +536,8 @@ async fn show_info(index_path: PathBuf) -> Result<()> {
     let index = hermes_core::Index::open(dir, config).await?;
 
     println!("Index: {:?}", index_path);
-    println!("Documents: {}", index.num_docs());
-    println!("Segments: {}", index.segment_readers().len());
+    println!("Documents: {}", index.num_docs().await?);
+    println!("Segments: {}", index.segment_readers().await?.len());
     println!();
     println!("Schema:");
     for (_field, entry) in index.schema().fields() {
@@ -554,32 +551,36 @@ async fn show_info(index_path: PathBuf) -> Result<()> {
 }
 
 async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> {
+    use hermes_core::{DirectoryWriter, SLICE_CACHE_FILENAME, SliceCachingDirectory};
+
     info!(
         "Opening index with slice caching (max {} bytes)...",
         cache_size
     );
 
     let dir = FsDirectory::new(&index_path);
-    let caching_dir = SliceCachingDirectory::new(dir, cache_size);
+    let caching_dir = SliceCachingDirectory::new(dir.clone(), cache_size);
     let config = IndexConfig::default();
 
     let index = hermes_core::Index::open(caching_dir, config).await?;
 
     info!(
         "Index opened: {} documents, {} segments",
-        index.num_docs(),
-        index.segment_readers().len()
+        index.num_docs().await?,
+        index.segment_readers().await?.len()
     );
 
-    let stats = index.slice_cache_stats();
+    let stats = index.directory().stats();
     info!(
         "Cache populated: {} bytes in {} slices across {} files",
         stats.total_bytes, stats.total_slices, stats.files_cached
     );
 
-    index.save_slice_cache().await?;
-
+    // Serialize cache data
+    let cache_data = index.directory().serialize();
     let cache_file = index_path.join(SLICE_CACHE_FILENAME);
+    dir.write(cache_file.as_path(), &cache_data).await?;
+
     let cache_file_size = std::fs::metadata(&cache_file).map(|m| m.len()).unwrap_or(0);
 
     info!(

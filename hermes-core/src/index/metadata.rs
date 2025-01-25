@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::dsl::VectorIndexType;
 use crate::error::{Error, Result};
+use crate::schema::Schema;
 
 /// Metadata file name at index level
 pub const INDEX_META_FILENAME: &str = "metadata.json";
@@ -52,11 +53,13 @@ pub struct FieldVectorMeta {
     pub codebook_file: Option<String>,
 }
 
-/// Unified index metadata - replaces segments.json
+/// Unified index metadata - single source of truth for index state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
     /// Version for compatibility
     pub version: u32,
+    /// Index schema
+    pub schema: Schema,
     /// List of committed segment IDs (hex strings)
     pub segments: Vec<String>,
     /// Per-field vector index metadata
@@ -67,28 +70,13 @@ pub struct IndexMetadata {
     pub total_vectors: usize,
 }
 
-impl Default for IndexMetadata {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl IndexMetadata {
-    /// Create empty metadata
-    pub fn new() -> Self {
+    /// Create new metadata with schema
+    pub fn new(schema: Schema) -> Self {
         Self {
             version: 1,
+            schema,
             segments: Vec::new(),
-            vector_fields: HashMap::new(),
-            total_vectors: 0,
-        }
-    }
-
-    /// Create from existing segments list (migration from old format)
-    pub fn from_segments(segments: Vec<String>) -> Self {
-        Self {
-            version: 1,
-            segments,
             vector_fields: HashMap::new(),
             total_vectors: 0,
         }
@@ -161,28 +149,12 @@ impl IndexMetadata {
         self.segments.retain(|s| !to_remove.contains(s));
     }
 
-    /// Load from directory (with migration from old segments.json)
+    /// Load from directory
     pub async fn load<D: crate::directories::Directory>(dir: &D) -> Result<Self> {
         let path = Path::new(INDEX_META_FILENAME);
-        match dir.open_read(path).await {
-            Ok(slice) => {
-                let bytes = slice.read_bytes().await?;
-                serde_json::from_slice(bytes.as_slice())
-                    .map_err(|e| Error::Serialization(e.to_string()))
-            }
-            Err(_) => {
-                // Try migration from old segments.json format
-                let old_path = Path::new("segments.json");
-                if let Ok(slice) = dir.open_read(old_path).await
-                    && let Ok(bytes) = slice.read_bytes().await
-                    && let Ok(segments) = serde_json::from_slice::<Vec<String>>(bytes.as_slice())
-                {
-                    Ok(Self::from_segments(segments))
-                } else {
-                    Ok(Self::new())
-                }
-            }
-        }
+        let slice = dir.open_read(path).await?;
+        let bytes = slice.read_bytes().await?;
+        serde_json::from_slice(bytes.as_slice()).map_err(|e| Error::Serialization(e.to_string()))
     }
 
     /// Save to directory
@@ -242,9 +214,13 @@ impl IndexMetadata {
 mod tests {
     use super::*;
 
+    fn test_schema() -> Schema {
+        Schema::default()
+    }
+
     #[test]
     fn test_metadata_init() {
-        let mut meta = IndexMetadata::new();
+        let mut meta = IndexMetadata::new(test_schema());
         assert_eq!(meta.total_vectors, 0);
         assert!(meta.segments.is_empty());
         assert!(!meta.is_field_built(0));
@@ -256,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_metadata_segments() {
-        let mut meta = IndexMetadata::new();
+        let mut meta = IndexMetadata::new(test_schema());
         meta.add_segment("abc123".to_string());
         meta.add_segment("def456".to_string());
         assert_eq!(meta.segments.len(), 2);
@@ -272,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_mark_field_built() {
-        let mut meta = IndexMetadata::new();
+        let mut meta = IndexMetadata::new(test_schema());
         meta.init_field(0, VectorIndexType::IvfRaBitQ);
         meta.total_vectors = 10000;
 
@@ -290,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_should_build_field() {
-        let mut meta = IndexMetadata::new();
+        let mut meta = IndexMetadata::new(test_schema());
         meta.init_field(0, VectorIndexType::IvfRaBitQ);
 
         // Below threshold
@@ -308,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_serialization() {
-        let mut meta = IndexMetadata::new();
+        let mut meta = IndexMetadata::new(test_schema());
         meta.add_segment("seg1".to_string());
         meta.init_field(0, VectorIndexType::IvfRaBitQ);
         meta.total_vectors = 5000;
