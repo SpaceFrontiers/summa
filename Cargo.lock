@@ -1758,7 +1758,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.4.12"
+version = "1.4.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.4.12"
+version = "1.4.13"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.4.12"
+version = "1.4.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.4.12"
+version = "1.4.13"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.4.12"
+version = "1.4.13"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",

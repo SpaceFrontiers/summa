@@ -44,9 +44,9 @@ struct Args {
     #[arg(short, long)]
     cache_dir: Option<PathBuf>,
 
-    /// Max documents per segment before auto-flush
-    #[arg(long, default_value = "100000")]
-    max_docs_per_segment: u32,
+    /// Max indexing memory (MB) before auto-flush (global across all builders)
+    #[arg(long, default_value = "3072")]
+    max_indexing_memory_mb: usize,
 
     /// Number of parallel indexing threads (defaults to CPU count)
     #[arg(long)]
@@ -485,7 +485,7 @@ async fn main() -> Result<()> {
     let num_indexing_threads = args.indexing_threads.unwrap_or_else(num_cpus::get);
 
     let config = IndexConfig {
-        max_docs_per_segment: args.max_docs_per_segment,
+        max_indexing_memory_bytes: args.max_indexing_memory_mb * 1024 * 1024,
         num_indexing_threads,
         ..Default::default()
     };
@@ -502,7 +502,7 @@ async fn main() -> Result<()> {
 
     info!("Starting Hermes server on {}", addr);
     info!("Data directory: {:?}", args.data_dir);
-    info!("Max docs per segment: {}", args.max_docs_per_segment);
+    info!("Max indexing memory: {} MB", args.max_indexing_memory_mb);
     info!("Indexing threads: {}", num_indexing_threads);
 
     // 256 MB limit for large batch index operations

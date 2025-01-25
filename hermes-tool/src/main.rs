@@ -143,9 +143,9 @@ enum Commands {
         #[arg(short, long, default_value = "100000")]
         progress: usize,
 
-        /// Max documents per segment (default: 100000)
-        #[arg(short = 'm', long, default_value = "100000")]
-        max_segment_size: u32,
+        /// Max indexing memory in MB before auto-flush (default: 256)
+        #[arg(short = 'm', long, default_value = "3072")]
+        max_indexing_memory_mb: usize,
 
         /// Number of parallel segment builders (default: 1)
         #[arg(short = 'j', long)]
@@ -471,7 +471,7 @@ async fn index_documents(
     documents_path: Option<PathBuf>,
     use_stdin: bool,
     progress_interval: usize,
-    max_segment_size: u32,
+    max_indexing_memory_mb: usize,
     indexing_threads: Option<usize>,
     compression_threads: Option<usize>,
     optimization: String,
@@ -488,7 +488,7 @@ async fn index_documents(
     let dir = FsDirectory::new(&index_path);
     let default_config = IndexConfig::default();
     let config = IndexConfig {
-        max_docs_per_segment: max_segment_size,
+        max_indexing_memory_bytes: max_indexing_memory_mb * 1024 * 1024,
         num_indexing_threads: indexing_threads.unwrap_or(default_config.num_indexing_threads),
         num_compression_threads: compression_threads
             .unwrap_or(default_config.num_compression_threads),
@@ -1475,7 +1475,7 @@ async fn main() -> Result<()> {
             documents,
             stdin,
             progress,
-            max_segment_size,
+            max_indexing_memory_mb,
             indexing_threads,
             compression_threads,
             optimization,
@@ -1485,7 +1485,7 @@ async fn main() -> Result<()> {
                 documents,
                 stdin,
                 progress,
-                max_segment_size,
+                max_indexing_memory_mb,
                 indexing_threads,
                 compression_threads,
                 optimization,

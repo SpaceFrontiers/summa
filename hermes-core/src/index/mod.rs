@@ -54,8 +54,8 @@ pub struct IndexConfig {
     pub term_cache_blocks: usize,
     /// Block cache size for document store per segment
     pub store_cache_blocks: usize,
-    /// Max documents per segment before auto-commit
-    pub max_docs_per_segment: u32,
+    /// Max memory (bytes) across all builders before auto-commit (global limit)
+    pub max_indexing_memory_bytes: usize,
     /// Merge policy for background segment merging
     pub merge_policy: Box<dyn crate::merge::MergePolicy>,
     /// Index optimization mode (adaptive, size-optimized, performance-optimized)
@@ -75,7 +75,7 @@ impl Default for IndexConfig {
             num_compression_threads: cpus,
             term_cache_blocks: 256,
             store_cache_blocks: 32,
-            max_docs_per_segment: 100_000,
+            max_indexing_memory_bytes: 2 * 1024 * 1024 * 1024, // 256 MB default
             merge_policy: Box::new(crate::merge::TieredMergePolicy::default()),
             optimization: crate::structures::IndexOptimization::default(),
         }
@@ -754,7 +754,7 @@ mod tests {
 
         let dir = RamDirectory::new();
         let config = IndexConfig {
-            max_docs_per_segment: 5, // Small segments for testing
+            max_indexing_memory_bytes: 1024, // Very small to trigger frequent flushes
             ..Default::default()
         };
 
@@ -786,7 +786,7 @@ mod tests {
 
         let dir = RamDirectory::new();
         let config = IndexConfig {
-            max_docs_per_segment: 3,
+            max_indexing_memory_bytes: 512, // Very small to trigger frequent flushes
             ..Default::default()
         };
 

@@ -147,6 +147,10 @@ pub struct MemoryBreakdown {
     pub dense_vectors_bytes: usize,
     /// Number of dense vectors
     pub dense_vector_count: usize,
+    /// Sparse vector storage
+    pub sparse_vectors_bytes: usize,
+    /// Position index storage
+    pub position_index_bytes: usize,
 }
 
 /// Configuration for segment builder
@@ -441,12 +445,45 @@ impl SegmentBuilder {
         let local_tf_buffer_bytes =
             self.local_tf_buffer.capacity() * (size_of::<lasso::Spur>() + size_of::<u32>() + 16);
 
+        // Sparse vectors: FxHashMap<u32, SparseVectorBuilder> where each builder has
+        // postings: FxHashMap<u32, Vec<(DocId, f32)>>
+        let mut sparse_vectors_bytes: usize = 0;
+        for builder in self.sparse_vectors.values() {
+            // Each SparseVectorBuilder has a FxHashMap<u32, Vec<(DocId, f32)>>
+            for postings in builder.postings.values() {
+                // Vec<(DocId, f32)> = Vec<(u32, f32)> = 8 bytes per entry
+                sparse_vectors_bytes += postings.capacity() * 8 + size_of::<Vec<(DocId, f32)>>();
+            }
+            // HashMap overhead: ~40 bytes per entry
+            sparse_vectors_bytes += builder.postings.len() * 40;
+        }
+        // Outer HashMap overhead
+        sparse_vectors_bytes += self.sparse_vectors.len() * 40;
+
+        // Position index: HashMap<TermKey, PositionPostingListBuilder>
+        // Each PositionPostingListBuilder has postings: Vec<(DocId, Vec<u32>)>
+        let mut position_index_bytes: usize = 0;
+        for pos_builder in self.position_index.values() {
+            for (_, positions) in &pos_builder.postings {
+                // Vec<u32> capacity
+                position_index_bytes +=
+                    positions.capacity() * size_of::<u32>() + size_of::<Vec<u32>>();
+            }
+            // Vec<(DocId, Vec<u32>)> overhead
+            position_index_bytes +=
+                pos_builder.postings.capacity() * (size_of::<DocId>() + size_of::<Vec<u32>>());
+        }
+        // HashMap overhead
+        position_index_bytes += self.position_index.len() * (size_of::<TermKey>() + 40);
+
         let estimated_memory_bytes = postings_bytes
             + index_overhead_bytes
             + interner_bytes
             + field_lengths_bytes
             + dense_vectors_bytes
-            + local_tf_buffer_bytes;
+            + local_tf_buffer_bytes
+            + sparse_vectors_bytes
+            + position_index_bytes;
 
         let memory_breakdown = MemoryBreakdown {
             postings_bytes,
@@ -455,6 +492,8 @@ impl SegmentBuilder {
             field_lengths_bytes,
             dense_vectors_bytes,
             dense_vector_count,
+            sparse_vectors_bytes,
+            position_index_bytes,
         };
 
         SegmentBuilderStats {

@@ -48,6 +48,8 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     segment_id_receiver: AsyncMutex<mpsc::UnboundedReceiver<String>>,
     /// Count of in-flight background builds
     pending_builds: Arc<AtomicUsize>,
+    /// Global memory usage across all builders (bytes)
+    global_memory_bytes: Arc<AtomicUsize>,
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
@@ -116,6 +118,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_id_sender,
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds: Arc::new(AtomicUsize::new(0)),
+            global_memory_bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -172,6 +175,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_id_sender,
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds: Arc::new(AtomicUsize::new(0)),
+            global_memory_bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -189,7 +193,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ///
     /// Documents are distributed randomly across multiple builders for parallel indexing.
     /// Random distribution avoids atomic contention and provides better load balancing.
-    /// When a builder reaches `max_docs_per_segment`, it is committed and a new one starts.
+    /// When global memory exceeds threshold, the largest builder is committed.
     pub async fn add_document(&self, doc: Document) -> Result<DocId> {
         use rand::Rng;
 
@@ -197,6 +201,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let builder_idx = rand::rng().random_range(0..self.builders.len());
 
         let mut builder_guard = self.builders[builder_idx].lock().await;
+
+        // Get memory before adding (for delta calculation)
+        let memory_before = builder_guard
+            .as_ref()
+            .map(|b| b.stats().estimated_memory_bytes)
+            .unwrap_or(0);
 
         // Initialize builder if needed
         if builder_guard.is_none() {
@@ -211,9 +221,20 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let builder = builder_guard.as_mut().unwrap();
         let doc_id = builder.add_document(doc)?;
 
-        // Check if we need to commit
-        if builder.num_docs() >= self.config.max_docs_per_segment {
+        // Update global memory counter with delta
+        let memory_after = builder.stats().estimated_memory_bytes;
+        let memory_delta = memory_after.saturating_sub(memory_before);
+        self.global_memory_bytes
+            .fetch_add(memory_delta, Ordering::Relaxed);
+
+        // Check if global memory exceeds threshold - flush this builder
+        if self.global_memory_bytes.load(Ordering::Relaxed) >= self.config.max_indexing_memory_bytes
+        {
+            let builder_memory = memory_after;
             let full_builder = builder_guard.take().unwrap();
+            // Subtract this builder's memory from global counter
+            self.global_memory_bytes
+                .fetch_sub(builder_memory, Ordering::Relaxed);
             drop(builder_guard); // Release lock before spawning background task
             self.spawn_background_build(full_builder);
         }

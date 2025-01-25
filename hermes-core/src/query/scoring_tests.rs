@@ -412,7 +412,7 @@ mod tests {
         let (schema, content) = create_schema();
         let dir = RamDirectory::new();
         let config = IndexConfig {
-            max_docs_per_segment: 5,
+            max_indexing_memory_bytes: 1024, // Small to trigger frequent flushes
             ..Default::default()
         };
 
