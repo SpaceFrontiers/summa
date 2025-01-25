@@ -361,8 +361,34 @@ class HermesClient:
 # =============================================================================
 
 
+def _is_sparse_vector(value: list) -> bool:
+    """Check if list is a sparse vector: list of (int, float) pairs."""
+    if not value:
+        return False
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return False
+        idx, val = item
+        if not isinstance(idx, int) or not isinstance(val, (int, float)):
+            return False
+    return True
+
+
+def _is_dense_vector(value: list) -> bool:
+    """Check if list is a dense vector: flat list of numeric values."""
+    if not value:
+        return False
+    return all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
+
+
 def _to_field_value(value: Any) -> pb.FieldValue:
-    """Convert Python value to protobuf FieldValue."""
+    """Convert Python value to protobuf FieldValue.
+
+    Special handling for vector types:
+    - list[(int, float)] -> SparseVector (list of (index, value) tuples)
+    - list[float] -> DenseVector (flat list of numeric values)
+    - Other lists/dicts -> JSON
+    """
     if isinstance(value, str):
         return pb.FieldValue(text=value)
     elif isinstance(value, bool):
@@ -376,8 +402,23 @@ def _to_field_value(value: Any) -> pb.FieldValue:
         return pb.FieldValue(f64=value)
     elif isinstance(value, bytes):
         return pb.FieldValue(bytes_value=value)
-    elif isinstance(value, (list, dict)):
-        # Assume JSON for complex types
+    elif isinstance(value, dict):
+        # Dicts are always JSON
+        return pb.FieldValue(json_value=json.dumps(value))
+    elif isinstance(value, list):
+        # Check if it's a sparse vector: list of (index, value) pairs
+        if _is_sparse_vector(value):
+            indices = [int(item[0]) for item in value]
+            values = [float(item[1]) for item in value]
+            return pb.FieldValue(
+                sparse_vector=pb.SparseVector(indices=indices, values=values)
+            )
+        # Check if it's a dense vector: flat list of numeric values
+        if _is_dense_vector(value):
+            return pb.FieldValue(
+                dense_vector=pb.DenseVector(values=[float(v) for v in value])
+            )
+        # Otherwise treat as JSON
         return pb.FieldValue(json_value=json.dumps(value))
     else:
         return pb.FieldValue(text=str(value))
