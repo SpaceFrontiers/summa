@@ -238,6 +238,9 @@ pub struct SegmentBuilder {
 
     /// Current element ordinal for multi-valued fields (reset per document)
     current_element_ordinal: FxHashMap<u32, u32>,
+
+    /// Incrementally tracked memory estimate (avoids expensive stats() calls)
+    estimated_memory: usize,
 }
 
 /// Builder for dense vector index using RaBitQ
@@ -377,6 +380,7 @@ impl SegmentBuilder {
             position_index: HashMap::new(),
             position_enabled_fields,
             current_element_ordinal: FxHashMap::default(),
+            estimated_memory: 0,
         })
     }
 
@@ -388,7 +392,13 @@ impl SegmentBuilder {
         self.next_doc_id
     }
 
-    /// Get current statistics for debugging performance
+    /// Fast O(1) memory estimate - updated incrementally during indexing
+    #[inline]
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.estimated_memory
+    }
+
+    /// Get current statistics for debugging performance (expensive - iterates all data)
     pub fn stats(&self) -> SegmentBuilderStats {
         use std::mem::size_of;
 

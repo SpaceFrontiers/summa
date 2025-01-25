@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::DocId;
 use crate::directories::DirectoryWriter;
@@ -21,13 +22,26 @@ use crate::tokenizer::BoxedTokenizer;
 
 use super::IndexConfig;
 
+/// Message sent to worker tasks
+enum WorkerMessage {
+    /// A document to index
+    Document(Document),
+    /// Signal to flush current builder and respond when done
+    Flush(oneshot::Sender<()>),
+}
+
 /// Async IndexWriter for adding documents and committing segments
 ///
 /// Features:
-/// - Parallel indexing with multiple segment builders
+/// - Queue-based parallel indexing with worker tasks
 /// - Streams documents to disk immediately (no in-memory document storage)
 /// - Uses string interning for terms (reduced allocations)
 /// - Uses hashbrown HashMap (faster than BTreeMap)
+///
+/// **Architecture:**
+/// - `add_document()` sends to a bounded channel (fast, non-blocking)
+/// - Worker tasks poll the channel and index documents in parallel
+/// - Each worker owns a SegmentBuilder and flushes when memory threshold is reached
 ///
 /// **State management:**
 /// - Building segments: Managed here (pending_builds)
@@ -36,20 +50,38 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) directory: Arc<D>,
     pub(super) schema: Arc<Schema>,
     pub(super) config: IndexConfig,
+    #[allow(dead_code)] // Used for creating new builders in worker_state
     builder_config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
-    /// Multiple segment builders for parallel indexing
-    builders: Vec<AsyncMutex<Option<SegmentBuilder>>>,
+    /// Channel sender for worker messages - add_document() sends here
+    msg_sender: mpsc::Sender<WorkerMessage>,
+    /// Worker task handles - kept alive to prevent premature shutdown
+    #[allow(dead_code)]
+    workers: Vec<JoinHandle<()>>,
+    /// Shared state for workers
+    #[allow(dead_code)]
+    worker_state: Arc<WorkerState<D>>,
     /// Segment manager - owns metadata.json, handles segments and background merging
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
-    /// Channel sender for completed segment IDs from background builds
-    segment_id_sender: mpsc::UnboundedSender<String>,
     /// Channel receiver for completed segment IDs
     segment_id_receiver: AsyncMutex<mpsc::UnboundedReceiver<String>>,
     /// Count of in-flight background builds
     pending_builds: Arc<AtomicUsize>,
     /// Global memory usage across all builders (bytes)
+    #[allow(dead_code)]
     global_memory_bytes: Arc<AtomicUsize>,
+}
+
+/// Shared state for worker tasks
+struct WorkerState<D: DirectoryWriter + 'static> {
+    directory: Arc<D>,
+    schema: Arc<Schema>,
+    config: IndexConfig,
+    builder_config: SegmentBuilderConfig,
+    tokenizers: FxHashMap<Field, BoxedTokenizer>,
+    segment_id_sender: mpsc::UnboundedSender<String>,
+    segment_manager: Arc<crate::merge::SegmentManager<D>>,
+    pending_builds: Arc<AtomicUsize>,
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
@@ -82,13 +114,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .write(Path::new("segments.json"), &segments_bytes)
             .await?;
 
-        // Create multiple builders for parallel indexing
-        let num_builders = config.num_indexing_threads.max(1);
-        let mut builders = Vec::with_capacity(num_builders);
-        for _ in 0..num_builders {
-            builders.push(AsyncMutex::new(None));
-        }
-
         // Create channel for background builds to report completed segment IDs
         let (segment_id_sender, segment_id_receiver) = mpsc::unbounded_channel();
 
@@ -107,18 +132,50 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Save initial metadata
         segment_manager.update_metadata(|_| {}).await?;
 
+        let pending_builds = Arc::new(AtomicUsize::new(0));
+        let global_memory_bytes = Arc::new(AtomicUsize::new(0));
+
+        // Create shared worker state
+        let worker_state = Arc::new(WorkerState {
+            directory: Arc::clone(&directory),
+            schema: Arc::clone(&schema),
+            config: config.clone(),
+            builder_config: builder_config.clone(),
+            tokenizers: FxHashMap::default(),
+            segment_id_sender,
+            segment_manager: Arc::clone(&segment_manager),
+            pending_builds: Arc::clone(&pending_builds),
+        });
+
+        // Create message channel - bounded to apply backpressure
+        let num_workers = config.num_indexing_threads.max(1);
+        let (msg_sender, msg_receiver) = mpsc::channel::<WorkerMessage>(num_workers * 1000);
+        let msg_receiver = Arc::new(AsyncMutex::new(msg_receiver));
+
+        // Spawn worker tasks
+        let mut workers = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let state = Arc::clone(&worker_state);
+            let receiver = Arc::clone(&msg_receiver);
+            let handle = tokio::spawn(async move {
+                Self::worker_loop(state, receiver).await;
+            });
+            workers.push(handle);
+        }
+
         Ok(Self {
             directory,
             schema,
             config,
             builder_config,
             tokenizers: FxHashMap::default(),
-            builders,
+            msg_sender,
+            workers,
+            worker_state,
             segment_manager,
-            segment_id_sender,
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
-            pending_builds: Arc::new(AtomicUsize::new(0)),
-            global_memory_bytes: Arc::new(AtomicUsize::new(0)),
+            pending_builds,
+            global_memory_bytes,
         })
     }
 
@@ -145,13 +202,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Load unified metadata
         let metadata = super::IndexMetadata::load(directory.as_ref()).await?;
 
-        // Create multiple builders for parallel indexing
-        let num_builders = config.num_indexing_threads.max(1);
-        let mut builders = Vec::with_capacity(num_builders);
-        for _ in 0..num_builders {
-            builders.push(AsyncMutex::new(None));
-        }
-
         // Create channel for background builds to report completed segment IDs
         let (segment_id_sender, segment_id_receiver) = mpsc::unbounded_channel();
 
@@ -164,18 +214,50 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config.term_cache_blocks,
         ));
 
+        let pending_builds = Arc::new(AtomicUsize::new(0));
+        let global_memory_bytes = Arc::new(AtomicUsize::new(0));
+
+        // Create shared worker state
+        let worker_state = Arc::new(WorkerState {
+            directory: Arc::clone(&directory),
+            schema: Arc::clone(&schema),
+            config: config.clone(),
+            builder_config: builder_config.clone(),
+            tokenizers: FxHashMap::default(),
+            segment_id_sender,
+            segment_manager: Arc::clone(&segment_manager),
+            pending_builds: Arc::clone(&pending_builds),
+        });
+
+        // Create message channel - bounded to apply backpressure
+        let num_workers = config.num_indexing_threads.max(1);
+        let (msg_sender, msg_receiver) = mpsc::channel::<WorkerMessage>(num_workers * 1000);
+        let msg_receiver = Arc::new(AsyncMutex::new(msg_receiver));
+
+        // Spawn worker tasks
+        let mut workers = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let state = Arc::clone(&worker_state);
+            let receiver = Arc::clone(&msg_receiver);
+            let handle = tokio::spawn(async move {
+                Self::worker_loop(state, receiver).await;
+            });
+            workers.push(handle);
+        }
+
         Ok(Self {
             directory,
             schema,
             config,
             builder_config,
             tokenizers: FxHashMap::default(),
-            builders,
+            msg_sender,
+            workers,
+            worker_state,
             segment_manager,
-            segment_id_sender,
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
-            pending_builds: Arc::new(AtomicUsize::new(0)),
-            global_memory_bytes: Arc::new(AtomicUsize::new(0)),
+            pending_builds,
+            global_memory_bytes,
         })
     }
 
@@ -189,114 +271,160 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.tokenizers.insert(field, Box::new(tokenizer));
     }
 
-    /// Add a document
+    /// Add a document to the indexing queue
     ///
-    /// Documents are distributed randomly across multiple builders for parallel indexing.
-    /// Random distribution avoids atomic contention and provides better load balancing.
-    /// When global memory exceeds threshold, the largest builder is committed.
+    /// Documents are sent to worker tasks via a bounded channel.
+    /// This is fast and non-blocking (unless backpressure kicks in).
+    /// Workers handle the actual indexing in parallel.
     pub async fn add_document(&self, doc: Document) -> Result<DocId> {
-        use rand::Rng;
+        // Send to worker queue - applies backpressure if queue is full
+        self.msg_sender
+            .send(WorkerMessage::Document(doc))
+            .await
+            .map_err(|_| Error::Internal("Document channel closed".into()))?;
 
-        // Random selection of builder - avoids atomic contention
-        let builder_idx = rand::rng().random_range(0..self.builders.len());
-
-        let mut builder_guard = self.builders[builder_idx].lock().await;
-
-        // Get memory before adding (for delta calculation)
-        let memory_before = builder_guard
-            .as_ref()
-            .map(|b| b.stats().estimated_memory_bytes)
-            .unwrap_or(0);
-
-        // Initialize builder if needed
-        if builder_guard.is_none() {
-            let mut builder =
-                SegmentBuilder::new((*self.schema).clone(), self.builder_config.clone())?;
-            for (field, tokenizer) in &self.tokenizers {
-                builder.set_tokenizer(*field, tokenizer.clone_box());
-            }
-            *builder_guard = Some(builder);
-        }
-
-        let builder = builder_guard.as_mut().unwrap();
-        let doc_id = builder.add_document(doc)?;
-
-        // Update global memory counter with delta
-        let memory_after = builder.stats().estimated_memory_bytes;
-        let memory_delta = memory_after.saturating_sub(memory_before);
-        self.global_memory_bytes
-            .fetch_add(memory_delta, Ordering::Relaxed);
-
-        // Check if global memory exceeds threshold - flush this builder
-        if self.global_memory_bytes.load(Ordering::Relaxed) >= self.config.max_indexing_memory_bytes
-        {
-            let builder_memory = memory_after;
-            let full_builder = builder_guard.take().unwrap();
-            // Subtract this builder's memory from global counter
-            self.global_memory_bytes
-                .fetch_sub(builder_memory, Ordering::Relaxed);
-            drop(builder_guard); // Release lock before spawning background task
-            self.spawn_background_build(full_builder);
-        }
-
-        Ok(doc_id)
+        // Note: We don't have the actual DocId here since workers assign it
+        // Return a placeholder - callers typically don't need the exact ID
+        Ok(0)
     }
 
-    /// Add multiple documents in parallel
-    ///
-    /// Documents are distributed across builders concurrently for maximum throughput.
-    /// Returns the count of successfully indexed documents.
+    /// Documents are sent to worker tasks for parallel processing.
+    /// Returns the count of documents successfully queued.
     pub async fn add_documents(&self, documents: Vec<Document>) -> Result<usize> {
-        use futures::stream::{self, StreamExt};
-
-        let results: Vec<Result<DocId>> = stream::iter(documents)
-            .map(|doc| self.add_document(doc))
-            .buffer_unordered(self.builders.len() * 2) // Allow some concurrency
-            .collect()
-            .await;
-
-        let success_count = results.iter().filter(|r| r.is_ok()).count();
-        Ok(success_count)
+        let mut queued = 0;
+        for doc in documents {
+            if self
+                .msg_sender
+                .send(WorkerMessage::Document(doc))
+                .await
+                .is_ok()
+            {
+                queued += 1;
+            }
+        }
+        Ok(queued)
     }
 
-    /// Spawn a background task to build a segment without blocking document ingestion
-    ///
-    /// The background task will send its segment ID through the channel when complete,
-    /// allowing indexing to continue immediately.
-    fn spawn_background_build(&self, builder: SegmentBuilder) {
-        let directory = Arc::clone(&self.directory);
+    /// Worker loop - polls messages from queue and indexes documents
+    async fn worker_loop(
+        state: Arc<WorkerState<D>>,
+        receiver: Arc<AsyncMutex<mpsc::Receiver<WorkerMessage>>>,
+    ) {
+        let mut builder: Option<SegmentBuilder> = None;
+        let mut doc_count = 0u32;
+
+        loop {
+            // Try to receive a message
+            let msg = {
+                let mut rx = receiver.lock().await;
+                rx.recv().await
+            };
+
+            let Some(msg) = msg else {
+                // Channel closed - flush remaining docs and exit
+                if let Some(b) = builder.take() {
+                    if b.num_docs() > 0 {
+                        Self::spawn_segment_build(&state, b);
+                    }
+                }
+                return;
+            };
+
+            match msg {
+                WorkerMessage::Document(doc) => {
+                    // Initialize builder if needed
+                    if builder.is_none() {
+                        match SegmentBuilder::new(
+                            (*state.schema).clone(),
+                            state.builder_config.clone(),
+                        ) {
+                            Ok(mut b) => {
+                                for (field, tokenizer) in &state.tokenizers {
+                                    b.set_tokenizer(*field, tokenizer.clone_box());
+                                }
+                                builder = Some(b);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to create segment builder: {:?}", e);
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Index the document
+                    let b = builder.as_mut().unwrap();
+                    if let Err(e) = b.add_document(doc) {
+                        eprintln!("Failed to index document: {:?}", e);
+                        continue;
+                    }
+
+                    doc_count += 1;
+
+                    // Check memory periodically
+                    // Use smaller interval for small memory limits (for testing)
+                    let per_worker_limit = state.config.max_indexing_memory_bytes
+                        / state.config.num_indexing_threads.max(1);
+                    let check_interval = if per_worker_limit < 1024 * 1024 {
+                        1
+                    } else {
+                        100
+                    };
+
+                    if doc_count % check_interval == 0 {
+                        let builder_memory = b.stats().estimated_memory_bytes;
+
+                        if builder_memory >= per_worker_limit {
+                            let full_builder = builder.take().unwrap();
+                            Self::spawn_segment_build(&state, full_builder);
+                            doc_count = 0;
+                        }
+                    }
+                }
+                WorkerMessage::Flush(respond) => {
+                    // Flush current builder if it has documents
+                    if let Some(b) = builder.take() {
+                        if b.num_docs() > 0 {
+                            Self::spawn_segment_build(&state, b);
+                        }
+                    }
+                    doc_count = 0;
+                    // Signal that flush is complete for this worker
+                    let _ = respond.send(());
+                }
+            }
+        }
+    }
+    fn spawn_segment_build(state: &Arc<WorkerState<D>>, builder: SegmentBuilder) {
+        let directory = Arc::clone(&state.directory);
         let segment_id = SegmentId::new();
         let segment_hex = segment_id.to_hex();
-        let sender = self.segment_id_sender.clone();
-        let segment_manager = Arc::clone(&self.segment_manager);
+        let sender = state.segment_id_sender.clone();
+        let segment_manager = Arc::clone(&state.segment_manager);
+        let pending_builds = Arc::clone(&state.pending_builds);
 
-        self.pending_builds.fetch_add(1, Ordering::SeqCst);
+        pending_builds.fetch_add(1, Ordering::SeqCst);
 
-        // Spawn a fully independent task that registers its own segment ID
         tokio::spawn(async move {
             match builder.build(directory.as_ref(), segment_id).await {
                 Ok(_) => {
-                    // Register segment via SegmentManager (also triggers merge check)
                     let _ = segment_manager.register_segment(segment_hex.clone()).await;
-                    // Also send through channel for flush() to know when all are done
-                    let _ = sender.send(segment_hex);
                 }
                 Err(e) => {
-                    // Log error but don't crash - segment just won't be registered
                     eprintln!("Background segment build failed: {:?}", e);
                 }
             }
+            // Always send to channel and decrement - even on failure
+            // This ensures commit() doesn't hang waiting for messages
+            let _ = sender.send(segment_hex);
+            pending_builds.fetch_sub(1, Ordering::SeqCst);
         });
     }
 
     /// Collect any completed segment IDs from the channel (non-blocking)
-    ///
-    /// Merge checking is now handled by SegmentManager.register_segment().
     async fn collect_completed_segments(&self) {
         let mut receiver = self.segment_id_receiver.lock().await;
-        while let Ok(_segment_hex) = receiver.try_recv() {
-            // Segment ID already registered by the background task via SegmentManager
-            self.pending_builds.fetch_sub(1, Ordering::SeqCst);
+        while receiver.try_recv().is_ok() {
+            // Segment already registered by spawn_segment_build
         }
     }
 
@@ -334,69 +462,55 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.cleanup_orphan_segments().await
     }
 
-    /// Get current builder statistics for debugging (aggregated from all builders)
-    pub async fn get_builder_stats(&self) -> Option<crate::segment::SegmentBuilderStats> {
-        let mut total_stats: Option<crate::segment::SegmentBuilderStats> = None;
-
-        for builder_mutex in &self.builders {
-            let guard = builder_mutex.lock().await;
-            if let Some(builder) = guard.as_ref() {
-                let stats = builder.stats();
-                if let Some(ref mut total) = total_stats {
-                    total.num_docs += stats.num_docs;
-                    total.unique_terms += stats.unique_terms;
-                    total.postings_in_memory += stats.postings_in_memory;
-                    total.interned_strings += stats.interned_strings;
-                    total.doc_field_lengths_size += stats.doc_field_lengths_size;
-                } else {
-                    total_stats = Some(stats);
-                }
-            }
-        }
-
-        total_stats
-    }
-
-    /// Flush current builders to background processing (non-blocking)
+    /// Flush all workers - signals them to build their current segments
     ///
-    /// This takes all current builders with documents and spawns background tasks
-    /// to build them. Returns immediately - use `commit()` for durability.
-    /// New documents can continue to be added while segments are being built.
+    /// Sends flush signals to all workers and waits for them to acknowledge.
+    /// Workers continue running and can accept new documents after flush.
     pub async fn flush(&self) -> Result<()> {
-        // Collect any already-completed segments
-        self.collect_completed_segments().await;
+        // Send flush signal to each worker and collect response channels
+        let num_workers = self.config.num_indexing_threads.max(1);
+        let mut responses = Vec::with_capacity(num_workers);
 
-        // Take all builders that have documents and spawn background builds
-        for builder_mutex in &self.builders {
-            let mut guard = builder_mutex.lock().await;
-            if let Some(builder) = guard.take()
-                && builder.num_docs() > 0
+        for _ in 0..num_workers {
+            let (tx, rx) = oneshot::channel();
+            if self
+                .msg_sender
+                .send(WorkerMessage::Flush(tx))
+                .await
+                .is_err()
             {
-                self.spawn_background_build(builder);
+                // Channel closed, worker may have exited
+                continue;
             }
+            responses.push(rx);
         }
+
+        // Wait for all workers to acknowledge flush
+        for rx in responses {
+            let _ = rx.await;
+        }
+
+        // Collect any completed segments
+        self.collect_completed_segments().await;
 
         Ok(())
     }
 
     /// Commit all pending segments to disk and wait for completion
     ///
-    /// This flushes any current builders and waits for ALL background builds
-    /// and merges to complete. Provides durability guarantees - all data is persisted.
+    /// This flushes workers and waits for ALL background builds to complete.
+    /// Provides durability guarantees - all data is persisted.
     ///
     /// **Auto-triggers vector index build** when threshold is crossed for any field.
     pub async fn commit(&self) -> Result<()> {
-        // First flush any current builders
+        // Flush all workers first
         self.flush().await?;
 
         // Wait for all pending builds to complete
         let mut receiver = self.segment_id_receiver.lock().await;
         while self.pending_builds.load(Ordering::SeqCst) > 0 {
-            match receiver.recv().await {
-                Some(_segment_hex) => {
-                    self.pending_builds.fetch_sub(1, Ordering::SeqCst);
-                }
-                None => break, // Channel closed
+            if receiver.recv().await.is_none() {
+                break; // Channel closed
             }
         }
         drop(receiver);

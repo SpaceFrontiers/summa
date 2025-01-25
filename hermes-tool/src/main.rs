@@ -404,33 +404,10 @@ async fn index_from_reader<R: BufRead>(
         if progress_interval > 0 && count.is_multiple_of(progress_interval) {
             let elapsed = start_time.elapsed().as_secs_f64();
             let rate = count as f64 / elapsed;
-
-            // Get builder stats for debugging
-            if let Some(stats) = writer.get_builder_stats().await {
-                let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
-                let m = &stats.memory_breakdown;
-
-                // Detect flush (memory dropped significantly) and release memory to OS
-                if stats.estimated_memory_bytes < 5 * 1024 * 1024 {
-                    release_memory_to_os();
-                }
-
-                info!(
-                    "Progress: {} docs ({:.0}/s) | mem: {:.1} MB (postings: {:.1}, index: {:.1}, interner: {:.1}, vectors: {:.1})",
-                    count,
-                    rate,
-                    mb(stats.estimated_memory_bytes),
-                    mb(m.postings_bytes),
-                    mb(m.index_overhead_bytes),
-                    mb(m.interner_bytes),
-                    mb(m.dense_vectors_bytes),
-                );
-            } else {
-                info!(
-                    "Progress: {} documents indexed ({:.0} docs/sec)",
-                    count, rate
-                );
-            }
+            info!(
+                "Progress: {} documents indexed ({:.0} docs/sec)",
+                count, rate
+            );
         }
     }
 
