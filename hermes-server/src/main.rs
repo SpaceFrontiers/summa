@@ -43,6 +43,14 @@ struct Args {
     /// Cache directory for HuggingFace models/tokenizers
     #[arg(short, long)]
     cache_dir: Option<PathBuf>,
+
+    /// Max documents per segment before auto-flush
+    #[arg(long, default_value = "100000")]
+    max_docs_per_segment: u32,
+
+    /// Number of parallel indexing threads (defaults to CPU count)
+    #[arg(long)]
+    indexing_threads: Option<usize>,
 }
 
 /// Index registry holding all open indexes
@@ -50,14 +58,16 @@ struct IndexRegistry {
     indexes: RwLock<HashMap<String, Arc<Index<FsDirectory>>>>,
     writers: RwLock<HashMap<String, Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>>>,
     data_dir: PathBuf,
+    config: IndexConfig,
 }
 
 impl IndexRegistry {
-    fn new(data_dir: PathBuf) -> Self {
+    fn new(data_dir: PathBuf, config: IndexConfig) -> Self {
         Self {
             indexes: RwLock::new(HashMap::new()),
             writers: RwLock::new(HashMap::new()),
             data_dir,
+            config,
         }
     }
 
@@ -75,8 +85,7 @@ impl IndexRegistry {
 
         let dir = FsDirectory::new(&index_path);
 
-        let config = IndexConfig::default();
-        let index = Index::open(dir, config)
+        let index = Index::open(dir, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to open index: {}", e)))?;
 
@@ -102,13 +111,12 @@ impl IndexRegistry {
 
         let dir = FsDirectory::new(&index_path);
 
-        let config = IndexConfig::default();
-        let writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        let writer = IndexWriter::create(dir.clone(), schema, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
 
         // Open the index for reading
-        let index = Index::open(dir, config)
+        let index = Index::open(dir, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to open created index: {}", e)))?;
 
@@ -138,8 +146,7 @@ impl IndexRegistry {
 
         let dir = FsDirectory::new(&index_path);
 
-        let config = IndexConfig::default();
-        let writer = IndexWriter::open(dir, config)
+        let writer = IndexWriter::open(dir, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to open writer: {}", e)))?;
 
@@ -477,7 +484,16 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)?;
 
     let addr: SocketAddr = args.addr.parse()?;
-    let registry = Arc::new(IndexRegistry::new(args.data_dir.clone()));
+
+    let num_indexing_threads = args.indexing_threads.unwrap_or_else(num_cpus::get);
+
+    let config = IndexConfig {
+        max_docs_per_segment: args.max_docs_per_segment,
+        num_indexing_threads,
+        ..Default::default()
+    };
+
+    let registry = Arc::new(IndexRegistry::new(args.data_dir.clone(), config));
 
     let search_service = SearchServiceImpl {
         registry: Arc::clone(&registry),
@@ -489,6 +505,8 @@ async fn main() -> Result<()> {
 
     info!("Starting Hermes server on {}", addr);
     info!("Data directory: {:?}", args.data_dir);
+    info!("Max docs per segment: {}", args.max_docs_per_segment);
+    info!("Indexing threads: {}", num_indexing_threads);
 
     // 256 MB limit for large batch index operations
     const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;

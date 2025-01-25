@@ -130,10 +130,10 @@ impl AsyncSegmentReader {
             Self::load_vectors_file(dir, &files, &schema).await?;
 
         // Load sparse vector indexes from .sparse file
-        let sparse_indexes = Self::load_sparse_file(dir, &files, meta.num_docs).await?;
+        let sparse_indexes = Self::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
 
         // Open positions file handle (if exists) - offsets are now in TermInfo
-        let positions_handle = Self::open_positions_file(dir, &files).await?;
+        let positions_handle = Self::open_positions_file(dir, &files, &schema).await?;
 
         Ok(Self {
             meta,
@@ -768,11 +768,20 @@ impl AsyncSegmentReader {
         dir: &D,
         files: &SegmentFiles,
         total_docs: u32,
+        schema: &Schema,
     ) -> Result<FxHashMap<u32, SparseIndex>> {
         use byteorder::{LittleEndian, ReadBytesExt};
         use std::io::Cursor;
 
         let mut indexes = FxHashMap::default();
+
+        // Skip loading sparse file if schema has no sparse vector fields
+        let has_sparse_vectors = schema
+            .fields()
+            .any(|(_, entry)| entry.sparse_vector_config.is_some());
+        if !has_sparse_vectors {
+            return Ok(indexes);
+        }
 
         // Try to open sparse file (may not exist if no sparse vectors were indexed)
         let handle = match dir.open_lazy(&files.sparse).await {
@@ -867,7 +876,14 @@ impl AsyncSegmentReader {
     async fn open_positions_file<D: Directory>(
         dir: &D,
         files: &SegmentFiles,
+        schema: &Schema,
     ) -> Result<Option<LazyFileHandle>> {
+        // Skip loading positions file if schema has no fields with position tracking
+        let has_positions = schema.fields().any(|(_, entry)| entry.positions.is_some());
+        if !has_positions {
+            return Ok(None);
+        }
+
         // Try to open positions file (may not exist if no positions were indexed)
         match dir.open_lazy(&files.positions).await {
             Ok(h) => Ok(Some(h)),
