@@ -1,7 +1,5 @@
 //! Proto conversion helpers
 
-use std::collections::HashMap;
-
 use hermes_core::query::{DenseVectorQuery, SparseVectorQuery};
 use hermes_core::tokenizer::tokenizer_cache;
 use hermes_core::{
@@ -172,12 +170,18 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
 }
 
 pub fn convert_proto_to_document(
-    fields: &HashMap<String, proto::FieldValue>,
+    fields: &[proto::FieldEntry],
     schema: &Schema,
 ) -> Result<Document, String> {
     let mut doc = Document::new();
 
-    for (name, value) in fields {
+    for entry in fields {
+        let name = &entry.name;
+        let value = entry
+            .value
+            .as_ref()
+            .ok_or_else(|| format!("Field '{}' has no value", name))?;
+
         let field = schema
             .get_field(name)
             .ok_or_else(|| format!("Field '{}' not found in schema", name))?;

@@ -19,7 +19,7 @@ _sym_db = _symbol_database.Default()
 
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
-    b'\n\x0chermes.proto\x12\x06hermes"\x88\x02\n\x05Query\x12!\n\x04term\x18\x01 \x01(\x0b\x32\x11.hermes.TermQueryH\x00\x12\'\n\x07\x62oolean\x18\x02 \x01(\x0b\x32\x14.hermes.BooleanQueryH\x00\x12#\n\x05\x62oost\x18\x03 \x01(\x0b\x32\x12.hermes.BoostQueryH\x00\x12\x1f\n\x03\x61ll\x18\x04 \x01(\x0b\x32\x10.hermes.AllQueryH\x00\x12\x32\n\rsparse_vector\x18\x05 \x01(\x0b\x32\x19.hermes.SparseVectorQueryH\x00\x12\x30\n\x0c\x64\x65nse_vector\x18\x06 \x01(\x0b\x32\x18.hermes.DenseVectorQueryH\x00\x42\x07\n\x05query"Q\n\x11SparseVectorQuery\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\x0f\n\x07indices\x18\x02 \x03(\r\x12\x0e\n\x06values\x18\x03 \x03(\x02\x12\x0c\n\x04text\x18\x04 \x01(\t"X\n\x10\x44\x65nseVectorQuery\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\x0e\n\x06vector\x18\x02 \x03(\x02\x12\x0e\n\x06nprobe\x18\x03 \x01(\r\x12\x15\n\rrerank_factor\x18\x04 \x01(\r"(\n\tTermQuery\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\x0c\n\x04term\x18\x02 \x01(\t"k\n\x0c\x42ooleanQuery\x12\x1b\n\x04must\x18\x01 \x03(\x0b\x32\r.hermes.Query\x12\x1d\n\x06should\x18\x02 \x03(\x0b\x32\r.hermes.Query\x12\x1f\n\x08must_not\x18\x03 \x03(\x0b\x32\r.hermes.Query"9\n\nBoostQuery\x12\x1c\n\x05query\x18\x01 \x01(\x0b\x32\r.hermes.Query\x12\r\n\x05\x62oost\x18\x02 \x01(\x02"\n\n\x08\x41llQuery"x\n\rSearchRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x1c\n\x05query\x18\x02 \x01(\x0b\x32\r.hermes.Query\x12\r\n\x05limit\x18\x03 \x01(\r\x12\x0e\n\x06offset\x18\x04 \x01(\r\x12\x16\n\x0e\x66ields_to_load\x18\x05 \x03(\t"\x9c\x01\n\tSearchHit\x12\x0e\n\x06\x64oc_id\x18\x01 \x01(\r\x12\r\n\x05score\x18\x02 \x01(\x02\x12-\n\x06\x66ields\x18\x03 \x03(\x0b\x32\x1d.hermes.SearchHit.FieldsEntry\x1a\x41\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12!\n\x05value\x18\x02 \x01(\x0b\x32\x12.hermes.FieldValue:\x02\x38\x01"\xdb\x01\n\nFieldValue\x12\x0e\n\x04text\x18\x01 \x01(\tH\x00\x12\r\n\x03u64\x18\x02 \x01(\x04H\x00\x12\r\n\x03i64\x18\x03 \x01(\x03H\x00\x12\r\n\x03\x66\x36\x34\x18\x04 \x01(\x01H\x00\x12\x15\n\x0b\x62ytes_value\x18\x05 \x01(\x0cH\x00\x12-\n\rsparse_vector\x18\x06 \x01(\x0b\x32\x14.hermes.SparseVectorH\x00\x12+\n\x0c\x64\x65nse_vector\x18\x07 \x01(\x0b\x32\x13.hermes.DenseVectorH\x00\x12\x14\n\njson_value\x18\x08 \x01(\tH\x00\x42\x07\n\x05value"/\n\x0cSparseVector\x12\x0f\n\x07indices\x18\x01 \x03(\r\x12\x0e\n\x06values\x18\x02 \x03(\x02"\x1d\n\x0b\x44\x65nseVector\x12\x0e\n\x06values\x18\x01 \x03(\x02"V\n\x0eSearchResponse\x12\x1f\n\x04hits\x18\x01 \x03(\x0b\x32\x11.hermes.SearchHit\x12\x12\n\ntotal_hits\x18\x02 \x01(\r\x12\x0f\n\x07took_ms\x18\x03 \x01(\x04"8\n\x12GetDocumentRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x0e\n\x06\x64oc_id\x18\x02 \x01(\r"\x91\x01\n\x13GetDocumentResponse\x12\x37\n\x06\x66ields\x18\x01 \x03(\x0b\x32\'.hermes.GetDocumentResponse.FieldsEntry\x1a\x41\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12!\n\x05value\x18\x02 \x01(\x0b\x32\x12.hermes.FieldValue:\x02\x38\x01")\n\x13GetIndexInfoRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t"b\n\x14GetIndexInfoResponse\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x10\n\x08num_docs\x18\x02 \x01(\r\x12\x14\n\x0cnum_segments\x18\x03 \x01(\r\x12\x0e\n\x06schema\x18\x04 \x01(\t"8\n\x12\x43reateIndexRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x0e\n\x06schema\x18\x02 \x01(\t"&\n\x13\x43reateIndexResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08"\x85\x01\n\rNamedDocument\x12\x31\n\x06\x66ields\x18\x01 \x03(\x0b\x32!.hermes.NamedDocument.FieldsEntry\x1a\x41\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12!\n\x05value\x18\x02 \x01(\x0b\x32\x12.hermes.FieldValue:\x02\x38\x01"Z\n\x1a\x42\x61tchIndexDocumentsRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12(\n\tdocuments\x18\x02 \x03(\x0b\x32\x15.hermes.NamedDocument"I\n\x1b\x42\x61tchIndexDocumentsResponse\x12\x15\n\rindexed_count\x18\x01 \x01(\r\x12\x13\n\x0b\x65rror_count\x18\x02 \x01(\r"\xa7\x01\n\x14IndexDocumentRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x38\n\x06\x66ields\x18\x02 \x03(\x0b\x32(.hermes.IndexDocumentRequest.FieldsEntry\x1a\x41\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12!\n\x05value\x18\x02 \x01(\x0b\x32\x12.hermes.FieldValue:\x02\x38\x01"/\n\x16IndexDocumentsResponse\x12\x15\n\rindexed_count\x18\x01 \x01(\r"#\n\rCommitRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t"3\n\x0e\x43ommitResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x10\n\x08num_docs\x18\x02 \x01(\r"\'\n\x11\x46orceMergeRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t";\n\x12\x46orceMergeResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x14\n\x0cnum_segments\x18\x02 \x01(\r"(\n\x12\x44\x65leteIndexRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t"&\n\x13\x44\x65leteIndexResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x32\xdb\x01\n\rSearchService\x12\x37\n\x06Search\x12\x15.hermes.SearchRequest\x1a\x16.hermes.SearchResponse\x12\x46\n\x0bGetDocument\x12\x1a.hermes.GetDocumentRequest\x1a\x1b.hermes.GetDocumentResponse\x12I\n\x0cGetIndexInfo\x12\x1b.hermes.GetIndexInfoRequest\x1a\x1c.hermes.GetIndexInfoResponse2\xce\x03\n\x0cIndexService\x12\x46\n\x0b\x43reateIndex\x12\x1a.hermes.CreateIndexRequest\x1a\x1b.hermes.CreateIndexResponse\x12P\n\x0eIndexDocuments\x12\x1c.hermes.IndexDocumentRequest\x1a\x1e.hermes.IndexDocumentsResponse(\x01\x12^\n\x13\x42\x61tchIndexDocuments\x12".hermes.BatchIndexDocumentsRequest\x1a#.hermes.BatchIndexDocumentsResponse\x12\x37\n\x06\x43ommit\x12\x15.hermes.CommitRequest\x1a\x16.hermes.CommitResponse\x12\x43\n\nForceMerge\x12\x19.hermes.ForceMergeRequest\x1a\x1a.hermes.ForceMergeResponse\x12\x46\n\x0b\x44\x65leteIndex\x12\x1a.hermes.DeleteIndexRequest\x1a\x1b.hermes.DeleteIndexResponseb\x06proto3'
+    b'\n\x0chermes.proto\x12\x06hermes"\x88\x02\n\x05Query\x12!\n\x04term\x18\x01 \x01(\x0b\x32\x11.hermes.TermQueryH\x00\x12\'\n\x07\x62oolean\x18\x02 \x01(\x0b\x32\x14.hermes.BooleanQueryH\x00\x12#\n\x05\x62oost\x18\x03 \x01(\x0b\x32\x12.hermes.BoostQueryH\x00\x12\x1f\n\x03\x61ll\x18\x04 \x01(\x0b\x32\x10.hermes.AllQueryH\x00\x12\x32\n\rsparse_vector\x18\x05 \x01(\x0b\x32\x19.hermes.SparseVectorQueryH\x00\x12\x30\n\x0c\x64\x65nse_vector\x18\x06 \x01(\x0b\x32\x18.hermes.DenseVectorQueryH\x00\x42\x07\n\x05query"Q\n\x11SparseVectorQuery\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\x0f\n\x07indices\x18\x02 \x03(\r\x12\x0e\n\x06values\x18\x03 \x03(\x02\x12\x0c\n\x04text\x18\x04 \x01(\t"X\n\x10\x44\x65nseVectorQuery\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\x0e\n\x06vector\x18\x02 \x03(\x02\x12\x0e\n\x06nprobe\x18\x03 \x01(\r\x12\x15\n\rrerank_factor\x18\x04 \x01(\r"(\n\tTermQuery\x12\r\n\x05\x66ield\x18\x01 \x01(\t\x12\x0c\n\x04term\x18\x02 \x01(\t"k\n\x0c\x42ooleanQuery\x12\x1b\n\x04must\x18\x01 \x03(\x0b\x32\r.hermes.Query\x12\x1d\n\x06should\x18\x02 \x03(\x0b\x32\r.hermes.Query\x12\x1f\n\x08must_not\x18\x03 \x03(\x0b\x32\r.hermes.Query"9\n\nBoostQuery\x12\x1c\n\x05query\x18\x01 \x01(\x0b\x32\r.hermes.Query\x12\r\n\x05\x62oost\x18\x02 \x01(\x02"\n\n\x08\x41llQuery"x\n\rSearchRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x1c\n\x05query\x18\x02 \x01(\x0b\x32\r.hermes.Query\x12\r\n\x05limit\x18\x03 \x01(\r\x12\x0e\n\x06offset\x18\x04 \x01(\r\x12\x16\n\x0e\x66ields_to_load\x18\x05 \x03(\t"\x9c\x01\n\tSearchHit\x12\x0e\n\x06\x64oc_id\x18\x01 \x01(\r\x12\r\n\x05score\x18\x02 \x01(\x02\x12-\n\x06\x66ields\x18\x03 \x03(\x0b\x32\x1d.hermes.SearchHit.FieldsEntry\x1a\x41\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12!\n\x05value\x18\x02 \x01(\x0b\x32\x12.hermes.FieldValue:\x02\x38\x01"\xdb\x01\n\nFieldValue\x12\x0e\n\x04text\x18\x01 \x01(\tH\x00\x12\r\n\x03u64\x18\x02 \x01(\x04H\x00\x12\r\n\x03i64\x18\x03 \x01(\x03H\x00\x12\r\n\x03\x66\x36\x34\x18\x04 \x01(\x01H\x00\x12\x15\n\x0b\x62ytes_value\x18\x05 \x01(\x0cH\x00\x12-\n\rsparse_vector\x18\x06 \x01(\x0b\x32\x14.hermes.SparseVectorH\x00\x12+\n\x0c\x64\x65nse_vector\x18\x07 \x01(\x0b\x32\x13.hermes.DenseVectorH\x00\x12\x14\n\njson_value\x18\x08 \x01(\tH\x00\x42\x07\n\x05value"/\n\x0cSparseVector\x12\x0f\n\x07indices\x18\x01 \x03(\r\x12\x0e\n\x06values\x18\x02 \x03(\x02"\x1d\n\x0b\x44\x65nseVector\x12\x0e\n\x06values\x18\x01 \x03(\x02"V\n\x0eSearchResponse\x12\x1f\n\x04hits\x18\x01 \x03(\x0b\x32\x11.hermes.SearchHit\x12\x12\n\ntotal_hits\x18\x02 \x01(\r\x12\x0f\n\x07took_ms\x18\x03 \x01(\x04"8\n\x12GetDocumentRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x0e\n\x06\x64oc_id\x18\x02 \x01(\r"\x91\x01\n\x13GetDocumentResponse\x12\x37\n\x06\x66ields\x18\x01 \x03(\x0b\x32\'.hermes.GetDocumentResponse.FieldsEntry\x1a\x41\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12!\n\x05value\x18\x02 \x01(\x0b\x32\x12.hermes.FieldValue:\x02\x38\x01")\n\x13GetIndexInfoRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t"b\n\x14GetIndexInfoResponse\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x10\n\x08num_docs\x18\x02 \x01(\r\x12\x14\n\x0cnum_segments\x18\x03 \x01(\r\x12\x0e\n\x06schema\x18\x04 \x01(\t"8\n\x12\x43reateIndexRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12\x0e\n\x06schema\x18\x02 \x01(\t"&\n\x13\x43reateIndexResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08"=\n\nFieldEntry\x12\x0c\n\x04name\x18\x01 \x01(\t\x12!\n\x05value\x18\x02 \x01(\x0b\x32\x12.hermes.FieldValue"3\n\rNamedDocument\x12"\n\x06\x66ields\x18\x01 \x03(\x0b\x32\x12.hermes.FieldEntry"Z\n\x1a\x42\x61tchIndexDocumentsRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12(\n\tdocuments\x18\x02 \x03(\x0b\x32\x15.hermes.NamedDocument"I\n\x1b\x42\x61tchIndexDocumentsResponse\x12\x15\n\rindexed_count\x18\x01 \x01(\r\x12\x13\n\x0b\x65rror_count\x18\x02 \x01(\r"N\n\x14IndexDocumentRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t\x12"\n\x06\x66ields\x18\x02 \x03(\x0b\x32\x12.hermes.FieldEntry"/\n\x16IndexDocumentsResponse\x12\x15\n\rindexed_count\x18\x01 \x01(\r"#\n\rCommitRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t"3\n\x0e\x43ommitResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x10\n\x08num_docs\x18\x02 \x01(\r"\'\n\x11\x46orceMergeRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t";\n\x12\x46orceMergeResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x14\n\x0cnum_segments\x18\x02 \x01(\r"(\n\x12\x44\x65leteIndexRequest\x12\x12\n\nindex_name\x18\x01 \x01(\t"&\n\x13\x44\x65leteIndexResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x32\xdb\x01\n\rSearchService\x12\x37\n\x06Search\x12\x15.hermes.SearchRequest\x1a\x16.hermes.SearchResponse\x12\x46\n\x0bGetDocument\x12\x1a.hermes.GetDocumentRequest\x1a\x1b.hermes.GetDocumentResponse\x12I\n\x0cGetIndexInfo\x12\x1b.hermes.GetIndexInfoRequest\x1a\x1c.hermes.GetIndexInfoResponse2\xce\x03\n\x0cIndexService\x12\x46\n\x0b\x43reateIndex\x12\x1a.hermes.CreateIndexRequest\x1a\x1b.hermes.CreateIndexResponse\x12P\n\x0eIndexDocuments\x12\x1c.hermes.IndexDocumentRequest\x1a\x1e.hermes.IndexDocumentsResponse(\x01\x12^\n\x13\x42\x61tchIndexDocuments\x12".hermes.BatchIndexDocumentsRequest\x1a#.hermes.BatchIndexDocumentsResponse\x12\x37\n\x06\x43ommit\x12\x15.hermes.CommitRequest\x1a\x16.hermes.CommitResponse\x12\x43\n\nForceMerge\x12\x19.hermes.ForceMergeRequest\x1a\x1a.hermes.ForceMergeResponse\x12\x46\n\x0b\x44\x65leteIndex\x12\x1a.hermes.DeleteIndexRequest\x1a\x1b.hermes.DeleteIndexResponseb\x06proto3'
 )
 
 _globals = globals()
@@ -31,10 +31,6 @@ if not _descriptor._USE_C_DESCRIPTORS:
     _globals["_SEARCHHIT_FIELDSENTRY"]._serialized_options = b"8\001"
     _globals["_GETDOCUMENTRESPONSE_FIELDSENTRY"]._loaded_options = None
     _globals["_GETDOCUMENTRESPONSE_FIELDSENTRY"]._serialized_options = b"8\001"
-    _globals["_NAMEDDOCUMENT_FIELDSENTRY"]._loaded_options = None
-    _globals["_NAMEDDOCUMENT_FIELDSENTRY"]._serialized_options = b"8\001"
-    _globals["_INDEXDOCUMENTREQUEST_FIELDSENTRY"]._loaded_options = None
-    _globals["_INDEXDOCUMENTREQUEST_FIELDSENTRY"]._serialized_options = b"8\001"
     _globals["_QUERY"]._serialized_start = 25
     _globals["_QUERY"]._serialized_end = 289
     _globals["_SPARSEVECTORQUERY"]._serialized_start = 291
@@ -77,34 +73,32 @@ if not _descriptor._USE_C_DESCRIPTORS:
     _globals["_CREATEINDEXREQUEST"]._serialized_end = 1762
     _globals["_CREATEINDEXRESPONSE"]._serialized_start = 1764
     _globals["_CREATEINDEXRESPONSE"]._serialized_end = 1802
-    _globals["_NAMEDDOCUMENT"]._serialized_start = 1805
-    _globals["_NAMEDDOCUMENT"]._serialized_end = 1938
-    _globals["_NAMEDDOCUMENT_FIELDSENTRY"]._serialized_start = 900
-    _globals["_NAMEDDOCUMENT_FIELDSENTRY"]._serialized_end = 965
-    _globals["_BATCHINDEXDOCUMENTSREQUEST"]._serialized_start = 1940
-    _globals["_BATCHINDEXDOCUMENTSREQUEST"]._serialized_end = 2030
-    _globals["_BATCHINDEXDOCUMENTSRESPONSE"]._serialized_start = 2032
-    _globals["_BATCHINDEXDOCUMENTSRESPONSE"]._serialized_end = 2105
-    _globals["_INDEXDOCUMENTREQUEST"]._serialized_start = 2108
-    _globals["_INDEXDOCUMENTREQUEST"]._serialized_end = 2275
-    _globals["_INDEXDOCUMENTREQUEST_FIELDSENTRY"]._serialized_start = 900
-    _globals["_INDEXDOCUMENTREQUEST_FIELDSENTRY"]._serialized_end = 965
-    _globals["_INDEXDOCUMENTSRESPONSE"]._serialized_start = 2277
-    _globals["_INDEXDOCUMENTSRESPONSE"]._serialized_end = 2324
-    _globals["_COMMITREQUEST"]._serialized_start = 2326
-    _globals["_COMMITREQUEST"]._serialized_end = 2361
-    _globals["_COMMITRESPONSE"]._serialized_start = 2363
-    _globals["_COMMITRESPONSE"]._serialized_end = 2414
-    _globals["_FORCEMERGEREQUEST"]._serialized_start = 2416
-    _globals["_FORCEMERGEREQUEST"]._serialized_end = 2455
-    _globals["_FORCEMERGERESPONSE"]._serialized_start = 2457
-    _globals["_FORCEMERGERESPONSE"]._serialized_end = 2516
-    _globals["_DELETEINDEXREQUEST"]._serialized_start = 2518
-    _globals["_DELETEINDEXREQUEST"]._serialized_end = 2558
-    _globals["_DELETEINDEXRESPONSE"]._serialized_start = 2560
-    _globals["_DELETEINDEXRESPONSE"]._serialized_end = 2598
-    _globals["_SEARCHSERVICE"]._serialized_start = 2601
-    _globals["_SEARCHSERVICE"]._serialized_end = 2820
-    _globals["_INDEXSERVICE"]._serialized_start = 2823
-    _globals["_INDEXSERVICE"]._serialized_end = 3285
+    _globals["_FIELDENTRY"]._serialized_start = 1804
+    _globals["_FIELDENTRY"]._serialized_end = 1865
+    _globals["_NAMEDDOCUMENT"]._serialized_start = 1867
+    _globals["_NAMEDDOCUMENT"]._serialized_end = 1918
+    _globals["_BATCHINDEXDOCUMENTSREQUEST"]._serialized_start = 1920
+    _globals["_BATCHINDEXDOCUMENTSREQUEST"]._serialized_end = 2010
+    _globals["_BATCHINDEXDOCUMENTSRESPONSE"]._serialized_start = 2012
+    _globals["_BATCHINDEXDOCUMENTSRESPONSE"]._serialized_end = 2085
+    _globals["_INDEXDOCUMENTREQUEST"]._serialized_start = 2087
+    _globals["_INDEXDOCUMENTREQUEST"]._serialized_end = 2165
+    _globals["_INDEXDOCUMENTSRESPONSE"]._serialized_start = 2167
+    _globals["_INDEXDOCUMENTSRESPONSE"]._serialized_end = 2214
+    _globals["_COMMITREQUEST"]._serialized_start = 2216
+    _globals["_COMMITREQUEST"]._serialized_end = 2251
+    _globals["_COMMITRESPONSE"]._serialized_start = 2253
+    _globals["_COMMITRESPONSE"]._serialized_end = 2304
+    _globals["_FORCEMERGEREQUEST"]._serialized_start = 2306
+    _globals["_FORCEMERGEREQUEST"]._serialized_end = 2345
+    _globals["_FORCEMERGERESPONSE"]._serialized_start = 2347
+    _globals["_FORCEMERGERESPONSE"]._serialized_end = 2406
+    _globals["_DELETEINDEXREQUEST"]._serialized_start = 2408
+    _globals["_DELETEINDEXREQUEST"]._serialized_end = 2448
+    _globals["_DELETEINDEXRESPONSE"]._serialized_start = 2450
+    _globals["_DELETEINDEXRESPONSE"]._serialized_end = 2488
+    _globals["_SEARCHSERVICE"]._serialized_start = 2491
+    _globals["_SEARCHSERVICE"]._serialized_end = 2710
+    _globals["_INDEXSERVICE"]._serialized_start = 2713
+    _globals["_INDEXSERVICE"]._serialized_end = 3175
 # @@protoc_insertion_point(module_scope)

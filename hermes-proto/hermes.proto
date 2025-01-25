@@ -161,9 +161,16 @@ message CreateIndexResponse {
   bool success = 1;
 }
 
+// Field entry for multi-value field support
+message FieldEntry {
+  string name = 1;
+  FieldValue value = 2;
+}
+
 // Named document for batch indexing
+// Uses repeated FieldEntry to support multi-value fields (same name, multiple values)
 message NamedDocument {
-  map<string, FieldValue> fields = 1;
+  repeated FieldEntry fields = 1;
 }
 
 // Batch index documents request
@@ -180,7 +187,7 @@ message BatchIndexDocumentsResponse {
 // Index document request/response
 message IndexDocumentRequest {
   string index_name = 1;
-  map<string, FieldValue> fields = 2;
+  repeated FieldEntry fields = 2;
 }
 
 message IndexDocumentsResponse {

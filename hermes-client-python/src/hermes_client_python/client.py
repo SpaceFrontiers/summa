@@ -164,7 +164,7 @@ class HermesClient:
 
         named_docs = []
         for doc in documents:
-            fields = {k: _to_field_value(v) for k, v in doc.items()}
+            fields = _to_field_entries(doc)
             named_docs.append(pb.NamedDocument(fields=fields))
 
         request = pb.BatchIndexDocumentsRequest(
@@ -198,7 +198,7 @@ class HermesClient:
 
         async def request_iterator():
             async for doc in documents:
-                fields = {k: _to_field_value(v) for k, v in doc.items()}
+                fields = _to_field_entries(doc)
                 yield pb.IndexDocumentRequest(index_name=index_name, fields=fields)
 
         response = await self._index_stub.IndexDocuments(request_iterator())
@@ -374,11 +374,57 @@ def _is_sparse_vector(value: list) -> bool:
     return True
 
 
+def _is_multi_sparse_vector(value: list) -> bool:
+    """Check if list is a multi-value sparse vector: list of sparse vectors."""
+    if not value:
+        return False
+    return all(_is_sparse_vector(item) for item in value if isinstance(item, list))
+
+
 def _is_dense_vector(value: list) -> bool:
     """Check if list is a dense vector: flat list of numeric values."""
     if not value:
         return False
     return all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
+
+
+def _is_multi_dense_vector(value: list) -> bool:
+    """Check if list is a multi-value dense vector: list of dense vectors."""
+    if not value:
+        return False
+    return all(_is_dense_vector(item) for item in value if isinstance(item, list))
+
+
+def _to_field_entries(doc: dict[str, Any]) -> list[pb.FieldEntry]:
+    """Convert document dict to list of FieldEntry for multi-value field support.
+
+    Multi-value fields (list of sparse vectors or list of dense vectors) are
+    expanded into multiple FieldEntry with the same name.
+    """
+    entries = []
+    for name, value in doc.items():
+        if isinstance(value, list):
+            # Check for multi-value sparse vectors: [[( idx, val), ...], ...]
+            if _is_multi_sparse_vector(value):
+                for sv in value:
+                    indices = [int(item[0]) for item in sv]
+                    values = [float(item[1]) for item in sv]
+                    fv = pb.FieldValue(
+                        sparse_vector=pb.SparseVector(indices=indices, values=values)
+                    )
+                    entries.append(pb.FieldEntry(name=name, value=fv))
+                continue
+            # Check for multi-value dense vectors: [[f1, f2, ...], ...]
+            if _is_multi_dense_vector(value):
+                for dv in value:
+                    fv = pb.FieldValue(
+                        dense_vector=pb.DenseVector(values=[float(v) for v in dv])
+                    )
+                    entries.append(pb.FieldEntry(name=name, value=fv))
+                continue
+        # Single value - use standard conversion
+        entries.append(pb.FieldEntry(name=name, value=_to_field_value(value)))
+    return entries
 
 
 def _to_field_value(value: Any) -> pb.FieldValue:
