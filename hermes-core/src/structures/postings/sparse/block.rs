@@ -257,6 +257,24 @@ impl BlockSparsePostingList {
         self.blocks.get(block_idx).map(|b| b.header.max_weight)
     }
 
+    /// Approximate memory usage in bytes
+    pub fn size_bytes(&self) -> usize {
+        use std::mem::size_of;
+
+        let header_size = size_of::<u32>() * 2; // doc_count + num_blocks
+        let blocks_size: usize = self
+            .blocks
+            .iter()
+            .map(|b| {
+                size_of::<BlockHeader>()
+                    + b.doc_ids_data.len()
+                    + b.ordinals_data.len()
+                    + b.weights_data.len()
+            })
+            .sum();
+        header_size + blocks_size
+    }
+
     pub fn iterator(&self) -> BlockSparsePostingIterator<'_> {
         BlockSparsePostingIterator::new(self)
     }
