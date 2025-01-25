@@ -8,6 +8,12 @@
 //! - **Memory-mapped intermediate files**: Reduces memory pressure
 //! - **Arena allocation**: Batch allocations for reduced fragmentation
 
+mod config;
+mod posting;
+mod vectors;
+
+pub use config::{MemoryBreakdown, SegmentBuilderConfig, SegmentBuilderStats};
+
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -17,168 +23,25 @@ use lasso::{Rodeo, Spur};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::compression::CompressionLevel;
+
+use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
 use crate::tokenizer::BoxedTokenizer;
 use crate::{DocId, Result};
 
+use posting::{
+    CompactPosting, PositionPostingListBuilder, PostingListBuilder, SerializedPosting, TermKey,
+};
+use vectors::{DenseVectorBuilder, SparseVectorBuilder};
+
 // Re-export from vector_data for backwards compatibility
 pub use super::vector_data::{FlatVectorData, IVFRaBitQIndexData, ScaNNIndexData};
 
 /// Size of the document store buffer before writing to disk
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
-
-/// Interned term key combining field and term
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct TermKey {
-    field: u32,
-    term: Spur,
-}
-
-/// Compact posting entry for in-memory storage
-#[derive(Clone, Copy)]
-struct CompactPosting {
-    doc_id: DocId,
-    term_freq: u16,
-}
-
-/// In-memory posting list for a term
-struct PostingListBuilder {
-    /// In-memory postings
-    postings: Vec<CompactPosting>,
-}
-
-impl PostingListBuilder {
-    fn new() -> Self {
-        Self {
-            postings: Vec::new(),
-        }
-    }
-
-    /// Add a posting, merging if same doc_id as last
-    #[inline]
-    fn add(&mut self, doc_id: DocId, term_freq: u32) {
-        // Check if we can merge with the last posting
-        if let Some(last) = self.postings.last_mut()
-            && last.doc_id == doc_id
-        {
-            last.term_freq = last.term_freq.saturating_add(term_freq as u16);
-            return;
-        }
-        self.postings.push(CompactPosting {
-            doc_id,
-            term_freq: term_freq.min(u16::MAX as u32) as u16,
-        });
-    }
-
-    fn len(&self) -> usize {
-        self.postings.len()
-    }
-}
-
-/// In-memory position posting list for a term (for fields with record_positions=true)
-struct PositionPostingListBuilder {
-    /// Doc ID -> list of positions (encoded as element_ordinal << 20 | token_position)
-    postings: Vec<(DocId, Vec<u32>)>,
-}
-
-impl PositionPostingListBuilder {
-    fn new() -> Self {
-        Self {
-            postings: Vec::new(),
-        }
-    }
-
-    /// Add a position for a document
-    #[inline]
-    fn add_position(&mut self, doc_id: DocId, position: u32) {
-        if let Some((last_doc, positions)) = self.postings.last_mut()
-            && *last_doc == doc_id
-        {
-            positions.push(position);
-            return;
-        }
-        self.postings.push((doc_id, vec![position]));
-    }
-}
-
-/// Intermediate result for parallel posting serialization
-enum SerializedPosting {
-    /// Inline posting (small enough to fit in TermInfo)
-    Inline(TermInfo),
-    /// External posting with serialized bytes
-    External { bytes: Vec<u8>, doc_count: u32 },
-}
-
-/// Statistics for debugging segment builder performance
-#[derive(Debug, Clone)]
-pub struct SegmentBuilderStats {
-    /// Number of documents indexed
-    pub num_docs: u32,
-    /// Number of unique terms in the inverted index
-    pub unique_terms: usize,
-    /// Total postings in memory (across all terms)
-    pub postings_in_memory: usize,
-    /// Number of interned strings
-    pub interned_strings: usize,
-    /// Size of doc_field_lengths vector
-    pub doc_field_lengths_size: usize,
-    /// Estimated total memory usage in bytes
-    pub estimated_memory_bytes: usize,
-    /// Memory breakdown by component
-    pub memory_breakdown: MemoryBreakdown,
-}
-
-/// Detailed memory breakdown by component
-#[derive(Debug, Clone, Default)]
-pub struct MemoryBreakdown {
-    /// Postings memory (CompactPosting structs)
-    pub postings_bytes: usize,
-    /// Inverted index HashMap overhead
-    pub index_overhead_bytes: usize,
-    /// Term interner memory
-    pub interner_bytes: usize,
-    /// Document field lengths
-    pub field_lengths_bytes: usize,
-    /// Dense vector storage
-    pub dense_vectors_bytes: usize,
-    /// Number of dense vectors
-    pub dense_vector_count: usize,
-    /// Sparse vector storage
-    pub sparse_vectors_bytes: usize,
-    /// Position index storage
-    pub position_index_bytes: usize,
-}
-
-/// Configuration for segment builder
-#[derive(Clone)]
-pub struct SegmentBuilderConfig {
-    /// Directory for temporary spill files
-    pub temp_dir: PathBuf,
-    /// Compression level for document store
-    pub compression_level: CompressionLevel,
-    /// Number of threads for parallel compression
-    pub num_compression_threads: usize,
-    /// Initial capacity for term interner
-    pub interner_capacity: usize,
-    /// Initial capacity for posting lists hashmap
-    pub posting_map_capacity: usize,
-}
-
-impl Default for SegmentBuilderConfig {
-    fn default() -> Self {
-        Self {
-            temp_dir: std::env::temp_dir(),
-            compression_level: CompressionLevel(7),
-            num_compression_threads: num_cpus::get(),
-            interner_capacity: 1_000_000,
-            posting_map_capacity: 500_000,
-        }
-    }
-}
 
 /// Segment builder with optimized memory usage
 ///
@@ -241,91 +104,6 @@ pub struct SegmentBuilder {
 
     /// Incrementally tracked memory estimate (avoids expensive stats() calls)
     estimated_memory: usize,
-}
-
-/// Builder for dense vector index using RaBitQ
-struct DenseVectorBuilder {
-    /// Dimension of vectors
-    dim: usize,
-    /// Document IDs with vectors
-    doc_ids: Vec<DocId>,
-    /// Flat vector storage (doc_ids.len() * dim floats)
-    vectors: Vec<f32>,
-}
-
-impl DenseVectorBuilder {
-    fn new(dim: usize) -> Self {
-        Self {
-            dim,
-            doc_ids: Vec::new(),
-            vectors: Vec::new(),
-        }
-    }
-
-    fn add(&mut self, doc_id: DocId, vector: &[f32]) {
-        debug_assert_eq!(vector.len(), self.dim, "Vector dimension mismatch");
-        self.doc_ids.push(doc_id);
-        self.vectors.extend_from_slice(vector);
-    }
-
-    fn len(&self) -> usize {
-        self.doc_ids.len()
-    }
-
-    /// Get all vectors as Vec<Vec<f32>> for RaBitQ indexing
-    fn get_vectors(&self) -> Vec<Vec<f32>> {
-        self.doc_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let start = i * self.dim;
-                self.vectors[start..start + self.dim].to_vec()
-            })
-            .collect()
-    }
-
-    /// Get vectors trimmed to specified dimension for matryoshka/MRL indexing
-    fn get_vectors_trimmed(&self, trim_dim: usize) -> Vec<Vec<f32>> {
-        debug_assert!(trim_dim <= self.dim, "trim_dim must be <= dim");
-        self.doc_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let start = i * self.dim;
-                self.vectors[start..start + trim_dim].to_vec()
-            })
-            .collect()
-    }
-}
-
-/// Builder for sparse vector index using BlockSparsePostingList
-///
-/// Collects (doc_id, weight) postings per dimension, then builds
-/// BlockSparsePostingList with proper quantization during commit.
-struct SparseVectorBuilder {
-    /// Postings per dimension: dim_id -> Vec<(doc_id, weight)>
-    postings: FxHashMap<u32, Vec<(DocId, f32)>>,
-}
-
-impl SparseVectorBuilder {
-    fn new() -> Self {
-        Self {
-            postings: FxHashMap::default(),
-        }
-    }
-
-    /// Add a sparse vector entry
-    #[inline]
-    fn add(&mut self, dim_id: u32, doc_id: DocId, weight: f32) {
-        self.postings
-            .entry(dim_id)
-            .or_default()
-            .push((doc_id, weight));
-    }
-
-    fn is_empty(&self) -> bool {
-        self.postings.is_empty()
-    }
 }
 
 impl SegmentBuilder {
@@ -405,86 +183,87 @@ impl SegmentBuilder {
         let postings_in_memory: usize =
             self.inverted_index.values().map(|p| p.postings.len()).sum();
 
-        // Precise memory calculation using actual struct sizes
-        // CompactPosting: doc_id (u32) + term_freq (u16) = 6 bytes, but may have padding
+        // Size constants computed from actual types
         let compact_posting_size = size_of::<CompactPosting>();
+        let vec_overhead = size_of::<Vec<u8>>(); // Vec header: ptr + len + cap = 24 bytes on 64-bit
+        let term_key_size = size_of::<TermKey>();
+        let posting_builder_size = size_of::<PostingListBuilder>();
+        let spur_size = size_of::<lasso::Spur>();
+        let sparse_entry_size = size_of::<(DocId, u16, f32)>();
 
-        // Postings: actual Vec capacity * element size + Vec overhead (24 bytes on 64-bit)
+        // hashbrown HashMap entry overhead: key + value + 1 byte control + padding
+        // Measured: ~(key_size + value_size + 8) per entry on average
+        let hashmap_entry_base_overhead = 8usize;
+
+        // FxHashMap uses same layout as hashbrown
+        let fxhashmap_entry_overhead = hashmap_entry_base_overhead;
+
+        // Postings memory
         let postings_bytes: usize = self
             .inverted_index
             .values()
-            .map(|p| {
-                p.postings.capacity() * compact_posting_size + size_of::<Vec<CompactPosting>>()
-            })
+            .map(|p| p.postings.capacity() * compact_posting_size + vec_overhead)
             .sum();
 
-        // Inverted index: HashMap overhead per entry
-        // Each entry: TermKey (field u32 + Spur 4 bytes = 8 bytes) + PostingListBuilder + HashMap bucket overhead
-        // HashMap typically uses ~1.5x capacity, each bucket ~16-24 bytes
-        let term_key_size = size_of::<TermKey>();
-        let posting_builder_size = size_of::<PostingListBuilder>();
-        let hashmap_entry_overhead = 24; // bucket pointer + metadata
+        // Inverted index overhead
         let index_overhead_bytes = self.inverted_index.len()
-            * (term_key_size + posting_builder_size + hashmap_entry_overhead);
+            * (term_key_size + posting_builder_size + hashmap_entry_base_overhead);
 
         // Term interner: Rodeo stores strings + metadata
-        // Each interned string: actual string bytes + Spur (4 bytes) + internal overhead (~16 bytes)
-        // We can't get exact string lengths, so estimate average term length of 8 bytes
-        let avg_term_len = 8;
-        let interner_overhead_per_string = size_of::<lasso::Spur>() + 16;
+        // Rodeo internal: string bytes + Spur + arena overhead (~2 pointers per string)
+        let interner_arena_overhead = 2 * size_of::<usize>();
+        let avg_term_len = 8; // Estimated average term length
         let interner_bytes =
-            self.term_interner.len() * (avg_term_len + interner_overhead_per_string);
+            self.term_interner.len() * (avg_term_len + spur_size + interner_arena_overhead);
 
-        // Doc field lengths: Vec<u32> with capacity
+        // Doc field lengths
         let field_lengths_bytes =
-            self.doc_field_lengths.capacity() * size_of::<u32>() + size_of::<Vec<u32>>();
+            self.doc_field_lengths.capacity() * size_of::<u32>() + vec_overhead;
 
-        // Dense vectors: actual capacity used
+        // Dense vectors
         let mut dense_vectors_bytes: usize = 0;
         let mut dense_vector_count: usize = 0;
+        let doc_id_ordinal_size = size_of::<(DocId, u16)>();
         for b in self.dense_vectors.values() {
-            // vectors: Vec<f32> capacity + doc_ids: Vec<DocId> capacity
             dense_vectors_bytes += b.vectors.capacity() * size_of::<f32>()
-                + b.doc_ids.capacity() * size_of::<DocId>()
-                + size_of::<Vec<f32>>()
-                + size_of::<Vec<DocId>>();
+                + b.doc_ids.capacity() * doc_id_ordinal_size
+                + 2 * vec_overhead; // Two Vecs
             dense_vector_count += b.doc_ids.len();
         }
 
         // Local buffers
-        let local_tf_buffer_bytes =
-            self.local_tf_buffer.capacity() * (size_of::<lasso::Spur>() + size_of::<u32>() + 16);
+        let local_tf_entry_size = spur_size + size_of::<u32>() + fxhashmap_entry_overhead;
+        let local_tf_buffer_bytes = self.local_tf_buffer.capacity() * local_tf_entry_size;
 
-        // Sparse vectors: FxHashMap<u32, SparseVectorBuilder> where each builder has
-        // postings: FxHashMap<u32, Vec<(DocId, f32)>>
+        // Sparse vectors
         let mut sparse_vectors_bytes: usize = 0;
         for builder in self.sparse_vectors.values() {
-            // Each SparseVectorBuilder has a FxHashMap<u32, Vec<(DocId, f32)>>
             for postings in builder.postings.values() {
-                // Vec<(DocId, f32)> = Vec<(u32, f32)> = 8 bytes per entry
-                sparse_vectors_bytes += postings.capacity() * 8 + size_of::<Vec<(DocId, f32)>>();
+                sparse_vectors_bytes += postings.capacity() * sparse_entry_size + vec_overhead;
             }
-            // HashMap overhead: ~40 bytes per entry
-            sparse_vectors_bytes += builder.postings.len() * 40;
+            // Inner FxHashMap overhead: u32 key + Vec value ptr + overhead
+            let inner_entry_size = size_of::<u32>() + vec_overhead + fxhashmap_entry_overhead;
+            sparse_vectors_bytes += builder.postings.len() * inner_entry_size;
         }
-        // Outer HashMap overhead
-        sparse_vectors_bytes += self.sparse_vectors.len() * 40;
+        // Outer FxHashMap overhead
+        let outer_sparse_entry_size =
+            size_of::<u32>() + size_of::<SparseVectorBuilder>() + fxhashmap_entry_overhead;
+        sparse_vectors_bytes += self.sparse_vectors.len() * outer_sparse_entry_size;
 
-        // Position index: HashMap<TermKey, PositionPostingListBuilder>
-        // Each PositionPostingListBuilder has postings: Vec<(DocId, Vec<u32>)>
+        // Position index
         let mut position_index_bytes: usize = 0;
         for pos_builder in self.position_index.values() {
             for (_, positions) in &pos_builder.postings {
-                // Vec<u32> capacity
-                position_index_bytes +=
-                    positions.capacity() * size_of::<u32>() + size_of::<Vec<u32>>();
+                position_index_bytes += positions.capacity() * size_of::<u32>() + vec_overhead;
             }
-            // Vec<(DocId, Vec<u32>)> overhead
-            position_index_bytes +=
-                pos_builder.postings.capacity() * (size_of::<DocId>() + size_of::<Vec<u32>>());
+            // Vec<(DocId, Vec<u32>)> entry size
+            let pos_entry_size = size_of::<DocId>() + vec_overhead;
+            position_index_bytes += pos_builder.postings.capacity() * pos_entry_size;
         }
-        // HashMap overhead
-        position_index_bytes += self.position_index.len() * (size_of::<TermKey>() + 40);
+        // HashMap overhead for position_index
+        let pos_index_entry_size =
+            term_key_size + size_of::<PositionPostingListBuilder>() + hashmap_entry_base_overhead;
+        position_index_bytes += self.position_index.len() * pos_index_entry_size;
 
         let estimated_memory_bytes = postings_bytes
             + index_overhead_bytes
@@ -566,10 +345,23 @@ impl SegmentBuilder {
                     self.index_numeric_field(*field, doc_id, v.to_bits())?;
                 }
                 (FieldType::DenseVector, FieldValue::DenseVector(vec)) => {
-                    self.index_dense_vector_field(*field, doc_id, vec)?;
+                    // Get current element ordinal for multi-valued fields
+                    let element_ordinal = *self.current_element_ordinal.get(&field.0).unwrap_or(&0);
+                    self.index_dense_vector_field(*field, doc_id, element_ordinal as u16, vec)?;
+                    // Increment element ordinal for next value of this field
+                    *self.current_element_ordinal.entry(field.0).or_insert(0) += 1;
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
-                    self.index_sparse_vector_field(*field, doc_id, entries)?;
+                    // Get current element ordinal for multi-valued fields
+                    let element_ordinal = *self.current_element_ordinal.get(&field.0).unwrap_or(&0);
+                    self.index_sparse_vector_field(
+                        *field,
+                        doc_id,
+                        element_ordinal as u16,
+                        entries,
+                    )?;
+                    // Increment element ordinal for next value of this field
+                    *self.current_element_ordinal.entry(field.0).or_insert(0) += 1;
                 }
                 _ => {}
             }
@@ -706,11 +498,12 @@ impl SegmentBuilder {
         Ok(())
     }
 
-    /// Index a dense vector field
+    /// Index a dense vector field with ordinal tracking
     fn index_dense_vector_field(
         &mut self,
         field: Field,
         doc_id: DocId,
+        ordinal: u16,
         vector: &[f32],
     ) -> Result<()> {
         let dim = vector.len();
@@ -728,13 +521,13 @@ impl SegmentBuilder {
             )));
         }
 
-        builder.add(doc_id, vector);
+        builder.add(doc_id, ordinal, vector);
         Ok(())
     }
 
     /// Index a sparse vector field using dedicated sparse posting lists
     ///
-    /// Collects (doc_id, weight) postings per dimension. During commit, these are
+    /// Collects (doc_id, ordinal, weight) postings per dimension. During commit, these are
     /// converted to BlockSparsePostingList with proper quantization from SparseVectorConfig.
     ///
     /// Weights below the configured `weight_threshold` are not indexed.
@@ -742,6 +535,7 @@ impl SegmentBuilder {
         &mut self,
         field: Field,
         doc_id: DocId,
+        ordinal: u16,
         entries: &[(u32, f32)],
     ) -> Result<()> {
         // Get weight threshold from field config (default 0.0 = no filtering)
@@ -763,7 +557,7 @@ impl SegmentBuilder {
                 continue;
             }
 
-            builder.add(dim_id, doc_id, weight);
+            builder.add(dim_id, doc_id, ordinal, weight);
         }
 
         Ok(())
@@ -971,13 +765,17 @@ impl SegmentBuilder {
 
             let field = crate::dsl::Field(field_id);
 
-            // Get quantization from field config
-            let quantization = self
+            // Get config from field
+            let sparse_config = self
                 .schema
                 .get_field_entry(field)
-                .and_then(|e| e.sparse_vector_config.as_ref())
+                .and_then(|e| e.sparse_vector_config.as_ref());
+
+            let quantization = sparse_config
                 .map(|c| c.weight_quantization)
                 .unwrap_or(WeightQuantization::Float32);
+
+            let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
 
             // Find max dimension ID
             let max_dim_id = builder.postings.keys().max().copied().unwrap_or(0);
@@ -986,14 +784,17 @@ impl SegmentBuilder {
             let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
 
             for (&dim_id, postings) in &builder.postings {
-                // Sort postings by doc_id
+                // Sort postings by doc_id, then by ordinal
                 let mut sorted_postings = postings.clone();
-                sorted_postings.sort_by_key(|(doc_id, _)| *doc_id);
+                sorted_postings.sort_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
 
-                // Build BlockSparsePostingList
-                let block_list =
-                    BlockSparsePostingList::from_postings(&sorted_postings, quantization)
-                        .map_err(crate::Error::Io)?;
+                // Build BlockSparsePostingList with configured block size
+                let block_list = BlockSparsePostingList::from_postings_with_block_size(
+                    &sorted_postings,
+                    quantization,
+                    block_size,
+                )
+                .map_err(crate::Error::Io)?;
 
                 // Serialize
                 let mut bytes = Vec::new();

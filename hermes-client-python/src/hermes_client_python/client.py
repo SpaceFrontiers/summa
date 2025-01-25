@@ -247,6 +247,7 @@ class HermesClient:
         dense_vector: tuple[str, list[float]] | None = None,
         nprobe: int = 0,
         rerank_factor: int = 0,
+        heap_factor: float = 1.0,
         combiner: str = "sum",
         limit: int = 10,
         offset: int = 0,
@@ -263,6 +264,7 @@ class HermesClient:
             dense_vector: Dense vector query as (field, vector) tuple
             nprobe: Number of clusters to probe for dense vector (IVF indexes)
             rerank_factor: Re-ranking factor for dense vector search
+            heap_factor: Approximate search factor for sparse vectors (1.0=exact, 0.8=faster)
             combiner: Score combiner for multi-value fields: "sum", "max", or "avg"
             limit: Maximum number of results
             offset: Offset for pagination
@@ -309,6 +311,7 @@ class HermesClient:
             dense_vector=dense_vector,
             nprobe=nprobe,
             rerank_factor=rerank_factor,
+            heap_factor=heap_factor,
             combiner=combiner,
         )
 
@@ -518,6 +521,7 @@ def _build_query(
     dense_vector: tuple[str, list[float]] | None = None,
     nprobe: int = 0,
     rerank_factor: int = 0,
+    heap_factor: float = 1.0,
     combiner: str = "sum",
 ) -> pb.Query:
     """Build a protobuf Query from parameters."""
@@ -548,7 +552,11 @@ def _build_query(
         field, indices, values = sparse_vector
         return pb.Query(
             sparse_vector=pb.SparseVectorQuery(
-                field=field, indices=indices, values=values, combiner=combiner_value
+                field=field,
+                indices=indices,
+                values=values,
+                combiner=combiner_value,
+                heap_factor=heap_factor,
             )
         )
 
@@ -556,7 +564,10 @@ def _build_query(
         field, text = sparse_text
         return pb.Query(
             sparse_vector=pb.SparseVectorQuery(
-                field=field, text=text, combiner=combiner_value
+                field=field,
+                text=text,
+                combiner=combiner_value,
+                heap_factor=heap_factor,
             )
         )
 

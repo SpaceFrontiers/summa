@@ -1,10 +1,11 @@
 //! Vector query types for dense and sparse vector search
 
 use crate::dsl::Field;
-use crate::segment::SegmentReader;
+use crate::segment::{SegmentReader, VectorSearchResult};
 use crate::{DocId, Score, TERMINATED};
 
-use super::traits::{CountFuture, Query, Scorer, ScorerFuture};
+use super::ScoredPosition;
+use super::traits::{CountFuture, MatchedPositions, Query, Scorer, ScorerFuture};
 
 /// Strategy for combining scores when a document has multiple values for the same field
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,7 +75,7 @@ impl Query for DenseVectorQuery {
             let results =
                 reader.search_dense_vector(field, &vector, limit, rerank_factor, combiner)?;
 
-            Ok(Box::new(DenseVectorScorer::new(results)) as Box<dyn Scorer>)
+            Ok(Box::new(DenseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)
         })
     }
 
@@ -83,17 +84,19 @@ impl Query for DenseVectorQuery {
     }
 }
 
-/// Scorer for dense vector search results
+/// Scorer for dense vector search results with ordinal tracking
 struct DenseVectorScorer {
-    results: Vec<(u32, f32)>,
+    results: Vec<VectorSearchResult>,
     position: usize,
+    field_id: u32,
 }
 
 impl DenseVectorScorer {
-    fn new(results: Vec<(u32, f32)>) -> Self {
+    fn new(results: Vec<VectorSearchResult>, field_id: u32) -> Self {
         Self {
             results,
             position: 0,
+            field_id,
         }
     }
 }
@@ -101,7 +104,7 @@ impl DenseVectorScorer {
 impl Scorer for DenseVectorScorer {
     fn doc(&self) -> DocId {
         if self.position < self.results.len() {
-            self.results[self.position].0
+            self.results[self.position].doc_id
         } else {
             TERMINATED
         }
@@ -109,7 +112,7 @@ impl Scorer for DenseVectorScorer {
 
     fn score(&self) -> Score {
         if self.position < self.results.len() {
-            self.results[self.position].1
+            self.results[self.position].score
         } else {
             0.0
         }
@@ -129,6 +132,19 @@ impl Scorer for DenseVectorScorer {
 
     fn size_hint(&self) -> u32 {
         (self.results.len() - self.position) as u32
+    }
+
+    fn matched_positions(&self) -> Option<MatchedPositions> {
+        if self.position >= self.results.len() {
+            return None;
+        }
+        let result = &self.results[self.position];
+        let scored_positions: Vec<ScoredPosition> = result
+            .ordinals
+            .iter()
+            .map(|(ordinal, score)| ScoredPosition::new(*ordinal, *score))
+            .collect();
+        Some(vec![(self.field_id, scored_positions)])
     }
 }
 
@@ -294,7 +310,7 @@ impl Query for SparseVectorQuery {
                 .search_sparse_vector(field, &vector, limit, combiner)
                 .await?;
 
-            Ok(Box::new(SparseVectorScorer::new(results)) as Box<dyn Scorer>)
+            Ok(Box::new(SparseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)
         })
     }
 
@@ -303,17 +319,19 @@ impl Query for SparseVectorQuery {
     }
 }
 
-/// Scorer for sparse vector search results
+/// Scorer for sparse vector search results with ordinal tracking
 struct SparseVectorScorer {
-    results: Vec<(u32, f32)>,
+    results: Vec<VectorSearchResult>,
     position: usize,
+    field_id: u32,
 }
 
 impl SparseVectorScorer {
-    fn new(results: Vec<(u32, f32)>) -> Self {
+    fn new(results: Vec<VectorSearchResult>, field_id: u32) -> Self {
         Self {
             results,
             position: 0,
+            field_id,
         }
     }
 }
@@ -321,7 +339,7 @@ impl SparseVectorScorer {
 impl Scorer for SparseVectorScorer {
     fn doc(&self) -> DocId {
         if self.position < self.results.len() {
-            self.results[self.position].0
+            self.results[self.position].doc_id
         } else {
             TERMINATED
         }
@@ -329,7 +347,7 @@ impl Scorer for SparseVectorScorer {
 
     fn score(&self) -> Score {
         if self.position < self.results.len() {
-            self.results[self.position].1
+            self.results[self.position].score
         } else {
             0.0
         }
@@ -349,6 +367,19 @@ impl Scorer for SparseVectorScorer {
 
     fn size_hint(&self) -> u32 {
         (self.results.len() - self.position) as u32
+    }
+
+    fn matched_positions(&self) -> Option<MatchedPositions> {
+        if self.position >= self.results.len() {
+            return None;
+        }
+        let result = &self.results[self.position];
+        let scored_positions: Vec<ScoredPosition> = result
+            .ordinals
+            .iter()
+            .map(|(ordinal, score)| ScoredPosition::new(*ordinal, *score))
+            .collect();
+        Some(vec![(self.field_id, scored_positions)])
     }
 }
 

@@ -24,7 +24,7 @@ mod posting_common;
 mod posting_format;
 mod roaring;
 mod rounded_bp128;
-mod sparse_vector;
+mod sparse;
 #[allow(dead_code)]
 mod vertical_bp128;
 
@@ -64,7 +64,7 @@ pub use roaring::{
 pub use rounded_bp128::{
     ROUNDED_BP128_BLOCK_SIZE, RoundedBP128Block, RoundedBP128Iterator, RoundedBP128PostingList,
 };
-pub use sparse_vector::{
+pub use sparse::{
     BlockSparsePostingIterator, BlockSparsePostingList, IndexSize, QueryWeighting,
     SPARSE_BLOCK_SIZE, SparseEntry, SparsePosting, SparsePostingIterator, SparsePostingList,
     SparseQueryConfig, SparseSkipEntry, SparseSkipList, SparseVector, SparseVectorConfig,

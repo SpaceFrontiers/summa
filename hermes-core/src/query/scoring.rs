@@ -22,6 +22,11 @@ pub trait ScoringIterator {
     /// Current document ID (u32::MAX if exhausted)
     fn doc(&self) -> DocId;
 
+    /// Current ordinal for multi-valued fields (default 0)
+    fn ordinal(&self) -> u16 {
+        0
+    }
+
     /// Advance to next document, returns new doc ID
     fn advance(&mut self) -> DocId;
 
@@ -55,6 +60,7 @@ pub trait ScoringIterator {
 pub struct HeapEntry {
     pub doc_id: DocId,
     pub score: f32,
+    pub ordinal: u16,
 }
 
 impl PartialEq for HeapEntry {
@@ -118,11 +124,26 @@ impl ScoreCollector {
     /// Caller must ensure each doc_id is inserted only once.
     #[inline]
     pub fn insert(&mut self, doc_id: DocId, score: f32) -> bool {
+        self.insert_with_ordinal(doc_id, score, 0)
+    }
+
+    /// Insert a document score with ordinal. Returns true if inserted in top-k.
+    /// Caller must ensure each doc_id is inserted only once.
+    #[inline]
+    pub fn insert_with_ordinal(&mut self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
         if self.heap.len() < self.k {
-            self.heap.push(HeapEntry { doc_id, score });
+            self.heap.push(HeapEntry {
+                doc_id,
+                score,
+                ordinal,
+            });
             true
         } else if score > self.threshold() {
-            self.heap.push(HeapEntry { doc_id, score });
+            self.heap.push(HeapEntry {
+                doc_id,
+                score,
+                ordinal,
+            });
             self.heap.pop(); // Remove lowest
             true
         } else {
@@ -149,12 +170,12 @@ impl ScoreCollector {
     }
 
     /// Convert to sorted top-k results (descending by score)
-    pub fn into_sorted_results(self) -> Vec<(DocId, f32)> {
+    pub fn into_sorted_results(self) -> Vec<(DocId, f32, u16)> {
         let mut results: Vec<_> = self
             .heap
             .into_vec()
             .into_iter()
-            .map(|e| (e.doc_id, e.score))
+            .map(|e| (e.doc_id, e.score, e.ordinal))
             .collect();
 
         // Sort by score descending, then doc_id ascending
@@ -173,6 +194,8 @@ impl ScoreCollector {
 pub struct ScoredDoc {
     pub doc_id: DocId,
     pub score: f32,
+    /// Ordinal for multi-valued fields (which vector in the field matched)
+    pub ordinal: u16,
 }
 
 /// Generic MaxScore WAND executor for top-k retrieval
@@ -246,6 +269,7 @@ impl<S: ScoringIterator> WandExecutor<S> {
 
         let mut docs_scored = 0u64;
         let mut docs_skipped = 0u64;
+        let mut blocks_skipped = 0u64;
         let num_scorers = self.scorers.len();
 
         // Indices sorted by current docID - initial sort O(n log n)
@@ -304,9 +328,39 @@ impl<S: ScoringIterator> WandExecutor<S> {
                 .all(|&i| self.scorers[i].doc() == pivot_doc);
 
             if all_at_pivot {
+                // Block-max WAND optimization: check if current blocks can beat threshold
+                // Sum the block-max scores for all iterators at pivot_doc
+                let block_max_sum: f32 = sorted_indices[first_active..=pivot_pos]
+                    .iter()
+                    .filter(|&&i| self.scorers[i].doc() == pivot_doc)
+                    .map(|&i| self.scorers[i].current_block_max_score())
+                    .sum();
+
+                if self.collector.len() >= self.collector.k && block_max_sum <= adjusted_threshold {
+                    // Block can't beat threshold - skip all iterators at pivot to next block
+                    debug!(
+                        "Block skip at doc {}: block_max={:.4} <= threshold={:.4}",
+                        pivot_doc, block_max_sum, adjusted_threshold
+                    );
+
+                    for (_pos, &idx) in sorted_indices.iter().enumerate().skip(first_active) {
+                        if self.scorers[idx].doc() == pivot_doc {
+                            self.scorers[idx].skip_to_next_block();
+                        } else if self.scorers[idx].doc() > pivot_doc {
+                            break;
+                        }
+                    }
+
+                    // Re-sort after block skips
+                    sorted_indices[first_active..].sort_by_key(|&i| self.scorers[i].doc());
+                    blocks_skipped += 1;
+                    continue;
+                }
+
                 // All terms up to pivot are at the same doc - fully score it
                 let mut score = 0.0f32;
                 let mut matching_terms = 0u32;
+                let mut ordinal: u16 = 0;
 
                 // Score from all iterators that have this document and advance them
                 // Collect indices that need re-sorting
@@ -316,6 +370,10 @@ impl<S: ScoringIterator> WandExecutor<S> {
                     let doc = self.scorers[idx].doc();
                     if doc == pivot_doc {
                         score += self.scorers[idx].score();
+                        // Take ordinal from first matching scorer (all should have same ordinal)
+                        if matching_terms == 0 {
+                            ordinal = self.scorers[idx].ordinal();
+                        }
                         matching_terms += 1;
                         self.scorers[idx].advance();
                         modified_positions.push(pos);
@@ -329,7 +387,10 @@ impl<S: ScoringIterator> WandExecutor<S> {
                     pivot_doc, score, matching_terms, num_scorers, adjusted_threshold
                 );
 
-                if self.collector.insert(pivot_doc, score) {
+                if self
+                    .collector
+                    .insert_with_ordinal(pivot_doc, score, ordinal)
+                {
                     docs_scored += 1;
                 } else {
                     docs_skipped += 1;
@@ -372,13 +433,18 @@ impl<S: ScoringIterator> WandExecutor<S> {
             .collector
             .into_sorted_results()
             .into_iter()
-            .map(|(doc_id, score)| ScoredDoc { doc_id, score })
+            .map(|(doc_id, score, ordinal)| ScoredDoc {
+                doc_id,
+                score,
+                ordinal,
+            })
             .collect();
 
         debug!(
-            "WandExecutor completed: scored={}, skipped={}, returned={}, top_score={:.4}",
+            "WandExecutor completed: scored={}, skipped={}, blocks_skipped={}, returned={}, top_score={:.4}",
             docs_scored,
             docs_skipped,
+            blocks_skipped,
             results.len(),
             results.first().map(|r| r.score).unwrap_or(0.0)
         );
@@ -483,8 +549,13 @@ pub struct SparseTermScorer<'a> {
 
 impl<'a> SparseTermScorer<'a> {
     /// Create a new sparse term scorer
+    ///
+    /// Note: Assumes positive weights for WAND upper bound calculation.
+    /// For negative query weights, uses absolute value to ensure valid upper bound.
     pub fn new(posting_list: &'a BlockSparsePostingList, query_weight: f32) -> Self {
-        let max_score = query_weight * posting_list.global_max_weight();
+        // Upper bound must account for sign: |query_weight| * max_weight
+        // This ensures the bound is valid regardless of weight sign
+        let max_score = query_weight.abs() * posting_list.global_max_weight();
         Self {
             iter: posting_list.iterator(),
             query_weight,
@@ -502,6 +573,11 @@ impl ScoringIterator for SparseTermScorer<'_> {
     #[inline]
     fn doc(&self) -> DocId {
         self.iter.doc()
+    }
+
+    #[inline]
+    fn ordinal(&self) -> u16 {
+        self.iter.ordinal()
     }
 
     #[inline]
@@ -527,7 +603,9 @@ impl ScoringIterator for SparseTermScorer<'_> {
 
     #[inline]
     fn current_block_max_score(&self) -> f32 {
-        self.iter.current_block_max_contribution(self.query_weight)
+        // Use abs() for valid upper bound with negative weights
+        self.iter
+            .current_block_max_contribution(self.query_weight.abs())
     }
 }
 
@@ -578,14 +656,17 @@ mod tests {
         heap.push(HeapEntry {
             doc_id: 1,
             score: 3.0,
+            ordinal: 0,
         });
         heap.push(HeapEntry {
             doc_id: 2,
             score: 1.0,
+            ordinal: 0,
         });
         heap.push(HeapEntry {
             doc_id: 3,
             score: 2.0,
+            ordinal: 0,
         });
 
         // Min-heap: lowest score should come out first

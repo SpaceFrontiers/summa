@@ -819,18 +819,18 @@ impl SegmentMerger {
 
             // Collect all Flat vectors from segments
             let mut all_vectors: Vec<Vec<f32>> = Vec::new();
-            let mut all_doc_ids: Vec<u32> = Vec::new();
+            let mut all_doc_ids: Vec<(u32, u16)> = Vec::new();
             let mut doc_offset = 0u32;
 
             for segment in segments {
                 if let Some(super::VectorIndex::Flat(flat_data)) =
                     segment.vector_indexes().get(&field.0)
                 {
-                    for (vec, &local_doc_id) in
+                    for (vec, (local_doc_id, ordinal)) in
                         flat_data.vectors.iter().zip(flat_data.doc_ids.iter())
                     {
                         all_vectors.push(vec.clone());
-                        all_doc_ids.push(doc_offset + local_doc_id);
+                        all_doc_ids.push((doc_offset + local_doc_id, *ordinal));
                     }
                 }
                 doc_offset += segment.num_docs();
@@ -841,6 +841,9 @@ impl SegmentMerger {
             }
 
             let dim = config.index_dim();
+
+            // Extract just doc_ids for ANN indexes (they don't track ordinals yet)
+            let ann_doc_ids: Vec<u32> = all_doc_ids.iter().map(|(doc_id, _)| *doc_id).collect();
 
             // Build ANN index based on index type and available trained structures
             match config.index_type {
@@ -858,7 +861,7 @@ impl SegmentMerger {
                             centroids,
                             &codebook,
                             &all_vectors,
-                            Some(&all_doc_ids),
+                            Some(&ann_doc_ids),
                         );
 
                         let index_data = super::builder::IVFRaBitQIndexData {
@@ -891,7 +894,7 @@ impl SegmentMerger {
                             centroids,
                             codebook,
                             &all_vectors,
-                            Some(&all_doc_ids),
+                            Some(&ann_doc_ids),
                         );
 
                         let index_data = super::builder::ScaNNIndexData {

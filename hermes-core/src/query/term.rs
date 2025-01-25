@@ -203,6 +203,17 @@ impl Scorer for TermScorer {
         let positions = self.positions.as_ref()?;
         let doc_id = self.iterator.doc();
         let pos = positions.get_positions(doc_id)?;
-        Some(vec![(self.field_id, pos.to_vec())])
+        let score = self.score();
+        // Each position contributes equally to the term score
+        let per_position_score = if pos.is_empty() {
+            0.0
+        } else {
+            score / pos.len() as f32
+        };
+        let scored_positions: Vec<super::ScoredPosition> = pos
+            .iter()
+            .map(|&p| super::ScoredPosition::new(p, per_position_score))
+            .collect();
+        Some(vec![(self.field_id, scored_positions)])
     }
 }

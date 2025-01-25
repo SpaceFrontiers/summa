@@ -77,6 +77,9 @@ impl IVFPQIndex {
     }
 
     /// Build index from vectors using provided coarse centroids and PQ codebook
+    ///
+    /// All vectors are assigned ordinal 0 (single-valued). For multi-valued fields,
+    /// use `add_vector` directly with the appropriate ordinal.
     pub fn build(
         config: IVFPQConfig,
         coarse_centroids: &CoarseCentroids,
@@ -88,7 +91,7 @@ impl IVFPQIndex {
 
         for (i, vector) in vectors.iter().enumerate() {
             let doc_id = doc_ids.map(|ids| ids[i]).unwrap_or(i as u32);
-            index.add_vector(coarse_centroids, codebook, doc_id, vector);
+            index.add_vector(coarse_centroids, codebook, doc_id, 0, vector);
         }
 
         index
@@ -100,6 +103,7 @@ impl IVFPQIndex {
         coarse_centroids: &CoarseCentroids,
         codebook: &PQCodebook,
         doc_id: u32,
+        ordinal: u16,
         vector: &[f32],
     ) {
         // Get cluster assignment (with SOAR if configured)
@@ -111,6 +115,7 @@ impl IVFPQIndex {
             codebook,
             &assignment,
             doc_id,
+            ordinal,
             vector,
             true,
         );
@@ -126,18 +131,21 @@ impl IVFPQIndex {
                 codebook,
                 &secondary_assignment,
                 doc_id,
+                ordinal,
                 vector,
                 false, // Don't store raw for secondary
             );
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_to_cluster(
         &mut self,
         coarse_centroids: &CoarseCentroids,
         codebook: &PQCodebook,
         assignment: &MultiAssignment,
         doc_id: u32,
+        ordinal: u16,
         vector: &[f32],
         store_raw: bool,
     ) {
@@ -154,7 +162,7 @@ impl IVFPQIndex {
             None
         };
 
-        self.clusters.add(cluster_id, doc_id, code, raw);
+        self.clusters.add(cluster_id, doc_id, ordinal, code, raw);
     }
 
     /// Search for k nearest neighbors
@@ -180,7 +188,7 @@ impl IVFPQIndex {
                 let distance_table = DistanceTable::build(codebook, query, Some(centroid));
 
                 // Score all vectors in cluster using ADC (Asymmetric Distance Computation)
-                for (doc_id, code) in cluster.iter() {
+                for (doc_id, _ordinal, code) in cluster.iter() {
                     let dist = distance_table.compute_distance(&code.codes);
                     candidates.push((doc_id, dist));
                 }

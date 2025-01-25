@@ -103,8 +103,9 @@ impl Query for Box<dyn Query> {
     }
 }
 
-/// Matched positions for a field (field_id, list of encoded positions)
-pub type MatchedPositions = Vec<(u32, Vec<u32>)>;
+/// Matched positions for a field (field_id, list of scored positions)
+/// Each position includes its individual score contribution
+pub type MatchedPositions = Vec<(u32, Vec<super::ScoredPosition>)>;
 
 /// Scorer that iterates over matching documents and computes scores
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,11 +1,13 @@
-//! Global statistics for cross-segment IDF computation
+//! Lazy global statistics for cross-segment IDF computation
 //!
-//! Provides cached aggregated statistics across multiple segments for:
+//! Provides lazily computed and cached statistics across multiple segments for:
 //! - Sparse vector dimensions (for sparse vector queries)
 //! - Full-text terms (for BM25/TF-IDF scoring)
 //!
-//! This implements a coordinator-style approach where statistics are gathered
-//! from all segments, cached, and used for consistent IDF scoring.
+//! Key design principles:
+//! - **Lazy computation**: IDF values computed on first access, not upfront
+//! - **Per-term caching**: Each term/dimension's IDF is cached independently
+//! - **Bound to Searcher**: Stats tied to segment snapshot lifetime
 
 use std::sync::Arc;
 
@@ -15,10 +17,197 @@ use rustc_hash::FxHashMap;
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
 
-/// Global statistics aggregated across all segments
+/// Lazy global statistics bound to a fixed set of segments
 ///
-/// Used for consistent IDF computation in multi-segment indexes.
-/// Statistics are cached and invalidated when segments change.
+/// Computes IDF values lazily on first access and caches them.
+/// Lifetime is bound to the Searcher that created it, ensuring
+/// statistics always match the current segment set.
+pub struct LazyGlobalStats {
+    /// Segment readers (Arc for shared ownership with Searcher)
+    segments: Vec<Arc<SegmentReader>>,
+    /// Total documents (computed once on construction)
+    total_docs: u64,
+    /// Cached sparse IDF values: field_id -> (dim_id -> idf)
+    sparse_idf_cache: RwLock<FxHashMap<u32, FxHashMap<u32, f32>>>,
+    /// Cached text IDF values: field_id -> (term -> idf)
+    text_idf_cache: RwLock<FxHashMap<u32, FxHashMap<String, f32>>>,
+    /// Cached average field lengths: field_id -> avg_len
+    avg_field_len_cache: RwLock<FxHashMap<u32, f32>>,
+}
+
+impl LazyGlobalStats {
+    /// Create new lazy stats bound to a set of segments
+    pub fn new(segments: Vec<Arc<SegmentReader>>) -> Self {
+        let total_docs: u64 = segments.iter().map(|s| s.num_docs() as u64).sum();
+        Self {
+            segments,
+            total_docs,
+            sparse_idf_cache: RwLock::new(FxHashMap::default()),
+            text_idf_cache: RwLock::new(FxHashMap::default()),
+            avg_field_len_cache: RwLock::new(FxHashMap::default()),
+        }
+    }
+
+    /// Total documents across all segments
+    #[inline]
+    pub fn total_docs(&self) -> u64 {
+        self.total_docs
+    }
+
+    /// Get or compute IDF for a sparse vector dimension (lazy + cached)
+    ///
+    /// IDF = ln(N / df) where N = total docs, df = docs containing dimension
+    pub fn sparse_idf(&self, field: Field, dim_id: u32) -> f32 {
+        // Fast path: check cache
+        {
+            let cache = self.sparse_idf_cache.read();
+            if let Some(field_cache) = cache.get(&field.0)
+                && let Some(&idf) = field_cache.get(&dim_id)
+            {
+                return idf;
+            }
+        }
+
+        // Slow path: compute and cache
+        let df = self.compute_sparse_df(field, dim_id);
+        let idf = if df > 0 && self.total_docs > 0 {
+            (self.total_docs as f32 / df as f32).ln()
+        } else {
+            0.0
+        };
+
+        // Cache the result
+        {
+            let mut cache = self.sparse_idf_cache.write();
+            cache.entry(field.0).or_default().insert(dim_id, idf);
+        }
+
+        idf
+    }
+
+    /// Compute IDF weights for multiple sparse dimensions (batch, uses cache)
+    pub fn sparse_idf_weights(&self, field: Field, dim_ids: &[u32]) -> Vec<f32> {
+        dim_ids.iter().map(|&d| self.sparse_idf(field, d)).collect()
+    }
+
+    /// Get or compute IDF for a full-text term (lazy + cached)
+    ///
+    /// IDF = ln((N - df + 0.5) / (df + 0.5) + 1) (BM25 variant)
+    pub fn text_idf(&self, field: Field, term: &str) -> f32 {
+        // Fast path: check cache
+        {
+            let cache = self.text_idf_cache.read();
+            if let Some(field_cache) = cache.get(&field.0)
+                && let Some(&idf) = field_cache.get(term)
+            {
+                return idf;
+            }
+        }
+
+        // Slow path: compute and cache
+        let df = self.compute_text_df(field, term);
+        let n = self.total_docs as f32;
+        let df_f = df as f32;
+        let idf = if df > 0 {
+            ((n - df_f + 0.5) / (df_f + 0.5) + 1.0).ln()
+        } else {
+            0.0
+        };
+
+        // Cache the result
+        {
+            let mut cache = self.text_idf_cache.write();
+            cache
+                .entry(field.0)
+                .or_default()
+                .insert(term.to_string(), idf);
+        }
+
+        idf
+    }
+
+    /// Get or compute average field length for BM25 (lazy + cached)
+    pub fn avg_field_len(&self, field: Field) -> f32 {
+        // Fast path: check cache
+        {
+            let cache = self.avg_field_len_cache.read();
+            if let Some(&avg) = cache.get(&field.0) {
+                return avg;
+            }
+        }
+
+        // Slow path: compute weighted average across segments
+        let mut weighted_sum = 0.0f64;
+        let mut total_weight = 0u64;
+
+        for segment in &self.segments {
+            let avg_len = segment.avg_field_len(field);
+            let doc_count = segment.num_docs() as u64;
+            if avg_len > 0.0 && doc_count > 0 {
+                weighted_sum += avg_len as f64 * doc_count as f64;
+                total_weight += doc_count;
+            }
+        }
+
+        let avg = if total_weight > 0 {
+            (weighted_sum / total_weight as f64) as f32
+        } else {
+            1.0
+        };
+
+        // Cache the result
+        {
+            let mut cache = self.avg_field_len_cache.write();
+            cache.insert(field.0, avg);
+        }
+
+        avg
+    }
+
+    /// Compute document frequency for a sparse dimension (not cached - internal)
+    fn compute_sparse_df(&self, field: Field, dim_id: u32) -> u64 {
+        let mut df = 0u64;
+        for segment in &self.segments {
+            if let Some(sparse_index) = segment.sparse_indexes().get(&field.0)
+                && let Some(Some(posting)) = sparse_index.postings.get(dim_id as usize)
+            {
+                df += posting.doc_count() as u64;
+            }
+        }
+        df
+    }
+
+    /// Compute document frequency for a text term (not cached - internal)
+    ///
+    /// Note: This is expensive as it requires async term lookup.
+    /// For now, returns 0 - text IDF should be computed via term dictionary.
+    fn compute_text_df(&self, _field: Field, _term: &str) -> u64 {
+        // Text term lookup requires async access to term dictionary
+        // For now, this is a placeholder - actual implementation would
+        // need to be async or use pre-computed stats
+        0
+    }
+
+    /// Number of segments
+    pub fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+impl std::fmt::Debug for LazyGlobalStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyGlobalStats")
+            .field("total_docs", &self.total_docs)
+            .field("num_segments", &self.segments.len())
+            .field("sparse_cache_fields", &self.sparse_idf_cache.read().len())
+            .field("text_cache_fields", &self.text_idf_cache.read().len())
+            .finish()
+    }
+}
+
+// Keep old types for backwards compatibility during transition
+
+/// Global statistics aggregated across all segments (legacy)
 #[derive(Debug)]
 pub struct GlobalStats {
     /// Total documents across all segments
@@ -65,8 +254,6 @@ impl GlobalStats {
     }
 
     /// Compute IDF for a sparse vector dimension
-    ///
-    /// IDF = ln(N / df) where N = total docs, df = docs containing dimension
     #[inline]
     pub fn sparse_idf(&self, field: Field, dim_id: u32) -> f32 {
         if let Some(stats) = self.sparse_stats.get(&field.0)
@@ -84,8 +271,6 @@ impl GlobalStats {
     }
 
     /// Compute IDF for a full-text term
-    ///
-    /// IDF = ln((N - df + 0.5) / (df + 0.5) + 1) (BM25 variant)
     #[inline]
     pub fn text_idf(&self, field: Field, term: &str) -> f32 {
         if let Some(stats) = self.text_stats.get(&field.0)
@@ -93,7 +278,6 @@ impl GlobalStats {
         {
             let n = self.total_docs as f32;
             let df = df as f32;
-            // BM25 IDF formula
             return ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
         }
         0.0
@@ -108,7 +292,7 @@ impl GlobalStats {
             .unwrap_or(1.0)
     }
 
-    /// Current generation (for cache invalidation)
+    /// Current generation
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation

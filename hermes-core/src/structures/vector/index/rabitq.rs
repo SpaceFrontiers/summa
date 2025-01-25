@@ -22,6 +22,10 @@ pub struct RaBitQIndex {
     pub codebook: RaBitQCodebook,
     /// Centroid of all indexed vectors
     pub centroid: Vec<f32>,
+    /// Document IDs
+    pub doc_ids: Vec<u32>,
+    /// Element ordinals for multi-valued fields (0 for single-valued)
+    pub ordinals: Vec<u16>,
     /// Quantized vectors
     pub vectors: Vec<QuantizedVector>,
     /// Raw vectors for re-ranking (optional)
@@ -37,24 +41,30 @@ impl RaBitQIndex {
         Self {
             codebook,
             centroid: vec![0.0; dim],
+            doc_ids: Vec::new(),
+            ordinals: Vec::new(),
             vectors: Vec::new(),
             raw_vectors: None,
         }
     }
 
-    /// Build index from a set of vectors
-    pub fn build(config: RaBitQConfig, vectors: &[Vec<f32>], store_raw: bool) -> Self {
+    /// Build index from vectors with doc IDs and ordinals
+    pub fn build_with_ids(
+        config: RaBitQConfig,
+        vectors: &[(u32, u16, Vec<f32>)], // (doc_id, ordinal, vector)
+        store_raw: bool,
+    ) -> Self {
         let n = vectors.len();
         let dim = config.dim;
 
         assert!(n > 0, "Cannot build index from empty vector set");
-        assert!(vectors[0].len() == dim, "Vector dimension mismatch");
+        assert!(vectors[0].2.len() == dim, "Vector dimension mismatch");
 
         let mut index = Self::new(config);
 
         // Compute centroid
         index.centroid = vec![0.0; dim];
-        for v in vectors {
+        for (_, _, v) in vectors {
             for (i, &val) in v.iter().enumerate() {
                 index.centroid[i] += val;
             }
@@ -63,17 +73,42 @@ impl RaBitQIndex {
             *c /= n as f32;
         }
 
-        // Quantize each vector relative to centroid
+        // Store doc_ids, ordinals and quantize vectors
+        index.doc_ids = vectors.iter().map(|(doc_id, _, _)| *doc_id).collect();
+        index.ordinals = vectors.iter().map(|(_, ordinal, _)| *ordinal).collect();
         index.vectors = vectors
             .iter()
-            .map(|v| index.codebook.encode(v, Some(&index.centroid)))
+            .map(|(_, _, v)| index.codebook.encode(v, Some(&index.centroid)))
             .collect();
 
         if store_raw {
-            index.raw_vectors = Some(vectors.to_vec());
+            index.raw_vectors = Some(vectors.iter().map(|(_, _, v)| v.clone()).collect());
         }
 
         index
+    }
+
+    /// Build index from a set of vectors (legacy, uses doc_id = index, ordinal = 0)
+    pub fn build(config: RaBitQConfig, vectors: &[Vec<f32>], store_raw: bool) -> Self {
+        let with_ids: Vec<(u32, u16, Vec<f32>)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, 0u16, v.clone()))
+            .collect();
+        Self::build_with_ids(config, &with_ids, store_raw)
+    }
+
+    /// Add a single vector to the index
+    pub fn add_vector(&mut self, doc_id: u32, ordinal: u16, vector: &[f32], raw: Option<Vec<f32>>) {
+        self.doc_ids.push(doc_id);
+        self.ordinals.push(ordinal);
+        self.vectors
+            .push(self.codebook.encode(vector, Some(&self.centroid)));
+        if let Some(ref mut raw_vectors) = self.raw_vectors
+            && let Some(r) = raw
+        {
+            raw_vectors.push(r);
+        }
     }
 
     /// Prepare a query for fast distance estimation
@@ -87,8 +122,8 @@ impl RaBitQIndex {
             .estimate_distance(query, &self.vectors[vec_idx])
     }
 
-    /// Search for k nearest neighbors
-    pub fn search(&self, query: &[f32], k: usize, rerank_factor: usize) -> Vec<(usize, f32)> {
+    /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
+    pub fn search(&self, query: &[f32], k: usize, rerank_factor: usize) -> Vec<(u32, u16, f32)> {
         let prepared = self.prepare_query(query);
 
         // Phase 1: Estimate distances for all vectors
@@ -105,7 +140,7 @@ impl RaBitQIndex {
         // Phase 2: Re-rank top candidates with exact distances
         let rerank_count = (k * rerank_factor).min(candidates.len());
 
-        if let Some(ref raw_vectors) = self.raw_vectors {
+        let results = if let Some(ref raw_vectors) = self.raw_vectors {
             let mut reranked: Vec<(usize, f32)> = candidates[..rerank_count]
                 .iter()
                 .map(|&(idx, _)| {
@@ -120,7 +155,13 @@ impl RaBitQIndex {
         } else {
             candidates.truncate(k);
             candidates
-        }
+        };
+
+        // Map indices to (doc_id, ordinal, dist)
+        results
+            .into_iter()
+            .map(|(idx, dist)| (self.doc_ids[idx], self.ordinals[idx], dist))
+            .collect()
     }
 
     /// Number of indexed vectors
@@ -134,16 +175,20 @@ impl RaBitQIndex {
 
     /// Memory usage in bytes
     pub fn size_bytes(&self) -> usize {
+        use std::mem::size_of;
+
         let vectors_size: usize = self.vectors.iter().map(|v| v.size_bytes()).sum();
-        let centroid_size = self.centroid.len() * 4;
+        let centroid_size = self.centroid.len() * size_of::<f32>();
+        let doc_ids_size = self.doc_ids.len() * size_of::<u32>();
+        let ordinals_size = self.ordinals.len() * size_of::<u16>();
         let codebook_size = self.codebook.size_bytes();
         let raw_size = self
             .raw_vectors
             .as_ref()
-            .map(|vecs| vecs.iter().map(|v| v.len() * 4).sum())
+            .map(|vecs| vecs.iter().map(|v| v.len() * size_of::<f32>()).sum())
             .unwrap_or(0);
 
-        vectors_size + centroid_size + codebook_size + raw_size
+        vectors_size + centroid_size + doc_ids_size + ordinals_size + codebook_size + raw_size
     }
 
     /// Compression ratio compared to raw float32 vectors

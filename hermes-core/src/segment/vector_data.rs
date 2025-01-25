@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 pub struct FlatVectorData {
     pub dim: usize,
     pub vectors: Vec<Vec<f32>>,
-    pub doc_ids: Vec<u32>,
+    /// Document IDs with ordinals: (doc_id, ordinal) pairs
+    /// Ordinal tracks which vector in a multi-valued field
+    pub doc_ids: Vec<(u32, u16)>,
 }
 
 /// IVF-RaBitQ index data with embedded centroids and codebook

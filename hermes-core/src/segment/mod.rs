@@ -13,7 +13,7 @@ mod vector_data;
 pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, TrainedVectorStructures, delete_segment};
-pub use reader::{AsyncSegmentReader, SegmentReader, SparseIndex, VectorIndex};
+pub use reader::{AsyncSegmentReader, SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
 pub use store::*;
 #[cfg(feature = "native")]
 pub use tracker::{SegmentSnapshot, SegmentTracker};
@@ -70,5 +70,129 @@ mod tests {
         // Test document retrieval
         let doc = reader.doc(0).await.unwrap().unwrap();
         assert_eq!(doc.get_first(title).unwrap().as_text(), Some("Hello World"));
+    }
+
+    #[tokio::test]
+    async fn test_dense_vector_ordinal_tracking() {
+        use crate::query::MultiValueCombiner;
+
+        let mut schema_builder = SchemaBuilder::default();
+        // Use simple add method - defaults to Flat index
+        let embedding = schema_builder.add_dense_vector_field("embedding", 4, true, true);
+        let schema = Arc::new(schema_builder.build());
+
+        let dir = RamDirectory::new();
+        let segment_id = SegmentId::new();
+
+        let config = SegmentBuilderConfig::default();
+        let mut builder = SegmentBuilder::new((*schema).clone(), config).unwrap();
+
+        // Doc 0: single vector
+        let mut doc = crate::dsl::Document::new();
+        doc.add_dense_vector(embedding, vec![1.0, 0.0, 0.0, 0.0]);
+        builder.add_document(doc).unwrap();
+
+        // Doc 1: multi-valued vectors (2 vectors)
+        let mut doc = crate::dsl::Document::new();
+        doc.add_dense_vector(embedding, vec![0.0, 1.0, 0.0, 0.0]);
+        doc.add_dense_vector(embedding, vec![0.0, 0.0, 1.0, 0.0]);
+        builder.add_document(doc).unwrap();
+
+        // Doc 2: single vector
+        let mut doc = crate::dsl::Document::new();
+        doc.add_dense_vector(embedding, vec![0.0, 0.0, 0.0, 1.0]);
+        builder.add_document(doc).unwrap();
+
+        builder.build(&dir, segment_id).await.unwrap();
+
+        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
+            .await
+            .unwrap();
+
+        // Query close to doc 1's first vector
+        let query = vec![0.0, 0.9, 0.1, 0.0];
+        let results = reader
+            .search_dense_vector(embedding, &query, 10, 1, MultiValueCombiner::Max)
+            .unwrap();
+
+        // Doc 1 should be in results with ordinal tracking
+        let doc1_result = results.iter().find(|r| r.doc_id == 1);
+        assert!(doc1_result.is_some(), "Doc 1 should be in results");
+
+        let doc1 = doc1_result.unwrap();
+        // Should have 2 ordinals (0 and 1) for the two vectors
+        assert!(
+            doc1.ordinals.len() <= 2,
+            "Doc 1 should have at most 2 ordinals, got {}",
+            doc1.ordinals.len()
+        );
+
+        // Check ordinals are valid (0 or 1)
+        for (ordinal, _score) in &doc1.ordinals {
+            assert!(*ordinal <= 1, "Ordinal should be 0 or 1, got {}", ordinal);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sparse_vector_ordinal_tracking() {
+        use crate::query::MultiValueCombiner;
+
+        let mut schema_builder = SchemaBuilder::default();
+        let sparse = schema_builder.add_sparse_vector_field("sparse", true, true);
+        let schema = Arc::new(schema_builder.build());
+
+        let dir = RamDirectory::new();
+        let segment_id = SegmentId::new();
+
+        let config = SegmentBuilderConfig::default();
+        let mut builder = SegmentBuilder::new((*schema).clone(), config).unwrap();
+
+        // Doc 0: single sparse vector
+        let mut doc = crate::dsl::Document::new();
+        doc.add_sparse_vector(sparse, vec![(0, 1.0), (1, 0.5)]);
+        builder.add_document(doc).unwrap();
+
+        // Doc 1: multi-valued sparse vectors (2 vectors)
+        let mut doc = crate::dsl::Document::new();
+        doc.add_sparse_vector(sparse, vec![(0, 0.8), (2, 0.3)]);
+        doc.add_sparse_vector(sparse, vec![(1, 0.9), (3, 0.4)]);
+        builder.add_document(doc).unwrap();
+
+        // Doc 2: single sparse vector
+        let mut doc = crate::dsl::Document::new();
+        doc.add_sparse_vector(sparse, vec![(2, 1.0), (3, 0.5)]);
+        builder.add_document(doc).unwrap();
+
+        builder.build(&dir, segment_id).await.unwrap();
+
+        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
+            .await
+            .unwrap();
+
+        // Query matching dimension 0
+        let query = vec![(0u32, 1.0f32)];
+        let results = reader
+            .search_sparse_vector(sparse, &query, 10, MultiValueCombiner::Sum)
+            .await
+            .unwrap();
+
+        // Both doc 0 and doc 1 have dimension 0
+        assert!(results.len() >= 2, "Should have at least 2 results");
+
+        // Check doc 1 has ordinal tracking
+        let doc1_result = results.iter().find(|r| r.doc_id == 1);
+        assert!(doc1_result.is_some(), "Doc 1 should be in results");
+
+        let doc1 = doc1_result.unwrap();
+        // Doc 1's first sparse vector has dim 0, so ordinal should be 0
+        assert!(
+            !doc1.ordinals.is_empty(),
+            "Doc 1 should have ordinal information"
+        );
+
+        // Check ordinals are valid (0 or 1)
+        for (ordinal, _score) in &doc1.ordinals {
+            assert!(*ordinal <= 1, "Ordinal should be 0 or 1, got {}", ordinal);
+        }
     }
 }

@@ -32,14 +32,32 @@ impl DocAddress {
     }
 }
 
+/// A scored position/ordinal within a field
+/// For text fields: position is the token position
+/// For vector fields: position is the ordinal (which vector in multi-value)
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct ScoredPosition {
+    /// Position (text) or ordinal (vector)
+    pub position: u32,
+    /// Individual score contribution from this position/ordinal
+    pub score: f32,
+}
+
+impl ScoredPosition {
+    pub fn new(position: u32, score: f32) -> Self {
+        Self { position, score }
+    }
+}
+
 /// Search result with doc_id and score (internal use)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub doc_id: DocId,
     pub score: Score,
-    /// Matched positions per field: (field_id, encoded_positions)
+    /// Matched positions per field: (field_id, scored_positions)
+    /// Each position includes its individual score contribution
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub positions: Vec<(u32, Vec<u32>)>,
+    pub positions: Vec<(u32, Vec<ScoredPosition>)>,
 }
 
 /// Matched field info with ordinals (for multi-valued fields)
@@ -54,16 +72,24 @@ pub struct MatchedField {
 
 impl SearchResult {
     /// Extract unique ordinals from positions for each field
-    /// Uses the position encoding: ordinal = position >> 20
+    /// For text fields: ordinal = position >> 20 (from encoded position)
+    /// For vector fields: position IS the ordinal directly
     pub fn extract_ordinals(&self) -> Vec<MatchedField> {
         use rustc_hash::FxHashSet;
 
         self.positions
             .iter()
-            .map(|(field_id, positions)| {
+            .map(|(field_id, scored_positions)| {
                 let mut ordinals: FxHashSet<u32> = FxHashSet::default();
-                for &pos in positions {
-                    let ordinal = pos >> 20; // Extract ordinal from encoded position
+                for sp in scored_positions {
+                    // For text fields with encoded positions, extract ordinal
+                    // For vector fields, position IS the ordinal
+                    // We use a heuristic: if position > 0xFFFFF (20 bits), it's encoded
+                    let ordinal = if sp.position > 0xFFFFF {
+                        sp.position >> 20
+                    } else {
+                        sp.position
+                    };
                     ordinals.insert(ordinal);
                 }
                 let mut ordinals: Vec<u32> = ordinals.into_iter().collect();
@@ -74,6 +100,14 @@ impl SearchResult {
                 }
             })
             .collect()
+    }
+
+    /// Get all scored positions for a specific field
+    pub fn field_positions(&self, field_id: u32) -> Option<&[ScoredPosition]> {
+        self.positions
+            .iter()
+            .find(|(fid, _)| *fid == field_id)
+            .map(|(_, positions)| positions.as_slice())
     }
 }
 
@@ -125,7 +159,8 @@ impl Ord for SearchResult {
 /// combined and passed to query execution.
 pub trait Collector {
     /// Called for each matching document
-    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<u32>)]);
+    /// positions: Vec of (field_id, scored_positions)
+    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]);
 
     /// Whether this collector needs position information
     fn needs_positions(&self) -> bool {
@@ -171,7 +206,7 @@ impl TopKCollector {
 }
 
 impl Collector for TopKCollector {
-    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<u32>)]) {
+    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]) {
         let positions = if self.collect_positions {
             positions.to_vec()
         } else {
@@ -220,7 +255,12 @@ impl CountCollector {
 
 impl Collector for CountCollector {
     #[inline]
-    fn collect(&mut self, _doc_id: DocId, _score: Score, _positions: &[(u32, Vec<u32>)]) {
+    fn collect(
+        &mut self,
+        _doc_id: DocId,
+        _score: Score,
+        _positions: &[(u32, Vec<ScoredPosition>)],
+    ) {
         self.count += 1;
     }
 }
@@ -256,7 +296,7 @@ pub async fn count_segment(reader: &SegmentReader, query: &dyn Query) -> Result<
 
 // Implement Collector for tuple of 2 collectors
 impl<A: Collector, B: Collector> Collector for (&mut A, &mut B) {
-    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<u32>)]) {
+    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]) {
         self.0.collect(doc_id, score, positions);
         self.1.collect(doc_id, score, positions);
     }
@@ -267,7 +307,7 @@ impl<A: Collector, B: Collector> Collector for (&mut A, &mut B) {
 
 // Implement Collector for tuple of 3 collectors
 impl<A: Collector, B: Collector, C: Collector> Collector for (&mut A, &mut B, &mut C) {
-    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<u32>)]) {
+    fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]) {
         self.0.collect(doc_id, score, positions);
         self.1.collect(doc_id, score, positions);
         self.2.collect(doc_id, score, positions);

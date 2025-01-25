@@ -16,6 +16,7 @@ use rustc_hash::FxHashMap;
 
 use crate::dsl::Schema;
 use crate::error::Result;
+use crate::query::LazyGlobalStats;
 use crate::segment::{SegmentId, SegmentReader, SegmentSnapshot};
 use crate::structures::{CoarseCentroids, PQCodebook};
 
@@ -41,6 +42,9 @@ pub struct Searcher<D: DirectoryWriter + 'static> {
     trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
     /// Trained codebooks per field
     trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
+    /// Lazy global statistics for cross-segment IDF computation
+    /// Bound to this Searcher's segment set - stats are computed lazily and cached
+    global_stats: Arc<LazyGlobalStats>,
 }
 
 #[cfg(feature = "native")]
@@ -95,6 +99,10 @@ impl<D: DirectoryWriter + 'static> Searcher<D> {
                 .collect()
         };
 
+        // Create lazy global statistics bound to this segment set
+        // IDF values will be computed on-demand and cached
+        let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
+
         Ok(Self {
             _snapshot: snapshot,
             segments,
@@ -103,6 +111,7 @@ impl<D: DirectoryWriter + 'static> Searcher<D> {
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
             trained_centroids,
             trained_codebooks,
+            global_stats,
         })
     }
 
@@ -134,6 +143,14 @@ impl<D: DirectoryWriter + 'static> Searcher<D> {
     /// Get trained codebooks
     pub fn trained_codebooks(&self) -> &FxHashMap<u32, Arc<PQCodebook>> {
         &self.trained_codebooks
+    }
+
+    /// Get lazy global statistics for cross-segment IDF computation
+    ///
+    /// Statistics are computed lazily on first access and cached per term/dimension.
+    /// The stats are bound to this Searcher's segment set.
+    pub fn global_stats(&self) -> &Arc<LazyGlobalStats> {
+        &self.global_stats
     }
 
     /// Get total document count across all segments

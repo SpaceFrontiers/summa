@@ -1,5 +1,10 @@
 //! Async segment reader with lazy loading
 
+mod loader;
+mod types;
+
+pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
+
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -7,69 +12,13 @@ use rustc_hash::FxHashMap;
 use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
 use crate::dsl::{Document, Field, Schema};
 use crate::structures::{
-    AsyncSSTableReader, BlockPostingList, BlockSparsePostingList, CoarseCentroids, IVFPQIndex,
-    IVFRaBitQIndex, PQCodebook, RaBitQCodebook, RaBitQIndex, SSTableStats, TermInfo,
+    AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFPQIndex, IVFRaBitQIndex, PQCodebook,
+    RaBitQIndex, SSTableStats, TermInfo,
 };
 use crate::{DocId, Error, Result};
 
 use super::store::{AsyncStoreReader, RawStoreBlock};
 use super::types::{SegmentFiles, SegmentId, SegmentMeta};
-use super::vector_data::FlatVectorData;
-
-/// Vector index type - Flat, RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
-#[derive(Clone)]
-#[allow(clippy::upper_case_acronyms)]
-pub enum VectorIndex {
-    /// Flat - brute-force search over raw vectors (accumulating state)
-    Flat(Arc<FlatVectorData>),
-    /// RaBitQ - binary quantization, good for small datasets
-    RaBitQ(Arc<RaBitQIndex>),
-    /// IVF-RaBitQ - inverted file with RaBitQ, good for medium datasets
-    IVF {
-        index: Arc<IVFRaBitQIndex>,
-        codebook: Arc<RaBitQCodebook>,
-    },
-    /// ScaNN (IVF-PQ) - product quantization with OPQ, best for large datasets
-    ScaNN {
-        index: Arc<IVFPQIndex>,
-        codebook: Arc<PQCodebook>,
-    },
-}
-
-/// Sparse vector index for a field: direct-indexed by dimension ID
-#[derive(Clone)]
-pub struct SparseIndex {
-    /// Posting lists indexed directly by dimension ID (O(1) lookup)
-    /// None means dimension not present in index
-    pub postings: Vec<Option<Arc<BlockSparsePostingList>>>,
-    /// Total document count in this segment (for IDF computation)
-    pub total_docs: u32,
-}
-
-impl SparseIndex {
-    /// Compute IDF (inverse document frequency) for a dimension
-    ///
-    /// IDF = log(N / df) where N = total docs, df = docs containing dimension
-    /// Returns 0.0 if dimension not present
-    #[inline]
-    pub fn idf(&self, dim_id: u32) -> f32 {
-        if let Some(Some(pl)) = self.postings.get(dim_id as usize) {
-            let df = pl.doc_count() as f32;
-            if df > 0.0 {
-                (self.total_docs as f32 / df).ln()
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
-    }
-
-    /// Get IDF weights for multiple dimensions
-    pub fn idf_weights(&self, dim_ids: &[u32]) -> Vec<f32> {
-        dim_ids.iter().map(|&d| self.idf(d)).collect()
-    }
-}
 
 /// Async segment reader with lazy loading
 ///
@@ -127,13 +76,13 @@ impl AsyncSegmentReader {
 
         // Load dense vector indexes from unified .vectors file
         let (vector_indexes, coarse_centroids) =
-            Self::load_vectors_file(dir, &files, &schema).await?;
+            loader::load_vectors_file(dir, &files, &schema).await?;
 
         // Load sparse vector indexes from .sparse file
-        let sparse_indexes = Self::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
+        let sparse_indexes = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
 
         // Open positions file handle (if exists) - offsets are now in TermInfo
-        let positions_handle = Self::open_positions_file(dir, &files, &schema).await?;
+        let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
 
         Ok(Self {
             meta,
@@ -332,7 +281,7 @@ impl AsyncSegmentReader {
 
     /// Search dense vectors using RaBitQ
     ///
-    /// Returns (doc_id, score) pairs sorted by score (descending).
+    /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
     /// The doc_ids are adjusted by doc_id_offset for this segment.
     /// If mrl_dim is configured, the query vector is automatically trimmed.
     /// For multi-valued documents, scores are combined using the specified combiner.
@@ -343,7 +292,7 @@ impl AsyncSegmentReader {
         k: usize,
         rerank_factor: usize,
         combiner: crate::query::MultiValueCombiner,
-    ) -> Result<Vec<(DocId, f32)>> {
+    ) -> Result<Vec<VectorSearchResult>> {
         use crate::query::MultiValueCombiner;
         let index = self
             .vector_indexes
@@ -370,89 +319,89 @@ impl AsyncSegmentReader {
             query
         };
 
-        let results: Vec<(u32, f32)> = match index {
+        // Results include (doc_id, ordinal, distance)
+        let results: Vec<(u32, u16, f32)> = match index {
             VectorIndex::Flat(flat_data) => {
                 // Brute-force search over raw vectors using SIMD-accelerated distance
                 use crate::structures::simd::squared_euclidean_distance;
 
-                let mut candidates: Vec<(u32, f32)> = flat_data
+                let mut candidates: Vec<(u32, u16, f32)> = flat_data
                     .vectors
                     .iter()
                     .zip(flat_data.doc_ids.iter())
-                    .map(|(vec, &doc_id)| {
+                    .map(|(vec, &(doc_id, ordinal))| {
                         let dist = squared_euclidean_distance(effective_query, vec);
-                        (doc_id, dist)
+                        (doc_id, ordinal, dist)
                     })
                     .collect();
                 candidates
-                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    .sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
                 candidates.truncate(k);
                 candidates
             }
-            VectorIndex::RaBitQ(rabitq) => rabitq
-                .search(effective_query, k, rerank_factor)
-                .into_iter()
-                .map(|(idx, dist)| (idx as u32, dist))
-                .collect(),
+            VectorIndex::RaBitQ(rabitq) => rabitq.search(effective_query, k, rerank_factor),
             VectorIndex::IVF { index, codebook } => {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("IVF index requires coarse centroids".to_string())
                 })?;
                 let nprobe = rerank_factor.max(32); // Use rerank_factor as nprobe hint
-                index.search(centroids, codebook, effective_query, k, Some(nprobe))
+                index
+                    .search(centroids, codebook, effective_query, k, Some(nprobe))
+                    .into_iter()
+                    .map(|(doc_id, dist)| (doc_id, 0u16, dist)) // IVF doesn't track ordinals yet
+                    .collect()
             }
             VectorIndex::ScaNN { index, codebook } => {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("ScaNN index requires coarse centroids".to_string())
                 })?;
                 let nprobe = rerank_factor.max(32);
-                index.search(centroids, codebook, effective_query, k, Some(nprobe))
+                index
+                    .search(centroids, codebook, effective_query, k, Some(nprobe))
+                    .into_iter()
+                    .map(|(doc_id, dist)| (doc_id, 0u16, dist)) // ScaNN doesn't track ordinals yet
+                    .collect()
             }
         };
 
         // Convert distance to score (smaller distance = higher score)
         // and adjust doc_ids by segment offset
-        let raw_results: Vec<(DocId, f32)> = results
-            .into_iter()
-            .map(|(idx, dist)| {
-                let doc_id = idx as DocId + self.doc_id_offset;
-                let score = 1.0 / (1.0 + dist); // Convert distance to similarity score
-                (doc_id, score)
-            })
-            .collect();
-
-        // Combine scores for duplicate doc_ids (multi-valued documents)
-        let mut combined: rustc_hash::FxHashMap<DocId, (f32, u32)> =
+        // Track ordinals with individual scores for each doc_id
+        let mut doc_ordinals: rustc_hash::FxHashMap<DocId, Vec<(u32, f32)>> =
             rustc_hash::FxHashMap::default();
-        for (doc_id, score) in raw_results {
-            combined
-                .entry(doc_id)
-                .and_modify(|(acc_score, count)| match combiner {
-                    MultiValueCombiner::Sum => *acc_score += score,
-                    MultiValueCombiner::Max => *acc_score = acc_score.max(score),
-                    MultiValueCombiner::Avg => {
-                        *acc_score += score;
-                        *count += 1;
-                    }
-                })
-                .or_insert((score, 1));
+        for (doc_id, ordinal, dist) in results {
+            let doc_id = doc_id as DocId + self.doc_id_offset;
+            let score = 1.0 / (1.0 + dist); // Convert distance to similarity score
+            let ordinals = doc_ordinals.entry(doc_id).or_default();
+            ordinals.push((ordinal as u32, score));
         }
 
-        // Finalize averages and collect results
-        let mut final_results: Vec<(DocId, f32)> = combined
+        // Combine scores and build results with ordinal tracking
+        let mut final_results: Vec<VectorSearchResult> = doc_ordinals
             .into_iter()
-            .map(|(doc_id, (score, count))| {
-                let final_score = if combiner == MultiValueCombiner::Avg {
-                    score / count as f32
-                } else {
-                    score
+            .map(|(doc_id, ordinals)| {
+                let combined_score = match combiner {
+                    MultiValueCombiner::Sum => ordinals.iter().map(|(_, s)| s).sum(),
+                    MultiValueCombiner::Max => ordinals
+                        .iter()
+                        .map(|(_, s)| *s)
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(0.0),
+                    MultiValueCombiner::Avg => {
+                        let sum: f32 = ordinals.iter().map(|(_, s)| s).sum();
+                        sum / ordinals.len() as f32
+                    }
                 };
-                (doc_id, final_score)
+                VectorSearchResult::new(doc_id, combined_score, ordinals)
             })
             .collect();
 
         // Sort by score descending and take top k
-        final_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        final_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         final_results.truncate(k);
 
         Ok(final_results)
@@ -503,14 +452,14 @@ impl AsyncSegmentReader {
     /// 2. **Block-Max WAND**: Skips blocks where max contribution < threshold
     /// 3. **Top-K heap**: Efficient score collection
     ///
-    /// Returns (doc_id, score) pairs sorted by score descending.
+    /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
     pub async fn search_sparse_vector(
         &self,
         field: Field,
         vector: &[(u32, f32)],
         limit: usize,
         combiner: crate::query::MultiValueCombiner,
-    ) -> Result<Vec<(u32, f32)>> {
+    ) -> Result<Vec<VectorSearchResult>> {
         use crate::query::{MultiValueCombiner, SparseTermScorer, WandExecutor};
 
         let query_tokens = vector.len();
@@ -562,6 +511,16 @@ impl AsyncSegmentReader {
             index_dimensions
         );
 
+        // Log query tokens with their IDs and weights
+        if log::log_enabled!(log::Level::Debug) {
+            let query_details: Vec<_> = vector
+                .iter()
+                .take(30)
+                .map(|(id, w)| format!("{}:{:.3}", id, w))
+                .collect();
+            log::debug!("Query tokens (id:weight): [{}]", query_details.join(", "));
+        }
+
         if !matched_tokens.is_empty() {
             log::debug!(
                 "Matched token IDs: {:?}",
@@ -586,309 +545,44 @@ impl AsyncSegmentReader {
         // with different scores that need to be combined
         let raw_results = WandExecutor::new(scorers, limit * 2).execute(); // Over-fetch for combining
 
-        // Combine scores for duplicate doc_ids based on combiner strategy
-        let mut combined: rustc_hash::FxHashMap<u32, (f32, u32)> = rustc_hash::FxHashMap::default();
+        // Track ordinals with individual scores for each doc_id
+        // Now using real ordinals from the posting lists
+        let mut doc_ordinals: rustc_hash::FxHashMap<u32, Vec<(u32, f32)>> =
+            rustc_hash::FxHashMap::default();
         for r in raw_results {
-            combined
-                .entry(r.doc_id)
-                .and_modify(|(score, count)| match combiner {
-                    MultiValueCombiner::Sum => *score += r.score,
-                    MultiValueCombiner::Max => *score = score.max(r.score),
-                    MultiValueCombiner::Avg => {
-                        *score += r.score;
-                        *count += 1;
-                    }
-                })
-                .or_insert((r.score, 1));
+            let ordinals = doc_ordinals.entry(r.doc_id).or_default();
+            ordinals.push((r.ordinal as u32, r.score));
         }
 
-        // Finalize averages and collect results
-        let mut results: Vec<(u32, f32)> = combined
+        // Combine scores and build results with ordinal tracking
+        let mut results: Vec<VectorSearchResult> = doc_ordinals
             .into_iter()
-            .map(|(doc_id, (score, count))| {
-                let final_score = if combiner == MultiValueCombiner::Avg {
-                    score / count as f32
-                } else {
-                    score
+            .map(|(doc_id, ordinals)| {
+                let combined_score = match combiner {
+                    MultiValueCombiner::Sum => ordinals.iter().map(|(_, s)| s).sum(),
+                    MultiValueCombiner::Max => ordinals
+                        .iter()
+                        .map(|(_, s)| *s)
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(0.0),
+                    MultiValueCombiner::Avg => {
+                        let sum: f32 = ordinals.iter().map(|(_, s)| s).sum();
+                        sum / ordinals.len() as f32
+                    }
                 };
-                (doc_id, final_score)
+                VectorSearchResult::new(doc_id, combined_score, ordinals)
             })
             .collect();
 
         // Sort by score descending and take top limit
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
 
         Ok(results)
-    }
-
-    /// Load dense vector indexes from unified .vectors file
-    ///
-    /// Supports RaBitQ (type 0), IVF-RaBitQ (type 1), and ScaNN (type 2).
-    /// Also loads coarse centroids and PQ codebook as needed.
-    ///
-    /// Memory optimization: Uses lazy range reads to load each index separately,
-    /// avoiding loading the entire vectors file into memory at once.
-    async fn load_vectors_file<D: Directory>(
-        dir: &D,
-        files: &SegmentFiles,
-        schema: &Schema,
-    ) -> Result<(FxHashMap<u32, VectorIndex>, Option<Arc<CoarseCentroids>>)> {
-        use byteorder::{LittleEndian, ReadBytesExt};
-        use std::io::Cursor;
-
-        let mut indexes = FxHashMap::default();
-        let mut coarse_centroids: Option<Arc<CoarseCentroids>> = None;
-
-        // Skip loading vectors file if schema has no dense vector fields
-        let has_dense_vectors = schema
-            .fields()
-            .any(|(_, entry)| entry.dense_vector_config.is_some());
-        if !has_dense_vectors {
-            return Ok((indexes, None));
-        }
-
-        // Try to open vectors file (may not exist if no vectors were indexed)
-        let handle = match dir.open_lazy(&files.vectors).await {
-            Ok(h) => h,
-            Err(_) => return Ok((indexes, None)),
-        };
-
-        // Read only the header first (4 bytes for num_fields)
-        let header_bytes = match handle.read_bytes_range(0..4).await {
-            Ok(b) => b,
-            Err(_) => return Ok((indexes, None)),
-        };
-
-        if header_bytes.is_empty() {
-            return Ok((indexes, None));
-        }
-
-        let mut cursor = Cursor::new(header_bytes.as_slice());
-        let num_fields = cursor.read_u32::<LittleEndian>()?;
-
-        if num_fields == 0 {
-            return Ok((indexes, None));
-        }
-
-        // Read field entries header: (field_id: 4, index_type: 1, offset: 8, length: 8) = 21 bytes per field
-        let entries_size = num_fields as u64 * 21;
-        let entries_bytes = handle.read_bytes_range(4..4 + entries_size).await?;
-        let mut cursor = Cursor::new(entries_bytes.as_slice());
-
-        // Read field entries (field_id, index_type, offset, length)
-        let mut entries = Vec::with_capacity(num_fields as usize);
-        for _ in 0..num_fields {
-            let field_id = cursor.read_u32::<LittleEndian>()?;
-            // Try to read index_type - if this fails, assume old format without type
-            let index_type = cursor.read_u8().unwrap_or(255); // 255 = unknown/legacy
-            let offset = cursor.read_u64::<LittleEndian>()?;
-            let length = cursor.read_u64::<LittleEndian>()?;
-            entries.push((field_id, index_type, offset, length));
-        }
-
-        // Load each index on-demand using range reads (memory efficient)
-        for (field_id, index_type, offset, length) in entries {
-            // Read only this index's data
-            let data = handle.read_bytes_range(offset..offset + length).await?;
-            let _field = crate::dsl::Field(field_id);
-
-            match index_type {
-                3 => {
-                    // Flat (brute-force) - raw vectors for accumulating state
-                    if let Ok(flat_data) = serde_json::from_slice::<FlatVectorData>(data.as_slice())
-                    {
-                        indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
-                    }
-                }
-                2 => {
-                    // ScaNN (IVF-PQ) with embedded centroids and codebook
-                    use super::vector_data::ScaNNIndexData;
-                    if let Ok(scann_data) = ScaNNIndexData::from_bytes(data.as_slice()) {
-                        coarse_centroids = Some(Arc::new(scann_data.centroids));
-                        indexes.insert(
-                            field_id,
-                            VectorIndex::ScaNN {
-                                index: Arc::new(scann_data.index),
-                                codebook: Arc::new(scann_data.codebook),
-                            },
-                        );
-                    }
-                }
-                1 => {
-                    // IVF-RaBitQ with embedded centroids and codebook
-                    use super::vector_data::IVFRaBitQIndexData;
-                    if let Ok(ivf_data) = IVFRaBitQIndexData::from_bytes(data.as_slice()) {
-                        coarse_centroids = Some(Arc::new(ivf_data.centroids));
-                        indexes.insert(
-                            field_id,
-                            VectorIndex::IVF {
-                                index: Arc::new(ivf_data.index),
-                                codebook: Arc::new(ivf_data.codebook),
-                            },
-                        );
-                    }
-                }
-                0 => {
-                    // RaBitQ (standalone)
-                    if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data.as_slice())
-                    {
-                        indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
-                    }
-                }
-                _ => {
-                    // Unknown type - try Flat first (most common in new indexes)
-                    if let Ok(flat_data) = serde_json::from_slice::<FlatVectorData>(data.as_slice())
-                    {
-                        indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
-                    } else if let Ok(rabitq_index) =
-                        serde_json::from_slice::<RaBitQIndex>(data.as_slice())
-                    {
-                        indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
-                    }
-                }
-            }
-        }
-
-        Ok((indexes, coarse_centroids))
-    }
-
-    /// Load sparse vector indexes from .sparse file
-    ///
-    /// File format (direct-indexed table for O(1) dimension lookup):
-    /// - Header: num_fields (u32)
-    /// - For each field:
-    ///   - field_id (u32)
-    ///   - quantization (u8)
-    ///   - max_dim_id (u32)          ← table size
-    ///   - table: [(offset: u64, length: u32)] × max_dim_id  ← direct indexed
-    ///     (offset=0, length=0 means dimension not present)
-    /// - Data: concatenated serialized BlockSparsePostingList
-    async fn load_sparse_file<D: Directory>(
-        dir: &D,
-        files: &SegmentFiles,
-        total_docs: u32,
-        schema: &Schema,
-    ) -> Result<FxHashMap<u32, SparseIndex>> {
-        use byteorder::{LittleEndian, ReadBytesExt};
-        use std::io::Cursor;
-
-        let mut indexes = FxHashMap::default();
-
-        // Skip loading sparse file if schema has no sparse vector fields
-        let has_sparse_vectors = schema
-            .fields()
-            .any(|(_, entry)| entry.sparse_vector_config.is_some());
-        if !has_sparse_vectors {
-            return Ok(indexes);
-        }
-
-        // Try to open sparse file (may not exist if no sparse vectors were indexed)
-        let handle = match dir.open_lazy(&files.sparse).await {
-            Ok(h) => h,
-            Err(e) => {
-                log::debug!("No sparse file found ({}): {:?}", files.sparse.display(), e);
-                return Ok(indexes);
-            }
-        };
-
-        // Read the entire file (sparse files are typically small enough)
-        let data = match handle.read_bytes().await {
-            Ok(d) => d,
-            Err(_) => return Ok(indexes),
-        };
-
-        if data.len() < 4 {
-            return Ok(indexes);
-        }
-
-        let mut cursor = Cursor::new(data.as_slice());
-        let num_fields = cursor.read_u32::<LittleEndian>()?;
-
-        log::debug!(
-            "Loading sparse file: size={} bytes, num_fields={}",
-            data.len(),
-            num_fields
-        );
-
-        if num_fields == 0 {
-            return Ok(indexes);
-        }
-
-        // Read field entries and build indexes
-        for _ in 0..num_fields {
-            let field_id = cursor.read_u32::<LittleEndian>()?;
-            let _quantization = cursor.read_u8()?; // Already stored in each BlockSparsePostingList
-            let max_dim_id = cursor.read_u32::<LittleEndian>()?;
-
-            // Read direct-indexed table
-            let mut postings: Vec<Option<Arc<BlockSparsePostingList>>> =
-                vec![None; max_dim_id as usize];
-
-            for dim_id in 0..max_dim_id {
-                let offset = cursor.read_u64::<LittleEndian>()?;
-                let length = cursor.read_u32::<LittleEndian>()?;
-
-                // offset=0, length=0 means dimension not present
-                if length > 0 {
-                    let start = offset as usize;
-                    let end = start + length as usize;
-                    if end <= data.len() {
-                        let posting_data = &data.as_slice()[start..end];
-                        if let Ok(posting_list) =
-                            BlockSparsePostingList::deserialize(&mut Cursor::new(posting_data))
-                        {
-                            postings[dim_id as usize] = Some(Arc::new(posting_list));
-                        }
-                    }
-                }
-            }
-
-            let num_postings = postings.iter().filter(|p| p.is_some()).count();
-            log::debug!(
-                "Loaded sparse index for field {}: max_dim={}, active_postings={}",
-                field_id,
-                max_dim_id,
-                num_postings
-            );
-
-            indexes.insert(
-                field_id,
-                SparseIndex {
-                    postings,
-                    total_docs,
-                },
-            );
-        }
-
-        log::debug!(
-            "Sparse file loaded: fields={:?}",
-            indexes.keys().collect::<Vec<_>>()
-        );
-
-        Ok(indexes)
-    }
-
-    /// Load position index header from .pos file
-    ///
-    /// File format:
-    /// Open positions file handle (no header parsing needed - offsets are in TermInfo)
-    async fn open_positions_file<D: Directory>(
-        dir: &D,
-        files: &SegmentFiles,
-        schema: &Schema,
-    ) -> Result<Option<LazyFileHandle>> {
-        // Skip loading positions file if schema has no fields with position tracking
-        let has_positions = schema.fields().any(|(_, entry)| entry.positions.is_some());
-        if !has_positions {
-            return Ok(None);
-        }
-
-        // Try to open positions file (may not exist if no positions were indexed)
-        match dir.open_lazy(&files.positions).await {
-            Ok(h) => Ok(Some(h)),
-            Err(_) => Ok(None),
-        }
     }
 
     /// Get positions for a term (for phrase queries)

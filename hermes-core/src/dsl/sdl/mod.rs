@@ -214,6 +214,7 @@ struct IndexConfig {
     // Sparse vector index params
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
+    block_size: Option<usize>,
     // Sparse vector query-time config
     query_tokenizer: Option<String>,
     query_weighting: Option<QueryWeighting>,
@@ -355,6 +356,12 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             // weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
             if let Some(t) = p.into_inner().next() {
                 config.weight_threshold = Some(t.as_str().parse().unwrap_or(0.0));
+            }
+        }
+        Rule::block_size_kwarg => {
+            // block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
+            if let Some(n) = p.into_inner().next() {
+                config.block_size = Some(n.as_str().parse().unwrap_or(128));
             }
         }
         Rule::query_config_block => {
@@ -536,6 +543,7 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
         index_size,
         weight_quantization: WeightQuantization::default(),
         weight_threshold: 0.0,
+        block_size: 128,
         posting_list_pruning: None,
         query_config: None,
     }
@@ -548,6 +556,9 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     }
     if let Some(t) = idx_cfg.weight_threshold {
         config.weight_threshold = t;
+    }
+    if let Some(bs) = idx_cfg.block_size {
+        config.block_size = bs.next_power_of_two();
     }
     // Apply query-time configuration if present
     if idx_cfg.query_tokenizer.is_some() || idx_cfg.query_weighting.is_some() {

@@ -62,6 +62,7 @@ message SparseVectorQuery {
   repeated float values = 3;     // Pre-computed token values
   string text = 4;               // Raw text (tokenized server-side if tokenizer configured)
   MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
+  float heap_factor = 6;         // Approximate search factor (1.0 = exact, 0.8 = ~20% faster)
 }
 
 // Dense vector query for similarity search
@@ -104,6 +105,13 @@ message SearchHit {
   uint32 doc_id = 1;
   float score = 2;
   map<string, FieldValue> fields = 3;
+  repeated OrdinalScore ordinal_scores = 4;  // Per-ordinal scores for multi-value fields
+}
+
+// Score contribution from a specific ordinal in a multi-valued field
+message OrdinalScore {
+  uint32 ordinal = 1;  // Which value in the multi-valued field (0-indexed)
+  float score = 2;     // Score contribution from this ordinal
 }
 
 message FieldValue {

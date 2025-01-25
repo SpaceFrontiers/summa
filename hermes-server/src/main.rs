@@ -179,10 +179,23 @@ impl SearchService for SearchServiceImpl {
                 }
             }
 
+            // Convert ordinal scores from positions
+            let ordinal_scores: Vec<OrdinalScore> = result
+                .positions
+                .iter()
+                .flat_map(|(_, scored_positions)| {
+                    scored_positions.iter().map(|sp| OrdinalScore {
+                        ordinal: sp.position, // position contains the ordinal for vector fields
+                        score: sp.score,
+                    })
+                })
+                .collect();
+
             hits.push(SearchHit {
                 doc_id: result.doc_id,
                 score: result.score,
                 fields,
+                ordinal_scores,
             });
         }
 
