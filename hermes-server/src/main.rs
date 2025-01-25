@@ -620,9 +620,20 @@ async fn main() -> Result<()> {
     info!("Starting Hermes server on {}", addr);
     info!("Data directory: {:?}", args.data_dir);
 
+    // 256 MB limit for large batch index operations
+    const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+
     Server::builder()
-        .add_service(SearchServiceServer::new(search_service))
-        .add_service(IndexServiceServer::new(index_service))
+        .add_service(
+            SearchServiceServer::new(search_service)
+                .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+        )
+        .add_service(
+            IndexServiceServer::new(index_service)
+                .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+        )
         .serve(addr)
         .await?;
 
