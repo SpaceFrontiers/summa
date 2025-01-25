@@ -378,7 +378,10 @@ def _is_multi_sparse_vector(value: list) -> bool:
     """Check if list is a multi-value sparse vector: list of sparse vectors."""
     if not value:
         return False
-    return all(_is_sparse_vector(item) for item in value if isinstance(item, list))
+    # All items must be lists and each must be a valid sparse vector
+    if not all(isinstance(item, list) for item in value):
+        return False
+    return all(_is_sparse_vector(item) for item in value)
 
 
 def _is_dense_vector(value: list) -> bool:
@@ -392,7 +395,10 @@ def _is_multi_dense_vector(value: list) -> bool:
     """Check if list is a multi-value dense vector: list of dense vectors."""
     if not value:
         return False
-    return all(_is_dense_vector(item) for item in value if isinstance(item, list))
+    # All items must be lists and each must be a valid dense vector
+    if not all(isinstance(item, list) for item in value):
+        return False
+    return all(_is_dense_vector(item) for item in value)
 
 
 def _to_field_entries(doc: dict[str, Any]) -> list[pb.FieldEntry]:
