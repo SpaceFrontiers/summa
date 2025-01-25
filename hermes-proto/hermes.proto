@@ -47,6 +47,13 @@ message Query {
   }
 }
 
+// How to combine scores for multi-valued documents
+enum MultiValueCombiner {
+  COMBINER_SUM = 0;  // Sum all scores (default)
+  COMBINER_MAX = 1;  // Take maximum score
+  COMBINER_AVG = 2;  // Average all scores
+}
+
 // Sparse vector query for similarity search
 // Either provide (indices, values) directly, or provide text for server-side tokenization
 message SparseVectorQuery {
@@ -54,6 +61,7 @@ message SparseVectorQuery {
   repeated uint32 indices = 2;   // Pre-computed token indices
   repeated float values = 3;     // Pre-computed token values
   string text = 4;               // Raw text (tokenized server-side if tokenizer configured)
+  MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
 }
 
 // Dense vector query for similarity search
@@ -62,6 +70,7 @@ message DenseVectorQuery {
   repeated float vector = 2;
   uint32 nprobe = 3;           // Number of clusters to probe (for IVF indexes)
   uint32 rerank_factor = 4;    // Re-ranking factor (multiplied by k)
+  MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
 }
 
 message TermQuery {

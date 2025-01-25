@@ -247,6 +247,7 @@ class HermesClient:
         dense_vector: tuple[str, list[float]] | None = None,
         nprobe: int = 0,
         rerank_factor: int = 0,
+        combiner: str = "sum",
         limit: int = 10,
         offset: int = 0,
         fields_to_load: list[str] | None = None,
@@ -262,6 +263,7 @@ class HermesClient:
             dense_vector: Dense vector query as (field, vector) tuple
             nprobe: Number of clusters to probe for dense vector (IVF indexes)
             rerank_factor: Re-ranking factor for dense vector search
+            combiner: Score combiner for multi-value fields: "sum", "max", or "avg"
             limit: Maximum number of results
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
@@ -307,6 +309,7 @@ class HermesClient:
             dense_vector=dense_vector,
             nprobe=nprobe,
             rerank_factor=rerank_factor,
+            combiner=combiner,
         )
 
         request = pb.SearchRequest(
@@ -501,6 +504,11 @@ def _from_field_value(fv: pb.FieldValue) -> Any:
     return None
 
 
+def _combiner_to_proto(combiner: str) -> int:
+    """Convert combiner string to proto enum value."""
+    return {"sum": 0, "max": 1, "avg": 2}.get(combiner.lower(), 0)
+
+
 def _build_query(
     *,
     term: tuple[str, str] | None = None,
@@ -510,6 +518,7 @@ def _build_query(
     dense_vector: tuple[str, list[float]] | None = None,
     nprobe: int = 0,
     rerank_factor: int = 0,
+    combiner: str = "sum",
 ) -> pb.Query:
     """Build a protobuf Query from parameters."""
     if term is not None:
@@ -533,17 +542,23 @@ def _build_query(
             boolean=pb.BooleanQuery(must=must, should=should, must_not=must_not)
         )
 
+    combiner_value = _combiner_to_proto(combiner)
+
     if sparse_vector is not None:
         field, indices, values = sparse_vector
         return pb.Query(
             sparse_vector=pb.SparseVectorQuery(
-                field=field, indices=indices, values=values
+                field=field, indices=indices, values=values, combiner=combiner_value
             )
         )
 
     if sparse_text is not None:
         field, text = sparse_text
-        return pb.Query(sparse_vector=pb.SparseVectorQuery(field=field, text=text))
+        return pb.Query(
+            sparse_vector=pb.SparseVectorQuery(
+                field=field, text=text, combiner=combiner_value
+            )
+        )
 
     if dense_vector is not None:
         field, vector = dense_vector
@@ -553,6 +568,7 @@ def _build_query(
                 vector=vector,
                 nprobe=nprobe,
                 rerank_factor=rerank_factor,
+                combiner=combiner_value,
             )
         )
 

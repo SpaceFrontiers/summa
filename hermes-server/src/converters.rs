@@ -1,6 +1,6 @@
 //! Proto conversion helpers
 
-use hermes_core::query::{DenseVectorQuery, SparseVectorQuery};
+use hermes_core::query::{DenseVectorQuery, MultiValueCombiner, SparseVectorQuery};
 use hermes_core::tokenizer::tokenizer_cache;
 use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, Query, Schema, TermQuery,
@@ -9,6 +9,14 @@ use hermes_core::{
 use crate::proto;
 use crate::proto::field_value::Value;
 use crate::proto::query::Query as ProtoQueryType;
+
+fn convert_combiner(combiner: i32) -> MultiValueCombiner {
+    match combiner {
+        1 => MultiValueCombiner::Max,
+        2 => MultiValueCombiner::Avg,
+        _ => MultiValueCombiner::Sum, // 0 or default
+    }
+}
 
 pub fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Query>, String> {
     match &query.query {
@@ -95,7 +103,10 @@ pub fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Qu
                     .collect()
             };
 
-            Ok(Box::new(SparseVectorQuery::new(field, vector)))
+            let combiner = convert_combiner(sv_query.combiner);
+            Ok(Box::new(
+                SparseVectorQuery::new(field, vector).with_combiner(combiner),
+            ))
         }
         Some(ProtoQueryType::DenseVector(dv_query)) => {
             let field = schema
@@ -108,6 +119,8 @@ pub fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Qu
             if dv_query.rerank_factor > 0 {
                 query = query.with_rerank_factor(dv_query.rerank_factor as usize);
             }
+            let combiner = convert_combiner(dv_query.combiner);
+            query = query.with_combiner(combiner);
             Ok(Box::new(query))
         }
         None => Err("Query type is required".to_string()),
