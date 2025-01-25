@@ -513,26 +513,71 @@ impl AsyncSegmentReader {
     ) -> Result<Vec<(u32, f32)>> {
         use crate::query::{MultiValueCombiner, SparseTermScorer, WandExecutor};
 
+        let query_tokens = vector.len();
+
         // Get sparse index for this field
         let sparse_index = match self.sparse_indexes.get(&field.0) {
             Some(idx) => idx,
-            None => return Ok(Vec::new()),
+            None => {
+                log::debug!(
+                    "Sparse vector search: no index for field {}, returning empty",
+                    field.0
+                );
+                return Ok(Vec::new());
+            }
         };
 
+        let index_dimensions = sparse_index.postings.len();
+
         // Build scorers for each dimension that exists in the index
+        let mut matched_tokens = Vec::new();
+        let mut missing_tokens = Vec::new();
+
         let scorers: Vec<SparseTermScorer> = vector
             .iter()
             .filter_map(|&(dim_id, query_weight)| {
                 // Direct indexing: O(1) lookup
-                sparse_index
+                match sparse_index
                     .postings
                     .get(dim_id as usize)
                     .and_then(|opt| opt.as_ref())
-                    .map(|pl| SparseTermScorer::from_arc(pl, query_weight))
+                {
+                    Some(pl) => {
+                        matched_tokens.push(dim_id);
+                        Some(SparseTermScorer::from_arc(pl, query_weight))
+                    }
+                    None => {
+                        missing_tokens.push(dim_id);
+                        None
+                    }
+                }
             })
             .collect();
 
+        log::debug!(
+            "Sparse vector search: query_tokens={}, matched={}, missing={}, index_dimensions={}",
+            query_tokens,
+            matched_tokens.len(),
+            missing_tokens.len(),
+            index_dimensions
+        );
+
+        if !matched_tokens.is_empty() {
+            log::debug!(
+                "Matched token IDs: {:?}",
+                matched_tokens.iter().take(20).collect::<Vec<_>>()
+            );
+        }
+
+        if !missing_tokens.is_empty() {
+            log::debug!(
+                "Missing token IDs (not in index): {:?}",
+                missing_tokens.iter().take(20).collect::<Vec<_>>()
+            );
+        }
+
         if scorers.is_empty() {
+            log::debug!("Sparse vector search: no matching tokens, returning empty");
             return Ok(Vec::new());
         }
 

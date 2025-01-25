@@ -39,6 +39,10 @@ struct Args {
     /// Data directory for indexes
     #[arg(short, long, default_value = "./data")]
     data_dir: PathBuf,
+
+    /// Cache directory for HuggingFace models/tokenizers
+    #[arg(short, long)]
+    cache_dir: Option<PathBuf>,
 }
 
 /// Index registry holding all open indexes
@@ -460,6 +464,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Set HuggingFace cache directory if specified
+    if let Some(cache_dir) = &args.cache_dir {
+        std::fs::create_dir_all(cache_dir)?;
+        // SAFETY: We set this env var before any threads are spawned
+        unsafe { std::env::set_var("HF_HOME", cache_dir) };
+        info!("HuggingFace cache directory: {:?}", cache_dir);
+    }
 
     // Create data directory if needed
     std::fs::create_dir_all(&args.data_dir)?;
