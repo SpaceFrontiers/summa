@@ -242,6 +242,10 @@ class HermesClient:
         *,
         term: tuple[str, str] | None = None,
         boolean: dict[str, list[tuple[str, str]]] | None = None,
+        sparse_vector: tuple[str, list[int], list[float]] | None = None,
+        dense_vector: tuple[str, list[float]] | None = None,
+        nprobe: int = 0,
+        rerank_factor: int = 0,
         limit: int = 10,
         offset: int = 0,
         fields_to_load: list[str] | None = None,
@@ -252,6 +256,10 @@ class HermesClient:
             index_name: Name of the index
             term: Term query as (field, term) tuple
             boolean: Boolean query with "must", "should", "must_not" keys
+            sparse_vector: Sparse vector query as (field, indices, values) tuple
+            dense_vector: Dense vector query as (field, vector) tuple
+            nprobe: Number of clusters to probe for dense vector (IVF indexes)
+            rerank_factor: Re-ranking factor for dense vector search
             limit: Maximum number of results
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
@@ -268,10 +276,29 @@ class HermesClient:
                 "must": [("title", "hello")],
                 "should": [("body", "world")],
             })
+
+            # Sparse vector query
+            results = await client.search("docs",
+                sparse_vector=("embedding", [1, 5, 10], [0.5, 0.3, 0.2]),
+                fields_to_load=["title", "body"]
+            )
+
+            # Dense vector query
+            results = await client.search("docs",
+                dense_vector=("embedding", [0.1, 0.2, 0.3, ...]),
+                fields_to_load=["title"]
+            )
         """
         self._ensure_connected()
 
-        query = _build_query(term=term, boolean=boolean)
+        query = _build_query(
+            term=term,
+            boolean=boolean,
+            sparse_vector=sparse_vector,
+            dense_vector=dense_vector,
+            nprobe=nprobe,
+            rerank_factor=rerank_factor,
+        )
 
         request = pb.SearchRequest(
             index_name=index_name,
@@ -376,6 +403,10 @@ def _build_query(
     *,
     term: tuple[str, str] | None = None,
     boolean: dict[str, list[tuple[str, str]]] | None = None,
+    sparse_vector: tuple[str, list[int], list[float]] | None = None,
+    dense_vector: tuple[str, list[float]] | None = None,
+    nprobe: int = 0,
+    rerank_factor: int = 0,
 ) -> pb.Query:
     """Build a protobuf Query from parameters."""
     if term is not None:
@@ -397,6 +428,25 @@ def _build_query(
         ]
         return pb.Query(
             boolean=pb.BooleanQuery(must=must, should=should, must_not=must_not)
+        )
+
+    if sparse_vector is not None:
+        field, indices, values = sparse_vector
+        return pb.Query(
+            sparse_vector=pb.SparseVectorQuery(
+                field=field, indices=indices, values=values
+            )
+        )
+
+    if dense_vector is not None:
+        field, vector = dense_vector
+        return pb.Query(
+            dense_vector=pb.DenseVectorQuery(
+                field=field,
+                vector=vector,
+                nprobe=nprobe,
+                rerank_factor=rerank_factor,
+            )
         )
 
     # Default: match all (empty boolean query)

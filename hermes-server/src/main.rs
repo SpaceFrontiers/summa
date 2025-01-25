@@ -9,9 +9,10 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use parking_lot::RwLock;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{Request, Response, Status, codec::CompressionEncoding, transport::Server};
 use tracing::info;
 
+use hermes_core::query::{DenseVectorQuery, SparseVectorQuery};
 use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, FsDirectory, Index,
     IndexConfig, IndexWriter, Query, Schema, TermQuery, parse_schema, search_segment,
@@ -491,6 +492,31 @@ fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Query>
             // For now, return an error as we don't have AllQuery implemented
             Err("AllQuery not yet implemented".to_string())
         }
+        Some(ProtoQueryType::SparseVector(sv_query)) => {
+            let field = schema
+                .get_field(&sv_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", sv_query.field))?;
+            let vector: Vec<(u32, f32)> = sv_query
+                .indices
+                .iter()
+                .copied()
+                .zip(sv_query.values.iter().copied())
+                .collect();
+            Ok(Box::new(SparseVectorQuery::new(field, vector)))
+        }
+        Some(ProtoQueryType::DenseVector(dv_query)) => {
+            let field = schema
+                .get_field(&dv_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", dv_query.field))?;
+            let mut query = DenseVectorQuery::new(field, dv_query.vector.clone());
+            if dv_query.nprobe > 0 {
+                query = query.with_nprobe(dv_query.nprobe as usize);
+            }
+            if dv_query.rerank_factor > 0 {
+                query = query.with_rerank_factor(dv_query.rerank_factor as usize);
+            }
+            Ok(Box::new(query))
+        }
         None => Err("Query type is required".to_string()),
     }
 }
@@ -627,12 +653,16 @@ async fn main() -> Result<()> {
         .add_service(
             SearchServiceServer::new(search_service)
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+                .max_encoding_message_size(MAX_MESSAGE_SIZE)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip),
         )
         .add_service(
             IndexServiceServer::new(index_service)
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+                .max_encoding_message_size(MAX_MESSAGE_SIZE)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Gzip),
         )
         .serve(addr)
         .await?;

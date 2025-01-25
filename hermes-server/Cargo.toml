@@ -26,7 +26,7 @@ path = "src/bin/test_doc_retrieval.rs"
 [dependencies]
 hermes-core = { workspace = true, features = ["native"] }
 tokio = { workspace = true, features = ["macros", "signal"] }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["gzip"] }
 tonic-prost = "0.14"
 prost = { workspace = true }
 serde = { workspace = true }

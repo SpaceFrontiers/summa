@@ -15,6 +15,8 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokenizers::Tokenizer;
 
+use log::debug;
+
 use crate::Result;
 use crate::error::Error;
 
@@ -150,7 +152,16 @@ impl HfTokenizer {
             *counts.entry(id).or_insert(0) += 1;
         }
 
-        Ok(counts.into_iter().collect())
+        let result: Vec<(u32, u32)> = counts.into_iter().collect();
+        debug!(
+            "Tokenized query: text={:?} tokens={:?} token_ids={:?} unique_count={}",
+            text,
+            encoding.get_tokens(),
+            encoding.get_ids(),
+            result.len()
+        );
+
+        Ok(result)
     }
 
     /// Tokenize text and return unique token IDs (for weighting: one)
@@ -164,6 +175,14 @@ impl HfTokenizer {
         let mut ids: Vec<u32> = encoding.get_ids().to_vec();
         ids.sort_unstable();
         ids.dedup();
+
+        debug!(
+            "Tokenized query (unique): text={:?} tokens={:?} token_ids={:?} unique_count={}",
+            text,
+            encoding.get_tokens(),
+            encoding.get_ids(),
+            ids.len()
+        );
 
         Ok(ids)
     }

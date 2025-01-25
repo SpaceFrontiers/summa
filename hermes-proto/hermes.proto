@@ -42,7 +42,24 @@ message Query {
     BooleanQuery boolean = 2;
     BoostQuery boost = 3;
     AllQuery all = 4;
+    SparseVectorQuery sparse_vector = 5;
+    DenseVectorQuery dense_vector = 6;
   }
+}
+
+// Sparse vector query for similarity search
+message SparseVectorQuery {
+  string field = 1;
+  repeated uint32 indices = 2;
+  repeated float values = 3;
+}
+
+// Dense vector query for similarity search
+message DenseVectorQuery {
+  string field = 1;
+  repeated float vector = 2;
+  uint32 nprobe = 3;           // Number of clusters to probe (for IVF indexes)
+  uint32 rerank_factor = 4;    // Re-ranking factor (multiplied by k)
 }
 
 message TermQuery {

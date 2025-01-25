@@ -9,7 +9,7 @@ from pathlib import Path
 def main():
     root = Path(__file__).parent
     proto_dir = root.parent / "hermes-proto"
-    output_dir = root / "src" / "hermes_client"
+    output_dir = root / "src" / "hermes_client_python"
 
     proto_file = proto_dir / "hermes.proto"
 
