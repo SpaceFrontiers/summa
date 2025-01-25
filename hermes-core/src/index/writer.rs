@@ -322,10 +322,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
             let Some(msg) = msg else {
                 // Channel closed - flush remaining docs and exit
-                if let Some(b) = builder.take() {
-                    if b.num_docs() > 0 {
-                        Self::spawn_segment_build(&state, b);
-                    }
+                if let Some(b) = builder.take()
+                    && b.num_docs() > 0
+                {
+                    Self::spawn_segment_build(&state, b);
                 }
                 return;
             };
@@ -370,7 +370,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         100
                     };
 
-                    if doc_count % check_interval == 0 {
+                    if doc_count.is_multiple_of(check_interval) {
                         let builder_memory = b.stats().estimated_memory_bytes;
 
                         if builder_memory >= per_worker_limit {
@@ -382,10 +382,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 }
                 WorkerMessage::Flush(respond) => {
                     // Flush current builder if it has documents
-                    if let Some(b) = builder.take() {
-                        if b.num_docs() > 0 {
-                            Self::spawn_segment_build(&state, b);
-                        }
+                    if let Some(b) = builder.take()
+                        && b.num_docs() > 0
+                    {
+                        Self::spawn_segment_build(&state, b);
                     }
                     doc_count = 0;
                     // Signal that flush is complete for this worker
