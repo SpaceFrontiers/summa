@@ -777,7 +777,10 @@ impl AsyncSegmentReader {
         // Try to open sparse file (may not exist if no sparse vectors were indexed)
         let handle = match dir.open_lazy(&files.sparse).await {
             Ok(h) => h,
-            Err(_) => return Ok(indexes),
+            Err(e) => {
+                log::debug!("No sparse file found ({}): {:?}", files.sparse.display(), e);
+                return Ok(indexes);
+            }
         };
 
         // Read the entire file (sparse files are typically small enough)
@@ -792,6 +795,12 @@ impl AsyncSegmentReader {
 
         let mut cursor = Cursor::new(data.as_slice());
         let num_fields = cursor.read_u32::<LittleEndian>()?;
+
+        log::debug!(
+            "Loading sparse file: size={} bytes, num_fields={}",
+            data.len(),
+            num_fields
+        );
 
         if num_fields == 0 {
             return Ok(indexes);
@@ -826,6 +835,14 @@ impl AsyncSegmentReader {
                 }
             }
 
+            let num_postings = postings.iter().filter(|p| p.is_some()).count();
+            log::debug!(
+                "Loaded sparse index for field {}: max_dim={}, active_postings={}",
+                field_id,
+                max_dim_id,
+                num_postings
+            );
+
             indexes.insert(
                 field_id,
                 SparseIndex {
@@ -834,6 +851,11 @@ impl AsyncSegmentReader {
                 },
             );
         }
+
+        log::debug!(
+            "Sparse file loaded: fields={:?}",
+            indexes.keys().collect::<Vec<_>>()
+        );
 
         Ok(indexes)
     }
