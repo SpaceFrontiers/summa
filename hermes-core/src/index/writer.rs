@@ -221,6 +221,23 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(doc_id)
     }
 
+    /// Add multiple documents in parallel
+    ///
+    /// Documents are distributed across builders concurrently for maximum throughput.
+    /// Returns the count of successfully indexed documents.
+    pub async fn add_documents(&self, documents: Vec<Document>) -> Result<usize> {
+        use futures::stream::{self, StreamExt};
+
+        let results: Vec<Result<DocId>> = stream::iter(documents)
+            .map(|doc| self.add_document(doc))
+            .buffer_unordered(self.builders.len() * 2) // Allow some concurrency
+            .collect()
+            .await;
+
+        let success_count = results.iter().filter(|r| r.is_ok()).count();
+        Ok(success_count)
+    }
+
     /// Spawn a background task to build a segment without blocking document ingestion
     ///
     /// The background task will send its segment ID through the channel when complete,

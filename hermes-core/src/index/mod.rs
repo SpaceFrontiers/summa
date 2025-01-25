@@ -96,8 +96,10 @@ pub struct Index<D: Directory> {
     /// Cached global statistics for cross-segment IDF computation
     global_stats: crate::query::GlobalStatsCache,
     /// Index-level trained centroids per field (loaded from metadata)
+    #[allow(dead_code)] // Used in native builds for clone_for_builder
     trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
     /// Index-level trained PQ codebooks per field (for ScaNN)
+    #[allow(dead_code)] // Used in native builds for clone_for_builder
     trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
     #[cfg(feature = "native")]
     thread_pool: Arc<rayon::ThreadPool>,

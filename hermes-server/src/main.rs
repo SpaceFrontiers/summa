@@ -56,7 +56,7 @@ struct Args {
 /// Index registry holding all open indexes
 struct IndexRegistry {
     indexes: RwLock<HashMap<String, Arc<Index<FsDirectory>>>>,
-    writers: RwLock<HashMap<String, Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>>>,
+    writers: RwLock<HashMap<String, Arc<IndexWriter<FsDirectory>>>>,
     data_dir: PathBuf,
     config: IndexConfig,
 }
@@ -125,15 +125,12 @@ impl IndexRegistry {
             .insert(name.to_string(), Arc::new(index));
         self.writers
             .write()
-            .insert(name.to_string(), Arc::new(tokio::sync::Mutex::new(writer)));
+            .insert(name.to_string(), Arc::new(writer));
 
         Ok(())
     }
 
-    async fn get_writer(
-        &self,
-        name: &str,
-    ) -> Result<Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>, Status> {
+    async fn get_writer(&self, name: &str) -> Result<Arc<IndexWriter<FsDirectory>>, Status> {
         if let Some(writer) = self.writers.read().get(name) {
             return Ok(Arc::clone(writer));
         }
@@ -150,7 +147,7 @@ impl IndexRegistry {
             .await
             .map_err(|e| Status::internal(format!("Failed to open writer: {}", e)))?;
 
-        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+        let writer = Arc::new(writer);
         self.writers
             .write()
             .insert(name.to_string(), Arc::clone(&writer));
@@ -320,18 +317,24 @@ impl IndexService for IndexServiceImpl {
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let schema = index.schema();
 
-        let mut indexed_count = 0u32;
-        let mut error_count = 0u32;
+        // Convert all documents first (this is CPU-bound, could be parallelized further)
+        let mut documents = Vec::with_capacity(req.documents.len());
+        let mut conversion_errors = 0u32;
 
         for named_doc in req.documents {
             match convert_proto_to_document(&named_doc.fields, schema) {
-                Ok(doc) => match writer.lock().await.add_document(doc).await {
-                    Ok(_) => indexed_count += 1,
-                    Err(_) => error_count += 1,
-                },
-                Err(_) => error_count += 1,
+                Ok(doc) => documents.push(doc),
+                Err(_) => conversion_errors += 1,
             }
         }
+
+        // Use batch method for parallel document indexing
+        // IndexWriter is internally thread-safe, no external lock needed
+        let doc_count = documents.len() as u32;
+        let indexed_count = writer.add_documents(documents).await.unwrap_or(0) as u32;
+        let index_errors = doc_count - indexed_count;
+
+        let error_count = conversion_errors + index_errors;
 
         info!(
             index_name = %req.index_name,
@@ -353,7 +356,7 @@ impl IndexService for IndexServiceImpl {
         let mut stream = request.into_inner();
         let mut indexed_count = 0u32;
         let mut current_index: Option<String> = None;
-        let mut writer: Option<Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>> = None;
+        let mut writer: Option<Arc<IndexWriter<FsDirectory>>> = None;
 
         while let Some(req) = stream.message().await? {
             // Get or switch writer if index changed
@@ -368,9 +371,7 @@ impl IndexService for IndexServiceImpl {
             let doc = convert_proto_to_document(&req.fields, index.schema())
                 .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
 
-            w.lock()
-                .await
-                .add_document(doc)
+            w.add_document(doc)
                 .await
                 .map_err(|e| Status::internal(format!("Failed to index document: {}", e)))?;
 
@@ -388,8 +389,6 @@ impl IndexService for IndexServiceImpl {
         let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
-            .lock()
-            .await
             .commit()
             .await
             .map_err(|e| Status::internal(format!("Commit failed: {}", e)))?;
@@ -417,8 +416,6 @@ impl IndexService for IndexServiceImpl {
         let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
-            .lock()
-            .await
             .force_merge()
             .await
             .map_err(|e| Status::internal(format!("Merge failed: {}", e)))?;
