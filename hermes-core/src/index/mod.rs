@@ -7,12 +7,17 @@
 //!
 //! The Index owns the SegmentManager which handles segment lifecycle and tracking.
 
+#[cfg(feature = "native")]
 use std::sync::Arc;
 
+#[cfg(feature = "native")]
 use rustc_hash::FxHashMap;
 
+#[cfg(feature = "native")]
 use crate::dsl::Schema;
+#[cfg(feature = "native")]
 use crate::error::Result;
+#[cfg(feature = "native")]
 use crate::structures::{CoarseCentroids, PQCodebook};
 
 #[cfg(feature = "native")]
