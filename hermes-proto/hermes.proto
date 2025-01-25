@@ -48,10 +48,12 @@ message Query {
 }
 
 // Sparse vector query for similarity search
+// Either provide (indices, values) directly, or provide text for server-side tokenization
 message SparseVectorQuery {
   string field = 1;
-  repeated uint32 indices = 2;
-  repeated float values = 3;
+  repeated uint32 indices = 2;   // Pre-computed token indices
+  repeated float values = 3;     // Pre-computed token values
+  string text = 4;               // Raw text (tokenized server-side if tokenizer configured)
 }
 
 // Dense vector query for similarity search

@@ -243,6 +243,7 @@ class HermesClient:
         term: tuple[str, str] | None = None,
         boolean: dict[str, list[tuple[str, str]]] | None = None,
         sparse_vector: tuple[str, list[int], list[float]] | None = None,
+        sparse_text: tuple[str, str] | None = None,
         dense_vector: tuple[str, list[float]] | None = None,
         nprobe: int = 0,
         rerank_factor: int = 0,
@@ -257,6 +258,7 @@ class HermesClient:
             term: Term query as (field, term) tuple
             boolean: Boolean query with "must", "should", "must_not" keys
             sparse_vector: Sparse vector query as (field, indices, values) tuple
+            sparse_text: Sparse vector query with server-side tokenization as (field, text) tuple
             dense_vector: Dense vector query as (field, vector) tuple
             nprobe: Number of clusters to probe for dense vector (IVF indexes)
             rerank_factor: Re-ranking factor for dense vector search
@@ -277,9 +279,15 @@ class HermesClient:
                 "should": [("body", "world")],
             })
 
-            # Sparse vector query
+            # Sparse vector query (pre-tokenized)
             results = await client.search("docs",
                 sparse_vector=("embedding", [1, 5, 10], [0.5, 0.3, 0.2]),
+                fields_to_load=["title", "body"]
+            )
+
+            # Sparse text query (server-side tokenization)
+            results = await client.search("docs",
+                sparse_text=("embedding", "what is machine learning?"),
                 fields_to_load=["title", "body"]
             )
 
@@ -295,6 +303,7 @@ class HermesClient:
             term=term,
             boolean=boolean,
             sparse_vector=sparse_vector,
+            sparse_text=sparse_text,
             dense_vector=dense_vector,
             nprobe=nprobe,
             rerank_factor=rerank_factor,
@@ -404,6 +413,7 @@ def _build_query(
     term: tuple[str, str] | None = None,
     boolean: dict[str, list[tuple[str, str]]] | None = None,
     sparse_vector: tuple[str, list[int], list[float]] | None = None,
+    sparse_text: tuple[str, str] | None = None,
     dense_vector: tuple[str, list[float]] | None = None,
     nprobe: int = 0,
     rerank_factor: int = 0,
@@ -437,6 +447,10 @@ def _build_query(
                 field=field, indices=indices, values=values
             )
         )
+
+    if sparse_text is not None:
+        field, text = sparse_text
+        return pb.Query(sparse_vector=pb.SparseVectorQuery(field=field, text=text))
 
     if dense_vector is not None:
         field, vector = dense_vector
