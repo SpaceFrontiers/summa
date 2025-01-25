@@ -194,7 +194,7 @@ where
             }
         };
 
-        writer.add_document(doc).await?;
+        writer.add_document(doc)?;
         stats.indexed += 1;
 
         if let Some(callback) = progress_callback {
@@ -216,7 +216,7 @@ where
     let schema = writer.schema().clone();
     let doc = Document::from_json(json, &schema)
         .ok_or_else(|| Error::Document("Failed to parse JSON document".to_string()))?;
-    writer.add_document(doc).await?;
+    writer.add_document(doc)?;
     Ok(())
 }
 

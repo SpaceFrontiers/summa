@@ -723,12 +723,12 @@ mod tests {
         let mut doc1 = Document::new();
         doc1.add_text(title, "Hello World");
         doc1.add_text(body, "This is the first document");
-        writer.add_document(doc1).await.unwrap();
+        writer.add_document(doc1).unwrap();
 
         let mut doc2 = Document::new();
         doc2.add_text(title, "Goodbye World");
         doc2.add_text(body, "This is the second document");
-        writer.add_document(doc2).await.unwrap();
+        writer.add_document(doc2).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -767,7 +767,7 @@ mod tests {
             for i in 0..5 {
                 let mut doc = Document::new();
                 doc.add_text(title, format!("Document {} batch {}", i, batch));
-                writer.add_document(doc).await.unwrap();
+                writer.add_document(doc).unwrap();
             }
             writer.commit().await.unwrap();
         }
@@ -803,7 +803,7 @@ mod tests {
             for i in 0..3 {
                 let mut doc = Document::new();
                 doc.add_text(title, format!("Document {} batch {}", i, batch));
-                writer.add_document(doc).await.unwrap();
+                writer.add_document(doc).unwrap();
             }
             writer.flush().await.unwrap();
         }
@@ -854,12 +854,12 @@ mod tests {
         let mut doc1 = Document::new();
         doc1.add_text(title, "rust programming");
         doc1.add_text(body, "Learn rust language");
-        writer.add_document(doc1).await.unwrap();
+        writer.add_document(doc1).unwrap();
 
         let mut doc2 = Document::new();
         doc2.add_text(title, "python programming");
         doc2.add_text(body, "Learn python language");
-        writer.add_document(doc2).await.unwrap();
+        writer.add_document(doc2).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -913,7 +913,7 @@ mod tests {
             let mut doc = Document::new();
             doc.add_text(title, format!("Document {} about rust", i));
             doc.add_text(body, format!("This is body text number {}", i));
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
         writer.commit().await.unwrap();
 
@@ -971,13 +971,13 @@ mod tests {
         doc.add_text(uris, "one");
         doc.add_text(uris, "two");
         doc.add_text(title, "Test Document");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Add another document with different uris
         let mut doc2 = Document::new();
         doc2.add_text(uris, "three");
         doc2.add_text(title, "Another Document");
-        writer.add_document(doc2).await.unwrap();
+        writer.add_document(doc2).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -1044,27 +1044,27 @@ mod tests {
         // Doc 0: contains "rust" and "programming"
         let mut doc = Document::new();
         doc.add_text(content, "rust programming language is fast");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: contains "rust" only
         let mut doc = Document::new();
         doc.add_text(content, "rust is a systems language");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: contains "programming" only
         let mut doc = Document::new();
         doc.add_text(content, "programming is fun");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 3: contains "python" (neither rust nor programming)
         let mut doc = Document::new();
         doc.add_text(content, "python is easy to learn");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 4: contains both "rust" and "programming" multiple times
         let mut doc = Document::new();
         doc.add_text(content, "rust rust programming programming systems");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -1162,7 +1162,7 @@ mod tests {
                 _ => "cherry date",
             };
             doc.add_text(content, text);
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -1234,7 +1234,7 @@ mod tests {
             // Simple embedding: [i, i, i, i, i, i, i, i] normalized
             let vec: Vec<f32> = (0..8).map(|_| (i as f32) / 30.0).collect();
             doc.add_dense_vector(embedding, vec);
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
         writer.commit().await.unwrap();
 
@@ -1272,7 +1272,7 @@ mod tests {
             doc.add_text(title, format!("Document {}", i));
             let vec: Vec<f32> = (0..8).map(|_| (i as f32) / 60.0).collect();
             doc.add_dense_vector(embedding, vec);
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
         // Commit auto-triggers vector index build when threshold is crossed
         writer.commit().await.unwrap();

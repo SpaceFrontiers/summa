@@ -398,7 +398,7 @@ async fn index_from_reader<R: BufRead>(
             }
         };
 
-        writer.add_document(doc).await?;
+        writer.add_document(doc)?;
         count += 1;
 
         if progress_interval > 0 && count.is_multiple_of(progress_interval) {

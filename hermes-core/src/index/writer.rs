@@ -39,8 +39,8 @@ enum WorkerMessage {
 /// - Uses hashbrown HashMap (faster than BTreeMap)
 ///
 /// **Architecture:**
-/// - `add_document()` sends to a bounded channel (fast, non-blocking)
-/// - Worker tasks poll the channel and index documents in parallel
+/// - `add_document()` sends to per-worker unbounded channels (non-blocking)
+/// - Round-robin distribution across workers - no mutex contention
 /// - Each worker owns a SegmentBuilder and flushes when memory threshold is reached
 ///
 /// **State management:**
@@ -53,8 +53,10 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     #[allow(dead_code)] // Used for creating new builders in worker_state
     builder_config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
-    /// Channel sender for worker messages - add_document() sends here
-    msg_sender: mpsc::Sender<WorkerMessage>,
+    /// Per-worker channel senders - round-robin distribution
+    worker_senders: Vec<mpsc::UnboundedSender<WorkerMessage>>,
+    /// Round-robin counter for worker selection
+    next_worker: AtomicUsize,
     /// Worker task handles - kept alive to prevent premature shutdown
     #[allow(dead_code)]
     workers: Vec<JoinHandle<()>>,
@@ -147,18 +149,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             pending_builds: Arc::clone(&pending_builds),
         });
 
-        // Create message channel - bounded to apply backpressure
+        // Create per-worker unbounded channels and spawn workers
         let num_workers = config.num_indexing_threads.max(1);
-        let (msg_sender, msg_receiver) = mpsc::channel::<WorkerMessage>(num_workers * 1000);
-        let msg_receiver = Arc::new(AsyncMutex::new(msg_receiver));
-
-        // Spawn worker tasks
+        let mut worker_senders = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
+
         for _ in 0..num_workers {
+            let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
+            worker_senders.push(tx);
+
             let state = Arc::clone(&worker_state);
-            let receiver = Arc::clone(&msg_receiver);
             let handle = tokio::spawn(async move {
-                Self::worker_loop(state, receiver).await;
+                Self::worker_loop(state, rx).await;
             });
             workers.push(handle);
         }
@@ -169,7 +171,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config,
             builder_config,
             tokenizers: FxHashMap::default(),
-            msg_sender,
+            worker_senders,
+            next_worker: AtomicUsize::new(0),
             workers,
             worker_state,
             segment_manager,
@@ -229,18 +232,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             pending_builds: Arc::clone(&pending_builds),
         });
 
-        // Create message channel - bounded to apply backpressure
+        // Create per-worker unbounded channels and spawn workers
         let num_workers = config.num_indexing_threads.max(1);
-        let (msg_sender, msg_receiver) = mpsc::channel::<WorkerMessage>(num_workers * 1000);
-        let msg_receiver = Arc::new(AsyncMutex::new(msg_receiver));
-
-        // Spawn worker tasks
+        let mut worker_senders = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
+
         for _ in 0..num_workers {
+            let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
+            worker_senders.push(tx);
+
             let state = Arc::clone(&worker_state);
-            let receiver = Arc::clone(&msg_receiver);
             let handle = tokio::spawn(async move {
-                Self::worker_loop(state, receiver).await;
+                Self::worker_loop(state, rx).await;
             });
             workers.push(handle);
         }
@@ -251,7 +254,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config,
             builder_config,
             tokenizers: FxHashMap::default(),
-            msg_sender,
+            worker_senders,
+            next_worker: AtomicUsize::new(0),
             workers,
             worker_state,
             segment_manager,
@@ -273,52 +277,44 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Add a document to the indexing queue
     ///
-    /// Documents are sent to worker tasks via a bounded channel.
-    /// This is fast and non-blocking (unless backpressure kicks in).
+    /// Documents are sent to per-worker unbounded channels.
+    /// This is O(1) and never blocks - returns immediately.
     /// Workers handle the actual indexing in parallel.
-    pub async fn add_document(&self, doc: Document) -> Result<DocId> {
-        // Send to worker queue - applies backpressure if queue is full
-        self.msg_sender
+    pub fn add_document(&self, doc: Document) -> Result<DocId> {
+        // Round-robin select worker
+        let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_senders.len();
+        self.worker_senders[idx]
             .send(WorkerMessage::Document(doc))
-            .await
             .map_err(|_| Error::Internal("Document channel closed".into()))?;
-
-        // Note: We don't have the actual DocId here since workers assign it
-        // Return a placeholder - callers typically don't need the exact ID
         Ok(0)
     }
 
-    /// Documents are sent to worker tasks for parallel processing.
-    /// Returns the count of documents successfully queued.
-    pub async fn add_documents(&self, documents: Vec<Document>) -> Result<usize> {
-        let mut queued = 0;
-        for doc in documents {
-            if self
-                .msg_sender
-                .send(WorkerMessage::Document(doc))
-                .await
-                .is_ok()
-            {
-                queued += 1;
-            }
+    /// Add multiple documents to the indexing queue
+    ///
+    /// Documents are distributed round-robin to workers.
+    /// Returns immediately - never blocks.
+    pub fn add_documents(&self, documents: Vec<Document>) -> Result<usize> {
+        let num_workers = self.worker_senders.len();
+        let count = documents.len();
+        let base = self.next_worker.fetch_add(count, Ordering::Relaxed);
+        for (i, doc) in documents.into_iter().enumerate() {
+            let idx = (base + i) % num_workers;
+            let _ = self.worker_senders[idx].send(WorkerMessage::Document(doc));
         }
-        Ok(queued)
+        Ok(count)
     }
 
-    /// Worker loop - polls messages from queue and indexes documents
+    /// Worker loop - polls messages from its own channel and indexes documents
     async fn worker_loop(
         state: Arc<WorkerState<D>>,
-        receiver: Arc<AsyncMutex<mpsc::Receiver<WorkerMessage>>>,
+        mut receiver: mpsc::UnboundedReceiver<WorkerMessage>,
     ) {
         let mut builder: Option<SegmentBuilder> = None;
         let mut doc_count = 0u32;
 
         loop {
-            // Try to receive a message
-            let msg = {
-                let mut rx = receiver.lock().await;
-                rx.recv().await
-            };
+            // Receive from own channel - no mutex contention
+            let msg = receiver.recv().await;
 
             let Some(msg) = msg else {
                 // Channel closed - flush remaining docs and exit
@@ -467,18 +463,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Sends flush signals to all workers and waits for them to acknowledge.
     /// Workers continue running and can accept new documents after flush.
     pub async fn flush(&self) -> Result<()> {
-        // Send flush signal to each worker and collect response channels
-        let num_workers = self.config.num_indexing_threads.max(1);
-        let mut responses = Vec::with_capacity(num_workers);
+        // Send flush signal to each worker's channel
+        let mut responses = Vec::with_capacity(self.worker_senders.len());
 
-        for _ in 0..num_workers {
+        for sender in &self.worker_senders {
             let (tx, rx) = oneshot::channel();
-            if self
-                .msg_sender
-                .send(WorkerMessage::Flush(tx))
-                .await
-                .is_err()
-            {
+            if sender.send(WorkerMessage::Flush(tx)).is_err() {
                 // Channel closed, worker may have exited
                 continue;
             }

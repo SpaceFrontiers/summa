@@ -331,7 +331,7 @@ impl IndexService for IndexServiceImpl {
         // Use batch method for parallel document indexing
         // IndexWriter is internally thread-safe, no external lock needed
         let doc_count = documents.len() as u32;
-        let indexed_count = writer.add_documents(documents).await.unwrap_or(0) as u32;
+        let indexed_count = writer.add_documents(documents).unwrap_or(0) as u32;
         let index_errors = doc_count - indexed_count;
 
         let error_count = conversion_errors + index_errors;
@@ -372,7 +372,6 @@ impl IndexService for IndexServiceImpl {
                 .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
 
             w.add_document(doc)
-                .await
                 .map_err(|e| Status::internal(format!("Failed to index document: {}", e)))?;
 
             indexed_count += 1;

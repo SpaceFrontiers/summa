@@ -86,27 +86,27 @@ mod tests {
         // Doc 0: rust programming (tf=1)
         let mut doc = Document::new();
         doc.add_text(content, "rust programming");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: python programming (no rust)
         let mut doc = Document::new();
         doc.add_text(content, "python programming");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: rust rust rust (tf=3)
         let mut doc = Document::new();
         doc.add_text(content, "rust rust rust");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 3: java code (no rust)
         let mut doc = Document::new();
         doc.add_text(content, "java code");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 4: rust systems (tf=1)
         let mut doc = Document::new();
         doc.add_text(content, "rust systems");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -142,27 +142,27 @@ mod tests {
         // Doc 0: rust programming
         let mut doc = Document::new();
         doc.add_text(content, "rust programming");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: python programming
         let mut doc = Document::new();
         doc.add_text(content, "python programming");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: rust python (both)
         let mut doc = Document::new();
         doc.add_text(content, "rust python");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 3: java code (neither)
         let mut doc = Document::new();
         doc.add_text(content, "java code");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 4: python only
         let mut doc = Document::new();
         doc.add_text(content, "python only");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -207,7 +207,7 @@ mod tests {
         for doc_content in &docs {
             let mut doc = Document::new();
             doc.add_text(content, doc_content.clone());
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -268,7 +268,7 @@ mod tests {
             }
 
             doc.add_text(content, terms.join(" "));
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -326,7 +326,7 @@ mod tests {
             let mut doc = Document::new();
             let text = vec!["test"; tf].join(" ");
             doc.add_text(content, text);
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -367,22 +367,22 @@ mod tests {
         // Doc 0: only rust
         let mut doc = Document::new();
         doc.add_text(content, "rust");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: only systems
         let mut doc = Document::new();
         doc.add_text(content, "systems");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: both rust and systems (tf=1 each)
         let mut doc = Document::new();
         doc.add_text(content, "rust systems");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 3: both with higher TF (tf=2 each)
         let mut doc = Document::new();
         doc.add_text(content, "rust rust systems systems");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -432,7 +432,7 @@ mod tests {
                     doc.add_text(content, format!("otherword doc{}", doc_id));
                 }
 
-                writer.add_document(doc).await.unwrap();
+                writer.add_document(doc).unwrap();
             }
             writer.commit().await.unwrap();
         }
@@ -473,7 +473,7 @@ mod tests {
         for _segment in 0..2 {
             let mut doc = Document::new();
             doc.add_text(content, "identical content here");
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
             writer.commit().await.unwrap();
         }
 
@@ -504,7 +504,7 @@ mod tests {
 
         let mut doc = Document::new();
         doc.add_text(content, "hello world");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -531,7 +531,7 @@ mod tests {
         for _i in 0..50 {
             let mut doc = Document::new();
             doc.add_text(content, "common term here");
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -566,7 +566,7 @@ mod tests {
         for (i, term) in terms.iter().enumerate() {
             let mut doc = Document::new();
             doc.add_text(content, format!("{} content", term));
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
 
             // Doc IDs will be 0-7
             assert_eq!(i, i); // placeholder
@@ -575,7 +575,7 @@ mod tests {
         // Add one doc that matches all terms (doc_id = 8)
         let mut doc = Document::new();
         doc.add_text(content, terms.join(" "));
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -613,12 +613,12 @@ mod tests {
         // Doc 0: very high TF
         let mut doc = Document::new();
         doc.add_text(content, vec!["repeat"; 100].join(" "));
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: normal TF
         let mut doc = Document::new();
         doc.add_text(content, "repeat once");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -653,7 +653,7 @@ mod tests {
         for i in 0..20 {
             let mut doc = Document::new();
             doc.add_text(content, format!("term1 term2 term3 doc{}", i));
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -688,7 +688,7 @@ mod tests {
         for _i in 0..10 {
             let mut doc = Document::new();
             doc.add_text(content, "test content here");
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -723,7 +723,7 @@ mod tests {
 
         let mut doc = Document::new();
         doc.add_text(content, "unique");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -753,7 +753,7 @@ mod tests {
             } else {
                 doc.add_text(content, "common");
             }
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
@@ -805,28 +805,28 @@ mod tests {
         doc.add_text(title, "rust programming guide");
         doc.add_text(body, "this is about software development");
         doc.add_text(tags, "tutorial beginner");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: term in body only
         let mut doc = Document::new();
         doc.add_text(title, "software guide");
         doc.add_text(body, "learn rust programming here");
         doc.add_text(tags, "tutorial");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: term in tags only
         let mut doc = Document::new();
         doc.add_text(title, "programming tutorial");
         doc.add_text(body, "general software development");
         doc.add_text(tags, "rust systems");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 3: term in all fields
         let mut doc = Document::new();
         doc.add_text(title, "rust mastery");
         doc.add_text(body, "advanced rust programming");
         doc.add_text(tags, "rust expert");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -867,25 +867,25 @@ mod tests {
         let mut doc = Document::new();
         doc.add_text(title, "searchterm in title");
         doc.add_text(body, "other content");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: searchterm in body
         let mut doc = Document::new();
         doc.add_text(title, "different title");
         doc.add_text(body, "searchterm in body");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: searchterm in both
         let mut doc = Document::new();
         doc.add_text(title, "searchterm title");
         doc.add_text(body, "searchterm body");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 3: no searchterm
         let mut doc = Document::new();
         doc.add_text(title, "unrelated");
         doc.add_text(body, "nothing here");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -927,21 +927,21 @@ mod tests {
         doc.add_text(title, "rust");
         doc.add_text(body, "programming");
         doc.add_text(tags, "code");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: high TF in one field
         let mut doc = Document::new();
         doc.add_text(title, "rust rust rust rust rust");
         doc.add_text(body, "programming");
         doc.add_text(tags, "code");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: medium TF spread across fields
         let mut doc = Document::new();
         doc.add_text(title, "rust rust");
         doc.add_text(body, "rust rust");
         doc.add_text(tags, "rust");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -979,13 +979,13 @@ mod tests {
         let mut doc = Document::new();
         doc.add_text(title, "rust guide");
         doc.add_text(body, "this is a very long body with lots of words that dilute the term frequency and should result in lower BM25 scores for terms that appear here because length normalization penalizes longer documents");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: short title with term
         let mut doc = Document::new();
         doc.add_text(title, "rust");
         doc.add_text(body, "short body");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: long title with term
         let mut doc = Document::new();
@@ -994,7 +994,7 @@ mod tests {
             "the comprehensive rust programming language tutorial guide for beginners",
         );
         doc.add_text(body, "content");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -1029,28 +1029,28 @@ mod tests {
         doc.add_text(title, "alpha");
         doc.add_text(body, "beta");
         doc.add_text(tags, "gamma");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: beta in title, gamma in body
         let mut doc = Document::new();
         doc.add_text(title, "beta");
         doc.add_text(body, "gamma");
         doc.add_text(tags, "alpha");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: gamma in title, alpha in body
         let mut doc = Document::new();
         doc.add_text(title, "gamma");
         doc.add_text(body, "alpha");
         doc.add_text(tags, "beta");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 3: all terms in title
         let mut doc = Document::new();
         doc.add_text(title, "alpha beta gamma");
         doc.add_text(body, "other");
         doc.add_text(tags, "misc");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -1097,13 +1097,13 @@ mod tests {
         let mut doc = Document::new();
         doc.add_text(title, "public information");
         doc.add_text(body, "this contains secret data");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: "secret" only in title
         let mut doc = Document::new();
         doc.add_text(title, "secret document");
         doc.add_text(body, "public information here");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -1141,21 +1141,21 @@ mod tests {
         doc.add_text(title, "rust");
         doc.add_text(body, "rust");
         doc.add_text(tags, "rust");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 1: target term appears multiple times in one field only
         let mut doc = Document::new();
         doc.add_text(title, "rust rust rust");
         doc.add_text(body, "other content");
         doc.add_text(tags, "misc");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         // Doc 2: no target term
         let mut doc = Document::new();
         doc.add_text(title, "python");
         doc.add_text(body, "java");
         doc.add_text(tags, "go");
-        writer.add_document(doc).await.unwrap();
+        writer.add_document(doc).unwrap();
 
         writer.commit().await.unwrap();
 
@@ -1220,7 +1220,7 @@ mod tests {
             }
 
             doc.add_text(tags, format!("tag{}", i % 10));
-            writer.add_document(doc).await.unwrap();
+            writer.add_document(doc).unwrap();
         }
 
         writer.commit().await.unwrap();
