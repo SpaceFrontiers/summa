@@ -75,15 +75,13 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        let segments = Self::load_segments(
+        let (segments, default_fields, global_stats) = Self::load_common(
             &directory,
             &schema,
             snapshot.segment_ids(),
             term_cache_blocks,
         )
         .await;
-        let default_fields = Self::build_default_fields(&schema);
-        let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
 
         Ok(Self {
             _snapshot: snapshot,
@@ -106,10 +104,8 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        let segments =
-            Self::load_segments(&directory, &schema, segment_ids, term_cache_blocks).await;
-        let default_fields = Self::build_default_fields(&schema);
-        let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
+        let (segments, default_fields, global_stats) =
+            Self::load_common(&directory, &schema, segment_ids, term_cache_blocks).await;
 
         #[cfg(feature = "native")]
         {
@@ -141,6 +137,23 @@ impl<D: Directory + 'static> Searcher<D> {
                 global_stats,
             })
         }
+    }
+
+    /// Common loading logic shared by create and from_snapshot
+    async fn load_common(
+        directory: &Arc<D>,
+        schema: &Arc<Schema>,
+        segment_ids: &[String],
+        term_cache_blocks: usize,
+    ) -> (
+        Vec<Arc<SegmentReader>>,
+        Vec<crate::Field>,
+        Arc<LazyGlobalStats>,
+    ) {
+        let segments = Self::load_segments(directory, schema, segment_ids, term_cache_blocks).await;
+        let default_fields = Self::build_default_fields(schema);
+        let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
+        (segments, default_fields, global_stats)
     }
 
     /// Load segment readers from IDs
