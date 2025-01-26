@@ -106,6 +106,8 @@ pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
     trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
     /// Trained codebooks for vector search
     trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
+    /// Cached reader (created lazily, reused across calls)
+    cached_reader: tokio::sync::OnceCell<IndexReader<D>>,
 }
 
 #[cfg(feature = "native")]
@@ -134,6 +136,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             segment_manager,
             trained_centroids: FxHashMap::default(),
             trained_codebooks: FxHashMap::default(),
+            cached_reader: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -164,6 +167,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             segment_manager,
             trained_centroids,
             trained_codebooks,
+            cached_reader: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -183,15 +187,22 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     }
 
     /// Get an IndexReader for searching (with reload policy)
-    pub async fn reader(&self) -> Result<IndexReader<D>> {
-        IndexReader::from_segment_manager(
-            Arc::clone(&self.schema),
-            Arc::clone(&self.segment_manager),
-            self.trained_centroids.clone(),
-            self.trained_codebooks.clone(),
-            self.config.term_cache_blocks,
-        )
-        .await
+    ///
+    /// The reader is cached and reused across calls. The reader's internal
+    /// searcher will reload segments based on its reload interval (default 1s).
+    pub async fn reader(&self) -> Result<&IndexReader<D>> {
+        self.cached_reader
+            .get_or_try_init(|| async {
+                IndexReader::from_segment_manager(
+                    Arc::clone(&self.schema),
+                    Arc::clone(&self.segment_manager),
+                    self.trained_centroids.clone(),
+                    self.trained_codebooks.clone(),
+                    self.config.term_cache_blocks,
+                )
+                .await
+            })
+            .await
     }
 
     /// Get the config

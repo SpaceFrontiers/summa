@@ -1,6 +1,9 @@
 //! Proto conversion helpers
 
-use hermes_core::query::{DenseVectorQuery, MultiValueCombiner, SparseVectorQuery};
+use hermes_core::query::{
+    DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, SparseVectorQuery,
+};
+use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::tokenizer_cache;
 use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, Query, Schema, TermQuery,
@@ -18,7 +21,11 @@ fn convert_combiner(combiner: i32) -> MultiValueCombiner {
     }
 }
 
-pub fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Query>, String> {
+pub fn convert_query(
+    query: &proto::Query,
+    schema: &Schema,
+    global_stats: Option<&LazyGlobalStats>,
+) -> Result<Box<dyn Query>, String> {
     match &query.query {
         Some(ProtoQueryType::Term(term_query)) => {
             let field = schema
@@ -29,15 +36,15 @@ pub fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Qu
         Some(ProtoQueryType::Boolean(bool_query)) => {
             let mut bq = BooleanQuery::new();
             for q in &bool_query.must {
-                let inner = convert_query(q, schema)?;
+                let inner = convert_query(q, schema, global_stats)?;
                 bq.must.push(inner.into());
             }
             for q in &bool_query.should {
-                let inner = convert_query(q, schema)?;
+                let inner = convert_query(q, schema, global_stats)?;
                 bq.should.push(inner.into());
             }
             for q in &bool_query.must_not {
-                let inner = convert_query(q, schema)?;
+                let inner = convert_query(q, schema, global_stats)?;
                 bq.must_not.push(inner.into());
             }
             Ok(Box::new(bq))
@@ -47,7 +54,7 @@ pub fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Qu
                 .query
                 .as_ref()
                 .ok_or_else(|| "Boost query requires inner query".to_string())?;
-            let inner_query = convert_query(inner, schema)?;
+            let inner_query = convert_query(inner, schema, global_stats)?;
             Ok(Box::new(BoostQuery {
                 inner: inner_query.into(),
                 boost: boost_query.boost,
@@ -88,11 +95,32 @@ pub fn convert_query(query: &proto::Query, schema: &Schema) -> Result<Box<dyn Qu
                     .map_err(|e| format!("Tokenization failed: {}", e))?;
 
                 // Convert (token_id, count) to (token_id, weight)
-                // Weight is count as f32 for now (can apply IDF weighting later)
-                token_counts
-                    .into_iter()
-                    .map(|(id, count)| (id, count as f32))
-                    .collect()
+                // Apply IDF weighting if configured
+                let token_ids: Vec<u32> = token_counts.iter().map(|(id, _)| *id).collect();
+                let weights: Vec<f32> = match query_config.weighting {
+                    QueryWeighting::One => token_counts
+                        .iter()
+                        .map(|(_, count)| *count as f32)
+                        .collect(),
+                    QueryWeighting::Idf => {
+                        if let Some(stats) = global_stats {
+                            let idf_weights = stats.sparse_idf_weights(field, &token_ids);
+                            // Multiply count by IDF weight
+                            token_counts
+                                .iter()
+                                .zip(idf_weights.iter())
+                                .map(|((_, count), idf)| *count as f32 * idf)
+                                .collect()
+                        } else {
+                            // No global stats available, fall back to count
+                            token_counts
+                                .iter()
+                                .map(|(_, count)| *count as f32)
+                                .collect()
+                        }
+                    }
+                };
+                token_ids.into_iter().zip(weights).collect()
             } else {
                 // Pre-computed indices/values provided
                 sv_query

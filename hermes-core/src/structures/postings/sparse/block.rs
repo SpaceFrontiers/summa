@@ -192,6 +192,23 @@ impl SparseBlock {
             weights_data,
         })
     }
+
+    /// Create a copy of this block with first_doc_id adjusted by offset.
+    ///
+    /// This is used during merge to remap doc_ids from different segments.
+    /// Only the first_doc_id needs adjustment - deltas within the block
+    /// remain unchanged since they're relative to the previous doc.
+    pub fn with_doc_offset(&self, doc_offset: u32) -> Self {
+        Self {
+            header: BlockHeader {
+                first_doc_id: self.header.first_doc_id + doc_offset,
+                ..self.header
+            },
+            doc_ids_data: self.doc_ids_data.clone(),
+            ordinals_data: self.ordinals_data.clone(),
+            weights_data: self.weights_data.clone(),
+        }
+    }
 }
 
 // ============================================================================
@@ -309,6 +326,43 @@ impl BlockSparsePostingList {
             }
         }
         result
+    }
+
+    /// Merge multiple posting lists from different segments with doc_id offsets.
+    ///
+    /// This is an optimized O(1) merge that stacks blocks without decode/re-encode.
+    /// Each posting list's blocks have their first_doc_id adjusted by the corresponding offset.
+    ///
+    /// # Arguments
+    /// * `lists` - Slice of (posting_list, doc_offset) pairs from each segment
+    ///
+    /// # Returns
+    /// A new posting list with all blocks concatenated and doc_ids remapped
+    pub fn merge_with_offsets(lists: &[(&BlockSparsePostingList, u32)]) -> Self {
+        if lists.is_empty() {
+            return Self {
+                doc_count: 0,
+                blocks: Vec::new(),
+            };
+        }
+
+        // Pre-calculate total capacity
+        let total_blocks: usize = lists.iter().map(|(pl, _)| pl.blocks.len()).sum();
+        let total_docs: u32 = lists.iter().map(|(pl, _)| pl.doc_count).sum();
+
+        let mut merged_blocks = Vec::with_capacity(total_blocks);
+
+        // Stack blocks from each segment with doc_id offset adjustment
+        for (posting_list, doc_offset) in lists {
+            for block in &posting_list.blocks {
+                merged_blocks.push(block.with_doc_offset(*doc_offset));
+            }
+        }
+
+        Self {
+            doc_count: total_docs,
+            blocks: merged_blocks,
+        }
     }
 
     fn find_block(&self, target: DocId) -> Option<usize> {
@@ -757,5 +811,78 @@ mod tests {
         assert_eq!(iter.seek(300), 300);
         assert_eq!(iter.seek(301), 303);
         assert_eq!(iter.seek(2000), TERMINATED);
+    }
+
+    #[test]
+    fn test_merge_with_offsets() {
+        // Segment 1: docs 0, 5, 10 with weights
+        let postings1: Vec<(DocId, u16, f32)> = vec![(0, 0, 1.0), (5, 0, 2.0), (10, 1, 3.0)];
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+
+        // Segment 2: docs 0, 3, 7 with weights (will become 100, 103, 107 after merge)
+        let postings2: Vec<(DocId, u16, f32)> = vec![(0, 0, 4.0), (3, 1, 5.0), (7, 0, 6.0)];
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Merge with offsets: segment 1 at offset 0, segment 2 at offset 100
+        let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
+
+        assert_eq!(merged.doc_count(), 6);
+
+        // Verify all doc_ids are correct after merge
+        let decoded = merged.decode_all();
+        assert_eq!(decoded.len(), 6);
+
+        // Segment 1 docs (offset 0)
+        assert_eq!(decoded[0].0, 0);
+        assert_eq!(decoded[1].0, 5);
+        assert_eq!(decoded[2].0, 10);
+
+        // Segment 2 docs (offset 100)
+        assert_eq!(decoded[3].0, 100); // 0 + 100
+        assert_eq!(decoded[4].0, 103); // 3 + 100
+        assert_eq!(decoded[5].0, 107); // 7 + 100
+
+        // Verify weights preserved
+        assert!((decoded[0].2 - 1.0).abs() < 0.01);
+        assert!((decoded[3].2 - 4.0).abs() < 0.01);
+
+        // Verify ordinals preserved
+        assert_eq!(decoded[2].1, 1); // ordinal from segment 1
+        assert_eq!(decoded[4].1, 1); // ordinal from segment 2
+    }
+
+    #[test]
+    fn test_merge_with_offsets_multi_block() {
+        // Create posting lists that span multiple blocks
+        let postings1: Vec<(DocId, u16, f32)> = (0..200).map(|i| (i * 2, 0, i as f32)).collect();
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+        assert!(list1.num_blocks() > 1, "Should have multiple blocks");
+
+        let postings2: Vec<(DocId, u16, f32)> = (0..150).map(|i| (i * 3, 1, i as f32)).collect();
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Merge with offset 1000 for segment 2
+        let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 1000)]);
+
+        assert_eq!(merged.doc_count(), 350);
+        assert_eq!(merged.num_blocks(), list1.num_blocks() + list2.num_blocks());
+
+        // Verify via iterator
+        let mut iter = merged.iterator();
+
+        // First segment docs start at 0
+        assert_eq!(iter.doc(), 0);
+
+        // Seek to segment 2 (should be at offset 1000)
+        let doc = iter.seek(1000);
+        assert_eq!(doc, 1000); // First doc of segment 2: 0 + 1000 = 1000
+
+        // Next doc in segment 2
+        iter.advance();
+        assert_eq!(iter.doc(), 1003); // 3 + 1000 = 1003
     }
 }

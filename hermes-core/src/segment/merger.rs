@@ -36,6 +36,8 @@ pub struct MergeStats {
     pub store_bytes: usize,
     /// Vector index output size
     pub vectors_bytes: usize,
+    /// Sparse vector index output size
+    pub sparse_bytes: usize,
 }
 
 impl MergeStats {
@@ -120,6 +122,7 @@ impl SegmentMerger {
             .fields()
             .any(|(_, entry)| entry.positions.is_some());
 
+        // Note: sparse vectors now use optimized block stacking merge (no rebuild needed)
         if can_stack_stores && !has_positions {
             self.merge_optimized_with_stats(dir, segments, new_segment_id)
                 .await
@@ -193,6 +196,12 @@ impl SegmentMerger {
             .await?;
         stats.vectors_bytes = vectors_bytes;
 
+        // Merge sparse vector indexes (optimized block stacking)
+        let sparse_bytes = self
+            .merge_sparse_vectors_optimized(dir, segments, &files)
+            .await?;
+        stats.sparse_bytes = sparse_bytes;
+
         // Merge field stats
         let mut merged_field_stats: FxHashMap<u32, FieldStats> = FxHashMap::default();
         for segment in segments {
@@ -213,12 +222,13 @@ impl SegmentMerger {
         dir.write(&files.meta, &meta.serialize()?).await?;
 
         log::info!(
-            "Merge complete: {} terms, output: term_dict={}, postings={}, store={}, vectors={}",
+            "Merge complete: {} terms, output: term_dict={}, postings={}, store={}, vectors={}, sparse={}",
             stats.terms_processed,
             MergeStats::format_memory(stats.term_dict_bytes),
             MergeStats::format_memory(stats.postings_bytes),
             MergeStats::format_memory(stats.store_bytes),
             MergeStats::format_memory(stats.vectors_bytes),
+            MergeStats::format_memory(stats.sparse_bytes),
         );
 
         Ok((meta, stats))
@@ -702,6 +712,167 @@ impl SegmentMerger {
         }
 
         Ok(0)
+    }
+
+    /// Merge sparse vector indexes using optimized block stacking
+    ///
+    /// This is O(blocks) instead of O(postings) - we stack blocks directly
+    /// and only adjust the first_doc_id in each block header by the doc offset.
+    /// Deltas within blocks remain unchanged since they're relative.
+    async fn merge_sparse_vectors_optimized<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        files: &SegmentFiles,
+    ) -> Result<usize> {
+        use crate::structures::BlockSparsePostingList;
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        // Calculate doc offsets for each segment
+        let mut doc_offsets = Vec::with_capacity(segments.len());
+        let mut offset = 0u32;
+        for segment in segments {
+            doc_offsets.push(offset);
+            offset += segment.num_docs();
+        }
+
+        // Collect all sparse vector fields from schema
+        let sparse_fields: Vec<_> = self
+            .schema
+            .fields()
+            .filter(|(_, entry)| matches!(entry.field_type, FieldType::SparseVector))
+            .map(|(field, entry)| (field, entry.sparse_vector_config.clone()))
+            .collect();
+
+        if sparse_fields.is_empty() {
+            return Ok(0);
+        }
+
+        // Collect field data: (field_id, quantization, max_dim_id, dim_id -> merged_posting_list)
+        type SparseFieldData = (
+            u32,
+            crate::structures::WeightQuantization,
+            u32,
+            FxHashMap<u32, Vec<u8>>,
+        );
+        let mut field_data: Vec<SparseFieldData> = Vec::new();
+
+        for (field, sparse_config) in &sparse_fields {
+            // Get quantization from config
+            let quantization = sparse_config
+                .as_ref()
+                .map(|c| c.weight_quantization)
+                .unwrap_or(crate::structures::WeightQuantization::Float32);
+
+            // Collect all dimensions across all segments for this field
+            let mut all_dims: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+            for segment in segments {
+                if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
+                    for (dim_id, posting) in sparse_index.postings.iter().enumerate() {
+                        if posting.is_some() {
+                            all_dims.insert(dim_id as u32);
+                        }
+                    }
+                }
+            }
+
+            if all_dims.is_empty() {
+                continue;
+            }
+
+            let max_dim_id = all_dims.iter().max().copied().unwrap_or(0);
+            let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
+
+            // For each dimension, merge posting lists from all segments
+            for dim_id in all_dims {
+                // Collect posting lists for this dimension from all segments
+                let mut lists_with_offsets: Vec<(&BlockSparsePostingList, u32)> = Vec::new();
+
+                for (seg_idx, segment) in segments.iter().enumerate() {
+                    if let Some(sparse_index) = segment.sparse_indexes().get(&field.0)
+                        && let Some(Some(posting_list)) = sparse_index.postings.get(dim_id as usize)
+                    {
+                        lists_with_offsets.push((posting_list.as_ref(), doc_offsets[seg_idx]));
+                    }
+                }
+
+                if lists_with_offsets.is_empty() {
+                    continue;
+                }
+
+                // Merge using optimized block stacking
+                let merged = BlockSparsePostingList::merge_with_offsets(&lists_with_offsets);
+
+                // Serialize
+                let mut bytes = Vec::new();
+                merged.serialize(&mut bytes).map_err(crate::Error::Io)?;
+                dim_bytes.insert(dim_id, bytes);
+            }
+
+            field_data.push((field.0, quantization, max_dim_id + 1, dim_bytes));
+        }
+
+        if field_data.is_empty() {
+            return Ok(0);
+        }
+
+        // Sort by field_id
+        field_data.sort_by_key(|(id, _, _, _)| *id);
+
+        // Build sparse file (same format as builder)
+        // Header: num_fields (4)
+        // Per field: field_id (4) + quant (1) + max_dim_id (4) + table (12 * max_dim_id)
+        let mut header_size = 4u64;
+        for (_, _, max_dim_id, _) in &field_data {
+            header_size += 4 + 1 + 4; // field_id + quant + max_dim_id
+            header_size += (*max_dim_id as u64) * 12; // table entries
+        }
+
+        let mut output = Vec::new();
+        output.write_u32::<LittleEndian>(field_data.len() as u32)?;
+
+        let mut current_offset = header_size;
+        let mut all_data: Vec<u8> = Vec::new();
+        let mut field_tables: Vec<Vec<(u64, u32)>> = Vec::new();
+
+        for (_, _, max_dim_id, dim_bytes) in &field_data {
+            let mut table: Vec<(u64, u32)> = vec![(0, 0); *max_dim_id as usize];
+
+            for dim_id in 0..*max_dim_id {
+                if let Some(bytes) = dim_bytes.get(&dim_id) {
+                    table[dim_id as usize] = (current_offset, bytes.len() as u32);
+                    current_offset += bytes.len() as u64;
+                    all_data.extend_from_slice(bytes);
+                }
+            }
+            field_tables.push(table);
+        }
+
+        // Write field headers and tables
+        for (i, (field_id, quantization, max_dim_id, _)) in field_data.iter().enumerate() {
+            output.write_u32::<LittleEndian>(*field_id)?;
+            output.write_u8(*quantization as u8)?;
+            output.write_u32::<LittleEndian>(*max_dim_id)?;
+
+            for &(offset, length) in &field_tables[i] {
+                output.write_u64::<LittleEndian>(offset)?;
+                output.write_u32::<LittleEndian>(length)?;
+            }
+        }
+
+        // Append all data
+        output.extend_from_slice(&all_data);
+
+        let output_size = output.len();
+        dir.write(&files.sparse, &output).await?;
+
+        log::info!(
+            "Sparse vector merge complete: {} fields, {} bytes",
+            field_data.len(),
+            output_size
+        );
+
+        Ok(output_size)
     }
 }
 
