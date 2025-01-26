@@ -248,7 +248,12 @@ impl SparseVectorQuery {
             QueryWeighting::One => vec![1.0f32; token_ids.len()],
             QueryWeighting::Idf => {
                 if let Some(stats) = global_stats {
-                    stats.sparse_idf_weights(field, &token_ids)
+                    // Clamp to zero: negative weights don't make sense for IDF
+                    stats
+                        .sparse_idf_weights(field, &token_ids)
+                        .into_iter()
+                        .map(|w| w.max(0.0))
+                        .collect()
                 } else {
                     vec![1.0f32; token_ids.len()]
                 }
@@ -288,7 +293,12 @@ impl SparseVectorQuery {
             QueryWeighting::One => vec![1.0f32; token_ids.len()],
             QueryWeighting::Idf => {
                 if let Some(stats) = global_stats {
-                    stats.sparse_idf_weights(field, &token_ids)
+                    // Clamp to zero: negative weights don't make sense for IDF
+                    stats
+                        .sparse_idf_weights(field, &token_ids)
+                        .into_iter()
+                        .map(|w| w.max(0.0))
+                        .collect()
                 } else {
                     vec![1.0f32; token_ids.len()]
                 }

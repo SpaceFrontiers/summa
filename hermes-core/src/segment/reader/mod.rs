@@ -555,9 +555,11 @@ impl AsyncSegmentReader {
         }
 
         // Combine scores and build results with ordinal tracking
+        // Add doc_id_offset to convert segment-local IDs to global IDs
         let mut results: Vec<VectorSearchResult> = doc_ordinals
             .into_iter()
             .map(|(doc_id, ordinals)| {
+                let global_doc_id = doc_id + self.doc_id_offset;
                 let combined_score = match combiner {
                     MultiValueCombiner::Sum => ordinals.iter().map(|(_, s)| s).sum(),
                     MultiValueCombiner::Max => ordinals
@@ -570,7 +572,7 @@ impl AsyncSegmentReader {
                         sum / ordinals.len() as f32
                     }
                 };
-                VectorSearchResult::new(doc_id, combined_score, ordinals)
+                VectorSearchResult::new(global_doc_id, combined_score, ordinals)
             })
             .collect();
 
