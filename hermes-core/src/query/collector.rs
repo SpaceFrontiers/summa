@@ -272,7 +272,7 @@ pub async fn search_segment(
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
     let mut collector = TopKCollector::new(limit);
-    collect_segment(reader, query, &mut collector).await?;
+    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
     Ok(collector.into_sorted_results())
 }
 
@@ -283,7 +283,7 @@ pub async fn search_segment_with_positions(
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
     let mut collector = TopKCollector::with_positions(limit);
-    collect_segment(reader, query, &mut collector).await?;
+    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
     Ok(collector.into_sorted_results())
 }
 
@@ -319,6 +319,10 @@ impl<A: Collector, B: Collector, C: Collector> Collector for (&mut A, &mut B, &m
 
 /// Execute a query with one or more collectors (async)
 ///
+/// Uses a large limit for the scorer to disable WAND pruning.
+/// For queries that benefit from WAND pruning (e.g., sparse vector search),
+/// use `collect_segment_with_limit` instead.
+///
 /// # Examples
 /// ```ignore
 /// // Single collector
@@ -335,9 +339,23 @@ pub async fn collect_segment<C: Collector>(
     query: &dyn Query,
     collector: &mut C,
 ) -> Result<()> {
+    // Use large limit to disable WAND skipping for exhaustive collection
+    collect_segment_with_limit(reader, query, collector, usize::MAX / 2).await
+}
+
+/// Execute a query with one or more collectors and a specific limit (async)
+///
+/// The limit is passed to the scorer to enable WAND pruning for queries
+/// that support it (e.g., sparse vector search). This significantly improves
+/// performance when only the top-k results are needed.
+pub async fn collect_segment_with_limit<C: Collector>(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    collector: &mut C,
+    limit: usize,
+) -> Result<()> {
     let needs_positions = collector.needs_positions();
-    // Use large limit to disable WAND skipping, but not usize::MAX to avoid overflow
-    let mut scorer = query.scorer(reader, usize::MAX / 2).await?;
+    let mut scorer = query.scorer(reader, limit).await?;
 
     let mut doc = scorer.doc();
     while doc != TERMINATED {
