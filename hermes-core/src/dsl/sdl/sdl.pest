@@ -128,7 +128,7 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | mrl_dim_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | block_size_kwarg | query_config_block | positions_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | mrl_dim_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | query_config_block | positions_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -147,6 +147,8 @@ quantization_kwarg = { "quantization" ~ ":" ~ quantization_spec }
 weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
 block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
 block_size_spec = @{ ASCII_DIGIT+ }
+pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
+pruning_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 nprobe_spec = @{ ASCII_DIGIT+ }
 path_chars = @{ (!("\"" ) ~ ANY)* }
 

@@ -215,6 +215,7 @@ struct IndexConfig {
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
+    posting_list_pruning: Option<f32>,
     // Sparse vector query-time config
     query_tokenizer: Option<String>,
     query_weighting: Option<QueryWeighting>,
@@ -362,6 +363,12 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             // block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
             if let Some(n) = p.into_inner().next() {
                 config.block_size = Some(n.as_str().parse().unwrap_or(128));
+            }
+        }
+        Rule::pruning_kwarg => {
+            // pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
+            if let Some(f) = p.into_inner().next() {
+                config.posting_list_pruning = Some(f.as_str().parse().unwrap_or(1.0));
             }
         }
         Rule::query_config_block => {
@@ -558,7 +565,26 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         config.weight_threshold = t;
     }
     if let Some(bs) = idx_cfg.block_size {
-        config.block_size = bs.next_power_of_two();
+        let adjusted = bs.next_power_of_two();
+        if adjusted != bs {
+            log::warn!(
+                "block_size {} adjusted to next power of two: {}",
+                bs,
+                adjusted
+            );
+        }
+        config.block_size = adjusted;
+    }
+    if let Some(p) = idx_cfg.posting_list_pruning {
+        let clamped = p.clamp(0.0, 1.0);
+        if (clamped - p).abs() > f32::EPSILON {
+            log::warn!(
+                "pruning {} clamped to valid range [0.0, 1.0]: {}",
+                p,
+                clamped
+            );
+        }
+        config.posting_list_pruning = Some(clamped);
     }
     // Apply query-time configuration if present
     if idx_cfg.query_tokenizer.is_some() || idx_cfg.query_weighting.is_some() {
@@ -1173,6 +1199,22 @@ mod tests {
         assert_eq!(config2.index_size, IndexSize::U32);
         assert_eq!(config2.weight_quantization, WeightQuantization::Float16);
         assert!((config2.weight_threshold - 0.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sparse_vector_with_pruning() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector [indexed<quantization: uint8, pruning: 0.1>, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let f = &indexes[0].fields[0];
+        assert_eq!(f.name, "embedding");
+        let config = f.sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
+        assert_eq!(config.posting_list_pruning, Some(0.1));
     }
 
     #[test]
