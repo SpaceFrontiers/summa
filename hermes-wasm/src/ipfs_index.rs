@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use hermes_core::directories::{
     Directory, FileSlice, LazyFileHandle, OwnedBytes, SliceCachingDirectory,
 };
-use hermes_core::{Index, IndexConfig, SLICE_CACHE_FILENAME};
+use hermes_core::{IndexMetadata, SLICE_CACHE_FILENAME, Searcher};
 use parking_lot::RwLock;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -252,7 +252,8 @@ pub type CachedJsFetchDirectory = SliceCachingDirectory<JsFetchDirectory>;
 pub struct IpfsIndex {
     base_path: String,
     cache_size: usize,
-    index: Option<Index<CachedJsFetchDirectory>>,
+    searcher: Option<Searcher<CachedJsFetchDirectory>>,
+    directory: Option<Arc<CachedJsFetchDirectory>>,
     stats: Arc<IpfsNetworkStats>,
 }
 
@@ -266,7 +267,8 @@ impl IpfsIndex {
         Self {
             base_path,
             cache_size: DEFAULT_CACHE_SIZE,
-            index: None,
+            searcher: None,
+            directory: None,
             stats: Arc::new(IpfsNetworkStats::new()),
         }
     }
@@ -277,7 +279,8 @@ impl IpfsIndex {
         Self {
             base_path,
             cache_size,
-            index: None,
+            searcher: None,
+            directory: None,
             stats: Arc::new(IpfsNetworkStats::new()),
         }
     }
@@ -318,13 +321,23 @@ impl IpfsIndex {
             }
         }
 
-        let config = IndexConfig::default();
+        let cached_dir = Arc::new(cached_dir);
 
-        let index = Index::open(cached_dir, config)
+        // Load metadata to get schema and segment IDs
+        let metadata = IndexMetadata::load(cached_dir.as_ref())
             .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to open index: {}", e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
 
-        self.index = Some(index);
+        let schema = Arc::new(metadata.schema.clone());
+        let segment_ids = metadata.segments.clone();
+
+        // Create Searcher directly
+        let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to open searcher: {}", e)))?;
+
+        self.searcher = Some(searcher);
+        self.directory = Some(cached_dir);
         Ok(())
     }
 
@@ -380,13 +393,23 @@ impl IpfsIndex {
             }
         }
 
-        let config = IndexConfig::default();
+        let cached_dir = Arc::new(cached_dir);
 
-        let index = Index::open(cached_dir, config)
+        // Load metadata to get schema and segment IDs
+        let metadata = IndexMetadata::load(cached_dir.as_ref())
             .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to open index: {}", e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
 
-        self.index = Some(index);
+        let schema = Arc::new(metadata.schema.clone());
+        let segment_ids = metadata.segments.clone();
+
+        // Create Searcher directly
+        let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to open searcher: {}", e)))?;
+
+        self.searcher = Some(searcher);
+        self.directory = Some(cached_dir);
         Ok(())
     }
 
@@ -424,8 +447,8 @@ impl IpfsIndex {
             files_cached: usize,
         }
 
-        if let Some(index) = &self.index {
-            let stats = index.directory().stats();
+        if let Some(directory) = &self.directory {
+            let stats = directory.stats();
             let js_stats = CacheStatsJs {
                 total_bytes: stats.total_bytes,
                 max_bytes: stats.max_bytes,
@@ -441,15 +464,15 @@ impl IpfsIndex {
     /// Get number of documents
     #[wasm_bindgen]
     pub fn num_docs(&self) -> u32 {
-        self.index.as_ref().map(|i| i.num_docs()).unwrap_or(0)
+        self.searcher.as_ref().map(|s| s.num_docs()).unwrap_or(0)
     }
 
     /// Get number of segments
     #[wasm_bindgen]
     pub fn num_segments(&self) -> usize {
-        self.index
+        self.searcher
             .as_ref()
-            .map(|i| i.segment_readers().len())
+            .map(|s| s.segment_readers().len())
             .unwrap_or(0)
     }
 
@@ -457,9 +480,9 @@ impl IpfsIndex {
     #[wasm_bindgen]
     pub fn field_names(&self) -> JsValue {
         let names: Vec<String> = self
-            .index
+            .searcher
             .as_ref()
-            .map(|i| i.schema().fields().map(|(_, f)| f.name.clone()).collect())
+            .map(|s| s.schema().fields().map(|(_, f)| f.name.clone()).collect())
             .unwrap_or_default();
         serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
     }
@@ -478,12 +501,12 @@ impl IpfsIndex {
         limit: usize,
         offset: usize,
     ) -> Result<JsValue, JsValue> {
-        let index = self
-            .index
+        let searcher = self
+            .searcher
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
-        let response = index
+        let response = searcher
             .query_offset(&query_str, limit, offset)
             .await
             .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
@@ -496,21 +519,21 @@ impl IpfsIndex {
     /// Get a document by address
     #[wasm_bindgen]
     pub async fn get_document(&self, segment_id: String, doc_id: u32) -> Result<JsValue, JsValue> {
-        let index = self
-            .index
+        let searcher = self
+            .searcher
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
         let address = hermes_core::query::DocAddress { segment_id, doc_id };
 
-        let doc = index
+        let doc = searcher
             .get_document(&address)
             .await
             .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
 
         match doc {
             Some(document) => {
-                let json = document.to_json(index.schema());
+                let json = document.to_json(searcher.schema());
                 json.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
                     .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
             }
@@ -522,12 +545,12 @@ impl IpfsIndex {
     #[wasm_bindgen]
     pub fn default_fields(&self) -> JsValue {
         let names: Vec<String> = self
-            .index
+            .searcher
             .as_ref()
-            .map(|i| {
-                i.default_fields()
+            .map(|s| {
+                s.default_fields()
                     .iter()
-                    .filter_map(|f| i.schema().get_field_name(*f).map(|s| s.to_string()))
+                    .filter_map(|f| s.schema().get_field_name(*f).map(|name| name.to_string()))
                     .collect()
             })
             .unwrap_or_default();
@@ -537,19 +560,18 @@ impl IpfsIndex {
     /// Export cache
     #[wasm_bindgen]
     pub fn export_cache(&self) -> Option<Vec<u8>> {
-        self.index.as_ref().map(|i| i.directory().serialize())
+        self.directory.as_ref().map(|d| d.serialize())
     }
 
     /// Import cache
     #[wasm_bindgen]
     pub fn import_cache(&self, data: &[u8]) -> Result<(), JsValue> {
-        let index = self
-            .index
+        let directory = self
+            .directory
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
-        index
-            .directory()
+        directory
             .deserialize(data)
             .map_err(|e| JsValue::from_str(&format!("Failed to import cache: {}", e)))
     }

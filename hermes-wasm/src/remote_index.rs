@@ -1,8 +1,9 @@
 //! HTTP-based remote index with slice caching
 
 use hermes_core::directories::SliceCachingDirectory;
-use hermes_core::{HttpDirectory, Index, IndexConfig, SLICE_CACHE_FILENAME};
+use hermes_core::{HttpDirectory, IndexMetadata, SLICE_CACHE_FILENAME, Searcher};
 use serde::Serialize;
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 use crate::idb::{cache_key, idb_delete, idb_get, idb_put};
@@ -16,7 +17,8 @@ pub type CachedHttpDirectory = SliceCachingDirectory<HttpDirectory>;
 pub struct RemoteIndex {
     base_url: String,
     cache_size: usize,
-    index: Option<Index<CachedHttpDirectory>>,
+    searcher: Option<Searcher<CachedHttpDirectory>>,
+    directory: Option<Arc<CachedHttpDirectory>>,
 }
 
 #[wasm_bindgen]
@@ -27,7 +29,8 @@ impl RemoteIndex {
         Self {
             base_url,
             cache_size: DEFAULT_CACHE_SIZE,
-            index: None,
+            searcher: None,
+            directory: None,
         }
     }
 
@@ -37,7 +40,8 @@ impl RemoteIndex {
         Self {
             base_url,
             cache_size,
-            index: None,
+            searcher: None,
+            directory: None,
         }
     }
 
@@ -61,13 +65,23 @@ impl RemoteIndex {
             let _ = cached_dir.deserialize(&cache_data);
         }
 
-        let config = IndexConfig::default();
+        let cached_dir = Arc::new(cached_dir);
 
-        let index = Index::open(cached_dir, config)
+        // Load metadata to get schema and segment IDs
+        let metadata = IndexMetadata::load(cached_dir.as_ref())
             .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to open index: {}", e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
 
-        self.index = Some(index);
+        let schema = Arc::new(metadata.schema.clone());
+        let segment_ids = metadata.segments.clone();
+
+        // Create Searcher directly
+        let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to open searcher: {}", e)))?;
+
+        self.searcher = Some(searcher);
+        self.directory = Some(cached_dir);
         Ok(())
     }
 
@@ -104,13 +118,23 @@ impl RemoteIndex {
             }
         }
 
-        let config = IndexConfig::default();
+        let cached_dir = Arc::new(cached_dir);
 
-        let index = Index::open(cached_dir, config)
+        // Load metadata to get schema and segment IDs
+        let metadata = IndexMetadata::load(cached_dir.as_ref())
             .await
-            .map_err(|e| JsValue::from_str(&format!("Failed to open index: {}", e)))?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
 
-        self.index = Some(index);
+        let schema = Arc::new(metadata.schema.clone());
+        let segment_ids = metadata.segments.clone();
+
+        // Create Searcher directly
+        let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to open searcher: {}", e)))?;
+
+        self.searcher = Some(searcher);
+        self.directory = Some(cached_dir);
         Ok(())
     }
 
@@ -125,8 +149,8 @@ impl RemoteIndex {
             files_cached: usize,
         }
 
-        if let Some(index) = &self.index {
-            let stats = index.directory().stats();
+        if let Some(directory) = &self.directory {
+            let stats = directory.stats();
             let js_stats = CacheStatsJs {
                 total_bytes: stats.total_bytes,
                 max_bytes: stats.max_bytes,
@@ -142,8 +166,8 @@ impl RemoteIndex {
     /// Get network statistics (requests made, bytes transferred, etc.)
     #[wasm_bindgen]
     pub fn network_stats(&self) -> JsValue {
-        if let Some(index) = &self.index {
-            let http_stats = index.directory().inner().http_stats();
+        if let Some(directory) = &self.directory {
+            let http_stats = directory.inner().http_stats();
             serde_wasm_bindgen::to_value(&http_stats).unwrap_or(JsValue::NULL)
         } else {
             JsValue::NULL
@@ -153,23 +177,23 @@ impl RemoteIndex {
     /// Reset network statistics
     #[wasm_bindgen]
     pub fn reset_network_stats(&self) {
-        if let Some(index) = &self.index {
-            index.directory().inner().reset_stats();
+        if let Some(directory) = &self.directory {
+            directory.inner().reset_stats();
         }
     }
 
     /// Get number of documents
     #[wasm_bindgen]
     pub fn num_docs(&self) -> u32 {
-        self.index.as_ref().map(|i| i.num_docs()).unwrap_or(0)
+        self.searcher.as_ref().map(|s| s.num_docs()).unwrap_or(0)
     }
 
     /// Get number of segments
     #[wasm_bindgen]
     pub fn num_segments(&self) -> usize {
-        self.index
+        self.searcher
             .as_ref()
-            .map(|i| i.segment_readers().len())
+            .map(|s| s.segment_readers().len())
             .unwrap_or(0)
     }
 
@@ -177,9 +201,9 @@ impl RemoteIndex {
     #[wasm_bindgen]
     pub fn field_names(&self) -> JsValue {
         let names: Vec<String> = self
-            .index
+            .searcher
             .as_ref()
-            .map(|i| i.schema().fields().map(|(_, f)| f.name.clone()).collect())
+            .map(|s| s.schema().fields().map(|(_, f)| f.name.clone()).collect())
             .unwrap_or_default();
         serde_wasm_bindgen::to_value(&names).unwrap_or(JsValue::NULL)
     }
@@ -206,13 +230,13 @@ impl RemoteIndex {
             &format!("=== SEARCH START: '{}' offset={} ===", query_str, offset).into(),
         );
 
-        let index = self
-            .index
+        let searcher = self
+            .searcher
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
         // Log segment info
-        for (i, seg) in index.segment_readers().iter().enumerate() {
+        for (i, seg) in searcher.segment_readers().iter().enumerate() {
             let stats = seg.term_dict_stats();
             web_sys::console::log_1(
                 &format!(
@@ -224,30 +248,34 @@ impl RemoteIndex {
         }
 
         // Reset network stats before search to see only this query's I/O
-        index.directory().inner().reset_stats();
+        if let Some(directory) = &self.directory {
+            directory.inner().reset_stats();
+        }
 
-        let response = index
+        let response = searcher
             .query_offset(&query_str, limit, offset)
             .await
             .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
 
         // Log network stats after search
-        let stats = index.directory().inner().http_stats();
-        web_sys::console::log_1(
-            &format!(
-                "=== SEARCH END: {} requests, {} bytes ===",
-                stats.total_requests, stats.total_bytes
-            )
-            .into(),
-        );
-        for op in &stats.operations {
+        if let Some(directory) = &self.directory {
+            let stats = directory.inner().http_stats();
             web_sys::console::log_1(
                 &format!(
-                    "  HTTP: {} bytes, {}ms, range={:?}, url={}",
-                    op.bytes, op.duration_ms, op.range, op.url
+                    "=== SEARCH END: {} requests, {} bytes ===",
+                    stats.total_requests, stats.total_bytes
                 )
                 .into(),
             );
+            for op in &stats.operations {
+                web_sys::console::log_1(
+                    &format!(
+                        "  HTTP: {} bytes, {}ms, range={:?}, url={}",
+                        op.bytes, op.duration_ms, op.range, op.url
+                    )
+                    .into(),
+                );
+            }
         }
 
         // Use json_compatible serializer for proper plain object output
@@ -261,21 +289,21 @@ impl RemoteIndex {
     /// Returns the document as a JSON object, or null if not found.
     #[wasm_bindgen]
     pub async fn get_document(&self, segment_id: String, doc_id: u32) -> Result<JsValue, JsValue> {
-        let index = self
-            .index
+        let searcher = self
+            .searcher
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
         let address = hermes_core::query::DocAddress { segment_id, doc_id };
 
-        let doc = index
+        let doc = searcher
             .get_document(&address)
             .await
             .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
 
         match doc {
             Some(document) => {
-                let json = document.to_json(index.schema());
+                let json = document.to_json(searcher.schema());
                 json.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
                     .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
             }
@@ -287,12 +315,12 @@ impl RemoteIndex {
     #[wasm_bindgen]
     pub fn default_fields(&self) -> JsValue {
         let names: Vec<String> = self
-            .index
+            .searcher
             .as_ref()
-            .map(|i| {
-                i.default_fields()
+            .map(|s| {
+                s.default_fields()
                     .iter()
-                    .filter_map(|f| i.schema().get_field_name(*f).map(|s| s.to_string()))
+                    .filter_map(|f| s.schema().get_field_name(*f).map(|name| name.to_string()))
                     .collect()
             })
             .unwrap_or_default();
@@ -305,7 +333,7 @@ impl RemoteIndex {
     /// or other persistent storage for later restoration.
     #[wasm_bindgen]
     pub fn export_cache(&self) -> Option<Vec<u8>> {
-        self.index.as_ref().map(|i| i.directory().serialize())
+        self.directory.as_ref().map(|d| d.serialize())
     }
 
     /// Import a previously exported slice cache
@@ -314,13 +342,12 @@ impl RemoteIndex {
     /// network requests for previously fetched data.
     #[wasm_bindgen]
     pub fn import_cache(&self, data: &[u8]) -> Result<(), JsValue> {
-        let index = self
-            .index
+        let directory = self
+            .directory
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
-        index
-            .directory()
+        directory
             .deserialize(data)
             .map_err(|e| JsValue::from_str(&format!("Failed to import cache: {}", e)))
     }

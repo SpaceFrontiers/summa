@@ -160,11 +160,11 @@ impl CoarseCentroids {
                 }
             }
 
-            for cluster_id in 0..actual_clusters {
-                if counts[cluster_id] > 0 {
+            for (cluster_id, &count) in counts.iter().enumerate().take(actual_clusters) {
+                if count > 0 {
                     let offset = cluster_id * dim;
                     for i in 0..dim {
-                        new_centroids[offset + i] /= counts[cluster_id] as f32;
+                        new_centroids[offset + i] /= count as f32;
                     }
                 }
             }

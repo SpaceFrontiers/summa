@@ -30,7 +30,9 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use crate::directories::DirectoryWriter;
 use crate::error::{Error, Result};
 use crate::index::IndexMetadata;
-use crate::segment::{SegmentId, SegmentMerger, SegmentReader, SegmentSnapshot, SegmentTracker};
+use crate::segment::{SegmentId, SegmentSnapshot, SegmentTracker};
+#[cfg(feature = "native")]
+use crate::segment::{SegmentMerger, SegmentReader};
 
 use super::{MergePolicy, SegmentInfo};
 
@@ -92,14 +94,57 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self.metadata.lock().await.segments.clone()
     }
 
+    /// Get the number of pending background merges
+    pub fn pending_merge_count(&self) -> usize {
+        self.pending_merges.load(Ordering::SeqCst)
+    }
+
+    /// Get a clone of the metadata Arc for read access
+    pub fn metadata(&self) -> Arc<AsyncMutex<IndexMetadata>> {
+        Arc::clone(&self.metadata)
+    }
+
+    /// Update metadata with a closure and persist atomically
+    pub async fn update_metadata<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut IndexMetadata),
+    {
+        let mut meta = self.metadata.lock().await;
+        f(&mut meta);
+        meta.save(self.directory.as_ref()).await
+    }
+
+    /// Acquire a snapshot of current segments for reading
+    /// The snapshot holds references - segments won't be deleted while snapshot exists
+    pub async fn acquire_snapshot(&self) -> SegmentSnapshot<D> {
+        let meta = self.metadata.lock().await;
+        let acquired = self.tracker.acquire(&meta.segments);
+        drop(meta);
+
+        SegmentSnapshot::new(
+            Arc::clone(&self.tracker),
+            Arc::clone(&self.directory),
+            acquired,
+        )
+    }
+
+    /// Get the segment tracker
+    pub fn tracker(&self) -> Arc<SegmentTracker> {
+        Arc::clone(&self.tracker)
+    }
+
+    /// Get the directory
+    pub fn directory(&self) -> Arc<D> {
+        Arc::clone(&self.directory)
+    }
+}
+
+/// Native-only methods for SegmentManager (merging, segment registration)
+#[cfg(feature = "native")]
+impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Register a new segment, persist metadata, and trigger merge check
     ///
     /// This is the main entry point for adding segments after builds complete.
-    /// It atomically:
-    /// 1. Adds the segment ID to the list
-    /// 2. Registers with tracker for reference counting
-    /// 3. Persists metadata to disk
-    /// 4. Triggers merge check (spawns background merges if needed)
     pub async fn register_segment(&self, segment_id: String) -> Result<()> {
         {
             let mut meta = self.metadata.lock().await;
@@ -113,11 +158,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // Check if we should trigger a merge (non-blocking)
         self.maybe_merge().await;
         Ok(())
-    }
-
-    /// Get the number of pending background merges
-    pub fn pending_merge_count(&self) -> usize {
-        self.pending_merges.load(Ordering::SeqCst)
     }
 
     /// Check merge policy and spawn background merges if needed
@@ -287,21 +327,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Get a clone of the metadata Arc for read access
-    pub fn metadata(&self) -> Arc<AsyncMutex<IndexMetadata>> {
-        Arc::clone(&self.metadata)
-    }
-
-    /// Update metadata with a closure and persist atomically
-    pub async fn update_metadata<F>(&self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut IndexMetadata),
-    {
-        let mut meta = self.metadata.lock().await;
-        f(&mut meta);
-        meta.save(self.directory.as_ref()).await
-    }
-
     /// Replace segment list atomically (for force merge / rebuild)
     pub async fn replace_segments(
         &self,
@@ -325,34 +350,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let _ = crate::segment::delete_segment(self.directory.as_ref(), segment_id).await;
         }
         Ok(())
-    }
-
-    /// Acquire a snapshot of current segments for reading
-    /// The snapshot holds references - segments won't be deleted while snapshot exists
-    ///
-    /// This is atomic: we hold the metadata lock while acquiring refs to prevent
-    /// a race where a merge completes between getting segment IDs and acquiring refs.
-    pub async fn acquire_snapshot(&self) -> SegmentSnapshot<D> {
-        // Hold metadata lock while acquiring refs - this prevents race with merge completion
-        let meta = self.metadata.lock().await;
-        let acquired = self.tracker.acquire(&meta.segments);
-        drop(meta); // Safe to drop now - refs are acquired
-
-        SegmentSnapshot::new(
-            Arc::clone(&self.tracker),
-            Arc::clone(&self.directory),
-            acquired,
-        )
-    }
-
-    /// Get the segment tracker
-    pub fn tracker(&self) -> Arc<SegmentTracker> {
-        Arc::clone(&self.tracker)
-    }
-
-    /// Get the directory
-    pub fn directory(&self) -> Arc<D> {
-        Arc::clone(&self.directory)
     }
 
     /// Clean up orphan segment files that are not registered

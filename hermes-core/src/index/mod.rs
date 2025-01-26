@@ -8,17 +8,18 @@
 //! The Index owns the SegmentManager which handles segment lifecycle and tracking.
 
 #[cfg(feature = "native")]
-use std::sync::Arc;
-
-#[cfg(feature = "native")]
-use rustc_hash::FxHashMap;
-
-#[cfg(feature = "native")]
 use crate::dsl::Schema;
 #[cfg(feature = "native")]
 use crate::error::Result;
 #[cfg(feature = "native")]
 use crate::structures::{CoarseCentroids, PQCodebook};
+#[cfg(feature = "native")]
+use rustc_hash::FxHashMap;
+#[cfg(feature = "native")]
+use std::sync::Arc;
+
+mod searcher;
+pub use searcher::Searcher;
 
 #[cfg(feature = "native")]
 mod reader;
@@ -27,7 +28,7 @@ mod vector_builder;
 #[cfg(feature = "native")]
 mod writer;
 #[cfg(feature = "native")]
-pub use reader::{IndexReader, Searcher};
+pub use reader::IndexReader;
 #[cfg(feature = "native")]
 pub use writer::IndexWriter;
 
@@ -181,11 +182,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         &self.segment_manager
     }
 
-    /// Get an IndexWriter for adding documents
-    pub fn writer(&self) -> writer::IndexWriter<D> {
-        writer::IndexWriter::from_index(self)
-    }
-
     /// Get an IndexReader for searching (with reload policy)
     pub async fn reader(&self) -> Result<IndexReader<D>> {
         IndexReader::from_segment_manager(
@@ -212,8 +208,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     pub fn trained_codebooks(&self) -> &FxHashMap<u32, Arc<PQCodebook>> {
         &self.trained_codebooks
     }
-
-    // ========== Convenience methods delegating to IndexReader/Searcher ==========
 
     /// Get segment readers for query execution (convenience method)
     pub async fn segment_readers(&self) -> Result<Vec<Arc<crate::segment::SegmentReader>>> {
@@ -401,6 +395,15 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         }
 
         Ok(results)
+    }
+}
+
+/// Native-only methods for Index
+#[cfg(feature = "native")]
+impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
+    /// Get an IndexWriter for adding documents
+    pub fn writer(&self) -> writer::IndexWriter<D> {
+        writer::IndexWriter::from_index(self)
     }
 }
 

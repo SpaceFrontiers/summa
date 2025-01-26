@@ -503,11 +503,11 @@ impl PQCodebook {
                 }
             }
 
-            for c in 0..actual_k {
-                if counts[c] > 0 {
+            for (c, &count) in counts.iter().enumerate().take(actual_k) {
+                if count > 0 {
                     let offset = c * sub_dim;
                     for j in 0..sub_dim {
-                        new_centroids[offset + j] /= counts[c] as f32;
+                        new_centroids[offset + j] /= count as f32;
                     }
                 }
             }

@@ -78,8 +78,9 @@ pub use tokenizer::{
 // Re-exports from other modules
 pub use directories::SLICE_CACHE_EXTENSION;
 pub use error::{Error, Result};
+pub use index::Searcher;
 #[cfg(feature = "native")]
-pub use index::{Index, IndexReader, IndexWriter, Searcher};
+pub use index::{Index, IndexReader, IndexWriter};
 pub use index::{IndexConfig, IndexMetadata, SLICE_CACHE_FILENAME};
 #[cfg(feature = "native")]
 pub use index::{

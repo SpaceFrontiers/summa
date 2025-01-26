@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::directories::DirectoryWriter;
+use crate::directories::Directory;
 use crate::segment::SegmentId;
 
 /// Tracks segment references and pending deletions
@@ -146,13 +146,13 @@ impl Default for SegmentTracker {
 
 /// RAII guard that holds references to a snapshot of segments
 /// When dropped, releases all segment references
-pub struct SegmentSnapshot<D: DirectoryWriter + 'static> {
+pub struct SegmentSnapshot<D: Directory + 'static> {
     tracker: Arc<SegmentTracker>,
     segment_ids: Vec<String>,
     directory: Arc<D>,
 }
 
-impl<D: DirectoryWriter + 'static> SegmentSnapshot<D> {
+impl<D: Directory + 'static> SegmentSnapshot<D> {
     /// Create a new snapshot holding references to the given segments
     pub fn new(tracker: Arc<SegmentTracker>, directory: Arc<D>, segment_ids: Vec<String>) -> Self {
         // Acquire is already done by caller
@@ -179,19 +179,12 @@ impl<D: DirectoryWriter + 'static> SegmentSnapshot<D> {
     }
 }
 
-impl<D: DirectoryWriter + 'static> Drop for SegmentSnapshot<D> {
+impl<D: Directory + 'static> Drop for SegmentSnapshot<D> {
     fn drop(&mut self) {
-        let to_delete = self.tracker.release(&self.segment_ids);
-
-        // Delete segments that are now ready
-        if !to_delete.is_empty() {
-            let dir = Arc::clone(&self.directory);
-            tokio::spawn(async move {
-                for segment_id in to_delete {
-                    let _ = crate::segment::delete_segment(dir.as_ref(), segment_id).await;
-                }
-            });
-        }
+        // Just release refs - actual deletion handled by SegmentManager for native
+        let _to_delete = self.tracker.release(&self.segment_ids);
+        let _ = _to_delete; // Suppress unused warning
+        let _ = &self.directory; // Suppress unused warning
     }
 }
 
