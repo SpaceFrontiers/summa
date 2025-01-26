@@ -53,7 +53,17 @@ class HermesClient:
 
     async def connect(self) -> None:
         """Connect to the server."""
-        self._channel = aio.insecure_channel(self.address)
+        # Increase message size limits for large responses (e.g., loading content fields)
+        options = [
+            ("grpc.max_receive_message_length", 50 * 1024 * 1024),  # 50MB
+            ("grpc.max_send_message_length", 50 * 1024 * 1024),  # 50MB
+        ]
+        # Enable gzip compression for smaller message sizes over the wire
+        self._channel = aio.insecure_channel(
+            self.address,
+            options=options,
+            compression=grpc.Compression.Gzip,
+        )
         self._index_stub = pb_grpc.IndexServiceStub(self._channel)
         self._search_stub = pb_grpc.SearchServiceStub(self._channel)
 
