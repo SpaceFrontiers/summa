@@ -37,19 +37,27 @@ pub struct SparseIndex {
     pub postings: Vec<Option<Arc<BlockSparsePostingList>>>,
     /// Total document count in this segment (for IDF computation)
     pub total_docs: u32,
+    /// Total sparse vectors in this segment (for multi-valued IDF)
+    /// For single-valued fields, this equals total_docs.
+    /// For multi-valued fields, this is the sum of all vectors across all docs.
+    pub total_vectors: u32,
 }
 
 impl SparseIndex {
     /// Compute IDF (inverse document frequency) for a dimension
     ///
-    /// IDF = log(N / df) where N = total docs, df = docs containing dimension
+    /// For multi-valued fields, uses total_vectors instead of total_docs
+    /// to properly handle cases where df can exceed total_docs.
+    /// IDF = log(N / df), clamped to >= 0
     /// Returns 0.0 if dimension not present
     #[inline]
     pub fn idf(&self, dim_id: u32) -> f32 {
         if let Some(Some(pl)) = self.postings.get(dim_id as usize) {
             let df = pl.doc_count() as f32;
             if df > 0.0 {
-                (self.total_docs as f32 / df).ln()
+                // Use total_vectors for proper IDF with multi-valued fields
+                let n = self.total_vectors.max(self.total_docs) as f32;
+                (n / df).ln().max(0.0)
             } else {
                 0.0
             }

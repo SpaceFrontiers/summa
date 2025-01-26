@@ -545,6 +545,23 @@ impl AsyncSegmentReader {
         // with different scores that need to be combined
         let raw_results = WandExecutor::new(scorers, limit * 2).execute(); // Over-fetch for combining
 
+        log::trace!(
+            "Sparse WAND returned {} raw results for segment (doc_id_offset={})",
+            raw_results.len(),
+            self.doc_id_offset
+        );
+        if log::log_enabled!(log::Level::Trace) && !raw_results.is_empty() {
+            for r in raw_results.iter().take(5) {
+                log::trace!(
+                    "  Raw result: doc_id={} (global={}), score={:.4}, ordinal={}",
+                    r.doc_id,
+                    r.doc_id + self.doc_id_offset,
+                    r.score,
+                    r.ordinal
+                );
+            }
+        }
+
         // Track ordinals with individual scores for each doc_id
         // Now using real ordinals from the posting lists
         let mut doc_ordinals: rustc_hash::FxHashMap<u32, Vec<(u32, f32)>> =

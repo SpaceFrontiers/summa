@@ -122,12 +122,16 @@ pub fn convert_query(
                 };
                 token_ids.into_iter().zip(weights).collect()
             } else {
-                // Pre-computed indices/values provided
+                // Pre-computed indices/values provided (from embedding model)
+                // Filter out entries with negative or zero weights - negative weights
+                // from SPLADE indicate "do not match this token" which we handle by
+                // simply not including them in the query
                 sv_query
                     .indices
                     .iter()
                     .copied()
                     .zip(sv_query.values.iter().copied())
+                    .filter(|(_, weight)| *weight > 0.0)
                     .collect()
             };
 

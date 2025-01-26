@@ -227,11 +227,20 @@ pub async fn load_sparse_file<D: Directory>(
         }
 
         let num_postings = postings.iter().filter(|p| p.is_some()).count();
+        // Compute total_vectors as sum of doc_count across all dimensions
+        // This handles multi-valued fields where each doc can have multiple vectors
+        let total_vectors: u32 = postings
+            .iter()
+            .filter_map(|p| p.as_ref())
+            .map(|pl| pl.doc_count())
+            .max()
+            .unwrap_or(total_docs);
         log::debug!(
-            "Loaded sparse index for field {}: max_dim={}, active_postings={}",
+            "Loaded sparse index for field {}: max_dim={}, active_postings={}, total_vectors={}",
             field_id,
             max_dim_id,
-            num_postings
+            num_postings,
+            total_vectors
         );
 
         indexes.insert(
@@ -239,6 +248,7 @@ pub async fn load_sparse_file<D: Directory>(
             SparseIndex {
                 postings,
                 total_docs,
+                total_vectors,
             },
         );
     }

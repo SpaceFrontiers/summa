@@ -70,8 +70,12 @@ impl LazyGlobalStats {
 
         // Slow path: compute and cache
         let df = self.compute_sparse_df(field, dim_id);
-        let idf = if df > 0 && self.total_docs > 0 {
-            (self.total_docs as f32 / df as f32).ln()
+        // Use total_vectors for proper IDF with multi-valued fields
+        // This ensures df <= N even when documents have multiple sparse vectors
+        let total_vectors = self.compute_sparse_total_vectors(field);
+        let n = total_vectors.max(self.total_docs);
+        let idf = if df > 0 && n > 0 {
+            (n as f32 / df as f32).ln().max(0.0)
         } else {
             0.0
         };
@@ -175,6 +179,18 @@ impl LazyGlobalStats {
             }
         }
         df
+    }
+
+    /// Compute total sparse vectors for a field across all segments
+    /// For multi-valued fields, this may exceed total_docs
+    fn compute_sparse_total_vectors(&self, field: Field) -> u64 {
+        let mut total = 0u64;
+        for segment in &self.segments {
+            if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
+                total += sparse_index.total_vectors as u64;
+            }
+        }
+        total
     }
 
     /// Compute document frequency for a text term (not cached - internal)

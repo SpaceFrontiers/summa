@@ -885,4 +885,325 @@ mod tests {
         iter.advance();
         assert_eq!(iter.doc(), 1003); // 3 + 1000 = 1003
     }
+
+    #[test]
+    fn test_merge_with_offsets_serialize_roundtrip() {
+        // Verify that serialization preserves adjusted doc_ids
+        let postings1: Vec<(DocId, u16, f32)> = vec![(0, 0, 1.0), (5, 0, 2.0), (10, 1, 3.0)];
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+
+        let postings2: Vec<(DocId, u16, f32)> = vec![(0, 0, 4.0), (3, 1, 5.0), (7, 0, 6.0)];
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Merge with offset 100 for segment 2
+        let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
+
+        // Serialize
+        let mut bytes = Vec::new();
+        merged.serialize(&mut bytes).unwrap();
+
+        // Deserialize
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let loaded = BlockSparsePostingList::deserialize(&mut cursor).unwrap();
+
+        // Verify doc_ids are preserved after round-trip
+        let decoded = loaded.decode_all();
+        assert_eq!(decoded.len(), 6);
+
+        // Segment 1 docs (offset 0)
+        assert_eq!(decoded[0].0, 0);
+        assert_eq!(decoded[1].0, 5);
+        assert_eq!(decoded[2].0, 10);
+
+        // Segment 2 docs (offset 100) - CRITICAL: these must be offset-adjusted
+        assert_eq!(decoded[3].0, 100, "First doc of seg2 should be 0+100=100");
+        assert_eq!(decoded[4].0, 103, "Second doc of seg2 should be 3+100=103");
+        assert_eq!(decoded[5].0, 107, "Third doc of seg2 should be 7+100=107");
+
+        // Verify iterator also works correctly
+        let mut iter = loaded.iterator();
+        assert_eq!(iter.doc(), 0);
+        iter.advance();
+        assert_eq!(iter.doc(), 5);
+        iter.advance();
+        assert_eq!(iter.doc(), 10);
+        iter.advance();
+        assert_eq!(iter.doc(), 100);
+        iter.advance();
+        assert_eq!(iter.doc(), 103);
+        iter.advance();
+        assert_eq!(iter.doc(), 107);
+    }
+
+    #[test]
+    fn test_merge_seek_after_roundtrip() {
+        // Create posting lists that span multiple blocks to test seek after merge
+        let postings1: Vec<(DocId, u16, f32)> = (0..200).map(|i| (i * 2, 0, 1.0)).collect();
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+
+        let postings2: Vec<(DocId, u16, f32)> = (0..150).map(|i| (i * 3, 0, 2.0)).collect();
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Merge with offset 1000 for segment 2
+        let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 1000)]);
+
+        // Serialize and deserialize (simulating what happens after merge file is written)
+        let mut bytes = Vec::new();
+        merged.serialize(&mut bytes).unwrap();
+        let loaded =
+            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+
+        // Test seeking to various positions
+        let mut iter = loaded.iterator();
+
+        // Seek to doc in segment 1
+        let doc = iter.seek(100);
+        assert_eq!(doc, 100, "Seek to 100 in segment 1");
+
+        // Seek to doc in segment 2 (1000 + offset)
+        let doc = iter.seek(1000);
+        assert_eq!(doc, 1000, "Seek to 1000 (first doc of segment 2)");
+
+        // Seek to middle of segment 2
+        let doc = iter.seek(1050);
+        assert!(
+            doc >= 1050,
+            "Seek to 1050 should find doc >= 1050, got {}",
+            doc
+        );
+
+        // Seek backwards should stay at current position (seek only goes forward)
+        let doc = iter.seek(500);
+        assert!(
+            doc >= 1050,
+            "Seek backwards should not go back, got {}",
+            doc
+        );
+
+        // Fresh iterator - verify block boundaries work
+        let mut iter2 = loaded.iterator();
+
+        // Verify we can iterate through all docs
+        let mut count = 0;
+        let mut prev_doc = 0;
+        while iter2.doc() != super::TERMINATED {
+            let current = iter2.doc();
+            if count > 0 {
+                assert!(
+                    current > prev_doc,
+                    "Docs should be monotonically increasing: {} vs {}",
+                    prev_doc,
+                    current
+                );
+            }
+            prev_doc = current;
+            iter2.advance();
+            count += 1;
+        }
+        assert_eq!(count, 350, "Should have 350 total docs");
+    }
+
+    #[test]
+    fn test_merge_preserves_weights_and_ordinals() {
+        // Test that weights and ordinals are preserved after merge + roundtrip
+        let postings1: Vec<(DocId, u16, f32)> = vec![(0, 0, 1.5), (5, 1, 2.5), (10, 2, 3.5)];
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+
+        let postings2: Vec<(DocId, u16, f32)> = vec![(0, 0, 4.5), (3, 1, 5.5), (7, 3, 6.5)];
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Merge with offset 100 for segment 2
+        let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
+
+        // Serialize and deserialize
+        let mut bytes = Vec::new();
+        merged.serialize(&mut bytes).unwrap();
+        let loaded =
+            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+
+        // Verify all postings via iterator
+        let mut iter = loaded.iterator();
+
+        // Segment 1 postings
+        assert_eq!(iter.doc(), 0);
+        assert!(
+            (iter.weight() - 1.5).abs() < 0.01,
+            "Weight should be 1.5, got {}",
+            iter.weight()
+        );
+        assert_eq!(iter.ordinal(), 0);
+
+        iter.advance();
+        assert_eq!(iter.doc(), 5);
+        assert!(
+            (iter.weight() - 2.5).abs() < 0.01,
+            "Weight should be 2.5, got {}",
+            iter.weight()
+        );
+        assert_eq!(iter.ordinal(), 1);
+
+        iter.advance();
+        assert_eq!(iter.doc(), 10);
+        assert!(
+            (iter.weight() - 3.5).abs() < 0.01,
+            "Weight should be 3.5, got {}",
+            iter.weight()
+        );
+        assert_eq!(iter.ordinal(), 2);
+
+        // Segment 2 postings (with offset 100)
+        iter.advance();
+        assert_eq!(iter.doc(), 100);
+        assert!(
+            (iter.weight() - 4.5).abs() < 0.01,
+            "Weight should be 4.5, got {}",
+            iter.weight()
+        );
+        assert_eq!(iter.ordinal(), 0);
+
+        iter.advance();
+        assert_eq!(iter.doc(), 103);
+        assert!(
+            (iter.weight() - 5.5).abs() < 0.01,
+            "Weight should be 5.5, got {}",
+            iter.weight()
+        );
+        assert_eq!(iter.ordinal(), 1);
+
+        iter.advance();
+        assert_eq!(iter.doc(), 107);
+        assert!(
+            (iter.weight() - 6.5).abs() < 0.01,
+            "Weight should be 6.5, got {}",
+            iter.weight()
+        );
+        assert_eq!(iter.ordinal(), 3);
+
+        // Verify exhausted
+        iter.advance();
+        assert_eq!(iter.doc(), super::TERMINATED);
+    }
+
+    #[test]
+    fn test_merge_global_max_weight() {
+        // Verify global_max_weight is correct after merge
+        let postings1: Vec<(DocId, u16, f32)> = vec![
+            (0, 0, 3.0),
+            (1, 0, 7.0), // max in segment 1
+            (2, 0, 2.0),
+        ];
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+
+        let postings2: Vec<(DocId, u16, f32)> = vec![
+            (0, 0, 5.0),
+            (1, 0, 4.0),
+            (2, 0, 6.0), // max in segment 2
+        ];
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Verify original global max weights
+        assert!((list1.global_max_weight() - 7.0).abs() < 0.01);
+        assert!((list2.global_max_weight() - 6.0).abs() < 0.01);
+
+        // Merge
+        let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
+
+        // Global max should be 7.0 (from segment 1)
+        assert!(
+            (merged.global_max_weight() - 7.0).abs() < 0.01,
+            "Global max should be 7.0, got {}",
+            merged.global_max_weight()
+        );
+
+        // Roundtrip
+        let mut bytes = Vec::new();
+        merged.serialize(&mut bytes).unwrap();
+        let loaded =
+            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+
+        assert!(
+            (loaded.global_max_weight() - 7.0).abs() < 0.01,
+            "After roundtrip, global max should still be 7.0, got {}",
+            loaded.global_max_weight()
+        );
+    }
+
+    #[test]
+    fn test_scoring_simulation_after_merge() {
+        // Simulate what SparseTermScorer does - compute query_weight * stored_weight
+        let postings1: Vec<(DocId, u16, f32)> = vec![
+            (0, 0, 0.5), // doc 0, weight 0.5
+            (5, 0, 0.8), // doc 5, weight 0.8
+        ];
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+
+        let postings2: Vec<(DocId, u16, f32)> = vec![
+            (0, 0, 0.6), // doc 100 after offset, weight 0.6
+            (3, 0, 0.9), // doc 103 after offset, weight 0.9
+        ];
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Merge with offset 100
+        let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
+
+        // Roundtrip
+        let mut bytes = Vec::new();
+        merged.serialize(&mut bytes).unwrap();
+        let loaded =
+            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+
+        // Simulate scoring with query_weight = 2.0
+        let query_weight = 2.0f32;
+        let mut iter = loaded.iterator();
+
+        // Expected scores: query_weight * stored_weight
+        // Doc 0: 2.0 * 0.5 = 1.0
+        assert_eq!(iter.doc(), 0);
+        let score = query_weight * iter.weight();
+        assert!(
+            (score - 1.0).abs() < 0.01,
+            "Doc 0 score should be 1.0, got {}",
+            score
+        );
+
+        iter.advance();
+        // Doc 5: 2.0 * 0.8 = 1.6
+        assert_eq!(iter.doc(), 5);
+        let score = query_weight * iter.weight();
+        assert!(
+            (score - 1.6).abs() < 0.01,
+            "Doc 5 score should be 1.6, got {}",
+            score
+        );
+
+        iter.advance();
+        // Doc 100: 2.0 * 0.6 = 1.2
+        assert_eq!(iter.doc(), 100);
+        let score = query_weight * iter.weight();
+        assert!(
+            (score - 1.2).abs() < 0.01,
+            "Doc 100 score should be 1.2, got {}",
+            score
+        );
+
+        iter.advance();
+        // Doc 103: 2.0 * 0.9 = 1.8
+        assert_eq!(iter.doc(), 103);
+        let score = query_weight * iter.weight();
+        assert!(
+            (score - 1.8).abs() < 0.01,
+            "Doc 103 score should be 1.8, got {}",
+            score
+        );
+    }
 }

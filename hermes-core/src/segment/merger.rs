@@ -731,7 +731,13 @@ impl SegmentMerger {
         // Calculate doc offsets for each segment
         let mut doc_offsets = Vec::with_capacity(segments.len());
         let mut offset = 0u32;
-        for segment in segments {
+        for (i, segment) in segments.iter().enumerate() {
+            log::debug!(
+                "Sparse merge: segment {} has {} docs, doc_offset={}",
+                i,
+                segment.num_docs(),
+                offset
+            );
             doc_offsets.push(offset);
             offset += segment.num_docs();
         }
@@ -792,6 +798,14 @@ impl SegmentMerger {
                     if let Some(sparse_index) = segment.sparse_indexes().get(&field.0)
                         && let Some(Some(posting_list)) = sparse_index.postings.get(dim_id as usize)
                     {
+                        log::trace!(
+                            "Sparse merge dim={}: seg={} offset={} doc_count={} blocks={}",
+                            dim_id,
+                            seg_idx,
+                            doc_offsets[seg_idx],
+                            posting_list.doc_count(),
+                            posting_list.blocks.len()
+                        );
                         lists_with_offsets.push((posting_list.as_ref(), doc_offsets[seg_idx]));
                     }
                 }
@@ -802,6 +816,14 @@ impl SegmentMerger {
 
                 // Merge using optimized block stacking
                 let merged = BlockSparsePostingList::merge_with_offsets(&lists_with_offsets);
+
+                log::trace!(
+                    "Sparse merge dim={}: merged {} lists -> doc_count={} blocks={}",
+                    dim_id,
+                    lists_with_offsets.len(),
+                    merged.doc_count(),
+                    merged.blocks.len()
+                );
 
                 // Serialize
                 let mut bytes = Vec::new();
