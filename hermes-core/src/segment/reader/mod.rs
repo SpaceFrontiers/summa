@@ -298,7 +298,6 @@ impl AsyncSegmentReader {
         rerank_factor: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
-        use crate::query::MultiValueCombiner;
         let index = self
             .vector_indexes
             .get(&field.0)
@@ -385,18 +384,7 @@ impl AsyncSegmentReader {
         let mut final_results: Vec<VectorSearchResult> = doc_ordinals
             .into_iter()
             .map(|(doc_id, ordinals)| {
-                let combined_score = match combiner {
-                    MultiValueCombiner::Sum => ordinals.iter().map(|(_, s)| s).sum(),
-                    MultiValueCombiner::Max => ordinals
-                        .iter()
-                        .map(|(_, s)| *s)
-                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                        .unwrap_or(0.0),
-                    MultiValueCombiner::Avg => {
-                        let sum: f32 = ordinals.iter().map(|(_, s)| s).sum();
-                        sum / ordinals.len() as f32
-                    }
-                };
+                let combined_score = combiner.combine(&ordinals);
                 VectorSearchResult::new(doc_id, combined_score, ordinals)
             })
             .collect();
@@ -465,7 +453,7 @@ impl AsyncSegmentReader {
         limit: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
-        use crate::query::{MultiValueCombiner, SparseTermScorer, WandExecutor};
+        use crate::query::{SparseTermScorer, WandExecutor};
 
         let query_tokens = vector.len();
 
@@ -582,18 +570,7 @@ impl AsyncSegmentReader {
             .into_iter()
             .map(|(doc_id, ordinals)| {
                 let global_doc_id = doc_id + self.doc_id_offset;
-                let combined_score = match combiner {
-                    MultiValueCombiner::Sum => ordinals.iter().map(|(_, s)| s).sum(),
-                    MultiValueCombiner::Max => ordinals
-                        .iter()
-                        .map(|(_, s)| *s)
-                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                        .unwrap_or(0.0),
-                    MultiValueCombiner::Avg => {
-                        let sum: f32 = ordinals.iter().map(|(_, s)| s).sum();
-                        sum / ordinals.len() as f32
-                    }
-                };
+                let combined_score = combiner.combine(&ordinals);
                 VectorSearchResult::new(global_doc_id, combined_score, ordinals)
             })
             .collect();

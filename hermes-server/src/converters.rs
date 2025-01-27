@@ -13,11 +13,21 @@ use crate::proto;
 use crate::proto::field_value::Value;
 use crate::proto::query::Query as ProtoQueryType;
 
-fn convert_combiner(combiner: i32) -> MultiValueCombiner {
+/// Convert proto combiner enum to core MultiValueCombiner
+/// Parameters (temperature, k, decay) are passed separately from the query message
+fn convert_combiner(combiner: i32, temperature: f32, top_k: u32, decay: f32) -> MultiValueCombiner {
     match combiner {
         1 => MultiValueCombiner::Max,
         2 => MultiValueCombiner::Avg,
-        _ => MultiValueCombiner::Sum, // 0 or default
+        3 => MultiValueCombiner::Sum,
+        4 => MultiValueCombiner::WeightedTopK {
+            k: if top_k > 0 { top_k as usize } else { 5 },
+            decay: if decay > 0.0 { decay } else { 0.7 },
+        },
+        _ => MultiValueCombiner::LogSumExp {
+            // 0 or default: LogSumExp
+            temperature: if temperature > 0.0 { temperature } else { 1.5 },
+        },
     }
 }
 
@@ -135,7 +145,12 @@ pub fn convert_query(
                     .collect()
             };
 
-            let combiner = convert_combiner(sv_query.combiner);
+            let combiner = convert_combiner(
+                sv_query.combiner,
+                sv_query.combiner_temperature,
+                sv_query.combiner_top_k,
+                sv_query.combiner_decay,
+            );
             Ok(Box::new(
                 SparseVectorQuery::new(field, vector).with_combiner(combiner),
             ))
@@ -151,7 +166,12 @@ pub fn convert_query(
             if dv_query.rerank_factor > 0 {
                 query = query.with_rerank_factor(dv_query.rerank_factor as usize);
             }
-            let combiner = convert_combiner(dv_query.combiner);
+            let combiner = convert_combiner(
+                dv_query.combiner,
+                dv_query.combiner_temperature,
+                dv_query.combiner_top_k,
+                dv_query.combiner_decay,
+            );
             query = query.with_combiner(combiner);
             Ok(Box::new(query))
         }

@@ -49,9 +49,11 @@ message Query {
 
 // How to combine scores for multi-valued documents
 enum MultiValueCombiner {
-  COMBINER_SUM = 0;  // Sum all scores (default)
-  COMBINER_MAX = 1;  // Take maximum score
-  COMBINER_AVG = 2;  // Average all scores
+  COMBINER_LOG_SUM_EXP = 0;  // Log-sum-exp smooth maximum (default)
+  COMBINER_MAX = 1;          // Take maximum score
+  COMBINER_AVG = 2;          // Average all scores
+  COMBINER_SUM = 3;          // Sum all scores
+  COMBINER_WEIGHTED_TOP_K = 4;  // Weighted top-k with decay
 }
 
 // Sparse vector query for similarity search
@@ -63,6 +65,9 @@ message SparseVectorQuery {
   string text = 4;               // Raw text (tokenized server-side if tokenizer configured)
   MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
   float heap_factor = 6;         // Approximate search factor (1.0 = exact, 0.8 = ~20% faster)
+  float combiner_temperature = 7;   // Temperature for LogSumExp (default: 1.5)
+  uint32 combiner_top_k = 8;        // K for WeightedTopK (default: 5)
+  float combiner_decay = 9;         // Decay for WeightedTopK (default: 0.7)
 }
 
 // Dense vector query for similarity search
@@ -72,6 +77,9 @@ message DenseVectorQuery {
   uint32 nprobe = 3;           // Number of clusters to probe (for IVF indexes)
   uint32 rerank_factor = 4;    // Re-ranking factor (multiplied by k)
   MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
+  float combiner_temperature = 6;   // Temperature for LogSumExp (default: 1.5)
+  uint32 combiner_top_k = 7;        // K for WeightedTopK (default: 5)
+  float combiner_decay = 8;         // Decay for WeightedTopK (default: 0.7)
 }
 
 message TermQuery {
