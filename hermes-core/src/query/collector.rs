@@ -173,6 +173,8 @@ pub struct TopKCollector {
     heap: BinaryHeap<SearchResult>,
     k: usize,
     collect_positions: bool,
+    /// Total documents seen by this collector
+    total_seen: u32,
 }
 
 impl TopKCollector {
@@ -181,6 +183,7 @@ impl TopKCollector {
             heap: BinaryHeap::with_capacity(k + 1),
             k,
             collect_positions: false,
+            total_seen: 0,
         }
     }
 
@@ -190,7 +193,13 @@ impl TopKCollector {
             heap: BinaryHeap::with_capacity(k + 1),
             k,
             collect_positions: true,
+            total_seen: 0,
         }
+    }
+
+    /// Get the total number of documents seen (scored) by this collector
+    pub fn total_seen(&self) -> u32 {
+        self.total_seen
     }
 
     pub fn into_sorted_results(self) -> Vec<SearchResult> {
@@ -203,10 +212,18 @@ impl TopKCollector {
         });
         results
     }
+
+    /// Consume collector and return (sorted_results, total_seen)
+    pub fn into_results_with_count(self) -> (Vec<SearchResult>, u32) {
+        let total = self.total_seen;
+        (self.into_sorted_results(), total)
+    }
 }
 
 impl Collector for TopKCollector {
     fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]) {
+        self.total_seen += 1;
+
         let positions = if self.collect_positions {
             positions.to_vec()
         } else {
@@ -276,6 +293,17 @@ pub async fn search_segment(
     Ok(collector.into_sorted_results())
 }
 
+/// Execute a search query on a single segment and return (results, total_seen) (async)
+pub async fn search_segment_with_count(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let mut collector = TopKCollector::new(limit);
+    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
+    Ok(collector.into_results_with_count())
+}
+
 /// Execute a search query on a single segment with position collection (async)
 pub async fn search_segment_with_positions(
     reader: &SegmentReader,
@@ -285,6 +313,17 @@ pub async fn search_segment_with_positions(
     let mut collector = TopKCollector::with_positions(limit);
     collect_segment_with_limit(reader, query, &mut collector, limit).await?;
     Ok(collector.into_sorted_results())
+}
+
+/// Execute a search query on a single segment with positions and return (results, total_seen)
+pub async fn search_segment_with_positions_and_count(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let mut collector = TopKCollector::with_positions(limit);
+    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
+    Ok(collector.into_results_with_count())
 }
 
 /// Count all documents matching a query on a single segment (async)

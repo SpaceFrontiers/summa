@@ -156,9 +156,9 @@ impl SearchService for SearchServiceImpl {
             req.limit as usize
         };
 
-        // Search using Searcher
-        let results = searcher
-            .search(core_query.as_ref(), limit)
+        // Search using Searcher (with count of total docs scored)
+        let (results, total_seen) = searcher
+            .search_with_count(core_query.as_ref(), limit)
             .await
             .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
 
@@ -201,9 +201,10 @@ impl SearchService for SearchServiceImpl {
 
         let took_ms = start.elapsed().as_millis() as u64;
 
+        // total_seen = number of documents that were actually scored across all segments
         Ok(Response::new(SearchResponse {
             hits,
-            total_hits: searcher.num_docs(),
+            total_hits: total_seen,
             took_ms,
         }))
     }

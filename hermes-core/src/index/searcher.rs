@@ -156,38 +156,59 @@ impl<D: Directory + 'static> Searcher<D> {
         (segments, default_fields, global_stats)
     }
 
-    /// Load segment readers from IDs
+    /// Load segment readers from IDs (parallel loading for performance)
     async fn load_segments(
         directory: &Arc<D>,
         schema: &Arc<Schema>,
         segment_ids: &[String],
         term_cache_blocks: usize,
     ) -> Vec<Arc<SegmentReader>> {
-        let mut segments = Vec::new();
-        let mut doc_id_offset = 0u32;
+        // Parse segment IDs and filter invalid ones
+        let valid_segments: Vec<(usize, SegmentId)> = segment_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, id_str)| SegmentId::from_hex(id_str).map(|sid| (idx, sid)))
+            .collect();
 
-        for id_str in segment_ids {
-            let Some(segment_id) = SegmentId::from_hex(id_str) else {
-                continue;
-            };
+        // Load all segments in parallel with offset=0
+        let futures: Vec<_> =
+            valid_segments
+                .iter()
+                .map(|(_, segment_id)| {
+                    let dir = Arc::clone(directory);
+                    let sch = Arc::clone(schema);
+                    let sid = *segment_id;
+                    async move {
+                        SegmentReader::open(dir.as_ref(), sid, sch, 0, term_cache_blocks).await
+                    }
+                })
+                .collect();
 
-            match SegmentReader::open(
-                directory.as_ref(),
-                segment_id,
-                Arc::clone(schema),
-                doc_id_offset,
-                term_cache_blocks,
-            )
-            .await
-            {
-                Ok(reader) => {
-                    doc_id_offset += reader.meta().num_docs;
-                    segments.push(Arc::new(reader));
-                }
+        let results = futures::future::join_all(futures).await;
+
+        // Collect successful results with their original index for ordering
+        let mut loaded: Vec<(usize, SegmentReader)> = valid_segments
+            .into_iter()
+            .zip(results)
+            .filter_map(|((idx, _), result)| match result {
+                Ok(reader) => Some((idx, reader)),
                 Err(e) => {
-                    log::warn!("Failed to open segment {}: {:?}", id_str, e);
+                    log::warn!("Failed to open segment: {:?}", e);
+                    None
                 }
-            }
+            })
+            .collect();
+
+        // Sort by original index to maintain deterministic ordering
+        loaded.sort_by_key(|(idx, _)| *idx);
+
+        // Calculate and assign doc_id_offsets sequentially
+        let mut doc_id_offset = 0u32;
+        let mut segments = Vec::with_capacity(loaded.len());
+        for (_, mut reader) in loaded {
+            reader.set_doc_id_offset(doc_id_offset);
+            doc_id_offset += reader.meta().num_docs;
+            segments.push(Arc::new(reader));
         }
 
         segments
@@ -273,7 +294,18 @@ impl<D: Directory + 'static> Searcher<D> {
         query: &dyn crate::query::Query,
         limit: usize,
     ) -> Result<Vec<crate::query::SearchResult>> {
-        self.search_with_offset(query, limit, 0).await
+        let (results, _) = self.search_with_count(query, limit).await?;
+        Ok(results)
+    }
+
+    /// Search across all segments and return (results, total_seen)
+    /// total_seen is the number of documents that were scored across all segments
+    pub async fn search_with_count(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        self.search_with_offset_and_count(query, limit, 0).await
     }
 
     /// Search with offset for pagination
@@ -283,13 +315,29 @@ impl<D: Directory + 'static> Searcher<D> {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::query::SearchResult>> {
+        let (results, _) = self
+            .search_with_offset_and_count(query, limit, offset)
+            .await?;
+        Ok(results)
+    }
+
+    /// Search with offset and return (results, total_seen)
+    pub async fn search_with_offset_and_count(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
         let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
+        let mut total_seen: u32 = 0;
 
         for segment in &self.segments {
             let segment_id = segment.meta().id;
-            let results =
-                crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?;
+            let (results, segment_seen) =
+                crate::query::search_segment_with_count(segment.as_ref(), query, fetch_limit)
+                    .await?;
+            total_seen += segment_seen;
             for result in results {
                 all_results.push((segment_id, result));
             }
@@ -303,12 +351,14 @@ impl<D: Directory + 'static> Searcher<D> {
         });
 
         // Apply offset and limit
-        Ok(all_results
+        let results = all_results
             .into_iter()
             .skip(offset)
             .take(limit)
             .map(|(_, result)| result)
-            .collect())
+            .collect();
+
+        Ok((results, total_seen))
     }
 
     /// Parse query string and search (convenience method)

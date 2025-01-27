@@ -115,6 +115,11 @@ impl AsyncSegmentReader {
         self.doc_id_offset
     }
 
+    /// Set the doc_id_offset (used for parallel segment loading)
+    pub fn set_doc_id_offset(&mut self, offset: DocId) {
+        self.doc_id_offset = offset;
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.schema
     }

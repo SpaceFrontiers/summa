@@ -32,10 +32,12 @@ pub struct IndexReader<D: DirectoryWriter + 'static> {
     trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
     /// Term cache blocks
     term_cache_blocks: usize,
-    /// Last reload time
-    last_reload: RwLock<std::time::Instant>,
-    /// Reload interval (default 1 second)
-    reload_interval: std::time::Duration,
+    /// Last reload check time
+    last_reload_check: RwLock<std::time::Instant>,
+    /// Reload check interval (default 1 second)
+    reload_check_interval: std::time::Duration,
+    /// Current segment IDs (to detect changes)
+    current_segment_ids: RwLock<Vec<String>>,
 }
 
 impl<D: DirectoryWriter + 'static> IndexReader<D> {
@@ -47,6 +49,9 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
+        // Get initial segment IDs
+        let initial_segment_ids = segment_manager.get_segment_ids().await;
+
         let reader = Self::create_reader(
             &schema,
             &segment_manager,
@@ -63,8 +68,9 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             trained_centroids,
             trained_codebooks,
             term_cache_blocks,
-            last_reload: RwLock::new(std::time::Instant::now()),
-            reload_interval: std::time::Duration::from_secs(1),
+            last_reload_check: RwLock::new(std::time::Instant::now()),
+            reload_check_interval: std::time::Duration::from_secs(1),
+            current_segment_ids: RwLock::new(initial_segment_ids),
         })
     }
 
@@ -91,21 +97,40 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         .await
     }
 
-    /// Set reload interval
+    /// Set reload check interval
     pub fn set_reload_interval(&mut self, interval: std::time::Duration) {
-        self.reload_interval = interval;
+        self.reload_check_interval = interval;
     }
 
-    /// Get current searcher (reloads if interval exceeded)
+    /// Get current searcher (reloads only if segments changed)
     pub async fn searcher(&self) -> Result<Arc<Searcher<D>>> {
-        // Check if reload needed
-        let should_reload = {
-            let last = self.last_reload.read();
-            last.elapsed() >= self.reload_interval
+        // Check if we should check for segment changes
+        let should_check = {
+            let last = self.last_reload_check.read();
+            last.elapsed() >= self.reload_check_interval
         };
 
-        if should_reload {
-            self.reload().await?;
+        if should_check {
+            // Update check time first to avoid concurrent checks
+            *self.last_reload_check.write() = std::time::Instant::now();
+
+            // Get current segment IDs from segment manager
+            let new_segment_ids = self.segment_manager.get_segment_ids().await;
+
+            // Check if segments actually changed
+            let segments_changed = {
+                let current = self.current_segment_ids.read();
+                *current != new_segment_ids
+            };
+
+            if segments_changed {
+                log::debug!(
+                    "Segments changed, reloading searcher ({} -> {} segments)",
+                    self.current_segment_ids.read().len(),
+                    new_segment_ids.len()
+                );
+                self.reload_with_segments(new_segment_ids).await?;
+            }
         }
 
         Ok(Arc::clone(&*self.searcher.read()))
@@ -113,6 +138,12 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
 
     /// Force reload reader with fresh snapshot
     pub async fn reload(&self) -> Result<()> {
+        let new_segment_ids = self.segment_manager.get_segment_ids().await;
+        self.reload_with_segments(new_segment_ids).await
+    }
+
+    /// Internal reload with specific segment IDs
+    async fn reload_with_segments(&self, new_segment_ids: Vec<String>) -> Result<()> {
         let new_reader = Self::create_reader(
             &self.schema,
             &self.segment_manager,
@@ -122,9 +153,9 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         )
         .await?;
 
-        // Swap in new searcher (old one will be dropped when last ref released)
+        // Swap in new searcher and update segment IDs
         *self.searcher.write() = Arc::new(new_reader);
-        *self.last_reload.write() = std::time::Instant::now();
+        *self.current_segment_ids.write() = new_segment_ids;
 
         Ok(())
     }
