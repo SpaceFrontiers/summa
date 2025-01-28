@@ -248,12 +248,11 @@ pub async fn load_sparse_file<D: Directory>(
         // Estimate total_vectors from first few posting lists (sample-based)
         // This avoids loading all posting lists just to compute stats
         for &(off, len) in offsets.iter().filter(|(_, l)| *l > 0).take(10) {
-            if let Ok(data) = handle.read_bytes_range(off..off + len as u64).await {
-                if let Ok(pl) =
+            if let Ok(data) = handle.read_bytes_range(off..off + len as u64).await
+                && let Ok(pl) =
                     BlockSparsePostingList::deserialize(&mut Cursor::new(data.as_slice()))
-                {
-                    max_doc_count = max_doc_count.max(pl.doc_count());
-                }
+            {
+                max_doc_count = max_doc_count.max(pl.doc_count());
             }
         }
 
