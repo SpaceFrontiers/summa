@@ -1205,7 +1205,7 @@ fn run_term_stats(
         })
         .collect();
 
-    terms.sort_by(|a, b| b.df.cmp(&a.df));
+    terms.sort_by_key(|t| std::cmp::Reverse(t.df));
 
     let wand_stats = WandStats {
         total_docs,

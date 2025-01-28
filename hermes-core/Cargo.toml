@@ -45,7 +45,8 @@ fst = { version = "0.4", optional = true }
 bincode = { version = "2.0", optional = true }
 memmap2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
-kmeans = { version = "2.0", optional = true }
+kentro = { version = "0.2", optional = true }
+ndarray = { version = "0.16", optional = true }
 nalgebra = { version = "0.34", optional = true }
 # Native tokenizers with onig (C library) for full regex support
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokenizers]
@@ -72,7 +73,7 @@ tokio = { workspace = true }
 
 [features]
 default = ["native"]
-native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:bincode", "dep:kmeans", "dep:nalgebra", "dep:tokenizers", "dep:fst"]
+native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:bincode", "dep:kentro", "dep:ndarray", "dep:nalgebra", "dep:tokenizers", "dep:fst"]
 wasm = ["dep:tokenizers"]
 http = ["dep:reqwest", "dep:instant"]
 

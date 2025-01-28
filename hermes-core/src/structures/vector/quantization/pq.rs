@@ -215,7 +215,8 @@ impl PQCodebook {
     /// Train codebook with OPQ rotation and anisotropic loss
     #[cfg(feature = "native")]
     pub fn train(config: PQConfig, vectors: &[Vec<f32>], max_iters: usize) -> Self {
-        use kmeans::{EuclideanDistance, KMeans, KMeansConfig};
+        use kentro::KMeans;
+        use ndarray::Array2;
 
         assert!(!vectors.is_empty(), "Cannot train on empty vector set");
         assert_eq!(vectors[0].len(), config.dim, "Vector dimension mismatch");
@@ -255,18 +256,20 @@ impl PQCodebook {
 
             let actual_k = k.min(n);
 
-            let kmean: KMeans<f32, 8, _> = KMeans::new(&subdata, n, sub_dim, EuclideanDistance);
-            let result = kmean.kmeans_lloyd(
-                actual_k,
-                max_iters,
-                KMeans::init_kmeanplusplus,
-                &KMeansConfig::default(),
-            );
+            let data = Array2::from_shape_vec((n, sub_dim), subdata)
+                .expect("Failed to create subspace array");
+            let mut kmeans = KMeans::new(actual_k)
+                .with_euclidean(true)
+                .with_iterations(max_iters);
+            let _ = kmeans
+                .train(data.view(), None)
+                .expect("K-means training failed");
 
-            let subspace_centroids: Vec<f32> = result
-                .centroids
+            let subspace_centroids: Vec<f32> = kmeans
+                .centroids()
+                .expect("No centroids")
                 .iter()
-                .flat_map(|c| c.iter().copied())
+                .copied()
                 .collect();
 
             centroids.extend(subspace_centroids);
@@ -393,7 +396,8 @@ impl PQCodebook {
         config: &PQConfig,
         rotated: &nalgebra::DMatrix<f32>,
     ) -> Vec<Vec<usize>> {
-        use kmeans::{EuclideanDistance, KMeans, KMeansConfig};
+        use kentro::KMeans;
+        use ndarray::Array2;
 
         let m = config.num_subspaces;
         let k = config.num_centroids.min(rotated.nrows());
@@ -410,12 +414,18 @@ impl PQCodebook {
                 }
             }
 
-            let kmean: KMeans<f32, 8, _> = KMeans::new(&subdata, n, sub_dim, EuclideanDistance);
-            let result =
-                kmean.kmeans_lloyd(k, 5, KMeans::init_kmeanplusplus, &KMeansConfig::default());
+            let data = Array2::from_shape_vec((n, sub_dim), subdata)
+                .expect("Failed to create subspace array");
+            let mut kmeans = KMeans::new(k).with_euclidean(true).with_iterations(5);
+            let clusters = kmeans
+                .train(data.view(), None)
+                .expect("K-means training failed");
 
-            for (i, &assignment) in result.assignments.iter().enumerate() {
-                all_assignments[i][subspace_idx] = assignment;
+            // Invert cluster assignments: clusters[cluster_id] = [point_indices]
+            for (cluster_id, point_indices) in clusters.iter().enumerate() {
+                for &point_idx in point_indices {
+                    all_assignments[point_idx][subspace_idx] = cluster_id;
+                }
             }
         }
 
@@ -428,7 +438,8 @@ impl PQCodebook {
         rotated: &nalgebra::DMatrix<f32>,
         assignments: &[Vec<usize>],
     ) -> nalgebra::DMatrix<f32> {
-        use kmeans::{EuclideanDistance, KMeans, KMeansConfig};
+        use kentro::KMeans;
+        use ndarray::Array2;
 
         let m = config.num_subspaces;
         let sub_dim = config.subspace_dim();
@@ -446,15 +457,21 @@ impl PQCodebook {
             }
 
             let k = config.num_centroids.min(n);
-            let kmean: KMeans<f32, 8, _> = KMeans::new(&subdata, n, sub_dim, EuclideanDistance);
-            let result =
-                kmean.kmeans_lloyd(k, 5, KMeans::init_kmeanplusplus, &KMeansConfig::default());
+            let data = Array2::from_shape_vec((n, sub_dim), subdata)
+                .expect("Failed to create subspace array");
+            let mut kmeans = KMeans::new(k).with_euclidean(true).with_iterations(5);
+            let _ = kmeans
+                .train(data.view(), None)
+                .expect("K-means training failed");
+
+            let centroids = kmeans.centroids().expect("No centroids");
 
             for (row, assignment) in assignments.iter().enumerate() {
                 let centroid_idx = assignment[subspace_idx];
                 if centroid_idx < k {
-                    for (col, &val) in result.centroids[centroid_idx].iter().enumerate() {
-                        reconstructed[(row, subspace_idx * sub_dim + col)] = val;
+                    for col in 0..sub_dim {
+                        reconstructed[(row, subspace_idx * sub_dim + col)] =
+                            centroids[[centroid_idx, col]];
                     }
                 }
             }

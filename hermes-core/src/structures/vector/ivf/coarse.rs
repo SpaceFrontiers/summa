@@ -78,10 +78,11 @@ pub struct CoarseCentroids {
 impl CoarseCentroids {
     /// Train coarse centroids using k-means algorithm
     ///
-    /// Uses kmeans crate with SIMD acceleration (native feature).
+    /// Uses kentro crate for clustering (native feature).
     #[cfg(feature = "native")]
     pub fn train(config: &CoarseConfig, vectors: &[Vec<f32>]) -> Self {
-        use kmeans::{EuclideanDistance, KMeans, KMeansConfig};
+        use kentro::KMeans;
+        use ndarray::Array2;
 
         assert!(!vectors.is_empty(), "Cannot train on empty vector set");
         assert!(config.num_clusters > 0, "Need at least 1 cluster");
@@ -89,24 +90,25 @@ impl CoarseCentroids {
         let actual_clusters = config.num_clusters.min(vectors.len());
         let dim = config.dim;
 
-        // Flatten vectors for kmeans crate (expects flat slice)
-        let samples: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        // Convert to ndarray format
+        let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        let data = Array2::from_shape_vec((vectors.len(), dim), flat)
+            .expect("Failed to create ndarray from vectors");
 
-        // Run k-means with k-means++ initialization
-        // KMeans<f32, 8, _> uses 8-lane SIMD (AVX256)
-        let kmean: KMeans<f32, 8, _> = KMeans::new(&samples, vectors.len(), dim, EuclideanDistance);
-        let result = kmean.kmeans_lloyd(
-            actual_clusters,
-            config.max_iters,
-            KMeans::init_kmeanplusplus,
-            &KMeansConfig::default(),
-        );
+        // Run k-means with euclidean distance
+        let mut kmeans = KMeans::new(actual_clusters)
+            .with_euclidean(true)
+            .with_iterations(config.max_iters);
+        let _ = kmeans
+            .train(data.view(), None)
+            .expect("K-means training failed");
 
-        // Extract centroids from StrideBuffer to flat Vec
-        let centroids: Vec<f32> = result
-            .centroids
+        // Extract centroids
+        let centroids: Vec<f32> = kmeans
+            .centroids()
+            .expect("No centroids after training")
             .iter()
-            .flat_map(|c| c.iter().copied())
+            .copied()
             .collect();
 
         let version = std::time::SystemTime::now()
