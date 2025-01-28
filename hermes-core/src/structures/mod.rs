@@ -82,6 +82,7 @@ pub use postings::{
     SPARSE_BLOCK_SIZE,
     SkipEntry,
     SkipList,
+    SparseBlock,
     SparseEntry,
     SparsePosting,
     SparsePostingIterator,
@@ -149,7 +150,8 @@ pub use simd::bits_needed;
 // Re-export sstable
 pub use sstable::{
     AsyncSSTableIterator, AsyncSSTableReader, BLOCK_SIZE as SSTABLE_BLOCK_SIZE, BloomFilter,
-    SSTABLE_MAGIC, SSTableStats, SSTableValue, SSTableWriter, SSTableWriterConfig, TermInfo,
+    SSTABLE_MAGIC, SSTableStats, SSTableValue, SSTableWriter, SSTableWriterConfig, SparseDimInfo,
+    TermInfo,
 };
 
 // Re-export sstable_index

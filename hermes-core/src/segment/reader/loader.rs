@@ -205,57 +205,117 @@ pub async fn load_sparse_file<D: Directory>(
     let mut pos: usize = 4; // After num_fields
 
     for _ in 0..num_fields {
-        // Read field header: field_id(4) + quant(1) + max_dim(4) = 9 bytes
+        // Read field header: field_id(4) + quant(1) + num_dims(4) = 9 bytes
         let field_id = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         let _quantization = data[pos + 4];
-        let max_dim_id =
+        let num_dims =
             u32::from_le_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
         pos += 9;
 
-        // Parse offset table directly from memory: 12 bytes per dimension
-        let table_slice = &data[pos..pos + (max_dim_id as usize * 12)];
-        let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(max_dim_id as usize);
-        let mut active_dims = 0u32;
+        // Parse dimension entries with skip lists
+        // Format per dimension:
+        // - dim_id: u32
+        // - data_offset: u64 (absolute offset to posting list data)
+        // - posting_list header: doc_count(4) + global_max_weight(4) + num_blocks(4)
+        // - skip_entries: [SparseSkipEntry] × num_blocks (20 bytes each)
+        let mut dimensions: Vec<super::types::DimensionEntry> =
+            Vec::with_capacity(num_dims as usize);
 
-        for i in 0..max_dim_id as usize {
-            let base = i * 12;
-            let offset = u64::from_le_bytes([
-                table_slice[base],
-                table_slice[base + 1],
-                table_slice[base + 2],
-                table_slice[base + 3],
-                table_slice[base + 4],
-                table_slice[base + 5],
-                table_slice[base + 6],
-                table_slice[base + 7],
+        for _ in 0..num_dims {
+            let dim_id =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let data_offset = u64::from_le_bytes([
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+                data[pos + 8],
+                data[pos + 9],
+                data[pos + 10],
+                data[pos + 11],
             ]);
-            let length = u32::from_le_bytes([
-                table_slice[base + 8],
-                table_slice[base + 9],
-                table_slice[base + 10],
-                table_slice[base + 11],
+            let posting_length = u32::from_le_bytes([
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
             ]);
-            offsets.push((offset, length));
-            if length > 0 {
-                active_dims += 1;
+            pos += 16;
+
+            // Read posting list header from data_offset to get skip list
+            let pl_data =
+                &data[data_offset as usize..(data_offset + posting_length as u64) as usize];
+            let doc_count = u32::from_le_bytes([pl_data[0], pl_data[1], pl_data[2], pl_data[3]]);
+            let global_max_weight =
+                f32::from_le_bytes([pl_data[4], pl_data[5], pl_data[6], pl_data[7]]);
+            let num_blocks =
+                u32::from_le_bytes([pl_data[8], pl_data[9], pl_data[10], pl_data[11]]) as usize;
+
+            // Parse skip entries (20 bytes each: first_doc + last_doc + offset + length + max_weight)
+            let mut skip_entries = Vec::with_capacity(num_blocks);
+            let mut skip_pos = 12; // After header
+            for _ in 0..num_blocks {
+                let first_doc = u32::from_le_bytes([
+                    pl_data[skip_pos],
+                    pl_data[skip_pos + 1],
+                    pl_data[skip_pos + 2],
+                    pl_data[skip_pos + 3],
+                ]);
+                let last_doc = u32::from_le_bytes([
+                    pl_data[skip_pos + 4],
+                    pl_data[skip_pos + 5],
+                    pl_data[skip_pos + 6],
+                    pl_data[skip_pos + 7],
+                ]);
+                let offset = u32::from_le_bytes([
+                    pl_data[skip_pos + 8],
+                    pl_data[skip_pos + 9],
+                    pl_data[skip_pos + 10],
+                    pl_data[skip_pos + 11],
+                ]);
+                let length = u32::from_le_bytes([
+                    pl_data[skip_pos + 12],
+                    pl_data[skip_pos + 13],
+                    pl_data[skip_pos + 14],
+                    pl_data[skip_pos + 15],
+                ]);
+                let max_weight = f32::from_le_bytes([
+                    pl_data[skip_pos + 16],
+                    pl_data[skip_pos + 17],
+                    pl_data[skip_pos + 18],
+                    pl_data[skip_pos + 19],
+                ]);
+                skip_entries.push(crate::structures::SparseSkipEntry::new(
+                    first_doc, last_doc, offset, length, max_weight,
+                ));
+                skip_pos += 20;
             }
-        }
-        pos += max_dim_id as usize * 12;
 
-        // Use total_docs as estimate - no need for extra I/O to sample posting lists
+            // data_offset points to start of posting list, block data starts after header + skip list
+            let header_size = 12 + num_blocks * 20;
+            dimensions.push(super::types::DimensionEntry {
+                dim_id,
+                data_offset: data_offset + header_size as u64,
+                doc_count,
+                global_max_weight,
+                skip_entries,
+            });
+        }
+        // Ensure sorted by dim_id for binary search
+        dimensions.sort_by_key(|d| d.dim_id);
+
         let total_vectors = total_docs;
 
         log::debug!(
-            "Loaded sparse index for field {} (lazy): max_dim={}, active_dims={}, estimated_vectors={}",
+            "Loaded sparse index for field {} (lazy): num_dims={}, estimated_vectors={}",
             field_id,
-            max_dim_id,
-            active_dims,
+            num_dims,
             total_vectors
         );
 
         indexes.insert(
             field_id,
-            SparseIndex::new(handle.clone(), offsets, total_docs, total_vectors),
+            SparseIndex::new(handle.clone(), dimensions, total_docs, total_vectors),
         );
     }
 

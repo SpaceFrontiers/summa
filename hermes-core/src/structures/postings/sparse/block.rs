@@ -296,23 +296,93 @@ impl BlockSparsePostingList {
         BlockSparsePostingIterator::new(self)
     }
 
+    /// Serialize with skip list header for lazy loading
+    ///
+    /// Format:
+    /// - doc_count: u32
+    /// - global_max_weight: f32
+    /// - num_blocks: u32
+    /// - skip_list: [SparseSkipEntry] × num_blocks (first_doc, last_doc, offset, length, max_weight)
+    /// - block_data: concatenated SparseBlock data
     pub fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        use super::SparseSkipEntry;
+
         w.write_u32::<LittleEndian>(self.doc_count)?;
+        w.write_f32::<LittleEndian>(self.global_max_weight())?;
         w.write_u32::<LittleEndian>(self.blocks.len() as u32)?;
+
+        // First pass: serialize blocks to get their sizes
+        let mut block_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
-            block.write(w)?;
+            let mut buf = Vec::new();
+            block.write(&mut buf)?;
+            block_bytes.push(buf);
         }
+
+        // Write skip list entries
+        let mut offset = 0u32;
+        for (block, bytes) in self.blocks.iter().zip(block_bytes.iter()) {
+            let doc_ids = block.decode_doc_ids();
+            let first_doc = doc_ids.first().copied().unwrap_or(0);
+            let last_doc = doc_ids.last().copied().unwrap_or(0);
+            let length = bytes.len() as u32;
+
+            let entry =
+                SparseSkipEntry::new(first_doc, last_doc, offset, length, block.header.max_weight);
+            entry.write(w)?;
+            offset += length;
+        }
+
+        // Write block data
+        for bytes in block_bytes {
+            w.write_all(&bytes)?;
+        }
+
         Ok(())
     }
 
+    /// Deserialize fully (loads all blocks into memory)
+    /// For lazy loading, use deserialize_header() + load_block()
     pub fn deserialize<R: Read>(r: &mut R) -> io::Result<Self> {
+        use super::SparseSkipEntry;
+
         let doc_count = r.read_u32::<LittleEndian>()?;
+        let _global_max_weight = r.read_f32::<LittleEndian>()?;
         let num_blocks = r.read_u32::<LittleEndian>()? as usize;
+
+        // Skip the skip list entries
+        for _ in 0..num_blocks {
+            let _ = SparseSkipEntry::read(r)?;
+        }
+
+        // Read all blocks
         let mut blocks = Vec::with_capacity(num_blocks);
         for _ in 0..num_blocks {
             blocks.push(SparseBlock::read(r)?);
         }
         Ok(Self { doc_count, blocks })
+    }
+
+    /// Deserialize only the skip list header (for lazy loading)
+    /// Returns (doc_count, global_max_weight, skip_entries, header_size)
+    pub fn deserialize_header<R: Read>(
+        r: &mut R,
+    ) -> io::Result<(u32, f32, Vec<super::SparseSkipEntry>, usize)> {
+        use super::SparseSkipEntry;
+
+        let doc_count = r.read_u32::<LittleEndian>()?;
+        let global_max_weight = r.read_f32::<LittleEndian>()?;
+        let num_blocks = r.read_u32::<LittleEndian>()? as usize;
+
+        let mut entries = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            entries.push(SparseSkipEntry::read(r)?);
+        }
+
+        // Header size: 4 + 4 + 4 + num_blocks * SparseSkipEntry::SIZE
+        let header_size = 4 + 4 + 4 + num_blocks * SparseSkipEntry::SIZE;
+
+        Ok((doc_count, global_max_weight, entries, header_size))
     }
 
     pub fn decode_all(&self) -> Vec<(DocId, u16, f32)> {

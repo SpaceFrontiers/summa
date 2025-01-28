@@ -208,6 +208,35 @@ impl SSTableValue for Vec<u8> {
     }
 }
 
+/// Sparse dimension info for SSTable-based sparse index
+/// Stores offset and length for posting list lookup
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseDimInfo {
+    /// Offset in sparse file where posting list starts
+    pub offset: u64,
+    /// Length of serialized posting list
+    pub length: u32,
+}
+
+impl SparseDimInfo {
+    pub fn new(offset: u64, length: u32) -> Self {
+        Self { offset, length }
+    }
+}
+
+impl SSTableValue for SparseDimInfo {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        write_vint(writer, self.offset)?;
+        write_vint(writer, self.length as u64)
+    }
+
+    fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let offset = read_vint(reader)?;
+        let length = read_vint(reader)? as u32;
+        Ok(Self { offset, length })
+    }
+}
+
 /// Maximum number of postings that can be inlined in TermInfo
 pub const MAX_INLINE_POSTINGS: usize = 3;
 

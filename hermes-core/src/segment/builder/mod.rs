@@ -765,14 +765,13 @@ impl SegmentBuilder {
 
     /// Build sparse vectors file containing BlockSparsePostingList per field/dimension
     ///
-    /// File format (direct-indexed table for O(1) dimension lookup):
+    /// File format (compact - only active dimensions):
     /// - Header: num_fields (u32)
     /// - For each field:
     ///   - field_id (u32)
     ///   - quantization (u8)
-    ///   - max_dim_id (u32)          ← highest dimension ID + 1 (table size)
-    ///   - table: [(offset: u64, length: u32)] × max_dim_id  ← direct indexed by dim_id
-    ///     (offset=0, length=0 means dimension not present)
+    ///   - num_dims (u32)            ← number of active dimensions
+    ///   - table: [(dim_id: u32, offset: u64, length: u32)] × num_dims
     /// - Data: concatenated serialized BlockSparsePostingList
     fn build_sparse_file(&self) -> Result<Vec<u8>> {
         use crate::structures::{BlockSparsePostingList, WeightQuantization};
@@ -806,7 +805,7 @@ impl SegmentBuilder {
             let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
 
             // Find max dimension ID
-            let max_dim_id = builder.postings.keys().max().copied().unwrap_or(0);
+            let _max_dim_id = builder.postings.keys().max().copied().unwrap_or(0);
 
             // Build BlockSparsePostingList for each dimension
             let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
@@ -831,7 +830,8 @@ impl SegmentBuilder {
                 dim_bytes.insert(dim_id, bytes);
             }
 
-            field_data.push((field_id, quantization, max_dim_id + 1, dim_bytes));
+            // Store num_dims (active count) instead of max_dim_id
+            field_data.push((field_id, quantization, dim_bytes.len() as u32, dim_bytes));
         }
 
         if field_data.is_empty() {
@@ -841,13 +841,13 @@ impl SegmentBuilder {
         // Sort by field_id
         field_data.sort_by_key(|(id, _, _, _)| *id);
 
-        // Calculate header size
+        // Calculate header size (compact format)
         // Header: num_fields (4)
-        // Per field: field_id (4) + quant (1) + max_dim_id (4) + table (12 * max_dim_id)
+        // Per field: field_id (4) + quant (1) + num_dims (4) + table (16 * num_dims)
         let mut header_size = 4u64;
-        for (_, _, max_dim_id, _) in &field_data {
-            header_size += 4 + 1 + 4; // field_id + quant + max_dim_id
-            header_size += (*max_dim_id as u64) * 12; // table entries: (offset: u64, length: u32)
+        for (_, _, num_dims, _) in &field_data {
+            header_size += 4 + 1 + 4; // field_id + quant + num_dims
+            header_size += (*num_dims as u64) * 16; // table entries: (dim_id: u32, offset: u64, length: u32)
         }
 
         // Build output
@@ -859,34 +859,37 @@ impl SegmentBuilder {
         // Track current data offset (after all headers)
         let mut current_offset = header_size;
 
-        // First, collect all data bytes in order and build offset tables
+        // First, collect all data bytes in order and build compact offset tables
         let mut all_data: Vec<u8> = Vec::new();
-        let mut field_tables: Vec<Vec<(u64, u32)>> = Vec::new();
+        // (dim_id, offset, length) for each active dimension
+        let mut field_tables: Vec<Vec<(u32, u64, u32)>> = Vec::new();
 
-        for (_, _, max_dim_id, dim_bytes) in &field_data {
-            let mut table: Vec<(u64, u32)> = vec![(0, 0); *max_dim_id as usize];
+        for (_, _, _, dim_bytes) in &field_data {
+            let mut table: Vec<(u32, u64, u32)> = Vec::with_capacity(dim_bytes.len());
 
-            // Process dimensions in order
-            for dim_id in 0..*max_dim_id {
-                if let Some(bytes) = dim_bytes.get(&dim_id) {
-                    table[dim_id as usize] = (current_offset, bytes.len() as u32);
-                    current_offset += bytes.len() as u64;
-                    all_data.extend_from_slice(bytes);
-                }
-                // else: table entry stays (0, 0) meaning dimension not present
+            // Sort dimensions for deterministic output
+            let mut dims: Vec<_> = dim_bytes.keys().copied().collect();
+            dims.sort();
+
+            for dim_id in dims {
+                let bytes = &dim_bytes[&dim_id];
+                table.push((dim_id, current_offset, bytes.len() as u32));
+                current_offset += bytes.len() as u64;
+                all_data.extend_from_slice(bytes);
             }
 
             field_tables.push(table);
         }
 
-        // Write field headers and tables
-        for (i, (field_id, quantization, max_dim_id, _)) in field_data.iter().enumerate() {
+        // Write field headers and compact tables
+        for (i, (field_id, quantization, num_dims, _)) in field_data.iter().enumerate() {
             output.write_u32::<LittleEndian>(*field_id)?;
             output.write_u8(*quantization as u8)?;
-            output.write_u32::<LittleEndian>(*max_dim_id)?;
+            output.write_u32::<LittleEndian>(*num_dims)?;
 
-            // Write table (direct indexed by dim_id)
-            for &(offset, length) in &field_tables[i] {
+            // Write compact table: (dim_id, offset, length) only for active dims
+            for &(dim_id, offset, length) in &field_tables[i] {
+                output.write_u32::<LittleEndian>(dim_id)?;
                 output.write_u64::<LittleEndian>(offset)?;
                 output.write_u32::<LittleEndian>(length)?;
             }

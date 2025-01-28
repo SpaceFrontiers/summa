@@ -26,7 +26,7 @@
 mod block;
 mod config;
 
-pub use block::{BlockSparsePostingIterator, BlockSparsePostingList};
+pub use block::{BlockSparsePostingIterator, BlockSparsePostingList, SparseBlock};
 pub use config::{
     IndexSize, QueryWeighting, SparseEntry, SparseQueryConfig, SparseVector, SparseVectorConfig,
     WeightQuantization,
@@ -51,24 +51,37 @@ pub const SPARSE_BLOCK_SIZE: usize = 128;
 /// Skip entry for sparse posting lists with block-max support
 ///
 /// Extends the basic skip entry with `max_weight` for Block-Max WAND optimization.
+/// Used for lazy block loading - only skip list is loaded, blocks loaded on-demand.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SparseSkipEntry {
     /// First doc_id in the block (absolute)
     pub first_doc: DocId,
     /// Last doc_id in the block
     pub last_doc: DocId,
-    /// Byte offset to block data
+    /// Byte offset to block data (relative to data section start)
     pub offset: u32,
+    /// Byte length of block data
+    pub length: u32,
     /// Maximum weight in this block (for Block-Max optimization)
     pub max_weight: f32,
 }
 
 impl SparseSkipEntry {
-    pub fn new(first_doc: DocId, last_doc: DocId, offset: u32, max_weight: f32) -> Self {
+    /// Size in bytes when serialized
+    pub const SIZE: usize = 20; // 4 + 4 + 4 + 4 + 4
+
+    pub fn new(
+        first_doc: DocId,
+        last_doc: DocId,
+        offset: u32,
+        length: u32,
+        max_weight: f32,
+    ) -> Self {
         Self {
             first_doc,
             last_doc,
             offset,
+            length,
             max_weight,
         }
     }
@@ -87,6 +100,7 @@ impl SparseSkipEntry {
         writer.write_u32::<LittleEndian>(self.first_doc)?;
         writer.write_u32::<LittleEndian>(self.last_doc)?;
         writer.write_u32::<LittleEndian>(self.offset)?;
+        writer.write_u32::<LittleEndian>(self.length)?;
         writer.write_f32::<LittleEndian>(self.max_weight)?;
         Ok(())
     }
@@ -96,11 +110,13 @@ impl SparseSkipEntry {
         let first_doc = reader.read_u32::<LittleEndian>()?;
         let last_doc = reader.read_u32::<LittleEndian>()?;
         let offset = reader.read_u32::<LittleEndian>()?;
+        let length = reader.read_u32::<LittleEndian>()?;
         let max_weight = reader.read_f32::<LittleEndian>()?;
         Ok(Self {
             first_doc,
             last_doc,
             offset,
+            length,
             max_weight,
         })
     }
@@ -120,10 +136,17 @@ impl SparseSkipList {
     }
 
     /// Add a skip entry
-    pub fn push(&mut self, first_doc: DocId, last_doc: DocId, offset: u32, max_weight: f32) {
+    pub fn push(
+        &mut self,
+        first_doc: DocId,
+        last_doc: DocId,
+        offset: u32,
+        length: u32,
+        max_weight: f32,
+    ) {
         self.global_max_weight = self.global_max_weight.max(max_weight);
         self.entries.push(SparseSkipEntry::new(
-            first_doc, last_doc, offset, max_weight,
+            first_doc, last_doc, offset, length, max_weight,
         ));
     }
 
@@ -733,9 +756,9 @@ mod tests {
     #[test]
     fn test_sparse_skip_list_serialization() {
         let mut skip_list = SparseSkipList::new();
-        skip_list.push(0, 127, 0, 12.7);
-        skip_list.push(128, 255, 100, 25.5);
-        skip_list.push(256, 299, 200, 29.9);
+        skip_list.push(0, 127, 0, 50, 12.7);
+        skip_list.push(128, 255, 100, 60, 25.5);
+        skip_list.push(256, 299, 200, 40, 29.9);
 
         assert_eq!(skip_list.len(), 3);
         assert!((skip_list.global_max_weight() - 29.9).abs() < 0.01);

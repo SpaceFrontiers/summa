@@ -86,16 +86,15 @@ impl AsyncSegmentReader {
         // Open positions file handle (if exists) - offsets are now in TermInfo
         let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
 
-        // Log segment loading stats
-        let sparse_mem: usize = sparse_indexes
-            .values()
-            .map(|s| s.num_dimensions() * 12)
-            .sum();
+        // Log segment loading stats (compact format: ~24 bytes per active dim in hashmap)
+        let sparse_dims: usize = sparse_indexes.values().map(|s| s.num_dimensions()).sum();
+        let sparse_mem = sparse_dims * 24; // HashMap entry overhead
         log::debug!(
-            "[segment] loaded {:016x}: docs={}, sparse_dims_mem={:.2} MB, vectors={}",
+            "[segment] loaded {:016x}: docs={}, sparse_dims={}, sparse_mem={:.2} KB, vectors={}",
             segment_id.0,
             meta.num_docs,
-            sparse_mem as f64 / (1024.0 * 1024.0),
+            sparse_dims,
+            sparse_mem as f64 / 1024.0,
             vector_indexes.len()
         );
 

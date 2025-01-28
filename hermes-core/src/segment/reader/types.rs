@@ -3,13 +3,11 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
-
 use crate::DocId;
 use crate::directories::{AsyncFileRead, LazyFileHandle};
 use crate::structures::{
     BlockSparsePostingList, IVFPQIndex, IVFRaBitQIndex, PQCodebook, RaBitQCodebook, RaBitQIndex,
+    SparseBlock, SparseSkipEntry,
 };
 
 use super::super::vector_data::FlatVectorData;
@@ -34,186 +32,207 @@ pub enum VectorIndex {
     },
 }
 
-/// Sparse vector index for a field: lazy loading with mmap
+/// Sparse vector index for a field: lazy block loading via mmap
 ///
-/// Only stores the offset table in memory. Posting lists are loaded
-/// on-demand during queries using mmap for memory efficiency.
+/// Stores skip list per dimension (block metadata). Blocks loaded on-demand.
+/// Memory: only skip list headers in RAM, block data via mmap (OS page cache).
 #[derive(Clone)]
 pub struct SparseIndex {
-    /// Lazy file handle for on-demand loading
+    /// Mmap file handle for sparse data
     handle: LazyFileHandle,
-    /// Offset table: (offset, length) indexed by dimension ID
-    /// (0, 0) means dimension not present
-    offsets: Arc<Vec<(u64, u32)>>,
-    /// Cache of loaded posting lists (LRU-style, dimension_id -> posting_list)
-    cache: Arc<RwLock<FxHashMap<u32, Arc<BlockSparsePostingList>>>>,
+    /// Per-dimension data: [(dim_id, data_offset, doc_count, global_max_weight, skip_entries)]
+    /// Sorted by dim_id for binary search
+    dimensions: Arc<Vec<DimensionEntry>>,
     /// Total document count in this segment (for IDF computation)
     pub total_docs: u32,
     /// Total sparse vectors in this segment (for multi-valued IDF)
     pub total_vectors: u32,
 }
 
+/// Per-dimension skip list data
+#[derive(Clone)]
+pub struct DimensionEntry {
+    pub dim_id: u32,
+    /// Base offset in file where block data starts for this dimension
+    pub data_offset: u64,
+    /// Total documents in this dimension's posting list
+    pub doc_count: u32,
+    /// Global max weight across all blocks
+    pub global_max_weight: f32,
+    /// Skip list entries (block metadata)
+    pub skip_entries: Vec<SparseSkipEntry>,
+}
+
 impl SparseIndex {
-    /// Create a new lazy sparse index
+    /// Create a new sparse index with lazy block loading
     pub fn new(
         handle: LazyFileHandle,
-        offsets: Vec<(u64, u32)>,
+        dimensions: Vec<DimensionEntry>,
         total_docs: u32,
         total_vectors: u32,
     ) -> Self {
         Self {
             handle,
-            offsets: Arc::new(offsets),
-            cache: Arc::new(RwLock::new(FxHashMap::default())),
+            dimensions: Arc::new(dimensions),
             total_docs,
             total_vectors,
         }
     }
 
-    /// Get offset and length for a dimension, or None if not present
+    /// Find dimension entry via binary search
     #[inline]
-    fn get_offset(&self, dim_id: u32) -> Option<(u64, u32)> {
-        self.offsets
-            .get(dim_id as usize)
-            .filter(|(_, l)| *l > 0)
-            .copied()
+    fn get_dimension(&self, dim_id: u32) -> Option<&DimensionEntry> {
+        self.dimensions
+            .binary_search_by_key(&dim_id, |d| d.dim_id)
+            .ok()
+            .map(|idx| &self.dimensions[idx])
     }
 
-    /// Deserialize and cache a posting list from raw bytes
-    fn deserialize_and_cache(
+    /// Load a single block via mmap (OS page cache handles caching)
+    async fn load_block(
         &self,
-        dim_id: u32,
-        data: &[u8],
-    ) -> crate::Result<Arc<BlockSparsePostingList>> {
-        let posting_list = BlockSparsePostingList::deserialize(&mut Cursor::new(data))?;
-        let pl = Arc::new(posting_list);
-
-        // Cache it
-        {
-            let mut cache = self.cache.write();
-            cache.insert(dim_id, Arc::clone(&pl));
-        }
-
-        Ok(pl)
-    }
-
-    /// Get posting list for a dimension (async, loads on-demand)
-    pub async fn get_posting(
-        &self,
-        dim_id: u32,
-    ) -> crate::Result<Option<Arc<BlockSparsePostingList>>> {
-        // Check bounds
-        let (offset, length) = match self.get_offset(dim_id) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        // Check cache first
-        if let Some(pl) = self.get_cached(dim_id) {
-            return Ok(Some(pl));
-        }
-
-        // Load from file (mmap range read)
+        dim: &DimensionEntry,
+        block_idx: usize,
+    ) -> crate::Result<SparseBlock> {
+        let entry = &dim.skip_entries[block_idx];
+        let abs_offset = dim.data_offset + entry.offset as u64;
         let data = self
             .handle
-            .read_bytes_range(offset..offset + length as u64)
+            .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
             .await
             .map_err(crate::Error::Io)?;
 
-        Ok(Some(self.deserialize_and_cache(dim_id, data.as_slice())?))
+        Ok(SparseBlock::read(&mut Cursor::new(data.as_slice()))?)
     }
 
-    /// Check if dimension exists (without loading)
-    #[inline]
-    pub fn has_dimension(&self, dim_id: u32) -> bool {
-        self.get_offset(dim_id).is_some()
-    }
-
-    /// Get the number of dimensions in the index
-    #[inline]
-    pub fn num_dimensions(&self) -> usize {
-        self.offsets.len()
-    }
-
-    /// Clear the cache (useful for memory pressure)
-    pub fn clear_cache(&self) {
-        self.cache.write().clear();
-    }
-
-    /// Get cache size (number of cached posting lists)
-    pub fn cache_size(&self) -> usize {
-        self.cache.read().len()
-    }
-
-    /// Iterate over all active dimension IDs (dimensions that have posting lists)
-    /// This is synchronous and doesn't load the posting lists
-    pub fn active_dimensions(&self) -> impl Iterator<Item = u32> + '_ {
-        self.offsets
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, l))| *l > 0)
-            .map(|(i, _)| i as u32)
-    }
-
-    /// Get cached posting list if available (for synchronous access)
-    /// Returns None if not cached (doesn't load from disk)
-    pub fn get_cached(&self, dim_id: u32) -> Option<Arc<BlockSparsePostingList>> {
-        self.cache.read().get(&dim_id).cloned()
-    }
-
-    /// Compute IDF (inverse document frequency) for a dimension
-    /// Uses cached posting if available, otherwise returns 0
-    #[inline]
-    pub fn idf(&self, dim_id: u32) -> f32 {
-        if let Some(pl) = self.get_cached(dim_id) {
-            let df = pl.doc_count() as f32;
-            if df > 0.0 {
-                let n = self.total_vectors.max(self.total_docs) as f32;
-                (n / df).ln().max(0.0)
-            } else {
-                0.0
-            }
-        } else {
-            // Not cached - return 0 (caller should use GlobalStats for accurate IDF)
-            0.0
-        }
-    }
-
-    /// Get IDF weights for multiple dimensions (uses cache only)
-    pub fn idf_weights(&self, dim_ids: &[u32]) -> Vec<f32> {
-        dim_ids.iter().map(|&d| self.idf(d)).collect()
-    }
-
-    /// Get posting list synchronously (blocking) - for merger use only
-    /// Prefer async get_posting() for query-time access
+    /// Load block synchronously (for merger)
     #[cfg(feature = "native")]
-    pub fn get_posting_blocking(
+    fn load_block_blocking(
         &self,
-        dim_id: u32,
-    ) -> crate::Result<Option<Arc<BlockSparsePostingList>>> {
-        // Check bounds
-        let (offset, length) = match self.get_offset(dim_id) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        // Check cache first
-        if let Some(pl) = self.get_cached(dim_id) {
-            return Ok(Some(pl));
-        }
-
-        // Block on async read (only for merger, not query path)
+        dim: &DimensionEntry,
+        block_idx: usize,
+    ) -> crate::Result<SparseBlock> {
+        let entry = &dim.skip_entries[block_idx];
+        let abs_offset = dim.data_offset + entry.offset as u64;
         let handle = self.handle.clone();
+
         let data = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 handle
-                    .read_bytes_range(offset..offset + length as u64)
+                    .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
                     .await
             })
         })
         .map_err(crate::Error::Io)?;
 
-        Ok(Some(self.deserialize_and_cache(dim_id, data.as_slice())?))
+        Ok(SparseBlock::read(&mut Cursor::new(data.as_slice()))?)
+    }
+
+    /// Get posting list for a dimension (loads all blocks - for compatibility)
+    pub async fn get_posting(
+        &self,
+        dim_id: u32,
+    ) -> crate::Result<Option<Arc<BlockSparsePostingList>>> {
+        let dim = match self.get_dimension(dim_id) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        // Load all blocks
+        let mut blocks = Vec::with_capacity(dim.skip_entries.len());
+        for i in 0..dim.skip_entries.len() {
+            let block = self.load_block(dim, i).await?;
+            blocks.push(block);
+        }
+
+        Ok(Some(Arc::new(BlockSparsePostingList {
+            doc_count: dim.doc_count,
+            blocks,
+        })))
+    }
+
+    /// Get skip list for a dimension (for block-max iteration without loading blocks)
+    pub fn get_skip_list(&self, dim_id: u32) -> Option<(&[SparseSkipEntry], f32)> {
+        self.get_dimension(dim_id)
+            .map(|d| (d.skip_entries.as_slice(), d.global_max_weight))
+    }
+
+    /// Load specific block for a dimension
+    pub async fn get_block(
+        &self,
+        dim_id: u32,
+        block_idx: usize,
+    ) -> crate::Result<Option<SparseBlock>> {
+        let dim = match self.get_dimension(dim_id) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        if block_idx >= dim.skip_entries.len() {
+            return Ok(None);
+        }
+        Ok(Some(self.load_block(dim, block_idx).await?))
+    }
+
+    /// Check if dimension exists
+    #[inline]
+    pub fn has_dimension(&self, dim_id: u32) -> bool {
+        self.get_dimension(dim_id).is_some()
+    }
+
+    /// Get the number of dimensions in the index
+    #[inline]
+    pub fn num_dimensions(&self) -> usize {
+        self.dimensions.len()
+    }
+
+    /// Iterate over all active dimension IDs
+    pub fn active_dimensions(&self) -> impl Iterator<Item = u32> + '_ {
+        self.dimensions.iter().map(|d| d.dim_id)
+    }
+
+    /// Get doc count for dimension (from skip list, no I/O)
+    pub fn doc_count(&self, dim_id: u32) -> u32 {
+        self.get_dimension(dim_id).map(|d| d.doc_count).unwrap_or(0)
+    }
+
+    /// Compute IDF using doc_count from skip list
+    #[inline]
+    pub fn idf(&self, dim_id: u32) -> f32 {
+        let df = self.doc_count(dim_id) as f32;
+        if df > 0.0 {
+            let n = self.total_vectors.max(self.total_docs) as f32;
+            (n / df).ln().max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Get IDF weights for multiple dimensions
+    pub fn idf_weights(&self, dim_ids: &[u32]) -> Vec<f32> {
+        dim_ids.iter().map(|&d| self.idf(d)).collect()
+    }
+
+    /// Get posting list synchronously (blocking) - for merger
+    #[cfg(feature = "native")]
+    pub fn get_posting_blocking(
+        &self,
+        dim_id: u32,
+    ) -> crate::Result<Option<Arc<BlockSparsePostingList>>> {
+        let dim = match self.get_dimension(dim_id) {
+            Some(d) => d.clone(),
+            None => return Ok(None),
+        };
+
+        let mut blocks = Vec::with_capacity(dim.skip_entries.len());
+        for i in 0..dim.skip_entries.len() {
+            let block = self.load_block_blocking(&dim, i)?;
+            blocks.push(block);
+        }
+
+        Ok(Some(Arc::new(BlockSparsePostingList {
+            doc_count: dim.doc_count,
+            blocks,
+        })))
     }
 }
 
