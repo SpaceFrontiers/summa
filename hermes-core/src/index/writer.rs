@@ -412,11 +412,28 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         );
                     }
 
-                    if builder_memory >= per_worker_limit {
+                    // Require minimum 100 docs before flushing to avoid tiny segments
+                    // (sparse vectors with many dims can hit memory limit quickly)
+                    const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
+                    let doc_count = b.num_docs();
+
+                    if builder_memory >= per_worker_limit && doc_count >= MIN_DOCS_BEFORE_FLUSH {
+                        // Get detailed stats for debugging memory issues
+                        let stats = b.stats();
+                        let mb = stats.memory_breakdown;
                         log::info!(
-                            "[indexing] flushing segment: docs={}, memory={:.2} MB",
-                            b.num_docs(),
-                            builder_memory as f64 / (1024.0 * 1024.0)
+                            "[indexing] flushing segment: docs={}, est_mem={:.2} MB, actual_mem={:.2} MB, \
+                             postings={:.2} MB, sparse={:.2} MB, dense={:.2} MB, interner={:.2} MB, \
+                             unique_terms={}, sparse_dims={}",
+                            doc_count,
+                            builder_memory as f64 / (1024.0 * 1024.0),
+                            stats.estimated_memory_bytes as f64 / (1024.0 * 1024.0),
+                            mb.postings_bytes as f64 / (1024.0 * 1024.0),
+                            mb.sparse_vectors_bytes as f64 / (1024.0 * 1024.0),
+                            mb.dense_vectors_bytes as f64 / (1024.0 * 1024.0),
+                            mb.interner_bytes as f64 / (1024.0 * 1024.0),
+                            stats.unique_terms,
+                            b.sparse_dim_count(),
                         );
                         let full_builder = builder.take().unwrap();
                         Self::spawn_segment_build(&state, full_builder);

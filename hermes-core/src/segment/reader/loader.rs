@@ -182,14 +182,14 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Read only the header (4 bytes for num_fields)
-    let header_bytes = match handle.read_bytes_range(0..4).await {
+    // Read ENTIRE sparse file in one I/O call - much faster than multiple small reads
+    let all_bytes = match handle.read_bytes_range(0..file_size).await {
         Ok(d) => d,
         Err(_) => return Ok(indexes),
     };
+    let data = all_bytes.as_slice();
 
-    let mut cursor = Cursor::new(header_bytes.as_slice());
-    let num_fields = cursor.read_u32::<LittleEndian>()?;
+    let num_fields = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
 
     log::debug!(
         "Loading sparse file (lazy): size={} bytes, num_fields={}",
@@ -201,38 +201,19 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Calculate header size per field: field_id(4) + quant(1) + max_dim(4) = 9 bytes
-    // Then for each dim: offset(8) + length(4) = 12 bytes
-    // We need to read the field headers first to know table sizes
-
-    let mut current_offset: u64 = 4; // After num_fields
+    // Parse from memory - no more I/O calls
+    let mut pos: usize = 4; // After num_fields
 
     for _ in 0..num_fields {
         // Read field header: field_id(4) + quant(1) + max_dim(4) = 9 bytes
-        let field_header = handle
-            .read_bytes_range(current_offset..current_offset + 9)
-            .await
-            .map_err(crate::Error::Io)?;
+        let field_id = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let _quantization = data[pos + 4];
+        let max_dim_id =
+            u32::from_le_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
+        pos += 9;
 
-        let mut cursor = Cursor::new(field_header.as_slice());
-        let field_id = cursor.read_u32::<LittleEndian>()?;
-        let _quantization = cursor.read_u8()?;
-        let max_dim_id = cursor.read_u32::<LittleEndian>()?;
-
-        current_offset += 9;
-
-        // Read offset table: 12 bytes per dimension
-        let table_size = max_dim_id as u64 * 12;
-        let table_bytes = handle
-            .read_bytes_range(current_offset..current_offset + table_size)
-            .await
-            .map_err(crate::Error::Io)?;
-
-        current_offset += table_size;
-
-        // Parse offset table into Vec<(offset, length)>
-        // Use from_raw_parts style parsing for speed - avoid per-entry cursor reads
-        let table_slice = table_bytes.as_slice();
+        // Parse offset table directly from memory: 12 bytes per dimension
+        let table_slice = &data[pos..pos + (max_dim_id as usize * 12)];
         let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(max_dim_id as usize);
         let mut active_dims = 0u32;
 
@@ -259,6 +240,7 @@ pub async fn load_sparse_file<D: Directory>(
                 active_dims += 1;
             }
         }
+        pos += max_dim_id as usize * 12;
 
         // Use total_docs as estimate - no need for extra I/O to sample posting lists
         let total_vectors = total_docs;

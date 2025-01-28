@@ -176,6 +176,11 @@ impl SegmentBuilder {
         self.estimated_memory
     }
 
+    /// Count total unique sparse dimensions across all fields
+    pub fn sparse_dim_count(&self) -> usize {
+        self.sparse_vectors.values().map(|b| b.postings.len()).sum()
+    }
+
     /// Get current statistics for debugging performance (expensive - iterates all data)
     pub fn stats(&self) -> SegmentBuilderStats {
         use std::mem::size_of;
