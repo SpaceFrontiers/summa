@@ -308,7 +308,8 @@ impl SegmentMerger {
             }
         }
 
-        // Collect results for SSTable writing (need to buffer due to async)
+        // Buffer term results - needed because SSTableWriter can't be held across await points
+        // Memory is bounded by unique terms (typically much smaller than postings)
         let mut term_results: Vec<(Vec<u8>, TermInfo)> = Vec::new();
         let mut terms_processed = 0usize;
 
@@ -384,16 +385,19 @@ impl SegmentMerger {
             }
         }
 
-        log::info!(
-            "Merge complete: {} terms processed from {} segments",
-            terms_processed,
-            segments.len()
-        );
-
-        // Track memory for term_results buffer
+        // Track memory
         let results_mem = term_results.capacity() * std::mem::size_of::<(Vec<u8>, TermInfo)>();
         stats.current_memory_bytes = results_mem + postings_out.capacity();
         stats.peak_memory_bytes = stats.peak_memory_bytes.max(stats.current_memory_bytes);
+
+        log::info!(
+            "[merge] complete: terms={}, segments={}, term_buffer={:.2} MB, postings={:.2} MB, peak={:.2} MB",
+            terms_processed,
+            segments.len(),
+            results_mem as f64 / (1024.0 * 1024.0),
+            postings_out.capacity() as f64 / (1024.0 * 1024.0),
+            stats.peak_memory_bytes as f64 / (1024.0 * 1024.0)
+        );
 
         // Write to SSTable (sync, no await points)
         let mut writer = SSTableWriter::<TermInfo>::new(term_dict);

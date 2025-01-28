@@ -211,6 +211,20 @@ impl<D: Directory + 'static> Searcher<D> {
             segments.push(Arc::new(reader));
         }
 
+        // Log searcher loading summary
+        let total_docs: u32 = segments.iter().map(|s| s.meta().num_docs).sum();
+        let total_sparse_mem: usize = segments
+            .iter()
+            .flat_map(|s| s.sparse_indexes().values())
+            .map(|idx| idx.num_dimensions() * 12)
+            .sum();
+        log::info!(
+            "[searcher] loaded {} segments: total_docs={}, sparse_index_mem={:.2} MB",
+            segments.len(),
+            total_docs,
+            total_sparse_mem as f64 / (1024.0 * 1024.0)
+        );
+
         segments
     }
 

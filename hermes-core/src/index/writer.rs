@@ -351,7 +351,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         mut receiver: mpsc::UnboundedReceiver<WorkerMessage>,
     ) {
         let mut builder: Option<SegmentBuilder> = None;
-        let mut doc_count = 0u32;
+        let mut _doc_count = 0u32;
 
         loop {
             // Receive from own channel - no mutex contention
@@ -395,26 +395,32 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         continue;
                     }
 
-                    doc_count += 1;
+                    _doc_count += 1;
 
-                    // Check memory periodically
-                    // Use smaller interval for small memory limits (for testing)
+                    // Check memory after every document - O(1) with incremental tracking
                     let per_worker_limit = state.config.max_indexing_memory_bytes
                         / state.config.num_indexing_threads.max(1);
-                    let check_interval = if per_worker_limit < 1024 * 1024 {
-                        1
-                    } else {
-                        100
-                    };
+                    let builder_memory = b.estimated_memory_bytes();
 
-                    if doc_count.is_multiple_of(check_interval) {
-                        let builder_memory = b.stats().estimated_memory_bytes;
+                    // Log memory usage periodically
+                    if _doc_count.is_multiple_of(10_000) {
+                        log::debug!(
+                            "[indexing] docs={}, memory={:.2} MB, limit={:.2} MB",
+                            b.num_docs(),
+                            builder_memory as f64 / (1024.0 * 1024.0),
+                            per_worker_limit as f64 / (1024.0 * 1024.0)
+                        );
+                    }
 
-                        if builder_memory >= per_worker_limit {
-                            let full_builder = builder.take().unwrap();
-                            Self::spawn_segment_build(&state, full_builder);
-                            doc_count = 0;
-                        }
+                    if builder_memory >= per_worker_limit {
+                        log::info!(
+                            "[indexing] flushing segment: docs={}, memory={:.2} MB",
+                            b.num_docs(),
+                            builder_memory as f64 / (1024.0 * 1024.0)
+                        );
+                        let full_builder = builder.take().unwrap();
+                        Self::spawn_segment_build(&state, full_builder);
+                        _doc_count = 0;
                     }
                 }
                 WorkerMessage::Flush(respond) => {
@@ -424,7 +430,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     {
                         Self::spawn_segment_build(&state, b);
                     }
-                    doc_count = 0;
+                    _doc_count = 0;
                     // Signal that flush is complete for this worker
                     let _ = respond.send(());
                 }

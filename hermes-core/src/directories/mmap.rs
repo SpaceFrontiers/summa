@@ -2,7 +2,6 @@
 //!
 //! This module is only compiled with the "native" feature.
 
-use std::collections::HashMap;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -10,7 +9,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use memmap2::Mmap;
-use parking_lot::RwLock;
 
 use super::{Directory, DirectoryWriter, FileSlice, LazyFileHandle, OwnedBytes, RangeReadFn};
 
@@ -26,10 +24,9 @@ use super::{Directory, DirectoryWriter, FileSlice, LazyFileHandle, OwnedBytes, R
 /// - Efficient random access patterns
 ///
 /// Note: Write operations still use regular file I/O.
+/// No application-level cache - the OS page cache handles this efficiently.
 pub struct MmapDirectory {
     root: PathBuf,
-    /// Cache of memory-mapped files
-    mmap_cache: Arc<RwLock<HashMap<PathBuf, Arc<Mmap>>>>,
 }
 
 impl MmapDirectory {
@@ -37,7 +34,6 @@ impl MmapDirectory {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            mmap_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -45,41 +41,12 @@ impl MmapDirectory {
         self.root.join(path)
     }
 
-    /// Get or create a memory-mapped file
-    async fn get_mmap(&self, path: &Path) -> io::Result<Arc<Mmap>> {
+    /// Memory-map a file (no application cache - OS page cache handles this)
+    fn mmap_file(&self, path: &Path) -> io::Result<Arc<Mmap>> {
         let full_path = self.resolve(path);
-
-        // Check cache first
-        {
-            let cache = self.mmap_cache.read();
-            if let Some(mmap) = cache.get(&full_path) {
-                return Ok(Arc::clone(mmap));
-            }
-        }
-
-        // Create new mmap
         let file = std::fs::File::open(&full_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let mmap = Arc::new(mmap);
-
-        // Cache it
-        {
-            let mut cache = self.mmap_cache.write();
-            cache.insert(full_path, Arc::clone(&mmap));
-        }
-
-        Ok(mmap)
-    }
-
-    /// Clear the mmap cache (useful after writes)
-    pub fn clear_cache(&self) {
-        self.mmap_cache.write().clear();
-    }
-
-    /// Remove a specific file from the cache
-    fn invalidate_cache(&self, path: &Path) {
-        let full_path = self.resolve(path);
-        self.mmap_cache.write().remove(&full_path);
+        Ok(Arc::new(mmap))
     }
 }
 
@@ -87,7 +54,6 @@ impl Clone for MmapDirectory {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
-            mmap_cache: Arc::clone(&self.mmap_cache),
         }
     }
 }
@@ -106,15 +72,14 @@ impl Directory for MmapDirectory {
     }
 
     async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
-        let mmap = self.get_mmap(path).await?;
-        // Create OwnedBytes that references the mmap data
-        // The Arc<Mmap> keeps the mapping alive
-        let bytes = mmap.to_vec(); // Copy for now - could optimize with custom type
+        let mmap = self.mmap_file(path)?;
+        // Copy data - mmap will be dropped after this, OS page cache handles rest
+        let bytes = mmap.to_vec();
         Ok(FileSlice::new(OwnedBytes::new(bytes)))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
-        let mmap = self.get_mmap(path).await?;
+        let mmap = self.mmap_file(path)?;
         let start = range.start as usize;
         let end = range.end as usize;
 
@@ -143,14 +108,11 @@ impl Directory for MmapDirectory {
     }
 
     async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
-        let mmap = self.get_mmap(path).await?;
+        let mmap = self.mmap_file(path)?;
         let file_size = mmap.len() as u64;
 
-        // Clone the mmap Arc for the closure
-        let mmap_clone = Arc::clone(&mmap);
-
         let read_fn: RangeReadFn = Arc::new(move |range: Range<u64>| {
-            let mmap = Arc::clone(&mmap_clone);
+            let mmap = Arc::clone(&mmap);
             Box::pin(async move {
                 let start = range.start as usize;
                 let end = range.end as usize;
@@ -180,25 +142,15 @@ impl DirectoryWriter for MmapDirectory {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Invalidate cache before writing
-        self.invalidate_cache(path);
-
         tokio::fs::write(&full_path, data).await
     }
 
     async fn delete(&self, path: &Path) -> io::Result<()> {
-        // Invalidate cache before deleting
-        self.invalidate_cache(path);
-
         let full_path = self.resolve(path);
         tokio::fs::remove_file(&full_path).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        // Invalidate both paths
-        self.invalidate_cache(from);
-        self.invalidate_cache(to);
-
         let from_path = self.resolve(from);
         let to_path = self.resolve(to);
         tokio::fs::rename(&from_path, &to_path).await
@@ -244,28 +196,6 @@ mod tests {
         // Read range
         let range_bytes = dir.read_range(Path::new("test.txt"), 7..12).await.unwrap();
         assert_eq!(range_bytes.as_slice(), b"mmap ");
-    }
-
-    #[tokio::test]
-    async fn test_mmap_directory_cache() {
-        let temp_dir = TempDir::new().unwrap();
-        let dir = MmapDirectory::new(temp_dir.path());
-
-        // Write a file
-        dir.write(Path::new("cached.txt"), b"cached content")
-            .await
-            .unwrap();
-
-        // Read twice - second should use cache
-        let _ = dir.open_read(Path::new("cached.txt")).await.unwrap();
-        let _ = dir.open_read(Path::new("cached.txt")).await.unwrap();
-
-        // Cache should have one entry
-        assert_eq!(dir.mmap_cache.read().len(), 1);
-
-        // Clear cache
-        dir.clear_cache();
-        assert_eq!(dir.mmap_cache.read().len(), 0);
     }
 
     #[tokio::test]

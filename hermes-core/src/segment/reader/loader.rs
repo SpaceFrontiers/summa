@@ -9,7 +9,7 @@ use std::io::Cursor;
 use crate::Result;
 use crate::directories::{AsyncFileRead, Directory, LazyFileHandle};
 use crate::dsl::Schema;
-use crate::structures::{BlockSparsePostingList, CoarseCentroids, RaBitQIndex};
+use crate::structures::{CoarseCentroids, RaBitQIndex};
 
 use super::super::types::SegmentFiles;
 use super::super::vector_data::{FlatVectorData, IVFRaBitQIndexData, ScaNNIndexData};
@@ -231,32 +231,37 @@ pub async fn load_sparse_file<D: Directory>(
         current_offset += table_size;
 
         // Parse offset table into Vec<(offset, length)>
+        // Use from_raw_parts style parsing for speed - avoid per-entry cursor reads
+        let table_slice = table_bytes.as_slice();
         let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(max_dim_id as usize);
-        let mut cursor = Cursor::new(table_bytes.as_slice());
         let mut active_dims = 0u32;
-        let mut max_doc_count: u32 = 0;
 
-        for _ in 0..max_dim_id {
-            let offset = cursor.read_u64::<LittleEndian>()?;
-            let length = cursor.read_u32::<LittleEndian>()?;
+        for i in 0..max_dim_id as usize {
+            let base = i * 12;
+            let offset = u64::from_le_bytes([
+                table_slice[base],
+                table_slice[base + 1],
+                table_slice[base + 2],
+                table_slice[base + 3],
+                table_slice[base + 4],
+                table_slice[base + 5],
+                table_slice[base + 6],
+                table_slice[base + 7],
+            ]);
+            let length = u32::from_le_bytes([
+                table_slice[base + 8],
+                table_slice[base + 9],
+                table_slice[base + 10],
+                table_slice[base + 11],
+            ]);
             offsets.push((offset, length));
             if length > 0 {
                 active_dims += 1;
             }
         }
 
-        // Estimate total_vectors from first few posting lists (sample-based)
-        // This avoids loading all posting lists just to compute stats
-        for &(off, len) in offsets.iter().filter(|(_, l)| *l > 0).take(10) {
-            if let Ok(data) = handle.read_bytes_range(off..off + len as u64).await
-                && let Ok(pl) =
-                    BlockSparsePostingList::deserialize(&mut Cursor::new(data.as_slice()))
-            {
-                max_doc_count = max_doc_count.max(pl.doc_count());
-            }
-        }
-
-        let total_vectors = max_doc_count.max(total_docs);
+        // Use total_docs as estimate - no need for extra I/O to sample posting lists
+        let total_vectors = total_docs;
 
         log::debug!(
             "Loaded sparse index for field {} (lazy): max_dim={}, active_dims={}, estimated_vectors={}",

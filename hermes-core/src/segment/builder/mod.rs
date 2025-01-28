@@ -456,11 +456,21 @@ impl SegmentBuilder {
                 term: term_spur,
             };
 
+            let is_new_term = !self.inverted_index.contains_key(&term_key);
             let posting = self
                 .inverted_index
                 .entry(term_key)
                 .or_insert_with(PostingListBuilder::new);
             posting.add(doc_id, tf);
+
+            // Incremental memory tracking
+            use std::mem::size_of;
+            self.estimated_memory += size_of::<CompactPosting>();
+            if is_new_term {
+                // HashMap entry overhead + PostingListBuilder + Vec header
+                self.estimated_memory +=
+                    size_of::<TermKey>() + size_of::<PostingListBuilder>() + 24;
+            }
 
             // Add positions if enabled
             if position_mode.is_some()
@@ -522,6 +532,11 @@ impl SegmentBuilder {
         }
 
         builder.add(doc_id, ordinal, vector);
+
+        // Incremental memory tracking
+        use std::mem::{size_of, size_of_val};
+        self.estimated_memory += size_of_val(vector) + size_of::<(DocId, u16)>();
+
         Ok(())
     }
 
@@ -557,7 +572,15 @@ impl SegmentBuilder {
                 continue;
             }
 
+            // Incremental memory tracking
+            use std::mem::size_of;
+            let is_new_dim = !builder.postings.contains_key(&dim_id);
             builder.add(dim_id, doc_id, ordinal, weight);
+            self.estimated_memory += size_of::<(DocId, u16, f32)>();
+            if is_new_dim {
+                // HashMap entry overhead + Vec header
+                self.estimated_memory += size_of::<u32>() + size_of::<Vec<(DocId, u16, f32)>>() + 8; // 8 = hashmap control byte + padding
+            }
         }
 
         Ok(())

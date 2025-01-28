@@ -86,6 +86,19 @@ impl AsyncSegmentReader {
         // Open positions file handle (if exists) - offsets are now in TermInfo
         let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
 
+        // Log segment loading stats
+        let sparse_mem: usize = sparse_indexes
+            .values()
+            .map(|s| s.num_dimensions() * 12)
+            .sum();
+        log::debug!(
+            "[segment] loaded {:016x}: docs={}, sparse_dims_mem={:.2} MB, vectors={}",
+            segment_id.0,
+            meta.num_docs,
+            sparse_mem as f64 / (1024.0 * 1024.0),
+            vector_indexes.len()
+        );
+
         Ok(Self {
             meta,
             term_dict: Arc::new(term_dict),

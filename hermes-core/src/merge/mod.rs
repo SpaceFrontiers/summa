@@ -105,6 +105,21 @@ impl TieredMergePolicy {
         Self::default()
     }
 
+    /// Create an aggressive merge policy that merges more frequently
+    ///
+    /// - Merges when 3 segments in same tier (vs 10 default)
+    /// - Lower tier floor (500 docs vs 1000)
+    /// - Good for reducing segment count quickly
+    pub fn aggressive() -> Self {
+        Self {
+            segments_per_tier: 3,
+            max_merge_at_once: 10,
+            tier_factor: 10.0,
+            tier_floor: 500,
+            max_merged_docs: 10_000_000,
+        }
+    }
+
     /// Set segments per tier
     pub fn with_segments_per_tier(mut self, n: usize) -> Self {
         self.segments_per_tier = n;
@@ -120,6 +135,12 @@ impl TieredMergePolicy {
     /// Set tier factor
     pub fn with_tier_factor(mut self, factor: f64) -> Self {
         self.tier_factor = factor;
+        self
+    }
+
+    /// Set tier floor (minimum docs before tiering starts)
+    pub fn with_tier_floor(mut self, floor: u32) -> Self {
+        self.tier_floor = floor;
         self
     }
 
