@@ -1,0 +1,826 @@
+//! Memory-efficient SSTable index structures
+//!
+//! This module provides two approaches for memory-efficient block indexing:
+//!
+//! ## Option 1: FST-based Index (native feature)
+//! Uses a Finite State Transducer to map keys to block ordinals. The FST can be
+//! mmap'd directly without parsing into heap-allocated structures.
+//!
+//! ## Option 2: Mmap'd Raw Index
+//! Keeps the prefix-compressed block index as raw bytes and decodes entries
+//! on-demand during binary search. No heap allocation for the index.
+//!
+//! Both approaches use a compact BlockAddrStore with bitpacked offsets/lengths.
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::io::{self, Write};
+use std::ops::Range;
+
+use crate::directories::OwnedBytes;
+
+/// Block address - offset and length in the data section
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockAddr {
+    pub offset: u64,
+    pub length: u32,
+}
+
+impl BlockAddr {
+    pub fn byte_range(&self) -> Range<u64> {
+        self.offset..self.offset + self.length as u64
+    }
+}
+
+/// Compact storage for block addresses using delta + bitpacking
+///
+/// Memory layout:
+/// - Header: num_blocks (u32) + offset_bits (u8) + length_bits (u8)
+/// - Bitpacked data: offsets and lengths interleaved
+///
+/// Uses delta encoding for offsets (blocks are sequential) and
+/// stores lengths directly (typically similar sizes).
+#[derive(Debug)]
+pub struct BlockAddrStore {
+    data: OwnedBytes,
+    num_blocks: u32,
+    offset_bits: u8,
+    length_bits: u8,
+    header_size: usize,
+}
+
+impl BlockAddrStore {
+    /// Build from a list of block addresses
+    pub fn build(addrs: &[BlockAddr]) -> io::Result<Vec<u8>> {
+        if addrs.is_empty() {
+            let mut buf = Vec::with_capacity(6);
+            buf.write_u32::<LittleEndian>(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            return Ok(buf);
+        }
+
+        // Compute delta offsets and find max values for bit width
+        let mut deltas = Vec::with_capacity(addrs.len());
+        let mut prev_end: u64 = 0;
+        let mut max_delta: u64 = 0;
+        let mut max_length: u32 = 0;
+
+        for addr in addrs {
+            // Delta from end of previous block (handles gaps)
+            let delta = addr.offset.saturating_sub(prev_end);
+            deltas.push(delta);
+            max_delta = max_delta.max(delta);
+            max_length = max_length.max(addr.length);
+            prev_end = addr.offset + addr.length as u64;
+        }
+
+        // Compute bit widths
+        let offset_bits = if max_delta == 0 {
+            1
+        } else {
+            (64 - max_delta.leading_zeros()) as u8
+        };
+        let length_bits = if max_length == 0 {
+            1
+        } else {
+            (32 - max_length.leading_zeros()) as u8
+        };
+
+        // Calculate packed size
+        let bits_per_entry = offset_bits as usize + length_bits as usize;
+        let total_bits = bits_per_entry * addrs.len();
+        let packed_bytes = total_bits.div_ceil(8);
+
+        let mut buf = Vec::with_capacity(6 + packed_bytes);
+        buf.write_u32::<LittleEndian>(addrs.len() as u32)?;
+        buf.write_u8(offset_bits)?;
+        buf.write_u8(length_bits)?;
+
+        // Bitpack the data
+        let mut bit_writer = BitWriter::new(&mut buf);
+        for (i, addr) in addrs.iter().enumerate() {
+            bit_writer.write(deltas[i], offset_bits)?;
+            bit_writer.write(addr.length as u64, length_bits)?;
+        }
+        bit_writer.flush()?;
+
+        Ok(buf)
+    }
+
+    /// Load from raw bytes (zero-copy if mmap'd)
+    pub fn load(data: OwnedBytes) -> io::Result<Self> {
+        if data.len() < 6 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BlockAddrStore data too short",
+            ));
+        }
+
+        let mut reader = data.as_slice();
+        let num_blocks = reader.read_u32::<LittleEndian>()?;
+        let offset_bits = reader.read_u8()?;
+        let length_bits = reader.read_u8()?;
+
+        Ok(Self {
+            data,
+            num_blocks,
+            offset_bits,
+            length_bits,
+            header_size: 6,
+        })
+    }
+
+    /// Number of blocks
+    pub fn len(&self) -> usize {
+        self.num_blocks as usize
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.num_blocks == 0
+    }
+
+    /// Get block address by index (decodes on-demand)
+    pub fn get(&self, idx: usize) -> Option<BlockAddr> {
+        if idx >= self.num_blocks as usize {
+            return None;
+        }
+
+        let packed_data = &self.data.as_slice()[self.header_size..];
+
+        // We need to decode from the start to accumulate offsets
+        let mut bit_reader = BitReader::new(packed_data);
+        let mut current_offset: u64 = 0;
+
+        for i in 0..=idx {
+            let delta = bit_reader.read(self.offset_bits).ok()?;
+            let length = bit_reader.read(self.length_bits).ok()? as u32;
+
+            current_offset += delta;
+
+            if i == idx {
+                return Some(BlockAddr {
+                    offset: current_offset,
+                    length,
+                });
+            }
+
+            current_offset += length as u64;
+        }
+
+        None
+    }
+
+    /// Get all block addresses (for iteration)
+    pub fn all(&self) -> Vec<BlockAddr> {
+        let mut result = Vec::with_capacity(self.num_blocks as usize);
+        let packed_data = &self.data.as_slice()[self.header_size..];
+        let mut bit_reader = BitReader::new(packed_data);
+        let mut current_offset: u64 = 0;
+
+        for _ in 0..self.num_blocks {
+            if let (Ok(delta), Ok(length)) = (
+                bit_reader.read(self.offset_bits),
+                bit_reader.read(self.length_bits),
+            ) {
+                current_offset += delta;
+                result.push(BlockAddr {
+                    offset: current_offset,
+                    length: length as u32,
+                });
+                current_offset += length;
+            }
+        }
+
+        result
+    }
+}
+
+/// FST-based block index (Option 1)
+///
+/// Maps keys to block ordinals using an FST. The FST bytes can be mmap'd
+/// directly without any parsing or heap allocation.
+#[cfg(feature = "native")]
+pub struct FstBlockIndex {
+    fst: fst::Map<OwnedBytes>,
+    block_addrs: BlockAddrStore,
+}
+
+#[cfg(feature = "native")]
+impl FstBlockIndex {
+    /// Build FST index from keys and block addresses
+    pub fn build(entries: &[(Vec<u8>, BlockAddr)]) -> io::Result<Vec<u8>> {
+        use fst::MapBuilder;
+
+        // Build FST mapping keys to block ordinals
+        let mut fst_builder = MapBuilder::memory();
+        for (i, (key, _)) in entries.iter().enumerate() {
+            fst_builder
+                .insert(key, i as u64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        }
+        let fst_bytes = fst_builder
+            .into_inner()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Build block address store
+        let addrs: Vec<BlockAddr> = entries.iter().map(|(_, addr)| *addr).collect();
+        let addr_bytes = BlockAddrStore::build(&addrs)?;
+
+        // Combine: fst_len (u32) + fst_bytes + addr_bytes
+        let mut result = Vec::with_capacity(4 + fst_bytes.len() + addr_bytes.len());
+        result.write_u32::<LittleEndian>(fst_bytes.len() as u32)?;
+        result.extend_from_slice(&fst_bytes);
+        result.extend_from_slice(&addr_bytes);
+
+        Ok(result)
+    }
+
+    /// Load from raw bytes
+    pub fn load(data: OwnedBytes) -> io::Result<Self> {
+        if data.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FstBlockIndex data too short",
+            ));
+        }
+
+        let fst_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+        if data.len() < 4 + fst_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FstBlockIndex FST data truncated",
+            ));
+        }
+
+        let fst_data = data.slice(4..4 + fst_len);
+        let addr_data = data.slice(4 + fst_len..data.len());
+
+        let fst =
+            fst::Map::new(fst_data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let block_addrs = BlockAddrStore::load(addr_data)?;
+
+        Ok(Self { fst, block_addrs })
+    }
+
+    /// Look up the block index for a key
+    /// Returns the block ordinal that could contain this key
+    pub fn locate(&self, key: &[u8]) -> Option<usize> {
+        // FST gives us the block whose first_key <= key
+        // We need to find the largest key <= target
+        use fst::{IntoStreamer, Streamer};
+
+        let mut stream = self.fst.range().ge(key).into_stream();
+
+        // If exact match, return that block
+        if let Some((found_key, ordinal)) = stream.next()
+            && found_key == key
+        {
+            return Some(ordinal as usize);
+        }
+
+        // Otherwise, find the block before (largest key < target)
+        let mut stream = self.fst.range().lt(key).into_stream();
+        let mut last_ordinal = None;
+        while let Some((_, ordinal)) = stream.next() {
+            last_ordinal = Some(ordinal as usize);
+        }
+
+        last_ordinal
+    }
+
+    /// Get block address by ordinal
+    pub fn get_addr(&self, ordinal: usize) -> Option<BlockAddr> {
+        self.block_addrs.get(ordinal)
+    }
+
+    /// Number of blocks
+    pub fn len(&self) -> usize {
+        self.block_addrs.len()
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.block_addrs.is_empty()
+    }
+
+    /// Get all block addresses
+    pub fn all_addrs(&self) -> Vec<BlockAddr> {
+        self.block_addrs.all()
+    }
+}
+
+/// Mmap'd raw block index (Option 2)
+///
+/// Keeps the prefix-compressed block index as raw bytes and decodes
+/// entries on-demand. No heap allocation for keys.
+pub struct MmapBlockIndex {
+    data: OwnedBytes,
+    num_blocks: u32,
+    block_addrs: BlockAddrStore,
+    /// Offset where the prefix-compressed keys start
+    keys_offset: usize,
+}
+
+impl MmapBlockIndex {
+    /// Build mmap-friendly index from entries
+    pub fn build(entries: &[(Vec<u8>, BlockAddr)]) -> io::Result<Vec<u8>> {
+        if entries.is_empty() {
+            let mut buf = Vec::with_capacity(10);
+            buf.write_u32::<LittleEndian>(0)?; // num_blocks
+            buf.extend_from_slice(&BlockAddrStore::build(&[])?);
+            return Ok(buf);
+        }
+
+        // Build block address store
+        let addrs: Vec<BlockAddr> = entries.iter().map(|(_, addr)| *addr).collect();
+        let addr_bytes = BlockAddrStore::build(&addrs)?;
+
+        // Build prefix-compressed keys
+        let mut keys_buf = Vec::new();
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        for (key, _) in entries {
+            let prefix_len = common_prefix_len(&prev_key, key);
+            let suffix = &key[prefix_len..];
+
+            write_vint(&mut keys_buf, prefix_len as u64)?;
+            write_vint(&mut keys_buf, suffix.len() as u64)?;
+            keys_buf.extend_from_slice(suffix);
+
+            prev_key.clear();
+            prev_key.extend_from_slice(key);
+        }
+
+        // Combine: num_blocks (u32) + addr_bytes + keys_bytes
+        let mut result = Vec::with_capacity(4 + addr_bytes.len() + keys_buf.len());
+        result.write_u32::<LittleEndian>(entries.len() as u32)?;
+        result.extend_from_slice(&addr_bytes);
+        result.extend_from_slice(&keys_buf);
+
+        Ok(result)
+    }
+
+    /// Load from raw bytes
+    pub fn load(data: OwnedBytes) -> io::Result<Self> {
+        if data.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MmapBlockIndex data too short",
+            ));
+        }
+
+        let num_blocks = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+
+        // Load block addresses
+        let addr_data_start = 4;
+        let remaining = data.slice(addr_data_start..data.len());
+        let block_addrs = BlockAddrStore::load(remaining.clone())?;
+
+        // Calculate where keys start
+        let bits_per_entry = block_addrs.offset_bits as usize + block_addrs.length_bits as usize;
+        let total_bits = bits_per_entry * num_blocks as usize;
+        let addr_packed_size = total_bits.div_ceil(8);
+        let keys_offset = addr_data_start + 6 + addr_packed_size; // 6 = header of BlockAddrStore
+
+        Ok(Self {
+            data,
+            num_blocks,
+            block_addrs,
+            keys_offset,
+        })
+    }
+
+    /// Binary search for a key, returning the block ordinal
+    /// Decodes keys on-demand during the search
+    pub fn locate(&self, target: &[u8]) -> Option<usize> {
+        if self.num_blocks == 0 {
+            return None;
+        }
+
+        // We need to do linear scan with prefix decompression
+        // For a true binary search, we'd need restart points
+        // This is still better than loading all keys into memory
+        let keys_data = &self.data.as_slice()[self.keys_offset..];
+        let mut reader = keys_data;
+        let mut current_key = Vec::new();
+        let mut last_le_block: Option<usize> = None;
+
+        for i in 0..self.num_blocks as usize {
+            let prefix_len = match read_vint(&mut reader) {
+                Ok(v) => v as usize,
+                Err(_) => break,
+            };
+            let suffix_len = match read_vint(&mut reader) {
+                Ok(v) => v as usize,
+                Err(_) => break,
+            };
+
+            current_key.truncate(prefix_len);
+            if suffix_len > reader.len() {
+                break;
+            }
+            current_key.extend_from_slice(&reader[..suffix_len]);
+            reader = &reader[suffix_len..];
+
+            match current_key.as_slice().cmp(target) {
+                std::cmp::Ordering::Equal => return Some(i),
+                std::cmp::Ordering::Less => last_le_block = Some(i),
+                std::cmp::Ordering::Greater => {
+                    // First key greater than target - return previous block
+                    return last_le_block;
+                }
+            }
+        }
+
+        // Target is >= all keys, return last block
+        last_le_block
+    }
+
+    /// Get block address by ordinal
+    pub fn get_addr(&self, ordinal: usize) -> Option<BlockAddr> {
+        self.block_addrs.get(ordinal)
+    }
+
+    /// Number of blocks
+    pub fn len(&self) -> usize {
+        self.num_blocks as usize
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.num_blocks == 0
+    }
+
+    /// Get all block addresses
+    pub fn all_addrs(&self) -> Vec<BlockAddr> {
+        self.block_addrs.all()
+    }
+
+    /// Decode all keys (for debugging/merging)
+    pub fn all_keys(&self) -> Vec<Vec<u8>> {
+        let mut result = Vec::with_capacity(self.num_blocks as usize);
+        let keys_data = &self.data.as_slice()[self.keys_offset..];
+        let mut reader = keys_data;
+        let mut current_key = Vec::new();
+
+        for _ in 0..self.num_blocks {
+            let prefix_len = match read_vint(&mut reader) {
+                Ok(v) => v as usize,
+                Err(_) => break,
+            };
+            let suffix_len = match read_vint(&mut reader) {
+                Ok(v) => v as usize,
+                Err(_) => break,
+            };
+
+            current_key.truncate(prefix_len);
+            if suffix_len > reader.len() {
+                break;
+            }
+            current_key.extend_from_slice(&reader[..suffix_len]);
+            reader = &reader[suffix_len..];
+
+            result.push(current_key.clone());
+        }
+
+        result
+    }
+}
+
+/// Unified block index that can use either FST or mmap'd raw index
+pub enum BlockIndex {
+    #[cfg(feature = "native")]
+    Fst(FstBlockIndex),
+    Mmap(MmapBlockIndex),
+}
+
+impl BlockIndex {
+    /// Locate the block that could contain the key
+    pub fn locate(&self, key: &[u8]) -> Option<usize> {
+        match self {
+            #[cfg(feature = "native")]
+            BlockIndex::Fst(idx) => idx.locate(key),
+            BlockIndex::Mmap(idx) => idx.locate(key),
+        }
+    }
+
+    /// Get block address by ordinal
+    pub fn get_addr(&self, ordinal: usize) -> Option<BlockAddr> {
+        match self {
+            #[cfg(feature = "native")]
+            BlockIndex::Fst(idx) => idx.get_addr(ordinal),
+            BlockIndex::Mmap(idx) => idx.get_addr(ordinal),
+        }
+    }
+
+    /// Number of blocks
+    pub fn len(&self) -> usize {
+        match self {
+            #[cfg(feature = "native")]
+            BlockIndex::Fst(idx) => idx.len(),
+            BlockIndex::Mmap(idx) => idx.len(),
+        }
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get all block addresses
+    pub fn all_addrs(&self) -> Vec<BlockAddr> {
+        match self {
+            #[cfg(feature = "native")]
+            BlockIndex::Fst(idx) => idx.all_addrs(),
+            BlockIndex::Mmap(idx) => idx.all_addrs(),
+        }
+    }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+fn write_vint<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            writer.write_all(&[byte])?;
+            return Ok(());
+        } else {
+            writer.write_all(&[byte | 0x80])?;
+        }
+    }
+}
+
+fn read_vint(reader: &mut &[u8]) -> io::Result<u64> {
+    let mut result = 0u64;
+    let mut shift = 0;
+
+    loop {
+        if reader.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected end of varint",
+            ));
+        }
+        let byte = reader[0];
+        *reader = &reader[1..];
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Varint too long",
+            ));
+        }
+    }
+}
+
+/// Simple bit writer for packing
+struct BitWriter<'a> {
+    output: &'a mut Vec<u8>,
+    buffer: u64,
+    bits_in_buffer: u8,
+}
+
+impl<'a> BitWriter<'a> {
+    fn new(output: &'a mut Vec<u8>) -> Self {
+        Self {
+            output,
+            buffer: 0,
+            bits_in_buffer: 0,
+        }
+    }
+
+    fn write(&mut self, value: u64, num_bits: u8) -> io::Result<()> {
+        debug_assert!(num_bits <= 64);
+
+        self.buffer |= value << self.bits_in_buffer;
+        self.bits_in_buffer += num_bits;
+
+        while self.bits_in_buffer >= 8 {
+            self.output.push(self.buffer as u8);
+            self.buffer >>= 8;
+            self.bits_in_buffer -= 8;
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.bits_in_buffer > 0 {
+            self.output.push(self.buffer as u8);
+            self.buffer = 0;
+            self.bits_in_buffer = 0;
+        }
+        Ok(())
+    }
+}
+
+/// Simple bit reader for unpacking
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte_pos: usize,
+    bit_pos: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte_pos: 0,
+            bit_pos: 0,
+        }
+    }
+
+    fn read(&mut self, num_bits: u8) -> io::Result<u64> {
+        if num_bits == 0 {
+            return Ok(0);
+        }
+
+        let mut result: u64 = 0;
+        let mut bits_read: u8 = 0;
+
+        while bits_read < num_bits {
+            if self.byte_pos >= self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Not enough bits",
+                ));
+            }
+
+            let bits_available = 8 - self.bit_pos;
+            let bits_to_read = (num_bits - bits_read).min(bits_available);
+            // Handle edge case where bits_to_read == 8 to avoid overflow
+            let mask = if bits_to_read >= 8 {
+                0xFF
+            } else {
+                (1u8 << bits_to_read) - 1
+            };
+            let bits = (self.data[self.byte_pos] >> self.bit_pos) & mask;
+
+            result |= (bits as u64) << bits_read;
+            bits_read += bits_to_read;
+            self.bit_pos += bits_to_read;
+
+            if self.bit_pos >= 8 {
+                self.byte_pos += 1;
+                self.bit_pos = 0;
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_block_addr_store_roundtrip() {
+        let addrs = vec![
+            BlockAddr {
+                offset: 0,
+                length: 1000,
+            },
+            BlockAddr {
+                offset: 1000,
+                length: 1500,
+            },
+            BlockAddr {
+                offset: 2500,
+                length: 800,
+            },
+            BlockAddr {
+                offset: 3300,
+                length: 2000,
+            },
+        ];
+
+        let bytes = BlockAddrStore::build(&addrs).unwrap();
+        let store = BlockAddrStore::load(OwnedBytes::new(bytes)).unwrap();
+
+        assert_eq!(store.len(), 4);
+        for (i, expected) in addrs.iter().enumerate() {
+            let actual = store.get(i).unwrap();
+            assert_eq!(actual.offset, expected.offset, "offset mismatch at {}", i);
+            assert_eq!(actual.length, expected.length, "length mismatch at {}", i);
+        }
+    }
+
+    #[test]
+    fn test_block_addr_store_empty() {
+        let bytes = BlockAddrStore::build(&[]).unwrap();
+        let store = BlockAddrStore::load(OwnedBytes::new(bytes)).unwrap();
+        assert_eq!(store.len(), 0);
+        assert!(store.get(0).is_none());
+    }
+
+    #[test]
+    fn test_mmap_block_index_roundtrip() {
+        let entries = vec![
+            (
+                b"aaa".to_vec(),
+                BlockAddr {
+                    offset: 0,
+                    length: 100,
+                },
+            ),
+            (
+                b"bbb".to_vec(),
+                BlockAddr {
+                    offset: 100,
+                    length: 150,
+                },
+            ),
+            (
+                b"ccc".to_vec(),
+                BlockAddr {
+                    offset: 250,
+                    length: 200,
+                },
+            ),
+        ];
+
+        let bytes = MmapBlockIndex::build(&entries).unwrap();
+        let index = MmapBlockIndex::load(OwnedBytes::new(bytes)).unwrap();
+
+        assert_eq!(index.len(), 3);
+
+        // Test locate
+        assert_eq!(index.locate(b"aaa"), Some(0));
+        assert_eq!(index.locate(b"bbb"), Some(1));
+        assert_eq!(index.locate(b"ccc"), Some(2));
+        assert_eq!(index.locate(b"aab"), Some(0)); // Between aaa and bbb
+        assert_eq!(index.locate(b"ddd"), Some(2)); // After all keys
+        assert_eq!(index.locate(b"000"), None); // Before all keys
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_fst_block_index_roundtrip() {
+        let entries = vec![
+            (
+                b"aaa".to_vec(),
+                BlockAddr {
+                    offset: 0,
+                    length: 100,
+                },
+            ),
+            (
+                b"bbb".to_vec(),
+                BlockAddr {
+                    offset: 100,
+                    length: 150,
+                },
+            ),
+            (
+                b"ccc".to_vec(),
+                BlockAddr {
+                    offset: 250,
+                    length: 200,
+                },
+            ),
+        ];
+
+        let bytes = FstBlockIndex::build(&entries).unwrap();
+        let index = FstBlockIndex::load(OwnedBytes::new(bytes)).unwrap();
+
+        assert_eq!(index.len(), 3);
+
+        // Test locate
+        assert_eq!(index.locate(b"aaa"), Some(0));
+        assert_eq!(index.locate(b"bbb"), Some(1));
+        assert_eq!(index.locate(b"ccc"), Some(2));
+        assert_eq!(index.locate(b"aab"), Some(0)); // Between aaa and bbb
+        assert_eq!(index.locate(b"ddd"), Some(2)); // After all keys
+    }
+
+    #[test]
+    fn test_bit_writer_reader() {
+        let mut buf = Vec::new();
+        let mut writer = BitWriter::new(&mut buf);
+
+        writer.write(5, 3).unwrap(); // 101
+        writer.write(3, 2).unwrap(); // 11
+        writer.write(15, 4).unwrap(); // 1111
+        writer.flush().unwrap();
+
+        let mut reader = BitReader::new(&buf);
+        assert_eq!(reader.read(3).unwrap(), 5);
+        assert_eq!(reader.read(2).unwrap(), 3);
+        assert_eq!(reader.read(4).unwrap(), 15);
+    }
+}

@@ -41,6 +41,7 @@ bumpalo = { workspace = true, optional = true }
 lasso = { workspace = true, optional = true }
 hashbrown = { workspace = true }
 half = { version = "2.7", features = ["std"] }
+fst = { version = "0.4", optional = true }
 bincode = { version = "2.0", optional = true }
 memmap2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
@@ -71,7 +72,7 @@ tokio = { workspace = true }
 
 [features]
 default = ["native"]
-native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:bincode", "dep:kmeans", "dep:nalgebra", "dep:tokenizers"]
+native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:bincode", "dep:kmeans", "dep:nalgebra", "dep:tokenizers", "dep:fst"]
 wasm = ["dep:tokenizers"]
 http = ["dep:reqwest", "dep:instant"]
 

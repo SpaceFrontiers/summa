@@ -9,6 +9,7 @@
 pub mod postings;
 pub mod simd;
 mod sstable;
+mod sstable_index;
 pub mod vector;
 
 // Re-export postings
@@ -150,3 +151,8 @@ pub use sstable::{
     AsyncSSTableIterator, AsyncSSTableReader, BLOCK_SIZE as SSTABLE_BLOCK_SIZE, BloomFilter,
     SSTABLE_MAGIC, SSTableStats, SSTableValue, SSTableWriter, SSTableWriterConfig, TermInfo,
 };
+
+// Re-export sstable_index
+#[cfg(feature = "native")]
+pub use sstable_index::FstBlockIndex;
+pub use sstable_index::{BlockAddr, BlockAddrStore, BlockIndex, MmapBlockIndex};
