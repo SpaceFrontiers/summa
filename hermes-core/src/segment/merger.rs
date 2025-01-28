@@ -774,10 +774,8 @@ impl SegmentMerger {
             let mut all_dims: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
             for segment in segments {
                 if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
-                    for (dim_id, posting) in sparse_index.postings.iter().enumerate() {
-                        if posting.is_some() {
-                            all_dims.insert(dim_id as u32);
-                        }
+                    for dim_id in sparse_index.active_dimensions() {
+                        all_dims.insert(dim_id);
                     }
                 }
             }
@@ -792,11 +790,12 @@ impl SegmentMerger {
             // For each dimension, merge posting lists from all segments
             for dim_id in all_dims {
                 // Collect posting lists for this dimension from all segments
-                let mut lists_with_offsets: Vec<(&BlockSparsePostingList, u32)> = Vec::new();
+                // Keep Arcs alive while we borrow from them
+                let mut posting_arcs: Vec<(Arc<BlockSparsePostingList>, u32)> = Vec::new();
 
                 for (seg_idx, segment) in segments.iter().enumerate() {
                     if let Some(sparse_index) = segment.sparse_indexes().get(&field.0)
-                        && let Some(Some(posting_list)) = sparse_index.postings.get(dim_id as usize)
+                        && let Ok(Some(posting_list)) = sparse_index.get_posting_blocking(dim_id)
                     {
                         log::trace!(
                             "Sparse merge dim={}: seg={} offset={} doc_count={} blocks={}",
@@ -806,9 +805,15 @@ impl SegmentMerger {
                             posting_list.doc_count(),
                             posting_list.blocks.len()
                         );
-                        lists_with_offsets.push((posting_list.as_ref(), doc_offsets[seg_idx]));
+                        posting_arcs.push((posting_list, doc_offsets[seg_idx]));
                     }
                 }
+
+                // Create references for merge
+                let lists_with_offsets: Vec<(&BlockSparsePostingList, u32)> = posting_arcs
+                    .iter()
+                    .map(|(pl, offset)| (pl.as_ref(), *offset))
+                    .collect();
 
                 if lists_with_offsets.is_empty() {
                     continue;

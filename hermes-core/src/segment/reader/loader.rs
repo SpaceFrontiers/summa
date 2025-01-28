@@ -138,7 +138,7 @@ pub async fn load_vectors_file<D: Directory>(
     Ok((indexes, coarse_centroids))
 }
 
-/// Load sparse vector indexes from .sparse file
+/// Load sparse vector indexes from .sparse file (lazy loading)
 ///
 /// File format (direct-indexed table for O(1) dimension lookup):
 /// - Header: num_fields (u32)
@@ -149,6 +149,9 @@ pub async fn load_vectors_file<D: Directory>(
 ///   - table: [(offset: u64, length: u32)] × max_dim_id  ← direct indexed
 ///     (offset=0, length=0 means dimension not present)
 /// - Data: concatenated serialized BlockSparsePostingList
+///
+/// Memory optimization: Only loads the offset table, not the posting lists.
+/// Posting lists are loaded on-demand during queries via mmap range reads.
 pub async fn load_sparse_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
@@ -165,7 +168,7 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Try to open sparse file (may not exist if no sparse vectors were indexed)
+    // Try to open sparse file lazily (may not exist if no sparse vectors were indexed)
     let handle = match dir.open_lazy(&files.sparse).await {
         Ok(h) => h,
         Err(e) => {
@@ -174,22 +177,23 @@ pub async fn load_sparse_file<D: Directory>(
         }
     };
 
-    // Read the entire file (sparse files are typically small enough)
-    let data = match handle.read_bytes().await {
+    let file_size = handle.len();
+    if file_size < 4 {
+        return Ok(indexes);
+    }
+
+    // Read only the header (4 bytes for num_fields)
+    let header_bytes = match handle.read_bytes_range(0..4).await {
         Ok(d) => d,
         Err(_) => return Ok(indexes),
     };
 
-    if data.len() < 4 {
-        return Ok(indexes);
-    }
-
-    let mut cursor = Cursor::new(data.as_slice());
+    let mut cursor = Cursor::new(header_bytes.as_slice());
     let num_fields = cursor.read_u32::<LittleEndian>()?;
 
     log::debug!(
-        "Loading sparse file: size={} bytes, num_fields={}",
-        data.len(),
+        "Loading sparse file (lazy): size={} bytes, num_fields={}",
+        file_size,
         num_fields
     );
 
@@ -197,64 +201,80 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Read field entries and build indexes
+    // Calculate header size per field: field_id(4) + quant(1) + max_dim(4) = 9 bytes
+    // Then for each dim: offset(8) + length(4) = 12 bytes
+    // We need to read the field headers first to know table sizes
+
+    let mut current_offset: u64 = 4; // After num_fields
+
     for _ in 0..num_fields {
+        // Read field header: field_id(4) + quant(1) + max_dim(4) = 9 bytes
+        let field_header = handle
+            .read_bytes_range(current_offset..current_offset + 9)
+            .await
+            .map_err(crate::Error::Io)?;
+
+        let mut cursor = Cursor::new(field_header.as_slice());
         let field_id = cursor.read_u32::<LittleEndian>()?;
-        let _quantization = cursor.read_u8()?; // Already stored in each BlockSparsePostingList
+        let _quantization = cursor.read_u8()?;
         let max_dim_id = cursor.read_u32::<LittleEndian>()?;
 
-        // Read direct-indexed table
-        let mut postings: Vec<Option<Arc<BlockSparsePostingList>>> =
-            vec![None; max_dim_id as usize];
+        current_offset += 9;
 
-        for dim_id in 0..max_dim_id {
+        // Read offset table: 12 bytes per dimension
+        let table_size = max_dim_id as u64 * 12;
+        let table_bytes = handle
+            .read_bytes_range(current_offset..current_offset + table_size)
+            .await
+            .map_err(crate::Error::Io)?;
+
+        current_offset += table_size;
+
+        // Parse offset table into Vec<(offset, length)>
+        let mut offsets: Vec<(u64, u32)> = Vec::with_capacity(max_dim_id as usize);
+        let mut cursor = Cursor::new(table_bytes.as_slice());
+        let mut active_dims = 0u32;
+        let mut max_doc_count: u32 = 0;
+
+        for _ in 0..max_dim_id {
             let offset = cursor.read_u64::<LittleEndian>()?;
             let length = cursor.read_u32::<LittleEndian>()?;
-
-            // offset=0, length=0 means dimension not present
+            offsets.push((offset, length));
             if length > 0 {
-                let start = offset as usize;
-                let end = start + length as usize;
-                if end <= data.len() {
-                    let posting_data = &data.as_slice()[start..end];
-                    if let Ok(posting_list) =
-                        BlockSparsePostingList::deserialize(&mut Cursor::new(posting_data))
-                    {
-                        postings[dim_id as usize] = Some(Arc::new(posting_list));
-                    }
+                active_dims += 1;
+            }
+        }
+
+        // Estimate total_vectors from first few posting lists (sample-based)
+        // This avoids loading all posting lists just to compute stats
+        for &(off, len) in offsets.iter().filter(|(_, l)| *l > 0).take(10) {
+            if let Ok(data) = handle.read_bytes_range(off..off + len as u64).await {
+                if let Ok(pl) =
+                    BlockSparsePostingList::deserialize(&mut Cursor::new(data.as_slice()))
+                {
+                    max_doc_count = max_doc_count.max(pl.doc_count());
                 }
             }
         }
 
-        let num_postings = postings.iter().filter(|p| p.is_some()).count();
-        // Compute total_vectors as sum of doc_count across all dimensions
-        // This handles multi-valued fields where each doc can have multiple vectors
-        let total_vectors: u32 = postings
-            .iter()
-            .filter_map(|p| p.as_ref())
-            .map(|pl| pl.doc_count())
-            .max()
-            .unwrap_or(total_docs);
+        let total_vectors = max_doc_count.max(total_docs);
+
         log::debug!(
-            "Loaded sparse index for field {}: max_dim={}, active_postings={}, total_vectors={}",
+            "Loaded sparse index for field {} (lazy): max_dim={}, active_dims={}, estimated_vectors={}",
             field_id,
             max_dim_id,
-            num_postings,
+            active_dims,
             total_vectors
         );
 
         indexes.insert(
             field_id,
-            SparseIndex {
-                postings,
-                total_docs,
-                total_vectors,
-            },
+            SparseIndex::new(handle.clone(), offsets, total_docs, total_vectors),
         );
     }
 
     log::debug!(
-        "Sparse file loaded: fields={:?}",
+        "Sparse file loaded (lazy): fields={:?}",
         indexes.keys().collect::<Vec<_>>()
     );
 

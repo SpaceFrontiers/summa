@@ -5,6 +5,8 @@ mod types;
 
 pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
 
+use crate::structures::BlockSparsePostingList;
+
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -469,31 +471,39 @@ impl AsyncSegmentReader {
             }
         };
 
-        let index_dimensions = sparse_index.postings.len();
+        let index_dimensions = sparse_index.num_dimensions();
 
         // Build scorers for each dimension that exists in the index
+        // Load posting lists on-demand (lazy loading via mmap)
+        // Keep Arc references alive for the duration of scoring
         let mut matched_tokens = Vec::new();
         let mut missing_tokens = Vec::new();
+        let mut posting_lists: Vec<(u32, f32, Arc<BlockSparsePostingList>)> =
+            Vec::with_capacity(vector.len());
 
-        let scorers: Vec<SparseTermScorer> = vector
-            .iter()
-            .filter_map(|&(dim_id, query_weight)| {
-                // Direct indexing: O(1) lookup
-                match sparse_index
-                    .postings
-                    .get(dim_id as usize)
-                    .and_then(|opt| opt.as_ref())
-                {
-                    Some(pl) => {
-                        matched_tokens.push(dim_id);
-                        Some(SparseTermScorer::from_arc(pl, query_weight))
-                    }
-                    None => {
-                        missing_tokens.push(dim_id);
-                        None
-                    }
+        for &(dim_id, query_weight) in vector {
+            // Check if dimension exists before loading
+            if !sparse_index.has_dimension(dim_id) {
+                missing_tokens.push(dim_id);
+                continue;
+            }
+
+            // Load posting list on-demand (async, uses mmap)
+            match sparse_index.get_posting(dim_id).await? {
+                Some(pl) => {
+                    matched_tokens.push(dim_id);
+                    posting_lists.push((dim_id, query_weight, pl));
                 }
-            })
+                None => {
+                    missing_tokens.push(dim_id);
+                }
+            }
+        }
+
+        // Create scorers from the loaded posting lists (borrows from posting_lists)
+        let scorers: Vec<SparseTermScorer> = posting_lists
+            .iter()
+            .map(|(_, query_weight, pl)| SparseTermScorer::from_arc(pl, *query_weight))
             .collect();
 
         log::debug!(
