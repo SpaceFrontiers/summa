@@ -466,8 +466,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         tokio::spawn(async move {
             match builder.build(directory.as_ref(), segment_id).await {
-                Ok(_) => {
-                    let _ = segment_manager.register_segment(segment_hex.clone()).await;
+                Ok(meta) => {
+                    // Register segment with its doc count (avoids loading segment for merge decisions)
+                    let _ = segment_manager
+                        .register_segment(segment_hex.clone(), meta.num_docs)
+                        .await;
                 }
                 Err(e) => {
                     eprintln!("Background segment build failed: {:?}", e);
@@ -618,6 +621,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             readers.push(reader);
         }
 
+        // Calculate total doc count for the merged segment
+        let total_docs: u32 = readers.iter().map(|r| r.meta().num_docs).sum();
+
         // Merge into new segment
         let merger = SegmentMerger::new(Arc::clone(&self.schema));
         let new_segment_id = SegmentId::new();
@@ -627,7 +633,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         // Atomically update segments and delete old ones via SegmentManager
         self.segment_manager
-            .replace_segments(vec![new_segment_id.to_hex()], ids_to_merge)
+            .replace_segments(vec![(new_segment_id.to_hex(), total_docs)], ids_to_merge)
             .await?;
 
         Ok(())

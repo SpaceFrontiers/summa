@@ -77,7 +77,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ) -> Self {
         // Initialize tracker and register existing segments
         let tracker = Arc::new(SegmentTracker::new());
-        for seg_id in &metadata.segments {
+        for seg_id in metadata.segment_metas.keys() {
             tracker.register(seg_id);
         }
 
@@ -96,7 +96,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Get the current segment IDs (snapshot)
     pub async fn get_segment_ids(&self) -> Vec<String> {
-        self.metadata.read().await.segments.clone()
+        self.metadata.read().await.segment_ids()
     }
 
     /// Get the number of pending background merges
@@ -124,7 +124,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     pub async fn acquire_snapshot(&self) -> SegmentSnapshot<D> {
         let acquired = {
             let meta = self.metadata.read().await;
-            self.tracker.acquire(&meta.segments)
+            let segment_ids = meta.segment_ids();
+            self.tracker.acquire(&segment_ids)
         };
 
         SegmentSnapshot::new(
@@ -148,14 +149,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 /// Native-only methods for SegmentManager (merging, segment registration)
 #[cfg(feature = "native")]
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
-    /// Register a new segment, persist metadata, and trigger merge check
+    /// Register a new segment with its doc count, persist metadata, and trigger merge check
     ///
     /// This is the main entry point for adding segments after builds complete.
-    pub async fn register_segment(&self, segment_id: String) -> Result<()> {
+    pub async fn register_segment(&self, segment_id: String, num_docs: u32) -> Result<()> {
         {
             let mut meta = self.metadata.write().await;
-            if !meta.segments.contains(&segment_id) {
-                meta.segments.push(segment_id.clone());
+            if !meta.has_segment(&segment_id) {
+                meta.add_segment(segment_id.clone(), num_docs);
                 self.tracker.register(&segment_id);
             }
             meta.save(self.directory.as_ref()).await?;
@@ -167,30 +168,24 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Check merge policy and spawn background merges if needed
+    /// Uses doc counts from metadata - no segment loading required
     pub async fn maybe_merge(&self) {
-        // Get current segment info (excluding segments being merged or pending deletion)
-        let available_segments: Vec<String> = {
+        // Get current segment info from metadata (no segment loading!)
+        let segments: Vec<SegmentInfo> = {
             let meta = self.metadata.read().await;
             let merging = self.merging_segments.read();
 
             // Filter out segments currently being merged or pending deletion
-            meta.segments
+            meta.segment_metas
                 .iter()
-                .filter(|id| !merging.contains(*id) && !self.tracker.is_pending_deletion(id))
-                .cloned()
+                .filter(|(id, _)| !merging.contains(*id) && !self.tracker.is_pending_deletion(id))
+                .map(|(id, info)| SegmentInfo {
+                    id: id.clone(),
+                    num_docs: info.num_docs,
+                    size_bytes: None,
+                })
                 .collect()
         };
-
-        // Build segment info - we estimate doc count based on segment age (newer = smaller)
-        let segments: Vec<SegmentInfo> = available_segments
-            .iter()
-            .enumerate()
-            .map(|(i, id)| SegmentInfo {
-                id: id.clone(),
-                num_docs: ((i + 1) * 1000) as u32,
-                size_bytes: None,
-            })
-            .collect();
 
         // Ask merge policy for candidates
         let candidates = self.merge_policy.find_merges(&segments);
@@ -233,16 +228,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .await;
 
             match result {
-                Ok(new_segment_id) => {
+                Ok((new_segment_id, merged_doc_count)) => {
                     // Register new segment with tracker
                     tracker.register(&new_segment_id);
 
-                    // Atomically update metadata: remove merged segments, add new one
+                    // Atomically update metadata: remove merged segments, add new one with doc count
                     {
                         let mut meta = metadata.write().await;
-                        meta.segments
-                            .retain(|id| !segment_ids_to_merge.contains(id));
-                        meta.segments.push(new_segment_id);
+                        for id in &segment_ids_to_merge {
+                            meta.remove_segment(id);
+                        }
+                        meta.add_segment(new_segment_id, merged_doc_count);
                         if let Err(e) = meta.save(directory.as_ref()).await {
                             eprintln!("[merge] Failed to save metadata after merge: {:?}", e);
                         }
@@ -278,15 +274,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Perform the actual merge operation (runs in background task)
+    /// Returns (new_segment_id, total_doc_count)
     async fn do_merge(
         directory: &D,
         schema: &crate::dsl::Schema,
         segment_ids_to_merge: &[String],
         term_cache_blocks: usize,
-    ) -> Result<String> {
+    ) -> Result<(String, u32)> {
         // Load segment readers
         let mut readers = Vec::new();
         let mut doc_offset = 0u32;
+        let mut total_docs = 0u32;
 
         for id_str in segment_ids_to_merge {
             let segment_id = SegmentId::from_hex(id_str)
@@ -306,7 +304,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     return Err(e);
                 }
             };
-            doc_offset += reader.meta().num_docs;
+            let num_docs = reader.meta().num_docs;
+            total_docs += num_docs;
+            doc_offset += num_docs;
             readers.push(reader);
         }
 
@@ -324,7 +324,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
 
         // Note: Segment deletion is handled by the caller via tracker
-        Ok(new_segment_id.to_hex())
+        Ok((new_segment_id.to_hex(), total_docs))
     }
 
     /// Wait for all pending merges to complete
@@ -335,19 +335,23 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Replace segment list atomically (for force merge / rebuild)
+    /// new_segments: Vec of (segment_id, num_docs) pairs
     pub async fn replace_segments(
         &self,
-        new_segments: Vec<String>,
+        new_segments: Vec<(String, u32)>,
         old_to_delete: Vec<String>,
     ) -> Result<()> {
         // Register new segments with tracker
-        for seg_id in &new_segments {
+        for (seg_id, _) in &new_segments {
             self.tracker.register(seg_id);
         }
 
         {
             let mut meta = self.metadata.write().await;
-            meta.segments = new_segments;
+            meta.segment_metas.clear();
+            for (seg_id, num_docs) in new_segments {
+                meta.add_segment(seg_id, num_docs);
+            }
             meta.save(self.directory.as_ref()).await?;
         }
 
@@ -369,7 +373,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     pub async fn cleanup_orphan_segments(&self) -> Result<usize> {
         let registered_set: HashSet<String> = {
             let meta = self.metadata.read().await;
-            meta.segments.iter().cloned().collect()
+            meta.segment_metas.keys().cloned().collect()
         };
 
         // Find all segment files in directory

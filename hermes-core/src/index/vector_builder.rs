@@ -140,6 +140,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Load all segment readers
         let readers = self.load_segment_readers(&segment_ids).await?;
 
+        // Calculate total doc count for the merged segment
+        let total_docs: u32 = readers.iter().map(|r| r.meta().num_docs).sum();
+
         // Merge all segments into one with ANN indexes
         let merger = SegmentMerger::new(Arc::clone(&self.schema));
         let new_segment_id = SegmentId::new();
@@ -149,7 +152,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         // Atomically update segments and delete old ones via SegmentManager
         self.segment_manager
-            .replace_segments(vec![new_segment_id.to_hex()], segment_ids)
+            .replace_segments(vec![(new_segment_id.to_hex(), total_docs)], segment_ids)
             .await?;
 
         log::info!("Segments rebuilt with ANN indexes");

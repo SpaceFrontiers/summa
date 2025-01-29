@@ -36,6 +36,14 @@ pub enum VectorIndexState {
     },
 }
 
+/// Per-segment metadata stored in index metadata
+/// This allows merge decisions without loading segment files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentMetaInfo {
+    /// Number of documents in this segment
+    pub num_docs: u32,
+}
+
 /// Per-field vector index metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldVectorMeta {
@@ -60,8 +68,10 @@ pub struct IndexMetadata {
     pub version: u32,
     /// Index schema
     pub schema: Schema,
-    /// List of committed segment IDs (hex strings)
-    pub segments: Vec<String>,
+    /// Segment metadata: segment_id -> info (doc count, etc.)
+    /// Using HashMap allows O(1) lookup and stores doc counts for merge decisions
+    #[serde(default)]
+    pub segment_metas: HashMap<String, SegmentMetaInfo>,
     /// Per-field vector index metadata
     #[serde(default)]
     pub vector_fields: HashMap<u32, FieldVectorMeta>,
@@ -76,10 +86,36 @@ impl IndexMetadata {
         Self {
             version: 1,
             schema,
-            segments: Vec::new(),
+            segment_metas: HashMap::new(),
             vector_fields: HashMap::new(),
             total_vectors: 0,
         }
+    }
+
+    /// Get segment IDs as a Vec (for compatibility)
+    pub fn segment_ids(&self) -> Vec<String> {
+        self.segment_metas.keys().cloned().collect()
+    }
+
+    /// Add or update a segment with its doc count
+    pub fn add_segment(&mut self, segment_id: String, num_docs: u32) {
+        self.segment_metas
+            .insert(segment_id, SegmentMetaInfo { num_docs });
+    }
+
+    /// Remove a segment
+    pub fn remove_segment(&mut self, segment_id: &str) {
+        self.segment_metas.remove(segment_id);
+    }
+
+    /// Check if segment exists
+    pub fn has_segment(&self, segment_id: &str) -> bool {
+        self.segment_metas.contains_key(segment_id)
+    }
+
+    /// Get segment doc count
+    pub fn segment_doc_count(&self, segment_id: &str) -> Option<u32> {
+        self.segment_metas.get(segment_id).map(|m| m.num_docs)
     }
 
     /// Check if a field has been built
@@ -135,18 +171,6 @@ impl IndexMetadata {
         }
         // Build if we have enough vectors
         self.total_vectors >= threshold
-    }
-
-    /// Add a segment
-    pub fn add_segment(&mut self, segment_id: String) {
-        if !self.segments.contains(&segment_id) {
-            self.segments.push(segment_id);
-        }
-    }
-
-    /// Remove segments
-    pub fn remove_segments(&mut self, to_remove: &[String]) {
-        self.segments.retain(|s| !to_remove.contains(s));
     }
 
     /// Load from directory
@@ -222,7 +246,7 @@ mod tests {
     fn test_metadata_init() {
         let mut meta = IndexMetadata::new(test_schema());
         assert_eq!(meta.total_vectors, 0);
-        assert!(meta.segments.is_empty());
+        assert!(meta.segment_metas.is_empty());
         assert!(!meta.is_field_built(0));
 
         meta.init_field(0, VectorIndexType::IvfRaBitQ);
@@ -233,17 +257,21 @@ mod tests {
     #[test]
     fn test_metadata_segments() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.add_segment("abc123".to_string());
-        meta.add_segment("def456".to_string());
-        assert_eq!(meta.segments.len(), 2);
+        meta.add_segment("abc123".to_string(), 50);
+        meta.add_segment("def456".to_string(), 100);
+        assert_eq!(meta.segment_metas.len(), 2);
+        assert_eq!(meta.segment_doc_count("abc123"), Some(50));
+        assert_eq!(meta.segment_doc_count("def456"), Some(100));
 
-        // No duplicates
-        meta.add_segment("abc123".to_string());
-        assert_eq!(meta.segments.len(), 2);
+        // Overwrites existing
+        meta.add_segment("abc123".to_string(), 75);
+        assert_eq!(meta.segment_metas.len(), 2);
+        assert_eq!(meta.segment_doc_count("abc123"), Some(75));
 
-        meta.remove_segments(&["abc123".to_string()]);
-        assert_eq!(meta.segments.len(), 1);
-        assert_eq!(meta.segments[0], "def456");
+        meta.remove_segment("abc123");
+        assert_eq!(meta.segment_metas.len(), 1);
+        assert!(meta.has_segment("def456"));
+        assert!(!meta.has_segment("abc123"));
     }
 
     #[test]
@@ -285,14 +313,15 @@ mod tests {
     #[test]
     fn test_serialization() {
         let mut meta = IndexMetadata::new(test_schema());
-        meta.add_segment("seg1".to_string());
+        meta.add_segment("seg1".to_string(), 100);
         meta.init_field(0, VectorIndexType::IvfRaBitQ);
         meta.total_vectors = 5000;
 
         let json = serde_json::to_string_pretty(&meta).unwrap();
         let loaded: IndexMetadata = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(loaded.segments, meta.segments);
+        assert_eq!(loaded.segment_ids().len(), meta.segment_ids().len());
+        assert_eq!(loaded.segment_doc_count("seg1"), Some(100));
         assert_eq!(loaded.total_vectors, meta.total_vectors);
         assert!(loaded.vector_fields.contains_key(&0));
     }
