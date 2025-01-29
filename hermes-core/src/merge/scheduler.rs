@@ -37,6 +37,9 @@ use crate::segment::{SegmentMerger, SegmentReader};
 
 use super::{MergePolicy, SegmentInfo};
 
+/// Maximum number of concurrent merge operations
+const MAX_CONCURRENT_MERGES: usize = 2;
+
 /// Segment manager - coordinates segment registration and background merging
 ///
 /// This is the SOLE owner of `metadata.json` ensuring linearized access.
@@ -199,9 +202,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Spawn a background merge task
     fn spawn_merge(&self, segment_ids_to_merge: Vec<String>) {
-        // Mark segments as being merged
+        // Limit concurrent merges to avoid overwhelming the system during heavy indexing
+        if self.pending_merges.load(Ordering::SeqCst) >= MAX_CONCURRENT_MERGES {
+            return;
+        }
+
+        // Atomically check and mark segments as being merged
+        // This prevents race conditions where multiple maybe_merge calls
+        // could pick the same segments before they're marked
         {
             let mut merging = self.merging_segments.write();
+            // Check if any segment is already being merged
+            if segment_ids_to_merge.iter().any(|id| merging.contains(id)) {
+                // Some segment already being merged, skip this merge
+                return;
+            }
+            // Mark all segments as being merged
             for id in &segment_ids_to_merge {
                 merging.insert(id.clone());
             }
