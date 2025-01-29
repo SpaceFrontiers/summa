@@ -329,7 +329,7 @@ impl IpfsIndex {
             .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
 
         let schema = Arc::new(metadata.schema.clone());
-        let segment_ids = metadata.segments.clone();
+        let segment_ids = metadata.segment_ids();
 
         // Create Searcher directly
         let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
@@ -401,7 +401,7 @@ impl IpfsIndex {
             .map_err(|e| JsValue::from_str(&format!("Failed to load metadata: {}", e)))?;
 
         let schema = Arc::new(metadata.schema.clone());
-        let segment_ids = metadata.segments.clone();
+        let segment_ids = metadata.segment_ids();
 
         // Create Searcher directly
         let searcher = Searcher::open(Arc::clone(&cached_dir), schema, &segment_ids, 32)
