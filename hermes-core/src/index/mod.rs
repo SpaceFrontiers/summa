@@ -978,7 +978,7 @@ mod tests {
 
         // Verify centroids were trained (auto-triggered)
         assert!(
-            writer.is_vector_index_built(embedding).await,
+            writer.is_vector_index_built(embedding),
             "Vector index should be built after crossing threshold"
         );
 
@@ -1012,6 +1012,6 @@ mod tests {
         writer.build_vector_index().await.unwrap(); // Should skip training
 
         // Still built
-        assert!(writer.is_vector_index_built(embedding).await);
+        assert!(writer.is_vector_index_built(embedding));
     }
 }

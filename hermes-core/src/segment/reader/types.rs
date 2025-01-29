@@ -105,30 +105,7 @@ impl SparseIndex {
         Ok(SparseBlock::read(&mut Cursor::new(data.as_slice()))?)
     }
 
-    /// Load block synchronously (for merger)
-    #[cfg(feature = "native")]
-    fn load_block_blocking(
-        &self,
-        dim: &DimensionEntry,
-        block_idx: usize,
-    ) -> crate::Result<SparseBlock> {
-        let entry = &dim.skip_entries[block_idx];
-        let abs_offset = dim.data_offset + entry.offset as u64;
-        let handle = self.handle.clone();
-
-        let data = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                handle
-                    .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
-                    .await
-            })
-        })
-        .map_err(crate::Error::Io)?;
-
-        Ok(SparseBlock::read(&mut Cursor::new(data.as_slice()))?)
-    }
-
-    /// Get posting list for a dimension (loads all blocks - for compatibility)
+    /// Get posting list for a dimension (loads all blocks via mmap)
     pub async fn get_posting(
         &self,
         dim_id: u32,
@@ -210,29 +187,6 @@ impl SparseIndex {
     /// Get IDF weights for multiple dimensions
     pub fn idf_weights(&self, dim_ids: &[u32]) -> Vec<f32> {
         dim_ids.iter().map(|&d| self.idf(d)).collect()
-    }
-
-    /// Get posting list synchronously (blocking) - for merger
-    #[cfg(feature = "native")]
-    pub fn get_posting_blocking(
-        &self,
-        dim_id: u32,
-    ) -> crate::Result<Option<Arc<BlockSparsePostingList>>> {
-        let dim = match self.get_dimension(dim_id) {
-            Some(d) => d.clone(),
-            None => return Ok(None),
-        };
-
-        let mut blocks = Vec::with_capacity(dim.skip_entries.len());
-        for i in 0..dim.skip_entries.len() {
-            let block = self.load_block_blocking(&dim, i)?;
-            blocks.push(block);
-        }
-
-        Ok(Some(Arc::new(BlockSparsePostingList {
-            doc_count: dim.doc_count,
-            blocks,
-        })))
     }
 }
 

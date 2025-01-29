@@ -83,7 +83,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         trained_codebooks: &FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Searcher<D>> {
-        // Use SegmentManager's acquire_snapshot - this locks metadata and tracker together
+        // Use SegmentManager's acquire_snapshot - non-blocking RwLock read
         let snapshot = segment_manager.acquire_snapshot().await;
 
         Searcher::from_snapshot(
@@ -114,7 +114,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             // Update check time first to avoid concurrent checks
             *self.last_reload_check.write() = std::time::Instant::now();
 
-            // Get current segment IDs from segment manager
+            // Get current segment IDs from segment manager (non-blocking)
             let new_segment_ids = self.segment_manager.get_segment_ids().await;
 
             // Check if segments actually changed

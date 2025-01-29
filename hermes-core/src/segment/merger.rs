@@ -799,7 +799,7 @@ impl SegmentMerger {
 
                 for (seg_idx, segment) in segments.iter().enumerate() {
                     if let Some(sparse_index) = segment.sparse_indexes().get(&field.0)
-                        && let Ok(Some(posting_list)) = sparse_index.get_posting_blocking(dim_id)
+                        && let Ok(Some(posting_list)) = sparse_index.get_posting(dim_id).await
                     {
                         log::trace!(
                             "Sparse merge dim={}: seg={} offset={} doc_count={} blocks={}",

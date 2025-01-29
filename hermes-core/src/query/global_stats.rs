@@ -169,22 +169,7 @@ impl LazyGlobalStats {
     }
 
     /// Compute document frequency for a sparse dimension (not cached - internal)
-    #[cfg(feature = "native")]
-    fn compute_sparse_df(&self, field: Field, dim_id: u32) -> u64 {
-        let mut df = 0u64;
-        for segment in &self.segments {
-            if let Some(sparse_index) = segment.sparse_indexes().get(&field.0)
-                && let Ok(Some(posting)) = sparse_index.get_posting_blocking(dim_id)
-            {
-                df += posting.doc_count() as u64;
-            }
-        }
-        df
-    }
-
-    /// Compute document frequency for a sparse dimension (not cached - internal)
     /// Uses skip list metadata - no I/O needed
-    #[cfg(not(feature = "native"))]
     fn compute_sparse_df(&self, field: Field, dim_id: u32) -> u64 {
         let mut df = 0u64;
         for segment in &self.segments {

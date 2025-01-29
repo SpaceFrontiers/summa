@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{Notify, RwLock};
 
 use crate::directories::DirectoryWriter;
 use crate::error::{Error, Result};
@@ -40,19 +40,23 @@ use super::{MergePolicy, SegmentInfo};
 ///
 /// This is the SOLE owner of `metadata.json` ensuring linearized access.
 /// All segment list modifications and metadata updates go through here.
+///
+/// Uses RwLock for metadata to allow concurrent reads (search) while
+/// writes (indexing/merge) get exclusive access.
 pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Directory for segment operations
     directory: Arc<D>,
     /// Schema for segment operations
     schema: Arc<crate::dsl::Schema>,
     /// Unified metadata (segments + vector index state) - SOLE owner
-    metadata: Arc<AsyncMutex<IndexMetadata>>,
+    /// RwLock allows concurrent reads, exclusive writes
+    metadata: Arc<RwLock<IndexMetadata>>,
     /// The merge policy to use
     merge_policy: Box<dyn MergePolicy>,
     /// Count of in-flight background merges
     pending_merges: Arc<AtomicUsize>,
     /// Segments currently being merged (to avoid double-merging)
-    merging_segments: Arc<AsyncMutex<HashSet<String>>>,
+    merging_segments: Arc<RwLock<HashSet<String>>>,
     /// Term cache blocks for segment readers during merge
     term_cache_blocks: usize,
     /// Notifier for merge completion (avoids busy-waiting)
@@ -79,10 +83,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Self {
             directory,
             schema,
-            metadata: Arc::new(AsyncMutex::new(metadata)),
+            metadata: Arc::new(RwLock::new(metadata)),
             merge_policy,
             pending_merges: Arc::new(AtomicUsize::new(0)),
-            merging_segments: Arc::new(AsyncMutex::new(HashSet::new())),
+            merging_segments: Arc::new(RwLock::new(HashSet::new())),
             term_cache_blocks,
             merge_complete: Arc::new(Notify::new()),
             tracker,
@@ -91,7 +95,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Get the current segment IDs (snapshot)
     pub async fn get_segment_ids(&self) -> Vec<String> {
-        self.metadata.lock().await.segments.clone()
+        self.metadata.read().await.segments.clone()
     }
 
     /// Get the number of pending background merges
@@ -100,7 +104,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Get a clone of the metadata Arc for read access
-    pub fn metadata(&self) -> Arc<AsyncMutex<IndexMetadata>> {
+    pub fn metadata(&self) -> Arc<RwLock<IndexMetadata>> {
         Arc::clone(&self.metadata)
     }
 
@@ -109,7 +113,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     where
         F: FnOnce(&mut IndexMetadata),
     {
-        let mut meta = self.metadata.lock().await;
+        let mut meta = self.metadata.write().await;
         f(&mut meta);
         meta.save(self.directory.as_ref()).await
     }
@@ -117,9 +121,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Acquire a snapshot of current segments for reading
     /// The snapshot holds references - segments won't be deleted while snapshot exists
     pub async fn acquire_snapshot(&self) -> SegmentSnapshot<D> {
-        let meta = self.metadata.lock().await;
-        let acquired = self.tracker.acquire(&meta.segments);
-        drop(meta);
+        let acquired = {
+            let meta = self.metadata.read().await;
+            self.tracker.acquire(&meta.segments)
+        };
 
         SegmentSnapshot::new(
             Arc::clone(&self.tracker),
@@ -147,7 +152,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// This is the main entry point for adding segments after builds complete.
     pub async fn register_segment(&self, segment_id: String) -> Result<()> {
         {
-            let mut meta = self.metadata.lock().await;
+            let mut meta = self.metadata.write().await;
             if !meta.segments.contains(&segment_id) {
                 meta.segments.push(segment_id.clone());
                 self.tracker.register(&segment_id);
@@ -163,19 +168,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Check merge policy and spawn background merges if needed
     pub async fn maybe_merge(&self) {
         // Get current segment info (excluding segments being merged or pending deletion)
-        let meta = self.metadata.lock().await;
-        let merging = self.merging_segments.lock().await;
+        let available_segments: Vec<String> = {
+            let meta = self.metadata.read().await;
+            let merging = self.merging_segments.read();
 
-        // Filter out segments currently being merged or pending deletion
-        let available_segments: Vec<String> = meta
-            .segments
-            .iter()
-            .filter(|id| !merging.contains(*id) && !self.tracker.is_pending_deletion(id))
-            .cloned()
-            .collect();
-
-        drop(merging);
-        drop(meta);
+            // Filter out segments currently being merged or pending deletion
+            meta.segments
+                .iter()
+                .filter(|id| !merging.contains(*id) && !self.tracker.is_pending_deletion(id))
+                .cloned()
+                .collect()
+        };
 
         // Build segment info - we estimate doc count based on segment age (newer = smaller)
         let segments: Vec<SegmentInfo> = available_segments
@@ -193,16 +196,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         for candidate in candidates {
             if candidate.segment_ids.len() >= 2 {
-                self.spawn_merge(candidate.segment_ids).await;
+                self.spawn_merge(candidate.segment_ids);
             }
         }
     }
 
     /// Spawn a background merge task
-    async fn spawn_merge(&self, segment_ids_to_merge: Vec<String>) {
+    fn spawn_merge(&self, segment_ids_to_merge: Vec<String>) {
         // Mark segments as being merged
         {
-            let mut merging = self.merging_segments.lock().await;
+            let mut merging = self.merging_segments.write();
             for id in &segment_ids_to_merge {
                 merging.insert(id.clone());
             }
@@ -233,15 +236,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     // Register new segment with tracker
                     tracker.register(&new_segment_id);
 
-                    // Atomically update metadata: remove merged segments, add new one, persist
-                    let mut meta = metadata.lock().await;
-                    meta.segments
-                        .retain(|id| !segment_ids_to_merge.contains(id));
-                    meta.segments.push(new_segment_id);
-                    if let Err(e) = meta.save(directory.as_ref()).await {
-                        eprintln!("[merge] Failed to save metadata after merge: {:?}", e);
+                    // Atomically update metadata: remove merged segments, add new one
+                    {
+                        let mut meta = metadata.write().await;
+                        meta.segments
+                            .retain(|id| !segment_ids_to_merge.contains(id));
+                        meta.segments.push(new_segment_id);
+                        if let Err(e) = meta.save(directory.as_ref()).await {
+                            eprintln!("[merge] Failed to save metadata after merge: {:?}", e);
+                        }
                     }
-                    drop(meta);
 
                     // Mark old segments for deletion via tracker (deferred if refs exist)
                     let ready_to_delete = tracker.mark_for_deletion(&segment_ids_to_merge);
@@ -259,9 +263,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
 
             // Remove from merging set
-            let mut merging = merging_segments.lock().await;
-            for id in &segment_ids_to_merge {
-                merging.remove(id);
+            {
+                let mut merging = merging_segments.write();
+                for id in &segment_ids_to_merge {
+                    merging.remove(id);
+                }
             }
 
             // Decrement pending merges counter and notify waiters
@@ -339,7 +345,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
 
         {
-            let mut meta = self.metadata.lock().await;
+            let mut meta = self.metadata.write().await;
             meta.segments = new_segments;
             meta.save(self.directory.as_ref()).await?;
         }
@@ -361,7 +367,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Returns the number of orphan segments deleted.
     pub async fn cleanup_orphan_segments(&self) -> Result<usize> {
         let registered_set: HashSet<String> = {
-            let meta = self.metadata.lock().await;
+            let meta = self.metadata.read().await;
             meta.segments.iter().cloned().collect()
         };
 

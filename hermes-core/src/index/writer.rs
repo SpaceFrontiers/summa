@@ -591,7 +591,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Merge all segments into one (called explicitly via force_merge)
     async fn do_merge(&self) -> Result<()> {
-        let segment_ids = self.segment_manager.get_segment_ids().await;
+        let segment_ids = self.segment_manager.get_segment_ids();
 
         if segment_ids.len() < 2 {
             return Ok(());

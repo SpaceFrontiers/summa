@@ -31,7 +31,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Update total in metadata and check if any field should be built
         let should_build = {
             let metadata_arc = self.segment_manager.metadata();
-            let mut meta = metadata_arc.lock().await;
+            let mut meta = metadata_arc.write().await;
             meta.total_vectors = total_vectors;
             dense_fields.iter().any(|(field, config)| {
                 let threshold = config.build_threshold.unwrap_or(1000);
@@ -110,7 +110,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Load trained structures from metadata
         let (trained_centroids, trained_codebooks) = {
             let metadata_arc = self.segment_manager.metadata();
-            let meta = metadata_arc.lock().await;
+            let meta = metadata_arc.read().await;
             meta.load_trained_structures(self.directory.as_ref()).await
         };
 
@@ -146,13 +146,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Get total vector count across all segments (for threshold checking)
     pub async fn total_vector_count(&self) -> usize {
         let metadata_arc = self.segment_manager.metadata();
-        metadata_arc.lock().await.total_vectors
+        metadata_arc.read().await.total_vectors
     }
 
     /// Check if vector index has been built for a field
     pub async fn is_vector_index_built(&self, field: Field) -> bool {
         let metadata_arc = self.segment_manager.metadata();
-        metadata_arc.lock().await.is_field_built(field.0)
+        metadata_arc.read().await.is_field_built(field.0)
     }
 
     /// Rebuild vector index by retraining centroids/codebooks
@@ -181,9 +181,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
 
         // Collect files to delete and reset fields to Flat state
-        let files_to_delete: Vec<String> = {
+        let files_to_delete = {
             let metadata_arc = self.segment_manager.metadata();
-            let mut meta = metadata_arc.lock().await;
+            let mut meta = metadata_arc.write().await;
             let mut files = Vec::new();
             for field in &dense_fields {
                 if let Some(field_meta) = meta.vector_fields.get_mut(&field.0) {
@@ -241,7 +241,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         dense_fields: &[(Field, DenseVectorConfig)],
     ) -> Vec<(Field, DenseVectorConfig)> {
         let metadata_arc = self.segment_manager.metadata();
-        let meta = metadata_arc.lock().await;
+        let meta = metadata_arc.read().await;
         dense_fields
             .iter()
             .filter(|(field, _)| !meta.is_field_built(field.0))
