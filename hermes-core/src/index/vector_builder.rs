@@ -24,6 +24,19 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Ok(());
         }
 
+        // Quick check: if all fields are already built, skip entirely
+        // This avoids loading segments just to count vectors when index is already built
+        let all_built = {
+            let metadata_arc = self.segment_manager.metadata();
+            let meta = metadata_arc.read().await;
+            dense_fields
+                .iter()
+                .all(|(field, _)| meta.is_field_built(field.0))
+        };
+        if all_built {
+            return Ok(());
+        }
+
         // Count total vectors across all segments
         let segment_ids = self.segment_manager.get_segment_ids().await;
         let total_vectors = self.count_flat_vectors(&segment_ids).await;
@@ -250,20 +263,32 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     }
 
     /// Count flat vectors across all segments
+    /// Only loads segments that have a vectors file to avoid unnecessary I/O
     async fn count_flat_vectors(&self, segment_ids: &[String]) -> usize {
         let mut total_vectors = 0usize;
         let mut doc_offset = 0u32;
 
         for id_str in segment_ids {
-            if let Some(segment_id) = SegmentId::from_hex(id_str)
-                && let Ok(reader) = SegmentReader::open(
-                    self.directory.as_ref(),
-                    segment_id,
-                    Arc::clone(&self.schema),
-                    doc_offset,
-                    self.config.term_cache_blocks,
-                )
-                .await
+            let Some(segment_id) = SegmentId::from_hex(id_str) else {
+                continue;
+            };
+
+            // Quick check: skip segments without vectors file
+            let files = crate::segment::SegmentFiles::new(segment_id.0);
+            if !self.directory.exists(&files.vectors).await.unwrap_or(false) {
+                // No vectors file - segment has no vectors, skip loading
+                continue;
+            }
+
+            // Only load segments that have vectors
+            if let Ok(reader) = SegmentReader::open(
+                self.directory.as_ref(),
+                segment_id,
+                Arc::clone(&self.schema),
+                doc_offset,
+                self.config.term_cache_blocks,
+            )
+            .await
             {
                 for index in reader.vector_indexes().values() {
                     if let crate::segment::VectorIndex::Flat(flat_data) = index {
