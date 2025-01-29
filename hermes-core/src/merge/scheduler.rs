@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use parking_lot::RwLock as SyncRwLock;
 use tokio::sync::{Notify, RwLock};
 
 use crate::directories::DirectoryWriter;
@@ -56,7 +57,7 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Count of in-flight background merges
     pending_merges: Arc<AtomicUsize>,
     /// Segments currently being merged (to avoid double-merging)
-    merging_segments: Arc<RwLock<HashSet<String>>>,
+    merging_segments: Arc<SyncRwLock<HashSet<String>>>,
     /// Term cache blocks for segment readers during merge
     term_cache_blocks: usize,
     /// Notifier for merge completion (avoids busy-waiting)
@@ -86,7 +87,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             metadata: Arc::new(RwLock::new(metadata)),
             merge_policy,
             pending_merges: Arc::new(AtomicUsize::new(0)),
-            merging_segments: Arc::new(RwLock::new(HashSet::new())),
+            merging_segments: Arc::new(SyncRwLock::new(HashSet::new())),
             term_cache_blocks,
             merge_complete: Arc::new(Notify::new()),
             tracker,

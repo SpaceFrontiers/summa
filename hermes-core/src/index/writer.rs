@@ -591,14 +591,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Merge all segments into one (called explicitly via force_merge)
     async fn do_merge(&self) -> Result<()> {
-        let segment_ids = self.segment_manager.get_segment_ids();
+        let segment_ids = self.segment_manager.get_segment_ids().await;
 
         if segment_ids.len() < 2 {
             return Ok(());
         }
 
-        let ids_to_merge: Vec<String> = segment_ids.clone();
-        drop(segment_ids);
+        let ids_to_merge: Vec<String> = segment_ids;
 
         // Load segment readers
         let mut readers = Vec::new();
