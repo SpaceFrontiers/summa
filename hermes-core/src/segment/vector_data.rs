@@ -12,6 +12,22 @@ pub struct FlatVectorData {
     pub doc_ids: Vec<(u32, u16)>,
 }
 
+impl FlatVectorData {
+    /// Estimate memory usage
+    pub fn estimated_memory_bytes(&self) -> usize {
+        // Vec<Vec<f32>>: each inner vec has capacity * 4 bytes + Vec overhead
+        let vec_overhead = std::mem::size_of::<Vec<f32>>();
+        let vectors_bytes: usize = self
+            .vectors
+            .iter()
+            .map(|v| v.capacity() * 4 + vec_overhead)
+            .sum();
+        // doc_ids: (u32, u16) = 6 bytes + padding = 8 bytes each
+        let doc_ids_bytes = self.doc_ids.capacity() * 8;
+        vectors_bytes + doc_ids_bytes + vec_overhead * 2
+    }
+}
+
 /// IVF-RaBitQ index data with embedded centroids and codebook
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IVFRaBitQIndexData {

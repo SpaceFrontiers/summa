@@ -5,6 +5,36 @@ mod types;
 
 pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
 
+/// Memory statistics for a single segment
+#[derive(Debug, Clone, Default)]
+pub struct SegmentMemoryStats {
+    /// Segment ID
+    pub segment_id: u128,
+    /// Number of documents in segment
+    pub num_docs: u32,
+    /// Term dictionary block cache bytes
+    pub term_dict_cache_bytes: usize,
+    /// Document store block cache bytes
+    pub store_cache_bytes: usize,
+    /// Sparse vector index bytes (in-memory posting lists)
+    pub sparse_index_bytes: usize,
+    /// Dense vector index bytes (cluster assignments, quantized codes)
+    pub dense_index_bytes: usize,
+    /// Bloom filter bytes
+    pub bloom_filter_bytes: usize,
+}
+
+impl SegmentMemoryStats {
+    /// Total estimated memory for this segment
+    pub fn total_bytes(&self) -> usize {
+        self.term_dict_cache_bytes
+            + self.store_cache_bytes
+            + self.sparse_index_bytes
+            + self.dense_index_bytes
+            + self.bloom_filter_bytes
+    }
+}
+
 use crate::structures::BlockSparsePostingList;
 
 use std::sync::Arc;
@@ -151,6 +181,43 @@ impl AsyncSegmentReader {
     /// Get term dictionary stats for debugging
     pub fn term_dict_stats(&self) -> SSTableStats {
         self.term_dict.stats()
+    }
+
+    /// Estimate memory usage of this segment reader
+    pub fn memory_stats(&self) -> SegmentMemoryStats {
+        let term_dict_stats = self.term_dict.stats();
+
+        // Term dict cache: num_blocks * avg_block_size (estimate 4KB per cached block)
+        let term_dict_cache_bytes = self.term_dict.cached_blocks() * 4096;
+
+        // Store cache: similar estimate
+        let store_cache_bytes = self.store.cached_blocks() * 4096;
+
+        // Sparse index: each dimension has a posting list in memory
+        // Estimate: ~24 bytes per active dimension (HashMap entry overhead)
+        let sparse_index_bytes: usize = self
+            .sparse_indexes
+            .values()
+            .map(|s| s.num_dimensions() * 24)
+            .sum();
+
+        // Dense index: vectors are memory-mapped, but we track index structures
+        // RaBitQ/IVF indexes have cluster assignments in memory
+        let dense_index_bytes: usize = self
+            .vector_indexes
+            .values()
+            .map(|v| v.estimated_memory_bytes())
+            .sum();
+
+        SegmentMemoryStats {
+            segment_id: self.meta.id,
+            num_docs: self.meta.num_docs,
+            term_dict_cache_bytes,
+            store_cache_bytes,
+            sparse_index_bytes,
+            dense_index_bytes,
+            bloom_filter_bytes: term_dict_stats.bloom_filter_size,
+        }
     }
 
     /// Get posting list for a term (async - loads on demand)

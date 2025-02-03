@@ -445,6 +445,23 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     if let Some(b) = builder.take()
                         && b.num_docs() > 0
                     {
+                        // Log detailed memory breakdown on flush
+                        let stats = b.stats();
+                        let mb = stats.memory_breakdown;
+                        log::info!(
+                            "[indexing_flush] docs={}, total_mem={:.2} MB, \
+                             postings={:.2} MB, sparse={:.2} MB, dense={:.2} MB ({} vectors), \
+                             interner={:.2} MB, positions={:.2} MB, unique_terms={}",
+                            b.num_docs(),
+                            stats.estimated_memory_bytes as f64 / (1024.0 * 1024.0),
+                            mb.postings_bytes as f64 / (1024.0 * 1024.0),
+                            mb.sparse_vectors_bytes as f64 / (1024.0 * 1024.0),
+                            mb.dense_vectors_bytes as f64 / (1024.0 * 1024.0),
+                            mb.dense_vector_count,
+                            mb.interner_bytes as f64 / (1024.0 * 1024.0),
+                            mb.position_index_bytes as f64 / (1024.0 * 1024.0),
+                            stats.unique_terms,
+                        );
                         Self::spawn_segment_build(&state, b);
                     }
                     _doc_count = 0;
@@ -462,17 +479,40 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let segment_manager = Arc::clone(&state.segment_manager);
         let pending_builds = Arc::clone(&state.pending_builds);
 
+        let doc_count = builder.num_docs();
+        let memory_bytes = builder.estimated_memory_bytes();
+
+        log::info!(
+            "[segment_build_started] segment_id={} doc_count={} memory_bytes={}",
+            segment_hex,
+            doc_count,
+            memory_bytes
+        );
+
         pending_builds.fetch_add(1, Ordering::SeqCst);
 
         tokio::spawn(async move {
+            let build_start = std::time::Instant::now();
             match builder.build(directory.as_ref(), segment_id).await {
                 Ok(meta) => {
+                    let build_duration_ms = build_start.elapsed().as_millis() as u64;
+                    log::info!(
+                        "[segment_build_completed] segment_id={} doc_count={} duration_ms={}",
+                        segment_hex,
+                        meta.num_docs,
+                        build_duration_ms
+                    );
                     // Register segment with its doc count (avoids loading segment for merge decisions)
                     let _ = segment_manager
                         .register_segment(segment_hex.clone(), meta.num_docs)
                         .await;
                 }
                 Err(e) => {
+                    log::error!(
+                        "[segment_build_failed] segment_id={} error={}",
+                        segment_hex,
+                        e
+                    );
                     eprintln!("Background segment build failed: {:?}", e);
                 }
             }

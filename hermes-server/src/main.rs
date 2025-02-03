@@ -49,12 +49,19 @@ struct Args {
     /// Number of parallel indexing threads (defaults to CPU count)
     #[arg(long)]
     indexing_threads: Option<usize>,
+
+    /// Reload interval in milliseconds for searcher to check for new segments
+    /// Higher values reduce reload overhead during heavy indexing
+    #[arg(long, default_value = "1000")]
+    reload_interval_ms: u64,
 }
 
 /// Index registry holding all open indexes
 struct IndexRegistry {
     /// Open indexes (Index is the central concept)
     indexes: RwLock<HashMap<String, Arc<Index<FsDirectory>>>>,
+    /// Cached writers - one per index, reused across requests to avoid segment fragmentation
+    writers: RwLock<HashMap<String, Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>>>,
     data_dir: PathBuf,
     config: IndexConfig,
 }
@@ -63,6 +70,7 @@ impl IndexRegistry {
     fn new(data_dir: PathBuf, config: IndexConfig) -> Self {
         Self {
             indexes: RwLock::new(HashMap::new()),
+            writers: RwLock::new(HashMap::new()),
             data_dir,
             config,
         }
@@ -112,10 +120,38 @@ impl IndexRegistry {
             .await
             .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
 
+        let index = Arc::new(index);
+        let writer = Arc::new(tokio::sync::Mutex::new(index.writer()));
+
         self.indexes
             .write()
-            .insert(name.to_string(), Arc::new(index));
+            .insert(name.to_string(), Arc::clone(&index));
+        self.writers.write().insert(name.to_string(), writer);
         Ok(())
+    }
+
+    /// Get or create a cached writer for an index
+    async fn get_writer(
+        &self,
+        name: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>, Status> {
+        // Check if writer already exists
+        if let Some(writer) = self.writers.read().get(name) {
+            return Ok(Arc::clone(writer));
+        }
+
+        // Need to create writer - first ensure index is open
+        let index = self.get_or_open_index(name).await?;
+
+        // Double-check and create writer if needed
+        let mut writers = self.writers.write();
+        if let Some(writer) = writers.get(name) {
+            return Ok(Arc::clone(writer));
+        }
+
+        let writer = Arc::new(tokio::sync::Mutex::new(index.writer()));
+        writers.insert(name.to_string(), Arc::clone(&writer));
+        Ok(writer)
     }
 }
 
@@ -258,11 +294,44 @@ impl SearchService for SearchServiceImpl {
         // Convert schema to SDL string
         let schema_str = schema_to_sdl(index.schema());
 
+        // Collect memory stats from segment readers
+        let mut total_term_dict_cache = 0u64;
+        let mut total_store_cache = 0u64;
+        let mut total_sparse_index = 0u64;
+        let mut total_dense_index = 0u64;
+
+        for segment in searcher.segment_readers() {
+            let stats = segment.memory_stats();
+            total_term_dict_cache += stats.term_dict_cache_bytes as u64;
+            total_store_cache += stats.store_cache_bytes as u64;
+            total_sparse_index += stats.sparse_index_bytes as u64;
+            total_dense_index += stats.dense_index_bytes as u64;
+        }
+
+        let segment_reader_stats = SegmentReaderStats {
+            total_bytes: total_term_dict_cache
+                + total_store_cache
+                + total_sparse_index
+                + total_dense_index,
+            term_dict_cache_bytes: total_term_dict_cache,
+            store_cache_bytes: total_store_cache,
+            sparse_index_bytes: total_sparse_index,
+            dense_index_bytes: total_dense_index,
+            num_segments_loaded: searcher.segment_readers().len() as u32,
+        };
+
+        let memory_stats = MemoryStats {
+            total_bytes: segment_reader_stats.total_bytes,
+            indexing_buffer: None, // Writer stats not available from reader
+            segment_reader: Some(segment_reader_stats),
+        };
+
         Ok(Response::new(GetIndexInfoResponse {
             index_name: req.index_name,
             num_docs: searcher.num_docs(),
             num_segments: searcher.segment_readers().len() as u32,
             schema: schema_str,
+            memory_stats: Some(memory_stats),
         }))
     }
 }
@@ -301,7 +370,7 @@ impl IndexService for IndexServiceImpl {
         let req = request.into_inner();
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
-        let writer = index.writer();
+        let writer = self.registry.get_writer(&req.index_name).await?;
         let schema = index.schema();
 
         // Convert all documents first (this is CPU-bound, could be parallelized further)
@@ -315,10 +384,12 @@ impl IndexService for IndexServiceImpl {
             }
         }
 
-        // Use batch method for parallel document indexing
-        // IndexWriter is internally thread-safe, no external lock needed
+        // Use cached writer - lock only for the add_documents call
         let doc_count = documents.len() as u32;
-        let indexed_count = writer.add_documents(documents).unwrap_or(0) as u32;
+        let indexed_count = {
+            let w = writer.lock().await;
+            w.add_documents(documents).unwrap_or(0) as u32
+        };
         let index_errors = doc_count - indexed_count;
 
         let error_count = conversion_errors + index_errors;
@@ -343,25 +414,31 @@ impl IndexService for IndexServiceImpl {
         let mut stream = request.into_inner();
         let mut indexed_count = 0u32;
         let mut current_index: Option<Arc<Index<FsDirectory>>> = None;
-        let mut writer: Option<IndexWriter<FsDirectory>> = None;
+        let mut current_writer: Option<Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>> = None;
+        let mut current_index_name: Option<String> = None;
 
         while let Some(req) = stream.message().await? {
             // Get or switch index/writer if index changed
-            let needs_switch = current_index.is_none();
+            let needs_switch = current_index_name.as_ref() != Some(&req.index_name);
 
             if needs_switch {
                 let index = self.registry.get_or_open_index(&req.index_name).await?;
-                writer = Some(index.writer());
+                let writer = self.registry.get_writer(&req.index_name).await?;
                 current_index = Some(index);
+                current_writer = Some(writer);
+                current_index_name = Some(req.index_name.clone());
             }
 
-            let w = writer.as_ref().unwrap();
+            let writer = current_writer.as_ref().unwrap();
             let index = current_index.as_ref().unwrap();
 
             let doc = convert_proto_to_document(&req.fields, index.schema())
                 .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
 
-            w.add_document(doc)
+            writer
+                .lock()
+                .await
+                .add_document(doc)
                 .map_err(|e| Status::internal(format!("Failed to index document: {}", e)))?;
 
             indexed_count += 1;
@@ -376,9 +453,11 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<CommitResponse>, Status> {
         let req = request.into_inner();
         let index = self.registry.get_or_open_index(&req.index_name).await?;
-        let writer = index.writer();
+        let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
+            .lock()
+            .await
             .commit()
             .await
             .map_err(|e| Status::internal(format!("Commit failed: {}", e)))?;
@@ -407,9 +486,11 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<ForceMergeResponse>, Status> {
         let req = request.into_inner();
         let index = self.registry.get_or_open_index(&req.index_name).await?;
-        let writer = index.writer();
+        let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
+            .lock()
+            .await
             .force_merge()
             .await
             .map_err(|e| Status::internal(format!("Merge failed: {}", e)))?;
@@ -439,12 +520,13 @@ impl IndexService for IndexServiceImpl {
         let req = request.into_inner();
 
         // Wait for any pending merges to complete before deleting
-        let index_to_wait = self.registry.indexes.read().get(&req.index_name).cloned();
-        if let Some(index) = index_to_wait {
-            index.writer().wait_for_merges().await;
+        let writer_to_wait = self.registry.writers.read().get(&req.index_name).cloned();
+        if let Some(writer) = writer_to_wait {
+            writer.lock().await.wait_for_merges().await;
         }
 
-        // Remove from registry
+        // Remove writer and index from registry
+        self.registry.writers.write().remove(&req.index_name);
         self.registry.indexes.write().remove(&req.index_name);
 
         // Delete directory
@@ -490,6 +572,7 @@ async fn main() -> Result<()> {
     let config = IndexConfig {
         max_indexing_memory_bytes: args.max_indexing_memory_mb * 1024 * 1024,
         num_indexing_threads,
+        reload_interval_ms: args.reload_interval_ms,
         ..Default::default()
     };
 
@@ -507,6 +590,7 @@ async fn main() -> Result<()> {
     info!("Data directory: {:?}", args.data_dir);
     info!("Max indexing memory: {} MB", args.max_indexing_memory_mb);
     info!("Indexing threads: {}", num_indexing_threads);
+    info!("Reload interval: {} ms", args.reload_interval_ms);
 
     // 256 MB limit for large batch index operations
     const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;

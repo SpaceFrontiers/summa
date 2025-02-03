@@ -49,6 +49,26 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
+        Self::from_segment_manager_with_reload_interval(
+            schema,
+            segment_manager,
+            trained_centroids,
+            trained_codebooks,
+            term_cache_blocks,
+            1000, // default 1 second
+        )
+        .await
+    }
+
+    /// Create a new searcher from a segment manager with custom reload interval
+    pub async fn from_segment_manager_with_reload_interval(
+        schema: Arc<Schema>,
+        segment_manager: Arc<crate::merge::SegmentManager<D>>,
+        trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
+        trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
+        term_cache_blocks: usize,
+        reload_interval_ms: u64,
+    ) -> Result<Self> {
         // Get initial segment IDs
         let initial_segment_ids = segment_manager.get_segment_ids().await;
 
@@ -69,7 +89,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             trained_codebooks,
             term_cache_blocks,
             last_reload_check: RwLock::new(std::time::Instant::now()),
-            reload_check_interval: std::time::Duration::from_secs(1),
+            reload_check_interval: std::time::Duration::from_millis(reload_interval_ms),
             current_segment_ids: RwLock::new(initial_segment_ids),
         })
     }
@@ -124,10 +144,12 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             };
 
             if segments_changed {
-                log::debug!(
-                    "Segments changed, reloading searcher ({} -> {} segments)",
-                    self.current_segment_ids.read().len(),
-                    new_segment_ids.len()
+                let old_count = self.current_segment_ids.read().len();
+                let new_count = new_segment_ids.len();
+                log::info!(
+                    "[index_reload] old_count={} new_count={}",
+                    old_count,
+                    new_count
                 );
                 self.reload_with_segments(new_segment_ids).await?;
             }

@@ -269,6 +269,11 @@ impl IVFRaBitQIndex {
         self.clusters.is_empty()
     }
 
+    /// Estimated memory usage in bytes
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.clusters.estimated_memory_bytes()
+    }
+
     /// Number of non-empty clusters
     pub fn num_clusters(&self) -> usize {
         self.clusters.num_clusters()

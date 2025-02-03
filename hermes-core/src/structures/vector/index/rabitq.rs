@@ -191,6 +191,11 @@ impl RaBitQIndex {
         vectors_size + centroid_size + doc_ids_size + ordinals_size + codebook_size + raw_size
     }
 
+    /// Estimated memory usage in bytes (alias for size_bytes)
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.size_bytes()
+    }
+
     /// Compression ratio compared to raw float32 vectors
     pub fn compression_ratio(&self) -> f32 {
         if self.vectors.is_empty() {

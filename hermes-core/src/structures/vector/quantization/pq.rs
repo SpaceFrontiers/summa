@@ -882,6 +882,11 @@ impl PQCodebook {
             .unwrap_or(0);
         centroids_size + norms_size + rotation_size + 64
     }
+
+    /// Estimated memory usage in bytes (alias for size_bytes)
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.size_bytes()
+    }
 }
 
 /// Precomputed distance table for fast asymmetric distance computation

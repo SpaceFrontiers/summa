@@ -252,6 +252,11 @@ impl<C: Clone + QuantizedCode> ClusterStorage<C> {
     pub fn size_bytes(&self) -> usize {
         self.clusters.values().map(|c| c.size_bytes()).sum()
     }
+
+    /// Estimated memory usage in bytes (alias for size_bytes)
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.size_bytes()
+    }
 }
 
 #[cfg(test)]

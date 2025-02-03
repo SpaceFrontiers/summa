@@ -1030,6 +1030,11 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         }
     }
 
+    /// Number of blocks currently in the cache
+    pub fn cached_blocks(&self) -> usize {
+        self.cache.read().blocks.len()
+    }
+
     /// Look up a key (async - may need to load block)
     ///
     /// Uses bloom filter for fast negative lookups, then memory-efficient

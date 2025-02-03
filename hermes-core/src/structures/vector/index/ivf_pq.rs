@@ -299,6 +299,11 @@ impl IVFPQIndex {
         self.clusters.size_bytes()
     }
 
+    /// Estimated memory usage in bytes (alias for size_bytes)
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.size_bytes()
+    }
+
     /// Serialize to bytes
     pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let json =

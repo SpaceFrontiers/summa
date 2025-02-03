@@ -438,6 +438,11 @@ impl AsyncStoreReader {
         self.num_docs
     }
 
+    /// Number of blocks currently in the cache
+    pub fn cached_blocks(&self) -> usize {
+        self.cache.read().blocks.len()
+    }
+
     /// Get a document by doc_id (async - may load block)
     pub async fn get(&self, doc_id: DocId, schema: &Schema) -> io::Result<Option<Document>> {
         if doc_id >= self.num_docs {

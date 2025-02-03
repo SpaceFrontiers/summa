@@ -326,6 +326,11 @@ impl RaBitQCodebook {
     pub fn size_bytes(&self) -> usize {
         self.random_signs.len() + self.random_perm.len() * 4 + 64
     }
+
+    /// Estimated memory usage in bytes (alias for size_bytes)
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.size_bytes()
+    }
 }
 
 impl Quantizer for RaBitQCodebook {

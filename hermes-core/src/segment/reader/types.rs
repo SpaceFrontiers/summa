@@ -32,6 +32,22 @@ pub enum VectorIndex {
     },
 }
 
+impl VectorIndex {
+    /// Estimate memory usage of this vector index
+    pub fn estimated_memory_bytes(&self) -> usize {
+        match self {
+            VectorIndex::Flat(data) => data.estimated_memory_bytes(),
+            VectorIndex::RaBitQ(idx) => idx.estimated_memory_bytes(),
+            VectorIndex::IVF { index, codebook } => {
+                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
+            }
+            VectorIndex::ScaNN { index, codebook } => {
+                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
+            }
+        }
+    }
+}
+
 /// Sparse vector index for a field: lazy block loading via mmap
 ///
 /// Stores skip list per dimension (block metadata). Blocks loaded on-demand.

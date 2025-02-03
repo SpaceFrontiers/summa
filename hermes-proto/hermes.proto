@@ -173,6 +173,40 @@ message GetIndexInfoResponse {
   uint32 num_segments = 3;
   // Schema in SDL format
   string schema = 4;
+  // Memory usage breakdown (if available)
+  MemoryStats memory_stats = 5;
+}
+
+// Memory usage statistics
+message MemoryStats {
+  // Total estimated memory usage in bytes
+  uint64 total_bytes = 1;
+  // Indexing buffer memory (pending documents not yet flushed)
+  IndexingBufferStats indexing_buffer = 2;
+  // Segment reader memory (loaded for search)
+  SegmentReaderStats segment_reader = 3;
+}
+
+// Indexing buffer memory breakdown
+message IndexingBufferStats {
+  uint64 total_bytes = 1;
+  uint64 postings_bytes = 2;
+  uint64 sparse_vectors_bytes = 3;
+  uint64 dense_vectors_bytes = 4;
+  uint64 interner_bytes = 5;
+  uint64 position_index_bytes = 6;
+  uint32 pending_docs = 7;
+  uint32 unique_terms = 8;
+}
+
+// Segment reader memory (search structures)
+message SegmentReaderStats {
+  uint64 total_bytes = 1;
+  uint64 term_dict_cache_bytes = 2;
+  uint64 store_cache_bytes = 3;
+  uint64 sparse_index_bytes = 4;
+  uint64 dense_index_bytes = 5;
+  uint32 num_segments_loaded = 6;
 }
 
 // Create index request/response

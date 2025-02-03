@@ -65,6 +65,8 @@ pub struct IndexConfig {
     pub merge_policy: Box<dyn crate::merge::MergePolicy>,
     /// Index optimization mode (adaptive, size-optimized, performance-optimized)
     pub optimization: crate::structures::IndexOptimization,
+    /// Reload interval in milliseconds for IndexReader (how often to check for new segments)
+    pub reload_interval_ms: u64,
 }
 
 impl Default for IndexConfig {
@@ -83,6 +85,7 @@ impl Default for IndexConfig {
             max_indexing_memory_bytes: 2 * 1024 * 1024 * 1024, // 256 MB default
             merge_policy: Box::new(crate::merge::TieredMergePolicy::default()),
             optimization: crate::structures::IndexOptimization::default(),
+            reload_interval_ms: 1000, // 1 second default
         }
     }
 }
@@ -189,16 +192,17 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     /// Get an IndexReader for searching (with reload policy)
     ///
     /// The reader is cached and reused across calls. The reader's internal
-    /// searcher will reload segments based on its reload interval (default 1s).
+    /// searcher will reload segments based on its reload interval (configurable via IndexConfig).
     pub async fn reader(&self) -> Result<&IndexReader<D>> {
         self.cached_reader
             .get_or_try_init(|| async {
-                IndexReader::from_segment_manager(
+                IndexReader::from_segment_manager_with_reload_interval(
                     Arc::clone(&self.schema),
                     Arc::clone(&self.segment_manager),
                     self.trained_centroids.clone(),
                     self.trained_codebooks.clone(),
                     self.config.term_cache_blocks,
+                    self.config.reload_interval_ms,
                 )
                 .await
             })
