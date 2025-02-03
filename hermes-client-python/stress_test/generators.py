@@ -166,7 +166,7 @@ def generate_sparse_vector(
     max_weight = max(weights) if weights else 1.0
     weights = [w / max_weight for w in weights]
 
-    return list(zip(indices, weights))
+    return list(zip(indices, weights, strict=True))
 
 
 def generate_dense_vector(dim: int) -> list[float]:
