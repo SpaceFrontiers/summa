@@ -18,13 +18,18 @@ pub struct RerankerConfig {
 
 /// Score a single document against the query vector.
 ///
-/// Returns `None` if the document has no values for the given field.
+/// Returns `None` if the document has no values for the given field,
+/// or if stored vectors have a different dimension than the query.
 fn score_document(doc: &crate::dsl::Document, config: &RerankerConfig) -> Option<f32> {
+    let query_dim = config.vector.len();
     let values: Vec<(u32, f32)> = doc
         .get_all(config.field)
         .enumerate()
         .filter_map(|(ordinal, fv)| {
             let vec = fv.as_dense_vector()?;
+            if vec.len() != query_dim {
+                return None;
+            }
             let dist = squared_euclidean_distance(&config.vector, vec);
             let score = 1.0 / (1.0 + dist);
             Some((ordinal as u32, score))
@@ -51,18 +56,41 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     config: &RerankerConfig,
     final_limit: usize,
 ) -> crate::error::Result<Vec<SearchResult>> {
-    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
+    if config.vector.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    for candidate in candidates {
-        if let Some(doc) = searcher.doc(candidate.doc_id).await?
-            && let Some(score) = score_document(&doc, config)
-        {
-            scored.push(SearchResult {
-                doc_id: candidate.doc_id,
-                score,
-                positions: Vec::new(),
-            });
+    // Load all candidate documents in parallel
+    let doc_futures: Vec<_> = candidates.iter().map(|c| searcher.doc(c.doc_id)).collect();
+    let docs = futures::future::join_all(doc_futures).await;
+
+    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
+    let mut skipped = 0u32;
+
+    for (candidate, doc_result) in candidates.iter().zip(docs) {
+        match doc_result {
+            Ok(Some(doc)) => {
+                if let Some(score) = score_document(&doc, config) {
+                    scored.push(SearchResult {
+                        doc_id: candidate.doc_id,
+                        score,
+                        positions: Vec::new(),
+                    });
+                } else {
+                    skipped += 1;
+                }
+            }
+            _ => {
+                skipped += 1;
+            }
         }
+    }
+
+    if skipped > 0 {
+        log::debug!(
+            "[reranker] skipped {skipped}/{} candidates (missing/incompatible vector field)",
+            candidates.len()
+        );
     }
 
     scored.sort_by(|a, b| {
@@ -149,6 +177,25 @@ mod tests {
         doc.add_text(Field(0), "not a vector");
 
         let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Max);
+        assert!(score_document(&doc, &config).is_none());
+    }
+
+    #[test]
+    fn test_score_document_dimension_mismatch() {
+        let mut doc = Document::new();
+        doc.add_dense_vector(Field(0), vec![1.0, 0.0]); // 2D
+
+        let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Max); // 3D query
+        assert!(score_document(&doc, &config).is_none());
+    }
+
+    #[test]
+    fn test_score_document_empty_query_vector() {
+        let mut doc = Document::new();
+        doc.add_dense_vector(Field(0), vec![1.0, 0.0, 0.0]);
+
+        let config = make_config(vec![], MultiValueCombiner::Max);
+        // Empty query can't match any stored vector (dimension mismatch)
         assert!(score_document(&doc, &config).is_none());
     }
 }

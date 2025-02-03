@@ -251,10 +251,32 @@ pub fn convert_reranker(
         .get_field_entry(field)
         .ok_or_else(|| format!("Field entry for '{}' not found", reranker.field))?;
 
+    if entry.field_type != hermes_core::FieldType::DenseVector {
+        return Err(format!(
+            "Reranker field '{}' must be a dense_vector, got {:?}",
+            reranker.field, entry.field_type
+        ));
+    }
+
     if !entry.stored {
         return Err(format!(
             "Reranker field '{}' must be stored",
             reranker.field
+        ));
+    }
+
+    if reranker.vector.is_empty() {
+        return Err("Reranker query vector must not be empty".to_string());
+    }
+
+    if let Some(ref dv_config) = entry.dense_vector_config
+        && reranker.vector.len() != dv_config.dim
+    {
+        return Err(format!(
+            "Reranker query vector dimension {} does not match field '{}' dimension {}",
+            reranker.vector.len(),
+            reranker.field,
+            dv_config.dim
         ));
     }
 

@@ -263,6 +263,7 @@ class HermesClient:
         offset: int = 0,
         fields_to_load: list[str] | None = None,
         reranker: tuple[str, list[float], int] | None = None,
+        reranker_combiner: str = "log_sum_exp",
     ) -> SearchResponse:
         """Search for documents.
 
@@ -282,6 +283,9 @@ class HermesClient:
             fields_to_load: List of fields to include in results
             reranker: L2 reranker as (field, query_vector, l1_limit) tuple.
                 Reranks L1 candidates by exact dense vector distance.
+                l1_limit=0 defaults to 10x the final limit.
+            reranker_combiner: Score combiner for reranker multi-value fields:
+                "log_sum_exp" (default), "max", "avg", "sum"
 
         Returns:
             SearchResponse with hits
@@ -331,10 +335,12 @@ class HermesClient:
         pb_reranker = None
         if reranker is not None:
             field_name, query_vector, l1_limit = reranker
+            reranker_combiner_value = _reranker_combiner_to_proto(reranker_combiner)
             pb_reranker = pb.Reranker(
                 field=field_name,
                 vector=query_vector,
                 limit=l1_limit,
+                combiner=reranker_combiner_value,
             )
 
         request = pb.SearchRequest(
@@ -533,6 +539,17 @@ def _from_field_value(fv: pb.FieldValue) -> Any:
 def _combiner_to_proto(combiner: str) -> int:
     """Convert combiner string to proto enum value."""
     return {"sum": 0, "max": 1, "avg": 2}.get(combiner.lower(), 0)
+
+
+def _reranker_combiner_to_proto(combiner: str) -> int:
+    """Convert reranker combiner string to proto MultiValueCombiner enum."""
+    return {
+        "log_sum_exp": 0,
+        "max": 1,
+        "avg": 2,
+        "sum": 3,
+        "weighted_top_k": 4,
+    }.get(combiner.lower(), 0)
 
 
 def _build_query(
