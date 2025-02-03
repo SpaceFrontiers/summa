@@ -151,9 +151,14 @@ pub fn convert_query(
                 sv_query.combiner_top_k,
                 sv_query.combiner_decay,
             );
-            Ok(Box::new(
-                SparseVectorQuery::new(field, vector).with_combiner(combiner),
-            ))
+            let mut query = SparseVectorQuery::new(field, vector).with_combiner(combiner);
+
+            // Set heap_factor if provided (defaults to 1.0 for exact search)
+            if sv_query.heap_factor > 0.0 {
+                query = query.with_heap_factor(sv_query.heap_factor);
+            }
+
+            Ok(Box::new(query))
         }
         Some(ProtoQueryType::DenseVector(dv_query)) => {
             let field = schema

@@ -172,7 +172,7 @@ mod tests {
         // Query matching dimension 0
         let query = vec![(0u32, 1.0f32)];
         let results = reader
-            .search_sparse_vector(sparse, &query, 10, MultiValueCombiner::Sum)
+            .search_sparse_vector(sparse, &query, 10, MultiValueCombiner::Sum, 1.0)
             .await
             .unwrap();
 

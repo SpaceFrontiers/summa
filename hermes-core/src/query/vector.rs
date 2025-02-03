@@ -261,6 +261,9 @@ pub struct SparseVectorQuery {
     pub vector: Vec<(u32, f32)>,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
+    /// Approximate search factor (1.0 = exact, lower values = faster but approximate)
+    /// Controls WAND pruning aggressiveness in block-max scoring
+    pub heap_factor: f32,
 }
 
 impl SparseVectorQuery {
@@ -270,12 +273,24 @@ impl SparseVectorQuery {
             field,
             vector,
             combiner: MultiValueCombiner::Sum,
+            heap_factor: 1.0,
         }
     }
 
     /// Set the multi-value score combiner
     pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
         self.combiner = combiner;
+        self
+    }
+
+    /// Set the heap factor for approximate search
+    ///
+    /// Controls the trade-off between speed and recall:
+    /// - 1.0 = exact search (default)
+    /// - 0.8-0.9 = ~20-40% faster with minimal recall loss
+    /// - Lower values = more aggressive pruning, faster but lower recall
+    pub fn with_heap_factor(mut self, heap_factor: f32) -> Self {
+        self.heap_factor = heap_factor.clamp(0.0, 1.0);
         self
     }
 
@@ -419,9 +434,10 @@ impl Query for SparseVectorQuery {
         let field = self.field;
         let vector = self.vector.clone();
         let combiner = self.combiner;
+        let heap_factor = self.heap_factor;
         Box::pin(async move {
             let results = reader
-                .search_sparse_vector(field, &vector, limit, combiner)
+                .search_sparse_vector(field, &vector, limit, combiner, heap_factor)
                 .await?;
 
             Ok(Box::new(SparseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)

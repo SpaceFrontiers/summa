@@ -533,6 +533,7 @@ impl AsyncSegmentReader {
         vector: &[(u32, f32)],
         limit: usize,
         combiner: crate::query::MultiValueCombiner,
+        heap_factor: f32,
     ) -> Result<Vec<VectorSearchResult>> {
         use crate::query::{SparseTermScorer, WandExecutor};
 
@@ -625,7 +626,7 @@ impl AsyncSegmentReader {
         // Use shared WandExecutor for top-k retrieval
         // Note: For multi-valued fields, same doc_id may appear multiple times
         // with different scores that need to be combined
-        let raw_results = WandExecutor::new(scorers, limit * 2).execute(); // Over-fetch for combining
+        let raw_results = WandExecutor::with_heap_factor(scorers, limit * 2, heap_factor).execute(); // Over-fetch for combining
 
         log::trace!(
             "Sparse WAND returned {} raw results for segment (doc_id_offset={})",
