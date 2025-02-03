@@ -70,9 +70,6 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pending_builds: Arc<AtomicUsize>,
     /// Segments flushed to disk but not yet registered in metadata
     flushed_segments: AsyncMutex<Vec<(String, u32)>>,
-    /// Global memory usage across all builders (bytes)
-    #[allow(dead_code)]
-    global_memory_bytes: Arc<AtomicUsize>,
 }
 
 /// Shared state for worker tasks
@@ -84,6 +81,9 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
     segment_id_sender: mpsc::UnboundedSender<(String, u32)>,
     pending_builds: Arc<AtomicUsize>,
+    /// Limits concurrent segment builds to prevent OOM from unbounded build parallelism.
+    /// Workers block at acquire, providing natural backpressure.
+    build_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
@@ -121,7 +121,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         segment_manager.update_metadata(|_| {}).await?;
 
         let pending_builds = Arc::new(AtomicUsize::new(0));
-        let global_memory_bytes = Arc::new(AtomicUsize::new(0));
+
+        // Limit concurrent segment builds to prevent OOM.
+        // With N workers, allow at most ceil(N/2) concurrent builds.
+        let num_workers = config.num_indexing_threads.max(1);
+        let max_concurrent_builds = num_workers.div_ceil(2).max(1);
+        let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
 
         // Create shared worker state
         let worker_state = Arc::new(WorkerState {
@@ -132,10 +137,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             tokenizers: FxHashMap::default(),
             segment_id_sender,
             pending_builds: Arc::clone(&pending_builds),
+            build_semaphore,
         });
 
         // Create per-worker unbounded channels and spawn workers
-        let num_workers = config.num_indexing_threads.max(1);
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
@@ -163,7 +168,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_manager,
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds,
-            global_memory_bytes,
             flushed_segments: AsyncMutex::new(Vec::new()),
         })
     }
@@ -198,7 +202,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         ));
 
         let pending_builds = Arc::new(AtomicUsize::new(0));
-        let global_memory_bytes = Arc::new(AtomicUsize::new(0));
+
+        // Limit concurrent segment builds to prevent OOM.
+        let num_workers = config.num_indexing_threads.max(1);
+        let max_concurrent_builds = num_workers.div_ceil(2).max(1);
+        let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
 
         // Create shared worker state
         let worker_state = Arc::new(WorkerState {
@@ -209,10 +217,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             tokenizers: FxHashMap::default(),
             segment_id_sender,
             pending_builds: Arc::clone(&pending_builds),
+            build_semaphore,
         });
 
         // Create per-worker unbounded channels and spawn workers
-        let num_workers = config.num_indexing_threads.max(1);
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
@@ -240,7 +248,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_manager,
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds,
-            global_memory_bytes,
             flushed_segments: AsyncMutex::new(Vec::new()),
         })
     }
@@ -260,7 +267,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let (segment_id_sender, segment_id_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let pending_builds = Arc::new(AtomicUsize::new(0));
-        let global_memory_bytes = Arc::new(AtomicUsize::new(0));
+
+        // Limit concurrent segment builds to prevent OOM.
+        let num_workers = config.num_indexing_threads.max(1);
+        let max_concurrent_builds = num_workers.div_ceil(2).max(1);
+        let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
 
         // Create shared worker state
         let worker_state = Arc::new(WorkerState {
@@ -271,10 +282,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             tokenizers: FxHashMap::default(),
             segment_id_sender,
             pending_builds: Arc::clone(&pending_builds),
+            build_semaphore,
         });
 
         // Create per-worker channels and spawn workers
-        let num_workers = config.num_indexing_threads.max(1);
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
@@ -302,7 +313,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_manager,
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds,
-            global_memory_bytes,
             flushed_segments: AsyncMutex::new(Vec::new()),
         }
     }
@@ -363,7 +373,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 if let Some(b) = builder.take()
                     && b.num_docs() > 0
                 {
-                    Self::spawn_segment_build(&state, b);
+                    Self::spawn_segment_build(&state, b).await;
                 }
                 return;
             };
@@ -398,9 +408,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
                     _doc_count += 1;
 
-                    // Check memory after every document - O(1) with incremental tracking
-                    let per_worker_limit = state.config.max_indexing_memory_bytes
-                        / state.config.num_indexing_threads.max(1);
+                    // Check memory after every document - O(1) with incremental tracking.
+                    // Shrink per-worker budget when builds are in-flight to account for
+                    // build-phase memory amplification (posting duplication, sparse serialization).
+                    let in_flight = state.pending_builds.load(Ordering::Relaxed);
+                    let effective_slots = state.config.num_indexing_threads.max(1) + in_flight * 2;
+                    let per_worker_limit = state.config.max_indexing_memory_bytes / effective_slots;
                     let builder_memory = b.estimated_memory_bytes();
 
                     // Log memory usage periodically
@@ -437,7 +450,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                             b.sparse_dim_count(),
                         );
                         let full_builder = builder.take().unwrap();
-                        Self::spawn_segment_build(&state, full_builder);
+                        Self::spawn_segment_build(&state, full_builder).await;
                         _doc_count = 0;
                     }
                 }
@@ -463,7 +476,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                             mb.position_index_bytes as f64 / (1024.0 * 1024.0),
                             stats.unique_terms,
                         );
-                        Self::spawn_segment_build(&state, b);
+                        Self::spawn_segment_build(&state, b).await;
                     }
                     _doc_count = 0;
                     // Signal that flush is complete for this worker
@@ -472,7 +485,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             }
         }
     }
-    fn spawn_segment_build(state: &Arc<WorkerState<D>>, builder: SegmentBuilder) {
+    async fn spawn_segment_build(state: &Arc<WorkerState<D>>, builder: SegmentBuilder) {
+        // Acquire semaphore permit before spawning - blocks if too many builds in flight.
+        // This provides backpressure: workers pause indexing until a build slot opens.
+        let permit = state.build_semaphore.clone().acquire_owned().await.unwrap();
+
         let directory = Arc::clone(&state.directory);
         let segment_id = SegmentId::new();
         let segment_hex = segment_id.to_hex();
@@ -492,6 +509,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         pending_builds.fetch_add(1, Ordering::SeqCst);
 
         tokio::spawn(async move {
+            let _permit = permit; // held for build duration, released on drop
             let build_start = std::time::Instant::now();
             let result = match builder.build(directory.as_ref(), segment_id).await {
                 Ok(meta) => {
