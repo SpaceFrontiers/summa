@@ -64,10 +64,12 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     worker_state: Arc<WorkerState<D>>,
     /// Segment manager - owns metadata.json, handles segments and background merging
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
-    /// Channel receiver for completed segment IDs
-    segment_id_receiver: AsyncMutex<mpsc::UnboundedReceiver<String>>,
+    /// Channel receiver for completed segment IDs and doc counts
+    segment_id_receiver: AsyncMutex<mpsc::UnboundedReceiver<(String, u32)>>,
     /// Count of in-flight background builds
     pending_builds: Arc<AtomicUsize>,
+    /// Segments flushed to disk but not yet registered in metadata
+    flushed_segments: AsyncMutex<Vec<(String, u32)>>,
     /// Global memory usage across all builders (bytes)
     #[allow(dead_code)]
     global_memory_bytes: Arc<AtomicUsize>,
@@ -80,8 +82,7 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     config: IndexConfig,
     builder_config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
-    segment_id_sender: mpsc::UnboundedSender<String>,
-    segment_manager: Arc<crate::merge::SegmentManager<D>>,
+    segment_id_sender: mpsc::UnboundedSender<(String, u32)>,
     pending_builds: Arc<AtomicUsize>,
 }
 
@@ -130,7 +131,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             builder_config: builder_config.clone(),
             tokenizers: FxHashMap::default(),
             segment_id_sender,
-            segment_manager: Arc::clone(&segment_manager),
             pending_builds: Arc::clone(&pending_builds),
         });
 
@@ -164,6 +164,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds,
             global_memory_bytes,
+            flushed_segments: AsyncMutex::new(Vec::new()),
         })
     }
 
@@ -207,7 +208,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             builder_config: builder_config.clone(),
             tokenizers: FxHashMap::default(),
             segment_id_sender,
-            segment_manager: Arc::clone(&segment_manager),
             pending_builds: Arc::clone(&pending_builds),
         });
 
@@ -241,6 +241,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds,
             global_memory_bytes,
+            flushed_segments: AsyncMutex::new(Vec::new()),
         })
     }
 
@@ -269,7 +270,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             builder_config: builder_config.clone(),
             tokenizers: FxHashMap::default(),
             segment_id_sender,
-            segment_manager: Arc::clone(&segment_manager),
             pending_builds: Arc::clone(&pending_builds),
         });
 
@@ -303,6 +303,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds,
             global_memory_bytes,
+            flushed_segments: AsyncMutex::new(Vec::new()),
         }
     }
 
@@ -476,7 +477,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let segment_id = SegmentId::new();
         let segment_hex = segment_id.to_hex();
         let sender = state.segment_id_sender.clone();
-        let segment_manager = Arc::clone(&state.segment_manager);
         let pending_builds = Arc::clone(&state.pending_builds);
 
         let doc_count = builder.num_docs();
@@ -493,7 +493,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         tokio::spawn(async move {
             let build_start = std::time::Instant::now();
-            match builder.build(directory.as_ref(), segment_id).await {
+            let result = match builder.build(directory.as_ref(), segment_id).await {
                 Ok(meta) => {
                     let build_duration_ms = build_start.elapsed().as_millis() as u64;
                     log::info!(
@@ -502,10 +502,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         meta.num_docs,
                         build_duration_ms
                     );
-                    // Register segment with its doc count (avoids loading segment for merge decisions)
-                    let _ = segment_manager
-                        .register_segment(segment_hex.clone(), meta.num_docs)
-                        .await;
+                    (segment_hex, meta.num_docs)
                 }
                 Err(e) => {
                     log::error!(
@@ -514,21 +511,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         e
                     );
                     eprintln!("Background segment build failed: {:?}", e);
+                    // Signal failure with num_docs=0 so waiters don't block
+                    (segment_hex, 0)
                 }
-            }
+            };
             // Always send to channel and decrement - even on failure
-            // This ensures commit() doesn't hang waiting for messages
-            let _ = sender.send(segment_hex);
+            // This ensures flush()/commit() doesn't hang waiting for messages
+            let _ = sender.send(result);
             pending_builds.fetch_sub(1, Ordering::SeqCst);
         });
-    }
-
-    /// Collect any completed segment IDs from the channel (non-blocking)
-    async fn collect_completed_segments(&self) {
-        let mut receiver = self.segment_id_receiver.lock().await;
-        while receiver.try_recv().is_ok() {
-            // Segment already registered by spawn_segment_build
-        }
     }
 
     /// Get the number of pending background builds
@@ -577,9 +568,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.cleanup_orphan_segments().await
     }
 
-    /// Flush all workers - signals them to build their current segments
+    /// Flush all workers - serializes in-memory data to segment files on disk
     ///
-    /// Sends flush signals to all workers and waits for them to acknowledge.
+    /// Sends flush signals to all workers, waits for them to acknowledge,
+    /// then waits for ALL pending background builds to complete.
+    /// Completed segments are accumulated in `flushed_segments` but NOT
+    /// registered in metadata - only `commit()` does that.
+    ///
     /// Workers continue running and can accept new documents after flush.
     pub async fn flush(&self) -> Result<()> {
         // Send flush signal to each worker's channel
@@ -599,30 +594,53 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             let _ = rx.await;
         }
 
-        // Collect any completed segments
-        self.collect_completed_segments().await;
+        // Wait for ALL pending builds to complete and collect results
+        let mut receiver = self.segment_id_receiver.lock().await;
+        while self.pending_builds.load(Ordering::SeqCst) > 0 {
+            if let Some((segment_hex, num_docs)) = receiver.recv().await {
+                if num_docs > 0 {
+                    self.flushed_segments
+                        .lock()
+                        .await
+                        .push((segment_hex, num_docs));
+                }
+            } else {
+                break; // Channel closed
+            }
+        }
+
+        // Drain any remaining messages (builds that completed between checks)
+        while let Ok((segment_hex, num_docs)) = receiver.try_recv() {
+            if num_docs > 0 {
+                self.flushed_segments
+                    .lock()
+                    .await
+                    .push((segment_hex, num_docs));
+            }
+        }
 
         Ok(())
     }
 
-    /// Commit all pending segments to disk and wait for completion
+    /// Commit all pending segments to metadata and wait for completion
     ///
-    /// This flushes workers and waits for ALL background builds to complete.
-    /// Provides durability guarantees - all data is persisted.
+    /// Calls `flush()` to serialize all in-memory data to disk, then
+    /// registers flushed segments in metadata. This provides transactional
+    /// semantics: on crash before commit, orphan files are cleaned up by
+    /// `cleanup_orphan_segments()`.
     ///
     /// **Auto-triggers vector index build** when threshold is crossed for any field.
     pub async fn commit(&self) -> Result<()> {
-        // Flush all workers first
+        // Flush all workers and wait for builds to complete
         self.flush().await?;
 
-        // Wait for all pending builds to complete
-        let mut receiver = self.segment_id_receiver.lock().await;
-        while self.pending_builds.load(Ordering::SeqCst) > 0 {
-            if receiver.recv().await.is_none() {
-                break; // Channel closed
-            }
+        // Register all flushed segments in metadata
+        let segments = std::mem::take(&mut *self.flushed_segments.lock().await);
+        for (segment_hex, num_docs) in segments {
+            self.segment_manager
+                .register_segment(segment_hex, num_docs)
+                .await?;
         }
-        drop(receiver);
 
         // Auto-trigger vector index build if threshold crossed
         self.maybe_build_vector_index().await?;
