@@ -823,12 +823,29 @@ impl SegmentBuilder {
                 .unwrap_or(WeightQuantization::Float32);
 
             let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
+            let pruning_fraction = sparse_config.and_then(|c| c.posting_list_pruning);
 
             let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
 
             for (&dim_id, postings) in builder.postings.iter_mut() {
                 // Sort in-place — no clone needed since we have &mut access
                 postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
+
+                // Apply posting list pruning: keep only top fraction by weight magnitude
+                if let Some(fraction) = pruning_fraction
+                    && postings.len() > 1
+                    && fraction < 1.0
+                {
+                    let original_len = postings.len();
+                    postings.sort_by(|a, b| {
+                        b.2.abs()
+                            .partial_cmp(&a.2.abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
+                    postings.truncate(keep);
+                    postings.sort_unstable_by_key(|(d, o, _)| (*d, *o));
+                }
 
                 let block_list = BlockSparsePostingList::from_postings_with_block_size(
                     postings,

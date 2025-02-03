@@ -597,6 +597,21 @@ impl<'a> BlockSparsePostingIterator<'a> {
         self.doc()
     }
 
+    /// Skip to the start of the next block, returning its first doc_id.
+    /// Used by block-max WAND to skip entire blocks that can't beat threshold.
+    pub fn skip_to_next_block(&mut self) -> DocId {
+        if self.exhausted {
+            return TERMINATED;
+        }
+        let next = self.block_idx + 1;
+        if next >= self.posting_list.blocks.len() {
+            self.exhausted = true;
+            return TERMINATED;
+        }
+        self.load_block(next);
+        self.doc()
+    }
+
     pub fn is_exhausted(&self) -> bool {
         self.exhausted
     }

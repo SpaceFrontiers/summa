@@ -124,6 +124,10 @@ impl Directory for MmapDirectory {
                     ));
                 }
 
+                // Hint the OS to prefetch these pages before the memcpy
+                #[cfg(unix)]
+                let _ = mmap.advise_range(memmap2::Advice::WillNeed, start, end - start);
+
                 Ok(OwnedBytes::new(mmap[start..end].to_vec()))
             })
         });

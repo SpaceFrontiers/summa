@@ -607,6 +607,349 @@ impl ScoringIterator for SparseTermScorer<'_> {
         self.iter
             .current_block_max_contribution(self.query_weight.abs())
     }
+
+    #[inline]
+    fn skip_to_next_block(&mut self) -> DocId {
+        self.iter.skip_to_next_block()
+    }
+}
+
+/// Block-Max Pruning (BMP) executor for learned sparse retrieval
+///
+/// Processes blocks in score-descending order using a priority queue.
+/// Best for queries with many terms (20+), like SPLADE expansions.
+/// Uses document accumulators (FxHashMap) instead of per-term iterators.
+///
+/// Reference: Mallia et al., "Faster Learned Sparse Retrieval with
+/// Block-Max Pruning" (SIGIR 2024)
+pub struct BmpExecutor {
+    /// Posting lists for each query term
+    posting_lists: Vec<Arc<BlockSparsePostingList>>,
+    /// Query weight for each term
+    query_weights: Vec<f32>,
+    /// Number of results to return
+    k: usize,
+    /// Heap factor for approximate search
+    heap_factor: f32,
+}
+
+/// Entry in the BMP priority queue: (term_index, block_index)
+struct BmpBlockEntry {
+    /// Upper bound contribution of this block
+    contribution: f32,
+    /// Index into posting_lists
+    term_idx: usize,
+    /// Block index within the posting list
+    block_idx: usize,
+}
+
+impl PartialEq for BmpBlockEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.contribution == other.contribution
+    }
+}
+
+impl Eq for BmpBlockEntry {}
+
+impl Ord for BmpBlockEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap: higher contributions come first
+        self.contribution
+            .partial_cmp(&other.contribution)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for BmpBlockEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl BmpExecutor {
+    /// Create a new BMP executor
+    pub fn new(
+        posting_lists: Vec<Arc<BlockSparsePostingList>>,
+        query_weights: Vec<f32>,
+        k: usize,
+        heap_factor: f32,
+    ) -> Self {
+        Self {
+            posting_lists,
+            query_weights,
+            k,
+            heap_factor: heap_factor.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Execute BMP and return top-k results
+    pub fn execute(self) -> Vec<ScoredDoc> {
+        use rustc_hash::FxHashMap;
+
+        if self.posting_lists.is_empty() {
+            return Vec::new();
+        }
+
+        let num_terms = self.posting_lists.len();
+
+        // Build priority queue of all blocks across all terms
+        let mut block_queue: BinaryHeap<BmpBlockEntry> = BinaryHeap::new();
+
+        // Track remaining upper bound per term (sum of unprocessed block contributions)
+        let mut remaining_max: Vec<f32> = Vec::with_capacity(num_terms);
+
+        for (term_idx, pl) in self.posting_lists.iter().enumerate() {
+            let qw = self.query_weights[term_idx].abs();
+            let mut term_remaining = 0.0f32;
+
+            for block_idx in 0..pl.num_blocks() {
+                if let Some(block_max_weight) = pl.block_max_weight(block_idx) {
+                    let contribution = qw * block_max_weight;
+                    term_remaining += contribution;
+                    block_queue.push(BmpBlockEntry {
+                        contribution,
+                        term_idx,
+                        block_idx,
+                    });
+                }
+            }
+            remaining_max.push(term_remaining);
+        }
+
+        // Document accumulators: doc_id -> (accumulated_score, best_ordinal)
+        let mut accumulators: FxHashMap<DocId, (f32, u16)> = FxHashMap::default();
+        let mut collector = ScoreCollector::new(self.k);
+        let mut blocks_processed = 0u64;
+
+        // Process blocks in contribution-descending order
+        while let Some(entry) = block_queue.pop() {
+            // Update remaining max for this term
+            remaining_max[entry.term_idx] -= entry.contribution;
+
+            // Early termination: check if total remaining across all terms
+            // can beat the current threshold
+            let total_remaining: f32 = remaining_max.iter().sum();
+            let adjusted_threshold = collector.threshold() * self.heap_factor;
+            if collector.len() >= self.k && total_remaining <= adjusted_threshold {
+                debug!(
+                    "BMP early termination after {} blocks: remaining={:.4} <= threshold={:.4}",
+                    blocks_processed, total_remaining, adjusted_threshold
+                );
+                break;
+            }
+
+            // Decode this block and accumulate scores
+            let pl = &self.posting_lists[entry.term_idx];
+            let block = &pl.blocks[entry.block_idx];
+            let doc_ids = block.decode_doc_ids();
+            let weights = block.decode_weights();
+            let ordinals = block.decode_ordinals();
+            let qw = self.query_weights[entry.term_idx];
+
+            for i in 0..block.header.count as usize {
+                let score_contribution = qw * weights[i];
+                let acc = accumulators.entry(doc_ids[i]).or_insert((0.0, ordinals[i]));
+                acc.0 += score_contribution;
+            }
+
+            blocks_processed += 1;
+        }
+
+        // Flush accumulators to collector
+        for (doc_id, (score, ordinal)) in &accumulators {
+            collector.insert_with_ordinal(*doc_id, *score, *ordinal);
+        }
+
+        let results: Vec<ScoredDoc> = collector
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| ScoredDoc {
+                doc_id,
+                score,
+                ordinal,
+            })
+            .collect();
+
+        debug!(
+            "BmpExecutor completed: blocks_processed={}, accumulators={}, returned={}, top_score={:.4}",
+            blocks_processed,
+            accumulators.len(),
+            results.len(),
+            results.first().map(|r| r.score).unwrap_or(0.0)
+        );
+
+        results
+    }
+}
+
+/// MaxScore executor with essential/non-essential term partitioning
+///
+/// For medium-length queries (6-20 terms), partitions terms into:
+/// - Essential terms: must be checked for every candidate document
+/// - Non-essential terms: only scored when candidate could enter top-k
+///
+/// Reference: Turtle & Flood, "Query Evaluation: Strategies and
+/// Optimizations" (Information Processing & Management, 1995)
+pub struct MaxScoreExecutor<S: ScoringIterator> {
+    /// Scorers sorted by max_score ascending
+    scorers: Vec<S>,
+    /// Cumulative max_score prefix sums (prefix_sums[i] = sum of max_scores[0..=i])
+    prefix_sums: Vec<f32>,
+    /// Top-k collector
+    collector: ScoreCollector,
+    /// Heap factor for approximate search
+    heap_factor: f32,
+}
+
+impl<S: ScoringIterator> MaxScoreExecutor<S> {
+    /// Create a new MaxScore executor
+    pub fn new(scorers: Vec<S>, k: usize) -> Self {
+        Self::with_heap_factor(scorers, k, 1.0)
+    }
+
+    /// Create a new MaxScore executor with approximate search
+    pub fn with_heap_factor(mut scorers: Vec<S>, k: usize, heap_factor: f32) -> Self {
+        // Sort scorers by max_score ascending (non-essential terms first)
+        scorers.sort_by(|a, b| {
+            a.max_score()
+                .partial_cmp(&b.max_score())
+                .unwrap_or(Ordering::Equal)
+        });
+
+        // Compute prefix sums of max_scores
+        let mut prefix_sums = Vec::with_capacity(scorers.len());
+        let mut cumsum = 0.0f32;
+        for s in &scorers {
+            cumsum += s.max_score();
+            prefix_sums.push(cumsum);
+        }
+
+        debug!(
+            "Creating MaxScoreExecutor: num_scorers={}, k={}, total_upper={:.4}, heap_factor={:.2}",
+            scorers.len(),
+            k,
+            cumsum,
+            heap_factor
+        );
+
+        Self {
+            scorers,
+            prefix_sums,
+            collector: ScoreCollector::new(k),
+            heap_factor: heap_factor.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Find partition point: [0..partition) = non-essential, [partition..) = essential
+    /// Non-essential terms have cumulative max_score <= threshold
+    fn find_partition(&self) -> usize {
+        let threshold = self.collector.threshold() * self.heap_factor;
+        // Find first index where prefix_sums[i] > threshold
+        // Everything before that is non-essential
+        self.prefix_sums
+            .iter()
+            .position(|&sum| sum > threshold)
+            .unwrap_or(self.scorers.len())
+    }
+
+    /// Execute MaxScore and return top-k results
+    pub fn execute(mut self) -> Vec<ScoredDoc> {
+        if self.scorers.is_empty() {
+            return Vec::new();
+        }
+
+        let n = self.scorers.len();
+        let mut docs_scored = 0u64;
+        let mut docs_skipped = 0u64;
+
+        loop {
+            let partition = self.find_partition();
+
+            // If all terms are non-essential, we're done
+            if partition >= n {
+                debug!("MaxScore: all terms non-essential, early termination");
+                break;
+            }
+
+            // Find minimum doc_id across essential scorers [partition..n)
+            let mut min_doc = u32::MAX;
+            for i in partition..n {
+                let doc = self.scorers[i].doc();
+                if doc < min_doc {
+                    min_doc = doc;
+                }
+            }
+
+            if min_doc == u32::MAX {
+                break; // All essential scorers exhausted
+            }
+
+            // Score from essential scorers and advance them
+            let mut score = 0.0f32;
+            let mut ordinal = 0u16;
+            let mut first_match = true;
+
+            for i in partition..n {
+                if self.scorers[i].doc() == min_doc {
+                    score += self.scorers[i].score();
+                    if first_match {
+                        ordinal = self.scorers[i].ordinal();
+                        first_match = false;
+                    }
+                    self.scorers[i].advance();
+                }
+            }
+
+            // Check if score + non-essential upper bound could beat threshold
+            let non_essential_upper = if partition > 0 {
+                self.prefix_sums[partition - 1]
+            } else {
+                0.0
+            };
+
+            let adjusted_threshold = self.collector.threshold() * self.heap_factor;
+
+            if self.collector.len() >= self.collector.k
+                && score + non_essential_upper <= adjusted_threshold
+            {
+                docs_skipped += 1;
+                continue;
+            }
+
+            // Score from non-essential scorers (seek to min_doc)
+            for i in 0..partition {
+                let doc = self.scorers[i].seek(min_doc);
+                if doc == min_doc {
+                    score += self.scorers[i].score();
+                    self.scorers[i].advance();
+                }
+            }
+
+            self.collector.insert_with_ordinal(min_doc, score, ordinal);
+            docs_scored += 1;
+        }
+
+        let results: Vec<ScoredDoc> = self
+            .collector
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| ScoredDoc {
+                doc_id,
+                score,
+                ordinal,
+            })
+            .collect();
+
+        debug!(
+            "MaxScoreExecutor completed: scored={}, skipped={}, returned={}, top_score={:.4}",
+            docs_scored,
+            docs_skipped,
+            results.len(),
+            results.first().map(|r| r.score).unwrap_or(0.0)
+        );
+
+        results
+    }
 }
 
 #[cfg(test)]

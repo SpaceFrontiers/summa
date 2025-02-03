@@ -328,16 +328,30 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         let searcher = reader.searcher().await?;
         let segments = searcher.segment_readers();
 
-        let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
         let fetch_limit = offset + limit;
 
-        for segment in segments {
-            let segment_id = segment.meta().id;
-            let results =
-                crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?;
-            for result in results {
-                all_results.push((segment_id, result));
-            }
+        let futures: Vec<_> = segments
+            .iter()
+            .map(|segment| {
+                let sid = segment.meta().id;
+                async move {
+                    let results =
+                        crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?;
+                    Ok::<_, crate::error::Error>(
+                        results
+                            .into_iter()
+                            .map(move |r| (sid, r))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            })
+            .collect();
+
+        let batches = futures::future::try_join_all(futures).await?;
+        let mut all_results: Vec<(u128, crate::query::SearchResult)> =
+            Vec::with_capacity(batches.iter().map(|b| b.len()).sum());
+        for batch in batches {
+            all_results.extend(batch);
         }
 
         all_results.sort_by(|a, b| {

@@ -343,18 +343,36 @@ impl<D: Directory + 'static> Searcher<D> {
         offset: usize,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
+
+        let futures: Vec<_> = self
+            .segments
+            .iter()
+            .map(|segment| {
+                let sid = segment.meta().id;
+                async move {
+                    let (results, segment_seen) = crate::query::search_segment_with_count(
+                        segment.as_ref(),
+                        query,
+                        fetch_limit,
+                    )
+                    .await?;
+                    Ok::<_, crate::error::Error>((
+                        results
+                            .into_iter()
+                            .map(move |r| (sid, r))
+                            .collect::<Vec<_>>(),
+                        segment_seen,
+                    ))
+                }
+            })
+            .collect();
+
+        let batches = futures::future::try_join_all(futures).await?;
         let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
         let mut total_seen: u32 = 0;
-
-        for segment in &self.segments {
-            let segment_id = segment.meta().id;
-            let (results, segment_seen) =
-                crate::query::search_segment_with_count(segment.as_ref(), query, fetch_limit)
-                    .await?;
+        for (batch, segment_seen) in batches {
             total_seen += segment_seen;
-            for result in results {
-                all_results.push((segment_id, result));
-            }
+            all_results.extend(batch);
         }
 
         // Sort by score descending
@@ -413,15 +431,32 @@ impl<D: Directory + 'static> Searcher<D> {
             .map_err(crate::error::Error::Query)?;
 
         let fetch_limit = offset + limit;
-        let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
+        let query_ref = query.as_ref();
 
-        for segment in &self.segments {
-            let segment_id = segment.meta().id;
-            let results =
-                crate::query::search_segment(segment.as_ref(), query.as_ref(), fetch_limit).await?;
-            for result in results {
-                all_results.push((segment_id, result));
-            }
+        let futures: Vec<_> = self
+            .segments
+            .iter()
+            .map(|segment| {
+                let sid = segment.meta().id;
+                async move {
+                    let results =
+                        crate::query::search_segment(segment.as_ref(), query_ref, fetch_limit)
+                            .await?;
+                    Ok::<_, crate::error::Error>(
+                        results
+                            .into_iter()
+                            .map(move |r| (sid, r))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            })
+            .collect();
+
+        let batches = futures::future::try_join_all(futures).await?;
+        let mut all_results: Vec<(u128, crate::query::SearchResult)> =
+            Vec::with_capacity(batches.iter().map(|b| b.len()).sum());
+        for batch in batches {
+            all_results.extend(batch);
         }
 
         all_results.sort_by(|a, b| {
