@@ -84,8 +84,14 @@ pub async fn load_vectors_file<D: Directory>(
         let _field = crate::dsl::Field(field_id);
 
         match index_type {
+            4 => {
+                // Flat binary format (compact, no JSON overhead)
+                if let Ok(flat_data) = FlatVectorData::from_binary_bytes(data.as_slice()) {
+                    indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
+                }
+            }
             3 => {
-                // Flat (brute-force) - raw vectors for accumulating state
+                // Flat (brute-force) - JSON format (legacy)
                 if let Ok(flat_data) = serde_json::from_slice::<FlatVectorData>(data.as_slice()) {
                     indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
                 }

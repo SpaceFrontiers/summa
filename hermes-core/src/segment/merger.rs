@@ -1133,9 +1133,8 @@ impl SegmentMerger {
                 vectors: all_vectors,
                 doc_ids: all_doc_ids,
             };
-            let bytes = serde_json::to_vec(&flat_data)
-                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-            field_indexes.push((field.0, 3u8, bytes)); // 3 = Flat
+            let bytes = flat_data.to_binary_bytes();
+            field_indexes.push((field.0, 4u8, bytes)); // 4 = Flat Binary
         }
 
         // Write vectors file

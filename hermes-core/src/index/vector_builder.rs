@@ -305,14 +305,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         total_vectors
     }
 
-    /// Collect all vectors from segments for fields that need building
+    /// Collect vectors from segments for training, with sampling for large datasets.
+    ///
+    /// K-means clustering converges well with ~100K samples, so we cap collection
+    /// per field to avoid loading millions of vectors into memory.
     async fn collect_vectors_for_training(
         &self,
         segment_ids: &[String],
         fields_to_build: &[(Field, DenseVectorConfig)],
     ) -> Result<FxHashMap<u32, Vec<Vec<f32>>>> {
+        /// Maximum vectors per field for training. K-means converges well with ~100K samples.
+        const MAX_TRAINING_VECTORS: usize = 100_000;
+
         let mut all_vectors: FxHashMap<u32, Vec<Vec<f32>>> = FxHashMap::default();
         let mut doc_offset = 0u32;
+        let mut total_skipped = 0usize;
 
         for id_str in segment_ids {
             let segment_id = SegmentId::from_hex(id_str)
@@ -326,19 +333,45 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             )
             .await?;
 
-            // Extract vectors from each Flat index
             for (field_id, index) in reader.vector_indexes() {
                 if fields_to_build.iter().any(|(f, _)| f.0 == *field_id)
                     && let crate::segment::VectorIndex::Flat(flat_data) = index
                 {
-                    all_vectors
-                        .entry(*field_id)
-                        .or_default()
-                        .extend(flat_data.vectors.iter().cloned());
+                    let entry = all_vectors.entry(*field_id).or_default();
+                    let remaining = MAX_TRAINING_VECTORS.saturating_sub(entry.len());
+
+                    if remaining == 0 {
+                        total_skipped += flat_data.vectors.len();
+                        continue;
+                    }
+
+                    if flat_data.vectors.len() <= remaining {
+                        // Take all vectors from this segment
+                        entry.extend(flat_data.vectors.iter().cloned());
+                    } else {
+                        // Uniform sample: take every Nth vector
+                        let step = (flat_data.vectors.len() / remaining).max(1);
+                        for (i, vec) in flat_data.vectors.iter().enumerate() {
+                            if i % step == 0 && entry.len() < MAX_TRAINING_VECTORS {
+                                entry.push(vec.clone());
+                            }
+                        }
+                        total_skipped += flat_data.vectors.len() - remaining;
+                    }
                 }
             }
 
             doc_offset += reader.meta().num_docs;
+        }
+
+        if total_skipped > 0 {
+            let collected: usize = all_vectors.values().map(|v| v.len()).sum();
+            log::info!(
+                "Sampled {} vectors for training (skipped {}, max {} per field)",
+                collected,
+                total_skipped,
+                MAX_TRAINING_VECTORS,
+            );
         }
 
         Ok(all_vectors)

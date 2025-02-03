@@ -34,31 +34,6 @@ impl DenseVectorBuilder {
     pub fn len(&self) -> usize {
         self.doc_ids.len()
     }
-
-    /// Get all vectors as Vec<Vec<f32>> for RaBitQ indexing
-    pub fn get_vectors(&self) -> Vec<Vec<f32>> {
-        self.doc_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let start = i * self.dim;
-                self.vectors[start..start + self.dim].to_vec()
-            })
-            .collect()
-    }
-
-    /// Get vectors trimmed to specified dimension for matryoshka/MRL indexing
-    pub fn get_vectors_trimmed(&self, trim_dim: usize) -> Vec<Vec<f32>> {
-        debug_assert!(trim_dim <= self.dim, "trim_dim must be <= dim");
-        self.doc_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let start = i * self.dim;
-                self.vectors[start..start + trim_dim].to_vec()
-            })
-            .collect()
-    }
 }
 
 /// Builder for sparse vector index using BlockSparsePostingList
