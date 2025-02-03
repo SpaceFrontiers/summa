@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 use hermes_core::parse_schema;
 
@@ -201,9 +201,15 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<DeleteIndexResponse>, Status> {
         let req = request.into_inner();
 
-        // Wait for any pending merges to complete before deleting
+        // Wait for any pending segment builds and merges to complete before deleting
         if let Some(writer) = self.registry.get_existing_writer(&req.index_name) {
-            writer.lock().await.wait_for_merges().await;
+            let w = writer.lock().await;
+            // Flush triggers workers to finish current builders and waits for
+            // all pending segment builds to complete
+            if let Err(e) = w.flush().await {
+                warn!(index_name = %req.index_name, error = %e, "Error flushing writer during delete");
+            }
+            w.wait_for_merges().await;
         }
 
         // Remove writer and index from registry
