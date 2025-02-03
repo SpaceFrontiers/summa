@@ -78,27 +78,34 @@ pub struct LowercaseTokenizer;
 
 impl Tokenizer for LowercaseTokenizer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
-        let mut tokens = Vec::new();
-        let mut position = 0u32;
+        tokenize_and_clean(text, |s| s.to_string())
+    }
+}
 
-        for (offset, word) in split_whitespace_with_offsets(text) {
-            if !word.is_empty() {
-                // Remove punctuation and lowercase
-                let cleaned: String = word
-                    .chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .flat_map(|c| c.to_lowercase())
-                    .collect();
-
-                if !cleaned.is_empty() {
-                    tokens.push(Token::new(cleaned, position, offset, offset + word.len()));
-                    position += 1;
-                }
+/// Shared tokenization logic: split on whitespace, clean (remove punctuation + lowercase),
+/// then apply a transform function to produce the final token text.
+fn tokenize_and_clean(text: &str, transform: impl Fn(&str) -> String) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut position = 0u32;
+    for (offset, word) in split_whitespace_with_offsets(text) {
+        if !word.is_empty() {
+            let cleaned: String = word
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            if !cleaned.is_empty() {
+                tokens.push(Token::new(
+                    transform(&cleaned),
+                    position,
+                    offset,
+                    offset + word.len(),
+                ));
+                position += 1;
             }
         }
-
-        tokens
     }
+    tokens
 }
 
 /// Split text on whitespace, returning (offset, word) pairs
@@ -262,33 +269,7 @@ impl Default for StemmerTokenizer {
 impl Tokenizer for StemmerTokenizer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
         let stemmer = rust_stemmers::Stemmer::create(self.language.to_algorithm());
-        let mut tokens = Vec::new();
-        let mut position = 0u32;
-
-        for (offset, word) in split_whitespace_with_offsets(text) {
-            if !word.is_empty() {
-                // Remove punctuation and lowercase
-                let cleaned: String = word
-                    .chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .flat_map(|c| c.to_lowercase())
-                    .collect();
-
-                if !cleaned.is_empty() {
-                    // Apply stemming
-                    let stemmed = stemmer.stem(&cleaned);
-                    tokens.push(Token::new(
-                        stemmed.into_owned(),
-                        position,
-                        offset,
-                        offset + word.len(),
-                    ));
-                    position += 1;
-                }
-            }
-        }
-
-        tokens
+        tokenize_and_clean(text, |s| stemmer.stem(s).into_owned())
     }
 }
 
@@ -310,31 +291,7 @@ impl MultiLanguageStemmer {
     /// Tokenize text using a specific language
     pub fn tokenize_with_language(&self, text: &str, language: Language) -> Vec<Token> {
         let stemmer = rust_stemmers::Stemmer::create(language.to_algorithm());
-        let mut tokens = Vec::new();
-        let mut position = 0u32;
-
-        for (offset, word) in split_whitespace_with_offsets(text) {
-            if !word.is_empty() {
-                let cleaned: String = word
-                    .chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .flat_map(|c| c.to_lowercase())
-                    .collect();
-
-                if !cleaned.is_empty() {
-                    let stemmed = stemmer.stem(&cleaned);
-                    tokens.push(Token::new(
-                        stemmed.into_owned(),
-                        position,
-                        offset,
-                        offset + word.len(),
-                    ));
-                    position += 1;
-                }
-            }
-        }
-
-        tokens
+        tokenize_and_clean(text, |s| stemmer.stem(s).into_owned())
     }
 
     /// Get the default language

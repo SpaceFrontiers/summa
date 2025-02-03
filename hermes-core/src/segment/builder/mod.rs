@@ -959,20 +959,17 @@ impl SegmentBuilder {
                 } else {
                     let mut posting_bytes = Vec::new();
                     let block_list =
-                        crate::structures::BlockPostingList::from_posting_list(&full_postings)
-                            .expect("BlockPostingList creation failed");
-                    block_list
-                        .serialize(&mut posting_bytes)
-                        .expect("BlockPostingList serialization failed");
+                        crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
+                    block_list.serialize(&mut posting_bytes)?;
                     SerializedPosting::External {
                         bytes: posting_bytes,
                         doc_count: full_postings.doc_count(),
                     }
                 };
 
-                (key, result)
+                Ok((key, result))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // Phase 3: Sequential assembly
         let mut term_dict = Vec::new();
