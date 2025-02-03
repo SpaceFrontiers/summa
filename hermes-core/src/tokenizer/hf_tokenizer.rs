@@ -22,7 +22,7 @@ use crate::error::Error;
 
 /// Cached HuggingFace tokenizer
 pub struct HfTokenizer {
-    tokenizer: Tokenizer,
+    pub(crate) tokenizer: Tokenizer,
 }
 
 /// Tokenizer source - where to load the tokenizer from
