@@ -696,11 +696,17 @@ mod tests {
         assert_eq!(default.weight_quantization, WeightQuantization::Float32);
         assert_eq!(default.bytes_per_entry(), 8.0); // 4 + 4
 
-        // Test SPLADE config
+        // Test SPLADE config (research-validated defaults)
         let splade = SparseVectorConfig::splade();
         assert_eq!(splade.index_size, IndexSize::U16);
         assert_eq!(splade.weight_quantization, WeightQuantization::UInt8);
         assert_eq!(splade.bytes_per_entry(), 3.0); // 2 + 1
+        assert_eq!(splade.weight_threshold, 0.01);
+        assert_eq!(splade.posting_list_pruning, Some(0.1));
+        assert!(splade.query_config.is_some());
+        let query_cfg = splade.query_config.as_ref().unwrap();
+        assert_eq!(query_cfg.heap_factor, 0.8);
+        assert_eq!(query_cfg.max_query_dims, Some(20));
 
         // Test compact config
         let compact = SparseVectorConfig::compact();
@@ -708,10 +714,23 @@ mod tests {
         assert_eq!(compact.weight_quantization, WeightQuantization::UInt4);
         assert_eq!(compact.bytes_per_entry(), 2.5); // 2 + 0.5
 
-        // Test serialization roundtrip
+        // Test conservative config
+        let conservative = SparseVectorConfig::conservative();
+        assert_eq!(conservative.index_size, IndexSize::U32);
+        assert_eq!(
+            conservative.weight_quantization,
+            WeightQuantization::Float16
+        );
+        assert_eq!(conservative.weight_threshold, 0.005);
+        assert_eq!(conservative.posting_list_pruning, None);
+
+        // Test byte serialization roundtrip (only index_size and weight_quantization are serialized)
         let byte = splade.to_byte();
         let restored = SparseVectorConfig::from_byte(byte).unwrap();
-        assert_eq!(restored, splade);
+        assert_eq!(restored.index_size, splade.index_size);
+        assert_eq!(restored.weight_quantization, splade.weight_quantization);
+        // Note: Other fields (weight_threshold, posting_list_pruning, query_config) are not
+        // serialized in the byte format, so they revert to defaults after deserialization
     }
 
     #[test]
