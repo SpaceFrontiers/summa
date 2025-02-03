@@ -312,9 +312,12 @@ impl NcclCommunicator {
     }
 }
 
-/// Broadcast model weights from rank 0 to all other ranks
-/// Must be called after model initialization to ensure all ranks have identical weights
-pub fn sync_model(var_map: &candle_nn::VarMap, comm: &NcclCommunicator) -> Result<()> {
+/// Flatten all variables, apply a collective operation, and unflatten back.
+/// Shared helper for sync_model (broadcast) and sync_gradients (all-reduce).
+fn sync_vars(
+    var_map: &candle_nn::VarMap,
+    op: impl FnOnce(&Tensor) -> Result<Tensor>,
+) -> Result<()> {
     use candle_core::Shape;
 
     let vars: Vec<candle_core::Var> = var_map.all_vars();
@@ -333,11 +336,10 @@ pub fn sync_model(var_map: &candle_nn::VarMap, comm: &NcclCommunicator) -> Resul
         flat_data.extend(data);
     }
 
-    // Broadcast from rank 0 to all other ranks
     let device = vars[0].as_tensor().device();
     let len = flat_data.len();
     let flat_tensor = Tensor::from_vec(flat_data, len, device)?;
-    let synced = comm.broadcast(&flat_tensor)?;
+    let synced = op(&flat_tensor)?;
     let synced_data: Vec<f32> = synced.to_vec1()?;
 
     // Unflatten and update each variable
@@ -353,43 +355,14 @@ pub fn sync_model(var_map: &candle_nn::VarMap, comm: &NcclCommunicator) -> Resul
     Ok(())
 }
 
+/// Broadcast model weights from rank 0 to all other ranks
+/// Must be called after model initialization to ensure all ranks have identical weights
+pub fn sync_model(var_map: &candle_nn::VarMap, comm: &NcclCommunicator) -> Result<()> {
+    sync_vars(var_map, |t| comm.broadcast(t))
+}
+
 /// Synchronize gradients across all ranks using NCCL
 /// Flattens all gradients into a single tensor for efficient all-reduce
 pub fn sync_gradients(var_map: &candle_nn::VarMap, comm: &NcclCommunicator) -> Result<()> {
-    use candle_core::Shape;
-
-    let vars: Vec<candle_core::Var> = var_map.all_vars();
-    if vars.is_empty() {
-        return Ok(());
-    }
-
-    // Collect shapes and flatten all tensors into one
-    let mut shapes: Vec<Shape> = Vec::with_capacity(vars.len());
-    let mut flat_data: Vec<f32> = Vec::new();
-
-    for var in &vars {
-        let tensor = var.as_tensor();
-        shapes.push(tensor.shape().clone());
-        let data: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
-        flat_data.extend(data);
-    }
-
-    // Single all-reduce for all gradients
-    let device = vars[0].as_tensor().device();
-    let len = flat_data.len();
-    let flat_tensor = Tensor::from_vec(flat_data, len, device)?;
-    let synced = comm.all_reduce_avg(&flat_tensor)?;
-    let synced_data: Vec<f32> = synced.to_vec1()?;
-
-    // Unflatten and update each variable
-    let mut offset = 0;
-    for (var, shape) in vars.iter().zip(shapes.iter()) {
-        let size = shape.elem_count();
-        let data = &synced_data[offset..offset + size];
-        let tensor = Tensor::from_vec(data.to_vec(), shape.dims(), device)?;
-        var.set(&tensor)?;
-        offset += size;
-    }
-
-    Ok(())
+    sync_vars(var_map, |t| comm.all_reduce_avg(t))
 }

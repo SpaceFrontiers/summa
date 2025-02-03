@@ -205,23 +205,23 @@ fn get_device(use_gpu: bool, gpu_id: usize) -> Result<Device> {
     Ok(Device::Cpu)
 }
 
-fn get_model_def(name: &str) -> hermes_llm::ModelDef {
+fn get_model_def(name: &str) -> Result<hermes_llm::ModelDef> {
     // First try builtin models
     if let Some(model_def) = hermes_llm::get_builtin_model(name) {
-        return model_def;
+        return Ok(model_def);
     }
 
     // Try to load from .mal file if it exists
     if std::path::Path::new(name).exists() {
         match hermes_llm::parse_mal_file(name) {
-            Ok(model_def) => return model_def,
+            Ok(model_def) => return Ok(model_def),
             Err(e) => {
                 warn!("Failed to parse MAL file '{}': {}", name, e);
             }
         }
     }
 
-    panic!(
+    anyhow::bail!(
         "Unknown model '{}'. Available: {:?}",
         name,
         hermes_llm::list_wellknown_models()
@@ -379,7 +379,7 @@ fn main() -> Result<()> {
             info!("Tokenizer vocab size: {}", tokenizer.vocab_size());
 
             // Model config
-            let mut config = get_model_def(&model);
+            let mut config = get_model_def(&model)?;
             config.vocab_size = tokenizer.vocab_size();
             info!("Model: {}", config.name);
 
@@ -575,7 +575,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Info { model } => {
-            let model_def = get_model_def(&model);
+            let model_def = get_model_def(&model)?;
             print!("{}", model_def);
         }
 

@@ -315,7 +315,6 @@ pub struct FeedForward {
     down_proj: Linear,
     dropout: Dropout,
     use_swiglu: bool,
-    use_gate: bool,
 }
 
 impl FeedForward {
@@ -352,13 +351,12 @@ impl FeedForward {
             down_proj,
             dropout,
             use_swiglu,
-            use_gate,
         })
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
-        let hidden = if self.use_gate {
-            let gate = self.gate_proj.as_ref().unwrap().forward(x)?;
+        let hidden = if let Some(gate_proj) = &self.gate_proj {
+            let gate = gate_proj.forward(x)?;
             let up = self.up_proj.forward(x)?;
             if self.use_swiglu {
                 let gate = candle_nn::ops::silu(&gate)?;

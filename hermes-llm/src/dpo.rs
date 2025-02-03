@@ -215,7 +215,9 @@ impl DpoTrainer {
             let mut rejected_ids_batch = Vec::new();
 
             for i in batch_start..batch_end {
-                let pair = dataset.get(i).unwrap();
+                let pair = dataset
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("dataset index {i} out of bounds"))?;
 
                 let chosen_text = format!("{}{}", pair.prompt, pair.chosen);
                 let rejected_text = format!("{}{}", pair.prompt, pair.rejected);

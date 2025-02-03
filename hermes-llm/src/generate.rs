@@ -73,7 +73,7 @@ impl<'a> TextGenerator<'a> {
 fn top_k_filter(logits: &Tensor, k: usize, device: &Device) -> Result<Tensor> {
     let logits_vec: Vec<f32> = logits.to_vec1()?;
     let mut indexed: Vec<(usize, f32)> = logits_vec.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut masked = vec![f32::NEG_INFINITY; logits_vec.len()];
     for i in 0..k.min(indexed.len()) {

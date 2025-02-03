@@ -153,71 +153,9 @@ impl Trainer {
         train_loader: &mut DataLoader,
         comm: Option<&crate::distributed::NcclCommunicator>,
     ) -> Result<f64> {
-        let is_main = comm.is_none_or(|c| c.rank() == 0);
-        let num_batches = train_loader.num_batches();
-
-        let pb = create_progress_bar(num_batches as u64, is_main);
-
-        let mut total_loss = 0.0;
-        let mut num_steps = 0;
-        let mut accumulated_loss = 0.0;
-
         train_loader.reset();
-
-        while let Some(batch_result) = train_loader.next_batch(&self.device)? {
-            let (input, target) = (batch_result.0, batch_result.1);
-
-            let logits = self.model.forward(&input, 0, true)?;
-            let loss = cross_entropy_loss(&logits, &target)?;
-
-            accumulated_loss += loss.to_scalar::<f32>()? as f64;
-            num_steps += 1;
-
-            if num_steps % self.training_config.gradient_accumulation_steps == 0 {
-                let avg_loss =
-                    accumulated_loss / self.training_config.gradient_accumulation_steps as f64;
-
-                self.optimizer.backward_step(&loss)?;
-
-                // Synchronize gradients across all ranks (all-reduce average)
-                if let Some(c) = comm {
-                    crate::distributed::sync_gradients(&self.var_map, c)?;
-                }
-
-                if self.training_config.grad_clip > 0.0 {
-                    for var in self.var_map.all_vars() {
-                        let grad = var.as_tensor();
-                        let norm = grad.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
-                        if norm > self.training_config.grad_clip as f32 {
-                            let scale = self.training_config.grad_clip as f32 / norm;
-                            let _ = var.set(&grad.affine(scale as f64, 0.0)?);
-                        }
-                    }
-                }
-
-                total_loss += avg_loss;
-                accumulated_loss = 0.0;
-                self.global_step += 1;
-
-                if self
-                    .global_step
-                    .is_multiple_of(self.training_config.log_every)
-                {
-                    pb.set_message(format!("{:.4}", avg_loss));
-                }
-            }
-
-            pb.inc(1);
-        }
-
-        pb.finish_with_message("done");
-
-        let effective_steps = self.global_step;
-        if effective_steps > 0 {
-            Ok(total_loss / effective_steps as f64)
-        } else {
-            Ok(0.0)
-        }
+        let (loss, _interrupted) = self.train_epoch_interruptible(train_loader, comm)?;
+        Ok(loss)
     }
 
     pub fn evaluate(&self, eval_loader: &mut DataLoader) -> Result<f64> {
