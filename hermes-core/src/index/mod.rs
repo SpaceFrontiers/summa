@@ -82,7 +82,7 @@ impl Default for IndexConfig {
             num_compression_threads: cpus,
             term_cache_blocks: 256,
             store_cache_blocks: 32,
-            max_indexing_memory_bytes: 2 * 1024 * 1024 * 1024, // 256 MB default
+            max_indexing_memory_bytes: 256 * 1024 * 1024, // 256 MB default
             merge_policy: Box::new(crate::merge::TieredMergePolicy::default()),
             optimization: crate::structures::IndexOptimization::default(),
             reload_interval_ms: 1000, // 1 second default

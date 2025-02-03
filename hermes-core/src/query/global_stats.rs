@@ -70,8 +70,9 @@ impl LazyGlobalStats {
 
         // Slow path: compute and cache
         let df = self.compute_sparse_df(field, dim_id);
-        // Use total_vectors for proper IDF with multi-valued fields
-        // This ensures df <= N even when documents have multiple sparse vectors
+        // N = total unique documents. doc_count per dimension counts unique
+        // documents (not ordinals), so df <= total_docs is always true.
+        // total_vectors is a safety bound (currently equals total_docs).
         let total_vectors = self.compute_sparse_total_vectors(field);
         let n = total_vectors.max(self.total_docs);
         let idf = if df > 0 && n > 0 {

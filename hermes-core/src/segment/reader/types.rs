@@ -189,6 +189,10 @@ impl SparseIndex {
     }
 
     /// Compute IDF using doc_count from skip list
+    ///
+    /// doc_count tracks unique documents per dimension (not ordinals),
+    /// so df <= total_docs is always true. max(total_vectors, total_docs)
+    /// is a safety invariant.
     #[inline]
     pub fn idf(&self, dim_id: u32) -> f32 {
         let df = self.doc_count(dim_id) as f32;

@@ -241,8 +241,19 @@ impl BlockSparsePostingList {
             blocks.push(SparseBlock::from_postings(chunk, weight_quant)?);
         }
 
+        // Count unique document IDs (not total postings).
+        // For multi-value fields, the same doc_id appears multiple times
+        // with different ordinals. Postings are sorted by (doc_id, ordinal),
+        // so we count transitions.
+        let mut unique_docs = 1u32;
+        for i in 1..postings.len() {
+            if postings[i].0 != postings[i - 1].0 {
+                unique_docs += 1;
+            }
+        }
+
         Ok(Self {
-            doc_count: postings.len() as u32,
+            doc_count: unique_docs,
             blocks,
         })
     }
@@ -1075,6 +1086,56 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 350, "Should have 350 total docs");
+    }
+
+    #[test]
+    fn test_doc_count_multi_value() {
+        // Multi-value: same doc_id with different ordinals
+        // doc 0 has 3 ordinals, doc 5 has 2, doc 10 has 1 = 3 unique docs
+        let postings: Vec<(DocId, u16, f32)> = vec![
+            (0, 0, 1.0),
+            (0, 1, 1.5),
+            (0, 2, 2.0),
+            (5, 0, 3.0),
+            (5, 1, 3.5),
+            (10, 0, 4.0),
+        ];
+        let list =
+            BlockSparsePostingList::from_postings(&postings, WeightQuantization::Float32).unwrap();
+
+        // doc_count should be 3 (unique docs), not 6 (total postings)
+        assert_eq!(list.doc_count(), 3);
+
+        // But we should still have all 6 postings accessible
+        let decoded = list.decode_all();
+        assert_eq!(decoded.len(), 6);
+    }
+
+    #[test]
+    fn test_doc_count_single_value() {
+        // Single-value: each doc_id appears once (ordinal always 0)
+        let postings: Vec<(DocId, u16, f32)> =
+            vec![(0, 0, 1.0), (5, 0, 2.0), (10, 0, 3.0), (15, 0, 4.0)];
+        let list =
+            BlockSparsePostingList::from_postings(&postings, WeightQuantization::Float32).unwrap();
+
+        // doc_count == total postings for single-value
+        assert_eq!(list.doc_count(), 4);
+    }
+
+    #[test]
+    fn test_doc_count_multi_value_serialization_roundtrip() {
+        // Verify doc_count survives serialization
+        let postings: Vec<(DocId, u16, f32)> =
+            vec![(0, 0, 1.0), (0, 1, 1.5), (5, 0, 2.0), (5, 1, 2.5)];
+        let list =
+            BlockSparsePostingList::from_postings(&postings, WeightQuantization::Float32).unwrap();
+        assert_eq!(list.doc_count(), 2);
+
+        let mut buf = Vec::new();
+        list.serialize(&mut buf).unwrap();
+        let loaded = BlockSparsePostingList::deserialize(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(loaded.doc_count(), 2);
     }
 
     #[test]

@@ -3,11 +3,17 @@
 #[cfg(any(feature = "native", feature = "wasm"))]
 mod hf_tokenizer;
 
+#[cfg(feature = "native")]
+mod idf_weights;
+
 #[cfg(any(feature = "native", feature = "wasm"))]
 pub use hf_tokenizer::{HfTokenizer, TokenizerSource};
 
 #[cfg(feature = "native")]
 pub use hf_tokenizer::{TokenizerCache, tokenizer_cache};
+
+#[cfg(feature = "native")]
+pub use idf_weights::{IdfWeights, IdfWeightsCache, idf_weights_cache};
 
 use std::collections::HashMap;
 use std::sync::Arc;

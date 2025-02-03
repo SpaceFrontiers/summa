@@ -310,6 +310,7 @@ impl SegmentBuilder {
         let base_idx = self.doc_field_lengths.len();
         self.doc_field_lengths
             .resize(base_idx + self.num_indexed_fields, 0);
+        self.estimated_memory += self.num_indexed_fields * std::mem::size_of::<u32>();
 
         // Reset element ordinals for this document (for multi-valued fields)
         self.current_element_ordinal.clear();
@@ -333,7 +334,10 @@ impl SegmentBuilder {
                     // Update field statistics
                     let stats = self.field_stats.entry(field.0).or_default();
                     stats.total_tokens += token_count as u64;
-                    stats.doc_count += 1;
+                    // Only count each document once, even for multi-value fields
+                    if element_ordinal == 0 {
+                        stats.doc_count += 1;
+                    }
 
                     // Store field length compactly
                     if let Some(&slot) = self.field_to_slot.get(&field.0) {
@@ -431,7 +435,14 @@ impl SegmentBuilder {
             }
 
             // Intern the term directly from buffer - O(1) amortized
+            let is_new_string = !self.term_interner.contains(&self.token_buffer);
             let term_spur = self.term_interner.get_or_intern(&self.token_buffer);
+            if is_new_string {
+                use std::mem::size_of;
+                // string bytes + Spur + arena overhead (2 pointers)
+                self.estimated_memory +=
+                    self.token_buffer.len() + size_of::<Spur>() + 2 * size_of::<usize>();
+            }
             *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
 
             // Record position based on mode
@@ -481,12 +492,19 @@ impl SegmentBuilder {
             if position_mode.is_some()
                 && let Some(positions) = local_positions.get(&term_spur)
             {
+                let is_new_pos_term = !self.position_index.contains_key(&term_key);
                 let pos_posting = self
                     .position_index
                     .entry(term_key)
                     .or_insert_with(PositionPostingListBuilder::new);
                 for &pos in positions {
                     pos_posting.add_position(doc_id, pos);
+                }
+                // Incremental memory tracking for position index
+                self.estimated_memory += positions.len() * size_of::<u32>();
+                if is_new_pos_term {
+                    self.estimated_memory +=
+                        size_of::<TermKey>() + size_of::<PositionPostingListBuilder>() + 24;
                 }
             }
         }
@@ -495,8 +513,11 @@ impl SegmentBuilder {
     }
 
     fn index_numeric_field(&mut self, field: Field, doc_id: DocId, value: u64) -> Result<()> {
+        use std::mem::size_of;
+
         // For numeric fields, we use a special encoding
         let term_str = format!("__num_{}", value);
+        let is_new_string = !self.term_interner.contains(&term_str);
         let term_spur = self.term_interner.get_or_intern(&term_str);
 
         let term_key = TermKey {
@@ -504,11 +525,21 @@ impl SegmentBuilder {
             term: term_spur,
         };
 
+        let is_new_term = !self.inverted_index.contains_key(&term_key);
         let posting = self
             .inverted_index
             .entry(term_key)
             .or_insert_with(PostingListBuilder::new);
         posting.add(doc_id, 1);
+
+        // Incremental memory tracking
+        self.estimated_memory += size_of::<CompactPosting>();
+        if is_new_term {
+            self.estimated_memory += size_of::<TermKey>() + size_of::<PostingListBuilder>() + 24;
+        }
+        if is_new_string {
+            self.estimated_memory += term_str.len() + size_of::<Spur>() + 2 * size_of::<usize>();
+        }
 
         Ok(())
     }

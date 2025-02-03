@@ -310,13 +310,16 @@ pub async fn load_sparse_file<D: Directory>(
         // Ensure sorted by dim_id for binary search
         dimensions.sort_by_key(|d| d.dim_id);
 
+        // total_vectors equals total_docs because doc_count per dimension
+        // already counts unique documents (not ordinals). The max(total_vectors,
+        // total_docs) in IDF computation is just a safety invariant.
         let total_vectors = total_docs;
 
         log::debug!(
-            "Loaded sparse index for field {} (lazy): num_dims={}, estimated_vectors={}",
+            "Loaded sparse index for field {} (lazy): num_dims={}, total_docs={}",
             field_id,
             num_dims,
-            total_vectors
+            total_docs
         );
 
         indexes.insert(

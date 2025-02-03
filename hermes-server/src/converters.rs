@@ -4,7 +4,7 @@ use hermes_core::query::{
     DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, RerankerConfig, SparseVectorQuery,
 };
 use hermes_core::structures::QueryWeighting;
-use hermes_core::tokenizer::tokenizer_cache;
+use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
 use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, Query, Schema, TermQuery,
 };
@@ -113,16 +113,25 @@ pub fn convert_query(
                         .map(|(_, count)| *count as f32)
                         .collect(),
                     QueryWeighting::Idf => {
-                        if let Some(stats) = global_stats {
+                        // Try pre-computed IDF from model's idf.json first
+                        let precomputed = idf_weights_cache().get_or_load(tokenizer_name);
+
+                        if let Some(idf_weights) = precomputed {
+                            // Use model's pre-computed IDF
+                            token_counts
+                                .iter()
+                                .map(|&(id, count)| count as f32 * idf_weights.get(id))
+                                .collect()
+                        } else if let Some(stats) = global_stats {
+                            // Fall back to index-derived IDF
                             let idf_weights = stats.sparse_idf_weights(field, &token_ids);
-                            // Multiply count by IDF weight
                             token_counts
                                 .iter()
                                 .zip(idf_weights.iter())
                                 .map(|((_, count), idf)| *count as f32 * idf)
                                 .collect()
                         } else {
-                            // No global stats available, fall back to count
+                            // No IDF available, fall back to count
                             token_counts
                                 .iter()
                                 .map(|(_, count)| *count as f32)

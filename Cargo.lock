@@ -1747,6 +1747,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.15.5",
+ "hf-hub",
  "instant",
  "kentro",
  "lasso",
