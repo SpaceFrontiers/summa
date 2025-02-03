@@ -408,11 +408,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
                     _doc_count += 1;
 
+                    // Periodically recalibrate memory estimate using capacity-based
+                    // calculation. The incremental tracker undercounts by ~33% because
+                    // Vec::push doubles capacity but we only track element sizes.
+                    if b.num_docs().is_multiple_of(1000) {
+                        b.recalibrate_memory();
+                    }
+
                     // Check memory after every document - O(1) with incremental tracking.
                     // Shrink per-worker budget when builds are in-flight to account for
                     // build-phase memory amplification (posting duplication, sparse serialization).
                     let in_flight = state.pending_builds.load(Ordering::Relaxed);
-                    let effective_slots = state.config.num_indexing_threads.max(1) + in_flight * 2;
+                    let effective_slots = state.config.num_indexing_threads.max(1) + in_flight * 4;
                     let per_worker_limit = state.config.max_indexing_memory_bytes / effective_slots;
                     let builder_memory = b.estimated_memory_bytes();
 

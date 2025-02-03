@@ -176,6 +176,14 @@ impl SegmentBuilder {
         self.estimated_memory
     }
 
+    /// Recalibrate incremental memory estimate using capacity-based calculation.
+    /// More expensive than estimated_memory_bytes() — O(terms + dims) vs O(1) —
+    /// but accounts for Vec capacity growth (doubling) and HashMap table overhead.
+    /// Call periodically (e.g. every 1000 docs) to prevent drift.
+    pub fn recalibrate_memory(&mut self) {
+        self.estimated_memory = self.stats().estimated_memory_bytes;
+    }
+
     /// Count total unique sparse dimensions across all fields
     pub fn sparse_dim_count(&self) -> usize {
         self.sparse_vectors.values().map(|b| b.postings.len()).sum()
