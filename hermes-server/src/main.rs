@@ -20,7 +20,9 @@ pub mod proto {
     tonic::include_proto!("hermes");
 }
 
-use converters::{convert_field_value, convert_proto_to_document, convert_query, schema_to_sdl};
+use converters::{
+    convert_field_value, convert_proto_to_document, convert_query, convert_reranker, schema_to_sdl,
+};
 use proto::index_service_server::{IndexService, IndexServiceServer};
 use proto::search_service_server::{SearchService, SearchServiceServer};
 use proto::*;
@@ -193,10 +195,24 @@ impl SearchService for SearchServiceImpl {
         };
 
         // Search using Searcher (with count of total docs scored)
-        let (results, total_seen) = searcher
-            .search_with_count(core_query.as_ref(), limit)
-            .await
-            .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
+        let (results, total_seen) = if let Some(reranker) = &req.reranker {
+            let config = convert_reranker(reranker, reader.schema())
+                .map_err(|e| Status::invalid_argument(format!("Invalid reranker: {}", e)))?;
+            let l1_limit = if reranker.limit == 0 {
+                limit * 10
+            } else {
+                reranker.limit as usize
+            };
+            searcher
+                .search_and_rerank(core_query.as_ref(), l1_limit, limit, &config)
+                .await
+                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?
+        } else {
+            searcher
+                .search_with_count(core_query.as_ref(), limit)
+                .await
+                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?
+        };
 
         // Convert to response with optional field loading
         let mut hits = Vec::new();

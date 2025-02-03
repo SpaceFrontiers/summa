@@ -375,6 +375,22 @@ impl<D: Directory + 'static> Searcher<D> {
         Ok((results, total_seen))
     }
 
+    /// Two-stage search: L1 retrieval + L2 dense vector reranking
+    ///
+    /// Runs the query to get `l1_limit` candidates, then reranks by exact
+    /// dense vector distance and returns the top `final_limit` results.
+    pub async fn search_and_rerank(
+        &self,
+        query: &dyn crate::query::Query,
+        l1_limit: usize,
+        final_limit: usize,
+        config: &crate::query::RerankerConfig,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        let (candidates, total_seen) = self.search_with_count(query, l1_limit).await?;
+        let reranked = crate::query::rerank(self, &candidates, config, final_limit).await?;
+        Ok((reranked, total_seen))
+    }
+
     /// Parse query string and search (convenience method)
     pub async fn query(
         &self,

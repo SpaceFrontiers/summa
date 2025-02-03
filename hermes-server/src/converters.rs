@@ -1,7 +1,7 @@
 //! Proto conversion helpers
 
 use hermes_core::query::{
-    DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, SparseVectorQuery,
+    DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, RerankerConfig, SparseVectorQuery,
 };
 use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::tokenizer_cache;
@@ -237,6 +237,39 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
     }
     lines.push("}".to_string());
     lines.join("\n")
+}
+
+pub fn convert_reranker(
+    reranker: &proto::Reranker,
+    schema: &Schema,
+) -> Result<RerankerConfig, String> {
+    let field = schema
+        .get_field(&reranker.field)
+        .ok_or_else(|| format!("Reranker field '{}' not found", reranker.field))?;
+
+    let entry = schema
+        .get_field_entry(field)
+        .ok_or_else(|| format!("Field entry for '{}' not found", reranker.field))?;
+
+    if !entry.stored {
+        return Err(format!(
+            "Reranker field '{}' must be stored",
+            reranker.field
+        ));
+    }
+
+    let combiner = convert_combiner(
+        reranker.combiner,
+        reranker.combiner_temperature,
+        reranker.combiner_top_k,
+        reranker.combiner_decay,
+    );
+
+    Ok(RerankerConfig {
+        field,
+        vector: reranker.vector.clone(),
+        combiner,
+    })
 }
 
 pub fn convert_proto_to_document(

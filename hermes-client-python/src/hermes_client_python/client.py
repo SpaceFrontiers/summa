@@ -262,6 +262,7 @@ class HermesClient:
         limit: int = 10,
         offset: int = 0,
         fields_to_load: list[str] | None = None,
+        reranker: tuple[str, list[float], int] | None = None,
     ) -> SearchResponse:
         """Search for documents.
 
@@ -279,6 +280,8 @@ class HermesClient:
             limit: Maximum number of results
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
+            reranker: L2 reranker as (field, query_vector, l1_limit) tuple.
+                Reranks L1 candidates by exact dense vector distance.
 
         Returns:
             SearchResponse with hits
@@ -325,12 +328,22 @@ class HermesClient:
             combiner=combiner,
         )
 
+        pb_reranker = None
+        if reranker is not None:
+            field_name, query_vector, l1_limit = reranker
+            pb_reranker = pb.Reranker(
+                field=field_name,
+                vector=query_vector,
+                limit=l1_limit,
+            )
+
         request = pb.SearchRequest(
             index_name=index_name,
             query=query,
             limit=limit,
             offset=offset,
             fields_to_load=fields_to_load or [],
+            reranker=pb_reranker,
         )
 
         response = await self._search_stub.Search(request)

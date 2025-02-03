@@ -6,6 +6,7 @@ mod boost;
 mod collector;
 mod global_stats;
 mod phrase;
+mod reranker;
 mod scoring;
 #[cfg(test)]
 mod scoring_tests;
@@ -20,6 +21,7 @@ pub use boost::*;
 pub use collector::*;
 pub use global_stats::*;
 pub use phrase::*;
+pub use reranker::*;
 pub use scoring::*;
 pub use term::*;
 pub use traits::*;
