@@ -244,6 +244,12 @@ class IndexServiceStub:
             response_deserializer=hermes__pb2.DeleteIndexResponse.FromString,
             _registered_method=True,
         )
+        self.ListIndexes = channel.unary_unary(
+            "/hermes.IndexService/ListIndexes",
+            request_serializer=hermes__pb2.ListIndexesRequest.SerializeToString,
+            response_deserializer=hermes__pb2.ListIndexesResponse.FromString,
+            _registered_method=True,
+        )
 
 
 class IndexServiceServicer:
@@ -285,6 +291,12 @@ class IndexServiceServicer:
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
+    def ListIndexes(self, request, context):
+        """List all indexes"""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
 
 def add_IndexServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -317,6 +329,11 @@ def add_IndexServiceServicer_to_server(servicer, server):
             servicer.DeleteIndex,
             request_deserializer=hermes__pb2.DeleteIndexRequest.FromString,
             response_serializer=hermes__pb2.DeleteIndexResponse.SerializeToString,
+        ),
+        "ListIndexes": grpc.unary_unary_rpc_method_handler(
+            servicer.ListIndexes,
+            request_deserializer=hermes__pb2.ListIndexesRequest.FromString,
+            response_serializer=hermes__pb2.ListIndexesResponse.SerializeToString,
         ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -499,6 +516,36 @@ class IndexService:
             "/hermes.IndexService/DeleteIndex",
             hermes__pb2.DeleteIndexRequest.SerializeToString,
             hermes__pb2.DeleteIndexResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def ListIndexes(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/hermes.IndexService/ListIndexes",
+            hermes__pb2.ListIndexesRequest.SerializeToString,
+            hermes__pb2.ListIndexesResponse.FromString,
             options,
             channel_credentials,
             insecure,

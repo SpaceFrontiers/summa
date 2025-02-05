@@ -33,6 +33,9 @@ service IndexService {
 
   // Delete an index
   rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
+
+  // List all indexes
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
 }
 
 // Query types
@@ -292,4 +295,11 @@ message DeleteIndexRequest {
 
 message DeleteIndexResponse {
   bool success = 1;
+}
+
+// List indexes request/response
+message ListIndexesRequest {}
+
+message ListIndexesResponse {
+  repeated string index_names = 1;
 }

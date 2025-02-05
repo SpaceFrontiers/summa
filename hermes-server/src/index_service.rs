@@ -226,4 +226,15 @@ impl IndexService for IndexServiceImpl {
 
         Ok(Response::new(DeleteIndexResponse { success: true }))
     }
+
+    async fn list_indexes(
+        &self,
+        _request: Request<ListIndexesRequest>,
+    ) -> Result<Response<ListIndexesResponse>, Status> {
+        let index_names = self.registry.list_indexes();
+
+        info!(count = index_names.len(), "Listed indexes");
+
+        Ok(Response::new(ListIndexesResponse { index_names }))
+    }
 }

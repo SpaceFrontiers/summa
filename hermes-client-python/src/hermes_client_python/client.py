@@ -135,6 +135,17 @@ class HermesClient:
         response = await self._index_stub.DeleteIndex(request)
         return response.success
 
+    async def list_indexes(self) -> list[str]:
+        """List all indexes on the server.
+
+        Returns:
+            List of index names
+        """
+        self._ensure_connected()
+        request = pb.ListIndexesRequest()
+        response = await self._index_stub.ListIndexes(request)
+        return list(response.index_names)
+
     async def get_index_info(self, index_name: str) -> IndexInfo:
         """Get information about an index.
 

@@ -120,4 +120,22 @@ impl IndexRegistry {
         self.writers.write().remove(name);
         self.indexes.write().remove(name);
     }
+
+    /// List all indexes on disk
+    pub fn list_indexes(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.data_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_dir() {
+                    entry.file_name().into_string().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        names.sort();
+        names
+    }
 }
