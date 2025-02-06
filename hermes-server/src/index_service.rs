@@ -47,23 +47,28 @@ impl IndexService for IndexServiceImpl {
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
-        let schema = index.schema();
+        let schema = index.schema().clone();
 
-        // Convert all documents first (this is CPU-bound, could be parallelized further)
-        let mut documents = Vec::with_capacity(req.documents.len());
-        let mut conversion_errors = 0u32;
-
-        for named_doc in req.documents {
-            match convert_proto_to_document(&named_doc.fields, schema) {
-                Ok(doc) => documents.push(doc),
-                Err(_) => conversion_errors += 1,
+        // Move CPU-bound proto conversion off the async runtime
+        let proto_docs = req.documents;
+        let (documents, conversion_errors) = tokio::task::spawn_blocking(move || {
+            let mut documents = Vec::with_capacity(proto_docs.len());
+            let mut conversion_errors = 0u32;
+            for named_doc in proto_docs {
+                match convert_proto_to_document(&named_doc.fields, &schema) {
+                    Ok(doc) => documents.push(doc),
+                    Err(_) => conversion_errors += 1,
+                }
             }
-        }
+            (documents, conversion_errors)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Conversion task failed: {}", e)))?;
 
-        // Use cached writer - lock only for the add_documents call
+        // Read lock allows concurrent document addition from multiple requests
         let doc_count = documents.len() as u32;
         let indexed_count = {
-            let w = writer.lock().await;
+            let w = writer.read().await;
             w.add_documents(documents).unwrap_or(0) as u32
         };
         let index_errors = doc_count - indexed_count;
@@ -91,7 +96,7 @@ impl IndexService for IndexServiceImpl {
         let mut indexed_count = 0u32;
         let mut current_index: Option<Arc<hermes_core::Index<hermes_core::FsDirectory>>> = None;
         let mut current_writer: Option<
-            Arc<tokio::sync::Mutex<hermes_core::IndexWriter<hermes_core::FsDirectory>>>,
+            Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::FsDirectory>>>,
         > = None;
         let mut current_index_name: Option<String> = None;
 
@@ -118,7 +123,7 @@ impl IndexService for IndexServiceImpl {
                 .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
 
             writer
-                .lock()
+                .read()
                 .await
                 .add_document(doc)
                 .map_err(|e| Status::internal(format!("Failed to index document: {}", e)))?;
@@ -138,7 +143,7 @@ impl IndexService for IndexServiceImpl {
         let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
-            .lock()
+            .write()
             .await
             .commit()
             .await
@@ -171,7 +176,7 @@ impl IndexService for IndexServiceImpl {
         let writer = self.registry.get_writer(&req.index_name).await?;
 
         writer
-            .lock()
+            .write()
             .await
             .force_merge()
             .await
@@ -203,7 +208,7 @@ impl IndexService for IndexServiceImpl {
 
         // Wait for any pending segment builds and merges to complete before deleting
         if let Some(writer) = self.registry.get_existing_writer(&req.index_name) {
-            let w = writer.lock().await;
+            let w = writer.write().await;
             // Flush triggers workers to finish current builders and waits for
             // all pending segment builds to complete
             if let Err(e) = w.flush().await {

@@ -14,7 +14,8 @@ pub struct IndexRegistry {
     /// Open indexes (Index is the central concept)
     indexes: RwLock<HashMap<String, Arc<Index<FsDirectory>>>>,
     /// Cached writers - one per index, reused across requests to avoid segment fragmentation
-    writers: RwLock<HashMap<String, Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>>>,
+    /// Uses RwLock: read lock for add_document (concurrent), write lock for commit/merge (exclusive)
+    writers: RwLock<HashMap<String, Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>>>,
     pub(crate) data_dir: PathBuf,
     config: IndexConfig,
 }
@@ -74,7 +75,7 @@ impl IndexRegistry {
             .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
 
         let index = Arc::new(index);
-        let writer = Arc::new(tokio::sync::Mutex::new(index.writer()));
+        let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
 
         self.indexes
             .write()
@@ -87,7 +88,7 @@ impl IndexRegistry {
     pub async fn get_writer(
         &self,
         name: &str,
-    ) -> Result<Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>, Status> {
+    ) -> Result<Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>, Status> {
         // Check if writer already exists
         if let Some(writer) = self.writers.read().get(name) {
             return Ok(Arc::clone(writer));
@@ -102,7 +103,7 @@ impl IndexRegistry {
             return Ok(Arc::clone(writer));
         }
 
-        let writer = Arc::new(tokio::sync::Mutex::new(index.writer()));
+        let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
         writers.insert(name.to_string(), Arc::clone(&writer));
         Ok(writer)
     }
@@ -111,7 +112,7 @@ impl IndexRegistry {
     pub fn get_existing_writer(
         &self,
         name: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<IndexWriter<FsDirectory>>>> {
+    ) -> Option<Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>> {
         self.writers.read().get(name).cloned()
     }
 
