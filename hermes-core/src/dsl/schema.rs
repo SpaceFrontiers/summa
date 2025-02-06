@@ -717,6 +717,22 @@ impl Document {
         &self.field_values
     }
 
+    /// Return a new Document containing only fields marked as `stored` in the schema
+    pub fn filter_stored(&self, schema: &Schema) -> Document {
+        Document {
+            field_values: self
+                .field_values
+                .iter()
+                .filter(|(field, _)| {
+                    schema
+                        .get_field_entry(*field)
+                        .is_some_and(|entry| entry.stored)
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Convert document to a JSON object using field names from schema
     ///
     /// Fields marked as `multi` in the schema are always returned as JSON arrays.

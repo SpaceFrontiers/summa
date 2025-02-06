@@ -36,8 +36,83 @@ pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
 #[cfg(feature = "native")]
 const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel(7);
 
-pub fn serialize_document(doc: &Document, _schema: &Schema) -> io::Result<Vec<u8>> {
-    serde_json::to_vec(doc).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+/// Binary document format:
+///   num_fields: u16
+///   per field: field_id: u16, type_tag: u8, value data
+///     0=Text:         len:u32 + utf8
+///     1=U64:          u64 LE
+///     2=I64:          i64 LE
+///     3=F64:          f64 LE
+///     4=Bytes:        len:u32 + raw
+///     5=SparseVector: count:u32 + count*(u32+f32)
+///     6=DenseVector:  count:u32 + count*f32
+///     7=Json:         len:u32 + json utf8
+pub fn serialize_document(doc: &Document, schema: &Schema) -> io::Result<Vec<u8>> {
+    use crate::dsl::FieldValue;
+
+    let stored: Vec<_> = doc
+        .field_values()
+        .iter()
+        .filter(|(field, _)| schema.get_field_entry(*field).is_some_and(|e| e.stored))
+        .collect();
+
+    let mut buf = Vec::with_capacity(256);
+    buf.write_u16::<LittleEndian>(stored.len() as u16)?;
+
+    for (field, value) in &stored {
+        buf.write_u16::<LittleEndian>(field.0 as u16)?;
+        match value {
+            FieldValue::Text(s) => {
+                buf.push(0);
+                let bytes = s.as_bytes();
+                buf.write_u32::<LittleEndian>(bytes.len() as u32)?;
+                buf.extend_from_slice(bytes);
+            }
+            FieldValue::U64(v) => {
+                buf.push(1);
+                buf.write_u64::<LittleEndian>(*v)?;
+            }
+            FieldValue::I64(v) => {
+                buf.push(2);
+                buf.write_i64::<LittleEndian>(*v)?;
+            }
+            FieldValue::F64(v) => {
+                buf.push(3);
+                buf.write_f64::<LittleEndian>(*v)?;
+            }
+            FieldValue::Bytes(b) => {
+                buf.push(4);
+                buf.write_u32::<LittleEndian>(b.len() as u32)?;
+                buf.extend_from_slice(b);
+            }
+            FieldValue::SparseVector(entries) => {
+                buf.push(5);
+                buf.write_u32::<LittleEndian>(entries.len() as u32)?;
+                for (idx, val) in entries {
+                    buf.write_u32::<LittleEndian>(*idx)?;
+                    buf.write_f32::<LittleEndian>(*val)?;
+                }
+            }
+            FieldValue::DenseVector(values) => {
+                buf.push(6);
+                buf.write_u32::<LittleEndian>(values.len() as u32)?;
+                // Write raw f32 bytes directly
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
+                };
+                buf.extend_from_slice(byte_slice);
+            }
+            FieldValue::Json(v) => {
+                buf.push(7);
+                let json_bytes = serde_json::to_vec(v)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                buf.write_u32::<LittleEndian>(json_bytes.len() as u32)?;
+                buf.extend_from_slice(&json_bytes);
+            }
+        }
+    }
+
+    Ok(buf)
 }
 
 /// Compressed block result
@@ -521,7 +596,89 @@ impl AsyncStoreReader {
 }
 
 pub fn deserialize_document(data: &[u8], _schema: &Schema) -> io::Result<Document> {
-    serde_json::from_slice(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    use crate::dsl::Field;
+
+    let mut reader = data;
+    let num_fields = reader.read_u16::<LittleEndian>()? as usize;
+    let mut doc = Document::new();
+
+    for _ in 0..num_fields {
+        let field_id = reader.read_u16::<LittleEndian>()?;
+        let field = Field(field_id as u32);
+        let type_tag = reader.read_u8()?;
+
+        match type_tag {
+            0 => {
+                // Text
+                let len = reader.read_u32::<LittleEndian>()? as usize;
+                let s = std::str::from_utf8(&reader[..len])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                doc.add_text(field, s);
+                reader = &reader[len..];
+            }
+            1 => {
+                // U64
+                doc.add_u64(field, reader.read_u64::<LittleEndian>()?);
+            }
+            2 => {
+                // I64
+                doc.add_i64(field, reader.read_i64::<LittleEndian>()?);
+            }
+            3 => {
+                // F64
+                doc.add_f64(field, reader.read_f64::<LittleEndian>()?);
+            }
+            4 => {
+                // Bytes
+                let len = reader.read_u32::<LittleEndian>()? as usize;
+                doc.add_bytes(field, reader[..len].to_vec());
+                reader = &reader[len..];
+            }
+            5 => {
+                // SparseVector
+                let count = reader.read_u32::<LittleEndian>()? as usize;
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let idx = reader.read_u32::<LittleEndian>()?;
+                    let val = reader.read_f32::<LittleEndian>()?;
+                    entries.push((idx, val));
+                }
+                doc.add_sparse_vector(field, entries);
+            }
+            6 => {
+                // DenseVector
+                let count = reader.read_u32::<LittleEndian>()? as usize;
+                let byte_len = count * 4;
+                let mut values = vec![0.0f32; count];
+                // Read raw f32 bytes directly
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        reader.as_ptr(),
+                        values.as_mut_ptr() as *mut u8,
+                        byte_len,
+                    );
+                }
+                reader = &reader[byte_len..];
+                doc.add_dense_vector(field, values);
+            }
+            7 => {
+                // Json
+                let len = reader.read_u32::<LittleEndian>()? as usize;
+                let v: serde_json::Value = serde_json::from_slice(&reader[..len])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                doc.add_json(field, v);
+                reader = &reader[len..];
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unknown field type tag: {}", type_tag),
+                ));
+            }
+        }
+    }
+
+    Ok(doc)
 }
 
 /// Raw block info for store merging (without decompression)
