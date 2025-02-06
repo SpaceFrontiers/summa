@@ -334,6 +334,14 @@ impl SparseVectorQuery {
                     vec![1.0f32; token_ids.len()]
                 }
             }
+            QueryWeighting::IdfFile => {
+                use crate::tokenizer::idf_weights_cache;
+                if let Some(idf) = idf_weights_cache().get_or_load(tokenizer_name) {
+                    token_ids.iter().map(|&id| idf.get(id)).collect()
+                } else {
+                    vec![1.0f32; token_ids.len()]
+                }
+            }
         };
 
         let vector: Vec<(u32, f32)> = token_ids.into_iter().zip(weights).collect();
@@ -376,6 +384,11 @@ impl SparseVectorQuery {
                 } else {
                     vec![1.0f32; token_ids.len()]
                 }
+            }
+            QueryWeighting::IdfFile => {
+                // IdfFile requires a tokenizer name for HF model lookup;
+                // this code path doesn't have one, so fall back to 1.0
+                vec![1.0f32; token_ids.len()]
             }
         };
 
@@ -421,6 +434,11 @@ impl SparseVectorQuery {
                 } else {
                     vec![1.0f32; token_ids.len()]
                 }
+            }
+            QueryWeighting::IdfFile => {
+                // IdfFile requires a tokenizer name for HF model lookup;
+                // this code path doesn't have one, so fall back to 1.0
+                vec![1.0f32; token_ids.len()]
             }
         };
 

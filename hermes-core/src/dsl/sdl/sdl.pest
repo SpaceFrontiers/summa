@@ -160,7 +160,7 @@ query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg }
 query_tokenizer_kwarg = { "tokenizer" ~ ":" ~ tokenizer_path }
 query_weighting_kwarg = { "weighting" ~ ":" ~ weighting_spec }
 tokenizer_path = { "\"" ~ path_chars ~ "\"" }
-weighting_spec = { "one" | "idf" }
+weighting_spec = { "one" | "idf_file" | "idf" }
 
 // Identifier (field names, index names, tokenizer names)
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

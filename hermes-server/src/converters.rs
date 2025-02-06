@@ -156,25 +156,11 @@ pub fn convert_query(
                         .map(|(_, count)| *count as f32)
                         .collect(),
                     QueryWeighting::Idf => {
-                        // Try pre-computed IDF from model's idf.json first
-                        let precomputed = idf_weights_cache().get_or_load(tokenizer_name);
-
-                        if let Some(idf_weights) = &precomputed {
-                            // Use model's pre-computed IDF
-                            let weights: Vec<f32> = token_counts
-                                .iter()
-                                .map(|&(id, count)| count as f32 * idf_weights.get(id))
-                                .collect();
-                            debug!(
-                                "Sparse IDF (precomputed from idf.json): tokenizer={}, tokens={:?}, weights={:?}",
-                                tokenizer_name, token_ids, weights,
-                            );
-                            weights
-                        } else if let Some(stats) = global_stats {
-                            // Fall back to index-derived IDF
+                        // Use real IDF from global index statistics
+                        if let Some(stats) = global_stats {
                             let idf_weights = stats.sparse_idf_weights(field, &token_ids);
                             debug!(
-                                "Sparse IDF (index-derived): field={}, total_docs={}, token_ids={:?}, idf={:?}",
+                                "Sparse IDF (global stats): field={}, total_docs={}, token_ids={:?}, idf={:?}",
                                 sv_query.field,
                                 stats.total_docs(),
                                 token_ids,
@@ -186,10 +172,34 @@ pub fn convert_query(
                                 .map(|((_, count), idf)| *count as f32 * idf)
                                 .collect()
                         } else {
-                            // No IDF available, fall back to count
                             warn!(
-                                "Sparse IDF: no idf.json and no global_stats available for field={}, falling back to count",
+                                "Sparse IDF: no global_stats available for field={}, falling back to count",
                                 sv_query.field,
+                            );
+                            token_counts
+                                .iter()
+                                .map(|(_, count)| *count as f32)
+                                .collect()
+                        }
+                    }
+                    QueryWeighting::IdfFile => {
+                        // Use pre-computed IDF from model's idf.json (no global stats fallback)
+                        let precomputed = idf_weights_cache().get_or_load(tokenizer_name);
+
+                        if let Some(idf_weights) = &precomputed {
+                            let weights: Vec<f32> = token_counts
+                                .iter()
+                                .map(|&(id, count)| count as f32 * idf_weights.get(id))
+                                .collect();
+                            debug!(
+                                "Sparse IDF (idf.json): tokenizer={}, tokens={:?}, weights={:?}",
+                                tokenizer_name, token_ids, weights,
+                            );
+                            weights
+                        } else {
+                            warn!(
+                                "Sparse IdfFile: no idf.json available for model '{}', field={}, falling back to count",
+                                tokenizer_name, sv_query.field,
                             );
                             token_counts
                                 .iter()

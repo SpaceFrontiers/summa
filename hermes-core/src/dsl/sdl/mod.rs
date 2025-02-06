@@ -410,6 +410,7 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                                     config.query_weighting = Some(match w.as_str() {
                                         "one" => QueryWeighting::One,
                                         "idf" => QueryWeighting::Idf,
+                                        "idf_file" => QueryWeighting::IdfFile,
                                         _ => QueryWeighting::One,
                                     });
                                 }
@@ -1579,5 +1580,34 @@ mod tests {
         let query_config = config.query_config.as_ref().unwrap();
         assert!(query_config.tokenizer.is_none());
         assert_eq!(query_config.weighting, QueryWeighting::One);
+    }
+
+    #[test]
+    fn test_sparse_vector_query_config_weighting_idf_file() {
+        use crate::structures::QueryWeighting;
+
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16> [indexed<quantization: uint8, query<tokenizer: "opensearch-neural-sparse-encoding-v1", weighting: idf_file>>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+
+        let query_config = config.query_config.as_ref().unwrap();
+        assert_eq!(
+            query_config.tokenizer.as_deref(),
+            Some("opensearch-neural-sparse-encoding-v1")
+        );
+        assert_eq!(query_config.weighting, QueryWeighting::IdfFile);
+
+        // Verify schema conversion preserves idf_file
+        let schema = indexes[0].to_schema();
+        let field = schema.get_field("embedding").unwrap();
+        let entry = schema.get_field_entry(field).unwrap();
+        let sc = entry.sparse_vector_config.as_ref().unwrap();
+        let qc = sc.query_config.as_ref().unwrap();
+        assert_eq!(qc.weighting, QueryWeighting::IdfFile);
     }
 }

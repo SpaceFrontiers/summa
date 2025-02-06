@@ -88,8 +88,12 @@ pub enum QueryWeighting {
     /// All terms get weight 1.0
     #[default]
     One,
-    /// Terms weighted by IDF (inverse document frequency) from the index
+    /// Terms weighted by IDF (inverse document frequency) from global index statistics
+    /// Uses ln(N/df) where N = total docs, df = docs containing dimension
     Idf,
+    /// Terms weighted by pre-computed IDF from model's idf.json file
+    /// Loaded from HuggingFace model repo. No fallback to global stats.
+    IdfFile,
 }
 
 /// Query-time configuration for sparse vectors
