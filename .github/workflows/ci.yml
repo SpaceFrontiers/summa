@@ -90,3 +90,31 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
       - run: ruff format --check .
+
+  # TypeScript client - build check
+  typescript:
+    name: TypeScript Client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: hermes-client-typescript/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: cd hermes-client-typescript && pnpm install
+
+      - name: Generate proto stubs
+        run: cd hermes-client-typescript && pnpm run generate
+
+      - name: Build
+        run: cd hermes-client-typescript && pnpm run build

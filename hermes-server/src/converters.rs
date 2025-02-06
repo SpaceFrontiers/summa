@@ -1,5 +1,7 @@
 //! Proto conversion helpers
 
+use std::sync::LazyLock;
+
 use hermes_core::query::{
     DenseVectorQuery, LazyGlobalStats, MultiValueCombiner, RerankerConfig, SparseVectorQuery,
 };
@@ -7,8 +9,11 @@ use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
 use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, Query, Schema, TermQuery,
+    TokenizerRegistry, WandOrQuery,
 };
 use tracing::{debug, warn};
+
+static TOKENIZER_REGISTRY: LazyLock<TokenizerRegistry> = LazyLock::new(TokenizerRegistry::new);
 
 use crate::proto;
 use crate::proto::field_value::Value;
@@ -43,6 +48,43 @@ pub fn convert_query(
                 .get_field(&term_query.field)
                 .ok_or_else(|| format!("Field '{}' not found", term_query.field))?;
             Ok(Box::new(TermQuery::text(field, &term_query.term)))
+        }
+        Some(ProtoQueryType::Match(match_query)) => {
+            let field = schema
+                .get_field(&match_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", match_query.field))?;
+
+            // Get the field's configured tokenizer (or default)
+            let tokenizer_name = schema
+                .get_field_entry(field)
+                .and_then(|entry| entry.tokenizer.as_deref())
+                .unwrap_or("default");
+
+            let tokenizer = TOKENIZER_REGISTRY
+                .get(tokenizer_name)
+                .unwrap_or_else(|| Box::new(hermes_core::LowercaseTokenizer));
+
+            let tokens: Vec<String> = tokenizer
+                .tokenize(&match_query.text)
+                .into_iter()
+                .map(|t| t.text)
+                .collect();
+
+            if tokens.is_empty() {
+                return Err(format!(
+                    "No tokens in match query text '{}'",
+                    match_query.text
+                ));
+            }
+
+            if tokens.len() == 1 {
+                // Single token - use TermQuery directly
+                return Ok(Box::new(TermQuery::text(field, &tokens[0])));
+            }
+
+            // Multiple tokens - use WandOrQuery for efficient OR search
+            let query = WandOrQuery::new(field).terms(tokens);
+            Ok(Box::new(query))
         }
         Some(ProtoQueryType::Boolean(bool_query)) => {
             let mut bq = BooleanQuery::new();

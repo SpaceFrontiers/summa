@@ -47,6 +47,7 @@ message Query {
     AllQuery all = 4;
     SparseVectorQuery sparse_vector = 5;
     DenseVectorQuery dense_vector = 6;
+    MatchQuery match = 7;
   }
 }
 
@@ -102,6 +103,13 @@ message BoostQuery {
 }
 
 message AllQuery {}
+
+// Full-text match query - tokenizes text server-side and searches as OR of tokens
+// Use this instead of TermQuery when searching with natural language text
+message MatchQuery {
+  string field = 1;
+  string text = 2;
+}
 
 // L2 reranker: rerank L1 candidates by exact dense vector distance
 message Reranker {

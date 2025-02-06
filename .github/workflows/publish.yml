@@ -23,6 +23,10 @@ on:
         description: "Publish to PyPI"
         type: boolean
         default: true
+      publish_npm_ts:
+        description: "Publish TS client to NPM"
+        type: boolean
+        default: true
       publish_docker:
         description: "Publish Docker image"
         type: boolean
@@ -97,12 +101,18 @@ jobs:
           sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-client-python/pyproject.toml
           echo "Updated pyproject.toml to version ${{ steps.bump.outputs.new_version }}"
 
+      - name: Update TypeScript client version
+        run: |
+          cd hermes-client-typescript
+          sed -i 's/"version": ".*"/"version": "${{ steps.bump.outputs.new_version }}"/' package.json
+          echo "Updated package.json to version ${{ steps.bump.outputs.new_version }}"
+
       - name: Update Cargo.lock
         run: cargo generate-lockfile
 
       - name: Commit and push
         run: |
-          git add Cargo.toml Cargo.lock hermes-client-python/pyproject.toml
+          git add Cargo.toml Cargo.lock hermes-client-python/pyproject.toml hermes-client-typescript/package.json
           git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
           git push
 
@@ -183,6 +193,41 @@ jobs:
         run: |
           cd hermes-wasm/pkg
           npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-npm-ts:
+    name: Publish TS Client to NPM
+    runs-on: ubuntu-latest
+    needs: bump-version
+    if: inputs.publish_npm_ts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: cd hermes-client-typescript && pnpm install
+
+      - name: Generate proto stubs
+        run: cd hermes-client-typescript && pnpm run generate
+
+      - name: Build
+        run: cd hermes-client-typescript && pnpm run build
+
+      - name: Publish to NPM
+        run: cd hermes-client-typescript && pnpm publish --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 

@@ -1,0 +1,3 @@
+onlyBuiltDependencies:
+  - grpc-tools
+  - protobufjs

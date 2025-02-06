@@ -1,0 +1,41 @@
+{
+  "name": "hermes-client-typescript",
+  "version": "1.4.47",
+  "description": "TypeScript client for Hermes search server",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "generate": "bash generate_proto.sh",
+    "build": "tsc",
+    "prepublishOnly": "pnpm run build",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "search",
+    "full-text-search",
+    "grpc",
+    "hermes",
+    "vector-search"
+  ],
+  "license": "MIT",
+  "author": "izihawa",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SpaceFrontiers/hermes",
+    "directory": "hermes-client-typescript"
+  },
+  "homepage": "https://github.com/SpaceFrontiers/hermes",
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.11.0",
+    "@grpc/grpc-js": "^1.12.0",
+    "nice-grpc": "^2.1.10"
+  },
+  "devDependencies": {
+    "grpc-tools": "^1.12.4",
+    "ts-proto": "^2.6.1",
+    "typescript": "^5.8.0"
+  }
+}

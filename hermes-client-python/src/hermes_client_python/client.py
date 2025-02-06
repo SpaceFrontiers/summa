@@ -262,6 +262,7 @@ class HermesClient:
         index_name: str,
         *,
         term: tuple[str, str] | None = None,
+        match: tuple[str, str] | None = None,
         boolean: dict[str, list[tuple[str, str]]] | None = None,
         sparse_vector: tuple[str, list[int], list[float]] | None = None,
         sparse_text: tuple[str, str] | None = None,
@@ -280,7 +281,9 @@ class HermesClient:
 
         Args:
             index_name: Name of the index
-            term: Term query as (field, term) tuple
+            term: Term query as (field, term) tuple - exact single-term match
+            match: Match query as (field, text) tuple - tokenizes text server-side
+                and searches as OR of individual tokens (use for natural language)
             boolean: Boolean query with "must", "should", "must_not" keys
             sparse_vector: Sparse vector query as (field, indices, values) tuple
             sparse_text: Sparse vector query with server-side tokenization as (field, text) tuple
@@ -302,8 +305,11 @@ class HermesClient:
             SearchResponse with hits
 
         Examples:
-            # Term query
+            # Term query (exact single token)
             results = await client.search("articles", term=("title", "hello"))
+
+            # Match query (full-text, tokenized server-side)
+            results = await client.search("articles", match=("title", "what is hemoglobin"))
 
             # Boolean query
             results = await client.search("articles", boolean={
@@ -333,6 +339,7 @@ class HermesClient:
 
         query = _build_query(
             term=term,
+            match=match,
             boolean=boolean,
             sparse_vector=sparse_vector,
             sparse_text=sparse_text,
@@ -566,6 +573,7 @@ def _reranker_combiner_to_proto(combiner: str) -> int:
 def _build_query(
     *,
     term: tuple[str, str] | None = None,
+    match: tuple[str, str] | None = None,
     boolean: dict[str, list[tuple[str, str]]] | None = None,
     sparse_vector: tuple[str, list[int], list[float]] | None = None,
     sparse_text: tuple[str, str] | None = None,
@@ -580,17 +588,21 @@ def _build_query(
         field, value = term
         return pb.Query(term=pb.TermQuery(field=field, term=value))
 
+    if match is not None:
+        field, text = match
+        return pb.Query(match=pb.MatchQuery(field=field, text=text))
+
     if boolean is not None:
         must = [
-            pb.Query(term=pb.TermQuery(field=f, term=t))
+            pb.Query(match=pb.MatchQuery(field=f, text=t))
             for f, t in boolean.get("must", [])
         ]
         should = [
-            pb.Query(term=pb.TermQuery(field=f, term=t))
+            pb.Query(match=pb.MatchQuery(field=f, text=t))
             for f, t in boolean.get("should", [])
         ]
         must_not = [
-            pb.Query(term=pb.TermQuery(field=f, term=t))
+            pb.Query(match=pb.MatchQuery(field=f, text=t))
             for f, t in boolean.get("must_not", [])
         ]
         return pb.Query(
