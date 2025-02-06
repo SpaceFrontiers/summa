@@ -268,11 +268,16 @@ pub struct SparseVectorQuery {
 
 impl SparseVectorQuery {
     /// Create a new sparse vector query
+    ///
+    /// Default combiner is `LogSumExp { temperature: 0.7 }` which provides
+    /// saturation for documents with many sparse vectors (e.g., 100+ ordinals).
+    /// This prevents over-weighting from multiple matches while still allowing
+    /// additional matches to contribute to the score.
     pub fn new(field: Field, vector: Vec<(u32, f32)>) -> Self {
         Self {
             field,
             vector,
-            combiner: MultiValueCombiner::Sum,
+            combiner: MultiValueCombiner::LogSumExp { temperature: 0.7 },
             heap_factor: 1.0,
         }
     }
