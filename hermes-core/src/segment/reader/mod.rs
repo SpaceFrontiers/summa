@@ -535,7 +535,7 @@ impl AsyncSegmentReader {
         combiner: crate::query::MultiValueCombiner,
         heap_factor: f32,
     ) -> Result<Vec<VectorSearchResult>> {
-        use crate::query::{BmpExecutor, MaxScoreExecutor, SparseTermScorer, WandExecutor};
+        use crate::query::{BlockMaxScoreExecutor, BmpExecutor, SparseTermScorer};
 
         let query_tokens = vector.len();
 
@@ -625,8 +625,7 @@ impl AsyncSegmentReader {
 
         // Select executor based on number of query terms:
         // - 12+ terms: BMP (block-at-a-time, best for SPLADE expansions)
-        // - 6-11 terms: MaxScore (essential/non-essential partitioning)
-        // - 1-5 terms: WAND (pivot-based, best for short queries)
+        // - 1-11 terms: BlockMaxScoreExecutor (unified MaxScore + block-max + conjunction)
         let num_terms = scorers.len();
         let over_fetch = limit * 2; // Over-fetch for multi-value combining
         let raw_results = if num_terms > 12 {
@@ -638,10 +637,8 @@ impl AsyncSegmentReader {
             let weights: Vec<_> = posting_lists.iter().map(|(_, qw, _)| *qw).collect();
             drop(scorers); // Release borrowing iterators before using posting_lists
             BmpExecutor::new(pl_refs, weights, over_fetch, heap_factor).execute()
-        } else if num_terms > 6 {
-            MaxScoreExecutor::with_heap_factor(scorers, over_fetch, heap_factor).execute()
         } else {
-            WandExecutor::with_heap_factor(scorers, over_fetch, heap_factor).execute()
+            BlockMaxScoreExecutor::with_heap_factor(scorers, over_fetch, heap_factor).execute()
         };
 
         log::trace!(

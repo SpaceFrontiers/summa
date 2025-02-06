@@ -3,7 +3,8 @@
 //! Provides common traits and utilities for efficient top-k retrieval:
 //! - `ScoringIterator`: Common interface for posting list iteration with scoring
 //! - `TopKCollector`: Efficient min-heap for maintaining top-k results
-//! - `WandExecutor`: Generic MaxScore WAND algorithm
+//! - `BlockMaxScoreExecutor`: Unified Block-Max MaxScore with conjunction optimization
+//! - `BmpExecutor`: Block-at-a-time executor for learned sparse retrieval (12+ terms)
 //! - `SparseTermScorer`: ScoringIterator implementation for sparse vectors
 
 use std::cmp::Ordering;
@@ -198,233 +199,242 @@ pub struct ScoredDoc {
     pub ordinal: u16,
 }
 
-/// Generic MaxScore WAND executor for top-k retrieval
+/// Unified Block-Max MaxScore executor for top-k retrieval
 ///
-/// Works with any type implementing `ScoringIterator`.
-/// Implements:
-/// - WAND pivot-based pruning: skip documents that can't beat threshold
-/// - Block-max WAND: skip blocks that can't beat threshold
-/// - Efficient top-k collection
-pub struct WandExecutor<S: ScoringIterator> {
-    /// Scorers for each query term
+/// Combines three optimizations from the literature into one executor:
+/// 1. **MaxScore partitioning** (Turtle & Flood 1995): terms split into essential
+///    (must check) and non-essential (only scored if candidate is promising)
+/// 2. **Block-max pruning** (Ding & Suel 2011): skip blocks where per-block
+///    upper bounds can't beat the current threshold
+/// 3. **Conjunction optimization** (Lucene/Grand 2023): progressively intersect
+///    essential terms as threshold rises, skipping docs that lack enough terms
+///
+/// Works with any type implementing `ScoringIterator` (text or sparse).
+/// Replaces separate WAND and MaxScore executors with better performance
+/// across all query lengths.
+pub struct BlockMaxScoreExecutor<S: ScoringIterator> {
+    /// Scorers sorted by max_score ascending (non-essential first)
     scorers: Vec<S>,
+    /// Cumulative max_score prefix sums: prefix_sums[i] = sum(max_score[0..=i])
+    prefix_sums: Vec<f32>,
     /// Top-k collector
     collector: ScoreCollector,
     /// Heap factor for approximate search (SEISMIC-style)
-    /// A block/document is skipped if max_possible < heap_factor * threshold
     /// - 1.0 = exact search (default)
     /// - 0.8 = approximate, faster with minor recall loss
     heap_factor: f32,
 }
 
-impl<S: ScoringIterator> WandExecutor<S> {
-    /// Create a new WAND executor with exact search (heap_factor = 1.0)
+/// Backwards-compatible alias for `BlockMaxScoreExecutor`
+pub type WandExecutor<S> = BlockMaxScoreExecutor<S>;
+
+impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
+    /// Create a new executor with exact search (heap_factor = 1.0)
     pub fn new(scorers: Vec<S>, k: usize) -> Self {
         Self::with_heap_factor(scorers, k, 1.0)
     }
 
-    /// Create a new WAND executor with approximate search
+    /// Create a new executor with approximate search
     ///
     /// `heap_factor` controls the trade-off between speed and recall:
     /// - 1.0 = exact search
     /// - 0.8 = ~20% faster, minor recall loss
     /// - 0.5 = much faster, noticeable recall loss
-    pub fn with_heap_factor(scorers: Vec<S>, k: usize, heap_factor: f32) -> Self {
-        let total_upper: f32 = scorers.iter().map(|s| s.max_score()).sum();
+    pub fn with_heap_factor(mut scorers: Vec<S>, k: usize, heap_factor: f32) -> Self {
+        // Sort scorers by max_score ascending (non-essential terms first)
+        scorers.sort_by(|a, b| {
+            a.max_score()
+                .partial_cmp(&b.max_score())
+                .unwrap_or(Ordering::Equal)
+        });
+
+        // Compute prefix sums of max_scores
+        let mut prefix_sums = Vec::with_capacity(scorers.len());
+        let mut cumsum = 0.0f32;
+        for s in &scorers {
+            cumsum += s.max_score();
+            prefix_sums.push(cumsum);
+        }
 
         debug!(
-            "Creating WandExecutor: num_scorers={}, k={}, total_upper={:.4}, heap_factor={:.2}",
+            "Creating BlockMaxScoreExecutor: num_scorers={}, k={}, total_upper={:.4}, heap_factor={:.2}",
             scorers.len(),
             k,
-            total_upper,
+            cumsum,
             heap_factor
         );
 
         Self {
             scorers,
+            prefix_sums,
             collector: ScoreCollector::new(k),
             heap_factor: heap_factor.clamp(0.0, 1.0),
         }
     }
 
-    /// Execute WAND and return top-k results
+    /// Find partition point: [0..partition) = non-essential, [partition..n) = essential
+    /// Non-essential terms have cumulative max_score <= threshold
+    #[inline]
+    fn find_partition(&self) -> usize {
+        let threshold = self.collector.threshold() * self.heap_factor;
+        self.prefix_sums
+            .iter()
+            .position(|&sum| sum > threshold)
+            .unwrap_or(self.scorers.len())
+    }
+
+    /// Execute Block-Max MaxScore and return top-k results
     ///
-    /// Implements the WAND (Weak AND) algorithm with pivot-based pruning:
-    /// 1. Maintain iterators sorted by current docID (using sorted vector)
-    /// 2. Find pivot: first term where cumulative upper bounds > threshold
-    /// 3. If all iterators at pivot docID, fully score; otherwise skip to pivot
-    /// 4. Insert into collector and advance
-    ///
-    /// Reference: Broder et al., "Efficient Query Evaluation using a Two-Level
-    /// Retrieval Process" (CIKM 2003)
-    ///
-    /// Note: For small number of terms (typical queries), a sorted vector with
-    /// insertion sort is faster than a heap due to better cache locality.
-    /// The vector stays mostly sorted, so insertion sort is ~O(n) amortized.
+    /// Algorithm:
+    /// 1. Partition terms into essential/non-essential based on max_score
+    /// 2. Find min_doc across essential scorers
+    /// 3. Conjunction check: skip if not enough essential terms present
+    /// 4. Block-max check: skip if block upper bounds can't beat threshold
+    /// 5. Score essential scorers, check if non-essential scoring is needed
+    /// 6. Score non-essential scorers, group by ordinal, insert results
     pub fn execute(mut self) -> Vec<ScoredDoc> {
         if self.scorers.is_empty() {
-            debug!("WandExecutor: no scorers, returning empty results");
+            debug!("BlockMaxScoreExecutor: no scorers, returning empty results");
             return Vec::new();
         }
 
+        let n = self.scorers.len();
         let mut docs_scored = 0u64;
         let mut docs_skipped = 0u64;
         let mut blocks_skipped = 0u64;
-        let num_scorers = self.scorers.len();
+        let mut conjunction_skipped = 0u64;
 
-        // Indices sorted by current docID - initial sort O(n log n)
-        let mut sorted_indices: Vec<usize> = (0..num_scorers).collect();
-        sorted_indices.sort_by_key(|&i| self.scorers[i].doc());
+        // Pre-allocate scratch buffers outside the loop
+        let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
 
         loop {
-            // Find first non-exhausted iterator (they're sorted, so check first)
-            let first_active = sorted_indices
-                .iter()
-                .position(|&i| self.scorers[i].doc() != u32::MAX);
+            let partition = self.find_partition();
 
-            let first_active = match first_active {
-                Some(pos) => pos,
-                None => break, // All exhausted
-            };
-
-            // Early termination: if total upper bound can't beat (adjusted) threshold
-            // heap_factor < 1.0 makes pruning more aggressive (approximate search)
-            let total_upper: f32 = sorted_indices[first_active..]
-                .iter()
-                .map(|&i| self.scorers[i].max_score())
-                .sum();
-
-            let adjusted_threshold = self.collector.threshold() * self.heap_factor;
-            if self.collector.len() >= self.collector.k && total_upper <= adjusted_threshold {
-                debug!(
-                    "Early termination: upper_bound={:.4} <= adjusted_threshold={:.4}",
-                    total_upper, adjusted_threshold
-                );
+            // If all terms are non-essential, we're done
+            if partition >= n {
+                debug!("BlockMaxScore: all terms non-essential, early termination");
                 break;
             }
 
-            // Find pivot: first term where cumulative upper bounds > adjusted threshold
-            let mut cumsum = 0.0f32;
-            let mut pivot_pos = first_active;
-
-            for (pos, &idx) in sorted_indices.iter().enumerate().skip(first_active) {
-                cumsum += self.scorers[idx].max_score();
-                if cumsum > adjusted_threshold || self.collector.len() < self.collector.k {
-                    pivot_pos = pos;
-                    break;
+            // Find minimum doc_id across essential scorers [partition..n)
+            let mut min_doc = u32::MAX;
+            for i in partition..n {
+                let doc = self.scorers[i].doc();
+                if doc < min_doc {
+                    min_doc = doc;
                 }
             }
 
-            let pivot_idx = sorted_indices[pivot_pos];
-            let pivot_doc = self.scorers[pivot_idx].doc();
-
-            if pivot_doc == u32::MAX {
-                break;
+            if min_doc == u32::MAX {
+                break; // All essential scorers exhausted
             }
 
-            // Check if all iterators before pivot are at pivot_doc
-            let all_at_pivot = sorted_indices[first_active..=pivot_pos]
-                .iter()
-                .all(|&i| self.scorers[i].doc() == pivot_doc);
+            let non_essential_upper = if partition > 0 {
+                self.prefix_sums[partition - 1]
+            } else {
+                0.0
+            };
+            let adjusted_threshold = self.collector.threshold() * self.heap_factor;
 
-            if all_at_pivot {
-                // Block-max WAND optimization: check if current blocks can beat threshold
-                // Sum the block-max scores for all iterators at pivot_doc
-                let block_max_sum: f32 = sorted_indices[first_active..=pivot_pos]
-                    .iter()
-                    .filter(|&&i| self.scorers[i].doc() == pivot_doc)
-                    .map(|&i| self.scorers[i].current_block_max_score())
+            // --- Conjunction optimization (Lucene-style) ---
+            // Check if enough essential terms are present at min_doc.
+            // Sum max_scores of essential terms AT min_doc. If that plus
+            // non-essential upper can't beat threshold, skip this doc.
+            if self.collector.len() >= self.collector.k {
+                let present_upper: f32 = (partition..n)
+                    .filter(|&i| self.scorers[i].doc() == min_doc)
+                    .map(|i| self.scorers[i].max_score())
                     .sum();
 
-                if self.collector.len() >= self.collector.k && block_max_sum <= adjusted_threshold {
-                    // Block can't beat threshold - skip all iterators at pivot to next block
-                    debug!(
-                        "Block skip at doc {}: block_max={:.4} <= threshold={:.4}",
-                        pivot_doc, block_max_sum, adjusted_threshold
-                    );
-
-                    for (_pos, &idx) in sorted_indices.iter().enumerate().skip(first_active) {
-                        if self.scorers[idx].doc() == pivot_doc {
-                            self.scorers[idx].skip_to_next_block();
-                        } else if self.scorers[idx].doc() > pivot_doc {
-                            break;
+                if present_upper + non_essential_upper <= adjusted_threshold {
+                    // Not enough essential terms present - advance past min_doc
+                    for i in partition..n {
+                        if self.scorers[i].doc() == min_doc {
+                            self.scorers[i].advance();
                         }
                     }
+                    conjunction_skipped += 1;
+                    continue;
+                }
+            }
 
-                    // Re-sort after block skips
-                    sorted_indices[first_active..].sort_by_key(|&i| self.scorers[i].doc());
+            // --- Block-max pruning ---
+            // Sum block-max scores for essential scorers at min_doc.
+            // If block-max sum + non-essential upper can't beat threshold, skip blocks.
+            if self.collector.len() >= self.collector.k {
+                let block_max_sum: f32 = (partition..n)
+                    .filter(|&i| self.scorers[i].doc() == min_doc)
+                    .map(|i| self.scorers[i].current_block_max_score())
+                    .sum();
+
+                if block_max_sum + non_essential_upper <= adjusted_threshold {
+                    for i in partition..n {
+                        if self.scorers[i].doc() == min_doc {
+                            self.scorers[i].skip_to_next_block();
+                        }
+                    }
                     blocks_skipped += 1;
                     continue;
                 }
+            }
 
-                // All terms up to pivot are at the same doc - fully score it
-                let mut score = 0.0f32;
-                let mut matching_terms = 0u32;
-                let mut ordinal: u16 = 0;
+            // --- Score essential scorers ---
+            // Drain all entries for min_doc from each essential scorer
+            ordinal_scores.clear();
 
-                // Score from all iterators that have this document and advance them
-                // Collect indices that need re-sorting
-                let mut modified_positions: Vec<usize> = Vec::new();
-
-                for (pos, &idx) in sorted_indices.iter().enumerate().skip(first_active) {
-                    let doc = self.scorers[idx].doc();
-                    if doc == pivot_doc {
-                        score += self.scorers[idx].score();
-                        // Take ordinal from first matching scorer (all should have same ordinal)
-                        if matching_terms == 0 {
-                            ordinal = self.scorers[idx].ordinal();
-                        }
-                        matching_terms += 1;
-                        self.scorers[idx].advance();
-                        modified_positions.push(pos);
-                    } else if doc > pivot_doc {
-                        break;
+            for i in partition..n {
+                if self.scorers[i].doc() == min_doc {
+                    while self.scorers[i].doc() == min_doc {
+                        ordinal_scores.push((self.scorers[i].ordinal(), self.scorers[i].score()));
+                        self.scorers[i].advance();
                     }
+                }
+            }
+
+            // Check if essential score + non-essential upper could beat threshold
+            let essential_total: f32 = ordinal_scores.iter().map(|(_, s)| *s).sum();
+
+            if self.collector.len() >= self.collector.k
+                && essential_total + non_essential_upper <= adjusted_threshold
+            {
+                docs_skipped += 1;
+                continue;
+            }
+
+            // --- Score non-essential scorers ---
+            for i in 0..partition {
+                let doc = self.scorers[i].seek(min_doc);
+                if doc == min_doc {
+                    while self.scorers[i].doc() == min_doc {
+                        ordinal_scores.push((self.scorers[i].ordinal(), self.scorers[i].score()));
+                        self.scorers[i].advance();
+                    }
+                }
+            }
+
+            // --- Group by ordinal and insert ---
+            ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
+            let mut j = 0;
+            while j < ordinal_scores.len() {
+                let current_ord = ordinal_scores[j].0;
+                let mut score = 0.0f32;
+                while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
+                    score += ordinal_scores[j].1;
+                    j += 1;
                 }
 
                 trace!(
-                    "Doc {}: score={:.4}, matching={}/{}, threshold={:.4}",
-                    pivot_doc, score, matching_terms, num_scorers, adjusted_threshold
+                    "Doc {}: ordinal={}, score={:.4}, threshold={:.4}",
+                    min_doc, current_ord, score, adjusted_threshold
                 );
 
                 if self
                     .collector
-                    .insert_with_ordinal(pivot_doc, score, ordinal)
+                    .insert_with_ordinal(min_doc, score, current_ord)
                 {
                     docs_scored += 1;
                 } else {
                     docs_skipped += 1;
-                }
-
-                // Re-sort modified iterators using insertion sort (efficient for nearly-sorted)
-                // Move each modified iterator to its correct position
-                for &pos in modified_positions.iter().rev() {
-                    let idx = sorted_indices[pos];
-                    let new_doc = self.scorers[idx].doc();
-                    // Bubble up to correct position
-                    let mut curr = pos;
-                    while curr + 1 < sorted_indices.len()
-                        && self.scorers[sorted_indices[curr + 1]].doc() < new_doc
-                    {
-                        sorted_indices.swap(curr, curr + 1);
-                        curr += 1;
-                    }
-                }
-            } else {
-                // Not all at pivot - skip the first iterator to pivot_doc
-                let first_pos = first_active;
-                let first_idx = sorted_indices[first_pos];
-                self.scorers[first_idx].seek(pivot_doc);
-                docs_skipped += 1;
-
-                // Re-sort the modified iterator
-                let new_doc = self.scorers[first_idx].doc();
-                let mut curr = first_pos;
-                while curr + 1 < sorted_indices.len()
-                    && self.scorers[sorted_indices[curr + 1]].doc() < new_doc
-                {
-                    sorted_indices.swap(curr, curr + 1);
-                    curr += 1;
                 }
             }
         }
@@ -441,10 +451,11 @@ impl<S: ScoringIterator> WandExecutor<S> {
             .collect();
 
         debug!(
-            "WandExecutor completed: scored={}, skipped={}, blocks_skipped={}, returned={}, top_score={:.4}",
+            "BlockMaxScoreExecutor completed: scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
             docs_scored,
             docs_skipped,
             blocks_skipped,
+            conjunction_skipped,
             results.len(),
             results.first().map(|r| r.score).unwrap_or(0.0)
         );
@@ -716,8 +727,10 @@ impl BmpExecutor {
             remaining_max.push(term_remaining);
         }
 
-        // Document accumulators: doc_id -> (accumulated_score, best_ordinal)
-        let mut accumulators: FxHashMap<DocId, (f32, u16)> = FxHashMap::default();
+        // Document accumulators: (doc_id, ordinal) -> accumulated_score
+        // Using (doc_id, ordinal) as key ensures scores from different ordinals
+        // are NOT mixed together for multi-valued sparse vector fields.
+        let mut accumulators: FxHashMap<(DocId, u16), f32> = FxHashMap::default();
         let mut collector = ScoreCollector::new(self.k);
         let mut blocks_processed = 0u64;
 
@@ -748,16 +761,15 @@ impl BmpExecutor {
 
             for i in 0..block.header.count as usize {
                 let score_contribution = qw * weights[i];
-                let acc = accumulators.entry(doc_ids[i]).or_insert((0.0, ordinals[i]));
-                acc.0 += score_contribution;
+                *accumulators.entry((doc_ids[i], ordinals[i])).or_insert(0.0) += score_contribution;
             }
 
             blocks_processed += 1;
         }
 
         // Flush accumulators to collector
-        for (doc_id, (score, ordinal)) in &accumulators {
-            collector.insert_with_ordinal(*doc_id, *score, *ordinal);
+        for (&(doc_id, ordinal), &score) in &accumulators {
+            collector.insert_with_ordinal(doc_id, score, ordinal);
         }
 
         let results: Vec<ScoredDoc> = collector
@@ -774,176 +786,6 @@ impl BmpExecutor {
             "BmpExecutor completed: blocks_processed={}, accumulators={}, returned={}, top_score={:.4}",
             blocks_processed,
             accumulators.len(),
-            results.len(),
-            results.first().map(|r| r.score).unwrap_or(0.0)
-        );
-
-        results
-    }
-}
-
-/// MaxScore executor with essential/non-essential term partitioning
-///
-/// For medium-length queries (6-20 terms), partitions terms into:
-/// - Essential terms: must be checked for every candidate document
-/// - Non-essential terms: only scored when candidate could enter top-k
-///
-/// Reference: Turtle & Flood, "Query Evaluation: Strategies and
-/// Optimizations" (Information Processing & Management, 1995)
-pub struct MaxScoreExecutor<S: ScoringIterator> {
-    /// Scorers sorted by max_score ascending
-    scorers: Vec<S>,
-    /// Cumulative max_score prefix sums (prefix_sums[i] = sum of max_scores[0..=i])
-    prefix_sums: Vec<f32>,
-    /// Top-k collector
-    collector: ScoreCollector,
-    /// Heap factor for approximate search
-    heap_factor: f32,
-}
-
-impl<S: ScoringIterator> MaxScoreExecutor<S> {
-    /// Create a new MaxScore executor
-    pub fn new(scorers: Vec<S>, k: usize) -> Self {
-        Self::with_heap_factor(scorers, k, 1.0)
-    }
-
-    /// Create a new MaxScore executor with approximate search
-    pub fn with_heap_factor(mut scorers: Vec<S>, k: usize, heap_factor: f32) -> Self {
-        // Sort scorers by max_score ascending (non-essential terms first)
-        scorers.sort_by(|a, b| {
-            a.max_score()
-                .partial_cmp(&b.max_score())
-                .unwrap_or(Ordering::Equal)
-        });
-
-        // Compute prefix sums of max_scores
-        let mut prefix_sums = Vec::with_capacity(scorers.len());
-        let mut cumsum = 0.0f32;
-        for s in &scorers {
-            cumsum += s.max_score();
-            prefix_sums.push(cumsum);
-        }
-
-        debug!(
-            "Creating MaxScoreExecutor: num_scorers={}, k={}, total_upper={:.4}, heap_factor={:.2}",
-            scorers.len(),
-            k,
-            cumsum,
-            heap_factor
-        );
-
-        Self {
-            scorers,
-            prefix_sums,
-            collector: ScoreCollector::new(k),
-            heap_factor: heap_factor.clamp(0.0, 1.0),
-        }
-    }
-
-    /// Find partition point: [0..partition) = non-essential, [partition..) = essential
-    /// Non-essential terms have cumulative max_score <= threshold
-    fn find_partition(&self) -> usize {
-        let threshold = self.collector.threshold() * self.heap_factor;
-        // Find first index where prefix_sums[i] > threshold
-        // Everything before that is non-essential
-        self.prefix_sums
-            .iter()
-            .position(|&sum| sum > threshold)
-            .unwrap_or(self.scorers.len())
-    }
-
-    /// Execute MaxScore and return top-k results
-    pub fn execute(mut self) -> Vec<ScoredDoc> {
-        if self.scorers.is_empty() {
-            return Vec::new();
-        }
-
-        let n = self.scorers.len();
-        let mut docs_scored = 0u64;
-        let mut docs_skipped = 0u64;
-
-        loop {
-            let partition = self.find_partition();
-
-            // If all terms are non-essential, we're done
-            if partition >= n {
-                debug!("MaxScore: all terms non-essential, early termination");
-                break;
-            }
-
-            // Find minimum doc_id across essential scorers [partition..n)
-            let mut min_doc = u32::MAX;
-            for i in partition..n {
-                let doc = self.scorers[i].doc();
-                if doc < min_doc {
-                    min_doc = doc;
-                }
-            }
-
-            if min_doc == u32::MAX {
-                break; // All essential scorers exhausted
-            }
-
-            // Score from essential scorers and advance them
-            let mut score = 0.0f32;
-            let mut ordinal = 0u16;
-            let mut first_match = true;
-
-            for i in partition..n {
-                if self.scorers[i].doc() == min_doc {
-                    score += self.scorers[i].score();
-                    if first_match {
-                        ordinal = self.scorers[i].ordinal();
-                        first_match = false;
-                    }
-                    self.scorers[i].advance();
-                }
-            }
-
-            // Check if score + non-essential upper bound could beat threshold
-            let non_essential_upper = if partition > 0 {
-                self.prefix_sums[partition - 1]
-            } else {
-                0.0
-            };
-
-            let adjusted_threshold = self.collector.threshold() * self.heap_factor;
-
-            if self.collector.len() >= self.collector.k
-                && score + non_essential_upper <= adjusted_threshold
-            {
-                docs_skipped += 1;
-                continue;
-            }
-
-            // Score from non-essential scorers (seek to min_doc)
-            for i in 0..partition {
-                let doc = self.scorers[i].seek(min_doc);
-                if doc == min_doc {
-                    score += self.scorers[i].score();
-                    self.scorers[i].advance();
-                }
-            }
-
-            self.collector.insert_with_ordinal(min_doc, score, ordinal);
-            docs_scored += 1;
-        }
-
-        let results: Vec<ScoredDoc> = self
-            .collector
-            .into_sorted_results()
-            .into_iter()
-            .map(|(doc_id, score, ordinal)| ScoredDoc {
-                doc_id,
-                score,
-                ordinal,
-            })
-            .collect();
-
-        debug!(
-            "MaxScoreExecutor completed: scored={}, skipped={}, returned={}, top_score={:.4}",
-            docs_scored,
-            docs_skipped,
             results.len(),
             results.first().map(|r| r.score).unwrap_or(0.0)
         );
