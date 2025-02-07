@@ -450,14 +450,13 @@ impl AsyncSegmentReader {
         };
 
         // Convert distance to score (smaller distance = higher score)
-        // and adjust doc_ids by segment offset
+        // Note: doc_id_offset is NOT applied here - the collector applies it uniformly
         // Track ordinals with individual scores for each doc_id
         let mut doc_ordinals: rustc_hash::FxHashMap<DocId, Vec<(u32, f32)>> =
             rustc_hash::FxHashMap::default();
         for (doc_id, ordinal, dist) in results {
-            let doc_id = doc_id as DocId + self.doc_id_offset;
             let score = 1.0 / (1.0 + dist); // Convert distance to similarity score
-            let ordinals = doc_ordinals.entry(doc_id).or_default();
+            let ordinals = doc_ordinals.entry(doc_id as DocId).or_default();
             ordinals.push((ordinal as u32, score));
         }
 
@@ -668,13 +667,12 @@ impl AsyncSegmentReader {
         }
 
         // Combine scores and build results with ordinal tracking
-        // Add doc_id_offset to convert segment-local IDs to global IDs
+        // Note: doc_id_offset is NOT applied here - the collector applies it uniformly
         let mut results: Vec<VectorSearchResult> = doc_ordinals
             .into_iter()
             .map(|(doc_id, ordinals)| {
-                let global_doc_id = doc_id + self.doc_id_offset;
                 let combined_score = combiner.combine(&ordinals);
-                VectorSearchResult::new(global_doc_id, combined_score, ordinals)
+                VectorSearchResult::new(doc_id, combined_score, ordinals)
             })
             .collect();
 

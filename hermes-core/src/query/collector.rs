@@ -387,6 +387,9 @@ pub async fn collect_segment<C: Collector>(
 /// The limit is passed to the scorer to enable WAND pruning for queries
 /// that support it (e.g., sparse vector search). This significantly improves
 /// performance when only the top-k results are needed.
+///
+/// Doc IDs are automatically adjusted by the segment's doc_id_offset to produce
+/// global doc IDs that can be used across all segments.
 pub async fn collect_segment_with_limit<C: Collector>(
     reader: &SegmentReader,
     query: &dyn Query,
@@ -394,6 +397,7 @@ pub async fn collect_segment_with_limit<C: Collector>(
     limit: usize,
 ) -> Result<()> {
     let needs_positions = collector.needs_positions();
+    let doc_id_offset = reader.doc_id_offset();
     let mut scorer = query.scorer(reader, limit).await?;
 
     let mut doc = scorer.doc();
@@ -403,7 +407,8 @@ pub async fn collect_segment_with_limit<C: Collector>(
         } else {
             Vec::new()
         };
-        collector.collect(doc, scorer.score(), &positions);
+        // Add doc_id_offset to convert segment-local ID to global ID
+        collector.collect(doc + doc_id_offset, scorer.score(), &positions);
         doc = scorer.advance();
     }
 
