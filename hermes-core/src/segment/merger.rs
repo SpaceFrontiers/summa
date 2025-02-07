@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::io::Write;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -765,12 +766,14 @@ impl SegmentMerger {
         field_data.sort_by_key(|(id, _, _, _)| *id);
 
         // Compute header size and per-dimension offsets before writing
-        // Header: num_fields (4)
-        // Per field: field_id (4) + quant (1) + num_dims (4) + table (16 * num_dims)
-        let mut header_size = 4u64;
+        // num_fields(u32) + per-field: field_id(u32) + quant(u8) + num_dims(u32)
+        // per-dim: dim_id(u32) + offset(u64) + length(u32)
+        let per_dim_entry = size_of::<u32>() + size_of::<u64>() + size_of::<u32>();
+        let per_field_header = size_of::<u32>() + size_of::<u8>() + size_of::<u32>();
+        let mut header_size = size_of::<u32>() as u64;
         for (_, _, num_dims, _) in &field_data {
-            header_size += 4 + 1 + 4;
-            header_size += (*num_dims as u64) * 16;
+            header_size += per_field_header as u64;
+            header_size += (*num_dims as u64) * per_dim_entry as u64;
         }
 
         // Pre-compute offset tables (small — just dim_id + offset + length per dim)
@@ -996,8 +999,9 @@ async fn write_vector_file<D: Directory + DirectoryWriter>(
 
     let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
 
-    // Header: num_fields + (field_id, index_type, offset, len) per field
-    let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
+    // num_fields(u32) + per-field: field_id(u32) + index_type(u8) + offset(u64) + length(u64)
+    let per_field_entry = size_of::<u32>() + size_of::<u8>() + size_of::<u64>() + size_of::<u64>();
+    let header_size = size_of::<u32>() + field_indexes.len() * per_field_entry;
     writer.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
 
     let mut current_offset = header_size as u64;

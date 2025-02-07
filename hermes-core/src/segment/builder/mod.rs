@@ -659,10 +659,20 @@ impl SegmentBuilder {
 
         let files = SegmentFiles::new(segment_id.0);
 
-        // Phase 1: Build positions (consumes position_index, still borrows term_interner)
+        // Phase 1: Stream positions directly to disk (consumes position_index)
         let position_index = std::mem::take(&mut self.position_index);
-        let (positions_data, position_offsets) =
-            Self::build_positions_owned(position_index, &self.term_interner)?;
+        let position_offsets = if !position_index.is_empty() {
+            let mut pos_writer = dir.streaming_writer(&files.positions).await?;
+            let offsets = Self::build_positions_streaming(
+                position_index,
+                &self.term_interner,
+                &mut *pos_writer,
+            )?;
+            pos_writer.finish()?;
+            offsets
+        } else {
+            FxHashMap::default()
+        };
 
         // Phase 2: Build postings + store — stream directly to disk
         let inverted_index = std::mem::take(&mut self.inverted_index);
@@ -702,12 +712,6 @@ impl SegmentBuilder {
         term_dict_writer.finish()?;
         postings_writer.finish()?;
         store_writer.finish()?;
-
-        // Write positions (usually small, still buffered)
-        if !positions_data.is_empty() {
-            dir.write(&files.positions, &positions_data).await?;
-        }
-        drop(positions_data);
         drop(position_offsets);
 
         // Phase 3: Dense vectors — stream directly to disk
@@ -939,26 +943,25 @@ impl SegmentBuilder {
         Ok(())
     }
 
-    /// Build positions file, consuming the position_index to avoid cloning positions.
-    #[allow(clippy::type_complexity)]
-    fn build_positions_owned(
+    /// Stream positions directly to disk, returning only the offset map.
+    ///
+    /// Consumes the position_index and writes each position posting list
+    /// directly to the writer, tracking offsets for the postings phase.
+    fn build_positions_streaming(
         position_index: HashMap<TermKey, PositionPostingListBuilder>,
         term_interner: &Rodeo,
-    ) -> Result<(Vec<u8>, FxHashMap<Vec<u8>, (u64, u32)>)> {
+        writer: &mut dyn Write,
+    ) -> Result<FxHashMap<Vec<u8>, (u64, u32)>> {
         use crate::structures::PositionPostingList;
 
         let mut position_offsets: FxHashMap<Vec<u8>, (u64, u32)> = FxHashMap::default();
-
-        if position_index.is_empty() {
-            return Ok((Vec::new(), position_offsets));
-        }
 
         // Consume HashMap into Vec for sorting (owned, no borrowing)
         let mut entries: Vec<(Vec<u8>, PositionPostingListBuilder)> = position_index
             .into_iter()
             .map(|(term_key, pos_builder)| {
                 let term_str = term_interner.resolve(&term_key.term);
-                let mut key = Vec::with_capacity(4 + term_str.len());
+                let mut key = Vec::with_capacity(size_of::<u32>() + term_str.len());
                 key.extend_from_slice(&term_key.field.to_le_bytes());
                 key.extend_from_slice(term_str.as_bytes());
                 (key, pos_builder)
@@ -967,23 +970,24 @@ impl SegmentBuilder {
 
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut output = Vec::new();
+        let mut current_offset = 0u64;
 
         for (key, pos_builder) in entries {
             let mut pos_list = PositionPostingList::with_capacity(pos_builder.postings.len());
             for (doc_id, positions) in pos_builder.postings {
-                // Move positions instead of cloning — owned data
                 pos_list.push(doc_id, positions);
             }
 
-            let offset = output.len() as u64;
-            pos_list.serialize(&mut output).map_err(crate::Error::Io)?;
-            let len = (output.len() as u64 - offset) as u32;
+            // Serialize to a temp buffer to get exact length, then write
+            let mut buf = Vec::new();
+            pos_list.serialize(&mut buf).map_err(crate::Error::Io)?;
+            writer.write_all(&buf)?;
 
-            position_offsets.insert(key, (offset, len));
+            position_offsets.insert(key, (current_offset, buf.len() as u32));
+            current_offset += buf.len() as u64;
         }
 
-        Ok((output, position_offsets))
+        Ok(position_offsets)
     }
 
     /// Stream postings directly to disk.
