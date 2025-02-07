@@ -1622,6 +1622,31 @@ unsafe fn max_f32_sse(values: &[f32], count: usize) -> f32 {
 // Squared Euclidean Distance for Dense Vector Search
 // ============================================================================
 
+/// Compute cosine similarity between two f32 vectors with SIMD acceleration
+///
+/// Returns dot(a,b) / (||a|| * ||b||), range [-1, 1]
+/// Returns 0.0 if either vector has zero norm.
+#[inline]
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let count = a.len();
+
+    if count == 0 {
+        return 0.0;
+    }
+
+    let dot = dot_product_f32(a, b, count);
+    let norm_a = dot_product_f32(a, a, count);
+    let norm_b = dot_product_f32(b, b, count);
+
+    let denom = (norm_a * norm_b).sqrt();
+    if denom < f32::EPSILON {
+        return 0.0;
+    }
+
+    dot / denom
+}
+
 /// Compute squared Euclidean distance between two f32 vectors with SIMD acceleration
 ///
 /// Returns sum((a[i] - b[i])^2) for all i

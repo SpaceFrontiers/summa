@@ -1,7 +1,7 @@
 //! L2 reranker: rerank L1 candidates by exact dense vector distance on stored vectors
 
 use crate::dsl::Field;
-use crate::structures::simd::squared_euclidean_distance;
+use crate::structures::simd::cosine_similarity;
 
 use super::{MultiValueCombiner, ScoredPosition, SearchResult};
 
@@ -36,8 +36,7 @@ fn score_document(
             if vec.len() != query_dim {
                 return None;
             }
-            let dist = squared_euclidean_distance(&config.vector, vec);
-            let score = 1.0 / (1.0 + dist);
+            let score = cosine_similarity(&config.vector, vec);
             Some((ordinal as u32, score))
         })
         .collect();
@@ -140,28 +139,28 @@ mod tests {
 
         let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Max);
         let (score, positions) = score_document(&doc, &config).unwrap();
-        // Distance = 0, score = 1 / (1 + 0) = 1.0
+        // cosine([1,0,0], [1,0,0]) = 1.0
         assert!((score - 1.0).abs() < 1e-6);
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].position, 0); // ordinal 0
     }
 
     #[test]
-    fn test_score_document_distance_correctness() {
+    fn test_score_document_orthogonal() {
         let mut doc = Document::new();
-        doc.add_dense_vector(Field(0), vec![3.0, 0.0, 0.0]);
+        doc.add_dense_vector(Field(0), vec![0.0, 1.0, 0.0]);
 
-        let config = make_config(vec![0.0, 0.0, 0.0], MultiValueCombiner::Max);
+        let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Max);
         let (score, _) = score_document(&doc, &config).unwrap();
-        // Distance = 9.0, score = 1 / (1 + 9) = 0.1
-        assert!((score - 0.1).abs() < 1e-6);
+        // cosine([1,0,0], [0,1,0]) = 0.0
+        assert!(score.abs() < 1e-6);
     }
 
     #[test]
     fn test_score_document_multi_value_max() {
         let mut doc = Document::new();
-        doc.add_dense_vector(Field(0), vec![1.0, 0.0, 0.0]); // dist=0, score=1.0
-        doc.add_dense_vector(Field(0), vec![3.0, 0.0, 0.0]); // dist=4, score=0.2
+        doc.add_dense_vector(Field(0), vec![1.0, 0.0, 0.0]); // cos=1.0 (same direction)
+        doc.add_dense_vector(Field(0), vec![0.0, 1.0, 0.0]); // cos=0.0 (orthogonal)
 
         let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Max);
         let (score, positions) = score_document(&doc, &config).unwrap();
@@ -175,13 +174,13 @@ mod tests {
     #[test]
     fn test_score_document_multi_value_avg() {
         let mut doc = Document::new();
-        doc.add_dense_vector(Field(0), vec![1.0, 0.0, 0.0]); // dist=0, score=1.0
-        doc.add_dense_vector(Field(0), vec![3.0, 0.0, 0.0]); // dist=4, score=0.2
+        doc.add_dense_vector(Field(0), vec![1.0, 0.0, 0.0]); // cos=1.0
+        doc.add_dense_vector(Field(0), vec![0.0, 1.0, 0.0]); // cos=0.0
 
         let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Avg);
         let (score, _) = score_document(&doc, &config).unwrap();
-        // avg(1.0, 0.2) = 0.6
-        assert!((score - 0.6).abs() < 1e-6);
+        // avg(1.0, 0.0) = 0.5
+        assert!((score - 0.5).abs() < 1e-6);
     }
 
     #[test]

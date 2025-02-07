@@ -436,52 +436,68 @@ impl AsyncSegmentReader {
             query
         };
 
-        // Results include (doc_id, ordinal, distance)
+        // Results are (doc_id, ordinal, score) where score = similarity (higher = better)
         let results: Vec<(u32, u16, f32)> = match index {
             VectorIndex::Flat(flat_data) => {
-                // Brute-force search over raw vectors using SIMD-accelerated distance
-                use crate::structures::simd::squared_euclidean_distance;
+                // Brute-force search using cosine similarity
+                use crate::structures::simd::cosine_similarity;
 
                 let mut candidates: Vec<(u32, u16, f32)> = flat_data
                     .vectors
                     .iter()
                     .zip(flat_data.doc_ids.iter())
                     .map(|(vec, &(doc_id, ordinal))| {
-                        let dist = squared_euclidean_distance(effective_query, vec);
-                        (doc_id, ordinal, dist)
+                        let score = cosine_similarity(effective_query, vec);
+                        (doc_id, ordinal, score)
                     })
                     .collect();
+                // Sort by score descending (higher similarity = better)
                 candidates
-                    .sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+                    .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
                 // Use rerank_factor to fetch more candidates for multi-valued fields,
                 // so grouping by doc_id still yields enough unique documents
                 candidates.truncate(k * rerank_factor.max(1));
                 candidates
             }
-            VectorIndex::RaBitQ(rabitq) => rabitq.search(effective_query, k, rerank_factor),
+            VectorIndex::RaBitQ(rabitq) => {
+                // RaBitQ returns (doc_id, ordinal, euclidean_dist) — convert to score
+                rabitq
+                    .search(effective_query, k, rerank_factor)
+                    .into_iter()
+                    .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                    .collect()
+            }
             VectorIndex::IVF { index, codebook } => {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("IVF index requires coarse centroids".to_string())
                 })?;
                 let nprobe = rerank_factor.max(32); // Use rerank_factor as nprobe hint
-                index.search(centroids, codebook, effective_query, k, Some(nprobe))
+                // IVF returns euclidean distances — convert to scores
+                index
+                    .search(centroids, codebook, effective_query, k, Some(nprobe))
+                    .into_iter()
+                    .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                    .collect()
             }
             VectorIndex::ScaNN { index, codebook } => {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("ScaNN index requires coarse centroids".to_string())
                 })?;
                 let nprobe = rerank_factor.max(32);
-                index.search(centroids, codebook, effective_query, k, Some(nprobe))
+                // ScaNN returns euclidean distances — convert to scores
+                index
+                    .search(centroids, codebook, effective_query, k, Some(nprobe))
+                    .into_iter()
+                    .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                    .collect()
             }
         };
 
-        // Convert distance to score (smaller distance = higher score)
-        // Note: doc_id_offset is NOT applied here - the collector applies it uniformly
         // Track ordinals with individual scores for each doc_id
+        // Note: doc_id_offset is NOT applied here - the collector applies it uniformly
         let mut doc_ordinals: rustc_hash::FxHashMap<DocId, Vec<(u32, f32)>> =
             rustc_hash::FxHashMap::default();
-        for (doc_id, ordinal, dist) in results {
-            let score = 1.0 / (1.0 + dist); // Convert distance to similarity score
+        for (doc_id, ordinal, score) in results {
             let ordinals = doc_ordinals.entry(doc_id as DocId).or_default();
             ordinals.push((ordinal as u32, score));
         }
