@@ -173,11 +173,18 @@ impl Query for DenseVectorQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let vector = self.vector.clone();
+        let nprobe = self.nprobe;
         let rerank_factor = self.rerank_factor;
         let combiner = self.combiner;
         Box::pin(async move {
-            let results =
-                reader.search_dense_vector(field, &vector, limit, rerank_factor, combiner)?;
+            let results = reader.search_dense_vector(
+                field,
+                &vector,
+                limit,
+                nprobe,
+                rerank_factor,
+                combiner,
+            )?;
 
             Ok(Box::new(DenseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)
         })

@@ -416,10 +416,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     }
 
                     // Check memory after every document - O(1) with incremental tracking.
-                    // Shrink per-worker budget when builds are in-flight to account for
-                    // build-phase memory amplification (posting duplication, sparse serialization).
+                    // Always reserve 2x headroom for build-phase memory amplification:
+                    // when commit flushes all workers simultaneously, their builders stay
+                    // in memory during serialization, effectively doubling peak usage.
                     let in_flight = state.pending_builds.load(Ordering::Relaxed);
-                    let effective_slots = state.config.num_indexing_threads.max(1) + in_flight * 4;
+                    let num_workers = state.config.num_indexing_threads.max(1);
+                    let effective_slots = num_workers * 2 + in_flight * 2;
                     let per_worker_limit = state.config.max_indexing_memory_bytes / effective_slots;
                     let builder_memory = b.estimated_memory_bytes();
 

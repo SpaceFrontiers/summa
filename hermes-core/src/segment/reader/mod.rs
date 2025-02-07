@@ -408,6 +408,7 @@ impl AsyncSegmentReader {
         field: Field,
         query: &[f32],
         k: usize,
+        nprobe: usize,
         rerank_factor: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
@@ -471,10 +472,16 @@ impl AsyncSegmentReader {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("IVF index requires coarse centroids".to_string())
                 })?;
-                let nprobe = rerank_factor.max(32); // Use rerank_factor as nprobe hint
+                let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
                 // IVF returns euclidean distances — convert to scores
                 index
-                    .search(centroids, codebook, effective_query, k, Some(nprobe))
+                    .search(
+                        centroids,
+                        codebook,
+                        effective_query,
+                        k,
+                        Some(effective_nprobe),
+                    )
                     .into_iter()
                     .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                     .collect()
@@ -483,10 +490,16 @@ impl AsyncSegmentReader {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("ScaNN index requires coarse centroids".to_string())
                 })?;
-                let nprobe = rerank_factor.max(32);
+                let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
                 // ScaNN returns euclidean distances — convert to scores
                 index
-                    .search(centroids, codebook, effective_query, k, Some(nprobe))
+                    .search(
+                        centroids,
+                        codebook,
+                        effective_query,
+                        k,
+                        Some(effective_nprobe),
+                    )
                     .into_iter()
                     .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                     .collect()

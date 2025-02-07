@@ -974,6 +974,7 @@ mod tests {
                 embedding,
                 &query_vec,
                 5,
+                0,
                 1,
                 crate::query::MultiValueCombiner::Max,
             )
@@ -1016,6 +1017,7 @@ mod tests {
                 embedding,
                 &query_vec,
                 5,
+                0,
                 1,
                 crate::query::MultiValueCombiner::Max,
             )

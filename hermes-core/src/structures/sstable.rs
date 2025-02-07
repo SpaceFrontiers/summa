@@ -1190,7 +1190,6 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         {
             let mut cache = self.cache.write();
             if let Some(block) = cache.get(addr.offset) {
-                log::debug!("SSTable::load_block idx={} CACHE HIT", block_idx);
                 return Ok(block);
             }
         }

@@ -681,7 +681,6 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
                     if let Some(file_cache) = caches_guard.get_mut(&path)
                         && let Some(data) = file_cache.try_read(range.clone(), &mut counter)
                     {
-                        log::trace!("Cache HIT: {:?} [{}-{}]", path, range.start, range.end);
                         return Ok(OwnedBytes::new(data));
                     }
                 }

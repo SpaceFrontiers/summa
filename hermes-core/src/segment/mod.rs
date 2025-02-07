@@ -112,7 +112,7 @@ mod tests {
         // Query close to doc 1's first vector
         let query = vec![0.0, 0.9, 0.1, 0.0];
         let results = reader
-            .search_dense_vector(embedding, &query, 10, 1, MultiValueCombiner::Max)
+            .search_dense_vector(embedding, &query, 10, 0, 1, MultiValueCombiner::Max)
             .unwrap();
 
         // Doc 1 should be in results with ordinal tracking

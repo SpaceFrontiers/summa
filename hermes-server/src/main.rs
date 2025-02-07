@@ -41,7 +41,7 @@ struct Args {
     cache_dir: Option<PathBuf>,
 
     /// Max indexing memory (MB) before auto-flush (global across all builders)
-    #[arg(long, default_value = "3072")]
+    #[arg(long, default_value = "1024")]
     max_indexing_memory_mb: usize,
 
     /// Number of parallel indexing threads (defaults to CPU count)
