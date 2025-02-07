@@ -24,9 +24,9 @@ fn score_document(doc: &crate::dsl::Document, config: &RerankerConfig) -> Option
     let query_dim = config.vector.len();
     let values: Vec<(u32, f32)> = doc
         .get_all(config.field)
+        .filter_map(|fv| fv.as_dense_vector())
         .enumerate()
-        .filter_map(|(ordinal, fv)| {
-            let vec = fv.as_dense_vector()?;
+        .filter_map(|(ordinal, vec)| {
             if vec.len() != query_dim {
                 return None;
             }

@@ -166,7 +166,7 @@ impl IVFRaBitQIndex {
         self.clusters.add(cluster_id, doc_id, ordinal, code, raw);
     }
 
-    /// Search for k nearest neighbors
+    /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
     pub fn search(
         &self,
         coarse_centroids: &CoarseCentroids,
@@ -174,13 +174,13 @@ impl IVFRaBitQIndex {
         query: &[f32],
         k: usize,
         nprobe: Option<usize>,
-    ) -> Vec<(u32, f32)> {
+    ) -> Vec<(u32, u16, f32)> {
         let nprobe = nprobe.unwrap_or(self.config.default_nprobe);
 
         // Find nprobe nearest coarse centroids
         let nearest_clusters = coarse_centroids.find_k_nearest(query, nprobe);
 
-        let mut candidates: Vec<(u32, f32)> = Vec::new();
+        let mut candidates: Vec<(u32, u16, f32)> = Vec::new();
 
         for &cluster_id in &nearest_clusters {
             if let Some(cluster) = self.clusters.get(cluster_id) {
@@ -189,15 +189,15 @@ impl IVFRaBitQIndex {
                 let prepared_query = codebook.prepare_query(query, Some(centroid));
 
                 // Score all vectors in cluster
-                for (doc_id, _ordinal, code) in cluster.iter() {
+                for (doc_id, ordinal, code) in cluster.iter() {
                     let dist = codebook.estimate_distance(&prepared_query, code);
-                    candidates.push((doc_id, dist));
+                    candidates.push((doc_id, ordinal, dist));
                 }
             }
         }
 
         // Sort by distance
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
         // Re-rank top candidates if raw vectors available
         let rerank_count = (k * self.config.rerank_factor).min(candidates.len());
@@ -212,9 +212,9 @@ impl IVFRaBitQIndex {
             });
 
             if has_raw {
-                let mut reranked: Vec<(u32, f32)> = candidates[..rerank_count]
+                let mut reranked: Vec<(u32, u16, f32)> = candidates[..rerank_count]
                     .iter()
-                    .filter_map(|&(doc_id, _)| {
+                    .filter_map(|&(doc_id, ordinal, _)| {
                         // Find raw vector for this doc_id
                         for &cluster_id in &nearest_clusters {
                             if let Some(cluster) = self.clusters.get(cluster_id)
@@ -224,7 +224,7 @@ impl IVFRaBitQIndex {
                                     if did == doc_id {
                                         let exact_dist =
                                             euclidean_distance_squared(query, &raw_vecs[i]);
-                                        return Some((doc_id, exact_dist));
+                                        return Some((doc_id, ordinal, exact_dist));
                                     }
                                 }
                             }
@@ -233,7 +233,7 @@ impl IVFRaBitQIndex {
                     })
                     .collect();
 
-                reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                reranked.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
                 reranked.truncate(k);
                 return reranked;
             }

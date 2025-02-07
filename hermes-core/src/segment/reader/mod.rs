@@ -453,7 +453,9 @@ impl AsyncSegmentReader {
                     .collect();
                 candidates
                     .sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-                candidates.truncate(k);
+                // Use rerank_factor to fetch more candidates for multi-valued fields,
+                // so grouping by doc_id still yields enough unique documents
+                candidates.truncate(k * rerank_factor.max(1));
                 candidates
             }
             VectorIndex::RaBitQ(rabitq) => rabitq.search(effective_query, k, rerank_factor),
@@ -462,22 +464,14 @@ impl AsyncSegmentReader {
                     Error::Schema("IVF index requires coarse centroids".to_string())
                 })?;
                 let nprobe = rerank_factor.max(32); // Use rerank_factor as nprobe hint
-                index
-                    .search(centroids, codebook, effective_query, k, Some(nprobe))
-                    .into_iter()
-                    .map(|(doc_id, dist)| (doc_id, 0u16, dist)) // IVF doesn't track ordinals yet
-                    .collect()
+                index.search(centroids, codebook, effective_query, k, Some(nprobe))
             }
             VectorIndex::ScaNN { index, codebook } => {
                 let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                     Error::Schema("ScaNN index requires coarse centroids".to_string())
                 })?;
                 let nprobe = rerank_factor.max(32);
-                index
-                    .search(centroids, codebook, effective_query, k, Some(nprobe))
-                    .into_iter()
-                    .map(|(doc_id, dist)| (doc_id, 0u16, dist)) // ScaNN doesn't track ordinals yet
-                    .collect()
+                index.search(centroids, codebook, effective_query, k, Some(nprobe))
             }
         };
 

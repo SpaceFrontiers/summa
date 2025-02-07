@@ -165,7 +165,7 @@ impl IVFPQIndex {
         self.clusters.add(cluster_id, doc_id, ordinal, code, raw);
     }
 
-    /// Search for k nearest neighbors
+    /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
     pub fn search(
         &self,
         coarse_centroids: &CoarseCentroids,
@@ -173,13 +173,13 @@ impl IVFPQIndex {
         query: &[f32],
         k: usize,
         nprobe: Option<usize>,
-    ) -> Vec<(u32, f32)> {
+    ) -> Vec<(u32, u16, f32)> {
         let nprobe = nprobe.unwrap_or(self.config.default_nprobe);
 
         // Find nprobe nearest coarse centroids
         let nearest_clusters = coarse_centroids.find_k_nearest(query, nprobe);
 
-        let mut candidates: Vec<(u32, f32)> = Vec::new();
+        let mut candidates: Vec<(u32, u16, f32)> = Vec::new();
 
         for &cluster_id in &nearest_clusters {
             if let Some(cluster) = self.clusters.get(cluster_id) {
@@ -188,15 +188,15 @@ impl IVFPQIndex {
                 let distance_table = DistanceTable::build(codebook, query, Some(centroid));
 
                 // Score all vectors in cluster using ADC (Asymmetric Distance Computation)
-                for (doc_id, _ordinal, code) in cluster.iter() {
+                for (doc_id, ordinal, code) in cluster.iter() {
                     let dist = distance_table.compute_distance(&code.codes);
-                    candidates.push((doc_id, dist));
+                    candidates.push((doc_id, ordinal, dist));
                 }
             }
         }
 
         // Sort by distance
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
         // Re-rank top candidates if raw vectors available
         let rerank_count = (k * self.config.rerank_factor).min(candidates.len());
@@ -210,9 +210,9 @@ impl IVFPQIndex {
             });
 
             if has_raw {
-                let mut reranked: Vec<(u32, f32)> = candidates[..rerank_count]
+                let mut reranked: Vec<(u32, u16, f32)> = candidates[..rerank_count]
                     .iter()
-                    .filter_map(|&(doc_id, _)| {
+                    .filter_map(|&(doc_id, ordinal, _)| {
                         for &cluster_id in &nearest_clusters {
                             if let Some(cluster) = self.clusters.get(cluster_id)
                                 && let Some(ref raw_vecs) = cluster.raw_vectors
@@ -221,7 +221,7 @@ impl IVFPQIndex {
                                     if did == doc_id {
                                         let exact_dist =
                                             euclidean_distance_squared(query, &raw_vecs[i]);
-                                        return Some((doc_id, exact_dist));
+                                        return Some((doc_id, ordinal, exact_dist));
                                     }
                                 }
                             }
@@ -230,7 +230,7 @@ impl IVFPQIndex {
                     })
                     .collect();
 
-                reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                reranked.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
                 reranked.truncate(k);
                 return reranked;
             }
@@ -248,18 +248,18 @@ impl IVFPQIndex {
         query: &[f32],
         k: usize,
         nprobe: Option<usize>,
-    ) -> Vec<(u32, f32)> {
+    ) -> Vec<(u32, u16, f32)> {
         // For MIPS, we use the same search but with inner product distance table
         // The distance table stores negative inner products so we can use min-heap
         let mut results = self.search(coarse_centroids, codebook, query, k, nprobe);
 
         // Convert back to inner products (negate distances)
-        for (_, dist) in &mut results {
+        for (_, _, dist) in &mut results {
             *dist = -*dist;
         }
 
         // Re-sort by inner product (descending)
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
         results
     }
 
@@ -467,7 +467,7 @@ mod tests {
             // IVF-PQ search
             let results = index.search(&coarse_centroids, &codebook, &query, k, None);
             let pq_top_k: std::collections::HashSet<usize> =
-                results.iter().map(|(i, _)| *i as usize).collect();
+                results.iter().map(|(i, _, _)| *i as usize).collect();
 
             let recall = exact_top_k.intersection(&pq_top_k).count() as f32 / k as f32;
             total_recall += recall;
