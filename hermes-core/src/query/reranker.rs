@@ -3,7 +3,7 @@
 use crate::dsl::Field;
 use crate::structures::simd::squared_euclidean_distance;
 
-use super::{MultiValueCombiner, SearchResult};
+use super::{MultiValueCombiner, ScoredPosition, SearchResult};
 
 /// Configuration for L2 dense vector reranking
 #[derive(Debug, Clone)]
@@ -20,9 +20,15 @@ pub struct RerankerConfig {
 ///
 /// Returns `None` if the document has no values for the given field,
 /// or if stored vectors have a different dimension than the query.
-fn score_document(doc: &crate::dsl::Document, config: &RerankerConfig) -> Option<f32> {
+///
+/// Returns `(combined_score, ordinal_scores)` where ordinal_scores contains
+/// per-vector scores sorted by score descending (best chunk first).
+fn score_document(
+    doc: &crate::dsl::Document,
+    config: &RerankerConfig,
+) -> Option<(f32, Vec<ScoredPosition>)> {
     let query_dim = config.vector.len();
-    let values: Vec<(u32, f32)> = doc
+    let mut values: Vec<(u32, f32)> = doc
         .get_all(config.field)
         .filter_map(|fv| fv.as_dense_vector())
         .enumerate()
@@ -40,7 +46,16 @@ fn score_document(doc: &crate::dsl::Document, config: &RerankerConfig) -> Option
         return None;
     }
 
-    Some(config.combiner.combine(&values))
+    let combined = config.combiner.combine(&values);
+
+    // Sort ordinals by score descending (best chunk first)
+    values.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let positions: Vec<ScoredPosition> = values
+        .into_iter()
+        .map(|(ordinal, score)| ScoredPosition::new(ordinal, score))
+        .collect();
+
+    Some((combined, positions))
 }
 
 /// Rerank L1 candidates by exact dense vector distance.
@@ -67,14 +82,16 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
     let mut skipped = 0u32;
 
+    let field_id = config.field.0;
+
     for (candidate, doc_result) in candidates.iter().zip(docs) {
         match doc_result {
             Ok(Some(doc)) => {
-                if let Some(score) = score_document(&doc, config) {
+                if let Some((score, ordinal_positions)) = score_document(&doc, config) {
                     scored.push(SearchResult {
                         doc_id: candidate.doc_id,
                         score,
-                        positions: Vec::new(),
+                        positions: vec![(field_id, ordinal_positions)],
                     });
                 } else {
                     skipped += 1;
@@ -122,9 +139,11 @@ mod tests {
         doc.add_dense_vector(Field(0), vec![1.0, 0.0, 0.0]);
 
         let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Max);
-        let score = score_document(&doc, &config).unwrap();
+        let (score, positions) = score_document(&doc, &config).unwrap();
         // Distance = 0, score = 1 / (1 + 0) = 1.0
         assert!((score - 1.0).abs() < 1e-6);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].position, 0); // ordinal 0
     }
 
     #[test]
@@ -133,7 +152,7 @@ mod tests {
         doc.add_dense_vector(Field(0), vec![3.0, 0.0, 0.0]);
 
         let config = make_config(vec![0.0, 0.0, 0.0], MultiValueCombiner::Max);
-        let score = score_document(&doc, &config).unwrap();
+        let (score, _) = score_document(&doc, &config).unwrap();
         // Distance = 9.0, score = 1 / (1 + 9) = 0.1
         assert!((score - 0.1).abs() < 1e-6);
     }
@@ -145,8 +164,12 @@ mod tests {
         doc.add_dense_vector(Field(0), vec![3.0, 0.0, 0.0]); // dist=4, score=0.2
 
         let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Max);
-        let score = score_document(&doc, &config).unwrap();
+        let (score, positions) = score_document(&doc, &config).unwrap();
         assert!((score - 1.0).abs() < 1e-6);
+        // Best chunk first
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].position, 0); // ordinal 0 scored highest
+        assert!((positions[0].score - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -156,7 +179,7 @@ mod tests {
         doc.add_dense_vector(Field(0), vec![3.0, 0.0, 0.0]); // dist=4, score=0.2
 
         let config = make_config(vec![1.0, 0.0, 0.0], MultiValueCombiner::Avg);
-        let score = score_document(&doc, &config).unwrap();
+        let (score, _) = score_document(&doc, &config).unwrap();
         // avg(1.0, 0.2) = 0.6
         assert!((score - 0.6).abs() < 1e-6);
     }
