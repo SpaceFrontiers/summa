@@ -15,8 +15,7 @@ use crate::Result;
 use crate::directories::{Directory, DirectoryWriter, StreamingWriter};
 use crate::dsl::{FieldType, Schema};
 use crate::structures::{
-    BlockPostingList, PositionPostingList, PostingList, RaBitQConfig, RaBitQIndex, SSTableWriter,
-    TERMINATED, TermInfo,
+    BlockPostingList, PositionPostingList, PostingList, SSTableWriter, TERMINATED, TermInfo,
 };
 
 /// Write adapter that tracks bytes written.
@@ -612,26 +611,42 @@ impl SegmentMerger {
                 }
             }
 
-            // Fall back to RaBitQ rebuild (collect raw vectors)
+            // Fall back: collect raw vectors from all index types and rebuild as Flat
             let mut all_vectors: Vec<Vec<f32>> = Vec::new();
+            let mut all_doc_ids: Vec<(u32, u16)> = Vec::new();
+            let doc_offs = doc_offsets(segments);
 
-            for segment in segments {
-                if let Some(index) = segment.get_dense_vector_index(field)
-                    && let Some(raw_vecs) = &index.raw_vectors
-                {
-                    all_vectors.extend(raw_vecs.iter().cloned());
+            for (seg_idx, segment) in segments.iter().enumerate() {
+                match segment.vector_indexes().get(&field.0) {
+                    Some(super::VectorIndex::Flat(flat_data)) => {
+                        for (vec, &(local_doc_id, ordinal)) in
+                            flat_data.vectors.iter().zip(flat_data.doc_ids.iter())
+                        {
+                            all_vectors.push(vec.clone());
+                            all_doc_ids.push((doc_offs[seg_idx] + local_doc_id, ordinal));
+                        }
+                    }
+                    Some(super::VectorIndex::RaBitQ(index)) => {
+                        if let Some(raw_vecs) = &index.raw_vectors {
+                            for (i, vec) in raw_vecs.iter().enumerate() {
+                                all_vectors.push(vec.clone());
+                                all_doc_ids.push((doc_offs[seg_idx] + i as u32, 0));
+                            }
+                        }
+                    }
+                    _ => {} // IVF/ScaNN handled above
                 }
             }
 
             if !all_vectors.is_empty() {
                 let dim = all_vectors[0].len();
-                let config = RaBitQConfig::new(dim);
-                let merged_index = RaBitQIndex::build(config, &all_vectors, true);
-
-                let index_bytes = serde_json::to_vec(&merged_index)
-                    .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-
-                field_indexes.push((field.0, 0u8, index_bytes)); // 0 = RaBitQ
+                let flat_data = super::vector_data::FlatVectorData {
+                    dim,
+                    vectors: all_vectors,
+                    doc_ids: all_doc_ids,
+                };
+                let bytes = flat_data.to_binary_bytes();
+                field_indexes.push((field.0, 4u8, bytes)); // 4 = Flat Binary
             }
         }
 

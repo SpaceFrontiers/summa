@@ -240,6 +240,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 &schema,
                 &segment_ids_to_merge,
                 term_cache_blocks,
+                &metadata,
             )
             .await;
 
@@ -296,6 +297,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         schema: &crate::dsl::Schema,
         segment_ids_to_merge: &[String],
         term_cache_blocks: usize,
+        metadata: &RwLock<IndexMetadata>,
     ) -> Result<(String, u32)> {
         // Load segment readers
         let mut readers = Vec::new();
@@ -326,10 +328,29 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             readers.push(reader);
         }
 
-        // Merge into new segment
+        // Check if trained structures exist — if so, use merge_with_ann
+        // to preserve ANN indexes when merging mixed IVF+Flat segments
+        let (trained_centroids, trained_codebooks) = {
+            let meta = metadata.read().await;
+            meta.load_trained_structures(directory).await
+        };
+
         let merger = SegmentMerger::new(Arc::new(schema.clone()));
         let new_segment_id = SegmentId::new();
-        if let Err(e) = merger.merge(directory, &readers, new_segment_id).await {
+
+        let merge_result = if !trained_centroids.is_empty() {
+            let trained = crate::segment::TrainedVectorStructures {
+                centroids: trained_centroids,
+                codebooks: trained_codebooks,
+            };
+            merger
+                .merge_with_ann(directory, &readers, new_segment_id, &trained)
+                .await
+        } else {
+            merger.merge(directory, &readers, new_segment_id).await
+        };
+
+        if let Err(e) = merge_result {
             eprintln!(
                 "[merge] Merge failed for segments {:?} -> {}: {:?}",
                 segment_ids_to_merge,
