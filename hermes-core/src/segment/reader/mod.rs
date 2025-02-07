@@ -362,6 +362,16 @@ impl AsyncSegmentReader {
         self.term_dict.iter()
     }
 
+    /// Prefetch all term dictionary blocks in a single bulk I/O call.
+    ///
+    /// Call before merge iteration to eliminate per-block cache misses.
+    pub async fn prefetch_term_dict(&self) -> crate::Result<()> {
+        self.term_dict
+            .prefetch_all_data_bulk()
+            .await
+            .map_err(crate::Error::from)
+    }
+
     /// Read raw posting bytes at offset
     pub async fn read_postings(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
         let start = offset;

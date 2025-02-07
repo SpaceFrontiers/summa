@@ -208,6 +208,61 @@ impl SparseIndex {
     pub fn idf_weights(&self, dim_ids: &[u32]) -> Vec<f32> {
         dim_ids.iter().map(|&d| self.idf(d)).collect()
     }
+
+    /// Read ALL posting lists in a single bulk I/O operation.
+    ///
+    /// Used during merge to avoid per-dimension reads (turns 100K+ individual
+    /// I/O calls into 1 read per segment per field).
+    pub async fn read_all_postings_bulk(
+        &self,
+    ) -> crate::Result<rustc_hash::FxHashMap<u32, Arc<BlockSparsePostingList>>> {
+        if self.dimensions.is_empty() {
+            return Ok(rustc_hash::FxHashMap::default());
+        }
+
+        // Find extent of all block data so we can read in one shot
+        let mut max_end: u64 = 0;
+        for dim in self.dimensions.iter() {
+            for entry in &dim.skip_entries {
+                let end = dim.data_offset + entry.offset as u64 + entry.length as u64;
+                max_end = max_end.max(end);
+            }
+        }
+
+        // Single bulk read of the entire data region
+        let all_data = self
+            .handle
+            .read_bytes_range(0..max_end)
+            .await
+            .map_err(crate::Error::Io)?;
+        let buf = all_data.as_slice();
+
+        // Parse all posting lists from the in-memory buffer
+        let mut result = rustc_hash::FxHashMap::with_capacity_and_hasher(
+            self.dimensions.len(),
+            Default::default(),
+        );
+
+        for dim in self.dimensions.iter() {
+            let mut blocks = Vec::with_capacity(dim.skip_entries.len());
+            for entry in &dim.skip_entries {
+                let abs_offset = (dim.data_offset + entry.offset as u64) as usize;
+                let block_data = &buf[abs_offset..abs_offset + entry.length as usize];
+                let block =
+                    SparseBlock::read(&mut Cursor::new(block_data)).map_err(crate::Error::Io)?;
+                blocks.push(block);
+            }
+            result.insert(
+                dim.dim_id,
+                Arc::new(BlockSparsePostingList {
+                    doc_count: dim.doc_count,
+                    blocks,
+                }),
+            );
+        }
+
+        Ok(result)
+    }
 }
 
 /// Vector search result with ordinal tracking for multi-value fields

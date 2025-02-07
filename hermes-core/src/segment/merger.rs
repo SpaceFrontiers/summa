@@ -313,6 +313,12 @@ impl SegmentMerger {
     ) -> Result<usize> {
         let doc_offs = doc_offsets(segments);
 
+        // Bulk-prefetch all term dict blocks (1 I/O per segment instead of ~160)
+        for (i, segment) in segments.iter().enumerate() {
+            log::debug!("Prefetching term dict for segment {} ...", i);
+            segment.prefetch_term_dict().await?;
+        }
+
         // Create iterators for each segment's term dictionary
         let mut iterators: Vec<_> = segments.iter().map(|s| s.term_dict_iter()).collect();
 
@@ -697,57 +703,55 @@ impl SegmentMerger {
                 continue;
             }
 
-            let _max_dim_id = all_dims.iter().max().copied().unwrap_or(0);
+            // Bulk-read ALL posting lists per segment in one I/O call each.
+            // This replaces 80K+ individual get_posting() calls with ~4 bulk reads.
+            let mut segment_postings: Vec<FxHashMap<u32, Arc<BlockSparsePostingList>>> =
+                Vec::with_capacity(segments.len());
+            for (seg_idx, segment) in segments.iter().enumerate() {
+                if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
+                    log::debug!(
+                        "Sparse merge field {}: bulk-reading {} dims from segment {}",
+                        field.0,
+                        sparse_index.num_dimensions(),
+                        seg_idx
+                    );
+                    let postings = sparse_index.read_all_postings_bulk().await?;
+                    segment_postings.push(postings);
+                } else {
+                    segment_postings.push(FxHashMap::default());
+                }
+            }
+
             let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
 
-            // For each dimension, merge posting lists from all segments
+            // Merge from in-memory data — no I/O in this loop
             for dim_id in all_dims {
-                // Collect posting lists for this dimension from all segments
-                // Keep Arcs alive while we borrow from them
                 let mut posting_arcs: Vec<(Arc<BlockSparsePostingList>, u32)> = Vec::new();
 
-                for (seg_idx, segment) in segments.iter().enumerate() {
-                    if let Some(sparse_index) = segment.sparse_indexes().get(&field.0)
-                        && let Ok(Some(posting_list)) = sparse_index.get_posting(dim_id).await
-                    {
-                        log::trace!(
-                            "Sparse merge dim={}: seg={} offset={} doc_count={} blocks={}",
-                            dim_id,
-                            seg_idx,
-                            doc_offs[seg_idx],
-                            posting_list.doc_count(),
-                            posting_list.blocks.len()
-                        );
-                        posting_arcs.push((posting_list, doc_offs[seg_idx]));
+                for (seg_idx, postings) in segment_postings.iter().enumerate() {
+                    if let Some(posting_list) = postings.get(&dim_id) {
+                        posting_arcs.push((Arc::clone(posting_list), doc_offs[seg_idx]));
                     }
                 }
 
-                // Create references for merge
+                if posting_arcs.is_empty() {
+                    continue;
+                }
+
                 let lists_with_offsets: Vec<(&BlockSparsePostingList, u32)> = posting_arcs
                     .iter()
                     .map(|(pl, offset)| (pl.as_ref(), *offset))
                     .collect();
 
-                if lists_with_offsets.is_empty() {
-                    continue;
-                }
-
-                // Merge using optimized block stacking
                 let merged = BlockSparsePostingList::merge_with_offsets(&lists_with_offsets);
 
-                log::trace!(
-                    "Sparse merge dim={}: merged {} lists -> doc_count={} blocks={}",
-                    dim_id,
-                    lists_with_offsets.len(),
-                    merged.doc_count(),
-                    merged.blocks.len()
-                );
-
-                // Serialize
                 let mut bytes = Vec::new();
                 merged.serialize(&mut bytes).map_err(crate::Error::Io)?;
                 dim_bytes.insert(dim_id, bytes);
             }
+
+            // Drop bulk data before accumulating output
+            drop(segment_postings);
 
             // Store num_dims (active count) instead of max_dim_id
             field_data.push((field.0, quantization, dim_bytes.len() as u32, dim_bytes));

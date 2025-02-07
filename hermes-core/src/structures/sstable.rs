@@ -1135,6 +1135,50 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         Ok(())
     }
 
+    /// Prefetch all data blocks via a single bulk I/O operation.
+    ///
+    /// Reads the entire compressed data section in one call, then decompresses
+    /// each block and populates the cache. This turns N individual reads into 1.
+    /// Cache capacity is expanded to hold all blocks.
+    pub async fn prefetch_all_data_bulk(&self) -> io::Result<()> {
+        let num_blocks = self.block_index.len();
+        if num_blocks == 0 {
+            return Ok(());
+        }
+
+        // Find total data extent
+        let mut max_end: u64 = 0;
+        for i in 0..num_blocks {
+            if let Some(addr) = self.block_index.get_addr(i) {
+                max_end = max_end.max(addr.offset + addr.length as u64);
+            }
+        }
+
+        // Single bulk read of entire data section
+        let all_data = self.data_slice.read_bytes_range(0..max_end).await?;
+        let buf = all_data.as_slice();
+
+        // Expand cache and decompress all blocks
+        let mut cache = self.cache.write();
+        cache.max_blocks = cache.max_blocks.max(num_blocks);
+        for i in 0..num_blocks {
+            let addr = self.block_index.get_addr(i).unwrap();
+            if cache.get(addr.offset).is_some() {
+                continue;
+            }
+            let compressed =
+                &buf[addr.offset as usize..(addr.offset + addr.length as u64) as usize];
+            let decompressed = if let Some(ref dict) = self.dictionary {
+                crate::compression::decompress_with_dict(compressed, dict)?
+            } else {
+                crate::compression::decompress(compressed)?
+            };
+            cache.insert(addr.offset, Arc::new(decompressed));
+        }
+
+        Ok(())
+    }
+
     /// Load a block (checks cache first, then loads from FileSlice)
     /// Uses dictionary decompression if dictionary is present
     async fn load_block(&self, block_idx: usize) -> io::Result<Arc<Vec<u8>>> {
