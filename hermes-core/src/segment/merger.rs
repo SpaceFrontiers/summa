@@ -974,6 +974,11 @@ impl SegmentMerger {
             .build_ann_vectors(dir, segments, &files, trained)
             .await?;
 
+        // Merge sparse vector indexes (optimized block stacking)
+        let sparse_bytes = self
+            .merge_sparse_vectors_optimized(dir, segments, &files)
+            .await?;
+
         // Merge field stats
         let mut merged_field_stats: rustc_hash::FxHashMap<u32, FieldStats> =
             rustc_hash::FxHashMap::default();
@@ -995,9 +1000,10 @@ impl SegmentMerger {
         dir.write(&files.meta, &meta.serialize()?).await?;
 
         log::info!(
-            "ANN merge complete: {} docs, vectors={}",
+            "ANN merge complete: {} docs, vectors={}, sparse={}",
             total_docs,
-            MergeStats::format_memory(vectors_bytes)
+            MergeStats::format_memory(vectors_bytes),
+            MergeStats::format_memory(sparse_bytes),
         );
 
         Ok(meta)
