@@ -139,10 +139,28 @@ impl SegmentMerger {
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
     ) -> Result<(SegmentMeta, MergeStats)> {
+        self.merge_core(
+            dir,
+            segments,
+            new_segment_id,
+            DenseVectorStrategy::MergeExisting,
+        )
+        .await
+    }
+
+    /// Core merge: handles all mandatory parts (postings, store, sparse, field stats, meta)
+    /// and delegates dense vector handling to the provided strategy.
+    async fn merge_core<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        new_segment_id: SegmentId,
+        dense_strategy: DenseVectorStrategy<'_>,
+    ) -> Result<(SegmentMeta, MergeStats)> {
         let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
 
-        // Build merged term dictionary and postings
+        // === Mandatory: merge postings ===
         let mut term_dict_data = Vec::new();
         let mut postings_data = Vec::new();
         let terms_processed = self
@@ -157,12 +175,11 @@ impl SegmentMerger {
         stats.term_dict_bytes = term_dict_data.len();
         stats.postings_bytes = postings_data.len();
 
-        // Track peak memory (term dict + postings buffers)
         let current_mem = term_dict_data.capacity() + postings_data.capacity();
         stats.current_memory_bytes = current_mem;
         stats.peak_memory_bytes = stats.peak_memory_bytes.max(current_mem);
 
-        // Stack store files without recompression
+        // === Mandatory: stack store files ===
         let mut store_data = Vec::new();
         {
             let mut store_merger = StoreMerger::new(&mut store_data);
@@ -175,34 +192,38 @@ impl SegmentMerger {
         }
         stats.store_bytes = store_data.len();
 
-        // Update peak memory
         let current_mem =
             term_dict_data.capacity() + postings_data.capacity() + store_data.capacity();
         stats.peak_memory_bytes = stats.peak_memory_bytes.max(current_mem);
 
-        // Write files
         dir.write(&files.term_dict, &term_dict_data).await?;
         dir.write(&files.postings, &postings_data).await?;
         dir.write(&files.store, &store_data).await?;
 
-        // Free memory after writing
         drop(term_dict_data);
         drop(postings_data);
         drop(store_data);
 
-        // Merge dense vector indexes
-        let vectors_bytes = self
-            .merge_dense_vectors_with_stats(dir, segments, &files)
-            .await?;
+        // === Dense vectors: strategy-dependent ===
+        let vectors_bytes = match &dense_strategy {
+            DenseVectorStrategy::MergeExisting => {
+                self.merge_dense_vectors_with_stats(dir, segments, &files)
+                    .await?
+            }
+            DenseVectorStrategy::BuildAnn(trained) => {
+                self.build_ann_vectors(dir, segments, &files, trained)
+                    .await?
+            }
+        };
         stats.vectors_bytes = vectors_bytes;
 
-        // Merge sparse vector indexes (optimized block stacking)
+        // === Mandatory: merge sparse vectors ===
         let sparse_bytes = self
             .merge_sparse_vectors_optimized(dir, segments, &files)
             .await?;
         stats.sparse_bytes = sparse_bytes;
 
-        // Merge field stats
+        // === Mandatory: merge field stats + write meta ===
         let mut merged_field_stats: FxHashMap<u32, FieldStats> = FxHashMap::default();
         for segment in segments {
             for (&field_id, field_stats) in &segment.meta().field_stats {
@@ -221,8 +242,14 @@ impl SegmentMerger {
 
         dir.write(&files.meta, &meta.serialize()?).await?;
 
+        let label = match &dense_strategy {
+            DenseVectorStrategy::MergeExisting => "Merge",
+            DenseVectorStrategy::BuildAnn(_) => "ANN merge",
+        };
         log::info!(
-            "Merge complete: {} terms, output: term_dict={}, postings={}, store={}, vectors={}, sparse={}",
+            "{} complete: {} docs, {} terms, term_dict={}, postings={}, store={}, vectors={}, sparse={}",
+            label,
+            total_docs,
             stats.terms_processed,
             MergeStats::format_memory(stats.term_dict_bytes),
             MergeStats::format_memory(stats.postings_bytes),
@@ -922,6 +949,14 @@ pub struct TrainedVectorStructures {
     pub codebooks: rustc_hash::FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
 }
 
+/// Strategy for handling dense vector indexes during merge
+pub enum DenseVectorStrategy<'a> {
+    /// Merge existing indexes (ScaNN/IVF cluster merge or RaBitQ rebuild)
+    MergeExisting,
+    /// Build ANN indexes from flat vectors using trained structures
+    BuildAnn(&'a TrainedVectorStructures),
+}
+
 impl SegmentMerger {
     /// Merge segments and rebuild dense vectors with ANN indexes using trained structures
     ///
@@ -934,78 +969,14 @@ impl SegmentMerger {
         new_segment_id: SegmentId,
         trained: &TrainedVectorStructures,
     ) -> Result<SegmentMeta> {
-        let files = SegmentFiles::new(new_segment_id.0);
-
-        // Build merged term dictionary and postings
-        let mut term_dict_data = Vec::new();
-        let mut postings_data = Vec::new();
-        let mut stats = MergeStats::default();
-        self.merge_postings_with_stats(
-            segments,
-            &mut term_dict_data,
-            &mut postings_data,
-            &mut stats,
-        )
-        .await?;
-
-        // Stack store files
-        let mut store_data = Vec::new();
-        {
-            let mut store_merger = StoreMerger::new(&mut store_data);
-            for segment in segments {
-                let raw_blocks = segment.store_raw_blocks();
-                let data_slice = segment.store_data_slice();
-                store_merger.append_store(data_slice, &raw_blocks).await?;
-            }
-            store_merger.finish()?;
-        }
-
-        // Write text index files
-        dir.write(&files.term_dict, &term_dict_data).await?;
-        dir.write(&files.postings, &postings_data).await?;
-        dir.write(&files.store, &store_data).await?;
-
-        drop(term_dict_data);
-        drop(postings_data);
-        drop(store_data);
-
-        // Build ANN indexes using trained centroids
-        let vectors_bytes = self
-            .build_ann_vectors(dir, segments, &files, trained)
+        let (meta, _stats) = self
+            .merge_core(
+                dir,
+                segments,
+                new_segment_id,
+                DenseVectorStrategy::BuildAnn(trained),
+            )
             .await?;
-
-        // Merge sparse vector indexes (optimized block stacking)
-        let sparse_bytes = self
-            .merge_sparse_vectors_optimized(dir, segments, &files)
-            .await?;
-
-        // Merge field stats
-        let mut merged_field_stats: rustc_hash::FxHashMap<u32, FieldStats> =
-            rustc_hash::FxHashMap::default();
-        for segment in segments {
-            for (&field_id, field_stats) in &segment.meta().field_stats {
-                let entry = merged_field_stats.entry(field_id).or_default();
-                entry.total_tokens += field_stats.total_tokens;
-                entry.doc_count += field_stats.doc_count;
-            }
-        }
-
-        let total_docs: u32 = segments.iter().map(|s| s.num_docs()).sum();
-        let meta = SegmentMeta {
-            id: new_segment_id.0,
-            num_docs: total_docs,
-            field_stats: merged_field_stats,
-        };
-
-        dir.write(&files.meta, &meta.serialize()?).await?;
-
-        log::info!(
-            "ANN merge complete: {} docs, vectors={}, sparse={}",
-            total_docs,
-            MergeStats::format_memory(vectors_bytes),
-            MergeStats::format_memory(sparse_bytes),
-        );
-
         Ok(meta)
     }
 
