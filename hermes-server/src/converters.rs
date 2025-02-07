@@ -358,12 +358,21 @@ pub fn convert_reranker(
         ));
     }
 
-    let combiner = convert_combiner(
-        reranker.combiner,
-        reranker.combiner_temperature,
-        reranker.combiner_top_k,
-        reranker.combiner_decay,
-    );
+    // Default reranker combiner to WeightedTopK(k=3, decay=0.7) — decaying
+    // combination of top-3 best-matching chunks. LogSumExp heavily biases
+    // toward documents with many vectors regardless of relevance.
+    // Proto enum default 0 = LOG_SUM_EXP — if nothing was explicitly set
+    // (combiner=0, temperature=0), override for reranking.
+    let combiner = if reranker.combiner == 0 && reranker.combiner_temperature == 0.0 {
+        MultiValueCombiner::WeightedTopK { k: 3, decay: 0.7 }
+    } else {
+        convert_combiner(
+            reranker.combiner,
+            reranker.combiner_temperature,
+            reranker.combiner_top_k,
+            reranker.combiner_decay,
+        )
+    };
 
     Ok(RerankerConfig {
         field,

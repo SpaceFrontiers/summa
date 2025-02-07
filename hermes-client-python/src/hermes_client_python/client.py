@@ -293,7 +293,7 @@ class HermesClient:
         offset: int = 0,
         fields_to_load: list[str] | None = None,
         reranker: tuple[str, list[float], int] | None = None,
-        reranker_combiner: str = "log_sum_exp",
+        reranker_combiner: str = "weighted_top_k",
     ) -> SearchResponse:
         """Search for documents.
 

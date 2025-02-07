@@ -186,7 +186,7 @@ export class HermesClient {
         field,
         vector,
         limit,
-        combiner: rerankerCombinerToProto(options.rerankerCombiner ?? "log_sum_exp"),
+        combiner: rerankerCombinerToProto(options.rerankerCombiner ?? "weighted_top_k"),
         combinerTemperature: 0,
         combinerTopK: 0,
         combinerDecay: 0,
