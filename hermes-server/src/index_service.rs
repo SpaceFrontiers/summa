@@ -94,9 +94,9 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<IndexDocumentsResponse>, Status> {
         let mut stream = request.into_inner();
         let mut indexed_count = 0u32;
-        let mut current_index: Option<Arc<hermes_core::Index<hermes_core::FsDirectory>>> = None;
+        let mut current_index: Option<Arc<hermes_core::Index<hermes_core::MmapDirectory>>> = None;
         let mut current_writer: Option<
-            Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::FsDirectory>>>,
+            Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::MmapDirectory>>>,
         > = None;
         let mut current_index_name: Option<String> = None;
 

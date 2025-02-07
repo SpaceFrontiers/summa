@@ -7,12 +7,12 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
 
-use hermes_core::{FsDirectory, Index, IndexConfig, IndexWriter, Schema};
+use hermes_core::{Index, IndexConfig, IndexWriter, MmapDirectory, Schema};
 
 /// Combined index + writer handle under a single registry entry
 pub struct IndexHandle {
-    pub index: Arc<Index<FsDirectory>>,
-    pub writer: Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>,
+    pub index: Arc<Index<MmapDirectory>>,
+    pub writer: Arc<tokio::sync::RwLock<IndexWriter<MmapDirectory>>>,
 }
 
 /// Index registry holding all open indexes
@@ -33,7 +33,7 @@ impl IndexRegistry {
     }
 
     /// Get or open an index
-    pub async fn get_or_open_index(&self, name: &str) -> Result<Arc<Index<FsDirectory>>, Status> {
+    pub async fn get_or_open_index(&self, name: &str) -> Result<Arc<Index<MmapDirectory>>, Status> {
         if let Some(h) = self.handles.read().get(name) {
             return Ok(Arc::clone(&h.index));
         }
@@ -44,7 +44,7 @@ impl IndexRegistry {
             return Err(Status::not_found(format!("Index '{}' not found", name)));
         }
 
-        let dir = FsDirectory::new(&index_path);
+        let dir = MmapDirectory::new(&index_path);
         let index = Index::open(dir, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to open index: {}", e)))?;
@@ -81,7 +81,7 @@ impl IndexRegistry {
         std::fs::create_dir_all(&index_path)
             .map_err(|e| Status::internal(format!("Failed to create directory: {}", e)))?;
 
-        let dir = FsDirectory::new(&index_path);
+        let dir = MmapDirectory::new(&index_path);
         let index = Index::create(dir, schema, self.config.clone())
             .await
             .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
@@ -103,7 +103,7 @@ impl IndexRegistry {
     pub async fn get_writer(
         &self,
         name: &str,
-    ) -> Result<Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>, Status> {
+    ) -> Result<Arc<tokio::sync::RwLock<IndexWriter<MmapDirectory>>>, Status> {
         if let Some(h) = self.handles.read().get(name) {
             return Ok(Arc::clone(&h.writer));
         }

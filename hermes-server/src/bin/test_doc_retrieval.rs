@@ -1,10 +1,10 @@
 //! Test document retrieval from the test index
 
-use hermes_core::{FsDirectory, Index, IndexConfig};
+use hermes_core::{Index, IndexConfig, MmapDirectory};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = FsDirectory::new("data/test_index");
+    let dir = MmapDirectory::new("data/test_index");
     let config = IndexConfig::default();
     let index = Index::open(dir, config).await?;
 
