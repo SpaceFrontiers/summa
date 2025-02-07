@@ -162,6 +162,13 @@ export class HermesClient {
     return response.numSegments;
   }
 
+  /** Retrain vector index centroids/codebooks from current data. */
+  async retrainVectorIndex(indexName: string): Promise<boolean> {
+    this.ensureConnected();
+    const response = await this.indexClient!.retrainVectorIndex({ indexName });
+    return response.success;
+  }
+
   // =========================================================================
   // Search
   // =========================================================================

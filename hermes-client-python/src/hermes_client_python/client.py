@@ -253,6 +253,24 @@ class HermesClient:
         response = await self._index_stub.ForceMerge(request)
         return response.num_segments
 
+    async def retrain_vector_index(self, index_name: str) -> bool:
+        """Retrain vector index centroids/codebooks from current data.
+
+        Resets the trained ANN structures and rebuilds them from scratch.
+        Use this when significant new data has been added and you want
+        better centroids, or when the vector distribution has changed.
+
+        Args:
+            index_name: Name of the index
+
+        Returns:
+            True if successful
+        """
+        self._ensure_connected()
+        request = pb.RetrainVectorIndexRequest(index_name=index_name)
+        response = await self._index_stub.RetrainVectorIndex(request)
+        return response.success
+
     # =========================================================================
     # Search
     # =========================================================================

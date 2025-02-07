@@ -36,6 +36,9 @@ service IndexService {
 
   // List all indexes
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+
+  // Retrain vector index (re-cluster centroids/codebooks from current data)
+  rpc RetrainVectorIndex(RetrainVectorIndexRequest) returns (RetrainVectorIndexResponse);
 }
 
 // Query types
@@ -310,4 +313,13 @@ message ListIndexesRequest {}
 
 message ListIndexesResponse {
   repeated string index_names = 1;
+}
+
+// Retrain vector index request/response
+message RetrainVectorIndexRequest {
+  string index_name = 1;
+}
+
+message RetrainVectorIndexResponse {
+  bool success = 1;
 }

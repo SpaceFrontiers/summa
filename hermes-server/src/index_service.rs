@@ -245,4 +245,24 @@ impl IndexService for IndexServiceImpl {
 
         Ok(Response::new(ListIndexesResponse { index_names }))
     }
+
+    async fn retrain_vector_index(
+        &self,
+        request: Request<RetrainVectorIndexRequest>,
+    ) -> Result<Response<RetrainVectorIndexResponse>, Status> {
+        let req = request.into_inner();
+        let _index = self.registry.get_or_open_index(&req.index_name).await?;
+        let writer = self.registry.get_writer(&req.index_name).await?;
+
+        writer
+            .write()
+            .await
+            .rebuild_vector_index()
+            .await
+            .map_err(|e| Status::internal(format!("Retrain failed: {}", e)))?;
+
+        info!(index_name = %req.index_name, "Retrained vector index");
+
+        Ok(Response::new(RetrainVectorIndexResponse { success: true }))
+    }
 }

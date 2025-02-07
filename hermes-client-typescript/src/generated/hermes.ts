@@ -371,6 +371,15 @@ export interface ListIndexesResponse {
   indexNames: string[];
 }
 
+/** Retrain vector index request/response */
+export interface RetrainVectorIndexRequest {
+  indexName: string;
+}
+
+export interface RetrainVectorIndexResponse {
+  success: boolean;
+}
+
 function createBaseQuery(): Query {
   return {
     term: undefined,
@@ -4513,6 +4522,128 @@ export const ListIndexesResponse: MessageFns<ListIndexesResponse> = {
   },
 };
 
+function createBaseRetrainVectorIndexRequest(): RetrainVectorIndexRequest {
+  return { indexName: "" };
+}
+
+export const RetrainVectorIndexRequest: MessageFns<RetrainVectorIndexRequest> = {
+  encode(message: RetrainVectorIndexRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.indexName !== "") {
+      writer.uint32(10).string(message.indexName);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RetrainVectorIndexRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRetrainVectorIndexRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.indexName = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RetrainVectorIndexRequest {
+    return {
+      indexName: isSet(object.indexName)
+        ? globalThis.String(object.indexName)
+        : isSet(object.index_name)
+        ? globalThis.String(object.index_name)
+        : "",
+    };
+  },
+
+  toJSON(message: RetrainVectorIndexRequest): unknown {
+    const obj: any = {};
+    if (message.indexName !== "") {
+      obj.indexName = message.indexName;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RetrainVectorIndexRequest>): RetrainVectorIndexRequest {
+    return RetrainVectorIndexRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RetrainVectorIndexRequest>): RetrainVectorIndexRequest {
+    const message = createBaseRetrainVectorIndexRequest();
+    message.indexName = object.indexName ?? "";
+    return message;
+  },
+};
+
+function createBaseRetrainVectorIndexResponse(): RetrainVectorIndexResponse {
+  return { success: false };
+}
+
+export const RetrainVectorIndexResponse: MessageFns<RetrainVectorIndexResponse> = {
+  encode(message: RetrainVectorIndexResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.success !== false) {
+      writer.uint32(8).bool(message.success);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RetrainVectorIndexResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRetrainVectorIndexResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.success = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RetrainVectorIndexResponse {
+    return { success: isSet(object.success) ? globalThis.Boolean(object.success) : false };
+  },
+
+  toJSON(message: RetrainVectorIndexResponse): unknown {
+    const obj: any = {};
+    if (message.success !== false) {
+      obj.success = message.success;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RetrainVectorIndexResponse>): RetrainVectorIndexResponse {
+    return RetrainVectorIndexResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RetrainVectorIndexResponse>): RetrainVectorIndexResponse {
+    const message = createBaseRetrainVectorIndexResponse();
+    message.success = object.success ?? false;
+    return message;
+  },
+};
+
 /** Search service */
 export type SearchServiceDefinition = typeof SearchServiceDefinition;
 export const SearchServiceDefinition = {
@@ -4615,6 +4746,15 @@ export const IndexServiceDefinition = {
       requestType: ListIndexesRequest,
       requestStream: false,
       responseType: ListIndexesResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Retrain vector index (re-cluster centroids/codebooks from current data) */
+    retrainVectorIndex: {
+      name: "RetrainVectorIndex",
+      requestType: RetrainVectorIndexRequest,
+      requestStream: false,
+      responseType: RetrainVectorIndexResponse,
       responseStream: false,
       options: {},
     },

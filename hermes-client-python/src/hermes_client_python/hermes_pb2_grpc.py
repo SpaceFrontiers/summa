@@ -250,6 +250,12 @@ class IndexServiceStub:
             response_deserializer=hermes__pb2.ListIndexesResponse.FromString,
             _registered_method=True,
         )
+        self.RetrainVectorIndex = channel.unary_unary(
+            "/hermes.IndexService/RetrainVectorIndex",
+            request_serializer=hermes__pb2.RetrainVectorIndexRequest.SerializeToString,
+            response_deserializer=hermes__pb2.RetrainVectorIndexResponse.FromString,
+            _registered_method=True,
+        )
 
 
 class IndexServiceServicer:
@@ -297,6 +303,12 @@ class IndexServiceServicer:
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
+    def RetrainVectorIndex(self, request, context):
+        """Retrain vector index (re-cluster centroids/codebooks from current data)"""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
 
 def add_IndexServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -334,6 +346,11 @@ def add_IndexServiceServicer_to_server(servicer, server):
             servicer.ListIndexes,
             request_deserializer=hermes__pb2.ListIndexesRequest.FromString,
             response_serializer=hermes__pb2.ListIndexesResponse.SerializeToString,
+        ),
+        "RetrainVectorIndex": grpc.unary_unary_rpc_method_handler(
+            servicer.RetrainVectorIndex,
+            request_deserializer=hermes__pb2.RetrainVectorIndexRequest.FromString,
+            response_serializer=hermes__pb2.RetrainVectorIndexResponse.SerializeToString,
         ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -546,6 +563,36 @@ class IndexService:
             "/hermes.IndexService/ListIndexes",
             hermes__pb2.ListIndexesRequest.SerializeToString,
             hermes__pb2.ListIndexesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def RetrainVectorIndex(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/hermes.IndexService/RetrainVectorIndex",
+            hermes__pb2.RetrainVectorIndexRequest.SerializeToString,
+            hermes__pb2.RetrainVectorIndexResponse.FromString,
             options,
             channel_credentials,
             insecure,
