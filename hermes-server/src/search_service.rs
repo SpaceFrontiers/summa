@@ -63,7 +63,7 @@ impl SearchService for SearchServiceImpl {
                 .map_err(|e| Status::internal(format!("Search failed: {}", e)))?
         } else {
             searcher
-                .search_with_count(core_query.as_ref(), limit)
+                .search_with_positions(core_query.as_ref(), limit)
                 .await
                 .map_err(|e| Status::internal(format!("Search failed: {}", e)))?
         };

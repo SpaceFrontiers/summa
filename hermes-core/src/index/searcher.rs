@@ -342,6 +342,28 @@ impl<D: Directory + 'static> Searcher<D> {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        self.search_internal(query, limit, offset, false).await
+    }
+
+    /// Search with positions (ordinal tracking) and return (results, total_seen)
+    ///
+    /// Use this when you need per-ordinal scores for multi-valued fields.
+    pub async fn search_with_positions(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        self.search_internal(query, limit, 0, true).await
+    }
+
+    /// Internal search implementation
+    async fn search_internal(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+        offset: usize,
+        collect_positions: bool,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
 
         let futures: Vec<_> = self
@@ -350,12 +372,21 @@ impl<D: Directory + 'static> Searcher<D> {
             .map(|segment| {
                 let sid = segment.meta().id;
                 async move {
-                    let (results, segment_seen) = crate::query::search_segment_with_count(
-                        segment.as_ref(),
-                        query,
-                        fetch_limit,
-                    )
-                    .await?;
+                    let (results, segment_seen) = if collect_positions {
+                        crate::query::search_segment_with_positions_and_count(
+                            segment.as_ref(),
+                            query,
+                            fetch_limit,
+                        )
+                        .await?
+                    } else {
+                        crate::query::search_segment_with_count(
+                            segment.as_ref(),
+                            query,
+                            fetch_limit,
+                        )
+                        .await?
+                    };
                     Ok::<_, crate::error::Error>((
                         results
                             .into_iter()
