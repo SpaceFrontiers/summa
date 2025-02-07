@@ -57,45 +57,56 @@ impl FlatVectorData {
         buf
     }
 
-    /// Serialize directly from flat f32 storage (avoids Vec<Vec<f32>> intermediate).
+    /// Compute the serialized size without actually serializing.
+    pub fn serialized_binary_size(index_dim: usize, num_vectors: usize) -> usize {
+        12 + num_vectors * index_dim * 4 + num_vectors * 6
+    }
+
+    /// Stream directly from flat f32 storage to a writer (zero-buffer serialization).
     ///
     /// `flat_vectors` is contiguous storage of dim*n floats.
     /// `original_dim` is the dimension in flat_vectors (may differ from index_dim for MRL).
-    pub fn serialize_binary_from_flat(
+    pub fn serialize_binary_from_flat_streaming(
         index_dim: usize,
         flat_vectors: &[f32],
         original_dim: usize,
         doc_ids: &[(u32, u16)],
-    ) -> Vec<u8> {
+        writer: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
         let num_vectors = doc_ids.len();
-        let total = 12 + num_vectors * index_dim * 4 + num_vectors * 6;
-        let mut buf = Vec::with_capacity(total);
 
-        buf.extend_from_slice(&FLAT_BINARY_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&(index_dim as u32).to_le_bytes());
-        buf.extend_from_slice(&(num_vectors as u32).to_le_bytes());
+        writer.write_all(&FLAT_BINARY_MAGIC.to_le_bytes())?;
+        writer.write_all(&(index_dim as u32).to_le_bytes())?;
+        writer.write_all(&(num_vectors as u32).to_le_bytes())?;
 
         if index_dim == original_dim {
             // No trimming — write all floats directly
-            for &val in flat_vectors {
-                buf.extend_from_slice(&val.to_le_bytes());
-            }
+            // SAFETY: reinterpret f32 slice as bytes for efficient bulk write
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    flat_vectors.as_ptr() as *const u8,
+                    flat_vectors.len() * 4,
+                )
+            };
+            writer.write_all(bytes)?;
         } else {
             // Trim each vector to index_dim (matryoshka/MRL)
             for i in 0..num_vectors {
                 let start = i * original_dim;
-                for j in 0..index_dim {
-                    buf.extend_from_slice(&flat_vectors[start + j].to_le_bytes());
-                }
+                let slice = &flat_vectors[start..start + index_dim];
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(slice.as_ptr() as *const u8, index_dim * 4)
+                };
+                writer.write_all(bytes)?;
             }
         }
 
         for &(doc_id, ordinal) in doc_ids {
-            buf.extend_from_slice(&doc_id.to_le_bytes());
-            buf.extend_from_slice(&ordinal.to_le_bytes());
+            writer.write_all(&doc_id.to_le_bytes())?;
+            writer.write_all(&ordinal.to_le_bytes())?;
         }
 
-        buf
+        Ok(())
     }
 
     /// Deserialize from binary format.

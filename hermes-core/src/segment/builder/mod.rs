@@ -645,8 +645,9 @@ impl SegmentBuilder {
 
     /// Build the final segment
     ///
-    /// Memory optimization: each phase consumes and drops its source data before
-    /// the next phase begins, preventing accumulation of multiple large buffers.
+    /// Streams all data directly to disk via StreamingWriter to avoid buffering
+    /// entire serialized outputs in memory. Each phase consumes and drops its
+    /// source data before the next phase begins.
     pub async fn build<D: Directory + DirectoryWriter>(
         mut self,
         dir: &D,
@@ -661,10 +662,8 @@ impl SegmentBuilder {
         let position_index = std::mem::take(&mut self.position_index);
         let (positions_data, position_offsets) =
             Self::build_positions_owned(position_index, &self.term_interner)?;
-        // position_index memory is now freed
 
-        // Phase 2: Build postings + store in parallel
-        // Take ownership of inverted_index and term_interner so they're freed after serialization
+        // Phase 2: Build postings + store — stream directly to disk
         let inverted_index = std::mem::take(&mut self.inverted_index);
         let term_interner = std::mem::replace(&mut self.term_interner, Rodeo::new());
         let store_path = self.store_path.clone();
@@ -672,54 +671,59 @@ impl SegmentBuilder {
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
 
+        // Create streaming writers (async) before entering sync build phases
+        let mut term_dict_writer = dir.streaming_writer(&files.term_dict).await?;
+        let mut postings_writer = dir.streaming_writer(&files.postings).await?;
+        let mut store_writer = dir.streaming_writer(&files.store).await?;
+
         let (postings_result, store_result) = rayon::join(
-            || Self::build_postings_owned(inverted_index, term_interner, &position_offsets),
             || {
-                Self::build_store_batched(
+                Self::build_postings_streaming(
+                    inverted_index,
+                    term_interner,
+                    &position_offsets,
+                    &mut *term_dict_writer,
+                    &mut *postings_writer,
+                )
+            },
+            || {
+                Self::build_store_streaming(
                     &store_path,
                     &schema_clone,
                     num_compression_threads,
                     compression_level,
+                    &mut *store_writer,
                 )
             },
         );
-        // inverted_index and term_interner consumed and freed by build_postings_owned
+        postings_result?;
+        store_result?;
+        term_dict_writer.finish()?;
+        postings_writer.finish()?;
+        store_writer.finish()?;
 
-        let (term_dict_data, postings_data) = postings_result?;
-        let store_data = store_result?;
-
-        // Write and immediately drop large buffers
-        dir.write(&files.term_dict, &term_dict_data).await?;
-        drop(term_dict_data);
-        dir.write(&files.postings, &postings_data).await?;
-        drop(postings_data);
-        dir.write(&files.store, &store_data).await?;
-        drop(store_data);
-
+        // Write positions (usually small, still buffered)
         if !positions_data.is_empty() {
             dir.write(&files.positions, &positions_data).await?;
         }
         drop(positions_data);
         drop(position_offsets);
 
-        // Phase 3: Build dense vectors (consumes dense_vectors)
+        // Phase 3: Dense vectors — stream directly to disk
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
         if !dense_vectors.is_empty() {
-            let vectors_data = Self::build_vectors_file_binary(dense_vectors, &self.schema)?;
-            if !vectors_data.is_empty() {
-                dir.write(&files.vectors, &vectors_data).await?;
-            }
+            let mut writer = dir.streaming_writer(&files.vectors).await?;
+            Self::build_vectors_streaming(dense_vectors, &self.schema, &mut *writer)?;
+            writer.finish()?;
         }
-        // dense_vectors memory is now freed
 
-        // Phase 4: Build sparse vectors (sorts in-place, no cloning)
+        // Phase 4: Sparse vectors — stream directly to disk
         let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
         if !sparse_vectors.is_empty() {
-            let sparse_data = Self::build_sparse_file_inplace(&mut sparse_vectors, &self.schema)?;
+            let mut writer = dir.streaming_writer(&files.sparse).await?;
+            Self::build_sparse_streaming(&mut sparse_vectors, &self.schema, &mut *writer)?;
             drop(sparse_vectors);
-            if !sparse_data.is_empty() {
-                dir.write(&files.sparse, &sparse_data).await?;
-            }
+            writer.finish()?;
         }
 
         let meta = SegmentMeta {
@@ -736,85 +740,99 @@ impl SegmentBuilder {
         Ok(meta)
     }
 
-    /// Build unified vectors file using compact binary format.
+    /// Stream dense vectors directly to disk (zero-buffer for vector data).
     ///
-    /// Writes directly from the DenseVectorBuilder's flat f32 storage,
-    /// avoiding the expensive Vec<Vec<f32>> clone and JSON serialization.
-    fn build_vectors_file_binary(
+    /// Computes sizes deterministically (no trial serialization needed), writes
+    /// a small header, then streams each field's raw f32 data directly to the writer.
+    fn build_vectors_streaming(
         dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
         schema: &Schema,
-    ) -> Result<Vec<u8>> {
+        writer: &mut dyn Write,
+    ) -> Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
 
-        let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
+        let mut fields: Vec<(u32, DenseVectorBuilder)> = dense_vectors
+            .into_iter()
+            .filter(|(_, b)| b.len() > 0)
+            .collect();
+        fields.sort_by_key(|(id, _)| *id);
 
-        for (field_id, builder) in dense_vectors {
-            if builder.len() == 0 {
-                continue;
-            }
+        if fields.is_empty() {
+            return Ok(());
+        }
 
+        // Compute sizes using deterministic formula (no serialization needed)
+        let mut field_sizes: Vec<usize> = Vec::with_capacity(fields.len());
+        for (field_id, builder) in &fields {
+            let field = crate::dsl::Field(*field_id);
+            let dense_config = schema
+                .get_field_entry(field)
+                .and_then(|e| e.dense_vector_config.as_ref());
+            let index_dim = dense_config.map(|c| c.index_dim()).unwrap_or(builder.dim);
+            field_sizes.push(FlatVectorData::serialized_binary_size(
+                index_dim,
+                builder.len(),
+            ));
+        }
+
+        // Write header (tiny — ~25 bytes per field)
+        let header_size = 4 + fields.len() * (4 + 1 + 8 + 8);
+        let mut header = Vec::with_capacity(header_size);
+        header.write_u32::<LittleEndian>(fields.len() as u32)?;
+
+        let mut current_offset = header_size as u64;
+        for (i, (field_id, _)) in fields.iter().enumerate() {
+            header.write_u32::<LittleEndian>(*field_id)?;
+            header.write_u8(4u8)?; // Flat Binary
+            header.write_u64::<LittleEndian>(current_offset)?;
+            header.write_u64::<LittleEndian>(field_sizes[i] as u64)?;
+            current_offset += field_sizes[i] as u64;
+        }
+        writer.write_all(&header)?;
+
+        // Stream each field's data directly (builder → disk, no intermediate buffer)
+        for (field_id, builder) in fields {
             let field = crate::dsl::Field(field_id);
             let dense_config = schema
                 .get_field_entry(field)
                 .and_then(|e| e.dense_vector_config.as_ref());
-
             let index_dim = dense_config.map(|c| c.index_dim()).unwrap_or(builder.dim);
 
-            // Serialize directly from flat storage — no Vec<Vec<f32>> clone
-            let index_bytes = FlatVectorData::serialize_binary_from_flat(
+            FlatVectorData::serialize_binary_from_flat_streaming(
                 index_dim,
                 &builder.vectors,
                 builder.dim,
                 &builder.doc_ids,
-            );
-
-            field_indexes.push((field_id, 4u8, index_bytes)); // 4 = Flat Binary
-            // builder dropped here, freeing vector memory
+                writer,
+            )
+            .map_err(crate::Error::Io)?;
+            // builder dropped here, freeing vector memory before next field
         }
 
-        if field_indexes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        field_indexes.sort_by_key(|(id, _, _)| *id);
-        let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
-
-        let mut output = Vec::new();
-        output.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
-
-        let mut current_offset = header_size as u64;
-        for (field_id, index_type, data) in &field_indexes {
-            output.write_u32::<LittleEndian>(*field_id)?;
-            output.write_u8(*index_type)?;
-            output.write_u64::<LittleEndian>(current_offset)?;
-            output.write_u64::<LittleEndian>(data.len() as u64)?;
-            current_offset += data.len() as u64;
-        }
-
-        for (_, _, data) in field_indexes {
-            output.extend_from_slice(&data);
-        }
-
-        Ok(output)
+        Ok(())
     }
 
-    /// Build sparse vectors file, sorting postings in-place (no cloning).
+    /// Stream sparse vectors directly to disk.
     ///
-    /// Takes `&mut` to the sparse vectors map so postings can be sorted in-place,
-    /// eliminating the per-dimension clone that previously doubled memory usage.
-    fn build_sparse_file_inplace(
+    /// Serializes per-dimension posting lists (needed for header offset computation),
+    /// writes header, then streams each dimension's data directly to the writer.
+    /// Eliminates the triple-buffered approach (dim_bytes + all_data + output).
+    fn build_sparse_streaming(
         sparse_vectors: &mut FxHashMap<u32, SparseVectorBuilder>,
         schema: &Schema,
-    ) -> Result<Vec<u8>> {
+        writer: &mut dyn Write,
+    ) -> Result<()> {
         use crate::structures::{BlockSparsePostingList, WeightQuantization};
         use byteorder::{LittleEndian, WriteBytesExt};
 
         if sparse_vectors.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        type SparseFieldData = (u32, WeightQuantization, u32, FxHashMap<u32, Vec<u8>>);
-        let mut field_data: Vec<SparseFieldData> = Vec::new();
+        // Phase 1: Serialize all dims, keep bytes for offset computation
+        type DimEntry = (u32, Vec<u8>);
+        type FieldEntry = (u32, WeightQuantization, Vec<DimEntry>);
+        let mut field_data: Vec<FieldEntry> = Vec::new();
 
         for (&field_id, builder) in sparse_vectors.iter_mut() {
             if builder.is_empty() {
@@ -833,13 +851,11 @@ impl SegmentBuilder {
             let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
             let pruning_fraction = sparse_config.and_then(|c| c.posting_list_pruning);
 
-            let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
+            let mut dims: Vec<DimEntry> = Vec::new();
 
             for (&dim_id, postings) in builder.postings.iter_mut() {
-                // Sort in-place — no clone needed since we have &mut access
                 postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
 
-                // Apply posting list pruning: keep only top fraction by weight magnitude
                 if let Some(fraction) = pruning_fraction
                     && postings.len() > 1
                     && fraction < 1.0
@@ -864,60 +880,54 @@ impl SegmentBuilder {
 
                 let mut bytes = Vec::new();
                 block_list.serialize(&mut bytes).map_err(crate::Error::Io)?;
-                dim_bytes.insert(dim_id, bytes);
+                dims.push((dim_id, bytes));
             }
 
-            field_data.push((field_id, quantization, dim_bytes.len() as u32, dim_bytes));
+            dims.sort_by_key(|(id, _)| *id);
+            field_data.push((field_id, quantization, dims));
         }
 
         if field_data.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        field_data.sort_by_key(|(id, _, _, _)| *id);
+        field_data.sort_by_key(|(id, _, _)| *id);
 
-        // Calculate header size (compact format)
+        // Phase 2: Compute header size and offsets
         let mut header_size = 4u64;
-        for (_, _, num_dims, _) in &field_data {
+        for (_, _, dims) in &field_data {
             header_size += 4 + 1 + 4;
-            header_size += (*num_dims as u64) * 16;
+            header_size += (dims.len() as u64) * 16;
         }
 
-        let mut output = Vec::new();
-        output.write_u32::<LittleEndian>(field_data.len() as u32)?;
+        let mut header = Vec::with_capacity(header_size as usize);
+        header.write_u32::<LittleEndian>(field_data.len() as u32)?;
 
         let mut current_offset = header_size;
-        let mut all_data: Vec<u8> = Vec::new();
-        let mut field_tables: Vec<Vec<(u32, u64, u32)>> = Vec::new();
+        for (field_id, quantization, dims) in &field_data {
+            header.write_u32::<LittleEndian>(*field_id)?;
+            header.write_u8(*quantization as u8)?;
+            header.write_u32::<LittleEndian>(dims.len() as u32)?;
 
-        for (_, _, _, dim_bytes) in &field_data {
-            let mut table: Vec<(u32, u64, u32)> = Vec::with_capacity(dim_bytes.len());
-            let mut dims: Vec<_> = dim_bytes.keys().copied().collect();
-            dims.sort();
-
-            for dim_id in dims {
-                let bytes = &dim_bytes[&dim_id];
-                table.push((dim_id, current_offset, bytes.len() as u32));
+            for (dim_id, bytes) in dims {
+                header.write_u32::<LittleEndian>(*dim_id)?;
+                header.write_u64::<LittleEndian>(current_offset)?;
+                header.write_u32::<LittleEndian>(bytes.len() as u32)?;
                 current_offset += bytes.len() as u64;
-                all_data.extend_from_slice(bytes);
-            }
-            field_tables.push(table);
-        }
-
-        for (i, (field_id, quantization, num_dims, _)) in field_data.iter().enumerate() {
-            output.write_u32::<LittleEndian>(*field_id)?;
-            output.write_u8(*quantization as u8)?;
-            output.write_u32::<LittleEndian>(*num_dims)?;
-
-            for &(dim_id, offset, length) in &field_tables[i] {
-                output.write_u32::<LittleEndian>(dim_id)?;
-                output.write_u64::<LittleEndian>(offset)?;
-                output.write_u32::<LittleEndian>(length)?;
             }
         }
 
-        output.extend_from_slice(&all_data);
-        Ok(output)
+        // Phase 3: Write header, then stream each dimension's data
+        writer.write_all(&header)?;
+
+        for (_, _, dims) in field_data {
+            for (_, bytes) in dims {
+                writer.write_all(&bytes)?;
+                // bytes dropped here — one dim at a time
+            }
+        }
+
+        Ok(())
     }
 
     /// Build positions file, consuming the position_index to avoid cloning positions.
@@ -967,15 +977,17 @@ impl SegmentBuilder {
         Ok((output, position_offsets))
     }
 
-    /// Build postings from inverted index, consuming both the index and interner.
+    /// Stream postings directly to disk.
     ///
-    /// Takes ownership so the inverted_index HashMap and term_interner are freed
-    /// as posting lists are serialized, rather than being held alongside the output.
-    fn build_postings_owned(
+    /// Parallel serialization of posting lists, then sequential streaming of
+    /// term dict and postings data directly to writers (no Vec<u8> accumulation).
+    fn build_postings_streaming(
         inverted_index: HashMap<TermKey, PostingListBuilder>,
         term_interner: Rodeo,
         position_offsets: &FxHashMap<Vec<u8>, (u64, u32)>,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        term_dict_writer: &mut dyn Write,
+        postings_writer: &mut dyn Write,
+    ) -> Result<()> {
         // Phase 1: Consume HashMap into sorted Vec (frees HashMap overhead)
         let mut term_entries: Vec<(Vec<u8>, PostingListBuilder)> = inverted_index
             .into_iter()
@@ -988,13 +1000,11 @@ impl SegmentBuilder {
             })
             .collect();
 
-        // term_interner no longer needed — all keys are materialized
         drop(term_interner);
 
         term_entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // Phase 2: Parallel serialization (consumes term_entries via into_par_iter,
-        // each PostingListBuilder is dropped after its posting list is serialized)
+        // Phase 2: Parallel serialization
         let serialized: Vec<(Vec<u8>, SerializedPosting)> = term_entries
             .into_par_iter()
             .map(|(key, posting_builder)| {
@@ -1002,7 +1012,6 @@ impl SegmentBuilder {
                 for p in &posting_builder.postings {
                     full_postings.push(p.doc_id, p.term_freq as u32);
                 }
-                // posting_builder dropped here — original posting memory freed
 
                 let doc_ids: Vec<u32> = full_postings.iter().map(|p| p.doc_id).collect();
                 let term_freqs: Vec<u32> = full_postings.iter().map(|p| p.term_freq).collect();
@@ -1027,30 +1036,30 @@ impl SegmentBuilder {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Phase 3: Sequential assembly
-        let mut term_dict = Vec::new();
-        let mut postings = Vec::new();
-        let mut writer = SSTableWriter::<TermInfo>::new(&mut term_dict);
+        // Phase 3: Stream directly to writers (no intermediate Vec<u8> accumulation)
+        let mut postings_offset = 0u64;
+        let mut writer = SSTableWriter::<TermInfo>::new(term_dict_writer);
 
         for (key, serialized_posting) in serialized {
             let term_info = match serialized_posting {
                 SerializedPosting::Inline(info) => info,
                 SerializedPosting::External { bytes, doc_count } => {
-                    let posting_offset = postings.len() as u64;
                     let posting_len = bytes.len() as u32;
-                    postings.extend_from_slice(&bytes);
+                    postings_writer.write_all(&bytes)?;
 
-                    if let Some(&(pos_offset, pos_len)) = position_offsets.get(&key) {
+                    let info = if let Some(&(pos_offset, pos_len)) = position_offsets.get(&key) {
                         TermInfo::external_with_positions(
-                            posting_offset,
+                            postings_offset,
                             posting_len,
                             doc_count,
                             pos_offset,
                             pos_len,
                         )
                     } else {
-                        TermInfo::external(posting_offset, posting_len, doc_count)
-                    }
+                        TermInfo::external(postings_offset, posting_len, doc_count)
+                    };
+                    postings_offset += posting_len as u64;
+                    info
                 }
             };
 
@@ -1058,25 +1067,25 @@ impl SegmentBuilder {
         }
 
         writer.finish()?;
-        Ok((term_dict, postings))
+        Ok(())
     }
 
-    /// Build document store from streamed temp file using batched processing.
+    /// Stream compressed document store directly to disk.
     ///
-    /// Processes documents in batches to limit peak memory, rather than
-    /// materializing all deserialized documents at once.
-    fn build_store_batched(
+    /// Reads documents from temp file, compresses in parallel batches,
+    /// and writes directly to the streaming writer (no Vec<u8> accumulation).
+    fn build_store_streaming(
         store_path: &PathBuf,
         schema: &Schema,
         num_compression_threads: usize,
         compression_level: CompressionLevel,
-    ) -> Result<Vec<u8>> {
+        writer: &mut dyn Write,
+    ) -> Result<()> {
         use super::store::EagerParallelStoreWriter;
 
         let file = File::open(store_path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-        // Phase 1: Parse document boundaries (sequential, fast)
         let mut doc_ranges: Vec<(usize, usize)> = Vec::new();
         let mut offset = 0usize;
         while offset + 4 <= mmap.len() {
@@ -1096,13 +1105,9 @@ impl SegmentBuilder {
             offset += doc_len;
         }
 
-        // Phase 2+3: Batched parallel deserialization and compression.
-        // Each batch is deserialized in parallel, fed to the store writer,
-        // then dropped before the next batch — limiting peak memory.
         const BATCH_SIZE: usize = 10_000;
-        let mut store_data = Vec::new();
         let mut store_writer = EagerParallelStoreWriter::with_compression_level(
-            &mut store_data,
+            writer,
             num_compression_threads,
             compression_level,
         );
@@ -1119,11 +1124,10 @@ impl SegmentBuilder {
             for doc in &batch_docs {
                 store_writer.store(doc, schema)?;
             }
-            // batch_docs dropped here, freeing memory for next batch
         }
 
         store_writer.finish()?;
-        Ok(store_data)
+        Ok(())
     }
 }
 
