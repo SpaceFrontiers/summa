@@ -90,6 +90,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Ok(());
         }
 
+        // Wait for any background merges to complete before training.
+        // rebuild_segments_with_ann() calls replace_segments() which clears ALL
+        // segments atomically — concurrent merges would lose data or operate on
+        // stale/deleted segments.
+        self.segment_manager.wait_for_merges().await;
+
         let segment_ids = self.segment_manager.get_segment_ids().await;
         if segment_ids.is_empty() {
             return Ok(());
@@ -115,6 +121,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Rebuild all segments with ANN indexes using trained centroids/codebooks
     pub(super) async fn rebuild_segments_with_ann(&self) -> Result<()> {
+        // Pause background merges and wait for any in-flight ones to finish.
+        // rebuild replaces ALL segments atomically — concurrent merges would
+        // operate on stale/deleted segments or lose their output.
+        self.segment_manager.pause_merges();
+        self.segment_manager.wait_for_merges().await;
+
+        let result = self.rebuild_segments_with_ann_inner().await;
+
+        // Always resume merges, even on error
+        self.segment_manager.resume_merges();
+
+        result
+    }
+
+    async fn rebuild_segments_with_ann_inner(&self) -> Result<()> {
         let segment_ids = self.segment_manager.get_segment_ids().await;
         if segment_ids.is_empty() {
             return Ok(());
