@@ -533,7 +533,10 @@ impl<D: Directory + 'static> Searcher<D> {
         )
     }
 
-    /// Get a document by address (segment_id + doc_id)
+    /// Get a document by address (segment_id + global doc_id)
+    ///
+    /// The doc_id in the address is a global doc_id (with doc_id_offset applied).
+    /// This method converts it back to a segment-local doc_id for the store lookup.
     pub async fn get_document(
         &self,
         address: &crate::query::DocAddress,
@@ -544,7 +547,9 @@ impl<D: Directory + 'static> Searcher<D> {
 
         for segment in &self.segments {
             if segment.meta().id == segment_id {
-                return segment.doc(address.doc_id).await;
+                // Convert global doc_id to segment-local doc_id
+                let local_doc_id = address.doc_id.wrapping_sub(segment.doc_id_offset());
+                return segment.doc(local_doc_id).await;
             }
         }
 

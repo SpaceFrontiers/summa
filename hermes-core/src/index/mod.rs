@@ -390,7 +390,9 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
         for segment in searcher.segment_readers() {
             if segment.meta().id == segment_id {
-                return segment.doc(address.doc_id).await;
+                // Convert global doc_id to segment-local doc_id
+                let local_doc_id = address.doc_id.wrapping_sub(segment.doc_id_offset());
+                return segment.doc(local_doc_id).await;
             }
         }
 
