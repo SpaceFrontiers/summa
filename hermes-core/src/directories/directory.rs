@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::io::{self, Write as _};
+use std::io;
+#[cfg(feature = "native")]
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
