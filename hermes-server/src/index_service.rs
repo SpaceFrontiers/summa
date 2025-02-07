@@ -206,21 +206,24 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<DeleteIndexResponse>, Status> {
         let req = request.into_inner();
 
-        // Wait for any pending segment builds and merges to complete before deleting
-        if let Some(writer) = self.registry.get_existing_writer(&req.index_name) {
-            let w = writer.write().await;
-            // Flush triggers workers to finish current builders and waits for
-            // all pending segment builds to complete
+        // 1. Evict from registry — atomic, prevents any new operations from
+        //    obtaining references to this index.
+        let handle = self.registry.evict(&req.index_name);
+
+        // 2. If the index was open, flush and wait for in-flight operations.
+        //    The write lock waits for all concurrent read locks (batch_index, etc.)
+        //    to finish, then holds exclusive access through file deletion.
+        if let Some(handle) = handle {
+            let w = handle.writer.write().await;
             if let Err(e) = w.flush().await {
                 warn!(index_name = %req.index_name, error = %e, "Error flushing writer during delete");
             }
             w.wait_for_merges().await;
         }
 
-        // Remove writer and index from registry
-        self.registry.remove(&req.index_name);
-
-        // Delete directory
+        // 3. Delete directory — safe because:
+        //    - No new operations can obtain the index (evicted from registry)
+        //    - All in-flight writes finished (write lock acquired above)
         let index_path = self.registry.data_dir.join(&req.index_name);
         if index_path.exists() {
             std::fs::remove_dir_all(&index_path)

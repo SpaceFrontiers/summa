@@ -9,13 +9,16 @@ use tonic::Status;
 
 use hermes_core::{FsDirectory, Index, IndexConfig, IndexWriter, Schema};
 
+/// Combined index + writer handle under a single registry entry
+pub struct IndexHandle {
+    pub index: Arc<Index<FsDirectory>>,
+    pub writer: Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>,
+}
+
 /// Index registry holding all open indexes
 pub struct IndexRegistry {
-    /// Open indexes (Index is the central concept)
-    indexes: RwLock<HashMap<String, Arc<Index<FsDirectory>>>>,
-    /// Cached writers - one per index, reused across requests to avoid segment fragmentation
-    /// Uses RwLock: read lock for add_document (concurrent), write lock for commit/merge (exclusive)
-    writers: RwLock<HashMap<String, Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>>>,
+    /// Single map: name → handle (index + writer together)
+    handles: RwLock<HashMap<String, IndexHandle>>,
     pub(crate) data_dir: PathBuf,
     config: IndexConfig,
 }
@@ -23,8 +26,7 @@ pub struct IndexRegistry {
 impl IndexRegistry {
     pub fn new(data_dir: PathBuf, config: IndexConfig) -> Self {
         Self {
-            indexes: RwLock::new(HashMap::new()),
-            writers: RwLock::new(HashMap::new()),
+            handles: RwLock::new(HashMap::new()),
             data_dir,
             config,
         }
@@ -32,9 +34,8 @@ impl IndexRegistry {
 
     /// Get or open an index
     pub async fn get_or_open_index(&self, name: &str) -> Result<Arc<Index<FsDirectory>>, Status> {
-        // Check if already open
-        if let Some(index) = self.indexes.read().get(name) {
-            return Ok(Arc::clone(index));
+        if let Some(h) = self.handles.read().get(name) {
+            return Ok(Arc::clone(&h.index));
         }
 
         // Open from disk
@@ -49,9 +50,20 @@ impl IndexRegistry {
             .map_err(|e| Status::internal(format!("Failed to open index: {}", e)))?;
 
         let index = Arc::new(index);
-        self.indexes
-            .write()
-            .insert(name.to_string(), Arc::clone(&index));
+        let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
+
+        let mut handles = self.handles.write();
+        // Double-check after acquiring write lock
+        if let Some(h) = handles.get(name) {
+            return Ok(Arc::clone(&h.index));
+        }
+        handles.insert(
+            name.to_string(),
+            IndexHandle {
+                index: Arc::clone(&index),
+                writer,
+            },
+        );
         Ok(index)
     }
 
@@ -77,49 +89,42 @@ impl IndexRegistry {
         let index = Arc::new(index);
         let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
 
-        self.indexes
-            .write()
-            .insert(name.to_string(), Arc::clone(&index));
-        self.writers.write().insert(name.to_string(), writer);
+        self.handles.write().insert(
+            name.to_string(),
+            IndexHandle {
+                index: Arc::clone(&index),
+                writer,
+            },
+        );
         Ok(())
     }
 
-    /// Get or create a cached writer for an index
+    /// Get writer for an index (opens index if needed)
     pub async fn get_writer(
         &self,
         name: &str,
     ) -> Result<Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>, Status> {
-        // Check if writer already exists
-        if let Some(writer) = self.writers.read().get(name) {
-            return Ok(Arc::clone(writer));
+        if let Some(h) = self.handles.read().get(name) {
+            return Ok(Arc::clone(&h.writer));
         }
 
-        // Need to create writer - first ensure index is open
-        let index = self.get_or_open_index(name).await?;
+        // Open index first (creates writer too)
+        self.get_or_open_index(name).await?;
 
-        // Double-check and create writer if needed
-        let mut writers = self.writers.write();
-        if let Some(writer) = writers.get(name) {
-            return Ok(Arc::clone(writer));
-        }
-
-        let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
-        writers.insert(name.to_string(), Arc::clone(&writer));
-        Ok(writer)
+        // Now the handle exists
+        self.handles
+            .read()
+            .get(name)
+            .map(|h| Arc::clone(&h.writer))
+            .ok_or_else(|| Status::internal("Failed to create writer"))
     }
 
-    /// Get a cloned writer reference if one exists (for waiting on merges before delete)
-    pub fn get_existing_writer(
-        &self,
-        name: &str,
-    ) -> Option<Arc<tokio::sync::RwLock<IndexWriter<FsDirectory>>>> {
-        self.writers.read().get(name).cloned()
-    }
-
-    /// Remove writer and index from registry
-    pub fn remove(&self, name: &str) {
-        self.writers.write().remove(name);
-        self.indexes.write().remove(name);
+    /// Evict an index from the registry atomically.
+    ///
+    /// Returns the handle so the caller can flush/wait on it before deleting files.
+    /// Once evicted, no new operations can obtain references to this index.
+    pub fn evict(&self, name: &str) -> Option<IndexHandle> {
+        self.handles.write().remove(name)
     }
 
     /// List all indexes on disk
