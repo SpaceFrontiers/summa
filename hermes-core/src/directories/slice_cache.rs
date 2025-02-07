@@ -789,6 +789,22 @@ impl<D: super::DirectoryWriter> super::DirectoryWriter for SliceCachingDirectory
     async fn sync(&self) -> io::Result<()> {
         self.inner.sync().await
     }
+
+    async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn super::StreamingWriter>> {
+        // Invalidate cache for this file before writing
+        {
+            let mut caches = self.caches.write();
+            if let Some(file_cache) = caches.remove(path) {
+                let mut current = self.current_bytes.write();
+                *current = current.saturating_sub(file_cache.total_bytes);
+            }
+        }
+        {
+            let mut file_sizes = self.file_sizes.write();
+            file_sizes.remove(path);
+        }
+        self.inner.streaming_writer(path).await
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use memmap2::Mmap;
 
-use super::{Directory, DirectoryWriter, FileSlice, LazyFileHandle, OwnedBytes, RangeReadFn};
+use super::{
+    Directory, DirectoryWriter, FileSlice, FileStreamingWriter, LazyFileHandle, OwnedBytes,
+    RangeReadFn, StreamingWriter,
+};
 
 /// Memory-mapped directory for efficient access to large index files
 ///
@@ -165,6 +168,15 @@ impl DirectoryWriter for MmapDirectory {
         let dir = std::fs::File::open(&self.root)?;
         dir.sync_all()?;
         Ok(())
+    }
+
+    async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        let full_path = self.resolve(path);
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = std::fs::File::create(&full_path)?;
+        Ok(Box::new(FileStreamingWriter { file, written: 0 }))
     }
 }
 

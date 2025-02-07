@@ -315,6 +315,11 @@ impl AsyncSegmentReader {
         self.store.has_dict()
     }
 
+    /// Get store reference for merge operations
+    pub fn store(&self) -> &super::store::AsyncStoreReader {
+        &self.store
+    }
+
     /// Get raw store blocks for optimized merging
     pub fn store_raw_blocks(&self) -> Vec<RawStoreBlock> {
         self.store.raw_blocks()
@@ -363,6 +368,23 @@ impl AsyncSegmentReader {
         let end = start + len as u64;
         let bytes = self.postings_handle.read_bytes_range(start..end).await?;
         Ok(bytes.to_vec())
+    }
+
+    /// Read raw position bytes at offset (for merge)
+    pub async fn read_position_bytes(&self, offset: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        let handle = match &self.positions_handle {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+        let start = offset;
+        let end = start + len as u64;
+        let bytes = handle.read_bytes_range(start..end).await?;
+        Ok(Some(bytes.to_vec()))
+    }
+
+    /// Check if this segment has a positions file
+    pub fn has_positions_file(&self) -> bool {
+        self.positions_handle.is_some()
     }
 
     /// Search dense vectors using RaBitQ

@@ -712,7 +712,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let new_segment_id = SegmentId::new();
         merger
             .merge(self.directory.as_ref(), &readers, new_segment_id)
-            .await?;
+            .await
+            .map(|_| ())?;
 
         // Atomically update segments and delete old ones via SegmentManager
         self.segment_manager

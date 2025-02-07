@@ -353,11 +353,11 @@ impl<'a> EagerParallelStoreWriter<'a> {
 
 /// Block index entry for document store
 #[derive(Debug, Clone)]
-struct StoreBlockIndex {
-    first_doc_id: DocId,
-    offset: u64,
-    length: u32,
-    num_docs: u32,
+pub(crate) struct StoreBlockIndex {
+    pub(crate) first_doc_id: DocId,
+    pub(crate) offset: u64,
+    pub(crate) length: u32,
+    pub(crate) num_docs: u32,
 }
 
 /// Async document store reader - loads blocks on demand
@@ -750,6 +750,51 @@ impl<'a, W: Write> StoreMerger<'a, W> {
         Ok(())
     }
 
+    /// Append blocks from a dict-compressed store by decompressing and recompressing.
+    ///
+    /// For stores that use dictionary compression, raw blocks can't be stacked
+    /// directly because the decompressor needs the original dictionary.
+    /// This method decompresses each block with the source dict, then
+    /// recompresses without a dictionary so the merged output is self-contained.
+    pub async fn append_store_recompressing(&mut self, store: &AsyncStoreReader) -> io::Result<()> {
+        let dict = store.dict();
+        let data_slice = store.data_slice();
+        let blocks = store.block_index();
+
+        for block in blocks {
+            let start = block.offset;
+            let end = start + block.length as u64;
+            let compressed = data_slice.read_bytes_range(start..end).await?;
+
+            // Decompress with source dict (or without if no dict)
+            let decompressed = if let Some(d) = dict {
+                crate::compression::decompress_with_dict(compressed.as_slice(), d)?
+            } else {
+                crate::compression::decompress(compressed.as_slice())?
+            };
+
+            // Recompress without dictionary
+            let recompressed = crate::compression::compress(
+                &decompressed,
+                crate::compression::CompressionLevel::default(),
+            )?;
+
+            self.writer.write_all(&recompressed)?;
+
+            self.index.push(StoreBlockIndex {
+                first_doc_id: self.next_doc_id,
+                offset: self.current_offset,
+                length: recompressed.len() as u32,
+                num_docs: block.num_docs,
+            });
+
+            self.current_offset += recompressed.len() as u64;
+            self.next_doc_id += block.num_docs;
+        }
+
+        Ok(())
+    }
+
     /// Finish writing the merged store
     pub fn finish(self) -> io::Result<u32> {
         let data_end_offset = self.current_offset;
@@ -801,5 +846,15 @@ impl AsyncStoreReader {
     /// Check if this store uses a dictionary (incompatible with raw merging)
     pub fn has_dict(&self) -> bool {
         self.dict.is_some()
+    }
+
+    /// Get the decompression dictionary (if any)
+    pub fn dict(&self) -> Option<&CompressionDict> {
+        self.dict.as_ref()
+    }
+
+    /// Get block index for iteration
+    pub(crate) fn block_index(&self) -> &[StoreBlockIndex] {
+        &self.index
     }
 }

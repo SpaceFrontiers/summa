@@ -2,28 +2,88 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::io::Write;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use super::builder::{SegmentBuilder, SegmentBuilderConfig};
 use super::reader::SegmentReader;
 use super::store::StoreMerger;
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
 use crate::Result;
-use crate::directories::{Directory, DirectoryWriter};
+use crate::directories::{Directory, DirectoryWriter, StreamingWriter};
 use crate::dsl::{FieldType, Schema};
 use crate::structures::{
-    BlockPostingList, PostingList, RaBitQConfig, RaBitQIndex, SSTableWriter, TERMINATED, TermInfo,
+    BlockPostingList, PositionPostingList, PostingList, RaBitQConfig, RaBitQIndex, SSTableWriter,
+    TERMINATED, TermInfo,
 };
+
+/// Write adapter that tracks bytes written.
+///
+/// Concrete type so it works with generic `serialize<W: Write>` functions
+/// (unlike `dyn StreamingWriter` which isn't `Sized`).
+pub(crate) struct OffsetWriter {
+    inner: Box<dyn StreamingWriter>,
+    offset: u64,
+}
+
+impl OffsetWriter {
+    fn new(inner: Box<dyn StreamingWriter>) -> Self {
+        Self { inner, offset: 0 }
+    }
+
+    /// Current write position (total bytes written so far).
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Finalize the underlying streaming writer.
+    fn finish(self) -> std::io::Result<()> {
+        self.inner.finish()
+    }
+}
+
+impl Write for OffsetWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.offset += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Format byte count as human-readable string
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Compute per-segment doc ID offsets (each segment's docs start after the previous)
+fn doc_offsets(segments: &[SegmentReader]) -> Vec<u32> {
+    let mut offsets = Vec::with_capacity(segments.len());
+    let mut acc = 0u32;
+    for seg in segments {
+        offsets.push(acc);
+        acc += seg.num_docs();
+    }
+    offsets
+}
 
 /// Statistics for merge operations
 #[derive(Debug, Clone, Default)]
 pub struct MergeStats {
     /// Number of terms processed
     pub terms_processed: usize,
-    /// Number of postings merged
-    pub postings_merged: usize,
     /// Peak memory usage in bytes (estimated)
     pub peak_memory_bytes: usize,
     /// Current memory usage in bytes (estimated)
@@ -38,21 +98,6 @@ pub struct MergeStats {
     pub vectors_bytes: usize,
     /// Sparse vector index output size
     pub sparse_bytes: usize,
-}
-
-impl MergeStats {
-    /// Format memory as human-readable string
-    pub fn format_memory(bytes: usize) -> String {
-        if bytes >= 1024 * 1024 * 1024 {
-            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-        } else if bytes >= 1024 * 1024 {
-            format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
-        } else if bytes >= 1024 {
-            format!("{:.2} KB", bytes as f64 / 1024.0)
-        } else {
-            format!("{} B", bytes)
-        }
-    }
 }
 
 /// Entry for k-way merge heap
@@ -84,6 +129,22 @@ impl Ord for MergeEntry {
     }
 }
 
+/// Trained vector index structures for rebuilding segments with ANN indexes
+pub struct TrainedVectorStructures {
+    /// Trained centroids per field_id
+    pub centroids: rustc_hash::FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
+    /// Trained PQ codebooks per field_id (for ScaNN)
+    pub codebooks: rustc_hash::FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
+}
+
+/// Strategy for handling dense vector indexes during merge
+pub enum DenseVectorStrategy<'a> {
+    /// Merge existing indexes (ScaNN/IVF cluster merge or RaBitQ rebuild)
+    MergeExisting,
+    /// Build ANN indexes from flat vectors using trained structures
+    BuildAnn(&'a TrainedVectorStructures),
+}
+
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
@@ -94,46 +155,8 @@ impl SegmentMerger {
         Self { schema }
     }
 
-    /// Merge segments - uses optimized store stacking when possible
+    /// Merge segments into one, streaming postings/positions/store directly to files.
     pub async fn merge<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segments: &[SegmentReader],
-        new_segment_id: SegmentId,
-    ) -> Result<SegmentMeta> {
-        let (meta, _stats) = self.merge_with_stats(dir, segments, new_segment_id).await?;
-        Ok(meta)
-    }
-
-    /// Merge segments with memory tracking - returns merge statistics
-    pub async fn merge_with_stats<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segments: &[SegmentReader],
-        new_segment_id: SegmentId,
-    ) -> Result<(SegmentMeta, MergeStats)> {
-        // Check if we can use optimized store stacking (no dictionaries)
-        let can_stack_stores = segments.iter().all(|s| !s.store_has_dict());
-
-        // Check if any segment has positions - if so, use rebuild merge
-        // (positions require doc ID remapping which optimized merge doesn't handle)
-        let has_positions = self
-            .schema
-            .fields()
-            .any(|(_, entry)| entry.positions.is_some());
-
-        // Note: sparse vectors now use optimized block stacking merge (no rebuild needed)
-        if can_stack_stores && !has_positions {
-            self.merge_optimized_with_stats(dir, segments, new_segment_id)
-                .await
-        } else {
-            self.merge_rebuild_with_stats(dir, segments, new_segment_id)
-                .await
-        }
-    }
-
-    /// Optimized merge with stats tracking
-    async fn merge_optimized_with_stats<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
@@ -148,8 +171,12 @@ impl SegmentMerger {
         .await
     }
 
-    /// Core merge: handles all mandatory parts (postings, store, sparse, field stats, meta)
+    /// Core merge: handles all mandatory parts (postings, positions, store, sparse, field stats, meta)
     /// and delegates dense vector handling to the provided strategy.
+    ///
+    /// Uses streaming writers so postings, positions, and store data flow directly
+    /// to files instead of buffering everything in memory. Only the term dictionary
+    /// (compact key+TermInfo entries) is buffered.
     async fn merge_core<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
@@ -160,55 +187,61 @@ impl SegmentMerger {
         let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
 
-        // === Mandatory: merge postings ===
-        let mut term_dict_data = Vec::new();
-        let mut postings_data = Vec::new();
+        // === Phase 1: merge postings + positions (streaming) ===
+        let mut postings_writer = OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
+        let mut positions_writer = OffsetWriter::new(dir.streaming_writer(&files.positions).await?);
+        let mut term_dict_writer = OffsetWriter::new(dir.streaming_writer(&files.term_dict).await?);
+
         let terms_processed = self
-            .merge_postings_with_stats(
+            .merge_postings(
                 segments,
-                &mut term_dict_data,
-                &mut postings_data,
+                &mut term_dict_writer,
+                &mut postings_writer,
+                &mut positions_writer,
                 &mut stats,
             )
             .await?;
         stats.terms_processed = terms_processed;
-        stats.term_dict_bytes = term_dict_data.len();
-        stats.postings_bytes = postings_data.len();
+        stats.postings_bytes = postings_writer.offset() as usize;
+        stats.term_dict_bytes = term_dict_writer.offset() as usize;
+        let positions_bytes = positions_writer.offset();
 
-        let current_mem = term_dict_data.capacity() + postings_data.capacity();
-        stats.current_memory_bytes = current_mem;
-        stats.peak_memory_bytes = stats.peak_memory_bytes.max(current_mem);
-
-        // === Mandatory: stack store files ===
-        let mut store_data = Vec::new();
-        {
-            let mut store_merger = StoreMerger::new(&mut store_data);
-            for segment in segments {
-                let raw_blocks = segment.store_raw_blocks();
-                let data_slice = segment.store_data_slice();
-                store_merger.append_store(data_slice, &raw_blocks).await?;
-            }
-            store_merger.finish()?;
+        postings_writer.finish()?;
+        term_dict_writer.finish()?;
+        if positions_bytes > 0 {
+            positions_writer.finish()?;
+        } else {
+            drop(positions_writer);
+            let _ = dir.delete(&files.positions).await;
         }
-        stats.store_bytes = store_data.len();
 
-        let current_mem =
-            term_dict_data.capacity() + postings_data.capacity() + store_data.capacity();
-        stats.peak_memory_bytes = stats.peak_memory_bytes.max(current_mem);
-
-        dir.write(&files.term_dict, &term_dict_data).await?;
-        dir.write(&files.postings, &postings_data).await?;
-        dir.write(&files.store, &store_data).await?;
-
-        drop(term_dict_data);
-        drop(postings_data);
-        drop(store_data);
+        // === Phase 2: merge store files (streaming) ===
+        {
+            let mut store_writer = OffsetWriter::new(dir.streaming_writer(&files.store).await?);
+            {
+                let mut store_merger = StoreMerger::new(&mut store_writer);
+                for segment in segments {
+                    if segment.store_has_dict() {
+                        store_merger
+                            .append_store_recompressing(segment.store())
+                            .await
+                            .map_err(crate::Error::Io)?;
+                    } else {
+                        let raw_blocks = segment.store_raw_blocks();
+                        let data_slice = segment.store_data_slice();
+                        store_merger.append_store(data_slice, &raw_blocks).await?;
+                    }
+                }
+                store_merger.finish()?;
+            }
+            stats.store_bytes = store_writer.offset() as usize;
+            store_writer.finish()?;
+        }
 
         // === Dense vectors: strategy-dependent ===
         let vectors_bytes = match &dense_strategy {
             DenseVectorStrategy::MergeExisting => {
-                self.merge_dense_vectors_with_stats(dir, segments, &files)
-                    .await?
+                self.merge_dense_vectors(dir, segments, &files).await?
             }
             DenseVectorStrategy::BuildAnn(trained) => {
                 self.build_ann_vectors(dir, segments, &files, trained)
@@ -218,9 +251,7 @@ impl SegmentMerger {
         stats.vectors_bytes = vectors_bytes;
 
         // === Mandatory: merge sparse vectors ===
-        let sparse_bytes = self
-            .merge_sparse_vectors_optimized(dir, segments, &files)
-            .await?;
+        let sparse_bytes = self.merge_sparse_vectors(dir, segments, &files).await?;
         stats.sparse_bytes = sparse_bytes;
 
         // === Mandatory: merge field stats + write meta ===
@@ -251,59 +282,12 @@ impl SegmentMerger {
             label,
             total_docs,
             stats.terms_processed,
-            MergeStats::format_memory(stats.term_dict_bytes),
-            MergeStats::format_memory(stats.postings_bytes),
-            MergeStats::format_memory(stats.store_bytes),
-            MergeStats::format_memory(stats.vectors_bytes),
-            MergeStats::format_memory(stats.sparse_bytes),
+            format_bytes(stats.term_dict_bytes),
+            format_bytes(stats.postings_bytes),
+            format_bytes(stats.store_bytes),
+            format_bytes(stats.vectors_bytes),
+            format_bytes(stats.sparse_bytes),
         );
-
-        Ok((meta, stats))
-    }
-
-    /// Fallback merge with stats tracking
-    ///
-    /// Uses SegmentBuilder for postings/store (needed for positions or dict stores),
-    /// then overwrites sparse vectors using optimized block-stacking merge from
-    /// source segment indexes. This ensures sparse data is preserved even when
-    /// sparse vector fields are not stored in the document store.
-    async fn merge_rebuild_with_stats<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segments: &[SegmentReader],
-        new_segment_id: SegmentId,
-    ) -> Result<(SegmentMeta, MergeStats)> {
-        let mut stats = MergeStats::default();
-
-        let mut builder =
-            SegmentBuilder::new((*self.schema).clone(), SegmentBuilderConfig::default())?;
-
-        for segment in segments {
-            for doc_id in 0..segment.num_docs() {
-                if let Some(doc) = segment.doc(doc_id).await? {
-                    builder.add_document(doc)?;
-                }
-
-                // Track memory periodically
-                if doc_id % 10000 == 0 {
-                    let builder_stats = builder.stats();
-                    stats.current_memory_bytes = builder_stats.estimated_memory_bytes;
-                    stats.peak_memory_bytes =
-                        stats.peak_memory_bytes.max(stats.current_memory_bytes);
-                }
-            }
-        }
-
-        let meta = builder.build(dir, new_segment_id).await?;
-
-        // Overwrite sparse vectors using optimized block-stacking merge from
-        // source segment indexes, not from stored documents. This guarantees
-        // sparse data is preserved even if the field is not stored.
-        let files = SegmentFiles::new(new_segment_id.0);
-        let sparse_bytes = self
-            .merge_sparse_vectors_optimized(dir, segments, &files)
-            .await?;
-        stats.sparse_bytes = sparse_bytes;
 
         Ok((meta, stats))
     }
@@ -319,20 +303,15 @@ impl SegmentMerger {
     /// in multiple segments need full merge.
     ///
     /// Returns the number of terms processed.
-    async fn merge_postings_with_stats(
+    async fn merge_postings(
         &self,
         segments: &[SegmentReader],
-        term_dict: &mut Vec<u8>,
-        postings_out: &mut Vec<u8>,
+        term_dict: &mut OffsetWriter,
+        postings_out: &mut OffsetWriter,
+        positions_out: &mut OffsetWriter,
         stats: &mut MergeStats,
     ) -> Result<usize> {
-        // Calculate doc offsets for each segment
-        let mut doc_offsets = Vec::with_capacity(segments.len());
-        let mut offset = 0u32;
-        for segment in segments {
-            doc_offsets.push(offset);
-            offset += segment.num_docs();
-        }
+        let doc_offs = doc_offsets(segments);
 
         // Create iterators for each segment's term dictionary
         let mut iterators: Vec<_> = segments.iter().map(|s| s.term_dict_iter()).collect();
@@ -345,7 +324,7 @@ impl SegmentMerger {
                     key,
                     term_info,
                     segment_idx: seg_idx,
-                    doc_offset: doc_offsets[seg_idx],
+                    doc_offset: doc_offs[seg_idx],
                 });
             }
         }
@@ -374,7 +353,7 @@ impl SegmentMerger {
                     key,
                     term_info,
                     segment_idx: first.segment_idx,
-                    doc_offset: doc_offsets[first.segment_idx],
+                    doc_offset: doc_offs[first.segment_idx],
                 });
             }
 
@@ -396,27 +375,15 @@ impl SegmentMerger {
                         key,
                         term_info,
                         segment_idx: entry.segment_idx,
-                        doc_offset: doc_offsets[entry.segment_idx],
+                        doc_offset: doc_offs[entry.segment_idx],
                     });
                 }
             }
 
-            // Process this term
-            let term_info = if sources.len() == 1 {
-                // Optimization: Term exists in only one segment - copy directly
-                let (seg_idx, source_info, seg_doc_offset) = &sources[0];
-                self.copy_term_posting(
-                    &segments[*seg_idx],
-                    source_info,
-                    *seg_doc_offset,
-                    postings_out,
-                )
-                .await?
-            } else {
-                // Term exists in multiple segments - need full merge
-                self.merge_term_postings(segments, &sources, postings_out)
-                    .await?
-            };
+            // Process this term (handles both single-source and multi-source)
+            let term_info = self
+                .merge_term(segments, &sources, postings_out, positions_out)
+                .await?;
 
             term_results.push((current_key, term_info));
             terms_processed += 1;
@@ -427,18 +394,18 @@ impl SegmentMerger {
             }
         }
 
-        // Track memory
+        // Track memory (only term_results is buffered; postings/positions stream to disk)
         let results_mem = term_results.capacity() * std::mem::size_of::<(Vec<u8>, TermInfo)>();
-        stats.current_memory_bytes = results_mem + postings_out.capacity();
+        stats.current_memory_bytes = results_mem;
         stats.peak_memory_bytes = stats.peak_memory_bytes.max(stats.current_memory_bytes);
 
         log::info!(
-            "[merge] complete: terms={}, segments={}, term_buffer={:.2} MB, postings={:.2} MB, peak={:.2} MB",
+            "[merge] complete: terms={}, segments={}, term_buffer={:.2} MB, postings={}, positions={}",
             terms_processed,
             segments.len(),
             results_mem as f64 / (1024.0 * 1024.0),
-            postings_out.capacity() as f64 / (1024.0 * 1024.0),
-            stats.peak_memory_bytes as f64 / (1024.0 * 1024.0)
+            format_bytes(postings_out.offset() as usize),
+            format_bytes(positions_out.offset() as usize),
         );
 
         // Write to SSTable (sync, no await points)
@@ -451,176 +418,120 @@ impl SegmentMerger {
         Ok(terms_processed)
     }
 
-    /// Copy a term's posting data directly from source segment (no decode/encode)
-    /// Only adjusts doc IDs by adding the segment's doc offset
-    async fn copy_term_posting(
-        &self,
-        segment: &SegmentReader,
-        source_info: &TermInfo,
-        doc_offset: u32,
-        postings_out: &mut Vec<u8>,
-    ) -> Result<TermInfo> {
-        // Handle inline postings - need to remap doc IDs
-        if let Some((doc_ids, term_freqs)) = source_info.decode_inline() {
-            let remapped_ids: Vec<u32> = doc_ids.iter().map(|&id| id + doc_offset).collect();
-            if let Some(inline) = TermInfo::try_inline(&remapped_ids, &term_freqs) {
-                return Ok(inline);
-            }
-            // If can't inline after remapping (shouldn't happen), fall through to external
-            let mut pl = PostingList::with_capacity(remapped_ids.len());
-            for (doc_id, tf) in remapped_ids.into_iter().zip(term_freqs.into_iter()) {
-                pl.push(doc_id, tf);
-            }
-            let posting_offset = postings_out.len() as u64;
-            let block_list = BlockPostingList::from_posting_list(&pl)?;
-            let mut encoded = Vec::new();
-            block_list.serialize(&mut encoded)?;
-            postings_out.extend_from_slice(&encoded);
-            return Ok(TermInfo::external(
-                posting_offset,
-                encoded.len() as u32,
-                pl.doc_count(),
-            ));
-        }
-
-        // External posting - read, decode, remap doc IDs, re-encode
-        // Note: We can't just copy bytes because doc IDs are delta-encoded
-        let (offset, len) = source_info.external_info().unwrap();
-        let posting_bytes = segment.read_postings(offset, len).await?;
-        let source_postings = BlockPostingList::deserialize(&mut posting_bytes.as_slice())?;
-
-        // Remap doc IDs
-        let mut remapped = PostingList::with_capacity(source_postings.doc_count() as usize);
-        let mut iter = source_postings.iterator();
-        while iter.doc() != TERMINATED {
-            remapped.add(iter.doc() + doc_offset, iter.term_freq());
-            iter.advance();
-        }
-
-        // Try to inline if small enough
-        let doc_ids: Vec<u32> = remapped.iter().map(|p| p.doc_id).collect();
-        let term_freqs: Vec<u32> = remapped.iter().map(|p| p.term_freq).collect();
-
-        if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
-            return Ok(inline);
-        }
-
-        // Write to postings file
-        let posting_offset = postings_out.len() as u64;
-        let block_list = BlockPostingList::from_posting_list(&remapped)?;
-        let mut encoded = Vec::new();
-        block_list.serialize(&mut encoded)?;
-        postings_out.extend_from_slice(&encoded);
-
-        Ok(TermInfo::external(
-            posting_offset,
-            encoded.len() as u32,
-            remapped.doc_count(),
-        ))
-    }
-
-    /// Merge postings for a term that exists in multiple segments
-    /// Uses block-level concatenation for O(num_blocks) instead of O(num_postings)
-    async fn merge_term_postings(
+    /// Merge a single term's postings + positions from one or more source segments.
+    ///
+    /// Fast path: when all sources are external and there are multiple,
+    /// uses block-level concatenation (O(blocks) instead of O(postings)).
+    /// Otherwise: full decode → remap doc IDs → re-encode.
+    async fn merge_term(
         &self,
         segments: &[SegmentReader],
         sources: &[(usize, TermInfo, u32)],
-        postings_out: &mut Vec<u8>,
+        postings_out: &mut OffsetWriter,
+        positions_out: &mut OffsetWriter,
     ) -> Result<TermInfo> {
-        // Sort sources by doc_offset to ensure postings are added in sorted order
-        let mut sorted_sources: Vec<_> = sources.to_vec();
-        sorted_sources.sort_by_key(|(_, _, doc_offset)| *doc_offset);
+        let mut sorted: Vec<_> = sources.to_vec();
+        sorted.sort_by_key(|(_, _, off)| *off);
 
-        // Check if all sources are external (can use block concatenation)
-        let all_external = sorted_sources
-            .iter()
-            .all(|(_, term_info, _)| term_info.external_info().is_some());
+        let any_positions = sorted.iter().any(|(_, ti, _)| ti.position_info().is_some());
+        let all_external = sorted.iter().all(|(_, ti, _)| ti.external_info().is_some());
 
-        if all_external && sorted_sources.len() > 1 {
+        // === Merge postings ===
+        let (posting_offset, posting_len, doc_count) = if all_external && sorted.len() > 1 {
             // Fast path: block-level concatenation
-            let mut block_sources = Vec::with_capacity(sorted_sources.len());
-
-            for (seg_idx, term_info, doc_offset) in &sorted_sources {
-                let segment = &segments[*seg_idx];
-                let (offset, len) = term_info.external_info().unwrap();
-                let posting_bytes = segment.read_postings(offset, len).await?;
-                let source_postings = BlockPostingList::deserialize(&mut posting_bytes.as_slice())?;
-                block_sources.push((source_postings, *doc_offset));
+            let mut block_sources = Vec::with_capacity(sorted.len());
+            for (seg_idx, ti, doc_off) in &sorted {
+                let (off, len) = ti.external_info().unwrap();
+                let bytes = segments[*seg_idx].read_postings(off, len).await?;
+                let bpl = BlockPostingList::deserialize(&mut bytes.as_slice())?;
+                block_sources.push((bpl, *doc_off));
             }
-
-            let merged_blocks = BlockPostingList::concatenate_blocks(&block_sources)?;
-            let posting_offset = postings_out.len() as u64;
-            let mut encoded = Vec::new();
-            merged_blocks.serialize(&mut encoded)?;
-            postings_out.extend_from_slice(&encoded);
-
-            return Ok(TermInfo::external(
-                posting_offset,
-                encoded.len() as u32,
-                merged_blocks.doc_count(),
-            ));
-        }
-
-        // Slow path: full decode/encode for inline postings or single source
-        let mut merged = PostingList::new();
-
-        for (seg_idx, term_info, doc_offset) in &sorted_sources {
-            let segment = &segments[*seg_idx];
-
-            if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
-                // Inline posting list
-                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
-                    merged.add(doc_id + doc_offset, tf);
-                }
-            } else {
-                // External posting list
-                let (offset, len) = term_info.external_info().unwrap();
-                let posting_bytes = segment.read_postings(offset, len).await?;
-                let source_postings = BlockPostingList::deserialize(&mut posting_bytes.as_slice())?;
-
-                let mut iter = source_postings.iterator();
-                while iter.doc() != TERMINATED {
-                    merged.add(iter.doc() + doc_offset, iter.term_freq());
-                    iter.advance();
+            let merged = BlockPostingList::concatenate_blocks(&block_sources)?;
+            let offset = postings_out.offset();
+            let mut buf = Vec::new();
+            merged.serialize(&mut buf)?;
+            postings_out.write_all(&buf)?;
+            (offset, buf.len() as u32, merged.doc_count())
+        } else {
+            // Decode all sources into a flat PostingList, remap doc IDs
+            let mut merged = PostingList::new();
+            for (seg_idx, ti, doc_off) in &sorted {
+                if let Some((ids, tfs)) = ti.decode_inline() {
+                    for (id, tf) in ids.into_iter().zip(tfs) {
+                        merged.add(id + doc_off, tf);
+                    }
+                } else {
+                    let (off, len) = ti.external_info().unwrap();
+                    let bytes = segments[*seg_idx].read_postings(off, len).await?;
+                    let bpl = BlockPostingList::deserialize(&mut bytes.as_slice())?;
+                    let mut it = bpl.iterator();
+                    while it.doc() != TERMINATED {
+                        merged.add(it.doc() + doc_off, it.term_freq());
+                        it.advance();
+                    }
                 }
             }
+            // Try to inline (only when no positions)
+            if !any_positions {
+                let ids: Vec<u32> = merged.iter().map(|p| p.doc_id).collect();
+                let tfs: Vec<u32> = merged.iter().map(|p| p.term_freq).collect();
+                if let Some(inline) = TermInfo::try_inline(&ids, &tfs) {
+                    return Ok(inline);
+                }
+            }
+            let offset = postings_out.offset();
+            let block = BlockPostingList::from_posting_list(&merged)?;
+            let mut buf = Vec::new();
+            block.serialize(&mut buf)?;
+            postings_out.write_all(&buf)?;
+            (offset, buf.len() as u32, merged.doc_count())
+        };
+
+        // === Merge positions (if any source has them) ===
+        if any_positions {
+            let mut pos_sources = Vec::new();
+            for (seg_idx, ti, doc_off) in &sorted {
+                if let Some((pos_off, pos_len)) = ti.position_info()
+                    && let Some(bytes) = segments[*seg_idx]
+                        .read_position_bytes(pos_off, pos_len)
+                        .await?
+                {
+                    let pl = PositionPostingList::deserialize(&mut bytes.as_slice())
+                        .map_err(crate::Error::Io)?;
+                    pos_sources.push((pl, *doc_off));
+                }
+            }
+            if !pos_sources.is_empty() {
+                let merged = PositionPostingList::concatenate_blocks(&pos_sources)
+                    .map_err(crate::Error::Io)?;
+                let offset = positions_out.offset();
+                let mut buf = Vec::new();
+                merged.serialize(&mut buf).map_err(crate::Error::Io)?;
+                positions_out.write_all(&buf)?;
+                return Ok(TermInfo::external_with_positions(
+                    posting_offset,
+                    posting_len,
+                    doc_count,
+                    offset,
+                    buf.len() as u32,
+                ));
+            }
         }
 
-        // Try to inline small posting lists
-        let doc_ids: Vec<u32> = merged.iter().map(|p| p.doc_id).collect();
-        let term_freqs: Vec<u32> = merged.iter().map(|p| p.term_freq).collect();
-
-        if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
-            return Ok(inline);
-        }
-
-        // Write to postings file
-        let posting_offset = postings_out.len() as u64;
-        let block_list = BlockPostingList::from_posting_list(&merged)?;
-        let mut encoded = Vec::new();
-        block_list.serialize(&mut encoded)?;
-        postings_out.extend_from_slice(&encoded);
-
-        Ok(TermInfo::external(
-            posting_offset,
-            encoded.len() as u32,
-            merged.doc_count(),
-        ))
+        Ok(TermInfo::external(posting_offset, posting_len, doc_count))
     }
-    /// Merge dense vector indexes with stats tracking - returns output size in bytes
+
+    /// Merge dense vector indexes - returns output size in bytes
     ///
     /// For ScaNN (IVF-PQ): O(1) merge by concatenating cluster data (same codebook)
     /// For IVF-RaBitQ: O(1) merge by concatenating cluster data (same centroids)
     /// For RaBitQ: Must rebuild with new centroid from all vectors
-    async fn merge_dense_vectors_with_stats<D: Directory + DirectoryWriter>(
+    async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
         files: &SegmentFiles,
     ) -> Result<usize> {
-        use byteorder::{LittleEndian, WriteBytesExt};
-
-        // (field_id, index_type, data)
         let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
 
         for (field, entry) in self.schema.fields() {
@@ -645,15 +556,9 @@ impl SegmentMerger {
                 let refs: Vec<&crate::structures::IVFPQIndex> =
                     scann_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
 
-                // Calculate doc_id offsets
-                let mut doc_offsets = Vec::with_capacity(segments.len());
-                let mut offset = 0u32;
-                for segment in segments {
-                    doc_offsets.push(offset);
-                    offset += segment.num_docs();
-                }
+                let doc_offs = doc_offsets(segments);
 
-                match crate::structures::IVFPQIndex::merge(&refs, &doc_offsets) {
+                match crate::structures::IVFPQIndex::merge(&refs, &doc_offs) {
                     Ok(merged) => {
                         let bytes = merged
                             .to_bytes()
@@ -684,15 +589,9 @@ impl SegmentMerger {
                 let refs: Vec<&crate::structures::IVFRaBitQIndex> =
                     ivf_indexes.iter().map(|arc| arc.as_ref()).collect();
 
-                // Calculate doc_id offsets
-                let mut doc_offsets = Vec::with_capacity(segments.len());
-                let mut offset = 0u32;
-                for segment in segments {
-                    doc_offsets.push(offset);
-                    offset += segment.num_docs();
-                }
+                let doc_offs = doc_offsets(segments);
 
-                match crate::structures::IVFRaBitQIndex::merge(&refs, &doc_offsets) {
+                match crate::structures::IVFRaBitQIndex::merge(&refs, &doc_offs) {
                     Ok(merged) => {
                         let bytes = merged
                             .to_bytes()
@@ -729,43 +628,15 @@ impl SegmentMerger {
             }
         }
 
-        // Write unified vectors file with index_type
-        if !field_indexes.is_empty() {
-            field_indexes.sort_by_key(|(id, _, _)| *id);
-
-            // Header: num_fields + (field_id, index_type, offset, len) per field
-            let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
-            let mut output = Vec::new();
-
-            output.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
-
-            let mut current_offset = header_size as u64;
-            for (field_id, index_type, data) in &field_indexes {
-                output.write_u32::<LittleEndian>(*field_id)?;
-                output.write_u8(*index_type)?;
-                output.write_u64::<LittleEndian>(current_offset)?;
-                output.write_u64::<LittleEndian>(data.len() as u64)?;
-                current_offset += data.len() as u64;
-            }
-
-            for (_, _, data) in field_indexes {
-                output.extend_from_slice(&data);
-            }
-
-            let output_size = output.len();
-            dir.write(&files.vectors, &output).await?;
-            return Ok(output_size);
-        }
-
-        Ok(0)
+        write_vector_file(dir, files, field_indexes).await
     }
 
-    /// Merge sparse vector indexes using optimized block stacking
+    /// Merge sparse vector indexes using block stacking
     ///
     /// This is O(blocks) instead of O(postings) - we stack blocks directly
     /// and only adjust the first_doc_id in each block header by the doc offset.
     /// Deltas within blocks remain unchanged since they're relative.
-    async fn merge_sparse_vectors_optimized<D: Directory + DirectoryWriter>(
+    async fn merge_sparse_vectors<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
@@ -774,18 +645,14 @@ impl SegmentMerger {
         use crate::structures::BlockSparsePostingList;
         use byteorder::{LittleEndian, WriteBytesExt};
 
-        // Calculate doc offsets for each segment
-        let mut doc_offsets = Vec::with_capacity(segments.len());
-        let mut offset = 0u32;
-        for (i, segment) in segments.iter().enumerate() {
+        let doc_offs = doc_offsets(segments);
+        for (i, seg) in segments.iter().enumerate() {
             log::debug!(
                 "Sparse merge: segment {} has {} docs, doc_offset={}",
                 i,
-                segment.num_docs(),
-                offset
+                seg.num_docs(),
+                doc_offs[i]
             );
-            doc_offsets.push(offset);
-            offset += segment.num_docs();
         }
 
         // Collect all sparse vector fields from schema
@@ -847,11 +714,11 @@ impl SegmentMerger {
                             "Sparse merge dim={}: seg={} offset={} doc_count={} blocks={}",
                             dim_id,
                             seg_idx,
-                            doc_offsets[seg_idx],
+                            doc_offs[seg_idx],
                             posting_list.doc_count(),
                             posting_list.blocks.len()
                         );
-                        posting_arcs.push((posting_list, doc_offsets[seg_idx]));
+                        posting_arcs.push((posting_list, doc_offs[seg_idx]));
                     }
                 }
 
@@ -893,106 +760,81 @@ impl SegmentMerger {
         // Sort by field_id
         field_data.sort_by_key(|(id, _, _, _)| *id);
 
-        // Build sparse file (compact format - only active dimensions)
+        // Compute header size and per-dimension offsets before writing
         // Header: num_fields (4)
         // Per field: field_id (4) + quant (1) + num_dims (4) + table (16 * num_dims)
         let mut header_size = 4u64;
         for (_, _, num_dims, _) in &field_data {
-            header_size += 4 + 1 + 4; // field_id + quant + num_dims
-            header_size += (*num_dims as u64) * 16; // table entries: (dim_id, offset, length)
+            header_size += 4 + 1 + 4;
+            header_size += (*num_dims as u64) * 16;
         }
 
-        let mut output = Vec::new();
-        output.write_u32::<LittleEndian>(field_data.len() as u32)?;
-
+        // Pre-compute offset tables (small — just dim_id + offset + length per dim)
         let mut current_offset = header_size;
-        let mut all_data: Vec<u8> = Vec::new();
-        // (dim_id, offset, length) for each active dimension
         let mut field_tables: Vec<Vec<(u32, u64, u32)>> = Vec::new();
-
         for (_, _, _, dim_bytes) in &field_data {
             let mut table: Vec<(u32, u64, u32)> = Vec::with_capacity(dim_bytes.len());
-
-            // Sort dimensions for deterministic output
             let mut dims: Vec<_> = dim_bytes.keys().copied().collect();
             dims.sort();
-
             for dim_id in dims {
                 let bytes = &dim_bytes[&dim_id];
                 table.push((dim_id, current_offset, bytes.len() as u32));
                 current_offset += bytes.len() as u64;
-                all_data.extend_from_slice(bytes);
             }
             field_tables.push(table);
         }
 
-        // Write field headers and compact tables
-        for (i, (field_id, quantization, num_dims, _)) in field_data.iter().enumerate() {
-            output.write_u32::<LittleEndian>(*field_id)?;
-            output.write_u8(*quantization as u8)?;
-            output.write_u32::<LittleEndian>(*num_dims)?;
+        // Stream header + tables + data directly to disk
+        let mut writer = OffsetWriter::new(dir.streaming_writer(&files.sparse).await?);
 
-            // Write compact table: (dim_id, offset, length) only for active dims
+        writer.write_u32::<LittleEndian>(field_data.len() as u32)?;
+        for (i, (field_id, quantization, num_dims, _)) in field_data.iter().enumerate() {
+            writer.write_u32::<LittleEndian>(*field_id)?;
+            writer.write_u8(*quantization as u8)?;
+            writer.write_u32::<LittleEndian>(*num_dims)?;
             for &(dim_id, offset, length) in &field_tables[i] {
-                output.write_u32::<LittleEndian>(dim_id)?;
-                output.write_u64::<LittleEndian>(offset)?;
-                output.write_u32::<LittleEndian>(length)?;
+                writer.write_u32::<LittleEndian>(dim_id)?;
+                writer.write_u64::<LittleEndian>(offset)?;
+                writer.write_u32::<LittleEndian>(length)?;
             }
         }
 
-        // Append all data
-        output.extend_from_slice(&all_data);
+        // Stream posting data per-field, per-dimension (drop each after writing)
+        for (_, _, _, dim_bytes) in field_data {
+            let mut dims: Vec<_> = dim_bytes.keys().copied().collect();
+            dims.sort();
+            for dim_id in dims {
+                writer.write_all(&dim_bytes[&dim_id])?;
+            }
+        }
 
-        let output_size = output.len();
-        dir.write(&files.sparse, &output).await?;
+        let output_size = writer.offset() as usize;
+        writer.finish()?;
 
         log::info!(
             "Sparse vector merge complete: {} fields, {} bytes",
-            field_data.len(),
+            field_tables.len(),
             output_size
         );
 
         Ok(output_size)
     }
-}
 
-/// Trained vector index structures for rebuilding segments with ANN indexes
-pub struct TrainedVectorStructures {
-    /// Trained centroids per field_id
-    pub centroids: rustc_hash::FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
-    /// Trained PQ codebooks per field_id (for ScaNN)
-    pub codebooks: rustc_hash::FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
-}
-
-/// Strategy for handling dense vector indexes during merge
-pub enum DenseVectorStrategy<'a> {
-    /// Merge existing indexes (ScaNN/IVF cluster merge or RaBitQ rebuild)
-    MergeExisting,
-    /// Build ANN indexes from flat vectors using trained structures
-    BuildAnn(&'a TrainedVectorStructures),
-}
-
-impl SegmentMerger {
-    /// Merge segments and rebuild dense vectors with ANN indexes using trained structures
-    ///
-    /// This is called after centroids/codebooks are trained at index level.
-    /// It collects Flat vectors from all segments and builds IVF-RaBitQ or ScaNN indexes.
+    /// Merge segments and rebuild dense vectors with ANN indexes using trained structures.
     pub async fn merge_with_ann<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
         trained: &TrainedVectorStructures,
-    ) -> Result<SegmentMeta> {
-        let (meta, _stats) = self
-            .merge_core(
-                dir,
-                segments,
-                new_segment_id,
-                DenseVectorStrategy::BuildAnn(trained),
-            )
-            .await?;
-        Ok(meta)
+    ) -> Result<(SegmentMeta, MergeStats)> {
+        self.merge_core(
+            dir,
+            segments,
+            new_segment_id,
+            DenseVectorStrategy::BuildAnn(trained),
+        )
+        .await
     }
 
     /// Build ANN indexes from Flat vectors using trained centroids
@@ -1004,7 +846,6 @@ impl SegmentMerger {
         trained: &TrainedVectorStructures,
     ) -> Result<usize> {
         use crate::dsl::VectorIndexType;
-        use byteorder::{LittleEndian, WriteBytesExt};
 
         let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
 
@@ -1129,35 +970,49 @@ impl SegmentMerger {
             field_indexes.push((field.0, 4u8, bytes)); // 4 = Flat Binary
         }
 
-        // Write vectors file
-        if !field_indexes.is_empty() {
-            field_indexes.sort_by_key(|(id, _, _)| *id);
-
-            let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
-            let mut output = Vec::new();
-
-            output.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
-
-            let mut current_offset = header_size as u64;
-            for (field_id, index_type, data) in &field_indexes {
-                output.write_u32::<LittleEndian>(*field_id)?;
-                output.write_u8(*index_type)?;
-                output.write_u64::<LittleEndian>(current_offset)?;
-                output.write_u64::<LittleEndian>(data.len() as u64)?;
-                current_offset += data.len() as u64;
-            }
-
-            for (_, _, data) in field_indexes {
-                output.extend_from_slice(&data);
-            }
-
-            let output_size = output.len();
-            dir.write(&files.vectors, &output).await?;
-            return Ok(output_size);
-        }
-
-        Ok(0)
+        write_vector_file(dir, files, field_indexes).await
     }
+}
+
+/// Write a vector index file with per-field header + data.
+/// Streams header then each field's data directly to disk, avoiding a single
+/// giant concatenation buffer.
+async fn write_vector_file<D: Directory + DirectoryWriter>(
+    dir: &D,
+    files: &SegmentFiles,
+    mut field_indexes: Vec<(u32, u8, Vec<u8>)>,
+) -> Result<usize> {
+    use byteorder::{LittleEndian, WriteBytesExt};
+
+    if field_indexes.is_empty() {
+        return Ok(0);
+    }
+
+    field_indexes.sort_by_key(|(id, _, _)| *id);
+
+    let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
+
+    // Header: num_fields + (field_id, index_type, offset, len) per field
+    let header_size = 4 + field_indexes.len() * (4 + 1 + 8 + 8);
+    writer.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
+
+    let mut current_offset = header_size as u64;
+    for (field_id, index_type, data) in &field_indexes {
+        writer.write_u32::<LittleEndian>(*field_id)?;
+        writer.write_u8(*index_type)?;
+        writer.write_u64::<LittleEndian>(current_offset)?;
+        writer.write_u64::<LittleEndian>(data.len() as u64)?;
+        current_offset += data.len() as u64;
+    }
+
+    // Stream each field's data (drop after writing)
+    for (_, _, data) in field_indexes {
+        writer.write_all(&data)?;
+    }
+
+    let output_size = writer.offset() as usize;
+    writer.finish()?;
+    Ok(output_size)
 }
 
 /// Delete segment files from directory

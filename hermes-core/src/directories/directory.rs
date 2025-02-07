@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -380,6 +380,83 @@ pub trait Directory: 'static {
     async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle>;
 }
 
+/// A writer for incrementally writing data to a directory file.
+///
+/// Avoids buffering entire files in memory during merge. File-backed
+/// directories write directly to disk; memory directories collect to Vec.
+pub trait StreamingWriter: io::Write + Send {
+    /// Finalize the write, making data available for reading.
+    fn finish(self: Box<Self>) -> io::Result<()>;
+
+    /// Bytes written so far.
+    fn bytes_written(&self) -> u64;
+}
+
+/// StreamingWriter backed by Vec<u8>, finalized via DirectoryWriter::write.
+/// Used as default/fallback and for RamDirectory.
+struct BufferedStreamingWriter {
+    path: PathBuf,
+    buffer: Vec<u8>,
+    /// Callback to write the buffer to the directory on finish.
+    /// We store the files Arc directly for RamDirectory.
+    files: Arc<RwLock<HashMap<PathBuf, Arc<Vec<u8>>>>>,
+}
+
+impl io::Write for BufferedStreamingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl StreamingWriter for BufferedStreamingWriter {
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        self.files.write().insert(self.path, Arc::new(self.buffer));
+        Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.buffer.len() as u64
+    }
+}
+
+/// StreamingWriter backed by std::fs::File for filesystem directories.
+#[cfg(feature = "native")]
+pub(crate) struct FileStreamingWriter {
+    pub(crate) file: std::fs::File,
+    pub(crate) written: u64,
+}
+
+#[cfg(feature = "native")]
+impl io::Write for FileStreamingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(feature = "native")]
+impl StreamingWriter for FileStreamingWriter {
+    fn finish(mut self: Box<Self>) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.written
+    }
+}
+
 /// Async directory trait for writing index files
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -395,6 +472,10 @@ pub trait DirectoryWriter: Directory {
 
     /// Sync all pending writes
     async fn sync(&self) -> io::Result<()>;
+
+    /// Create a streaming writer for incremental file writes.
+    /// Call finish() on the returned writer to finalize.
+    async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>>;
 }
 
 /// In-memory directory for testing and small indexes
@@ -541,6 +622,14 @@ impl DirectoryWriter for RamDirectory {
     async fn sync(&self) -> io::Result<()> {
         Ok(())
     }
+
+    async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        Ok(Box::new(BufferedStreamingWriter {
+            path: path.to_path_buf(),
+            buffer: Vec::new(),
+            files: Arc::clone(&self.files),
+        }))
+    }
 }
 
 /// Local filesystem directory with async IO via tokio
@@ -667,6 +756,15 @@ impl DirectoryWriter for FsDirectory {
         let dir = std::fs::File::open(&self.root)?;
         dir.sync_all()?;
         Ok(())
+    }
+
+    async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        let full_path = self.resolve(path);
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = std::fs::File::create(&full_path)?;
+        Ok(Box::new(FileStreamingWriter { file, written: 0 }))
     }
 }
 
