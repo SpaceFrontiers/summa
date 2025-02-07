@@ -78,20 +78,19 @@ impl IVFPQIndex {
 
     /// Build index from vectors using provided coarse centroids and PQ codebook
     ///
-    /// All vectors are assigned ordinal 0 (single-valued). For multi-valued fields,
-    /// use `add_vector` directly with the appropriate ordinal.
+    /// `doc_id_ordinals`: (doc_id, ordinal) pairs. If None, uses (index, 0).
     pub fn build(
         config: IVFPQConfig,
         coarse_centroids: &CoarseCentroids,
         codebook: &PQCodebook,
         vectors: &[Vec<f32>],
-        doc_ids: Option<&[u32]>,
+        doc_id_ordinals: Option<&[(u32, u16)]>,
     ) -> Self {
         let mut index = Self::new(config.clone(), coarse_centroids.version, codebook.version);
 
         for (i, vector) in vectors.iter().enumerate() {
-            let doc_id = doc_ids.map(|ids| ids[i]).unwrap_or(i as u32);
-            index.add_vector(coarse_centroids, codebook, doc_id, 0, vector);
+            let (doc_id, ordinal) = doc_id_ordinals.map(|ids| ids[i]).unwrap_or((i as u32, 0));
+            index.add_vector(coarse_centroids, codebook, doc_id, ordinal, vector);
         }
 
         index

@@ -137,14 +137,6 @@ pub struct TrainedVectorStructures {
     pub codebooks: rustc_hash::FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
 }
 
-/// Strategy for handling dense vector indexes during merge
-pub enum DenseVectorStrategy<'a> {
-    /// Merge existing indexes (ScaNN/IVF cluster merge or RaBitQ rebuild)
-    MergeExisting,
-    /// Build ANN indexes from flat vectors using trained structures
-    BuildAnn(&'a TrainedVectorStructures),
-}
-
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
@@ -162,17 +154,27 @@ impl SegmentMerger {
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
     ) -> Result<(SegmentMeta, MergeStats)> {
-        self.merge_core(
-            dir,
-            segments,
-            new_segment_id,
-            DenseVectorStrategy::MergeExisting,
-        )
-        .await
+        self.merge_core(dir, segments, new_segment_id, None).await
+    }
+
+    /// Merge segments with trained ANN structures available.
+    ///
+    /// Dense vectors use O(1) cluster merge when possible (homogeneous IVF/ScaNN),
+    /// otherwise extracts raw vectors from all index types and rebuilds with
+    /// the provided trained structures.
+    pub async fn merge_with_ann<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        new_segment_id: SegmentId,
+        trained: &TrainedVectorStructures,
+    ) -> Result<(SegmentMeta, MergeStats)> {
+        self.merge_core(dir, segments, new_segment_id, Some(trained))
+            .await
     }
 
     /// Core merge: handles all mandatory parts (postings, positions, store, sparse, field stats, meta)
-    /// and delegates dense vector handling to the provided strategy.
+    /// and delegates dense vector handling based on available trained structures.
     ///
     /// Uses streaming writers so postings, positions, and store data flow directly
     /// to files instead of buffering everything in memory. Only the term dictionary
@@ -182,7 +184,7 @@ impl SegmentMerger {
         dir: &D,
         segments: &[SegmentReader],
         new_segment_id: SegmentId,
-        dense_strategy: DenseVectorStrategy<'_>,
+        trained: Option<&TrainedVectorStructures>,
     ) -> Result<(SegmentMeta, MergeStats)> {
         let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
@@ -238,16 +240,10 @@ impl SegmentMerger {
             store_writer.finish()?;
         }
 
-        // === Dense vectors: strategy-dependent ===
-        let vectors_bytes = match &dense_strategy {
-            DenseVectorStrategy::MergeExisting => {
-                self.merge_dense_vectors(dir, segments, &files).await?
-            }
-            DenseVectorStrategy::BuildAnn(trained) => {
-                self.build_ann_vectors(dir, segments, &files, trained)
-                    .await?
-            }
-        };
+        // === Dense vectors ===
+        let vectors_bytes = self
+            .merge_dense_vectors(dir, segments, &files, trained)
+            .await?;
         stats.vectors_bytes = vectors_bytes;
 
         // === Mandatory: merge sparse vectors ===
@@ -273,9 +269,10 @@ impl SegmentMerger {
 
         dir.write(&files.meta, &meta.serialize()?).await?;
 
-        let label = match &dense_strategy {
-            DenseVectorStrategy::MergeExisting => "Merge",
-            DenseVectorStrategy::BuildAnn(_) => "ANN merge",
+        let label = if trained.is_some() {
+            "ANN merge"
+        } else {
+            "Merge"
         };
         log::info!(
             "{} complete: {} docs, {} terms, term_dict={}, postings={}, store={}, vectors={}, sparse={}",
@@ -529,39 +526,41 @@ impl SegmentMerger {
 
     /// Merge dense vector indexes - returns output size in bytes
     ///
-    /// For ScaNN (IVF-PQ): O(1) merge by concatenating cluster data (same codebook)
-    /// For IVF-RaBitQ: O(1) merge by concatenating cluster data (same centroids)
-    /// For RaBitQ: Must rebuild with new centroid from all vectors
+    /// Strategy:
+    /// 1. O(1) cluster merge when all segments have the same ANN type (IVF/ScaNN)
+    /// 2. Fallback: extract raw vectors from ALL index types (Flat, RaBitQ, IVF clusters)
+    ///    - If trained structures available → rebuild as IVF/ScaNN
+    ///    - Otherwise → keep as Flat
     async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
         files: &SegmentFiles,
+        trained: Option<&TrainedVectorStructures>,
     ) -> Result<usize> {
+        use crate::dsl::VectorIndexType;
+
         let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
 
         for (field, entry) in self.schema.fields() {
-            if !matches!(entry.field_type, FieldType::DenseVector) {
+            if !matches!(entry.field_type, FieldType::DenseVector) || !entry.indexed {
                 continue;
             }
 
-            // Check if all segments have ScaNN indexes for this field
+            // --- Fast path: O(1) cluster merge for homogeneous ScaNN ---
             let scann_indexes: Vec<_> = segments
                 .iter()
                 .filter_map(|s| s.get_scann_vector_index(field))
                 .collect();
 
-            if scann_indexes.len()
-                == segments
-                    .iter()
-                    .filter(|s| s.has_dense_vector_index(field))
-                    .count()
-                && !scann_indexes.is_empty()
-            {
-                // All segments have ScaNN - use O(1) cluster merge!
+            let segments_with_vectors = segments
+                .iter()
+                .filter(|s| s.has_dense_vector_index(field))
+                .count();
+
+            if scann_indexes.len() == segments_with_vectors && !scann_indexes.is_empty() {
                 let refs: Vec<&crate::structures::IVFPQIndex> =
                     scann_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
-
                 let doc_offs = doc_offsets(segments);
 
                 match crate::structures::IVFPQIndex::merge(&refs, &doc_offs) {
@@ -569,32 +568,24 @@ impl SegmentMerger {
                         let bytes = merged
                             .to_bytes()
                             .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        field_indexes.push((field.0, 2u8, bytes)); // 2 = ScaNN
+                        field_indexes.push((field.0, 2u8, bytes));
                         continue;
                     }
                     Err(e) => {
-                        log::warn!("ScaNN merge failed: {}, falling back to IVF", e);
+                        log::warn!("ScaNN merge failed: {}, falling back to rebuild", e);
                     }
                 }
             }
 
-            // Check if all segments have IVF indexes for this field
+            // --- Fast path: O(1) cluster merge for homogeneous IVF-RaBitQ ---
             let ivf_indexes: Vec<_> = segments
                 .iter()
                 .filter_map(|s| s.get_ivf_vector_index(field))
                 .collect();
 
-            if ivf_indexes.len()
-                == segments
-                    .iter()
-                    .filter(|s| s.has_dense_vector_index(field))
-                    .count()
-                && !ivf_indexes.is_empty()
-            {
-                // All segments have IVF - use O(1) cluster merge!
+            if ivf_indexes.len() == segments_with_vectors && !ivf_indexes.is_empty() {
                 let refs: Vec<&crate::structures::IVFRaBitQIndex> =
                     ivf_indexes.iter().map(|arc| arc.as_ref()).collect();
-
                 let doc_offs = doc_offsets(segments);
 
                 match crate::structures::IVFRaBitQIndex::merge(&refs, &doc_offs) {
@@ -602,7 +593,7 @@ impl SegmentMerger {
                         let bytes = merged
                             .to_bytes()
                             .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        field_indexes.push((field.0, 1u8, bytes)); // 1 = IVF-RaBitQ
+                        field_indexes.push((field.0, 1u8, bytes));
                         continue;
                     }
                     Err(e) => {
@@ -611,42 +602,133 @@ impl SegmentMerger {
                 }
             }
 
-            // Fall back: collect raw vectors from all index types and rebuild as Flat
+            // --- Fallback: collect raw vectors from ALL index types ---
             let mut all_vectors: Vec<Vec<f32>> = Vec::new();
             let mut all_doc_ids: Vec<(u32, u16)> = Vec::new();
             let doc_offs = doc_offsets(segments);
 
             for (seg_idx, segment) in segments.iter().enumerate() {
+                let offset = doc_offs[seg_idx];
                 match segment.vector_indexes().get(&field.0) {
                     Some(super::VectorIndex::Flat(flat_data)) => {
                         for (vec, &(local_doc_id, ordinal)) in
                             flat_data.vectors.iter().zip(flat_data.doc_ids.iter())
                         {
                             all_vectors.push(vec.clone());
-                            all_doc_ids.push((doc_offs[seg_idx] + local_doc_id, ordinal));
+                            all_doc_ids.push((offset + local_doc_id, ordinal));
                         }
                     }
                     Some(super::VectorIndex::RaBitQ(index)) => {
                         if let Some(raw_vecs) = &index.raw_vectors {
                             for (i, vec) in raw_vecs.iter().enumerate() {
                                 all_vectors.push(vec.clone());
-                                all_doc_ids.push((doc_offs[seg_idx] + i as u32, 0));
+                                all_doc_ids.push((offset + i as u32, 0));
                             }
                         }
                     }
-                    _ => {} // IVF/ScaNN handled above
+                    Some(super::VectorIndex::IVF { index, .. }) => {
+                        // Extract raw vectors from IVF-RaBitQ clusters
+                        for cluster in index.clusters.clusters.values() {
+                            if let Some(ref raw_vecs) = cluster.raw_vectors {
+                                for (i, raw) in raw_vecs.iter().enumerate() {
+                                    all_vectors.push(raw.clone());
+                                    all_doc_ids
+                                        .push((offset + cluster.doc_ids[i], cluster.ordinals[i]));
+                                }
+                            }
+                        }
+                    }
+                    // ScaNN (IVF-PQ) stores only PQ codes, no raw vectors — skip
+                    _ => {}
                 }
             }
 
-            if !all_vectors.is_empty() {
-                let dim = all_vectors[0].len();
+            if all_vectors.is_empty() {
+                continue;
+            }
+
+            let config = entry.dense_vector_config.as_ref();
+            let dim = config
+                .map(|c| c.index_dim())
+                .unwrap_or(all_vectors[0].len());
+
+            // Try to rebuild as ANN if trained structures are available
+            let mut built_ann = false;
+            if let (Some(trained), Some(config)) = (trained, config) {
+                match config.index_type {
+                    VectorIndexType::IvfRaBitQ => {
+                        if let Some(centroids) = trained.centroids.get(&field.0) {
+                            let rabitq_config = crate::structures::RaBitQConfig::new(dim);
+                            let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
+                            let ivf_config = crate::structures::IVFRaBitQConfig::new(dim)
+                                .with_store_raw(config.store_raw);
+                            let ivf_index = crate::structures::IVFRaBitQIndex::build(
+                                ivf_config,
+                                centroids,
+                                &codebook,
+                                &all_vectors,
+                                Some(&all_doc_ids),
+                            );
+                            let index_data = super::builder::IVFRaBitQIndexData {
+                                centroids: (**centroids).clone(),
+                                codebook,
+                                index: ivf_index,
+                            };
+                            let bytes = index_data
+                                .to_bytes()
+                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                            field_indexes.push((field.0, 1u8, bytes));
+                            built_ann = true;
+                            log::info!(
+                                "Rebuilt IVF-RaBitQ for field {} ({} vectors)",
+                                field.0,
+                                all_vectors.len()
+                            );
+                        }
+                    }
+                    VectorIndexType::ScaNN => {
+                        if let (Some(centroids), Some(codebook)) = (
+                            trained.centroids.get(&field.0),
+                            trained.codebooks.get(&field.0),
+                        ) {
+                            let ivf_pq_config = crate::structures::IVFPQConfig::new(dim);
+                            let ivf_pq_index = crate::structures::IVFPQIndex::build(
+                                ivf_pq_config,
+                                centroids,
+                                codebook,
+                                &all_vectors,
+                                Some(&all_doc_ids),
+                            );
+                            let index_data = super::builder::ScaNNIndexData {
+                                centroids: (**centroids).clone(),
+                                codebook: (**codebook).clone(),
+                                index: ivf_pq_index,
+                            };
+                            let bytes = index_data
+                                .to_bytes()
+                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                            field_indexes.push((field.0, 2u8, bytes));
+                            built_ann = true;
+                            log::info!(
+                                "Rebuilt ScaNN for field {} ({} vectors)",
+                                field.0,
+                                all_vectors.len()
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Fall back to Flat if no ANN rebuild happened
+            if !built_ann {
                 let flat_data = super::vector_data::FlatVectorData {
                     dim,
                     vectors: all_vectors,
                     doc_ids: all_doc_ids,
                 };
                 let bytes = flat_data.to_binary_bytes();
-                field_indexes.push((field.0, 4u8, bytes)); // 4 = Flat Binary
+                field_indexes.push((field.0, 4u8, bytes));
             }
         }
 
@@ -840,159 +922,6 @@ impl SegmentMerger {
         );
 
         Ok(output_size)
-    }
-
-    /// Merge segments and rebuild dense vectors with ANN indexes using trained structures.
-    pub async fn merge_with_ann<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segments: &[SegmentReader],
-        new_segment_id: SegmentId,
-        trained: &TrainedVectorStructures,
-    ) -> Result<(SegmentMeta, MergeStats)> {
-        self.merge_core(
-            dir,
-            segments,
-            new_segment_id,
-            DenseVectorStrategy::BuildAnn(trained),
-        )
-        .await
-    }
-
-    /// Build ANN indexes from Flat vectors using trained centroids
-    async fn build_ann_vectors<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segments: &[SegmentReader],
-        files: &SegmentFiles,
-        trained: &TrainedVectorStructures,
-    ) -> Result<usize> {
-        use crate::dsl::VectorIndexType;
-
-        let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
-
-        for (field, entry) in self.schema.fields() {
-            if !matches!(entry.field_type, FieldType::DenseVector) || !entry.indexed {
-                continue;
-            }
-
-            let config = match &entry.dense_vector_config {
-                Some(c) => c,
-                None => continue,
-            };
-
-            // Collect all Flat vectors from segments
-            let mut all_vectors: Vec<Vec<f32>> = Vec::new();
-            let mut all_doc_ids: Vec<(u32, u16)> = Vec::new();
-            let mut doc_offset = 0u32;
-
-            for segment in segments {
-                if let Some(super::VectorIndex::Flat(flat_data)) =
-                    segment.vector_indexes().get(&field.0)
-                {
-                    for (vec, (local_doc_id, ordinal)) in
-                        flat_data.vectors.iter().zip(flat_data.doc_ids.iter())
-                    {
-                        all_vectors.push(vec.clone());
-                        all_doc_ids.push((doc_offset + local_doc_id, *ordinal));
-                    }
-                }
-                doc_offset += segment.num_docs();
-            }
-
-            if all_vectors.is_empty() {
-                continue;
-            }
-
-            let dim = config.index_dim();
-
-            // Extract just doc_ids for ANN indexes (they don't track ordinals yet)
-            let ann_doc_ids: Vec<u32> = all_doc_ids.iter().map(|(doc_id, _)| *doc_id).collect();
-
-            // Build ANN index based on index type and available trained structures
-            match config.index_type {
-                VectorIndexType::IvfRaBitQ => {
-                    if let Some(centroids) = trained.centroids.get(&field.0) {
-                        // Create RaBitQ codebook for the dimension
-                        let rabitq_config = crate::structures::RaBitQConfig::new(dim);
-                        let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
-
-                        // Build IVF-RaBitQ index
-                        let ivf_config = crate::structures::IVFRaBitQConfig::new(dim)
-                            .with_store_raw(config.store_raw);
-                        let ivf_index = crate::structures::IVFRaBitQIndex::build(
-                            ivf_config,
-                            centroids,
-                            &codebook,
-                            &all_vectors,
-                            Some(&ann_doc_ids),
-                        );
-
-                        let index_data = super::builder::IVFRaBitQIndexData {
-                            centroids: (**centroids).clone(),
-                            codebook,
-                            index: ivf_index,
-                        };
-                        let bytes = index_data
-                            .to_bytes()
-                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        field_indexes.push((field.0, 1u8, bytes)); // 1 = IVF-RaBitQ
-
-                        log::info!(
-                            "Built IVF-RaBitQ index for field {} with {} vectors",
-                            field.0,
-                            all_vectors.len()
-                        );
-                        continue;
-                    }
-                }
-                VectorIndexType::ScaNN => {
-                    if let (Some(centroids), Some(codebook)) = (
-                        trained.centroids.get(&field.0),
-                        trained.codebooks.get(&field.0),
-                    ) {
-                        // Build ScaNN (IVF-PQ) index
-                        let ivf_pq_config = crate::structures::IVFPQConfig::new(dim);
-                        let ivf_pq_index = crate::structures::IVFPQIndex::build(
-                            ivf_pq_config,
-                            centroids,
-                            codebook,
-                            &all_vectors,
-                            Some(&ann_doc_ids),
-                        );
-
-                        let index_data = super::builder::ScaNNIndexData {
-                            centroids: (**centroids).clone(),
-                            codebook: (**codebook).clone(),
-                            index: ivf_pq_index,
-                        };
-                        let bytes = index_data
-                            .to_bytes()
-                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        field_indexes.push((field.0, 2u8, bytes)); // 2 = ScaNN
-
-                        log::info!(
-                            "Built ScaNN index for field {} with {} vectors",
-                            field.0,
-                            all_vectors.len()
-                        );
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-
-            // Fallback: keep as Flat if no trained structures available
-            let flat_data = super::builder::FlatVectorData {
-                dim,
-                vectors: all_vectors,
-                doc_ids: all_doc_ids,
-            };
-            let bytes = flat_data.to_binary_bytes();
-            field_indexes.push((field.0, 4u8, bytes)); // 4 = Flat Binary
-        }
-
-        write_vector_file(dir, files, field_indexes).await
     }
 }
 
