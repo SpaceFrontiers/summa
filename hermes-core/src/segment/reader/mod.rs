@@ -411,10 +411,10 @@ impl AsyncSegmentReader {
         rerank_factor: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
-        let index = self
-            .vector_indexes
-            .get(&field.0)
-            .ok_or_else(|| Error::Schema(format!("No dense vector index for field {}", field.0)))?;
+        let index = match self.vector_indexes.get(&field.0) {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()), // segment has no vectors for this field
+        };
 
         // Get mrl_dim from config to trim query vector if needed
         let mrl_dim = self
