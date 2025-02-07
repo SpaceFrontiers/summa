@@ -20,6 +20,8 @@ use crate::schema::Schema;
 
 /// Metadata file name at index level
 pub const INDEX_META_FILENAME: &str = "metadata.json";
+/// Temp file for atomic writes (write here, then rename to INDEX_META_FILENAME)
+const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 
 /// State of vector index for a field
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -176,19 +178,42 @@ impl IndexMetadata {
     }
 
     /// Load from directory
+    ///
+    /// If `metadata.json` is missing but `metadata.json.tmp` exists (crash
+    /// between write and rename), recovers from the temp file.
     pub async fn load<D: crate::directories::Directory>(dir: &D) -> Result<Self> {
         let path = Path::new(INDEX_META_FILENAME);
-        let slice = dir.open_read(path).await?;
-        let bytes = slice.read_bytes().await?;
-        serde_json::from_slice(bytes.as_slice()).map_err(|e| Error::Serialization(e.to_string()))
+        match dir.open_read(path).await {
+            Ok(slice) => {
+                let bytes = slice.read_bytes().await?;
+                serde_json::from_slice(bytes.as_slice())
+                    .map_err(|e| Error::Serialization(e.to_string()))
+            }
+            Err(_) => {
+                // Try recovering from temp file (crash between write and rename)
+                let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
+                let slice = dir.open_read(tmp_path).await?;
+                let bytes = slice.read_bytes().await?;
+                let meta: Self = serde_json::from_slice(bytes.as_slice())
+                    .map_err(|e| Error::Serialization(e.to_string()))?;
+                log::warn!("Recovered metadata from temp file (previous crash during save)");
+                Ok(meta)
+            }
+        }
     }
 
-    /// Save to directory
+    /// Save to directory (atomic: write temp file, then rename)
+    ///
+    /// Uses write-then-rename so a crash mid-write won't corrupt the
+    /// existing metadata file. On POSIX, rename is atomic.
     pub async fn save<D: crate::directories::DirectoryWriter>(&self, dir: &D) -> Result<()> {
-        let path = Path::new(INDEX_META_FILENAME);
+        let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
+        let final_path = Path::new(INDEX_META_FILENAME);
         let bytes =
             serde_json::to_vec_pretty(self).map_err(|e| Error::Serialization(e.to_string()))?;
-        dir.write(path, &bytes).await.map_err(Error::Io)
+        dir.write(tmp_path, &bytes).await.map_err(Error::Io)?;
+        dir.rename(tmp_path, final_path).await.map_err(Error::Io)?;
+        Ok(())
     }
 
     /// Load trained centroids and codebooks from index-level files
