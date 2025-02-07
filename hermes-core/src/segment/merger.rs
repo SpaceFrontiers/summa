@@ -262,6 +262,11 @@ impl SegmentMerger {
     }
 
     /// Fallback merge with stats tracking
+    ///
+    /// Uses SegmentBuilder for postings/store (needed for positions or dict stores),
+    /// then overwrites sparse vectors using optimized block-stacking merge from
+    /// source segment indexes. This ensures sparse data is preserved even when
+    /// sparse vector fields are not stored in the document store.
     async fn merge_rebuild_with_stats<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
@@ -290,6 +295,16 @@ impl SegmentMerger {
         }
 
         let meta = builder.build(dir, new_segment_id).await?;
+
+        // Overwrite sparse vectors using optimized block-stacking merge from
+        // source segment indexes, not from stored documents. This guarantees
+        // sparse data is preserved even if the field is not stored.
+        let files = SegmentFiles::new(new_segment_id.0);
+        let sparse_bytes = self
+            .merge_sparse_vectors_optimized(dir, segments, &files)
+            .await?;
+        stats.sparse_bytes = sparse_bytes;
+
         Ok((meta, stats))
     }
 
