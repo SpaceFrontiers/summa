@@ -1,9 +1,18 @@
 //! Vector index data structures shared between builder and reader
 
+use std::mem::size_of;
+
 use serde::{Deserialize, Serialize};
 
 /// Magic number for binary flat vector format ("FVD2" in little-endian)
 const FLAT_BINARY_MAGIC: u32 = 0x46564432;
+
+/// Binary header: magic(u32) + dim(u32) + num_vectors(u32)
+const FLAT_BINARY_HEADER_SIZE: usize = 3 * size_of::<u32>();
+/// Per-vector element size
+const FLOAT_SIZE: usize = size_of::<f32>();
+/// Per-doc_id entry: doc_id(u32) + ordinal(u16)
+const DOC_ID_ENTRY_SIZE: usize = size_of::<u32>() + size_of::<u16>();
 
 /// Flat vector data for brute-force search (accumulating state)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,25 +27,23 @@ pub struct FlatVectorData {
 impl FlatVectorData {
     /// Estimate memory usage
     pub fn estimated_memory_bytes(&self) -> usize {
-        // Vec<Vec<f32>>: each inner vec has capacity * 4 bytes + Vec overhead
-        let vec_overhead = std::mem::size_of::<Vec<f32>>();
+        let vec_overhead = size_of::<Vec<f32>>();
         let vectors_bytes: usize = self
             .vectors
             .iter()
-            .map(|v| v.capacity() * 4 + vec_overhead)
+            .map(|v| v.capacity() * FLOAT_SIZE + vec_overhead)
             .sum();
-        // doc_ids: (u32, u16) = 6 bytes + padding = 8 bytes each
-        let doc_ids_bytes = self.doc_ids.capacity() * 8;
+        let doc_ids_bytes = self.doc_ids.capacity() * size_of::<(u32, u16)>();
         vectors_bytes + doc_ids_bytes + vec_overhead * 2
     }
 
     /// Serialize to compact binary format.
     ///
-    /// Format: magic(4) + dim(4) + num_vectors(4) + vectors(dim*n*4) + doc_ids(n*6)
+    /// Format: header + vectors(dim*n*sizeof(f32)) + doc_ids(n*DOC_ID_ENTRY_SIZE)
     /// Much more compact than JSON and avoids intermediate allocations.
     pub fn to_binary_bytes(&self) -> Vec<u8> {
         let num_vectors = self.doc_ids.len();
-        let total = 12 + num_vectors * self.dim * 4 + num_vectors * 6;
+        let total = Self::serialized_binary_size(self.dim, num_vectors);
         let mut buf = Vec::with_capacity(total);
 
         buf.extend_from_slice(&FLAT_BINARY_MAGIC.to_le_bytes());
@@ -59,7 +66,9 @@ impl FlatVectorData {
 
     /// Compute the serialized size without actually serializing.
     pub fn serialized_binary_size(index_dim: usize, num_vectors: usize) -> usize {
-        12 + num_vectors * index_dim * 4 + num_vectors * 6
+        FLAT_BINARY_HEADER_SIZE
+            + num_vectors * index_dim * FLOAT_SIZE
+            + num_vectors * DOC_ID_ENTRY_SIZE
     }
 
     /// Stream directly from flat f32 storage to a writer (zero-buffer serialization).
@@ -85,7 +94,7 @@ impl FlatVectorData {
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     flat_vectors.as_ptr() as *const u8,
-                    flat_vectors.len() * 4,
+                    flat_vectors.len() * FLOAT_SIZE,
                 )
             };
             writer.write_all(bytes)?;
@@ -95,7 +104,7 @@ impl FlatVectorData {
                 let start = i * original_dim;
                 let slice = &flat_vectors[start..start + index_dim];
                 let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const u8, index_dim * 4)
+                    std::slice::from_raw_parts(slice.as_ptr() as *const u8, index_dim * FLOAT_SIZE)
                 };
                 writer.write_all(bytes)?;
             }
@@ -111,7 +120,7 @@ impl FlatVectorData {
 
     /// Deserialize from binary format.
     pub fn from_binary_bytes(data: &[u8]) -> std::io::Result<Self> {
-        if data.len() < 12 {
+        if data.len() < FLAT_BINARY_HEADER_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "FlatVectorData binary too short",
@@ -129,10 +138,10 @@ impl FlatVectorData {
         let dim = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
         let num_vectors = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
 
-        let vectors_start = 12;
-        let vectors_byte_len = num_vectors * dim * 4;
+        let vectors_start = FLAT_BINARY_HEADER_SIZE;
+        let vectors_byte_len = num_vectors * dim * FLOAT_SIZE;
         let doc_ids_start = vectors_start + vectors_byte_len;
-        let doc_ids_byte_len = num_vectors * 6;
+        let doc_ids_byte_len = num_vectors * DOC_ID_ENTRY_SIZE;
 
         if data.len() < doc_ids_start + doc_ids_byte_len {
             return Err(std::io::Error::new(
@@ -144,9 +153,9 @@ impl FlatVectorData {
         let mut vectors = Vec::with_capacity(num_vectors);
         for i in 0..num_vectors {
             let mut vec = Vec::with_capacity(dim);
-            let base = vectors_start + i * dim * 4;
+            let base = vectors_start + i * dim * FLOAT_SIZE;
             for j in 0..dim {
-                let off = base + j * 4;
+                let off = base + j * FLOAT_SIZE;
                 vec.push(f32::from_le_bytes([
                     data[off],
                     data[off + 1],
@@ -159,7 +168,7 @@ impl FlatVectorData {
 
         let mut doc_ids = Vec::with_capacity(num_vectors);
         for i in 0..num_vectors {
-            let off = doc_ids_start + i * 6;
+            let off = doc_ids_start + i * DOC_ID_ENTRY_SIZE;
             let doc_id =
                 u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             let ordinal = u16::from_le_bytes([data[off + 4], data[off + 5]]);

@@ -16,6 +16,7 @@ pub use config::{MemoryBreakdown, SegmentBuilderConfig, SegmentBuilderStats};
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::mem::size_of;
 use std::path::PathBuf;
 
 use hashbrown::HashMap;
@@ -776,14 +777,18 @@ impl SegmentBuilder {
         }
 
         // Write header (tiny — ~25 bytes per field)
-        let header_size = 4 + fields.len() * (4 + 1 + 8 + 8);
+        // num_fields(u32) + per-field: field_id(u32) + index_type(u8) + offset(u64) + length(u64)
+        let per_field_entry =
+            size_of::<u32>() + size_of::<u8>() + size_of::<u64>() + size_of::<u64>();
+        let header_size = size_of::<u32>() + fields.len() * per_field_entry;
         let mut header = Vec::with_capacity(header_size);
         header.write_u32::<LittleEndian>(fields.len() as u32)?;
 
         let mut current_offset = header_size as u64;
         for (i, (field_id, _)) in fields.iter().enumerate() {
             header.write_u32::<LittleEndian>(*field_id)?;
-            header.write_u8(4u8)?; // Flat Binary
+            const FLAT_BINARY_INDEX_TYPE: u8 = 4;
+            header.write_u8(FLAT_BINARY_INDEX_TYPE)?;
             header.write_u64::<LittleEndian>(current_offset)?;
             header.write_u64::<LittleEndian>(field_sizes[i] as u64)?;
             current_offset += field_sizes[i] as u64;
@@ -894,10 +899,14 @@ impl SegmentBuilder {
         field_data.sort_by_key(|(id, _, _)| *id);
 
         // Phase 2: Compute header size and offsets
-        let mut header_size = 4u64;
+        // num_fields(u32) + per-field: field_id(u32) + quantization(u8) + num_dims(u32)
+        // per-dim: dim_id(u32) + offset(u64) + length(u32)
+        let per_dim_entry = size_of::<u32>() + size_of::<u64>() + size_of::<u32>();
+        let per_field_header = size_of::<u32>() + size_of::<u8>() + size_of::<u32>();
+        let mut header_size = size_of::<u32>() as u64;
         for (_, _, dims) in &field_data {
-            header_size += 4 + 1 + 4;
-            header_size += (dims.len() as u64) * 16;
+            header_size += per_field_header as u64;
+            header_size += (dims.len() as u64) * per_dim_entry as u64;
         }
 
         let mut header = Vec::with_capacity(header_size as usize);
