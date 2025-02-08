@@ -364,12 +364,13 @@ pub struct IVFRaBitQIndexData {
 
 impl IVFRaBitQIndexData {
     pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
-        serde_json::to_vec(self)
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        serde_json::from_slice(data)
+        bincode::serde::decode_from_slice(data, bincode::config::standard())
+            .map(|(v, _)| v)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
@@ -384,12 +385,13 @@ pub struct ScaNNIndexData {
 
 impl ScaNNIndexData {
     pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
-        serde_json::to_vec(self)
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     pub fn from_bytes(data: &[u8]) -> std::io::Result<Self> {
-        serde_json::from_slice(data)
+        bincode::serde::decode_from_slice(data, bincode::config::standard())
+            .map(|(v, _)| v)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }

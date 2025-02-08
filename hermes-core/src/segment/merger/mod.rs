@@ -336,6 +336,7 @@ impl SegmentMerger {
         // Memory is bounded by unique terms (typically much smaller than postings)
         let mut term_results: Vec<(Vec<u8>, TermInfo)> = Vec::new();
         let mut terms_processed = 0usize;
+        let mut serialize_buf: Vec<u8> = Vec::new();
 
         while !heap.is_empty() {
             // Get the smallest key
@@ -385,7 +386,13 @@ impl SegmentMerger {
 
             // Process this term (handles both single-source and multi-source)
             let term_info = self
-                .merge_term(segments, &sources, postings_out, positions_out)
+                .merge_term(
+                    segments,
+                    &sources,
+                    postings_out,
+                    positions_out,
+                    &mut serialize_buf,
+                )
                 .await?;
 
             term_results.push((current_key, term_info));
@@ -431,6 +438,7 @@ impl SegmentMerger {
         sources: &[(usize, TermInfo, u32)],
         postings_out: &mut OffsetWriter,
         positions_out: &mut OffsetWriter,
+        buf: &mut Vec<u8>,
     ) -> Result<TermInfo> {
         let mut sorted: Vec<_> = sources.to_vec();
         sorted.sort_by_key(|(_, _, off)| *off);
@@ -450,9 +458,9 @@ impl SegmentMerger {
             }
             let merged = BlockPostingList::concatenate_blocks(&block_sources)?;
             let offset = postings_out.offset();
-            let mut buf = Vec::new();
-            merged.serialize(&mut buf)?;
-            postings_out.write_all(&buf)?;
+            buf.clear();
+            merged.serialize(buf)?;
+            postings_out.write_all(buf)?;
             (offset, buf.len() as u32, merged.doc_count())
         } else {
             // Decode all sources into a flat PostingList, remap doc IDs
@@ -483,9 +491,9 @@ impl SegmentMerger {
             }
             let offset = postings_out.offset();
             let block = BlockPostingList::from_posting_list(&merged)?;
-            let mut buf = Vec::new();
-            block.serialize(&mut buf)?;
-            postings_out.write_all(&buf)?;
+            buf.clear();
+            block.serialize(buf)?;
+            postings_out.write_all(buf)?;
             (offset, buf.len() as u32, merged.doc_count())
         };
 
@@ -507,9 +515,9 @@ impl SegmentMerger {
                 let merged = PositionPostingList::concatenate_blocks(&pos_sources)
                     .map_err(crate::Error::Io)?;
                 let offset = positions_out.offset();
-                let mut buf = Vec::new();
-                merged.serialize(&mut buf).map_err(crate::Error::Io)?;
-                positions_out.write_all(&buf)?;
+                buf.clear();
+                merged.serialize(buf).map_err(crate::Error::Io)?;
+                positions_out.write_all(buf)?;
                 return Ok(TermInfo::external_with_positions(
                     posting_offset,
                     posting_len,

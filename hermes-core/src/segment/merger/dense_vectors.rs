@@ -63,6 +63,8 @@ async fn feed_segment(
     let dim = lazy_flat.dim;
     let quant = lazy_flat.quantization;
     let mut count = 0;
+    // Only allocate dequantize buffer for non-f32 quantizations
+    let needs_dequant = quant != DenseVectorQuantization::F32;
     let mut f32_buf: Vec<f32> = Vec::new();
 
     for batch_start in (0..n).step_by(VECTOR_BATCH_SIZE) {
@@ -74,16 +76,26 @@ async fn feed_segment(
         let raw = batch_bytes.as_slice();
         let batch_floats = batch_count * dim;
 
-        // Dequantize raw bytes to f32 based on storage quantization
-        f32_buf.resize(batch_floats, 0.0);
-        dequantize_raw(raw, quant, batch_floats, &mut f32_buf);
+        // For f32: reinterpret mmap bytes directly (zero-copy).
+        // For f16/u8: dequantize into buffer.
+        let vectors: &[f32] = if needs_dequant {
+            f32_buf.resize(batch_floats, 0.0);
+            dequantize_raw(raw, quant, batch_floats, &mut f32_buf);
+            &f32_buf
+        } else {
+            debug_assert!(
+                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                "f32 vector data not 4-byte aligned"
+            );
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats) }
+        };
 
         for i in 0..batch_count {
             let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
             add_fn(
                 doc_id_offset + doc_id,
                 ordinal,
-                &f32_buf[i * dim..(i + 1) * dim],
+                &vectors[i * dim..(i + 1) * dim],
             );
             count += 1;
         }

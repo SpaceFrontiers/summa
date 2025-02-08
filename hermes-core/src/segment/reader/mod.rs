@@ -527,11 +527,12 @@ impl AsyncSegmentReader {
             }
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force from lazy flat vectors (native-precision SIMD scoring)
+            // Uses a top-k heap to avoid collecting and sorting all N candidates.
             let dim = lazy_flat.dim;
             let n = lazy_flat.num_vectors;
             let quant = lazy_flat.quantization;
             let fetch_k = k * rerank_factor.max(1);
-            let mut candidates: Vec<(u32, u16, f32)> = Vec::new();
+            let mut collector = crate::query::ScoreCollector::new(fetch_k);
 
             for batch_start in (0..n).step_by(BRUTE_FORCE_BATCH) {
                 let batch_count = BRUTE_FORCE_BATCH.min(n - batch_start);
@@ -546,13 +547,15 @@ impl AsyncSegmentReader {
 
                 for (i, &score) in scores.iter().enumerate().take(batch_count) {
                     let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                    candidates.push((doc_id, ordinal, score));
+                    collector.insert_with_ordinal(doc_id, score, ordinal);
                 }
             }
 
-            candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-            candidates.truncate(fetch_k);
-            candidates
+            collector
+                .into_sorted_results()
+                .into_iter()
+                .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
+                .collect()
         } else {
             return Ok(Vec::new());
         };
@@ -580,6 +583,9 @@ impl AsyncSegmentReader {
             }
 
             if !resolved.is_empty() {
+                // Sort by flat_idx for sequential mmap access (better page locality)
+                resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
+
                 // Batch-read raw quantized bytes into contiguous buffer
                 let mut raw_buf = vec![0u8; resolved.len() * vbs];
                 for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {

@@ -355,25 +355,54 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 }
 
                 let n = lazy_flat.num_vectors;
-                if n <= remaining {
-                    // Take all vectors from this segment (async reads)
-                    for i in 0..n {
-                        if let Ok(vec) = lazy_flat.get_vector(i).await {
-                            entry.push(vec);
-                        }
-                    }
+                let dim = lazy_flat.dim;
+                let quant = lazy_flat.quantization;
+
+                // Determine which vector indices to collect
+                let indices: Vec<usize> = if n <= remaining {
+                    (0..n).collect()
                 } else {
-                    // Uniform sample: take every Nth vector
                     let step = (n / remaining).max(1);
-                    for i in 0..n {
-                        if i % step == 0
-                            && entry.len() < MAX_TRAINING_VECTORS
-                            && let Ok(vec) = lazy_flat.get_vector(i).await
+                    (0..n).step_by(step).take(remaining).collect()
+                };
+
+                if indices.len() < n {
+                    total_skipped += n - indices.len();
+                }
+
+                // Batch-read and dequantize instead of one-by-one get_vector()
+                const BATCH: usize = 1024;
+                let mut f32_buf = vec![0f32; BATCH * dim];
+                for chunk in indices.chunks(BATCH) {
+                    // For contiguous ranges, use batch read
+                    let start = chunk[0];
+                    let end = *chunk.last().unwrap();
+                    if end - start + 1 == chunk.len() {
+                        // Contiguous — single batch read
+                        if let Ok(batch_bytes) =
+                            lazy_flat.read_vectors_batch(start, chunk.len()).await
                         {
-                            entry.push(vec);
+                            let floats = chunk.len() * dim;
+                            f32_buf.resize(floats, 0.0);
+                            crate::segment::dequantize_raw(
+                                batch_bytes.as_slice(),
+                                quant,
+                                floats,
+                                &mut f32_buf,
+                            );
+                            for i in 0..chunk.len() {
+                                entry.push(f32_buf[i * dim..(i + 1) * dim].to_vec());
+                            }
+                        }
+                    } else {
+                        // Non-contiguous (sampled) — read individually but reuse buffer
+                        f32_buf.resize(dim, 0.0);
+                        for &idx in chunk {
+                            if let Ok(()) = lazy_flat.read_vector_into(idx, &mut f32_buf).await {
+                                entry.push(f32_buf[..dim].to_vec());
+                            }
                         }
                     }
-                    total_skipped += n - remaining;
                 }
             }
 
