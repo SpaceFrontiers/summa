@@ -119,10 +119,10 @@ impl RaBitQCodebook {
             random_perm.swap(i, j);
         }
 
-        let version = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Version derived from config — codebook is deterministic (same seed+dim
+        // always produces identical random_signs and random_perm), so segments
+        // built with the same config are merge-compatible.
+        let version = config.seed ^ (config.dim as u64).wrapping_mul(0x9e3779b97f4a7c15);
 
         Self {
             config,
