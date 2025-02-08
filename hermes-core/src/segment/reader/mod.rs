@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
+use super::vector_data::LazyFlatVectorData;
 use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
 use crate::dsl::{Document, Field, Schema};
 use crate::structures::{
@@ -68,8 +69,10 @@ pub struct AsyncSegmentReader {
     schema: Arc<Schema>,
     /// Base doc_id offset for this segment
     doc_id_offset: DocId,
-    /// Dense vector indexes per field (RaBitQ or IVF-RaBitQ)
+    /// Dense vector indexes per field (RaBitQ or IVF-RaBitQ) — for search
     vector_indexes: FxHashMap<u32, VectorIndex>,
+    /// Lazy flat vectors per field — for reranking and merge (doc_ids in memory, vectors via mmap)
+    flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
     /// Shared coarse centroids for IVF search (loaded once)
     coarse_centroids: Option<Arc<CoarseCentroids>>,
     /// Sparse vector indexes per field
@@ -107,8 +110,10 @@ impl AsyncSegmentReader {
         let store = AsyncStoreReader::open(store_handle, cache_blocks).await?;
 
         // Load dense vector indexes from unified .vectors file
-        let (vector_indexes, coarse_centroids) =
-            loader::load_vectors_file(dir, &files, &schema).await?;
+        let vectors_data = loader::load_vectors_file(dir, &files, &schema).await?;
+        let vector_indexes = vectors_data.indexes;
+        let flat_vectors = vectors_data.flat_vectors;
+        let coarse_centroids = vectors_data.coarse_centroids;
 
         // Load sparse vector indexes from .sparse file
         let sparse_indexes = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
@@ -136,6 +141,7 @@ impl AsyncSegmentReader {
             schema,
             doc_id_offset,
             vector_indexes,
+            flat_vectors,
             coarse_centroids,
             sparse_indexes,
             positions_handle,
@@ -176,6 +182,11 @@ impl AsyncSegmentReader {
     /// Get vector indexes for all fields
     pub fn vector_indexes(&self) -> &FxHashMap<u32, VectorIndex> {
         &self.vector_indexes
+    }
+
+    /// Get lazy flat vectors for all fields (for reranking and merge)
+    pub fn flat_vectors(&self) -> &FxHashMap<u32, LazyFlatVectorData> {
+        &self.flat_vectors
     }
 
     /// Get term dictionary stats for debugging
@@ -412,11 +423,6 @@ impl AsyncSegmentReader {
         rerank_factor: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
-        let index = match self.vector_indexes.get(&field.0) {
-            Some(idx) => idx,
-            None => return Ok(Vec::new()), // segment has no vectors for this field
-        };
-
         // Get mrl_dim from config to trim query vector if needed
         let mrl_dim = self
             .schema
@@ -437,118 +443,164 @@ impl AsyncSegmentReader {
             query
         };
 
-        // Check if the field is stored (for store-based reranking)
-        let field_is_stored = self.schema.get_field_entry(field).is_some_and(|e| e.stored);
+        let ann_index = self.vector_indexes.get(&field.0);
+        let lazy_flat = self.flat_vectors.get(&field.0);
+
+        // No vectors at all for this field
+        if ann_index.is_none() && lazy_flat.is_none() {
+            return Ok(Vec::new());
+        }
 
         // Results are (doc_id, ordinal, score) where score = similarity (higher = better)
-        let mut results: Vec<(u32, u16, f32)> = match index {
-            VectorIndex::Flat(flat_data) => {
-                // Brute-force search using cosine similarity
-                use crate::structures::simd::cosine_similarity;
+        let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
+            // ANN search (RaBitQ, IVF, ScaNN)
+            match index {
+                VectorIndex::RaBitQ(rabitq) => {
+                    let fetch_k = k * rerank_factor.max(1);
+                    rabitq
+                        .search(effective_query, fetch_k, rerank_factor)
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
+                }
+                VectorIndex::IVF { index, codebook } => {
+                    let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
+                        Error::Schema("IVF index requires coarse centroids".to_string())
+                    })?;
+                    let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
+                    let fetch_k = k * rerank_factor.max(1);
+                    index
+                        .search(
+                            centroids,
+                            codebook,
+                            effective_query,
+                            fetch_k,
+                            Some(effective_nprobe),
+                        )
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
+                }
+                VectorIndex::ScaNN { index, codebook } => {
+                    let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
+                        Error::Schema("ScaNN index requires coarse centroids".to_string())
+                    })?;
+                    let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
+                    let fetch_k = k * rerank_factor.max(1);
+                    index
+                        .search(
+                            centroids,
+                            codebook,
+                            effective_query,
+                            fetch_k,
+                            Some(effective_nprobe),
+                        )
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
+                }
+            }
+        } else if let Some(lazy_flat) = lazy_flat {
+            // Brute-force from lazy flat vectors (mmap-backed range read)
+            let all_bytes = lazy_flat
+                .read_all_vector_bytes()
+                .await
+                .map_err(crate::Error::Io)?;
+            let raw = all_bytes.as_slice();
+            let full_dim = lazy_flat.dim;
+            let n = lazy_flat.num_vectors;
+            let total_floats = n * full_dim;
 
-                let mut candidates: Vec<(u32, u16, f32)> = (0..flat_data.num_vectors())
-                    .map(|i| {
-                        let vec = flat_data.get_vector(i);
-                        let (doc_id, ordinal) = flat_data.get_doc_id(i);
-                        let score = cosine_similarity(effective_query, vec);
-                        (doc_id, ordinal, score)
-                    })
-                    .collect();
-                // Sort by score descending (higher similarity = better)
-                candidates
-                    .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-                // Use rerank_factor to fetch more candidates for multi-valued fields,
-                // so grouping by doc_id still yields enough unique documents
-                candidates.truncate(k * rerank_factor.max(1));
-                candidates
-            }
-            VectorIndex::RaBitQ(rabitq) => {
-                // RaBitQ returns (doc_id, ordinal, euclidean_dist) — convert to score
-                let fetch_k = k * rerank_factor.max(1);
-                rabitq
-                    .search(effective_query, fetch_k, rerank_factor)
-                    .into_iter()
-                    .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
-                    .collect()
-            }
-            VectorIndex::IVF { index, codebook } => {
-                let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
-                    Error::Schema("IVF index requires coarse centroids".to_string())
-                })?;
-                let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
-                // Fetch extra candidates for reranking from store
-                let fetch_k = k * rerank_factor.max(1);
-                index
-                    .search(
-                        centroids,
-                        codebook,
-                        effective_query,
-                        fetch_k,
-                        Some(effective_nprobe),
-                    )
-                    .into_iter()
-                    .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
-                    .collect()
-            }
-            VectorIndex::ScaNN { index, codebook } => {
-                let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
-                    Error::Schema("ScaNN index requires coarse centroids".to_string())
-                })?;
-                let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
-                let fetch_k = k * rerank_factor.max(1);
-                index
-                    .search(
-                        centroids,
-                        codebook,
-                        effective_query,
-                        fetch_k,
-                        Some(effective_nprobe),
-                    )
-                    .into_iter()
-                    .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
-                    .collect()
-            }
+            // Use mmap bytes directly if already f32-aligned, otherwise copy once
+            let mut aligned_buf: Vec<f32> = Vec::new();
+            let vectors: &[f32] =
+                if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+                    // Zero-copy: reinterpret aligned mmap bytes as &[f32]
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, total_floats) }
+                } else {
+                    // Fallback: copy into aligned buffer (rare — mmap is page-aligned)
+                    aligned_buf.resize(total_floats, 0.0);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            raw.as_ptr(),
+                            aligned_buf.as_mut_ptr() as *mut u8,
+                            total_floats * std::mem::size_of::<f32>(),
+                        );
+                    }
+                    &aligned_buf
+                };
+
+            // Strided SIMD cosine: dim = effective_query.len(), stride = full_dim
+            // MRL: dim < stride → only prefix touched, rest skipped. No copy.
+            let score_dim = effective_query.len();
+            let mut scores = vec![0f32; n];
+            crate::structures::simd::batch_cosine_scores_strided(
+                effective_query,
+                vectors,
+                score_dim,
+                full_dim,
+                &mut scores,
+            );
+
+            let mut candidates: Vec<(u32, u16, f32)> = (0..n)
+                .map(|i| {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(i);
+                    (doc_id, ordinal, scores[i])
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.truncate(k * rerank_factor.max(1));
+            candidates
+        } else {
+            return Ok(Vec::new());
         };
 
-        // Rerank IVF/ScaNN candidates from document store
-        if matches!(index, VectorIndex::IVF { .. } | VectorIndex::ScaNN { .. })
-            && field_is_stored
+        // Rerank ANN candidates using raw vectors from lazy flat (mmap, no store reads)
+        // Batched: build doc_id→index lookup, batch-read vectors, batch cosine scores
+        if ann_index.is_some()
             && !results.is_empty()
+            && let Some(lazy_flat) = lazy_flat
         {
-            use crate::structures::simd::cosine_similarity;
+            let dim = lazy_flat.dim;
 
-            // Collect unique doc_ids to batch-fetch from store
-            let mut unique_docs: Vec<u32> = results.iter().map(|r| r.0).collect();
-            unique_docs.sort_unstable();
-            unique_docs.dedup();
+            // Build lookup: (doc_id, ordinal) → flat index
+            let lookup: rustc_hash::FxHashMap<(u32, u16), usize> = lazy_flat
+                .doc_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &(d, o))| ((d, o), i))
+                .collect();
 
-            // Fetch raw vectors from store for each unique doc
-            let mut doc_vectors: rustc_hash::FxHashMap<u32, Vec<Vec<f32>>> =
-                rustc_hash::FxHashMap::default();
-            for &doc_id in &unique_docs {
-                if let Ok(Some(doc)) = self.store.get(doc_id, &self.schema).await {
-                    let vecs: Vec<Vec<f32>> = doc
-                        .field_values()
-                        .iter()
-                        .filter(|(f, _)| f.0 == field.0)
-                        .filter_map(|(_, v)| v.as_dense_vector().map(|v| v.to_vec()))
-                        .collect();
-                    if !vecs.is_empty() {
-                        doc_vectors.insert(doc_id, vecs);
-                    }
+            // Resolve flat indexes for each candidate
+            let mut resolved: Vec<(usize, usize)> = Vec::new(); // (result_idx, flat_idx)
+            for (ri, c) in results.iter().enumerate() {
+                if let Some(&flat_idx) = lookup.get(&(c.0, c.1)) {
+                    resolved.push((ri, flat_idx));
                 }
             }
 
-            // Rerank with exact cosine similarity using full-dimension query
-            // (not MRL-trimmed effective_query, since raw vectors are full-dim)
-            for c in &mut results {
-                if let Some(vecs) = doc_vectors.get(&c.0) {
-                    let ordinal = c.1 as usize;
-                    if let Some(raw) = vecs.get(ordinal) {
-                        c.2 = cosine_similarity(query, raw);
-                    }
+            if !resolved.is_empty() {
+                // Batch-read all needed vectors directly into contiguous buffer (no intermediate alloc)
+                let mut vec_buf = vec![0f32; resolved.len() * dim];
+                for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
+                    let _ = lazy_flat
+                        .read_vector_into(
+                            flat_idx,
+                            &mut vec_buf[buf_idx * dim..(buf_idx + 1) * dim],
+                        )
+                        .await;
+                }
+
+                // Batch SIMD cosine with full query (not MRL-trimmed)
+                let mut scores = vec![0f32; resolved.len()];
+                crate::structures::simd::batch_cosine_scores(query, &vec_buf, dim, &mut scores);
+
+                // Write scores back to results
+                for (buf_idx, &(ri, _)) in resolved.iter().enumerate() {
+                    results[ri].2 = scores[buf_idx];
                 }
             }
+
             results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             results.truncate(k * rerank_factor.max(1));
         }
@@ -582,9 +634,9 @@ impl AsyncSegmentReader {
         Ok(final_results)
     }
 
-    /// Check if this segment has a dense vector index for the given field
+    /// Check if this segment has dense vectors for the given field
     pub fn has_dense_vector_index(&self, field: Field) -> bool {
-        self.vector_indexes.contains_key(&field.0)
+        self.vector_indexes.contains_key(&field.0) || self.flat_vectors.contains_key(&field.0)
     }
 
     /// Get the dense vector index for a field (if available)
@@ -596,11 +648,19 @@ impl AsyncSegmentReader {
     }
 
     /// Get the IVF vector index for a field (if available)
-    pub fn get_ivf_vector_index(&self, field: Field) -> Option<Arc<IVFRaBitQIndex>> {
+    pub fn get_ivf_vector_index(
+        &self,
+        field: Field,
+    ) -> Option<(Arc<IVFRaBitQIndex>, Arc<crate::structures::RaBitQCodebook>)> {
         match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::IVF { index, .. }) => Some(index.clone()),
+            Some(VectorIndex::IVF { index, codebook }) => Some((index.clone(), codebook.clone())),
             _ => None,
         }
+    }
+
+    /// Get coarse centroids (shared across IVF/ScaNN indexes)
+    pub fn coarse_centroids(&self) -> Option<&Arc<CoarseCentroids>> {
+        self.coarse_centroids.as_ref()
     }
 
     /// Get the ScaNN vector index for a field (if available)

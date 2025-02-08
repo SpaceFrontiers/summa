@@ -7,27 +7,39 @@ use rustc_hash::FxHashMap;
 use std::io::Cursor;
 
 use crate::Result;
-use crate::directories::{AsyncFileRead, Directory, LazyFileHandle};
+use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
 use crate::dsl::Schema;
 use crate::structures::{CoarseCentroids, RaBitQIndex};
 
 use super::super::types::SegmentFiles;
-use super::super::vector_data::{FlatVectorData, IVFRaBitQIndexData, ScaNNIndexData};
+use super::super::vector_data::{IVFRaBitQIndexData, LazyFlatVectorData, ScaNNIndexData};
 use super::{SparseIndex, VectorIndex};
+
+/// Vectors file loading result
+pub struct VectorsFileData {
+    /// ANN indexes per field (IVF, ScaNN, RaBitQ) — loaded into memory for search
+    pub indexes: FxHashMap<u32, VectorIndex>,
+    /// Lazy flat vectors per field — doc_ids in memory, vectors via mmap for reranking/merge
+    pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
+    /// Shared coarse centroids for IVF/ScaNN search
+    pub coarse_centroids: Option<Arc<CoarseCentroids>>,
+}
 
 /// Load dense vector indexes from unified .vectors file
 ///
-/// Supports RaBitQ (type 0), IVF-RaBitQ (type 1), and ScaNN (type 2).
-/// Also loads coarse centroids and PQ codebook as needed.
+/// Each field can have two entries:
+/// - Type 4 (Flat): raw vectors loaded lazily (doc_ids in memory, vectors via mmap)
+/// - Type 0/1/2 (ANN): loaded into memory for search
 ///
-/// Memory optimization: Uses lazy range reads to load each index separately,
-/// avoiding loading the entire vectors file into memory at once.
+/// Flat data is always present (written by builder and merger). ANN indexes
+/// are present after merge with trained structures.
 pub async fn load_vectors_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
     schema: &Schema,
-) -> Result<(FxHashMap<u32, VectorIndex>, Option<Arc<CoarseCentroids>>)> {
+) -> Result<VectorsFileData> {
     let mut indexes = FxHashMap::default();
+    let mut flat_vectors = FxHashMap::default();
     let mut coarse_centroids: Option<Arc<CoarseCentroids>> = None;
 
     // Skip loading vectors file if schema has no dense vector fields
@@ -35,30 +47,54 @@ pub async fn load_vectors_file<D: Directory>(
         .fields()
         .any(|(_, entry)| entry.dense_vector_config.is_some());
     if !has_dense_vectors {
-        return Ok((indexes, None));
+        return Ok(VectorsFileData {
+            indexes,
+            flat_vectors,
+            coarse_centroids,
+        });
     }
 
     // Try to open vectors file (may not exist if no vectors were indexed)
     let handle = match dir.open_lazy(&files.vectors).await {
         Ok(h) => h,
-        Err(_) => return Ok((indexes, None)),
+        Err(_) => {
+            return Ok(VectorsFileData {
+                indexes,
+                flat_vectors,
+                coarse_centroids,
+            });
+        }
     };
 
     // Read only the header first (4 bytes for num_fields)
     let header_bytes = match handle.read_bytes_range(0..4).await {
         Ok(b) => b,
-        Err(_) => return Ok((indexes, None)),
+        Err(_) => {
+            return Ok(VectorsFileData {
+                indexes,
+                flat_vectors,
+                coarse_centroids,
+            });
+        }
     };
 
     if header_bytes.is_empty() {
-        return Ok((indexes, None));
+        return Ok(VectorsFileData {
+            indexes,
+            flat_vectors,
+            coarse_centroids,
+        });
     }
 
     let mut cursor = Cursor::new(header_bytes.as_slice());
     let num_fields = cursor.read_u32::<LittleEndian>()?;
 
     if num_fields == 0 {
-        return Ok((indexes, None));
+        return Ok(VectorsFileData {
+            indexes,
+            flat_vectors,
+            coarse_centroids,
+        });
     }
 
     // Read field entries header: (field_id: 4, index_type: 1, offset: 8, length: 8) = 21 bytes per field
@@ -70,28 +106,34 @@ pub async fn load_vectors_file<D: Directory>(
     let mut entries = Vec::with_capacity(num_fields as usize);
     for _ in 0..num_fields {
         let field_id = cursor.read_u32::<LittleEndian>()?;
-        // Try to read index_type - if this fails, assume old format without type
-        let index_type = cursor.read_u8().unwrap_or(255); // 255 = unknown/legacy
+        let index_type = cursor.read_u8().unwrap_or(255);
         let offset = cursor.read_u64::<LittleEndian>()?;
         let length = cursor.read_u64::<LittleEndian>()?;
         entries.push((field_id, index_type, offset, length));
     }
 
-    // Load each index on-demand using range reads (memory efficient)
+    // Load each entry — a field can have both Flat (lazy) and ANN (in-memory)
     for (field_id, index_type, offset, length) in entries {
-        // Read only this index's data
-        let data = handle.read_bytes_range(offset..offset + length).await?;
-        let _field = crate::dsl::Field(field_id);
-
         match index_type {
             4 => {
-                // Flat binary format — single bulk memcpy into flat Vec<f32>
-                if let Ok(flat_data) = FlatVectorData::from_binary_bytes(data.as_slice()) {
-                    indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
+                // Flat binary — load lazily (only doc_ids in memory, vectors via mmap)
+                let slice = LazyFileSlice::from_handle_range(&handle, offset, length);
+                match LazyFlatVectorData::open(slice).await {
+                    Ok(lazy_flat) => {
+                        flat_vectors.insert(field_id, lazy_flat);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to load lazy flat vectors for field {}: {}",
+                            field_id,
+                            e
+                        );
+                    }
                 }
             }
             2 => {
                 // ScaNN (IVF-PQ) with embedded centroids and codebook
+                let data = handle.read_bytes_range(offset..offset + length).await?;
                 if let Ok(scann_data) = ScaNNIndexData::from_bytes(data.as_slice()) {
                     coarse_centroids = Some(Arc::new(scann_data.centroids));
                     indexes.insert(
@@ -105,6 +147,7 @@ pub async fn load_vectors_file<D: Directory>(
             }
             1 => {
                 // IVF-RaBitQ with embedded centroids and codebook
+                let data = handle.read_bytes_range(offset..offset + length).await?;
                 if let Ok(ivf_data) = IVFRaBitQIndexData::from_bytes(data.as_slice()) {
                     coarse_centroids = Some(Arc::new(ivf_data.centroids));
                     indexes.insert(
@@ -118,6 +161,7 @@ pub async fn load_vectors_file<D: Directory>(
             }
             0 => {
                 // RaBitQ (standalone)
+                let data = handle.read_bytes_range(offset..offset + length).await?;
                 if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data.as_slice()) {
                     indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
                 }
@@ -132,7 +176,11 @@ pub async fn load_vectors_file<D: Directory>(
         }
     }
 
-    Ok((indexes, coarse_centroids))
+    Ok(VectorsFileData {
+        indexes,
+        flat_vectors,
+        coarse_centroids,
+    })
 }
 
 /// Load sparse vector indexes from .sparse file (lazy loading)

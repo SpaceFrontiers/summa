@@ -10,14 +10,13 @@ use crate::structures::{
     SparseBlock, SparseSkipEntry,
 };
 
-use super::super::vector_data::FlatVectorData;
-
-/// Vector index type - Flat, RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
+/// Vector index type - RaBitQ, IVF-RaBitQ, or ScaNN (IVF-PQ)
+///
+/// Raw flat vectors are stored separately in [`LazyFlatVectorData`] and accessed
+/// via mmap for reranking and merge. This enum only holds ANN indexes.
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
-    /// Flat - brute-force search over raw vectors (accumulating state)
-    Flat(Arc<FlatVectorData>),
     /// RaBitQ - binary quantization, good for small datasets
     RaBitQ(Arc<RaBitQIndex>),
     /// IVF-RaBitQ - inverted file with RaBitQ, good for medium datasets
@@ -36,7 +35,6 @@ impl VectorIndex {
     /// Estimate memory usage of this vector index
     pub fn estimated_memory_bytes(&self) -> usize {
         match self {
-            VectorIndex::Flat(data) => data.estimated_memory_bytes(),
             VectorIndex::RaBitQ(idx) => idx.estimated_memory_bytes(),
             VectorIndex::IVF { index, codebook } => {
                 index.estimated_memory_bytes() + codebook.estimated_memory_bytes()

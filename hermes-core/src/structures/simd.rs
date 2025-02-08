@@ -1619,8 +1619,203 @@ unsafe fn max_f32_sse(values: &[f32], count: usize) -> f32 {
 }
 
 // ============================================================================
-// Squared Euclidean Distance for Dense Vector Search
+// Batched Cosine Similarity for Dense Vector Search
 // ============================================================================
+
+/// Fused dot-product + self-norm in a single pass (SIMD accelerated).
+///
+/// Returns (dot(a, b), dot(b, b)) — i.e. the dot product of a·b and ||b||².
+/// Loads `b` only once (halves memory bandwidth vs two separate dot products).
+#[inline]
+fn fused_dot_norm(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon::is_available() {
+            return unsafe { fused_dot_norm_neon(a, b, count) };
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse::is_available() {
+            return unsafe { fused_dot_norm_sse(a, b, count) };
+        }
+    }
+
+    // Scalar fallback
+    let mut dot = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..count {
+        dot += a[i] * b[i];
+        norm_b += b[i] * b[i];
+    }
+    (dot, norm_b)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn fused_dot_norm_neon(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
+    use std::arch::aarch64::*;
+
+    let chunks = count / 4;
+    let remainder = count % 4;
+
+    let mut acc_dot = vdupq_n_f32(0.0);
+    let mut acc_norm = vdupq_n_f32(0.0);
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let va = vld1q_f32(a.as_ptr().add(base));
+        let vb = vld1q_f32(b.as_ptr().add(base));
+        acc_dot = vfmaq_f32(acc_dot, va, vb);
+        acc_norm = vfmaq_f32(acc_norm, vb, vb);
+    }
+
+    let mut dot = vaddvq_f32(acc_dot);
+    let mut norm = vaddvq_f32(acc_norm);
+
+    let base = chunks * 4;
+    for i in 0..remainder {
+        dot += a[base + i] * b[base + i];
+        norm += b[base + i] * b[base + i];
+    }
+
+    (dot, norm)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn fused_dot_norm_sse(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
+    use std::arch::x86_64::*;
+
+    let chunks = count / 4;
+    let remainder = count % 4;
+
+    let mut acc_dot = _mm_setzero_ps();
+    let mut acc_norm = _mm_setzero_ps();
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let va = _mm_loadu_ps(a.as_ptr().add(base));
+        let vb = _mm_loadu_ps(b.as_ptr().add(base));
+        acc_dot = _mm_add_ps(acc_dot, _mm_mul_ps(va, vb));
+        acc_norm = _mm_add_ps(acc_norm, _mm_mul_ps(vb, vb));
+    }
+
+    // Horizontal sums
+    let shuf_d = _mm_shuffle_ps(acc_dot, acc_dot, 0b10_11_00_01);
+    let sums_d = _mm_add_ps(acc_dot, shuf_d);
+    let shuf2_d = _mm_movehl_ps(sums_d, sums_d);
+    let final_d = _mm_add_ss(sums_d, shuf2_d);
+    let mut dot = _mm_cvtss_f32(final_d);
+
+    let shuf_n = _mm_shuffle_ps(acc_norm, acc_norm, 0b10_11_00_01);
+    let sums_n = _mm_add_ps(acc_norm, shuf_n);
+    let shuf2_n = _mm_movehl_ps(sums_n, sums_n);
+    let final_n = _mm_add_ss(sums_n, shuf2_n);
+    let mut norm = _mm_cvtss_f32(final_n);
+
+    let base = chunks * 4;
+    for i in 0..remainder {
+        dot += a[base + i] * b[base + i];
+        norm += b[base + i] * b[base + i];
+    }
+
+    (dot, norm)
+}
+
+/// Batch cosine similarity: query vs N contiguous vectors.
+///
+/// `vectors` is a contiguous buffer of `n * dim` floats (row-major).
+/// `scores` must have length >= n.
+///
+/// Optimizations over calling `cosine_similarity` N times:
+/// 1. Query norm computed once (not N times)
+/// 2. Fused dot+norm kernel — each vector loaded once (halves bandwidth)
+/// 3. No per-call overhead (branch prediction, function calls)
+#[inline]
+pub fn batch_cosine_scores(query: &[f32], vectors: &[f32], dim: usize, scores: &mut [f32]) {
+    let n = scores.len();
+    debug_assert!(vectors.len() >= n * dim);
+    debug_assert_eq!(query.len(), dim);
+
+    if dim == 0 || n == 0 {
+        return;
+    }
+
+    // Pre-compute query norm once
+    let norm_q_sq = dot_product_f32(query, query, dim);
+    if norm_q_sq < f32::EPSILON {
+        for s in scores.iter_mut() {
+            *s = 0.0;
+        }
+        return;
+    }
+    let norm_q = norm_q_sq.sqrt();
+
+    for i in 0..n {
+        let vec = &vectors[i * dim..(i + 1) * dim];
+        let (dot, norm_v_sq) = fused_dot_norm(query, vec, dim);
+        if norm_v_sq < f32::EPSILON {
+            scores[i] = 0.0;
+        } else {
+            scores[i] = dot / (norm_q * norm_v_sq.sqrt());
+        }
+    }
+}
+
+/// Batch cosine similarity with stride: query vs N vectors stored at `stride` apart.
+///
+/// Computes cosine similarity using only the first `dim` elements of each vector,
+/// where vectors are spaced `stride` elements apart in the buffer. This avoids
+/// copying/trimming when only a prefix of each vector is needed (e.g., MRL).
+///
+/// - `query.len()` must equal `dim`
+/// - `vectors.len()` must be >= `(n-1) * stride + dim`
+/// - When `stride == dim`, this is identical to [`batch_cosine_scores`]
+///
+/// Example: 768-dim vectors, MRL trim to 256 →
+///   `dim = 256, stride = 768` — reads first 256 floats of each vector, skips rest.
+///   3× less SIMD work, zero copies.
+#[inline]
+pub fn batch_cosine_scores_strided(
+    query: &[f32],
+    vectors: &[f32],
+    dim: usize,
+    stride: usize,
+    scores: &mut [f32],
+) {
+    let n = scores.len();
+    debug_assert_eq!(query.len(), dim);
+    debug_assert!(stride >= dim);
+
+    if dim == 0 || n == 0 {
+        return;
+    }
+
+    // Pre-compute query norm once
+    let norm_q_sq = dot_product_f32(query, query, dim);
+    if norm_q_sq < f32::EPSILON {
+        for s in scores.iter_mut() {
+            *s = 0.0;
+        }
+        return;
+    }
+    let norm_q = norm_q_sq.sqrt();
+
+    for (i, score) in scores.iter_mut().enumerate() {
+        let start = i * stride;
+        let vec = &vectors[start..start + dim];
+        let (dot, norm_v_sq) = fused_dot_norm(query, vec, dim);
+        *score = if norm_v_sq < f32::EPSILON {
+            0.0
+        } else {
+            dot / (norm_q * norm_v_sq.sqrt())
+        };
+    }
+}
 
 /// Compute cosine similarity between two f32 vectors with SIMD acceleration
 ///
@@ -2152,6 +2347,218 @@ mod tests {
         let values: Vec<f32> = vec![];
         let result = max_f32(&values, 0);
         assert_eq!(result, f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_fused_dot_norm() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b = vec![2.0f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let (dot, norm_b) = fused_dot_norm(&a, &b, a.len());
+
+        let expected_dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let expected_norm: f32 = b.iter().map(|x| x * x).sum();
+        assert!(
+            (dot - expected_dot).abs() < 1e-5,
+            "dot: expected {}, got {}",
+            expected_dot,
+            dot
+        );
+        assert!(
+            (norm_b - expected_norm).abs() < 1e-5,
+            "norm: expected {}, got {}",
+            expected_norm,
+            norm_b
+        );
+    }
+
+    #[test]
+    fn test_fused_dot_norm_large() {
+        let a: Vec<f32> = (0..768).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..768).map(|i| (i as f32) * 0.02 + 0.5).collect();
+        let (dot, norm_b) = fused_dot_norm(&a, &b, a.len());
+
+        let expected_dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let expected_norm: f32 = b.iter().map(|x| x * x).sum();
+        assert!(
+            (dot - expected_dot).abs() < 1.0,
+            "dot: expected {}, got {}",
+            expected_dot,
+            dot
+        );
+        assert!(
+            (norm_b - expected_norm).abs() < 1.0,
+            "norm: expected {}, got {}",
+            expected_norm,
+            norm_b
+        );
+    }
+
+    #[test]
+    fn test_batch_cosine_scores() {
+        // 4 vectors of dim 3
+        let query = vec![1.0f32, 0.0, 0.0];
+        let vectors = vec![
+            1.0, 0.0, 0.0, // identical to query
+            0.0, 1.0, 0.0, // orthogonal
+            -1.0, 0.0, 0.0, // opposite
+            0.5, 0.5, 0.0, // 45 degrees
+        ];
+        let mut scores = vec![0f32; 4];
+        batch_cosine_scores(&query, &vectors, 3, &mut scores);
+
+        assert!((scores[0] - 1.0).abs() < 1e-5, "identical: {}", scores[0]);
+        assert!(scores[1].abs() < 1e-5, "orthogonal: {}", scores[1]);
+        assert!((scores[2] - (-1.0)).abs() < 1e-5, "opposite: {}", scores[2]);
+        let expected_45 = 0.5f32 / (0.5f32.powi(2) + 0.5f32.powi(2)).sqrt();
+        assert!(
+            (scores[3] - expected_45).abs() < 1e-5,
+            "45deg: expected {}, got {}",
+            expected_45,
+            scores[3]
+        );
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_matches_individual() {
+        let query: Vec<f32> = (0..128).map(|i| (i as f32) * 0.1).collect();
+        let n = 50;
+        let dim = 128;
+        let vectors: Vec<f32> = (0..n * dim).map(|i| ((i * 7 + 3) as f32) * 0.01).collect();
+
+        let mut batch_scores = vec![0f32; n];
+        batch_cosine_scores(&query, &vectors, dim, &mut batch_scores);
+
+        for i in 0..n {
+            let vec_i = &vectors[i * dim..(i + 1) * dim];
+            let individual = cosine_similarity(&query, vec_i);
+            assert!(
+                (batch_scores[i] - individual).abs() < 1e-5,
+                "vec {}: batch={}, individual={}",
+                i,
+                batch_scores[i],
+                individual
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_empty() {
+        let query = vec![1.0f32, 2.0, 3.0];
+        let vectors: Vec<f32> = vec![];
+        let mut scores: Vec<f32> = vec![];
+        batch_cosine_scores(&query, &vectors, 3, &mut scores);
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_zero_query() {
+        let query = vec![0.0f32, 0.0, 0.0];
+        let vectors = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut scores = vec![0f32; 2];
+        batch_cosine_scores(&query, &vectors, 3, &mut scores);
+        assert_eq!(scores[0], 0.0);
+        assert_eq!(scores[1], 0.0);
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_strided_mrl() {
+        // Simulate MRL: 4 vectors at full_dim=8, query trimmed to dim=3
+        // Vectors: [v0(8 floats), v1(8 floats), v2(8 floats), v3(8 floats)]
+        // Only first 3 floats of each vector should be used
+        let query = vec![1.0f32, 0.0, 0.0]; // dim=3
+        let vectors = vec![
+            1.0, 0.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v0: identical prefix
+            0.0, 1.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v1: orthogonal prefix
+            -1.0, 0.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v2: opposite prefix
+            0.5, 0.5, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v3: 45-degree prefix
+        ];
+        let mut scores = vec![0f32; 4];
+        batch_cosine_scores_strided(&query, &vectors, 3, 8, &mut scores);
+
+        assert!((scores[0] - 1.0).abs() < 1e-5, "identical: {}", scores[0]);
+        assert!(scores[1].abs() < 1e-5, "orthogonal: {}", scores[1]);
+        assert!((scores[2] - (-1.0)).abs() < 1e-5, "opposite: {}", scores[2]);
+        let expected_45 = 0.5f32 / (0.5f32.powi(2) + 0.5f32.powi(2)).sqrt();
+        assert!(
+            (scores[3] - expected_45).abs() < 1e-5,
+            "45deg: {}",
+            scores[3]
+        );
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_strided_matches_trimmed() {
+        // Verify strided version matches manually-trimmed batch version
+        let full_dim = 128;
+        let trim_dim = 32; // MRL dimension
+        let n = 20;
+
+        let full_query: Vec<f32> = (0..full_dim).map(|i| (i as f32) * 0.1).collect();
+        let trimmed_query = &full_query[..trim_dim];
+        let vectors: Vec<f32> = (0..n * full_dim)
+            .map(|i| ((i * 7 + 3) as f32) * 0.01)
+            .collect();
+
+        // Strided: operate on full buffer with stride
+        let mut strided_scores = vec![0f32; n];
+        batch_cosine_scores_strided(
+            trimmed_query,
+            &vectors,
+            trim_dim,
+            full_dim,
+            &mut strided_scores,
+        );
+
+        // Manual trim: copy first trim_dim floats per vector, then batch
+        let trimmed_vectors: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                vectors[i * full_dim..i * full_dim + trim_dim]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let mut trimmed_scores = vec![0f32; n];
+        batch_cosine_scores(
+            trimmed_query,
+            &trimmed_vectors,
+            trim_dim,
+            &mut trimmed_scores,
+        );
+
+        for i in 0..n {
+            assert!(
+                (strided_scores[i] - trimmed_scores[i]).abs() < 1e-5,
+                "vec {}: strided={}, trimmed={}",
+                i,
+                strided_scores[i],
+                trimmed_scores[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_strided_equals_non_strided() {
+        // When stride == dim, should produce identical results to batch_cosine_scores
+        let dim = 64;
+        let n = 30;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.1).collect();
+        let vectors: Vec<f32> = (0..n * dim).map(|i| ((i * 3 + 1) as f32) * 0.01).collect();
+
+        let mut scores_batch = vec![0f32; n];
+        batch_cosine_scores(&query, &vectors, dim, &mut scores_batch);
+
+        let mut scores_strided = vec![0f32; n];
+        batch_cosine_scores_strided(&query, &vectors, dim, dim, &mut scores_strided);
+
+        for i in 0..n {
+            assert!(
+                (scores_batch[i] - scores_strided[i]).abs() < 1e-6,
+                "vec {}: batch={}, strided={}",
+                i,
+                scores_batch[i],
+                scores_strided[i]
+            );
+        }
     }
 
     #[test]

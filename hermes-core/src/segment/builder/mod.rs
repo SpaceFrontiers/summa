@@ -39,7 +39,7 @@ use posting::{
 use vectors::{DenseVectorBuilder, SparseVectorBuilder};
 
 // Re-export from vector_data for backwards compatibility
-pub use super::vector_data::{FlatVectorData, IVFRaBitQIndexData, ScaNNIndexData};
+pub use super::vector_data::FlatVectorData;
 
 /// Size of the document store buffer before writing to disk
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
@@ -751,7 +751,7 @@ impl SegmentBuilder {
     /// a small header, then streams each field's raw f32 data directly to the writer.
     fn build_vectors_streaming(
         dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
-        schema: &Schema,
+        _schema: &Schema,
         writer: &mut dyn Write,
     ) -> Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
@@ -768,14 +768,10 @@ impl SegmentBuilder {
 
         // Compute sizes using deterministic formula (no serialization needed)
         let mut field_sizes: Vec<usize> = Vec::with_capacity(fields.len());
-        for (field_id, builder) in &fields {
-            let field = crate::dsl::Field(*field_id);
-            let dense_config = schema
-                .get_field_entry(field)
-                .and_then(|e| e.dense_vector_config.as_ref());
-            let index_dim = dense_config.map(|c| c.index_dim()).unwrap_or(builder.dim);
+        for (_field_id, builder) in &fields {
+            // Flat stores full-dimension vectors (MRL trimming only applies to ANN indexes)
             field_sizes.push(FlatVectorData::serialized_binary_size(
-                index_dim,
+                builder.dim,
                 builder.len(),
             ));
         }
@@ -800,15 +796,10 @@ impl SegmentBuilder {
         writer.write_all(&header)?;
 
         // Stream each field's data directly (builder → disk, no intermediate buffer)
-        for (field_id, builder) in fields {
-            let field = crate::dsl::Field(field_id);
-            let dense_config = schema
-                .get_field_entry(field)
-                .and_then(|e| e.dense_vector_config.as_ref());
-            let index_dim = dense_config.map(|c| c.index_dim()).unwrap_or(builder.dim);
-
+        for (_field_id, builder) in fields {
+            // Flat stores full-dimension vectors (no MRL trimming)
             FlatVectorData::serialize_binary_from_flat_streaming(
-                index_dim,
+                builder.dim,
                 &builder.vectors,
                 builder.dim,
                 &builder.doc_ids,

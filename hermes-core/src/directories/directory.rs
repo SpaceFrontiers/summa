@@ -241,6 +241,15 @@ impl std::fmt::Debug for LazyFileSlice {
 }
 
 impl LazyFileSlice {
+    /// Create a slice from a handle with absolute offset and length
+    pub fn from_handle_range(handle: &LazyFileHandle, offset: u64, len: u64) -> Self {
+        Self {
+            handle: handle.clone(),
+            offset,
+            len,
+        }
+    }
+
     /// Create a sub-slice
     pub fn slice(&self, range: Range<u64>) -> Self {
         Self {

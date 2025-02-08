@@ -18,7 +18,7 @@ pub use store::*;
 #[cfg(feature = "native")]
 pub use tracker::{SegmentSnapshot, SegmentTracker};
 pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
-pub use vector_data::{FlatVectorData, IVFRaBitQIndexData, ScaNNIndexData};
+pub use vector_data::{FlatVectorData, IVFRaBitQIndexData, LazyFlatVectorData, ScaNNIndexData};
 
 #[cfg(test)]
 #[cfg(feature = "native")]

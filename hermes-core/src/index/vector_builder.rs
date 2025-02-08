@@ -314,10 +314,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             )
             .await
             {
-                for index in reader.vector_indexes().values() {
-                    if let crate::segment::VectorIndex::Flat(flat_data) = index {
-                        total_vectors += flat_data.num_vectors();
-                    }
+                for flat_data in reader.flat_vectors().values() {
+                    total_vectors += flat_data.num_vectors;
                 }
                 doc_offset += reader.meta().num_docs;
             }
@@ -354,32 +352,38 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             )
             .await?;
 
-            for (field_id, index) in reader.vector_indexes() {
-                if fields_to_build.iter().any(|(f, _)| f.0 == *field_id)
-                    && let crate::segment::VectorIndex::Flat(flat_data) = index
-                {
-                    let entry = all_vectors.entry(*field_id).or_default();
-                    let remaining = MAX_TRAINING_VECTORS.saturating_sub(entry.len());
+            for (field_id, lazy_flat) in reader.flat_vectors() {
+                if !fields_to_build.iter().any(|(f, _)| f.0 == *field_id) {
+                    continue;
+                }
+                let entry = all_vectors.entry(*field_id).or_default();
+                let remaining = MAX_TRAINING_VECTORS.saturating_sub(entry.len());
 
-                    if remaining == 0 {
-                        total_skipped += flat_data.num_vectors();
-                        continue;
-                    }
+                if remaining == 0 {
+                    total_skipped += lazy_flat.num_vectors;
+                    continue;
+                }
 
-                    let n = flat_data.num_vectors();
-                    if n <= remaining {
-                        // Take all vectors from this segment
-                        entry.extend((0..n).map(|i| flat_data.get_vector(i).to_vec()));
-                    } else {
-                        // Uniform sample: take every Nth vector
-                        let step = (n / remaining).max(1);
-                        for i in 0..n {
-                            if i % step == 0 && entry.len() < MAX_TRAINING_VECTORS {
-                                entry.push(flat_data.get_vector(i).to_vec());
-                            }
+                let n = lazy_flat.num_vectors;
+                if n <= remaining {
+                    // Take all vectors from this segment (async reads)
+                    for i in 0..n {
+                        if let Ok(vec) = lazy_flat.get_vector(i).await {
+                            entry.push(vec);
                         }
-                        total_skipped += n - remaining;
                     }
+                } else {
+                    // Uniform sample: take every Nth vector
+                    let step = (n / remaining).max(1);
+                    for i in 0..n {
+                        if i % step == 0
+                            && entry.len() < MAX_TRAINING_VECTORS
+                            && let Ok(vec) = lazy_flat.get_vector(i).await
+                        {
+                            entry.push(vec);
+                        }
+                    }
+                    total_skipped += n - remaining;
                 }
             }
 
@@ -443,11 +447,22 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let num_clusters = config.optimal_num_clusters(num_vectors);
 
         log::info!(
-            "Training vector index for field {} with {} vectors, {} clusters",
+            "Training vector index for field {} with {} vectors, {} clusters (index_dim={})",
             field_id,
             num_vectors,
-            num_clusters
+            num_clusters,
+            index_dim,
         );
+
+        // Trim vectors to index_dim for training (MRL: flat stores full-dim,
+        // but centroids/codebooks must be at index_dim to match the ANN index)
+        let trimmed: Vec<Vec<f32>>;
+        let training_vectors = if vectors.first().is_some_and(|v| v.len() > index_dim) {
+            trimmed = vectors.iter().map(|v| v[..index_dim].to_vec()).collect();
+            &trimmed
+        } else {
+            vectors
+        };
 
         let centroids_filename = format!("field_{}_centroids.bin", field_id);
         let mut codebook_filename: Option<String> = None;
@@ -458,7 +473,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     field_id,
                     index_dim,
                     num_clusters,
-                    vectors,
+                    training_vectors,
                     &centroids_filename,
                 )
                 .await?;
@@ -469,7 +484,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     field_id,
                     index_dim,
                     num_clusters,
-                    vectors,
+                    training_vectors,
                     &centroids_filename,
                     codebook_filename.as_ref().unwrap(),
                 )
