@@ -719,17 +719,52 @@ impl SegmentMerger {
                     });
 
             if let Some(ann) = ann_type {
-                // --- ANN rebuild: collect vectors then build index ---
+                // --- Streaming ANN rebuild ---
+                // Flat segments: iterate index directly (zero alloc).
+                // Non-Flat segments: read from doc store one doc at a time.
+                // Both feed add_vector immediately — no intermediate collection.
                 let trained = trained.unwrap();
+                let mut total_vectors = 0usize;
 
-                // Collect vectors from all segments (Flat: direct, non-Flat: from doc store)
-                let mut all_vectors: Vec<(u32, u16, Vec<f32>)> = Vec::new();
-                for (seg_idx, segment) in segments.iter().enumerate() {
-                    let offset = doc_offs[seg_idx];
-                    let vecs = Self::collect_vectors(segment, field, offset).await;
-                    all_vectors.extend(vecs);
+                // Macro-like closure: streams vectors from a segment into an add_fn
+                // Returns number of vectors added.
+                async fn feed_segment(
+                    segment: &SegmentReader,
+                    field: crate::dsl::Field,
+                    doc_id_offset: u32,
+                    mut add_fn: impl FnMut(u32, u16, &[f32]),
+                ) -> usize {
+                    let mut count = 0;
+                    match segment.vector_indexes().get(&field.0) {
+                        Some(super::VectorIndex::Flat(flat_data)) => {
+                            for i in 0..flat_data.num_vectors() {
+                                let (doc_id, ordinal) = flat_data.get_doc_id(i);
+                                add_fn(doc_id_offset + doc_id, ordinal, flat_data.get_vector(i));
+                                count += 1;
+                            }
+                        }
+                        Some(_) => {
+                            let schema = segment.schema();
+                            let store = segment.store();
+                            for doc_id in 0..segment.num_docs() {
+                                if let Ok(Some(doc)) = store.get(doc_id, schema).await {
+                                    let mut ordinal = 0u16;
+                                    for (f, val) in doc.field_values() {
+                                        if f.0 == field.0
+                                            && let Some(vec) = val.as_dense_vector()
+                                        {
+                                            add_fn(doc_id_offset + doc_id, ordinal, vec);
+                                            ordinal += 1;
+                                            count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                    count
                 }
-                let total_vectors = all_vectors.len();
 
                 match ann {
                     VectorIndexType::IvfRaBitQ => {
@@ -743,8 +778,14 @@ impl SegmentMerger {
                             codebook.version,
                         );
 
-                        for (doc_id, ordinal, vec) in &all_vectors {
-                            ivf_index.add_vector(centroids, &codebook, *doc_id, *ordinal, vec);
+                        for (seg_idx, segment) in segments.iter().enumerate() {
+                            let offset = doc_offs[seg_idx];
+                            total_vectors +=
+                                feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
+                                    ivf_index
+                                        .add_vector(centroids, &codebook, doc_id, ordinal, vec);
+                                })
+                                .await;
                         }
 
                         let index_data = super::builder::IVFRaBitQIndexData {
@@ -761,7 +802,7 @@ impl SegmentMerger {
                             data: bytes,
                         });
                         log::info!(
-                            "Rebuilt IVF-RaBitQ for field {} ({} vectors)",
+                            "Rebuilt IVF-RaBitQ for field {} ({} vectors, streaming)",
                             field.0,
                             total_vectors
                         );
@@ -776,8 +817,14 @@ impl SegmentMerger {
                             codebook.version,
                         );
 
-                        for (doc_id, ordinal, vec) in &all_vectors {
-                            ivf_pq_index.add_vector(centroids, codebook, *doc_id, *ordinal, vec);
+                        for (seg_idx, segment) in segments.iter().enumerate() {
+                            let offset = doc_offs[seg_idx];
+                            total_vectors +=
+                                feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
+                                    ivf_pq_index
+                                        .add_vector(centroids, codebook, doc_id, ordinal, vec);
+                                })
+                                .await;
                         }
 
                         let index_data = super::builder::ScaNNIndexData {
@@ -794,7 +841,7 @@ impl SegmentMerger {
                             data: bytes,
                         });
                         log::info!(
-                            "Rebuilt ScaNN for field {} ({} vectors)",
+                            "Rebuilt ScaNN for field {} ({} vectors, streaming)",
                             field.0,
                             total_vectors
                         );
