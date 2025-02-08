@@ -770,48 +770,26 @@ impl AsyncSegmentReader {
 
         let index_dimensions = sparse_index.num_dimensions();
 
-        // Build scorers for each dimension that exists in the index
-        // Load posting lists on-demand (lazy loading via mmap)
-        // Keep Arc references alive for the duration of scoring
-        let mut matched_tokens = Vec::new();
+        // Filter query terms to only those present in the index
+        let mut matched_terms: Vec<(u32, f32)> = Vec::with_capacity(vector.len());
         let mut missing_tokens = Vec::new();
-        let mut posting_lists: Vec<(u32, f32, Arc<BlockSparsePostingList>)> =
-            Vec::with_capacity(vector.len());
 
         for &(dim_id, query_weight) in vector {
-            // Check if dimension exists before loading
-            if !sparse_index.has_dimension(dim_id) {
+            if sparse_index.has_dimension(dim_id) {
+                matched_terms.push((dim_id, query_weight));
+            } else {
                 missing_tokens.push(dim_id);
-                continue;
-            }
-
-            // Load posting list on-demand (async, uses mmap)
-            match sparse_index.get_posting(dim_id).await? {
-                Some(pl) => {
-                    matched_tokens.push(dim_id);
-                    posting_lists.push((dim_id, query_weight, pl));
-                }
-                None => {
-                    missing_tokens.push(dim_id);
-                }
             }
         }
-
-        // Create scorers from the loaded posting lists (borrows from posting_lists)
-        let scorers: Vec<SparseTermScorer> = posting_lists
-            .iter()
-            .map(|(_, query_weight, pl)| SparseTermScorer::from_arc(pl, *query_weight))
-            .collect();
 
         log::debug!(
             "Sparse vector search: query_tokens={}, matched={}, missing={}, index_dimensions={}",
             query_tokens,
-            matched_tokens.len(),
+            matched_terms.len(),
             missing_tokens.len(),
             index_dimensions
         );
 
-        // Log query tokens with their IDs and weights
         if log::log_enabled!(log::Level::Debug) {
             let query_details: Vec<_> = vector
                 .iter()
@@ -821,13 +799,6 @@ impl AsyncSegmentReader {
             log::debug!("Query tokens (id:weight): [{}]", query_details.join(", "));
         }
 
-        if !matched_tokens.is_empty() {
-            log::debug!(
-                "Matched token IDs: {:?}",
-                matched_tokens.iter().take(20).collect::<Vec<_>>()
-            );
-        }
-
         if !missing_tokens.is_empty() {
             log::debug!(
                 "Missing token IDs (not in index): {:?}",
@@ -835,26 +806,37 @@ impl AsyncSegmentReader {
             );
         }
 
-        if scorers.is_empty() {
+        if matched_terms.is_empty() {
             log::debug!("Sparse vector search: no matching tokens, returning empty");
             return Ok(Vec::new());
         }
 
         // Select executor based on number of query terms:
-        // - 12+ terms: BMP (block-at-a-time, best for SPLADE expansions)
+        // - 12+ terms: BMP (block-at-a-time, lazy block loading, best for SPLADE)
         // - 1-11 terms: BlockMaxScoreExecutor (unified MaxScore + block-max + conjunction)
-        let num_terms = scorers.len();
+        let num_terms = matched_terms.len();
         let over_fetch = limit * 2; // Over-fetch for multi-value combining
         let raw_results = if num_terms > 12 {
-            // BMP: use posting lists directly (not iterators)
-            let pl_refs: Vec<_> = posting_lists
-                .iter()
-                .map(|(_, _, pl)| Arc::clone(pl))
-                .collect();
-            let weights: Vec<_> = posting_lists.iter().map(|(_, qw, _)| *qw).collect();
-            drop(scorers); // Release borrowing iterators before using posting_lists
-            BmpExecutor::new(pl_refs, weights, over_fetch, heap_factor).execute()
+            // BMP: lazy block loading — only skip entries in memory, blocks loaded on-demand
+            BmpExecutor::new(sparse_index, matched_terms, over_fetch, heap_factor)
+                .execute()
+                .await?
         } else {
+            // Load posting lists only for the few terms (1-11) used by BlockMaxScore
+            let mut posting_lists: Vec<(u32, f32, Arc<BlockSparsePostingList>)> =
+                Vec::with_capacity(num_terms);
+            for &(dim_id, query_weight) in &matched_terms {
+                if let Some(pl) = sparse_index.get_posting(dim_id).await? {
+                    posting_lists.push((dim_id, query_weight, pl));
+                }
+            }
+            let scorers: Vec<SparseTermScorer> = posting_lists
+                .iter()
+                .map(|(_, query_weight, pl)| SparseTermScorer::from_arc(pl, *query_weight))
+                .collect();
+            if scorers.is_empty() {
+                return Ok(Vec::new());
+            }
             BlockMaxScoreExecutor::with_heap_factor(scorers, over_fetch, heap_factor).execute()
         };
 

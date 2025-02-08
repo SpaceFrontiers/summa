@@ -631,13 +631,16 @@ impl ScoringIterator for SparseTermScorer<'_> {
 /// Best for queries with many terms (20+), like SPLADE expansions.
 /// Uses document accumulators (FxHashMap) instead of per-term iterators.
 ///
+/// **Memory-efficient**: Only skip entries (block metadata) are kept in memory.
+/// Actual block data is loaded on-demand via mmap range reads during execution.
+///
 /// Reference: Mallia et al., "Faster Learned Sparse Retrieval with
 /// Block-Max Pruning" (SIGIR 2024)
-pub struct BmpExecutor {
-    /// Posting lists for each query term
-    posting_lists: Vec<Arc<BlockSparsePostingList>>,
-    /// Query weight for each term
-    query_weights: Vec<f32>,
+pub struct BmpExecutor<'a> {
+    /// Sparse index for on-demand block loading
+    sparse_index: &'a crate::segment::SparseIndex,
+    /// Query terms: (dim_id, query_weight) for each matched dimension
+    query_terms: Vec<(u32, f32)>,
     /// Number of results to return
     k: usize,
     /// Heap factor for approximate search
@@ -677,45 +680,48 @@ impl PartialOrd for BmpBlockEntry {
     }
 }
 
-impl BmpExecutor {
-    /// Create a new BMP executor
+impl<'a> BmpExecutor<'a> {
+    /// Create a new BMP executor with lazy block loading
+    ///
+    /// `query_terms` should contain only dimensions that exist in the index.
+    /// Block metadata (skip entries) is read from the sparse index directly.
     pub fn new(
-        posting_lists: Vec<Arc<BlockSparsePostingList>>,
-        query_weights: Vec<f32>,
+        sparse_index: &'a crate::segment::SparseIndex,
+        query_terms: Vec<(u32, f32)>,
         k: usize,
         heap_factor: f32,
     ) -> Self {
         Self {
-            posting_lists,
-            query_weights,
+            sparse_index,
+            query_terms,
             k,
             heap_factor: heap_factor.clamp(0.0, 1.0),
         }
     }
 
     /// Execute BMP and return top-k results
-    pub fn execute(self) -> Vec<ScoredDoc> {
+    ///
+    /// Builds the priority queue from skip entries (already in memory),
+    /// then loads blocks on-demand via mmap range reads as they are visited.
+    pub async fn execute(self) -> crate::Result<Vec<ScoredDoc>> {
         use rustc_hash::FxHashMap;
 
-        if self.posting_lists.is_empty() {
-            return Vec::new();
+        if self.query_terms.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let num_terms = self.posting_lists.len();
+        let num_terms = self.query_terms.len();
 
-        // Build priority queue of all blocks across all terms
+        // Build priority queue from skip entries (already in memory — no I/O)
         let mut block_queue: BinaryHeap<BmpBlockEntry> = BinaryHeap::new();
-
-        // Track remaining upper bound per term (sum of unprocessed block contributions)
         let mut remaining_max: Vec<f32> = Vec::with_capacity(num_terms);
 
-        for (term_idx, pl) in self.posting_lists.iter().enumerate() {
-            let qw = self.query_weights[term_idx].abs();
+        for (term_idx, &(dim_id, qw)) in self.query_terms.iter().enumerate() {
             let mut term_remaining = 0.0f32;
 
-            for block_idx in 0..pl.num_blocks() {
-                if let Some(block_max_weight) = pl.block_max_weight(block_idx) {
-                    let contribution = qw * block_max_weight;
+            if let Some((skip_entries, _global_max)) = self.sparse_index.get_skip_list(dim_id) {
+                for (block_idx, skip) in skip_entries.iter().enumerate() {
+                    let contribution = qw.abs() * skip.max_weight;
                     term_remaining += contribution;
                     block_queue.push(BmpBlockEntry {
                         contribution,
@@ -733,8 +739,9 @@ impl BmpExecutor {
         let mut accumulators: FxHashMap<(DocId, u16), f32> = FxHashMap::default();
         let mut collector = ScoreCollector::new(self.k);
         let mut blocks_processed = 0u64;
+        let mut blocks_skipped = 0u64;
 
-        // Process blocks in contribution-descending order
+        // Process blocks in contribution-descending order, loading each on-demand
         while let Some(entry) = block_queue.pop() {
             // Update remaining max for this term
             remaining_max[entry.term_idx] -= entry.contribution;
@@ -744,6 +751,7 @@ impl BmpExecutor {
             let total_remaining: f32 = remaining_max.iter().sum();
             let adjusted_threshold = collector.threshold() * self.heap_factor;
             if collector.len() >= self.k && total_remaining <= adjusted_threshold {
+                blocks_skipped += block_queue.len() as u64;
                 debug!(
                     "BMP early termination after {} blocks: remaining={:.4} <= threshold={:.4}",
                     blocks_processed, total_remaining, adjusted_threshold
@@ -751,13 +759,18 @@ impl BmpExecutor {
                 break;
             }
 
-            // Decode this block and accumulate scores
-            let pl = &self.posting_lists[entry.term_idx];
-            let block = &pl.blocks[entry.block_idx];
+            // Load this single block on-demand via mmap range read
+            let dim_id = self.query_terms[entry.term_idx].0;
+            let block = match self.sparse_index.get_block(dim_id, entry.block_idx).await? {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Decode and accumulate scores
             let doc_ids = block.decode_doc_ids();
             let weights = block.decode_weights();
             let ordinals = block.decode_ordinals();
-            let qw = self.query_weights[entry.term_idx];
+            let qw = self.query_terms[entry.term_idx].1;
 
             for i in 0..block.header.count as usize {
                 let score_contribution = qw * weights[i];
@@ -783,14 +796,15 @@ impl BmpExecutor {
             .collect();
 
         debug!(
-            "BmpExecutor completed: blocks_processed={}, accumulators={}, returned={}, top_score={:.4}",
+            "BmpExecutor completed: blocks_processed={}, blocks_skipped={}, accumulators={}, returned={}, top_score={:.4}",
             blocks_processed,
+            blocks_skipped,
             accumulators.len(),
             results.len(),
             results.first().map(|r| r.score).unwrap_or(0.0)
         );
 
-        results
+        Ok(results)
     }
 }
 
