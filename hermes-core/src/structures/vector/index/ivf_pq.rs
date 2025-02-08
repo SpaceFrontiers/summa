@@ -338,7 +338,7 @@ mod tests {
 
         // Verify sorted by distance
         for i in 1..results.len() {
-            assert!(results[i].1 >= results[i - 1].1);
+            assert!(results[i].2 >= results[i - 1].2);
         }
     }
 

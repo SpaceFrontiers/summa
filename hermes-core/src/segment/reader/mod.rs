@@ -464,8 +464,9 @@ impl AsyncSegmentReader {
             }
             VectorIndex::RaBitQ(rabitq) => {
                 // RaBitQ returns (doc_id, ordinal, euclidean_dist) — convert to score
+                let fetch_k = k * rerank_factor.max(1);
                 rabitq
-                    .search(effective_query, k, rerank_factor)
+                    .search(effective_query, fetch_k, rerank_factor)
                     .into_iter()
                     .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                     .collect()
@@ -538,12 +539,13 @@ impl AsyncSegmentReader {
                 }
             }
 
-            // Rerank with exact cosine similarity
+            // Rerank with exact cosine similarity using full-dimension query
+            // (not MRL-trimmed effective_query, since raw vectors are full-dim)
             for c in &mut results {
                 if let Some(vecs) = doc_vectors.get(&c.0) {
                     let ordinal = c.1 as usize;
                     if let Some(raw) = vecs.get(ordinal) {
-                        c.2 = cosine_similarity(effective_query, raw);
+                        c.2 = cosine_similarity(query, raw);
                     }
                 }
             }

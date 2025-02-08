@@ -719,10 +719,8 @@ impl SegmentMerger {
                     });
 
             if let Some(ann) = ann_type {
-                // --- Streaming ANN rebuild: iterate segments, call add_vector ---
-                // No Vec<Vec<f32>> collection — only the ANN index structure in memory.
+                // --- ANN rebuild: collect vectors then build index ---
                 let trained = trained.unwrap();
-                let _ = config;
 
                 // Collect vectors from all segments (Flat: direct, non-Flat: from doc store)
                 let mut all_vectors: Vec<(u32, u16, Vec<f32>)> = Vec::new();
