@@ -201,21 +201,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ///
     /// This resets the Built state to Flat, then triggers a fresh training.
     pub async fn rebuild_vector_index(&self) -> Result<()> {
-        let dense_fields: Vec<Field> = self
-            .schema
-            .fields()
-            .filter_map(|(field, entry)| {
-                if entry.field_type == FieldType::DenseVector && entry.indexed {
-                    Some(field)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
+        let dense_fields = self.get_dense_vector_fields();
         if dense_fields.is_empty() {
             return Ok(());
         }
+        let dense_fields: Vec<Field> = dense_fields.into_iter().map(|(f, _)| f).collect();
 
         // Collect files to delete and reset fields to Flat state
         let files_to_delete = {
@@ -498,6 +488,20 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(())
     }
 
+    /// Serialize a trained structure to JSON and save to an index-level file.
+    async fn save_trained_artifact(
+        &self,
+        artifact: &impl serde::Serialize,
+        filename: &str,
+    ) -> Result<()> {
+        let bytes =
+            serde_json::to_vec(artifact).map_err(|e| Error::Serialization(e.to_string()))?;
+        self.directory
+            .write(std::path::Path::new(filename), &bytes)
+            .await?;
+        Ok(())
+    }
+
     /// Train IVF-RaBitQ centroids
     async fn train_ivf_rabitq(
         &self,
@@ -509,13 +513,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ) -> Result<()> {
         let coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
         let centroids = crate::structures::CoarseCentroids::train(&coarse_config, vectors);
-
-        // Save centroids to index-level file
-        let centroids_path = std::path::Path::new(centroids_filename);
-        let centroids_bytes =
-            serde_json::to_vec(&centroids).map_err(|e| Error::Serialization(e.to_string()))?;
-        self.directory
-            .write(centroids_path, &centroids_bytes)
+        self.save_trained_artifact(&centroids, centroids_filename)
             .await?;
 
         log::info!(
@@ -523,7 +521,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             field_id,
             centroids.num_clusters
         );
-
         Ok(())
     }
 
@@ -537,34 +534,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         centroids_filename: &str,
         codebook_filename: &str,
     ) -> Result<()> {
-        // Train coarse centroids
         let coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
         let centroids = crate::structures::CoarseCentroids::train(&coarse_config, vectors);
-
-        // Train PQ codebook
-        let pq_config = crate::structures::PQConfig::new(dim);
-        let codebook = crate::structures::PQCodebook::train(pq_config, vectors, 10);
-
-        // Save centroids
-        let centroids_path = std::path::Path::new(centroids_filename);
-        let centroids_bytes =
-            serde_json::to_vec(&centroids).map_err(|e| Error::Serialization(e.to_string()))?;
-        self.directory
-            .write(centroids_path, &centroids_bytes)
+        self.save_trained_artifact(&centroids, centroids_filename)
             .await?;
 
-        // Save codebook
-        let codebook_path = std::path::Path::new(codebook_filename);
-        let codebook_bytes =
-            serde_json::to_vec(&codebook).map_err(|e| Error::Serialization(e.to_string()))?;
-        self.directory.write(codebook_path, &codebook_bytes).await?;
+        let pq_config = crate::structures::PQConfig::new(dim);
+        let codebook = crate::structures::PQCodebook::train(pq_config, vectors, 10);
+        self.save_trained_artifact(&codebook, codebook_filename)
+            .await?;
 
         log::info!(
             "Saved ScaNN centroids and codebook for field {} ({} clusters)",
             field_id,
             centroids.num_clusters
         );
-
         Ok(())
     }
 }

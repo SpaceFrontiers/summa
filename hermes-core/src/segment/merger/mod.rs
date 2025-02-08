@@ -88,8 +88,6 @@ pub struct MergeStats {
     pub terms_processed: usize,
     /// Peak memory usage in bytes (estimated)
     pub peak_memory_bytes: usize,
-    /// Current memory usage in bytes (estimated)
-    pub current_memory_bytes: usize,
     /// Term dictionary output size
     pub term_dict_bytes: usize,
     /// Postings output size
@@ -401,8 +399,7 @@ impl SegmentMerger {
 
         // Track memory (only term_results is buffered; postings/positions stream to disk)
         let results_mem = term_results.capacity() * std::mem::size_of::<(Vec<u8>, TermInfo)>();
-        stats.current_memory_bytes = results_mem;
-        stats.peak_memory_bytes = stats.peak_memory_bytes.max(stats.current_memory_bytes);
+        stats.peak_memory_bytes = stats.peak_memory_bytes.max(results_mem);
 
         log::info!(
             "[merge] complete: terms={}, segments={}, term_buffer={:.2} MB, postings={}, positions={}",
