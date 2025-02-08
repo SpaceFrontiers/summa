@@ -336,12 +336,8 @@ pub fn convert_reranker(
         ));
     }
 
-    if !entry.stored {
-        return Err(format!(
-            "Reranker field '{}' must be stored",
-            reranker.field
-        ));
-    }
+    // Dense vectors are always available via lazy flat files (.vectors),
+    // no need to check entry.stored — reranking reads from flat data, not store.
 
     if reranker.vector.is_empty() {
         return Err("Reranker query vector must not be empty".to_string());
