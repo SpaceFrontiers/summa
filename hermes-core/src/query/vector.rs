@@ -177,14 +177,9 @@ impl Query for DenseVectorQuery {
         let rerank_factor = self.rerank_factor;
         let combiner = self.combiner;
         Box::pin(async move {
-            let results = reader.search_dense_vector(
-                field,
-                &vector,
-                limit,
-                nprobe,
-                rerank_factor,
-                combiner,
-            )?;
+            let results = reader
+                .search_dense_vector(field, &vector, limit, nprobe, rerank_factor, combiner)
+                .await?;
 
             Ok(Box::new(DenseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)
         })

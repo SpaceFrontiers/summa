@@ -14,7 +14,7 @@ pub trait QuantizedCode: Clone + Send + Sync {
 /// Generic cluster data storage
 ///
 /// Stores document IDs, element ordinals, and quantized codes for vectors in a cluster.
-/// Can optionally store raw vectors for re-ranking.
+/// Reranking uses raw vectors from the document store, not from the index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterData<C: Clone> {
     /// Document IDs (local to segment)
@@ -24,8 +24,6 @@ pub struct ClusterData<C: Clone> {
     pub ordinals: Vec<u16>,
     /// Quantized vector codes
     pub codes: Vec<C>,
-    /// Raw vectors for re-ranking (optional)
-    pub raw_vectors: Option<Vec<Vec<f32>>>,
 }
 
 impl<C: Clone> Default for ClusterData<C> {
@@ -40,7 +38,6 @@ impl<C: Clone> ClusterData<C> {
             doc_ids: Vec::new(),
             ordinals: Vec::new(),
             codes: Vec::new(),
-            raw_vectors: None,
         }
     }
 
@@ -49,7 +46,6 @@ impl<C: Clone> ClusterData<C> {
             doc_ids: Vec::with_capacity(capacity),
             ordinals: Vec::with_capacity(capacity),
             codes: Vec::with_capacity(capacity),
-            raw_vectors: None,
         }
     }
 
@@ -62,14 +58,10 @@ impl<C: Clone> ClusterData<C> {
     }
 
     /// Add a vector to the cluster
-    pub fn add(&mut self, doc_id: u32, ordinal: u16, code: C, raw_vector: Option<Vec<f32>>) {
+    pub fn add(&mut self, doc_id: u32, ordinal: u16, code: C) {
         self.doc_ids.push(doc_id);
         self.ordinals.push(ordinal);
         self.codes.push(code);
-
-        if let Some(raw) = raw_vector {
-            self.raw_vectors.get_or_insert_with(Vec::new).push(raw);
-        }
     }
 
     /// Append another cluster's data (for merging segments)
@@ -79,11 +71,6 @@ impl<C: Clone> ClusterData<C> {
         }
         self.ordinals.extend(other.ordinals.iter().copied());
         self.codes.extend(other.codes.iter().cloned());
-
-        if let Some(ref other_raw) = other.raw_vectors {
-            let raw = self.raw_vectors.get_or_insert_with(Vec::new);
-            raw.extend(other_raw.iter().cloned());
-        }
     }
 
     /// Get iterator over (doc_id, ordinal, code) tuples
@@ -96,29 +83,11 @@ impl<C: Clone> ClusterData<C> {
             .map(|((doc_id, ordinal), code)| (doc_id, ordinal, code))
     }
 
-    /// Get iterator over (doc_id, ordinal, code, optional raw_vector) tuples
-    pub fn iter_with_raw(&self) -> impl Iterator<Item = (u32, u16, &C, Option<&Vec<f32>>)> {
-        let raw_iter = self.raw_vectors.as_ref();
-        self.doc_ids
-            .iter()
-            .copied()
-            .zip(self.ordinals.iter().copied())
-            .zip(self.codes.iter())
-            .enumerate()
-            .map(move |(i, ((doc_id, ordinal), code))| {
-                let raw = raw_iter.and_then(|r| r.get(i));
-                (doc_id, ordinal, code, raw)
-            })
-    }
-
     /// Clear all data
     pub fn clear(&mut self) {
         self.doc_ids.clear();
         self.ordinals.clear();
         self.codes.clear();
-        if let Some(ref mut raw) = self.raw_vectors {
-            raw.clear();
-        }
     }
 
     /// Reserve capacity
@@ -126,9 +95,6 @@ impl<C: Clone> ClusterData<C> {
         self.doc_ids.reserve(additional);
         self.ordinals.reserve(additional);
         self.codes.reserve(additional);
-        if let Some(ref mut raw) = self.raw_vectors {
-            raw.reserve(additional);
-        }
     }
 }
 
@@ -139,13 +105,8 @@ impl<C: Clone + QuantizedCode> ClusterData<C> {
         let doc_ids_size = self.doc_ids.len() * size_of::<u32>();
         let ordinals_size = self.ordinals.len() * size_of::<u16>();
         let codes_size: usize = self.codes.iter().map(|c| c.size_bytes()).sum();
-        let raw_size = self
-            .raw_vectors
-            .as_ref()
-            .map(|vecs| vecs.iter().map(|v| v.len() * size_of::<f32>()).sum())
-            .unwrap_or(0);
 
-        doc_ids_size + ordinals_size + codes_size + raw_size
+        doc_ids_size + ordinals_size + codes_size
     }
 }
 
@@ -180,18 +141,11 @@ impl<C: Clone> ClusterStorage<C> {
     }
 
     /// Add a vector to a cluster
-    pub fn add(
-        &mut self,
-        cluster_id: u32,
-        doc_id: u32,
-        ordinal: u16,
-        code: C,
-        raw_vector: Option<Vec<f32>>,
-    ) {
+    pub fn add(&mut self, cluster_id: u32, doc_id: u32, ordinal: u16, code: C) {
         self.clusters
             .entry(cluster_id)
             .or_default()
-            .add(doc_id, ordinal, code, raw_vector);
+            .add(doc_id, ordinal, code);
         self.total_vectors += 1;
     }
 
@@ -277,22 +231,11 @@ mod tests {
     fn test_cluster_data_basic() {
         let mut cluster: ClusterData<TestCode> = ClusterData::new();
 
-        cluster.add(0, 0, TestCode(vec![1, 2, 3]), None);
-        cluster.add(1, 0, TestCode(vec![4, 5, 6]), None);
+        cluster.add(0, 0, TestCode(vec![1, 2, 3]));
+        cluster.add(1, 0, TestCode(vec![4, 5, 6]));
 
         assert_eq!(cluster.len(), 2);
         assert!(!cluster.is_empty());
-    }
-
-    #[test]
-    fn test_cluster_data_with_raw() {
-        let mut cluster: ClusterData<TestCode> = ClusterData::new();
-
-        cluster.add(0, 0, TestCode(vec![1]), Some(vec![1.0, 2.0, 3.0]));
-        cluster.add(1, 0, TestCode(vec![2]), Some(vec![4.0, 5.0, 6.0]));
-
-        assert!(cluster.raw_vectors.is_some());
-        assert_eq!(cluster.raw_vectors.as_ref().unwrap().len(), 2);
     }
 
     #[test]
@@ -300,9 +243,9 @@ mod tests {
         let mut cluster: ClusterData<TestCode> = ClusterData::new();
 
         // Multi-valued field: doc 0 has 3 vectors
-        cluster.add(0, 0, TestCode(vec![1]), None);
-        cluster.add(0, 1, TestCode(vec![2]), None);
-        cluster.add(0, 2, TestCode(vec![3]), None);
+        cluster.add(0, 0, TestCode(vec![1]));
+        cluster.add(0, 1, TestCode(vec![2]));
+        cluster.add(0, 2, TestCode(vec![3]));
 
         assert_eq!(cluster.len(), 3);
         assert_eq!(cluster.ordinals, vec![0, 1, 2]);
@@ -311,12 +254,12 @@ mod tests {
     #[test]
     fn test_cluster_data_append() {
         let mut cluster1: ClusterData<TestCode> = ClusterData::new();
-        cluster1.add(0, 0, TestCode(vec![1]), None);
-        cluster1.add(1, 0, TestCode(vec![2]), None);
+        cluster1.add(0, 0, TestCode(vec![1]));
+        cluster1.add(1, 0, TestCode(vec![2]));
 
         let mut cluster2: ClusterData<TestCode> = ClusterData::new();
-        cluster2.add(0, 0, TestCode(vec![3]), None);
-        cluster2.add(1, 0, TestCode(vec![4]), None);
+        cluster2.add(0, 0, TestCode(vec![3]));
+        cluster2.add(1, 0, TestCode(vec![4]));
 
         cluster1.append(&cluster2, 100);
 
@@ -328,9 +271,9 @@ mod tests {
     fn test_cluster_storage() {
         let mut storage: ClusterStorage<TestCode> = ClusterStorage::new();
 
-        storage.add(0, 10, 0, TestCode(vec![1]), None);
-        storage.add(0, 11, 0, TestCode(vec![2]), None);
-        storage.add(1, 20, 0, TestCode(vec![3]), None);
+        storage.add(0, 10, 0, TestCode(vec![1]));
+        storage.add(0, 11, 0, TestCode(vec![2]));
+        storage.add(1, 20, 0, TestCode(vec![3]));
 
         assert_eq!(storage.num_clusters(), 2);
         assert_eq!(storage.len(), 3);
@@ -341,11 +284,11 @@ mod tests {
     #[test]
     fn test_cluster_storage_merge() {
         let mut storage1: ClusterStorage<TestCode> = ClusterStorage::new();
-        storage1.add(0, 0, 0, TestCode(vec![1]), None);
+        storage1.add(0, 0, 0, TestCode(vec![1]));
 
         let mut storage2: ClusterStorage<TestCode> = ClusterStorage::new();
-        storage2.add(0, 0, 0, TestCode(vec![2]), None);
-        storage2.add(1, 0, 0, TestCode(vec![3]), None);
+        storage2.add(0, 0, 0, TestCode(vec![2]));
+        storage2.add(1, 0, 0, TestCode(vec![3]));
 
         storage1.merge(&storage2, 100);
 

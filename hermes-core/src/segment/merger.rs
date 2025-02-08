@@ -524,39 +524,50 @@ impl SegmentMerger {
         Ok(TermInfo::external(posting_offset, posting_len, doc_count))
     }
 
-    /// Iterate over all vectors in a segment for a given field, calling `f` for each.
-    /// Handles Flat, RaBitQ, and IVF index types uniformly.
-    /// `doc_id_offset` is added to each doc_id for multi-segment merges.
-    fn for_each_vector(
+    /// Collect all vectors from a segment for a given field.
+    ///
+    /// - **Flat**: reads directly from the flat index (zero-copy slices).
+    /// - **Non-Flat** (RaBitQ, IVF, ScaNN): reads raw vectors from the document store,
+    ///   since quantized indexes no longer store raw vectors.
+    async fn collect_vectors(
         segment: &SegmentReader,
         field: crate::dsl::Field,
         doc_id_offset: u32,
-        mut f: impl FnMut(u32, u16, &[f32]),
-    ) {
+    ) -> Vec<(u32, u16, Vec<f32>)> {
         match segment.vector_indexes().get(&field.0) {
             Some(super::VectorIndex::Flat(flat_data)) => {
+                let mut result = Vec::with_capacity(flat_data.num_vectors());
                 for i in 0..flat_data.num_vectors() {
                     let (doc_id, ordinal) = flat_data.get_doc_id(i);
-                    f(doc_id_offset + doc_id, ordinal, flat_data.get_vector(i));
+                    result.push((
+                        doc_id_offset + doc_id,
+                        ordinal,
+                        flat_data.get_vector(i).to_vec(),
+                    ));
                 }
+                result
             }
-            Some(super::VectorIndex::RaBitQ(index)) => {
-                if let Some(raw_vecs) = &index.raw_vectors {
-                    for (i, vec) in raw_vecs.iter().enumerate() {
-                        f(doc_id_offset + i as u32, 0, vec);
-                    }
-                }
-            }
-            Some(super::VectorIndex::IVF { index, .. }) => {
-                for cluster in index.clusters.clusters.values() {
-                    if let Some(ref raw_vecs) = cluster.raw_vectors {
-                        for (i, raw) in raw_vecs.iter().enumerate() {
-                            f(doc_id_offset + cluster.doc_ids[i], cluster.ordinals[i], raw);
+            Some(_) => {
+                // Non-flat index: read raw vectors from the document store
+                let mut result = Vec::new();
+                let schema = segment.schema();
+                let store = segment.store();
+                for doc_id in 0..segment.num_docs() {
+                    if let Ok(Some(doc)) = store.get(doc_id, schema).await {
+                        let mut ordinal = 0u16;
+                        for (f, val) in doc.field_values() {
+                            if f.0 == field.0
+                                && let Some(vec) = val.as_dense_vector()
+                            {
+                                result.push((doc_id_offset + doc_id, ordinal, vec.to_vec()));
+                                ordinal += 1;
+                            }
                         }
                     }
                 }
+                result
             }
-            _ => {}
+            None => Vec::new(),
         }
     }
 
@@ -711,35 +722,31 @@ impl SegmentMerger {
                 // --- Streaming ANN rebuild: iterate segments, call add_vector ---
                 // No Vec<Vec<f32>> collection — only the ANN index structure in memory.
                 let trained = trained.unwrap();
-                let config = config.unwrap();
-                let mut total_vectors = 0usize;
+                let _ = config;
+
+                // Collect vectors from all segments (Flat: direct, non-Flat: from doc store)
+                let mut all_vectors: Vec<(u32, u16, Vec<f32>)> = Vec::new();
+                for (seg_idx, segment) in segments.iter().enumerate() {
+                    let offset = doc_offs[seg_idx];
+                    let vecs = Self::collect_vectors(segment, field, offset).await;
+                    all_vectors.extend(vecs);
+                }
+                let total_vectors = all_vectors.len();
 
                 match ann {
                     VectorIndexType::IvfRaBitQ => {
                         let centroids = &trained.centroids[&field.0];
                         let rabitq_config = crate::structures::RaBitQConfig::new(dim);
                         let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
-                        let ivf_config = crate::structures::IVFRaBitQConfig::new(dim)
-                            .with_store_raw(config.store_raw);
+                        let ivf_config = crate::structures::IVFRaBitQConfig::new(dim);
                         let mut ivf_index = crate::structures::IVFRaBitQIndex::new(
                             ivf_config,
                             centroids.version,
                             codebook.version,
                         );
 
-                        // Stream vectors from each segment directly into the index
-                        for (seg_idx, segment) in segments.iter().enumerate() {
-                            let offset = doc_offs[seg_idx];
-                            Self::for_each_vector(
-                                segment,
-                                field,
-                                offset,
-                                |doc_id, ordinal, vec| {
-                                    ivf_index
-                                        .add_vector(centroids, &codebook, doc_id, ordinal, vec);
-                                    total_vectors += 1;
-                                },
-                            );
+                        for (doc_id, ordinal, vec) in &all_vectors {
+                            ivf_index.add_vector(centroids, &codebook, *doc_id, *ordinal, vec);
                         }
 
                         let index_data = super::builder::IVFRaBitQIndexData {
@@ -756,7 +763,7 @@ impl SegmentMerger {
                             data: bytes,
                         });
                         log::info!(
-                            "Rebuilt IVF-RaBitQ for field {} ({} vectors, streaming)",
+                            "Rebuilt IVF-RaBitQ for field {} ({} vectors)",
                             field.0,
                             total_vectors
                         );
@@ -771,19 +778,8 @@ impl SegmentMerger {
                             codebook.version,
                         );
 
-                        // Stream vectors from each segment directly into the index
-                        for (seg_idx, segment) in segments.iter().enumerate() {
-                            let offset = doc_offs[seg_idx];
-                            Self::for_each_vector(
-                                segment,
-                                field,
-                                offset,
-                                |doc_id, ordinal, vec| {
-                                    ivf_pq_index
-                                        .add_vector(centroids, codebook, doc_id, ordinal, vec);
-                                    total_vectors += 1;
-                                },
-                            );
+                        for (doc_id, ordinal, vec) in &all_vectors {
+                            ivf_pq_index.add_vector(centroids, codebook, *doc_id, *ordinal, vec);
                         }
 
                         let index_data = super::builder::ScaNNIndexData {
@@ -800,7 +796,7 @@ impl SegmentMerger {
                             data: bytes,
                         });
                         log::info!(
-                            "Rebuilt ScaNN for field {} ({} vectors, streaming)",
+                            "Rebuilt ScaNN for field {} ({} vectors)",
                             field.0,
                             total_vectors
                         );
@@ -829,43 +825,38 @@ impl SegmentMerger {
                     });
                 }
             } else {
-                // --- Non-flat segments without ANN: serialize as Flat blob ---
-                // Stream vectors through a writer buffer (no Vec<Vec<f32>>)
-                let mut total_vectors = 0usize;
-                for segment in segments {
-                    Self::for_each_vector(segment, field, 0, |_, _, _| {
-                        total_vectors += 1;
-                    });
+                // --- Non-flat segments without ANN: collect from store, serialize as Flat ---
+                let mut all_vectors: Vec<(u32, u16, Vec<f32>)> = Vec::new();
+                for (seg_idx, segment) in segments.iter().enumerate() {
+                    let offset = doc_offs[seg_idx];
+                    let vecs = Self::collect_vectors(segment, field, offset).await;
+                    all_vectors.extend(vecs);
                 }
-                if total_vectors == 0 {
+                if all_vectors.is_empty() {
                     continue;
                 }
 
+                let total_vectors = all_vectors.len();
                 let total_size = FlatVectorData::serialized_binary_size(dim, total_vectors);
                 let mut buf = Vec::with_capacity(total_size);
                 FlatVectorData::write_binary_header(dim, total_vectors, &mut buf)
                     .map_err(|e| crate::Error::Serialization(e.to_string()))?;
 
                 // Pass 1: write vectors
-                for segment in segments {
-                    Self::for_each_vector(segment, field, 0, |_, _, vec| {
-                        let bytes: &[u8] = unsafe {
-                            std::slice::from_raw_parts(
-                                vec.as_ptr() as *const u8,
-                                std::mem::size_of_val(vec),
-                            )
-                        };
-                        let _ = buf.write_all(bytes);
-                    });
+                for (_, _, vec) in &all_vectors {
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            vec.as_ptr() as *const u8,
+                            std::mem::size_of_val(vec.as_slice()),
+                        )
+                    };
+                    let _ = buf.write_all(bytes);
                 }
 
-                // Pass 2: write doc_ids with offsets
-                for (seg_idx, segment) in segments.iter().enumerate() {
-                    let offset = doc_offs[seg_idx];
-                    Self::for_each_vector(segment, field, offset, |doc_id, ordinal, _| {
-                        let _ = buf.write_all(&doc_id.to_le_bytes());
-                        let _ = buf.write_all(&ordinal.to_le_bytes());
-                    });
+                // Pass 2: write doc_ids
+                for (doc_id, ordinal, _) in &all_vectors {
+                    let _ = buf.write_all(&doc_id.to_le_bytes());
+                    let _ = buf.write_all(&ordinal.to_le_bytes());
                 }
 
                 blob_fields.push(BlobField {

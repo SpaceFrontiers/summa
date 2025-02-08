@@ -20,10 +20,6 @@ pub struct IVFPQConfig {
     pub dim: usize,
     /// Number of clusters to probe during search
     pub default_nprobe: usize,
-    /// Store raw vectors for re-ranking
-    pub store_raw: bool,
-    /// Re-rank factor (multiply k by this to get candidates for re-ranking)
-    pub rerank_factor: usize,
 }
 
 impl IVFPQConfig {
@@ -31,23 +27,11 @@ impl IVFPQConfig {
         Self {
             dim,
             default_nprobe: 32,
-            store_raw: true,
-            rerank_factor: 10,
         }
     }
 
     pub fn with_nprobe(mut self, nprobe: usize) -> Self {
         self.default_nprobe = nprobe;
-        self
-    }
-
-    pub fn with_store_raw(mut self, store: bool) -> Self {
-        self.store_raw = store;
-        self
-    }
-
-    pub fn with_rerank_factor(mut self, factor: usize) -> Self {
-        self.rerank_factor = factor;
         self
     }
 }
@@ -116,7 +100,6 @@ impl IVFPQIndex {
             doc_id,
             ordinal,
             vector,
-            true,
         );
 
         // Add to secondary clusters (SOAR)
@@ -132,12 +115,10 @@ impl IVFPQIndex {
                 doc_id,
                 ordinal,
                 vector,
-                false, // Don't store raw for secondary
             );
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn add_to_cluster(
         &mut self,
         coarse_centroids: &CoarseCentroids,
@@ -146,7 +127,6 @@ impl IVFPQIndex {
         doc_id: u32,
         ordinal: u16,
         vector: &[f32],
-        store_raw: bool,
     ) {
         let cluster_id = assignment.primary_cluster;
         let centroid = coarse_centroids.get_centroid(cluster_id);
@@ -154,14 +134,7 @@ impl IVFPQIndex {
         // Encode residual with PQ
         let code = codebook.encode(vector, Some(centroid));
 
-        // Store
-        let raw = if store_raw && self.config.store_raw {
-            Some(vector.to_vec())
-        } else {
-            None
-        };
-
-        self.clusters.add(cluster_id, doc_id, ordinal, code, raw);
+        self.clusters.add(cluster_id, doc_id, ordinal, code);
     }
 
     /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
@@ -194,47 +167,8 @@ impl IVFPQIndex {
             }
         }
 
-        // Sort by distance
+        // Sort by distance and truncate
         candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-
-        // Re-rank top candidates if raw vectors available
-        let rerank_count = (k * self.config.rerank_factor).min(candidates.len());
-
-        if rerank_count > 0 {
-            let has_raw = nearest_clusters.iter().any(|&c| {
-                self.clusters
-                    .get(c)
-                    .map(|cl| cl.raw_vectors.is_some())
-                    .unwrap_or(false)
-            });
-
-            if has_raw {
-                let mut reranked: Vec<(u32, u16, f32)> = candidates[..rerank_count]
-                    .iter()
-                    .filter_map(|&(doc_id, ordinal, _)| {
-                        for &cluster_id in &nearest_clusters {
-                            if let Some(cluster) = self.clusters.get(cluster_id)
-                                && let Some(ref raw_vecs) = cluster.raw_vectors
-                            {
-                                for (i, &did) in cluster.doc_ids.iter().enumerate() {
-                                    if did == doc_id {
-                                        let exact_dist =
-                                            euclidean_distance_squared(query, &raw_vecs[i]);
-                                        return Some((doc_id, ordinal, exact_dist));
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    })
-                    .collect();
-
-                reranked.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-                reranked.truncate(k);
-                return reranked;
-            }
-        }
-
         candidates.truncate(k);
         candidates
     }
@@ -339,18 +273,6 @@ impl IVFPQIndex {
 
         Ok(merged)
     }
-}
-
-/// Compute squared Euclidean distance
-#[inline]
-fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
 }
 
 #[cfg(test)]

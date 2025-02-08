@@ -929,7 +929,6 @@ mod tests {
             DenseVectorConfig {
                 dim: 8,
                 index_type: VectorIndexType::IvfRaBitQ,
-                store_raw: true,
                 num_clusters: Some(4), // Small for test
                 nprobe: 2,
                 mrl_dim: None,
@@ -978,6 +977,7 @@ mod tests {
                 1,
                 crate::query::MultiValueCombiner::Max,
             )
+            .await
             .unwrap();
         assert!(!results.is_empty(), "Flat search should return results");
 
@@ -1021,6 +1021,7 @@ mod tests {
                 1,
                 crate::query::MultiValueCombiner::Max,
             )
+            .await
             .unwrap();
         assert!(
             !results.is_empty(),

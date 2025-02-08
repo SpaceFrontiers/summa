@@ -28,8 +28,6 @@ pub struct RaBitQIndex {
     pub ordinals: Vec<u16>,
     /// Quantized vectors
     pub vectors: Vec<QuantizedVector>,
-    /// Raw vectors for re-ranking (optional)
-    pub raw_vectors: Option<Vec<Vec<f32>>>,
 }
 
 impl RaBitQIndex {
@@ -44,7 +42,6 @@ impl RaBitQIndex {
             doc_ids: Vec::new(),
             ordinals: Vec::new(),
             vectors: Vec::new(),
-            raw_vectors: None,
         }
     }
 
@@ -52,7 +49,6 @@ impl RaBitQIndex {
     pub fn build_with_ids(
         config: RaBitQConfig,
         vectors: &[(u32, u16, Vec<f32>)], // (doc_id, ordinal, vector)
-        store_raw: bool,
     ) -> Self {
         let n = vectors.len();
         let dim = config.dim;
@@ -81,34 +77,25 @@ impl RaBitQIndex {
             .map(|(_, _, v)| index.codebook.encode(v, Some(&index.centroid)))
             .collect();
 
-        if store_raw {
-            index.raw_vectors = Some(vectors.iter().map(|(_, _, v)| v.clone()).collect());
-        }
-
         index
     }
 
     /// Build index from a set of vectors (legacy, uses doc_id = index, ordinal = 0)
-    pub fn build(config: RaBitQConfig, vectors: &[Vec<f32>], store_raw: bool) -> Self {
+    pub fn build(config: RaBitQConfig, vectors: &[Vec<f32>]) -> Self {
         let with_ids: Vec<(u32, u16, Vec<f32>)> = vectors
             .iter()
             .enumerate()
             .map(|(i, v)| (i as u32, 0u16, v.clone()))
             .collect();
-        Self::build_with_ids(config, &with_ids, store_raw)
+        Self::build_with_ids(config, &with_ids)
     }
 
     /// Add a single vector to the index
-    pub fn add_vector(&mut self, doc_id: u32, ordinal: u16, vector: &[f32], raw: Option<Vec<f32>>) {
+    pub fn add_vector(&mut self, doc_id: u32, ordinal: u16, vector: &[f32]) {
         self.doc_ids.push(doc_id);
         self.ordinals.push(ordinal);
         self.vectors
             .push(self.codebook.encode(vector, Some(&self.centroid)));
-        if let Some(ref mut raw_vectors) = self.raw_vectors
-            && let Some(r) = raw
-        {
-            raw_vectors.push(r);
-        }
     }
 
     /// Prepare a query for fast distance estimation
@@ -123,7 +110,7 @@ impl RaBitQIndex {
     }
 
     /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
-    pub fn search(&self, query: &[f32], k: usize, rerank_factor: usize) -> Vec<(u32, u16, f32)> {
+    pub fn search(&self, query: &[f32], k: usize, _rerank_factor: usize) -> Vec<(u32, u16, f32)> {
         let prepared = self.prepare_query(query);
 
         // Phase 1: Estimate distances for all vectors
@@ -137,28 +124,10 @@ impl RaBitQIndex {
         // Sort by estimated distance
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Phase 2: Re-rank top candidates with exact distances
-        let rerank_count = (k * rerank_factor).min(candidates.len());
-
-        let results = if let Some(ref raw_vectors) = self.raw_vectors {
-            let mut reranked: Vec<(usize, f32)> = candidates[..rerank_count]
-                .iter()
-                .map(|&(idx, _)| {
-                    let exact_dist = euclidean_distance_squared(query, &raw_vectors[idx]);
-                    (idx, exact_dist)
-                })
-                .collect();
-
-            reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            reranked.truncate(k);
-            reranked
-        } else {
-            candidates.truncate(k);
-            candidates
-        };
+        candidates.truncate(k);
 
         // Map indices to (doc_id, ordinal, dist)
-        results
+        candidates
             .into_iter()
             .map(|(idx, dist)| (self.doc_ids[idx], self.ordinals[idx], dist))
             .collect()
@@ -182,13 +151,7 @@ impl RaBitQIndex {
         let doc_ids_size = self.doc_ids.len() * size_of::<u32>();
         let ordinals_size = self.ordinals.len() * size_of::<u16>();
         let codebook_size = self.codebook.size_bytes();
-        let raw_size = self
-            .raw_vectors
-            .as_ref()
-            .map(|vecs| vecs.iter().map(|v| v.len() * size_of::<f32>()).sum())
-            .unwrap_or(0);
-
-        vectors_size + centroid_size + doc_ids_size + ordinals_size + codebook_size + raw_size
+        vectors_size + centroid_size + doc_ids_size + ordinals_size + codebook_size
     }
 
     /// Estimated memory usage in bytes (alias for size_bytes)
@@ -220,18 +183,6 @@ impl RaBitQIndex {
     }
 }
 
-/// Compute squared Euclidean distance
-#[inline]
-fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,7 +199,7 @@ mod tests {
             .collect();
 
         let config = RaBitQConfig::new(dim);
-        let index = RaBitQIndex::build(config, &vectors, true);
+        let index = RaBitQIndex::build(config, &vectors);
 
         assert_eq!(index.len(), n);
         println!("Compression ratio: {:.1}x", index.compression_ratio());
@@ -266,7 +217,7 @@ mod tests {
             .collect();
 
         let config = RaBitQConfig::new(dim);
-        let index = RaBitQIndex::build(config, &vectors, true);
+        let index = RaBitQIndex::build(config, &vectors);
 
         let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
         let results = index.search(&query, k, 10);

@@ -116,9 +116,6 @@ pub struct DenseVectorConfig {
     /// When in accumulating state, search uses brute-force regardless of this setting.
     #[serde(default)]
     pub index_type: VectorIndexType,
-    /// Whether to store raw vectors for re-ranking (increases storage but improves accuracy)
-    #[serde(default = "default_store_raw")]
-    pub store_raw: bool,
     /// Number of IVF clusters for IVF-RaBitQ and ScaNN (default: sqrt(n) capped at 4096)
     /// If None, automatically determined based on dataset size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,10 +135,6 @@ pub struct DenseVectorConfig {
     pub build_threshold: Option<usize>,
 }
 
-fn default_store_raw() -> bool {
-    true
-}
-
 fn default_nprobe() -> usize {
     32
 }
@@ -151,7 +144,6 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::RaBitQ,
-            store_raw: true,
             num_clusters: None,
             nprobe: 32,
             mrl_dim: None,
@@ -164,7 +156,6 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::IvfRaBitQ,
-            store_raw: true,
             num_clusters,
             nprobe,
             mrl_dim: None,
@@ -177,7 +168,6 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::ScaNN,
-            store_raw: true,
             num_clusters,
             nprobe,
             mrl_dim: None,
@@ -190,21 +180,8 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::Flat,
-            store_raw: true,
             num_clusters: None,
             nprobe: 0,
-            mrl_dim: None,
-            build_threshold: None,
-        }
-    }
-
-    pub fn without_raw(dim: usize) -> Self {
-        Self {
-            dim,
-            index_type: VectorIndexType::RaBitQ,
-            store_raw: false,
-            num_clusters: None,
-            nprobe: 32,
             mrl_dim: None,
             build_threshold: None,
         }

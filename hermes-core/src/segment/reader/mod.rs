@@ -403,7 +403,7 @@ impl AsyncSegmentReader {
     /// The doc_ids are adjusted by doc_id_offset for this segment.
     /// If mrl_dim is configured, the query vector is automatically trimmed.
     /// For multi-valued documents, scores are combined using the specified combiner.
-    pub fn search_dense_vector(
+    pub async fn search_dense_vector(
         &self,
         field: Field,
         query: &[f32],
@@ -437,8 +437,11 @@ impl AsyncSegmentReader {
             query
         };
 
+        // Check if the field is stored (for store-based reranking)
+        let field_is_stored = self.schema.get_field_entry(field).is_some_and(|e| e.stored);
+
         // Results are (doc_id, ordinal, score) where score = similarity (higher = better)
-        let results: Vec<(u32, u16, f32)> = match index {
+        let mut results: Vec<(u32, u16, f32)> = match index {
             VectorIndex::Flat(flat_data) => {
                 // Brute-force search using cosine similarity
                 use crate::structures::simd::cosine_similarity;
@@ -472,13 +475,14 @@ impl AsyncSegmentReader {
                     Error::Schema("IVF index requires coarse centroids".to_string())
                 })?;
                 let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
-                // IVF returns euclidean distances — convert to scores
+                // Fetch extra candidates for reranking from store
+                let fetch_k = k * rerank_factor.max(1);
                 index
                     .search(
                         centroids,
                         codebook,
                         effective_query,
-                        k,
+                        fetch_k,
                         Some(effective_nprobe),
                     )
                     .into_iter()
@@ -490,13 +494,13 @@ impl AsyncSegmentReader {
                     Error::Schema("ScaNN index requires coarse centroids".to_string())
                 })?;
                 let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
-                // ScaNN returns euclidean distances — convert to scores
+                let fetch_k = k * rerank_factor.max(1);
                 index
                     .search(
                         centroids,
                         codebook,
                         effective_query,
-                        k,
+                        fetch_k,
                         Some(effective_nprobe),
                     )
                     .into_iter()
@@ -504,6 +508,48 @@ impl AsyncSegmentReader {
                     .collect()
             }
         };
+
+        // Rerank IVF/ScaNN candidates from document store
+        if matches!(index, VectorIndex::IVF { .. } | VectorIndex::ScaNN { .. })
+            && field_is_stored
+            && !results.is_empty()
+        {
+            use crate::structures::simd::cosine_similarity;
+
+            // Collect unique doc_ids to batch-fetch from store
+            let mut unique_docs: Vec<u32> = results.iter().map(|r| r.0).collect();
+            unique_docs.sort_unstable();
+            unique_docs.dedup();
+
+            // Fetch raw vectors from store for each unique doc
+            let mut doc_vectors: rustc_hash::FxHashMap<u32, Vec<Vec<f32>>> =
+                rustc_hash::FxHashMap::default();
+            for &doc_id in &unique_docs {
+                if let Ok(Some(doc)) = self.store.get(doc_id, &self.schema).await {
+                    let vecs: Vec<Vec<f32>> = doc
+                        .field_values()
+                        .iter()
+                        .filter(|(f, _)| f.0 == field.0)
+                        .filter_map(|(_, v)| v.as_dense_vector().map(|v| v.to_vec()))
+                        .collect();
+                    if !vecs.is_empty() {
+                        doc_vectors.insert(doc_id, vecs);
+                    }
+                }
+            }
+
+            // Rerank with exact cosine similarity
+            for c in &mut results {
+                if let Some(vecs) = doc_vectors.get(&c.0) {
+                    let ordinal = c.1 as usize;
+                    if let Some(raw) = vecs.get(ordinal) {
+                        c.2 = cosine_similarity(effective_query, raw);
+                    }
+                }
+            }
+            results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            results.truncate(k * rerank_factor.max(1));
+        }
 
         // Track ordinals with individual scores for each doc_id
         // Note: doc_id_offset is NOT applied here - the collector applies it uniformly
