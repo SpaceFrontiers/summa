@@ -37,13 +37,14 @@ struct FlatStreamField {
     quantization: DenseVectorQuantization,
 }
 
-/// Batch size for streaming vector reads (1024 vectors × 1024 dims × 4 bytes ≈ 4MB)
+/// Batch size for streaming vector reads (1024 vectors at a time)
 const VECTOR_BATCH_SIZE: usize = 1024;
 
 /// Streams vectors from a segment's lazy flat data into an add_fn callback.
 ///
 /// Reads vectors in batches of VECTOR_BATCH_SIZE to bound memory usage.
-/// Each batch is a single range read via LazyFileSlice.
+/// Each batch is a single range read via LazyFileSlice. Vectors are
+/// dequantized to f32 regardless of storage quantization (f16, u8, f32).
 ///
 /// Returns number of vectors added.
 async fn feed_segment(
@@ -52,6 +53,8 @@ async fn feed_segment(
     doc_id_offset: u32,
     mut add_fn: impl FnMut(u32, u16, &[f32]),
 ) -> usize {
+    use crate::structures::simd::{f16_to_f32, u8_to_f32};
+
     let lazy_flat = match segment.flat_vectors().get(&field.0) {
         Some(f) => f,
         None => return 0,
@@ -61,7 +64,9 @@ async fn feed_segment(
         return 0;
     }
     let dim = lazy_flat.dim;
+    let quant = lazy_flat.quantization;
     let mut count = 0;
+    let mut f32_buf: Vec<f32> = Vec::new();
 
     for batch_start in (0..n).step_by(VECTOR_BATCH_SIZE) {
         let batch_count = VECTOR_BATCH_SIZE.min(n - batch_start);
@@ -72,29 +77,44 @@ async fn feed_segment(
         let raw = batch_bytes.as_slice();
         let batch_floats = batch_count * dim;
 
-        // Use mmap bytes directly if f32-aligned, otherwise copy once
-        let mut aligned_buf: Vec<f32> = Vec::new();
-        let vectors: &[f32] = if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
-        {
-            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats) }
-        } else {
-            aligned_buf.resize(batch_floats, 0.0);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    raw.as_ptr(),
-                    aligned_buf.as_mut_ptr() as *mut u8,
-                    batch_floats * std::mem::size_of::<f32>(),
-                );
+        // Dequantize raw bytes to f32 based on storage quantization
+        f32_buf.resize(batch_floats, 0.0);
+        match quant {
+            DenseVectorQuantization::F32 => {
+                if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+                    f32_buf.copy_from_slice(unsafe {
+                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats)
+                    });
+                } else {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            raw.as_ptr(),
+                            f32_buf.as_mut_ptr() as *mut u8,
+                            batch_floats * std::mem::size_of::<f32>(),
+                        );
+                    }
+                }
             }
-            &aligned_buf
-        };
+            DenseVectorQuantization::F16 => {
+                let f16_slice =
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, batch_floats) };
+                for (i, &h) in f16_slice.iter().enumerate() {
+                    f32_buf[i] = f16_to_f32(h);
+                }
+            }
+            DenseVectorQuantization::UInt8 => {
+                for (i, &b) in raw.iter().enumerate().take(batch_floats) {
+                    f32_buf[i] = u8_to_f32(b);
+                }
+            }
+        }
 
         for i in 0..batch_count {
             let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
             add_fn(
                 doc_id_offset + doc_id,
                 ordinal,
-                &vectors[i * dim..(i + 1) * dim],
+                &f32_buf[i * dim..(i + 1) * dim],
             );
             count += 1;
         }

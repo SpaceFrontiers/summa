@@ -655,6 +655,17 @@ pub fn deserialize_document(data: &[u8], _schema: &Schema) -> io::Result<Documen
                 // DenseVector
                 let count = reader.read_u32::<LittleEndian>()? as usize;
                 let byte_len = count * 4;
+                if reader.len() < byte_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "dense vector field {}: need {} bytes but only {} remain",
+                            field.0,
+                            byte_len,
+                            reader.len()
+                        ),
+                    ));
+                }
                 let mut values = vec![0.0f32; count];
                 // Read raw f32 bytes directly
                 unsafe {
