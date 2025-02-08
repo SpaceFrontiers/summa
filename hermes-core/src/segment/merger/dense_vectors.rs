@@ -9,7 +9,6 @@
 //! never from the document store.
 
 use std::io::Write;
-use std::mem::size_of;
 
 use super::OffsetWriter;
 use super::SegmentMerger;
@@ -21,6 +20,7 @@ use crate::dsl::{DenseVectorQuantization, FieldType, VectorIndexType};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::segment::vector_data::FlatVectorData;
+use crate::structures::simd::{f16_to_f32, u8_to_f32};
 
 /// Pre-serialized field data (ANN indexes, cluster merges)
 struct BlobField {
@@ -53,8 +53,6 @@ async fn feed_segment(
     doc_id_offset: u32,
     mut add_fn: impl FnMut(u32, u16, &[f32]),
 ) -> usize {
-    use crate::structures::simd::{f16_to_f32, u8_to_f32};
-
     let lazy_flat = match segment.flat_vectors().get(&field.0) {
         Some(f) => f,
         None => return 0,
@@ -81,21 +79,20 @@ async fn feed_segment(
         f32_buf.resize(batch_floats, 0.0);
         match quant {
             DenseVectorQuantization::F32 => {
-                if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-                    f32_buf.copy_from_slice(unsafe {
-                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats)
-                    });
-                } else {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            raw.as_ptr(),
-                            f32_buf.as_mut_ptr() as *mut u8,
-                            batch_floats * std::mem::size_of::<f32>(),
-                        );
-                    }
-                }
+                // Data-first file layout guarantees 4-byte alignment
+                debug_assert!(
+                    (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                    "f32 vector data not 4-byte aligned"
+                );
+                f32_buf.copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats)
+                });
             }
             DenseVectorQuantization::F16 => {
+                debug_assert!(
+                    (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+                    "f16 vector data not 2-byte aligned"
+                );
                 let f16_slice =
                     unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, batch_floats) };
                 for (i, &h) in f16_slice.iter().enumerate() {
@@ -151,15 +148,14 @@ impl SegmentMerger {
             let config = entry.dense_vector_config.as_ref();
 
             // Full dimension from lazy flat (for Flat entries and reranking)
-            let full_dim: usize = segments
+            let dim: usize = segments
                 .iter()
                 .filter_map(|s| s.flat_vectors().get(&field.0).map(|f| f.dim))
                 .find(|&d| d > 0)
                 .unwrap_or(0);
-            if full_dim == 0 {
+            if dim == 0 {
                 continue;
             }
-            let dim = full_dim;
 
             // Count total vectors across all segments (from lazy flat)
             let total_vectors: usize = segments
@@ -181,7 +177,7 @@ impl SegmentMerger {
             if total_vectors > 0 {
                 flat_fields.push(FlatStreamField {
                     field_id: field.0,
-                    dim: full_dim,
+                    dim,
                     total_vectors,
                     quantization,
                 });
@@ -311,6 +307,8 @@ impl SegmentMerger {
                 let mut total_fed = 0usize;
 
                 match ann {
+                    // Flat and RaBitQ are filtered out by ann_type match above
+                    VectorIndexType::Flat | VectorIndexType::RaBitQ => unreachable!(),
                     VectorIndexType::IvfRaBitQ => {
                         let centroids = &trained.centroids[&field.0];
                         let rabitq_config = crate::structures::RaBitQConfig::new(dim);
@@ -390,88 +388,74 @@ impl SegmentMerger {
                             total_fed
                         );
                     }
-                    _ => {}
                 }
             }
         }
 
-        // --- Write vectors file ---
+        // --- Write vectors file (data-first, TOC at end) ---
+        //
+        // Format: [field data...] [TOC entries] [footer]
+        // Data starts at file offset 0 → mmap page-aligned, no alignment copies needed.
+        // Footer (last 16 bytes): toc_offset(u64) + num_fields(u32) + magic(u32)
         let total_entries = blob_fields.len() + flat_fields.len();
         if total_entries == 0 {
             return Ok(0);
         }
 
-        struct FieldEntry {
+        /// Magic number for vectors file footer ("VEC2" in LE)
+        const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
+
+        struct WrittenEntry {
             field_id: u32,
             index_type: u8,
+            data_offset: u64,
             data_size: u64,
+        }
+
+        // Build write order: sort by (field_id, index_type)
+        struct PendingEntry {
+            field_id: u32,
+            index_type: u8,
             blob_idx: Option<usize>,
             flat_idx: Option<usize>,
         }
-
-        // Flat entries first (sorted by field_id), then ANN blobs
-        // Loader processes sequentially: ANN overwrites Flat in vector_indexes,
-        // but both are stored — Flat goes to flat_vectors, ANN goes to vector_indexes.
-        let mut entries: Vec<FieldEntry> = Vec::with_capacity(total_entries);
+        let mut pending: Vec<PendingEntry> = Vec::with_capacity(total_entries);
 
         for (i, flat) in flat_fields.iter().enumerate() {
-            entries.push(FieldEntry {
+            pending.push(PendingEntry {
                 field_id: flat.field_id,
                 index_type: 4,
-                data_size: FlatVectorData::serialized_binary_size(
-                    flat.dim,
-                    flat.total_vectors,
-                    flat.quantization,
-                ) as u64,
                 blob_idx: None,
                 flat_idx: Some(i),
             });
         }
-
         for (i, blob) in blob_fields.iter().enumerate() {
-            entries.push(FieldEntry {
+            pending.push(PendingEntry {
                 field_id: blob.field_id,
                 index_type: blob.index_type,
-                data_size: blob.data.len() as u64,
                 blob_idx: Some(i),
                 flat_idx: None,
             });
         }
-
-        // Sort by (field_id, index_type) so Flat (4) comes after ANN (1,2) for same field
-        entries.sort_by(|a, b| {
+        pending.sort_by(|a, b| {
             a.field_id
                 .cmp(&b.field_id)
                 .then(a.index_type.cmp(&b.index_type))
         });
 
-        // Write header + data
+        // Stream data first — track offsets as we go
         use byteorder::{LittleEndian, WriteBytesExt};
         let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
+        let mut toc: Vec<WrittenEntry> = Vec::with_capacity(total_entries);
 
-        let per_field_entry =
-            size_of::<u32>() + size_of::<u8>() + size_of::<u64>() + size_of::<u64>();
-        let header_size = size_of::<u32>() + entries.len() * per_field_entry;
+        for entry in &pending {
+            let data_offset = writer.offset();
 
-        writer.write_u32::<LittleEndian>(entries.len() as u32)?;
-
-        let mut current_offset = header_size as u64;
-        for entry in &entries {
-            writer.write_u32::<LittleEndian>(entry.field_id)?;
-            writer.write_u8(entry.index_type)?;
-            writer.write_u64::<LittleEndian>(current_offset)?;
-            writer.write_u64::<LittleEndian>(entry.data_size)?;
-            current_offset += entry.data_size;
-        }
-
-        // Write field data
-        for entry in &entries {
             if let Some(blob_idx) = entry.blob_idx {
                 writer.write_all(&blob_fields[blob_idx].data)?;
             } else if let Some(flat_idx) = entry.flat_idx {
                 let flat = &flat_fields[flat_idx];
 
-                // Write binary header with quantization type
                 FlatVectorData::write_binary_header(
                     flat.dim,
                     flat.total_vectors,
@@ -479,7 +463,7 @@ impl SegmentMerger {
                     &mut writer,
                 )?;
 
-                // Pass 1: stream raw vector bytes in chunks from each segment's lazy flat
+                // Pass 1: stream raw vector bytes in chunks
                 for segment in segments {
                     if let Some(lazy_flat) = segment.flat_vectors().get(&entry.field_id) {
                         let total_bytes = lazy_flat.vector_bytes_len();
@@ -510,7 +494,35 @@ impl SegmentMerger {
                     }
                 }
             }
+
+            let data_size = writer.offset() - data_offset;
+            toc.push(WrittenEntry {
+                field_id: entry.field_id,
+                index_type: entry.index_type,
+                data_offset,
+                data_size,
+            });
+
+            // Pad to 8-byte boundary so next field's mmap slice is aligned
+            let pad = (8 - (writer.offset() % 8)) % 8;
+            if pad > 0 {
+                writer.write_all(&[0u8; 8][..pad as usize])?;
+            }
         }
+
+        // Write TOC at end
+        let toc_offset = writer.offset();
+        for entry in &toc {
+            writer.write_u32::<LittleEndian>(entry.field_id)?;
+            writer.write_u8(entry.index_type)?;
+            writer.write_u64::<LittleEndian>(entry.data_offset)?;
+            writer.write_u64::<LittleEndian>(entry.data_size)?;
+        }
+
+        // Write footer: toc_offset(8) + num_fields(4) + magic(4) = 16 bytes
+        writer.write_u64::<LittleEndian>(toc_offset)?;
+        writer.write_u32::<LittleEndian>(toc.len() as u32)?;
+        writer.write_u32::<LittleEndian>(VECTORS_FOOTER_MAGIC)?;
 
         let output_size = writer.offset() as usize;
         writer.finish()?;

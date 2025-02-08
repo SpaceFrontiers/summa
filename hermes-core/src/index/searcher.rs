@@ -110,7 +110,7 @@ impl<D: Directory + 'static> Searcher<D> {
         #[cfg(feature = "native")]
         {
             let tracker = Arc::new(SegmentTracker::new());
-            let snapshot = SegmentSnapshot::new(tracker, directory, segment_ids.to_vec());
+            let snapshot = SegmentSnapshot::new(tracker, segment_ids.to_vec());
             Ok(Self {
                 _snapshot: snapshot,
                 segments,

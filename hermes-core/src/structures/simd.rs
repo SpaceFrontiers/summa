@@ -2072,6 +2072,13 @@ pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, sc
     let vec_bytes = dim * 2;
     debug_assert!(vectors_raw.len() >= n * vec_bytes);
 
+    // Vectors file uses data-first layout with 8-byte padding between fields,
+    // so mmap slices are always 2-byte aligned for u16 access.
+    debug_assert!(
+        (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+        "f16 vector data not 2-byte aligned"
+    );
+
     for i in 0..n {
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
         let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };

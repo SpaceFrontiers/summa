@@ -150,12 +150,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             });
         });
 
-        SegmentSnapshot::with_delete_fn(
-            Arc::clone(&self.tracker),
-            Arc::clone(&self.directory),
-            acquired,
-            delete_fn,
-        )
+        SegmentSnapshot::with_delete_fn(Arc::clone(&self.tracker), acquired, delete_fn)
     }
 
     /// Get the segment tracker

@@ -159,8 +159,7 @@ pub struct SegmentSnapshot<D: Directory + 'static> {
 
 impl<D: Directory + 'static> SegmentSnapshot<D> {
     /// Create a new snapshot holding references to the given segments
-    pub fn new(tracker: Arc<SegmentTracker>, _directory: Arc<D>, segment_ids: Vec<String>) -> Self {
-        // Acquire is already done by caller
+    pub fn new(tracker: Arc<SegmentTracker>, segment_ids: Vec<String>) -> Self {
         Self {
             tracker,
             segment_ids,
@@ -172,7 +171,6 @@ impl<D: Directory + 'static> SegmentSnapshot<D> {
     /// Create a snapshot with a deletion callback for deferred segment cleanup
     pub fn with_delete_fn(
         tracker: Arc<SegmentTracker>,
-        _directory: Arc<D>,
         segment_ids: Vec<String>,
         delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync>,
     ) -> Self {

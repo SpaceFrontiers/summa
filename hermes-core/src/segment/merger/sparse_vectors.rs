@@ -1,8 +1,4 @@
-//! Sparse vector merge using block stacking
-//!
-//! Merges sparse vector indexes by stacking compressed posting list blocks
-//! directly — O(blocks) instead of O(postings). Only adjusts first_doc_id
-//! in each block header by the doc offset; deltas within blocks stay unchanged.
+//! Sparse vector merge via per-dimension streaming and block stacking.
 
 use std::io::Write;
 use std::mem::size_of;

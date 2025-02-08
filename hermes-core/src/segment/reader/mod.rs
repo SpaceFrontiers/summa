@@ -431,6 +431,38 @@ impl AsyncSegmentReader {
         self.positions_handle.is_some()
     }
 
+    /// Batch cosine scoring on raw quantized bytes.
+    ///
+    /// Dispatches to the appropriate SIMD scorer based on quantization type.
+    /// Vectors file uses data-first layout (offset 0) with 8-byte padding between
+    /// fields, so mmap slices are always properly aligned for f32/f16/u8 access.
+    fn score_quantized_batch(
+        query: &[f32],
+        raw: &[u8],
+        quant: crate::dsl::DenseVectorQuantization,
+        dim: usize,
+        scores: &mut [f32],
+    ) {
+        match quant {
+            crate::dsl::DenseVectorQuantization::F32 => {
+                let num_floats = scores.len() * dim;
+                debug_assert!(
+                    (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                    "f32 vector data not 4-byte aligned — vectors file may use legacy format"
+                );
+                let vectors: &[f32] =
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
+                crate::structures::simd::batch_cosine_scores(query, vectors, dim, scores);
+            }
+            crate::dsl::DenseVectorQuantization::F16 => {
+                crate::structures::simd::batch_cosine_scores_f16(query, raw, dim, scores);
+            }
+            crate::dsl::DenseVectorQuantization::UInt8 => {
+                crate::structures::simd::batch_cosine_scores_u8(query, raw, dim, scores);
+            }
+        }
+    }
+
     /// Search dense vectors using RaBitQ
     ///
     /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
@@ -510,52 +542,7 @@ impl AsyncSegmentReader {
                 let raw = batch_bytes.as_slice();
 
                 let mut scores = vec![0f32; batch_count];
-
-                match quant {
-                    crate::dsl::DenseVectorQuantization::F32 => {
-                        let batch_floats = batch_count * dim;
-                        let mut aligned_buf: Vec<f32> = Vec::new();
-                        let vectors: &[f32] = if (raw.as_ptr() as usize)
-                            .is_multiple_of(std::mem::align_of::<f32>())
-                        {
-                            unsafe {
-                                std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats)
-                            }
-                        } else {
-                            aligned_buf.resize(batch_floats, 0.0);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    raw.as_ptr(),
-                                    aligned_buf.as_mut_ptr() as *mut u8,
-                                    batch_floats * std::mem::size_of::<f32>(),
-                                );
-                            }
-                            &aligned_buf
-                        };
-                        crate::structures::simd::batch_cosine_scores(
-                            query,
-                            vectors,
-                            dim,
-                            &mut scores,
-                        );
-                    }
-                    crate::dsl::DenseVectorQuantization::F16 => {
-                        crate::structures::simd::batch_cosine_scores_f16(
-                            query,
-                            raw,
-                            dim,
-                            &mut scores,
-                        );
-                    }
-                    crate::dsl::DenseVectorQuantization::UInt8 => {
-                        crate::structures::simd::batch_cosine_scores_u8(
-                            query,
-                            raw,
-                            dim,
-                            &mut scores,
-                        );
-                    }
-                }
+                Self::score_quantized_batch(query, raw, quant, dim, &mut scores);
 
                 for (i, &score) in scores.iter().enumerate().take(batch_count) {
                     let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
@@ -606,51 +593,7 @@ impl AsyncSegmentReader {
 
                 // Native-precision batch SIMD cosine scoring
                 let mut scores = vec![0f32; resolved.len()];
-                match quant {
-                    crate::dsl::DenseVectorQuantization::F32 => {
-                        let floats = resolved.len() * dim;
-                        let mut aligned_buf: Vec<f32> = Vec::new();
-                        let vectors: &[f32] = if (raw_buf.as_ptr() as usize)
-                            .is_multiple_of(std::mem::align_of::<f32>())
-                        {
-                            unsafe {
-                                std::slice::from_raw_parts(raw_buf.as_ptr() as *const f32, floats)
-                            }
-                        } else {
-                            aligned_buf.resize(floats, 0.0);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    raw_buf.as_ptr(),
-                                    aligned_buf.as_mut_ptr() as *mut u8,
-                                    floats * std::mem::size_of::<f32>(),
-                                );
-                            }
-                            &aligned_buf
-                        };
-                        crate::structures::simd::batch_cosine_scores(
-                            query,
-                            vectors,
-                            dim,
-                            &mut scores,
-                        );
-                    }
-                    crate::dsl::DenseVectorQuantization::F16 => {
-                        crate::structures::simd::batch_cosine_scores_f16(
-                            query,
-                            &raw_buf,
-                            dim,
-                            &mut scores,
-                        );
-                    }
-                    crate::dsl::DenseVectorQuantization::UInt8 => {
-                        crate::structures::simd::batch_cosine_scores_u8(
-                            query,
-                            &raw_buf,
-                            dim,
-                            &mut scores,
-                        );
-                    }
-                }
+                Self::score_quantized_batch(query, &raw_buf, quant, dim, &mut scores);
 
                 // Write scores back to results
                 for (buf_idx, &(ri, _)) in resolved.iter().enumerate() {

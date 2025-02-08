@@ -797,27 +797,23 @@ impl SegmentBuilder {
             ));
         }
 
-        // Write header (tiny — ~25 bytes per field)
-        // num_fields(u32) + per-field: field_id(u32) + index_type(u8) + offset(u64) + length(u64)
-        let per_field_entry =
-            size_of::<u32>() + size_of::<u8>() + size_of::<u64>() + size_of::<u64>();
-        let header_size = size_of::<u32>() + fields.len() * per_field_entry;
-        let mut header = Vec::with_capacity(header_size);
-        header.write_u32::<LittleEndian>(fields.len() as u32)?;
+        /// Magic number for vectors file footer ("VEC2" in LE)
+        const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
+        const FLAT_BINARY_INDEX_TYPE: u8 = 4;
 
-        let mut current_offset = header_size as u64;
-        for (i, (field_id, _)) in fields.iter().enumerate() {
-            header.write_u32::<LittleEndian>(*field_id)?;
-            const FLAT_BINARY_INDEX_TYPE: u8 = 4;
-            header.write_u8(FLAT_BINARY_INDEX_TYPE)?;
-            header.write_u64::<LittleEndian>(current_offset)?;
-            header.write_u64::<LittleEndian>(field_sizes[i] as u64)?;
-            current_offset += field_sizes[i] as u64;
+        // Data-first format: stream field data, then write TOC + footer at end.
+        // Data starts at file offset 0 → mmap page-aligned, no alignment copies.
+        struct TocEntry {
+            field_id: u32,
+            offset: u64,
+            size: u64,
         }
-        writer.write_all(&header)?;
+        let mut toc: Vec<TocEntry> = Vec::with_capacity(fields.len());
+        let mut current_offset = 0u64;
 
         // Stream each field's data directly (builder → disk, no intermediate buffer)
         for (i, (_field_id, builder)) in fields.into_iter().enumerate() {
+            let data_offset = current_offset;
             FlatVectorData::serialize_binary_from_flat_streaming(
                 builder.dim,
                 &builder.vectors,
@@ -826,8 +822,34 @@ impl SegmentBuilder {
                 writer,
             )
             .map_err(crate::Error::Io)?;
+            current_offset += field_sizes[i] as u64;
+            toc.push(TocEntry {
+                field_id: _field_id,
+                offset: data_offset,
+                size: field_sizes[i] as u64,
+            });
+            // Pad to 8-byte boundary so next field's mmap slice is aligned
+            let pad = (8 - (current_offset % 8)) % 8;
+            if pad > 0 {
+                writer.write_all(&[0u8; 8][..pad as usize])?;
+                current_offset += pad;
+            }
             // builder dropped here, freeing vector memory before next field
         }
+
+        // Write TOC entries
+        let toc_offset = current_offset;
+        for entry in &toc {
+            writer.write_u32::<LittleEndian>(entry.field_id)?;
+            writer.write_u8(FLAT_BINARY_INDEX_TYPE)?;
+            writer.write_u64::<LittleEndian>(entry.offset)?;
+            writer.write_u64::<LittleEndian>(entry.size)?;
+        }
+
+        // Write footer: toc_offset(8) + num_fields(4) + magic(4)
+        writer.write_u64::<LittleEndian>(toc_offset)?;
+        writer.write_u32::<LittleEndian>(toc.len() as u32)?;
+        writer.write_u32::<LittleEndian>(VECTORS_FOOTER_MAGIC)?;
 
         Ok(())
     }

@@ -25,14 +25,19 @@ pub struct VectorsFileData {
     pub coarse_centroids: Option<Arc<CoarseCentroids>>,
 }
 
+/// Magic number for vectors file footer ("VEC2" in LE)
+const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
+/// Footer size: toc_offset(8) + num_fields(4) + magic(4) = 16 bytes
+const VECTORS_FOOTER_SIZE: u64 = 16;
+
 /// Load dense vector indexes from unified .vectors file
 ///
-/// Each field can have two entries:
-/// - Type 4 (Flat): raw vectors loaded lazily (doc_ids in memory, vectors via mmap)
-/// - Type 0/1/2 (ANN): loaded into memory for search
+/// File format (data-first, TOC at end):
+/// - [field data...]  — starts at offset 0 (mmap page-aligned)
+/// - [TOC entries]    — field_id(4) + index_type(1) + offset(8) + size(8) per field
+/// - [footer 16B]     — toc_offset(8) + num_fields(4) + magic(4)
 ///
-/// Flat data is always present (written by builder and merger). ANN indexes
-/// are present after merge with trained structures.
+/// Also supports legacy header-first format (no magic) for backwards compatibility.
 pub async fn load_vectors_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
@@ -42,74 +47,80 @@ pub async fn load_vectors_file<D: Directory>(
     let mut flat_vectors = FxHashMap::default();
     let mut coarse_centroids: Option<Arc<CoarseCentroids>> = None;
 
+    let empty = || VectorsFileData {
+        indexes: FxHashMap::default(),
+        flat_vectors: FxHashMap::default(),
+        coarse_centroids: None,
+    };
+
     // Skip loading vectors file if schema has no dense vector fields
     let has_dense_vectors = schema
         .fields()
         .any(|(_, entry)| entry.dense_vector_config.is_some());
     if !has_dense_vectors {
-        return Ok(VectorsFileData {
-            indexes,
-            flat_vectors,
-            coarse_centroids,
-        });
+        return Ok(empty());
     }
 
     // Try to open vectors file (may not exist if no vectors were indexed)
     let handle = match dir.open_lazy(&files.vectors).await {
         Ok(h) => h,
-        Err(_) => {
-            return Ok(VectorsFileData {
-                indexes,
-                flat_vectors,
-                coarse_centroids,
-            });
-        }
+        Err(_) => return Ok(empty()),
     };
 
-    // Read only the header first (4 bytes for num_fields)
-    let header_bytes = match handle.read_bytes_range(0..4).await {
-        Ok(b) => b,
-        Err(_) => {
-            return Ok(VectorsFileData {
-                indexes,
-                flat_vectors,
-                coarse_centroids,
-            });
-        }
-    };
-
-    if header_bytes.is_empty() {
-        return Ok(VectorsFileData {
-            indexes,
-            flat_vectors,
-            coarse_centroids,
-        });
+    let file_size = handle.len();
+    if file_size < VECTORS_FOOTER_SIZE {
+        return Ok(empty());
     }
 
-    let mut cursor = Cursor::new(header_bytes.as_slice());
+    // Try new format: read footer (last 16 bytes)
+    let footer_bytes = handle
+        .read_bytes_range(file_size - VECTORS_FOOTER_SIZE..file_size)
+        .await?;
+    let mut cursor = Cursor::new(footer_bytes.as_slice());
+    let toc_offset = cursor.read_u64::<LittleEndian>()?;
     let num_fields = cursor.read_u32::<LittleEndian>()?;
+    let magic = cursor.read_u32::<LittleEndian>()?;
 
-    if num_fields == 0 {
-        return Ok(VectorsFileData {
-            indexes,
-            flat_vectors,
-            coarse_centroids,
-        });
-    }
+    let entries = if magic == VECTORS_FOOTER_MAGIC && toc_offset < file_size - VECTORS_FOOTER_SIZE {
+        // New format: TOC at end
+        let toc_size = num_fields as u64 * 21;
+        let toc_bytes = handle
+            .read_bytes_range(toc_offset..toc_offset + toc_size)
+            .await?;
+        let mut cursor = Cursor::new(toc_bytes.as_slice());
+        let mut entries = Vec::with_capacity(num_fields as usize);
+        for _ in 0..num_fields {
+            let field_id = cursor.read_u32::<LittleEndian>()?;
+            let index_type = cursor.read_u8().unwrap_or(255);
+            let offset = cursor.read_u64::<LittleEndian>()?;
+            let length = cursor.read_u64::<LittleEndian>()?;
+            entries.push((field_id, index_type, offset, length));
+        }
+        entries
+    } else {
+        // Legacy format: header at start (num_fields(4) + entries)
+        let header_bytes = handle.read_bytes_range(0..4).await?;
+        let mut cursor = Cursor::new(header_bytes.as_slice());
+        let num_fields = cursor.read_u32::<LittleEndian>()?;
+        if num_fields == 0 {
+            return Ok(empty());
+        }
+        let entries_size = num_fields as u64 * 21;
+        let entries_bytes = handle.read_bytes_range(4..4 + entries_size).await?;
+        let mut cursor = Cursor::new(entries_bytes.as_slice());
+        let mut entries = Vec::with_capacity(num_fields as usize);
+        for _ in 0..num_fields {
+            let field_id = cursor.read_u32::<LittleEndian>()?;
+            let index_type = cursor.read_u8().unwrap_or(255);
+            let offset = cursor.read_u64::<LittleEndian>()?;
+            let length = cursor.read_u64::<LittleEndian>()?;
+            entries.push((field_id, index_type, offset, length));
+        }
+        entries
+    };
 
-    // Read field entries header: (field_id: 4, index_type: 1, offset: 8, length: 8) = 21 bytes per field
-    let entries_size = num_fields as u64 * 21;
-    let entries_bytes = handle.read_bytes_range(4..4 + entries_size).await?;
-    let mut cursor = Cursor::new(entries_bytes.as_slice());
-
-    // Read field entries (field_id, index_type, offset, length)
-    let mut entries = Vec::with_capacity(num_fields as usize);
-    for _ in 0..num_fields {
-        let field_id = cursor.read_u32::<LittleEndian>()?;
-        let index_type = cursor.read_u8().unwrap_or(255);
-        let offset = cursor.read_u64::<LittleEndian>()?;
-        let length = cursor.read_u64::<LittleEndian>()?;
-        entries.push((field_id, index_type, offset, length));
+    if entries.is_empty() {
+        return Ok(empty());
     }
 
     // Load each entry — a field can have both Flat (lazy) and ANN (in-memory)
