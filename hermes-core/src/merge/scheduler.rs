@@ -134,10 +134,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             self.tracker.acquire(&segment_ids)
         };
 
-        SegmentSnapshot::new(
+        // Provide a deletion callback so deferred segment cleanup happens
+        // when this snapshot is dropped (after in-flight searches finish)
+        let dir = Arc::clone(&self.directory);
+        let delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync> = Arc::new(move |segment_ids| {
+            let dir = Arc::clone(&dir);
+            tokio::spawn(async move {
+                for segment_id in segment_ids {
+                    log::info!(
+                        "[segment_cleanup] deleting deferred segment {}",
+                        segment_id.0
+                    );
+                    let _ = crate::segment::delete_segment(dir.as_ref(), segment_id).await;
+                }
+            });
+        });
+
+        SegmentSnapshot::with_delete_fn(
             Arc::clone(&self.tracker),
             Arc::clone(&self.directory),
             acquired,
+            delete_fn,
         )
     }
 

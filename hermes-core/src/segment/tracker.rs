@@ -145,21 +145,42 @@ impl Default for SegmentTracker {
 }
 
 /// RAII guard that holds references to a snapshot of segments
-/// When dropped, releases all segment references
+/// When dropped, releases all segment references and deletes any
+/// segments that were pending deletion and have no remaining references.
 pub struct SegmentSnapshot<D: Directory + 'static> {
     tracker: Arc<SegmentTracker>,
     segment_ids: Vec<String>,
-    directory: Arc<D>,
+    /// Kept to satisfy the generic parameter; directory access is via delete_fn closure.
+    _directory: std::marker::PhantomData<Arc<D>>,
+    /// Callback to delete segment files when they become ready for deletion.
+    /// Provided by SegmentManager for native builds; None for read-only paths.
+    delete_fn: Option<Arc<dyn Fn(Vec<SegmentId>) + Send + Sync>>,
 }
 
 impl<D: Directory + 'static> SegmentSnapshot<D> {
     /// Create a new snapshot holding references to the given segments
-    pub fn new(tracker: Arc<SegmentTracker>, directory: Arc<D>, segment_ids: Vec<String>) -> Self {
+    pub fn new(tracker: Arc<SegmentTracker>, _directory: Arc<D>, segment_ids: Vec<String>) -> Self {
         // Acquire is already done by caller
         Self {
             tracker,
             segment_ids,
-            directory,
+            _directory: std::marker::PhantomData,
+            delete_fn: None,
+        }
+    }
+
+    /// Create a snapshot with a deletion callback for deferred segment cleanup
+    pub fn with_delete_fn(
+        tracker: Arc<SegmentTracker>,
+        _directory: Arc<D>,
+        segment_ids: Vec<String>,
+        delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync>,
+    ) -> Self {
+        Self {
+            tracker,
+            segment_ids,
+            _directory: std::marker::PhantomData,
+            delete_fn: Some(delete_fn),
         }
     }
 
@@ -181,10 +202,21 @@ impl<D: Directory + 'static> SegmentSnapshot<D> {
 
 impl<D: Directory + 'static> Drop for SegmentSnapshot<D> {
     fn drop(&mut self) {
-        // Just release refs - actual deletion handled by SegmentManager for native
-        let _to_delete = self.tracker.release(&self.segment_ids);
-        let _ = _to_delete; // Suppress unused warning
-        let _ = &self.directory; // Suppress unused warning
+        let to_delete = self.tracker.release(&self.segment_ids);
+        if !to_delete.is_empty() {
+            if let Some(delete_fn) = &self.delete_fn {
+                log::info!(
+                    "[segment_snapshot] dropping snapshot, deleting {} deferred segments",
+                    to_delete.len()
+                );
+                delete_fn(to_delete);
+            } else {
+                log::warn!(
+                    "[segment_snapshot] {} segments ready for deletion but no delete_fn provided",
+                    to_delete.len()
+                );
+            }
+        }
     }
 }
 
