@@ -1876,40 +1876,46 @@ pub fn batch_f32_to_u8(src: &[f32], dst: &mut [u8]) {
 mod neon_quant {
     use std::arch::aarch64::*;
 
-    /// Fused dot(query, vec) + norm(vec) for f16 vectors on NEON.
-    /// Converts f16→f32 via scalar bit manipulation, then uses NEON FMA.
+    /// Fused dot(query_f16, vec_f16) + norm(vec_f16) for f16 vectors on NEON.
+    ///
+    /// Both query and vectors are f16 (stored as u16). Uses hardware `vcvt_f32_f16`
+    /// for SIMD f16→f32 conversion (replaces scalar bit manipulation), processes
+    /// 8 elements per iteration with f32 accumulation for precision.
     #[target_feature(enable = "neon")]
-    pub unsafe fn fused_dot_norm_f16(query: &[f32], vec_f16: &[u16], dim: usize) -> (f32, f32) {
-        let chunks = dim / 4;
-        let remainder = dim % 4;
+    pub unsafe fn fused_dot_norm_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+        let chunks8 = dim / 8;
+        let remainder = dim % 8;
 
         let mut acc_dot = vdupq_n_f32(0.0);
         let mut acc_norm = vdupq_n_f32(0.0);
 
-        for c in 0..chunks {
-            let base = c * 4;
-            let q = vld1q_f32(query.as_ptr().add(base));
+        for c in 0..chunks8 {
+            let base = c * 8;
 
-            // Convert 4 f16→f32 into a small buffer, then SIMD load
-            let buf = [
-                super::f16_to_f32(*vec_f16.get_unchecked(base)),
-                super::f16_to_f32(*vec_f16.get_unchecked(base + 1)),
-                super::f16_to_f32(*vec_f16.get_unchecked(base + 2)),
-                super::f16_to_f32(*vec_f16.get_unchecked(base + 3)),
-            ];
-            let v = vld1q_f32(buf.as_ptr());
+            // Load 8 f16 vector values, hardware-convert to 2×4 f32
+            let v_raw = vld1q_u16(vec_f16.as_ptr().add(base));
+            let v_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(v_raw)));
+            let v_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(v_raw)));
 
-            acc_dot = vfmaq_f32(acc_dot, q, v);
-            acc_norm = vfmaq_f32(acc_norm, v, v);
+            // Load 8 f16 query values, hardware-convert to 2×4 f32
+            let q_raw = vld1q_u16(query_f16.as_ptr().add(base));
+            let q_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(q_raw)));
+            let q_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(q_raw)));
+
+            acc_dot = vfmaq_f32(acc_dot, q_lo, v_lo);
+            acc_dot = vfmaq_f32(acc_dot, q_hi, v_hi);
+            acc_norm = vfmaq_f32(acc_norm, v_lo, v_lo);
+            acc_norm = vfmaq_f32(acc_norm, v_hi, v_hi);
         }
 
         let mut dot = vaddvq_f32(acc_dot);
         let mut norm = vaddvq_f32(acc_norm);
 
-        let base = chunks * 4;
+        let base = chunks8 * 8;
         for i in 0..remainder {
             let v = super::f16_to_f32(*vec_f16.get_unchecked(base + i));
-            dot += *query.get_unchecked(base + i) * v;
+            let q = super::f16_to_f32(*query_f16.get_unchecked(base + i));
+            dot += q * v;
             norm += v * v;
         }
 
@@ -1993,12 +1999,13 @@ mod neon_quant {
 // ============================================================================
 
 #[allow(dead_code)]
-fn fused_dot_norm_f16_scalar(query: &[f32], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+fn fused_dot_norm_f16_scalar(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
     let mut dot = 0.0f32;
     let mut norm = 0.0f32;
     for i in 0..dim {
         let v = f16_to_f32(vec_f16[i]);
-        dot += query[i] * v;
+        let q = f16_to_f32(query_f16[i]);
+        dot += q * v;
         norm += v * v;
     }
     (dot, norm)
@@ -2021,14 +2028,14 @@ fn fused_dot_norm_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f
 // ============================================================================
 
 #[inline]
-fn fused_dot_norm_f16(query: &[f32], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+fn fused_dot_norm_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { neon_quant::fused_dot_norm_f16(query, vec_f16, dim) }
+        unsafe { neon_quant::fused_dot_norm_f16(query_f16, vec_f16, dim) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        fused_dot_norm_f16_scalar(query, vec_f16, dim)
+        fused_dot_norm_f16_scalar(query_f16, vec_f16, dim)
     }
 }
 
@@ -2051,8 +2058,9 @@ fn fused_dot_norm_u8(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
 /// Batch cosine similarity: f32 query vs N contiguous f16 vectors.
 ///
 /// `vectors_raw` is raw bytes: N vectors × dim × 2 bytes (f16 stored as u16).
-/// Converts f16→f32 in-register using SIMD, scores using fused dot+norm.
-/// Memory bandwidth is halved compared to f32 scoring.
+/// Query is quantized to f16 once, then both query and vectors are scored in
+/// f16 space using hardware SIMD conversion (8 elements/iteration on NEON).
+/// Memory bandwidth is halved for both query and vector loads.
 #[inline]
 pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
     let n = scores.len();
@@ -2060,6 +2068,7 @@ pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, sc
         return;
     }
 
+    // Compute query norm in f32 (full precision, before quantization)
     let norm_q_sq = dot_product_f32(query, query, dim);
     if norm_q_sq < f32::EPSILON {
         for s in scores.iter_mut() {
@@ -2068,6 +2077,9 @@ pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, sc
         return;
     }
     let norm_q = norm_q_sq.sqrt();
+
+    // Quantize query to f16 once (O(dim)), reused for all N vector scorings
+    let query_f16: Vec<u16> = query.iter().map(|&v| f32_to_f16(v)).collect();
 
     let vec_bytes = dim * 2;
     debug_assert!(vectors_raw.len() >= n * vec_bytes);
@@ -2083,7 +2095,7 @@ pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, sc
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
         let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
 
-        let (dot, norm_v_sq) = fused_dot_norm_f16(query, f16_slice, dim);
+        let (dot, norm_v_sq) = fused_dot_norm_f16(&query_f16, f16_slice, dim);
         scores[i] = if norm_v_sq < f32::EPSILON {
             0.0
         } else {
