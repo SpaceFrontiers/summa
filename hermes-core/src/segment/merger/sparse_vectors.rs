@@ -16,6 +16,7 @@ use super::doc_offsets;
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::FieldType;
+use crate::segment::SparseIndex;
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 
@@ -86,34 +87,31 @@ impl SegmentMerger {
                 continue;
             }
 
-            // Bulk-read ALL posting lists per segment in one I/O call each.
-            // This replaces 80K+ individual get_posting() calls with ~4 bulk reads.
-            let mut segment_postings: Vec<FxHashMap<u32, Arc<BlockSparsePostingList>>> =
-                Vec::with_capacity(segments.len());
-            for (seg_idx, segment) in segments.iter().enumerate() {
-                if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
-                    log::debug!(
-                        "Sparse merge field {}: bulk-reading {} dims from segment {}",
-                        field.0,
-                        sparse_index.num_dimensions(),
-                        seg_idx
-                    );
-                    let postings = sparse_index.read_all_postings_bulk().await?;
-                    segment_postings.push(postings);
-                } else {
-                    segment_postings.push(FxHashMap::default());
-                }
-            }
+            // Collect sparse indexes for this field (references only)
+            let sparse_indexes: Vec<Option<&SparseIndex>> = segments
+                .iter()
+                .map(|seg| seg.sparse_indexes().get(&field.0))
+                .collect();
 
+            log::debug!(
+                "Sparse merge field {}: {} unique dims across {} segments",
+                field.0,
+                all_dims.len(),
+                segments.len()
+            );
+
+            // Process one dimension at a time — load posting lists on-demand,
+            // merge, serialize, then drop. Only one dim's data in memory at a time.
             let mut dim_bytes: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
 
-            // Merge from in-memory data — no I/O in this loop
-            for dim_id in all_dims {
+            for dim_id in &all_dims {
                 let mut posting_arcs: Vec<(Arc<BlockSparsePostingList>, u32)> = Vec::new();
 
-                for (seg_idx, postings) in segment_postings.iter().enumerate() {
-                    if let Some(posting_list) = postings.get(&dim_id) {
-                        posting_arcs.push((Arc::clone(posting_list), doc_offs[seg_idx]));
+                for (seg_idx, sparse_idx) in sparse_indexes.iter().enumerate() {
+                    if let Some(idx) = sparse_idx
+                        && let Some(pl) = idx.get_posting(*dim_id).await?
+                    {
+                        posting_arcs.push((pl, doc_offs[seg_idx]));
                     }
                 }
 
@@ -130,11 +128,8 @@ impl SegmentMerger {
 
                 let mut bytes = Vec::new();
                 merged.serialize(&mut bytes).map_err(crate::Error::Io)?;
-                dim_bytes.insert(dim_id, bytes);
+                dim_bytes.insert(*dim_id, bytes);
             }
-
-            // Drop bulk data before accumulating output
-            drop(segment_postings);
 
             // Store num_dims (active count) instead of max_dim_id
             field_data.push((field.0, quantization, dim_bytes.len() as u32, dim_bytes));

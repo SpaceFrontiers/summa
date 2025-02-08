@@ -56,6 +56,15 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install panic hook that logs backtrace before aborting
+    // This catches panics in spawned tasks that would otherwise be silent
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("=== PANIC ===\n{info}\n{bt}");
+        default_hook(info);
+    }));
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -79,7 +88,9 @@ async fn main() -> Result<()> {
 
     let addr: SocketAddr = args.addr.parse()?;
 
-    let num_indexing_threads = args.indexing_threads.unwrap_or_else(num_cpus::get);
+    let num_indexing_threads = args
+        .indexing_threads
+        .unwrap_or_else(|| (num_cpus::get() / 2).max(1));
 
     let config = IndexConfig {
         max_indexing_memory_bytes: args.max_indexing_memory_mb * 1024 * 1024,

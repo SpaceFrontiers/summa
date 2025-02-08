@@ -125,11 +125,12 @@ impl AsyncSegmentReader {
         let sparse_dims: usize = sparse_indexes.values().map(|s| s.num_dimensions()).sum();
         let sparse_mem = sparse_dims * 24; // HashMap entry overhead
         log::debug!(
-            "[segment] loaded {:016x}: docs={}, sparse_dims={}, sparse_mem={:.2} KB, vectors={}",
+            "[segment] loaded {:016x}: docs={}, sparse_dims={}, sparse_mem={:.2} KB, dense_flat={}, dense_ann={}",
             segment_id.0,
             meta.num_docs,
             sparse_dims,
             sparse_mem as f64 / 1024.0,
+            flat_vectors.len(),
             vector_indexes.len()
         );
 
