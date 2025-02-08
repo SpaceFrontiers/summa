@@ -524,13 +524,49 @@ impl SegmentMerger {
         Ok(TermInfo::external(posting_offset, posting_len, doc_count))
     }
 
+    /// Iterate over all vectors in a segment for a given field, calling `f` for each.
+    /// Handles Flat, RaBitQ, and IVF index types uniformly.
+    /// `doc_id_offset` is added to each doc_id for multi-segment merges.
+    fn for_each_vector(
+        segment: &SegmentReader,
+        field: crate::dsl::Field,
+        doc_id_offset: u32,
+        mut f: impl FnMut(u32, u16, &[f32]),
+    ) {
+        match segment.vector_indexes().get(&field.0) {
+            Some(super::VectorIndex::Flat(flat_data)) => {
+                for i in 0..flat_data.num_vectors() {
+                    let (doc_id, ordinal) = flat_data.get_doc_id(i);
+                    f(doc_id_offset + doc_id, ordinal, flat_data.get_vector(i));
+                }
+            }
+            Some(super::VectorIndex::RaBitQ(index)) => {
+                if let Some(raw_vecs) = &index.raw_vectors {
+                    for (i, vec) in raw_vecs.iter().enumerate() {
+                        f(doc_id_offset + i as u32, 0, vec);
+                    }
+                }
+            }
+            Some(super::VectorIndex::IVF { index, .. }) => {
+                for cluster in index.clusters.clusters.values() {
+                    if let Some(ref raw_vecs) = cluster.raw_vectors {
+                        for (i, raw) in raw_vecs.iter().enumerate() {
+                            f(doc_id_offset + cluster.doc_ids[i], cluster.ordinals[i], raw);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Merge dense vector indexes - returns output size in bytes
     ///
     /// Strategy:
     /// 1. O(1) cluster merge when all segments have the same ANN type (IVF/ScaNN)
-    /// 2. Fallback: extract raw vectors from ALL index types (Flat, RaBitQ, IVF clusters)
-    ///    - If trained structures available → rebuild as IVF/ScaNN
-    ///    - Otherwise → keep as Flat
+    /// 2. ANN rebuild if trained structures available — must collect vectors in memory
+    /// 3. Flat streaming merge — streams vectors directly from segments to disk
+    ///    without collecting in memory (O(1) extra memory per field)
     async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
@@ -538,9 +574,26 @@ impl SegmentMerger {
         files: &SegmentFiles,
         trained: Option<&TrainedVectorStructures>,
     ) -> Result<usize> {
+        use super::vector_data::FlatVectorData;
         use crate::dsl::VectorIndexType;
 
-        let mut field_indexes: Vec<(u32, u8, Vec<u8>)> = Vec::new();
+        /// Pre-serialized field data (ANN indexes, cluster merges)
+        struct BlobField {
+            field_id: u32,
+            index_type: u8,
+            data: Vec<u8>,
+        }
+
+        /// Flat field to be streamed directly from segments
+        struct FlatStreamField {
+            field_id: u32,
+            dim: usize,
+            total_vectors: usize,
+        }
+
+        let mut blob_fields: Vec<BlobField> = Vec::new();
+        let mut flat_fields: Vec<FlatStreamField> = Vec::new();
+        let doc_offs = doc_offsets(segments);
 
         for (field, entry) in self.schema.fields() {
             if !matches!(entry.field_type, FieldType::DenseVector) || !entry.indexed {
@@ -561,14 +614,17 @@ impl SegmentMerger {
             if scann_indexes.len() == segments_with_vectors && !scann_indexes.is_empty() {
                 let refs: Vec<&crate::structures::IVFPQIndex> =
                     scann_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
-                let doc_offs = doc_offsets(segments);
 
                 match crate::structures::IVFPQIndex::merge(&refs, &doc_offs) {
                     Ok(merged) => {
                         let bytes = merged
                             .to_bytes()
                             .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        field_indexes.push((field.0, 2u8, bytes));
+                        blob_fields.push(BlobField {
+                            field_id: field.0,
+                            index_type: 2,
+                            data: bytes,
+                        });
                         continue;
                     }
                     Err(e) => {
@@ -586,14 +642,17 @@ impl SegmentMerger {
             if ivf_indexes.len() == segments_with_vectors && !ivf_indexes.is_empty() {
                 let refs: Vec<&crate::structures::IVFRaBitQIndex> =
                     ivf_indexes.iter().map(|arc| arc.as_ref()).collect();
-                let doc_offs = doc_offsets(segments);
 
                 match crate::structures::IVFRaBitQIndex::merge(&refs, &doc_offs) {
                     Ok(merged) => {
                         let bytes = merged
                             .to_bytes()
                             .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        field_indexes.push((field.0, 1u8, bytes));
+                        blob_fields.push(BlobField {
+                            field_id: field.0,
+                            index_type: 1,
+                            data: bytes,
+                        });
                         continue;
                     }
                     Err(e) => {
@@ -602,137 +661,319 @@ impl SegmentMerger {
                 }
             }
 
-            // --- Fallback: collect raw vectors from ALL index types ---
-            let mut all_vectors: Vec<Vec<f32>> = Vec::new();
-            let mut all_doc_ids: Vec<(u32, u16)> = Vec::new();
-            let doc_offs = doc_offsets(segments);
+            // --- Determine field dimension and total vector count ---
+            let config = entry.dense_vector_config.as_ref();
 
-            for (seg_idx, segment) in segments.iter().enumerate() {
-                let offset = doc_offs[seg_idx];
-                match segment.vector_indexes().get(&field.0) {
-                    Some(super::VectorIndex::Flat(flat_data)) => {
-                        for (vec, &(local_doc_id, ordinal)) in
-                            flat_data.vectors.iter().zip(flat_data.doc_ids.iter())
-                        {
-                            all_vectors.push(vec.clone());
-                            all_doc_ids.push((offset + local_doc_id, ordinal));
-                        }
-                    }
-                    Some(super::VectorIndex::RaBitQ(index)) => {
-                        if let Some(raw_vecs) = &index.raw_vectors {
-                            for (i, vec) in raw_vecs.iter().enumerate() {
-                                all_vectors.push(vec.clone());
-                                all_doc_ids.push((offset + i as u32, 0));
-                            }
-                        }
-                    }
-                    Some(super::VectorIndex::IVF { index, .. }) => {
-                        // Extract raw vectors from IVF-RaBitQ clusters
-                        for cluster in index.clusters.clusters.values() {
-                            if let Some(ref raw_vecs) = cluster.raw_vectors {
-                                for (i, raw) in raw_vecs.iter().enumerate() {
-                                    all_vectors.push(raw.clone());
-                                    all_doc_ids
-                                        .push((offset + cluster.doc_ids[i], cluster.ordinals[i]));
-                                }
-                            }
-                        }
-                    }
-                    // ScaNN (IVF-PQ) stores only PQ codes, no raw vectors — skip
-                    _ => {}
-                }
-            }
-
-            if all_vectors.is_empty() {
+            // Helper: get dim from segments
+            let dim_from_segments = || -> usize {
+                segments
+                    .iter()
+                    .filter_map(|s| match s.vector_indexes().get(&field.0) {
+                        Some(super::VectorIndex::Flat(f)) => Some(f.dim),
+                        _ => None,
+                    })
+                    .find(|&d| d > 0)
+                    .unwrap_or(0)
+            };
+            let dim = config
+                .map(|c| c.index_dim())
+                .unwrap_or_else(dim_from_segments);
+            if dim == 0 {
                 continue;
             }
 
-            let config = entry.dense_vector_config.as_ref();
-            let dim = config
-                .map(|c| c.index_dim())
-                .unwrap_or(all_vectors[0].len());
+            // Check if all segments have Flat indexes (enables streaming)
+            let all_flat = segments.iter().all(|s| {
+                matches!(
+                    s.vector_indexes().get(&field.0),
+                    Some(super::VectorIndex::Flat(_)) | None
+                )
+            });
 
-            // Try to rebuild as ANN if trained structures are available
-            let mut built_ann = false;
-            if let (Some(trained), Some(config)) = (trained, config) {
-                match config.index_type {
+            // Check if ANN rebuild is possible
+            let ann_type =
+                trained
+                    .zip(config)
+                    .and_then(|(trained, config)| match config.index_type {
+                        VectorIndexType::IvfRaBitQ if trained.centroids.contains_key(&field.0) => {
+                            Some(VectorIndexType::IvfRaBitQ)
+                        }
+                        VectorIndexType::ScaNN
+                            if trained.centroids.contains_key(&field.0)
+                                && trained.codebooks.contains_key(&field.0) =>
+                        {
+                            Some(VectorIndexType::ScaNN)
+                        }
+                        _ => None,
+                    });
+
+            if let Some(ann) = ann_type {
+                // --- Streaming ANN rebuild: iterate segments, call add_vector ---
+                // No Vec<Vec<f32>> collection — only the ANN index structure in memory.
+                let trained = trained.unwrap();
+                let config = config.unwrap();
+                let mut total_vectors = 0usize;
+
+                match ann {
                     VectorIndexType::IvfRaBitQ => {
-                        if let Some(centroids) = trained.centroids.get(&field.0) {
-                            let rabitq_config = crate::structures::RaBitQConfig::new(dim);
-                            let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
-                            let ivf_config = crate::structures::IVFRaBitQConfig::new(dim)
-                                .with_store_raw(config.store_raw);
-                            let ivf_index = crate::structures::IVFRaBitQIndex::build(
-                                ivf_config,
-                                centroids,
-                                &codebook,
-                                &all_vectors,
-                                Some(&all_doc_ids),
-                            );
-                            let index_data = super::builder::IVFRaBitQIndexData {
-                                centroids: (**centroids).clone(),
-                                codebook,
-                                index: ivf_index,
-                            };
-                            let bytes = index_data
-                                .to_bytes()
-                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                            field_indexes.push((field.0, 1u8, bytes));
-                            built_ann = true;
-                            log::info!(
-                                "Rebuilt IVF-RaBitQ for field {} ({} vectors)",
-                                field.0,
-                                all_vectors.len()
+                        let centroids = &trained.centroids[&field.0];
+                        let rabitq_config = crate::structures::RaBitQConfig::new(dim);
+                        let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
+                        let ivf_config = crate::structures::IVFRaBitQConfig::new(dim)
+                            .with_store_raw(config.store_raw);
+                        let mut ivf_index = crate::structures::IVFRaBitQIndex::new(
+                            ivf_config,
+                            centroids.version,
+                            codebook.version,
+                        );
+
+                        // Stream vectors from each segment directly into the index
+                        for (seg_idx, segment) in segments.iter().enumerate() {
+                            let offset = doc_offs[seg_idx];
+                            Self::for_each_vector(
+                                segment,
+                                field,
+                                offset,
+                                |doc_id, ordinal, vec| {
+                                    ivf_index
+                                        .add_vector(centroids, &codebook, doc_id, ordinal, vec);
+                                    total_vectors += 1;
+                                },
                             );
                         }
+
+                        let index_data = super::builder::IVFRaBitQIndexData {
+                            centroids: (**centroids).clone(),
+                            codebook,
+                            index: ivf_index,
+                        };
+                        let bytes = index_data
+                            .to_bytes()
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                        blob_fields.push(BlobField {
+                            field_id: field.0,
+                            index_type: 1,
+                            data: bytes,
+                        });
+                        log::info!(
+                            "Rebuilt IVF-RaBitQ for field {} ({} vectors, streaming)",
+                            field.0,
+                            total_vectors
+                        );
                     }
                     VectorIndexType::ScaNN => {
-                        if let (Some(centroids), Some(codebook)) = (
-                            trained.centroids.get(&field.0),
-                            trained.codebooks.get(&field.0),
-                        ) {
-                            let ivf_pq_config = crate::structures::IVFPQConfig::new(dim);
-                            let ivf_pq_index = crate::structures::IVFPQIndex::build(
-                                ivf_pq_config,
-                                centroids,
-                                codebook,
-                                &all_vectors,
-                                Some(&all_doc_ids),
-                            );
-                            let index_data = super::builder::ScaNNIndexData {
-                                centroids: (**centroids).clone(),
-                                codebook: (**codebook).clone(),
-                                index: ivf_pq_index,
-                            };
-                            let bytes = index_data
-                                .to_bytes()
-                                .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                            field_indexes.push((field.0, 2u8, bytes));
-                            built_ann = true;
-                            log::info!(
-                                "Rebuilt ScaNN for field {} ({} vectors)",
-                                field.0,
-                                all_vectors.len()
+                        let centroids = &trained.centroids[&field.0];
+                        let codebook = &trained.codebooks[&field.0];
+                        let ivf_pq_config = crate::structures::IVFPQConfig::new(dim);
+                        let mut ivf_pq_index = crate::structures::IVFPQIndex::new(
+                            ivf_pq_config,
+                            centroids.version,
+                            codebook.version,
+                        );
+
+                        // Stream vectors from each segment directly into the index
+                        for (seg_idx, segment) in segments.iter().enumerate() {
+                            let offset = doc_offs[seg_idx];
+                            Self::for_each_vector(
+                                segment,
+                                field,
+                                offset,
+                                |doc_id, ordinal, vec| {
+                                    ivf_pq_index
+                                        .add_vector(centroids, codebook, doc_id, ordinal, vec);
+                                    total_vectors += 1;
+                                },
                             );
                         }
+
+                        let index_data = super::builder::ScaNNIndexData {
+                            centroids: (**centroids).clone(),
+                            codebook: (**codebook).clone(),
+                            index: ivf_pq_index,
+                        };
+                        let bytes = index_data
+                            .to_bytes()
+                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+                        blob_fields.push(BlobField {
+                            field_id: field.0,
+                            index_type: 2,
+                            data: bytes,
+                        });
+                        log::info!(
+                            "Rebuilt ScaNN for field {} ({} vectors, streaming)",
+                            field.0,
+                            total_vectors
+                        );
                     }
                     _ => {}
                 }
-            }
+            } else if all_flat {
+                // --- Streaming flat merge: zero extra memory for vectors ---
+                let total_vectors: usize = segments
+                    .iter()
+                    .filter_map(|s| {
+                        if let Some(super::VectorIndex::Flat(f)) = s.vector_indexes().get(&field.0)
+                        {
+                            Some(f.num_vectors())
+                        } else {
+                            None
+                        }
+                    })
+                    .sum();
 
-            // Fall back to Flat if no ANN rebuild happened
-            if !built_ann {
-                let flat_data = super::vector_data::FlatVectorData {
-                    dim,
-                    vectors: all_vectors,
-                    doc_ids: all_doc_ids,
-                };
-                let bytes = flat_data.to_binary_bytes();
-                field_indexes.push((field.0, 4u8, bytes));
+                if total_vectors > 0 {
+                    flat_fields.push(FlatStreamField {
+                        field_id: field.0,
+                        dim,
+                        total_vectors,
+                    });
+                }
+            } else {
+                // --- Non-flat segments without ANN: serialize as Flat blob ---
+                // Stream vectors through a writer buffer (no Vec<Vec<f32>>)
+                let mut total_vectors = 0usize;
+                for segment in segments {
+                    Self::for_each_vector(segment, field, 0, |_, _, _| {
+                        total_vectors += 1;
+                    });
+                }
+                if total_vectors == 0 {
+                    continue;
+                }
+
+                let total_size = FlatVectorData::serialized_binary_size(dim, total_vectors);
+                let mut buf = Vec::with_capacity(total_size);
+                FlatVectorData::write_binary_header(dim, total_vectors, &mut buf)
+                    .map_err(|e| crate::Error::Serialization(e.to_string()))?;
+
+                // Pass 1: write vectors
+                for segment in segments {
+                    Self::for_each_vector(segment, field, 0, |_, _, vec| {
+                        let bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                vec.as_ptr() as *const u8,
+                                std::mem::size_of_val(vec),
+                            )
+                        };
+                        let _ = buf.write_all(bytes);
+                    });
+                }
+
+                // Pass 2: write doc_ids with offsets
+                for (seg_idx, segment) in segments.iter().enumerate() {
+                    let offset = doc_offs[seg_idx];
+                    Self::for_each_vector(segment, field, offset, |doc_id, ordinal, _| {
+                        let _ = buf.write_all(&doc_id.to_le_bytes());
+                        let _ = buf.write_all(&ordinal.to_le_bytes());
+                    });
+                }
+
+                blob_fields.push(BlobField {
+                    field_id: field.0,
+                    index_type: 4,
+                    data: buf,
+                });
             }
         }
 
-        write_vector_file(dir, files, field_indexes).await
+        // --- Write vectors file with streaming support ---
+        let total_fields = blob_fields.len() + flat_fields.len();
+        if total_fields == 0 {
+            return Ok(0);
+        }
+
+        // Build sorted field entries with pre-computed sizes
+        struct FieldEntry {
+            field_id: u32,
+            index_type: u8,
+            data_size: u64,
+            /// Index into blob_fields (None = flat stream)
+            blob_idx: Option<usize>,
+            /// Index into flat_fields (None = blob)
+            flat_idx: Option<usize>,
+        }
+
+        let mut entries: Vec<FieldEntry> = Vec::with_capacity(total_fields);
+
+        for (i, blob) in blob_fields.iter().enumerate() {
+            entries.push(FieldEntry {
+                field_id: blob.field_id,
+                index_type: blob.index_type,
+                data_size: blob.data.len() as u64,
+                blob_idx: Some(i),
+                flat_idx: None,
+            });
+        }
+
+        for (i, flat) in flat_fields.iter().enumerate() {
+            entries.push(FieldEntry {
+                field_id: flat.field_id,
+                index_type: 4, // Flat binary
+                data_size: FlatVectorData::serialized_binary_size(flat.dim, flat.total_vectors)
+                    as u64,
+                blob_idx: None,
+                flat_idx: Some(i),
+            });
+        }
+
+        entries.sort_by_key(|e| e.field_id);
+
+        // Write header + data
+        use byteorder::{LittleEndian, WriteBytesExt};
+        let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
+
+        let per_field_entry =
+            size_of::<u32>() + size_of::<u8>() + size_of::<u64>() + size_of::<u64>();
+        let header_size = size_of::<u32>() + entries.len() * per_field_entry;
+
+        writer.write_u32::<LittleEndian>(entries.len() as u32)?;
+
+        let mut current_offset = header_size as u64;
+        for entry in &entries {
+            writer.write_u32::<LittleEndian>(entry.field_id)?;
+            writer.write_u8(entry.index_type)?;
+            writer.write_u64::<LittleEndian>(current_offset)?;
+            writer.write_u64::<LittleEndian>(entry.data_size)?;
+            current_offset += entry.data_size;
+        }
+
+        // Write field data (blobs directly, flat fields streamed from segments)
+        for entry in &entries {
+            if let Some(blob_idx) = entry.blob_idx {
+                writer.write_all(&blob_fields[blob_idx].data)?;
+            } else if let Some(flat_idx) = entry.flat_idx {
+                let flat = &flat_fields[flat_idx];
+
+                // Write binary header
+                FlatVectorData::write_binary_header(flat.dim, flat.total_vectors, &mut writer)?;
+
+                // Pass 1: stream raw vector bytes from each segment (bulk copy)
+                for segment in segments {
+                    if let Some(super::VectorIndex::Flat(flat_data)) =
+                        segment.vector_indexes().get(&entry.field_id)
+                    {
+                        writer.write_all(flat_data.vectors_as_bytes())?;
+                    }
+                }
+
+                // Pass 2: stream doc_ids with offset adjustment
+                for (seg_idx, segment) in segments.iter().enumerate() {
+                    if let Some(super::VectorIndex::Flat(flat_data)) =
+                        segment.vector_indexes().get(&entry.field_id)
+                    {
+                        let offset = doc_offs[seg_idx];
+                        for &(doc_id, ordinal) in &flat_data.doc_ids {
+                            writer.write_all(&(offset + doc_id).to_le_bytes())?;
+                            writer.write_all(&ordinal.to_le_bytes())?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let output_size = writer.offset() as usize;
+        writer.finish()?;
+        Ok(output_size)
     }
 
     /// Merge sparse vector indexes using block stacking
@@ -923,48 +1164,6 @@ impl SegmentMerger {
 
         Ok(output_size)
     }
-}
-
-/// Write a vector index file with per-field header + data.
-/// Streams header then each field's data directly to disk, avoiding a single
-/// giant concatenation buffer.
-async fn write_vector_file<D: Directory + DirectoryWriter>(
-    dir: &D,
-    files: &SegmentFiles,
-    mut field_indexes: Vec<(u32, u8, Vec<u8>)>,
-) -> Result<usize> {
-    use byteorder::{LittleEndian, WriteBytesExt};
-
-    if field_indexes.is_empty() {
-        return Ok(0);
-    }
-
-    field_indexes.sort_by_key(|(id, _, _)| *id);
-
-    let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
-
-    // num_fields(u32) + per-field: field_id(u32) + index_type(u8) + offset(u64) + length(u64)
-    let per_field_entry = size_of::<u32>() + size_of::<u8>() + size_of::<u64>() + size_of::<u64>();
-    let header_size = size_of::<u32>() + field_indexes.len() * per_field_entry;
-    writer.write_u32::<LittleEndian>(field_indexes.len() as u32)?;
-
-    let mut current_offset = header_size as u64;
-    for (field_id, index_type, data) in &field_indexes {
-        writer.write_u32::<LittleEndian>(*field_id)?;
-        writer.write_u8(*index_type)?;
-        writer.write_u64::<LittleEndian>(current_offset)?;
-        writer.write_u64::<LittleEndian>(data.len() as u64)?;
-        current_offset += data.len() as u64;
-    }
-
-    // Stream each field's data (drop after writing)
-    for (_, _, data) in field_indexes {
-        writer.write_all(&data)?;
-    }
-
-    let output_size = writer.offset() as usize;
-    writer.finish()?;
-    Ok(output_size)
 }
 
 /// Delete segment files from directory

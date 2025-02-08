@@ -85,14 +85,8 @@ pub async fn load_vectors_file<D: Directory>(
 
         match index_type {
             4 => {
-                // Flat binary format (compact, no JSON overhead)
+                // Flat binary format — single bulk memcpy into flat Vec<f32>
                 if let Ok(flat_data) = FlatVectorData::from_binary_bytes(data.as_slice()) {
-                    indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
-                }
-            }
-            3 => {
-                // Flat (brute-force) - JSON format (legacy)
-                if let Ok(flat_data) = serde_json::from_slice::<FlatVectorData>(data.as_slice()) {
                     indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
                 }
             }
@@ -129,14 +123,11 @@ pub async fn load_vectors_file<D: Directory>(
                 }
             }
             _ => {
-                // Unknown type - try Flat first (most common in new indexes)
-                if let Ok(flat_data) = serde_json::from_slice::<FlatVectorData>(data.as_slice()) {
-                    indexes.insert(field_id, VectorIndex::Flat(Arc::new(flat_data)));
-                } else if let Ok(rabitq_index) =
-                    serde_json::from_slice::<RaBitQIndex>(data.as_slice())
-                {
-                    indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
-                }
+                log::warn!(
+                    "Unknown vector index type {} for field {}",
+                    index_type,
+                    field_id
+                );
             }
         }
     }

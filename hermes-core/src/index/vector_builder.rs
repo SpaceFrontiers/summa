@@ -316,7 +316,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             {
                 for index in reader.vector_indexes().values() {
                     if let crate::segment::VectorIndex::Flat(flat_data) = index {
-                        total_vectors += flat_data.vectors.len();
+                        total_vectors += flat_data.num_vectors();
                     }
                 }
                 doc_offset += reader.meta().num_docs;
@@ -362,22 +362,23 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     let remaining = MAX_TRAINING_VECTORS.saturating_sub(entry.len());
 
                     if remaining == 0 {
-                        total_skipped += flat_data.vectors.len();
+                        total_skipped += flat_data.num_vectors();
                         continue;
                     }
 
-                    if flat_data.vectors.len() <= remaining {
+                    let n = flat_data.num_vectors();
+                    if n <= remaining {
                         // Take all vectors from this segment
-                        entry.extend(flat_data.vectors.iter().cloned());
+                        entry.extend((0..n).map(|i| flat_data.get_vector(i).to_vec()));
                     } else {
                         // Uniform sample: take every Nth vector
-                        let step = (flat_data.vectors.len() / remaining).max(1);
-                        for (i, vec) in flat_data.vectors.iter().enumerate() {
+                        let step = (n / remaining).max(1);
+                        for i in 0..n {
                             if i % step == 0 && entry.len() < MAX_TRAINING_VECTORS {
-                                entry.push(vec.clone());
+                                entry.push(flat_data.get_vector(i).to_vec());
                             }
                         }
-                        total_skipped += flat_data.vectors.len() - remaining;
+                        total_skipped += n - remaining;
                     }
                 }
             }

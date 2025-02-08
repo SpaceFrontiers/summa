@@ -443,11 +443,10 @@ impl AsyncSegmentReader {
                 // Brute-force search using cosine similarity
                 use crate::structures::simd::cosine_similarity;
 
-                let mut candidates: Vec<(u32, u16, f32)> = flat_data
-                    .vectors
-                    .iter()
-                    .zip(flat_data.doc_ids.iter())
-                    .map(|(vec, &(doc_id, ordinal))| {
+                let mut candidates: Vec<(u32, u16, f32)> = (0..flat_data.num_vectors())
+                    .map(|i| {
+                        let vec = flat_data.get_vector(i);
+                        let (doc_id, ordinal) = flat_data.get_doc_id(i);
                         let score = cosine_similarity(effective_query, vec);
                         (doc_id, ordinal, score)
                     })
