@@ -101,6 +101,53 @@ pub enum VectorIndexType {
     ScaNN,
 }
 
+/// Storage quantization for dense vector elements
+///
+/// Controls the precision of each vector coordinate in `.vectors` files.
+/// Lower precision reduces storage and memory bandwidth; scoring uses
+/// native-precision SIMD (no dequantization on the hot path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenseVectorQuantization {
+    /// 32-bit IEEE 754 float (4 bytes/dim) — full precision, baseline
+    #[default]
+    F32,
+    /// 16-bit IEEE 754 half-float (2 bytes/dim) — <0.1% recall loss for normalized embeddings
+    F16,
+    /// 8-bit unsigned scalar quantization (1 byte/dim) — maps [-1,1] → [0,255]
+    UInt8,
+}
+
+impl DenseVectorQuantization {
+    /// Bytes per element for this quantization type
+    pub fn element_size(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 => 2,
+            Self::UInt8 => 1,
+        }
+    }
+
+    /// Wire format tag (stored in .vectors header)
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::UInt8 => 2,
+        }
+    }
+
+    /// Decode wire format tag
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::F32),
+            1 => Some(Self::F16),
+            2 => Some(Self::UInt8),
+            _ => None,
+        }
+    }
+}
+
 /// Configuration for dense vector fields using Flat, RaBitQ, IVF-RaBitQ, or ScaNN
 ///
 /// Indexes operate in two states:
@@ -116,6 +163,9 @@ pub struct DenseVectorConfig {
     /// When in accumulating state, search uses brute-force regardless of this setting.
     #[serde(default)]
     pub index_type: VectorIndexType,
+    /// Storage quantization for vector elements (f32, f16, uint8)
+    #[serde(default)]
+    pub quantization: DenseVectorQuantization,
     /// Number of IVF clusters for IVF-RaBitQ and ScaNN (default: sqrt(n) capped at 4096)
     /// If None, automatically determined based on dataset size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,11 +173,6 @@ pub struct DenseVectorConfig {
     /// Number of clusters to probe during search (default: 32)
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
-    /// Matryoshka/MRL dimension for index - use only first mrl_dim coordinates for indexing
-    /// Full vectors are stored but index uses truncated vectors for faster search
-    /// Must be <= dim. If None, uses full dim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mrl_dim: Option<usize>,
     /// Minimum number of vectors required before building ANN index.
     /// Below this threshold, brute-force (Flat) search is used.
     /// Default: 1000 for RaBitQ, 10000 for IVF-RaBitQ/ScaNN.
@@ -144,9 +189,9 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::RaBitQ,
+            quantization: DenseVectorQuantization::F32,
             num_clusters: None,
             nprobe: 32,
-            mrl_dim: None,
             build_threshold: None,
         }
     }
@@ -156,9 +201,9 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::IvfRaBitQ,
+            quantization: DenseVectorQuantization::F32,
             num_clusters,
             nprobe,
-            mrl_dim: None,
             build_threshold: None,
         }
     }
@@ -168,9 +213,9 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::ScaNN,
+            quantization: DenseVectorQuantization::F32,
             num_clusters,
             nprobe,
-            mrl_dim: None,
             build_threshold: None,
         }
     }
@@ -180,16 +225,16 @@ impl DenseVectorConfig {
         Self {
             dim,
             index_type: VectorIndexType::Flat,
+            quantization: DenseVectorQuantization::F32,
             num_clusters: None,
             nprobe: 0,
-            mrl_dim: None,
             build_threshold: None,
         }
     }
 
-    /// Set matryoshka/MRL dimension for index truncation
-    pub fn with_mrl_dim(mut self, mrl_dim: usize) -> Self {
-        self.mrl_dim = Some(mrl_dim);
+    /// Set storage quantization
+    pub fn with_quantization(mut self, quantization: DenseVectorQuantization) -> Self {
+        self.quantization = quantization;
         self
     }
 
@@ -203,11 +248,6 @@ impl DenseVectorConfig {
     pub fn with_num_clusters(mut self, num_clusters: usize) -> Self {
         self.num_clusters = Some(num_clusters);
         self
-    }
-
-    /// Get the effective dimension for indexing (mrl_dim if set, otherwise dim)
-    pub fn index_dim(&self) -> usize {
-        self.mrl_dim.unwrap_or(self.dim)
     }
 
     /// Check if this config uses IVF

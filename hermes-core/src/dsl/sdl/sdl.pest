@@ -49,7 +49,6 @@ string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 //   field name: text<default> [indexed, stored]
 //   field embedding: dense_vector<768> [indexed<rabitq>]
 //   field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>]
-//   field embedding: dense_vector<768> [indexed<scann, num_clusters: 1024, nprobe: 64, mrl_dim: 256>]
 //   field embedding: dense_vector<768> [indexed<flat>]  # brute-force, no ANN index
 field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (sparse_vector_config | dense_vector_config | tokenizer_spec)? ~ attributes? }
 
@@ -76,27 +75,28 @@ index_size_spec = { "u16" | "u32" }
 quantization_spec = { "float32" | "float16" | "uint8" | "uint4" | "f32" | "f16" | "u8" | "u4" }
 weight_threshold_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 
-// Dense vector configuration - only dimension
-// All index-related params (index type, num_clusters, nprobe, mrl_dim, build_threshold) are in indexed<...>
+// Dense vector configuration - dimension and optional quantization type
+// All index-related params (index type, num_clusters, nprobe, build_threshold) are in indexed<...>
 // Examples:
-//   field embedding: dense_vector<768> [indexed]                           # default RaBitQ
+//   field embedding: dense_vector<768> [indexed]                           # default f32
+//   field embedding: dense_vector<768, f16> [indexed]                      # half precision, 2× savings
+//   field embedding: dense_vector<768, uint8> [indexed]                    # scalar quantized, 4× savings
 //   field embedding: dense_vector<768> [indexed<rabitq>]                   # explicit RaBitQ
-//   field embedding: dense_vector<768> [indexed<ivf_rabitq>]               # IVF-RaBitQ (auto clusters)
-//   field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>]
-//   field embedding: dense_vector<768> [indexed<scann, num_clusters: 1024, nprobe: 64>]
+//   field embedding: dense_vector<768, f16> [indexed<ivf_rabitq>]          # f16 + IVF-RaBitQ
 //   field embedding: dense_vector<768> [indexed<flat>]                     # brute-force only
 //   field embedding: dense_vector<768> [stored]                            # not indexed, just stored
 dense_vector_config = { "<" ~ dense_vector_params ~ ">" }
 dense_vector_params = { dense_vector_keyword_params | dense_vector_positional_params }
 
-// Keyword-based params: only dims (index params moved to indexed<...>)
-dense_vector_keyword_params = { dims_kwarg }
+// Keyword-based params: dims and optional quantization
+dense_vector_keyword_params = { dims_kwarg ~ ("," ~ quant_type_spec)? }
 dims_kwarg = { "dims" ~ ":" ~ dimension_spec }
 
-// Positional params: just dimension
-dense_vector_positional_params = { dimension_spec }
+// Positional params: dimension and optional quantization
+dense_vector_positional_params = { dimension_spec ~ ("," ~ quant_type_spec)? }
 
 dimension_spec = @{ ASCII_DIGIT+ }
+quant_type_spec = { "f32" | "f16" | "uint8" | "u8" }
 
 // Tokenizer specification: <tokenizer_name>
 tokenizer_spec = { "<" ~ identifier ~ ">" }
@@ -121,21 +121,18 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<rabitq>     # RaBitQ binary quantization
 //   indexed<ivf_rabitq> # IVF-RaBitQ (centroids trained from data)
 //   indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>
-//   indexed<scann, num_clusters: 1024, nprobe: 64, mrl_dim: 256>
 //   indexed<rabitq, build_threshold: 5000>  # build ANN after 5000 vectors
 //   indexed<quantization: uint8, weight_threshold: 0.1>  # for sparse vectors
 //   indexed<positions, quantization: uint8>  # sparse with positions
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | mrl_dim_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | query_config_block | positions_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | query_config_block | positions_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
 //   token_position - only token position within text for phrase queries
 positions_kwarg = { "positions" | "ordinal" | "token_position" }
-mrl_dim_kwarg = { "mrl_dim" ~ ":" ~ mrl_dim_spec }
-mrl_dim_spec = @{ ASCII_DIGIT+ }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
 index_type_spec = { "flat" | "scann" | "ivf_rabitq" | "rabitq" }
 num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }

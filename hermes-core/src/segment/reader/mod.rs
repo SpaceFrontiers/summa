@@ -294,12 +294,34 @@ impl AsyncSegmentReader {
         Ok(Some(block_list))
     }
 
-    /// Get document by local doc_id (async - loads on demand)
+    /// Get document by local doc_id (async - loads on demand).
+    ///
+    /// Dense vector fields are hydrated from LazyFlatVectorData (not stored in .store).
+    /// Uses binary search on sorted doc_ids for O(log N) lookup.
     pub async fn doc(&self, local_doc_id: DocId) -> Result<Option<Document>> {
-        self.store
-            .get(local_doc_id, &self.schema)
-            .await
-            .map_err(Error::from)
+        let mut doc = match self.store.get(local_doc_id, &self.schema).await {
+            Ok(Some(d)) => d,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(Error::from(e)),
+        };
+
+        // Hydrate dense vector fields from flat vector data
+        for (&field_id, lazy_flat) in &self.flat_vectors {
+            let (start, entries) = lazy_flat.flat_indexes_for_doc(local_doc_id);
+            for (j, &(_doc_id, _ordinal)) in entries.iter().enumerate() {
+                let flat_idx = start + j;
+                match lazy_flat.get_vector(flat_idx).await {
+                    Ok(vec) => {
+                        doc.add_dense_vector(Field(field_id), vec);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to hydrate vector field {}: {}", field_id, e);
+                    }
+                }
+            }
+        }
+
+        Ok(Some(doc))
     }
 
     /// Prefetch term dictionary blocks for a key range
@@ -412,7 +434,6 @@ impl AsyncSegmentReader {
     ///
     /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
     /// The doc_ids are adjusted by doc_id_offset for this segment.
-    /// If mrl_dim is configured, the query vector is automatically trimmed.
     /// For multi-valued documents, scores are combined using the specified combiner.
     pub async fn search_dense_vector(
         &self,
@@ -423,26 +444,6 @@ impl AsyncSegmentReader {
         rerank_factor: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
-        // Get mrl_dim from config to trim query vector if needed
-        let mrl_dim = self
-            .schema
-            .get_field_entry(field)
-            .and_then(|e| e.dense_vector_config.as_ref())
-            .and_then(|c| c.mrl_dim);
-
-        // Trim query vector if mrl_dim is set
-        let query_vec: Vec<f32>;
-        let effective_query = if let Some(trim_dim) = mrl_dim {
-            if trim_dim < query.len() {
-                query_vec = query[..trim_dim].to_vec();
-                query_vec.as_slice()
-            } else {
-                query
-            }
-        } else {
-            query
-        };
-
         let ann_index = self.vector_indexes.get(&field.0);
         let lazy_flat = self.flat_vectors.get(&field.0);
 
@@ -451,6 +452,9 @@ impl AsyncSegmentReader {
             return Ok(Vec::new());
         }
 
+        /// Batch size for brute-force scoring (4096 vectors × 768 dims × 4 bytes ≈ 12MB)
+        const BRUTE_FORCE_BATCH: usize = 4096;
+
         // Results are (doc_id, ordinal, score) where score = similarity (higher = better)
         let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
             // ANN search (RaBitQ, IVF, ScaNN)
@@ -458,7 +462,7 @@ impl AsyncSegmentReader {
                 VectorIndex::RaBitQ(rabitq) => {
                     let fetch_k = k * rerank_factor.max(1);
                     rabitq
-                        .search(effective_query, fetch_k, rerank_factor)
+                        .search(query, fetch_k, rerank_factor)
                         .into_iter()
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
@@ -470,13 +474,7 @@ impl AsyncSegmentReader {
                     let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
                     let fetch_k = k * rerank_factor.max(1);
                     index
-                        .search(
-                            centroids,
-                            codebook,
-                            effective_query,
-                            fetch_k,
-                            Some(effective_nprobe),
-                        )
+                        .search(centroids, codebook, query, fetch_k, Some(effective_nprobe))
                         .into_iter()
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
@@ -488,112 +486,170 @@ impl AsyncSegmentReader {
                     let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
                     let fetch_k = k * rerank_factor.max(1);
                     index
-                        .search(
-                            centroids,
-                            codebook,
-                            effective_query,
-                            fetch_k,
-                            Some(effective_nprobe),
-                        )
+                        .search(centroids, codebook, query, fetch_k, Some(effective_nprobe))
                         .into_iter()
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
                 }
             }
         } else if let Some(lazy_flat) = lazy_flat {
-            // Brute-force from lazy flat vectors (mmap-backed range read)
-            let all_bytes = lazy_flat
-                .read_all_vector_bytes()
-                .await
-                .map_err(crate::Error::Io)?;
-            let raw = all_bytes.as_slice();
-            let full_dim = lazy_flat.dim;
+            // Batched brute-force from lazy flat vectors (native-precision SIMD scoring)
+            let dim = lazy_flat.dim;
             let n = lazy_flat.num_vectors;
-            let total_floats = n * full_dim;
+            let quant = lazy_flat.quantization;
+            let fetch_k = k * rerank_factor.max(1);
+            let mut candidates: Vec<(u32, u16, f32)> = Vec::new();
 
-            // Use mmap bytes directly if already f32-aligned, otherwise copy once
-            let mut aligned_buf: Vec<f32> = Vec::new();
-            let vectors: &[f32] =
-                if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-                    // Zero-copy: reinterpret aligned mmap bytes as &[f32]
-                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, total_floats) }
-                } else {
-                    // Fallback: copy into aligned buffer (rare — mmap is page-aligned)
-                    aligned_buf.resize(total_floats, 0.0);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            raw.as_ptr(),
-                            aligned_buf.as_mut_ptr() as *mut u8,
-                            total_floats * std::mem::size_of::<f32>(),
+            for batch_start in (0..n).step_by(BRUTE_FORCE_BATCH) {
+                let batch_count = BRUTE_FORCE_BATCH.min(n - batch_start);
+                let batch_bytes = lazy_flat
+                    .read_vectors_batch(batch_start, batch_count)
+                    .await
+                    .map_err(crate::Error::Io)?;
+                let raw = batch_bytes.as_slice();
+
+                let mut scores = vec![0f32; batch_count];
+
+                match quant {
+                    crate::dsl::DenseVectorQuantization::F32 => {
+                        let batch_floats = batch_count * dim;
+                        let mut aligned_buf: Vec<f32> = Vec::new();
+                        let vectors: &[f32] = if (raw.as_ptr() as usize)
+                            .is_multiple_of(std::mem::align_of::<f32>())
+                        {
+                            unsafe {
+                                std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats)
+                            }
+                        } else {
+                            aligned_buf.resize(batch_floats, 0.0);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    raw.as_ptr(),
+                                    aligned_buf.as_mut_ptr() as *mut u8,
+                                    batch_floats * std::mem::size_of::<f32>(),
+                                );
+                            }
+                            &aligned_buf
+                        };
+                        crate::structures::simd::batch_cosine_scores(
+                            query,
+                            vectors,
+                            dim,
+                            &mut scores,
                         );
                     }
-                    &aligned_buf
-                };
+                    crate::dsl::DenseVectorQuantization::F16 => {
+                        crate::structures::simd::batch_cosine_scores_f16(
+                            query,
+                            raw,
+                            dim,
+                            &mut scores,
+                        );
+                    }
+                    crate::dsl::DenseVectorQuantization::UInt8 => {
+                        crate::structures::simd::batch_cosine_scores_u8(
+                            query,
+                            raw,
+                            dim,
+                            &mut scores,
+                        );
+                    }
+                }
 
-            // Strided SIMD cosine: dim = effective_query.len(), stride = full_dim
-            // MRL: dim < stride → only prefix touched, rest skipped. No copy.
-            let score_dim = effective_query.len();
-            let mut scores = vec![0f32; n];
-            crate::structures::simd::batch_cosine_scores_strided(
-                effective_query,
-                vectors,
-                score_dim,
-                full_dim,
-                &mut scores,
-            );
+                for (i, &score) in scores.iter().enumerate().take(batch_count) {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                    candidates.push((doc_id, ordinal, score));
+                }
+            }
 
-            let mut candidates: Vec<(u32, u16, f32)> = (0..n)
-                .map(|i| {
-                    let (doc_id, ordinal) = lazy_flat.get_doc_id(i);
-                    (doc_id, ordinal, scores[i])
-                })
-                .collect();
             candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-            candidates.truncate(k * rerank_factor.max(1));
+            candidates.truncate(fetch_k);
             candidates
         } else {
             return Ok(Vec::new());
         };
 
-        // Rerank ANN candidates using raw vectors from lazy flat (mmap, no store reads)
-        // Batched: build doc_id→index lookup, batch-read vectors, batch cosine scores
+        // Rerank ANN candidates using raw vectors from lazy flat (binary search lookup)
+        // Uses native-precision SIMD scoring on quantized bytes — no dequantization overhead.
         if ann_index.is_some()
             && !results.is_empty()
             && let Some(lazy_flat) = lazy_flat
         {
             let dim = lazy_flat.dim;
+            let quant = lazy_flat.quantization;
+            let vbs = lazy_flat.vector_byte_size();
 
-            // Build lookup: (doc_id, ordinal) → flat index
-            let lookup: rustc_hash::FxHashMap<(u32, u16), usize> = lazy_flat
-                .doc_ids
-                .iter()
-                .enumerate()
-                .map(|(i, &(d, o))| ((d, o), i))
-                .collect();
-
-            // Resolve flat indexes for each candidate
+            // Resolve flat indexes for each candidate via binary search
             let mut resolved: Vec<(usize, usize)> = Vec::new(); // (result_idx, flat_idx)
             for (ri, c) in results.iter().enumerate() {
-                if let Some(&flat_idx) = lookup.get(&(c.0, c.1)) {
-                    resolved.push((ri, flat_idx));
+                let (start, entries) = lazy_flat.flat_indexes_for_doc(c.0);
+                for (j, &(_, ord)) in entries.iter().enumerate() {
+                    if ord == c.1 {
+                        resolved.push((ri, start + j));
+                        break;
+                    }
                 }
             }
 
             if !resolved.is_empty() {
-                // Batch-read all needed vectors directly into contiguous buffer (no intermediate alloc)
-                let mut vec_buf = vec![0f32; resolved.len() * dim];
+                // Batch-read raw quantized bytes into contiguous buffer
+                let mut raw_buf = vec![0u8; resolved.len() * vbs];
                 for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
                     let _ = lazy_flat
-                        .read_vector_into(
+                        .read_vector_raw_into(
                             flat_idx,
-                            &mut vec_buf[buf_idx * dim..(buf_idx + 1) * dim],
+                            &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
                         )
                         .await;
                 }
 
-                // Batch SIMD cosine with full query (not MRL-trimmed)
+                // Native-precision batch SIMD cosine scoring
                 let mut scores = vec![0f32; resolved.len()];
-                crate::structures::simd::batch_cosine_scores(query, &vec_buf, dim, &mut scores);
+                match quant {
+                    crate::dsl::DenseVectorQuantization::F32 => {
+                        let floats = resolved.len() * dim;
+                        let mut aligned_buf: Vec<f32> = Vec::new();
+                        let vectors: &[f32] = if (raw_buf.as_ptr() as usize)
+                            .is_multiple_of(std::mem::align_of::<f32>())
+                        {
+                            unsafe {
+                                std::slice::from_raw_parts(raw_buf.as_ptr() as *const f32, floats)
+                            }
+                        } else {
+                            aligned_buf.resize(floats, 0.0);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    raw_buf.as_ptr(),
+                                    aligned_buf.as_mut_ptr() as *mut u8,
+                                    floats * std::mem::size_of::<f32>(),
+                                );
+                            }
+                            &aligned_buf
+                        };
+                        crate::structures::simd::batch_cosine_scores(
+                            query,
+                            vectors,
+                            dim,
+                            &mut scores,
+                        );
+                    }
+                    crate::dsl::DenseVectorQuantization::F16 => {
+                        crate::structures::simd::batch_cosine_scores_f16(
+                            query,
+                            &raw_buf,
+                            dim,
+                            &mut scores,
+                        );
+                    }
+                    crate::dsl::DenseVectorQuantization::UInt8 => {
+                        crate::structures::simd::batch_cosine_scores_u8(
+                            query,
+                            &raw_buf,
+                            dim,
+                            &mut scores,
+                        );
+                    }
+                }
 
                 // Write scores back to results
                 for (buf_idx, &(ri, _)) in resolved.iter().enumerate() {

@@ -16,8 +16,8 @@ use super::SegmentMerger;
 use super::TrainedVectorStructures;
 use super::doc_offsets;
 use crate::Result;
-use crate::directories::{Directory, DirectoryWriter};
-use crate::dsl::{FieldType, VectorIndexType};
+use crate::directories::{AsyncFileRead, Directory, DirectoryWriter};
+use crate::dsl::{DenseVectorQuantization, FieldType, VectorIndexType};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::segment::vector_data::FlatVectorData;
@@ -34,12 +34,16 @@ struct FlatStreamField {
     field_id: u32,
     dim: usize,
     total_vectors: usize,
+    quantization: DenseVectorQuantization,
 }
+
+/// Batch size for streaming vector reads (1024 vectors × 1024 dims × 4 bytes ≈ 4MB)
+const VECTOR_BATCH_SIZE: usize = 1024;
 
 /// Streams vectors from a segment's lazy flat data into an add_fn callback.
 ///
-/// Bulk-reads all vector bytes once, then iterates with pointer arithmetic.
-/// No per-vector allocation — single mmap range read + optional alignment copy.
+/// Reads vectors in batches of VECTOR_BATCH_SIZE to bound memory usage.
+/// Each batch is a single range read via LazyFileSlice.
 ///
 /// Returns number of vectors added.
 async fn feed_segment(
@@ -57,40 +61,43 @@ async fn feed_segment(
         return 0;
     }
     let dim = lazy_flat.dim;
-
-    // Single bulk read of all vector bytes
-    let all_bytes = match lazy_flat.read_all_vector_bytes().await {
-        Ok(b) => b,
-        Err(_) => return 0,
-    };
-    let raw = all_bytes.as_slice();
-    let total_floats = n * dim;
-
-    // Use mmap bytes directly if f32-aligned, otherwise copy once
-    let mut aligned_buf: Vec<f32> = Vec::new();
-    let vectors: &[f32] = if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, total_floats) }
-    } else {
-        aligned_buf.resize(total_floats, 0.0);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                raw.as_ptr(),
-                aligned_buf.as_mut_ptr() as *mut u8,
-                total_floats * std::mem::size_of::<f32>(),
-            );
-        }
-        &aligned_buf
-    };
-
     let mut count = 0;
-    for i in 0..n {
-        let (doc_id, ordinal) = lazy_flat.get_doc_id(i);
-        add_fn(
-            doc_id_offset + doc_id,
-            ordinal,
-            &vectors[i * dim..(i + 1) * dim],
-        );
-        count += 1;
+
+    for batch_start in (0..n).step_by(VECTOR_BATCH_SIZE) {
+        let batch_count = VECTOR_BATCH_SIZE.min(n - batch_start);
+        let batch_bytes = match lazy_flat.read_vectors_batch(batch_start, batch_count).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let raw = batch_bytes.as_slice();
+        let batch_floats = batch_count * dim;
+
+        // Use mmap bytes directly if f32-aligned, otherwise copy once
+        let mut aligned_buf: Vec<f32> = Vec::new();
+        let vectors: &[f32] = if (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>())
+        {
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats) }
+        } else {
+            aligned_buf.resize(batch_floats, 0.0);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    raw.as_ptr(),
+                    aligned_buf.as_mut_ptr() as *mut u8,
+                    batch_floats * std::mem::size_of::<f32>(),
+                );
+            }
+            &aligned_buf
+        };
+
+        for i in 0..batch_count {
+            let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+            add_fn(
+                doc_id_offset + doc_id,
+                ordinal,
+                &vectors[i * dim..(i + 1) * dim],
+            );
+            count += 1;
+        }
     }
     count
 }
@@ -115,7 +122,9 @@ impl SegmentMerger {
         let doc_offs = doc_offsets(segments);
 
         for (field, entry) in self.schema.fields() {
-            if !matches!(entry.field_type, FieldType::DenseVector) || !entry.indexed {
+            if !matches!(entry.field_type, FieldType::DenseVector)
+                || !(entry.indexed || entry.stored)
+            {
                 continue;
             }
 
@@ -130,8 +139,7 @@ impl SegmentMerger {
             if full_dim == 0 {
                 continue;
             }
-            // Index dimension (may be MRL-trimmed) for ANN building
-            let index_dim = config.map(|c| c.index_dim()).unwrap_or(full_dim);
+            let dim = full_dim;
 
             // Count total vectors across all segments (from lazy flat)
             let total_vectors: usize = segments
@@ -139,12 +147,23 @@ impl SegmentMerger {
                 .filter_map(|s| s.flat_vectors().get(&field.0).map(|f| f.num_vectors))
                 .sum();
 
-            // 1. ALWAYS write Flat entry (full-dim raw vectors for reranking/merge)
+            // Resolve quantization: prefer schema config, fall back to source segment
+            let quantization = config
+                .map(|c| c.quantization)
+                .or_else(|| {
+                    segments
+                        .iter()
+                        .find_map(|s| s.flat_vectors().get(&field.0).map(|f| f.quantization))
+                })
+                .unwrap_or(DenseVectorQuantization::F32);
+
+            // 1. ALWAYS write Flat entry (raw vectors for reranking/merge)
             if total_vectors > 0 {
                 flat_fields.push(FlatStreamField {
                     field_id: field.0,
                     dim: full_dim,
                     total_vectors,
+                    quantization,
                 });
             }
 
@@ -274,9 +293,9 @@ impl SegmentMerger {
                 match ann {
                     VectorIndexType::IvfRaBitQ => {
                         let centroids = &trained.centroids[&field.0];
-                        let rabitq_config = crate::structures::RaBitQConfig::new(index_dim);
+                        let rabitq_config = crate::structures::RaBitQConfig::new(dim);
                         let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
-                        let ivf_config = crate::structures::IVFRaBitQConfig::new(index_dim);
+                        let ivf_config = crate::structures::IVFRaBitQConfig::new(dim);
                         let mut ivf_index = crate::structures::IVFRaBitQIndex::new(
                             ivf_config,
                             centroids.version,
@@ -287,12 +306,8 @@ impl SegmentMerger {
                             let offset = doc_offs[seg_idx];
                             total_fed +=
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
-                                    let v = if index_dim < vec.len() {
-                                        &vec[..index_dim]
-                                    } else {
-                                        vec
-                                    };
-                                    ivf_index.add_vector(centroids, &codebook, doc_id, ordinal, v);
+                                    ivf_index
+                                        .add_vector(centroids, &codebook, doc_id, ordinal, vec);
                                 })
                                 .await;
                         }
@@ -319,7 +334,7 @@ impl SegmentMerger {
                     VectorIndexType::ScaNN => {
                         let centroids = &trained.centroids[&field.0];
                         let codebook = &trained.codebooks[&field.0];
-                        let ivf_pq_config = crate::structures::IVFPQConfig::new(index_dim);
+                        let ivf_pq_config = crate::structures::IVFPQConfig::new(dim);
                         let mut ivf_pq_index = crate::structures::IVFPQIndex::new(
                             ivf_pq_config,
                             centroids.version,
@@ -330,13 +345,8 @@ impl SegmentMerger {
                             let offset = doc_offs[seg_idx];
                             total_fed +=
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
-                                    let v = if index_dim < vec.len() {
-                                        &vec[..index_dim]
-                                    } else {
-                                        vec
-                                    };
                                     ivf_pq_index
-                                        .add_vector(centroids, codebook, doc_id, ordinal, v);
+                                        .add_vector(centroids, codebook, doc_id, ordinal, vec);
                                 })
                                 .await;
                         }
@@ -388,8 +398,11 @@ impl SegmentMerger {
             entries.push(FieldEntry {
                 field_id: flat.field_id,
                 index_type: 4,
-                data_size: FlatVectorData::serialized_binary_size(flat.dim, flat.total_vectors)
-                    as u64,
+                data_size: FlatVectorData::serialized_binary_size(
+                    flat.dim,
+                    flat.total_vectors,
+                    flat.quantization,
+                ) as u64,
                 blob_idx: None,
                 flat_idx: Some(i),
             });
@@ -438,17 +451,31 @@ impl SegmentMerger {
             } else if let Some(flat_idx) = entry.flat_idx {
                 let flat = &flat_fields[flat_idx];
 
-                // Write binary header
-                FlatVectorData::write_binary_header(flat.dim, flat.total_vectors, &mut writer)?;
+                // Write binary header with quantization type
+                FlatVectorData::write_binary_header(
+                    flat.dim,
+                    flat.total_vectors,
+                    flat.quantization,
+                    &mut writer,
+                )?;
 
-                // Pass 1: stream raw vector bytes from each segment's lazy flat (bulk read)
+                // Pass 1: stream raw vector bytes in chunks from each segment's lazy flat
                 for segment in segments {
                     if let Some(lazy_flat) = segment.flat_vectors().get(&entry.field_id) {
-                        let vector_bytes = lazy_flat
-                            .read_all_vector_bytes()
-                            .await
-                            .map_err(crate::Error::Io)?;
-                        writer.write_all(vector_bytes.as_slice())?;
+                        let total_bytes = lazy_flat.vector_bytes_len();
+                        let base_offset = lazy_flat.vectors_byte_offset();
+                        let handle = lazy_flat.handle();
+                        const CHUNK: u64 = 1024 * 1024; // 1MB
+                        for chunk_start in (0..total_bytes).step_by(CHUNK as usize) {
+                            let chunk_end = (chunk_start + CHUNK).min(total_bytes);
+                            let bytes = handle
+                                .read_bytes_range(
+                                    base_offset + chunk_start..base_offset + chunk_end,
+                                )
+                                .await
+                                .map_err(crate::Error::Io)?;
+                            writer.write_all(bytes.as_slice())?;
+                        }
                     }
                 }
 

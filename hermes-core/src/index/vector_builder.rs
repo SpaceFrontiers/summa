@@ -442,49 +442,33 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             _ => return Ok(()),
         };
 
-        let index_dim = config.index_dim();
+        let dim = config.dim;
         let num_vectors = vectors.len();
         let num_clusters = config.optimal_num_clusters(num_vectors);
 
         log::info!(
-            "Training vector index for field {} with {} vectors, {} clusters (index_dim={})",
+            "Training vector index for field {} with {} vectors, {} clusters (dim={})",
             field_id,
             num_vectors,
             num_clusters,
-            index_dim,
+            dim,
         );
-
-        // Trim vectors to index_dim for training (MRL: flat stores full-dim,
-        // but centroids/codebooks must be at index_dim to match the ANN index)
-        let trimmed: Vec<Vec<f32>>;
-        let training_vectors = if vectors.first().is_some_and(|v| v.len() > index_dim) {
-            trimmed = vectors.iter().map(|v| v[..index_dim].to_vec()).collect();
-            &trimmed
-        } else {
-            vectors
-        };
 
         let centroids_filename = format!("field_{}_centroids.bin", field_id);
         let mut codebook_filename: Option<String> = None;
 
         match config.index_type {
             VectorIndexType::IvfRaBitQ => {
-                self.train_ivf_rabitq(
-                    field_id,
-                    index_dim,
-                    num_clusters,
-                    training_vectors,
-                    &centroids_filename,
-                )
-                .await?;
+                self.train_ivf_rabitq(field_id, dim, num_clusters, vectors, &centroids_filename)
+                    .await?;
             }
             VectorIndexType::ScaNN => {
                 codebook_filename = Some(format!("field_{}_codebook.bin", field_id));
                 self.train_scann(
                     field_id,
-                    index_dim,
+                    dim,
                     num_clusters,
-                    training_vectors,
+                    vectors,
                     &centroids_filename,
                     codebook_filename.as_ref().unwrap(),
                 )
@@ -518,12 +502,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     async fn train_ivf_rabitq(
         &self,
         field_id: u32,
-        index_dim: usize,
+        dim: usize,
         num_clusters: usize,
         vectors: &[Vec<f32>],
         centroids_filename: &str,
     ) -> Result<()> {
-        let coarse_config = crate::structures::CoarseConfig::new(index_dim, num_clusters);
+        let coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
         let centroids = crate::structures::CoarseCentroids::train(&coarse_config, vectors);
 
         // Save centroids to index-level file
@@ -547,18 +531,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     async fn train_scann(
         &self,
         field_id: u32,
-        index_dim: usize,
+        dim: usize,
         num_clusters: usize,
         vectors: &[Vec<f32>],
         centroids_filename: &str,
         codebook_filename: &str,
     ) -> Result<()> {
         // Train coarse centroids
-        let coarse_config = crate::structures::CoarseConfig::new(index_dim, num_clusters);
+        let coarse_config = crate::structures::CoarseConfig::new(dim, num_clusters);
         let centroids = crate::structures::CoarseCentroids::train(&coarse_config, vectors);
 
         // Train PQ codebook
-        let pq_config = crate::structures::PQConfig::new(index_dim);
+        let pq_config = crate::structures::PQConfig::new(dim);
         let codebook = crate::structures::PQCodebook::train(pq_config, vectors, 10);
 
         // Save centroids

@@ -25,9 +25,10 @@ index documents {
     field title_sparse_span: json [stored<multi>]
 
     # Multi dense vectors (e.g., sentence embeddings)
-    # IVF-RaBitQ uses binary quantization (~32x compression), MRL truncates to 128 dims at query time
+    # f16 storage quantization halves memory with <0.1% recall loss
+    # IVF-RaBitQ uses binary quantization (~32x compression) for ANN search
     # Index starts as Flat (brute-force), call build_vector_index() to train IVF-RaBitQ
-    field dense_vectors: dense_vector<1024> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32, mrl_dim: 128>, stored<multi>]
+    field dense_vectors: dense_vector<1024, f16> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>, stored<multi>]
 
     # Span metadata for dense vectors - stored JSON list, not indexed
     field dense_span: json [stored<multi>]

@@ -195,6 +195,49 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }
 ```
 
+## Dense Vectors
+
+Dense vector fields store high-dimensional embeddings for semantic search. Vectors are quantized on write and scored using native-precision SIMD (no dequantization on the hot path).
+
+### Syntax
+
+```
+field embedding: dense_vector<DIM> [indexed]              # f32 (default)
+field embedding: dense_vector<DIM, f16> [indexed]         # half-precision, 2× less storage
+field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4× less storage
+```
+
+### Quantization Types
+
+| Type    | Aliases | Bytes/dim | Recall impact | Use case            |
+| ------- | ------- | --------- | ------------- | ------------------- |
+| `f32`   |         | 4         | Baseline      | Maximum precision   |
+| `f16`   |         | 2         | <0.1% loss    | Recommended default |
+| `uint8` | `u8`    | 1         | 1-3% loss     | Maximum compression |
+
+### Index Types
+
+Dense vectors support multiple ANN index algorithms, specified in `indexed<...>`:
+
+```
+field e: dense_vector<768, f16> [indexed]                                    # default RaBitQ
+field e: dense_vector<768, f16> [indexed<rabitq>]                            # explicit RaBitQ
+field e: dense_vector<768, f16> [indexed<ivf_rabitq, num_clusters: 256>]     # IVF-RaBitQ
+field e: dense_vector<768, f16> [indexed<scann, num_clusters: 1024>]         # ScaNN
+field e: dense_vector<768, f16> [indexed<flat>]                              # brute-force only
+field e: dense_vector<768> [stored]                                          # stored, not indexed
+```
+
+### Example
+
+```
+index documents {
+    field title: text<en_stem> [indexed, stored]
+    field embedding: dense_vector<768, f16> [indexed<ivf_rabitq>, stored<multi>]
+    field span: json [stored<multi>]
+}
+```
+
 ## Best Practices
 
 1. **Use descriptive field names** - Field names should clearly indicate their purpose

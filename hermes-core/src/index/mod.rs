@@ -917,7 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_index_threshold_switch() {
-        use crate::dsl::{DenseVectorConfig, VectorIndexType};
+        use crate::dsl::{DenseVectorConfig, DenseVectorQuantization, VectorIndexType};
 
         // Create schema with dense vector field configured for IVF-RaBitQ
         let mut schema_builder = SchemaBuilder::default();
@@ -929,9 +929,9 @@ mod tests {
             DenseVectorConfig {
                 dim: 8,
                 index_type: VectorIndexType::IvfRaBitQ,
+                quantization: DenseVectorQuantization::F32,
                 num_clusters: Some(4), // Small for test
                 nprobe: 2,
-                mrl_dim: None,
                 build_threshold: Some(50), // Build when we have 50+ vectors
             },
         );

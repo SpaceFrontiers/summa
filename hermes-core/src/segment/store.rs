@@ -53,7 +53,13 @@ pub fn serialize_document(doc: &Document, schema: &Schema) -> io::Result<Vec<u8>
     let stored: Vec<_> = doc
         .field_values()
         .iter()
-        .filter(|(field, _)| schema.get_field_entry(*field).is_some_and(|e| e.stored))
+        .filter(|(field, value)| {
+            // Dense vectors live in .vectors (LazyFlatVectorData), not in .store
+            if matches!(value, crate::dsl::FieldValue::DenseVector(_)) {
+                return false;
+            }
+            schema.get_field_entry(*field).is_some_and(|e| e.stored)
+        })
         .collect();
 
     let mut buf = Vec::with_capacity(256);

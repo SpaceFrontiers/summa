@@ -1766,36 +1766,300 @@ pub fn batch_cosine_scores(query: &[f32], vectors: &[f32], dim: usize, scores: &
     }
 }
 
-/// Batch cosine similarity with stride: query vs N vectors stored at `stride` apart.
-///
-/// Computes cosine similarity using only the first `dim` elements of each vector,
-/// where vectors are spaced `stride` elements apart in the buffer. This avoids
-/// copying/trimming when only a prefix of each vector is needed (e.g., MRL).
-///
-/// - `query.len()` must equal `dim`
-/// - `vectors.len()` must be >= `(n-1) * stride + dim`
-/// - When `stride == dim`, this is identical to [`batch_cosine_scores`]
-///
-/// Example: 768-dim vectors, MRL trim to 256 →
-///   `dim = 256, stride = 768` — reads first 256 floats of each vector, skips rest.
-///   3× less SIMD work, zero copies.
-#[inline]
-pub fn batch_cosine_scores_strided(
-    query: &[f32],
-    vectors: &[f32],
-    dim: usize,
-    stride: usize,
-    scores: &mut [f32],
-) {
-    let n = scores.len();
-    debug_assert_eq!(query.len(), dim);
-    debug_assert!(stride >= dim);
+// ============================================================================
+// f16 (IEEE 754 half-precision) conversion
+// ============================================================================
 
+/// Convert f32 to f16 (IEEE 754 half-precision), stored as u16
+#[inline]
+pub fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+
+    if exp == 255 {
+        // Inf/NaN
+        return (sign | 0x7C00 | ((mantissa >> 13) & 0x3FF)) as u16;
+    }
+
+    let exp16 = exp - 127 + 15;
+
+    if exp16 >= 31 {
+        return (sign | 0x7C00) as u16; // overflow → infinity
+    }
+
+    if exp16 <= 0 {
+        if exp16 < -10 {
+            return sign as u16; // too small → zero
+        }
+        let m = (mantissa | 0x80_0000) >> (1 - exp16);
+        return (sign | (m >> 13)) as u16;
+    }
+
+    (sign | ((exp16 as u32) << 10) | (mantissa >> 13)) as u16
+}
+
+/// Convert f16 (stored as u16) to f32
+#[inline]
+pub fn f16_to_f32(half: u16) -> f32 {
+    let sign = ((half & 0x8000) as u32) << 16;
+    let exp = ((half >> 10) & 0x1F) as u32;
+    let mantissa = (half & 0x3FF) as u32;
+
+    if exp == 0 {
+        if mantissa == 0 {
+            return f32::from_bits(sign);
+        }
+        // Subnormal: normalize
+        let mut e = 0u32;
+        let mut m = mantissa;
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e += 1;
+        }
+        return f32::from_bits(sign | ((127 - 15 + 1 - e) << 23) | ((m & 0x3FF) << 13));
+    }
+
+    if exp == 31 {
+        return f32::from_bits(sign | 0x7F80_0000 | (mantissa << 13));
+    }
+
+    f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mantissa << 13))
+}
+
+// ============================================================================
+// uint8 scalar quantization for [-1, 1] range
+// ============================================================================
+
+const U8_SCALE: f32 = 127.5;
+const U8_INV_SCALE: f32 = 1.0 / 127.5;
+
+/// Quantize f32 in [-1, 1] to u8 [0, 255]
+#[inline]
+pub fn f32_to_u8_saturating(value: f32) -> u8 {
+    ((value.clamp(-1.0, 1.0) + 1.0) * U8_SCALE) as u8
+}
+
+/// Dequantize u8 [0, 255] to f32 in [-1, 1]
+#[inline]
+pub fn u8_to_f32(byte: u8) -> f32 {
+    byte as f32 * U8_INV_SCALE - 1.0
+}
+
+// ============================================================================
+// Batch conversion (used during builder write)
+// ============================================================================
+
+/// Batch convert f32 slice to f16 (stored as u16)
+pub fn batch_f32_to_f16(src: &[f32], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        *d = f32_to_f16(*s);
+    }
+}
+
+/// Batch convert f32 slice to u8 with [-1,1] → [0,255] mapping
+pub fn batch_f32_to_u8(src: &[f32], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (s, d) in src.iter().zip(dst.iter_mut()) {
+        *d = f32_to_u8_saturating(*s);
+    }
+}
+
+// ============================================================================
+// NEON-accelerated fused dot+norm for quantized vectors
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+mod neon_quant {
+    use std::arch::aarch64::*;
+
+    /// Fused dot(query, vec) + norm(vec) for f16 vectors on NEON.
+    /// Converts f16→f32 via scalar bit manipulation, then uses NEON FMA.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn fused_dot_norm_f16(query: &[f32], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+        let chunks = dim / 4;
+        let remainder = dim % 4;
+
+        let mut acc_dot = vdupq_n_f32(0.0);
+        let mut acc_norm = vdupq_n_f32(0.0);
+
+        for c in 0..chunks {
+            let base = c * 4;
+            let q = vld1q_f32(query.as_ptr().add(base));
+
+            // Convert 4 f16→f32 into a small buffer, then SIMD load
+            let buf = [
+                super::f16_to_f32(*vec_f16.get_unchecked(base)),
+                super::f16_to_f32(*vec_f16.get_unchecked(base + 1)),
+                super::f16_to_f32(*vec_f16.get_unchecked(base + 2)),
+                super::f16_to_f32(*vec_f16.get_unchecked(base + 3)),
+            ];
+            let v = vld1q_f32(buf.as_ptr());
+
+            acc_dot = vfmaq_f32(acc_dot, q, v);
+            acc_norm = vfmaq_f32(acc_norm, v, v);
+        }
+
+        let mut dot = vaddvq_f32(acc_dot);
+        let mut norm = vaddvq_f32(acc_norm);
+
+        let base = chunks * 4;
+        for i in 0..remainder {
+            let v = super::f16_to_f32(*vec_f16.get_unchecked(base + i));
+            dot += *query.get_unchecked(base + i) * v;
+            norm += v * v;
+        }
+
+        (dot, norm)
+    }
+
+    /// Fused dot(query, vec) + norm(vec) for u8 vectors on NEON.
+    /// Processes 16 u8 values per iteration using NEON widening chain.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn fused_dot_norm_u8(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
+        let scale = vdupq_n_f32(super::U8_INV_SCALE);
+        let offset = vdupq_n_f32(-1.0);
+
+        let chunks16 = dim / 16;
+        let remainder = dim % 16;
+
+        let mut acc_dot = vdupq_n_f32(0.0);
+        let mut acc_norm = vdupq_n_f32(0.0);
+
+        for c in 0..chunks16 {
+            let base = c * 16;
+
+            // Load 16 u8 values
+            let bytes = vld1q_u8(vec_u8.as_ptr().add(base));
+
+            // Widen: 16×u8 → 2×8×u16 → 4×4×u32 → 4×4×f32
+            let lo8 = vget_low_u8(bytes);
+            let hi8 = vget_high_u8(bytes);
+            let lo16 = vmovl_u8(lo8);
+            let hi16 = vmovl_u8(hi8);
+
+            let f0 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16))), scale),
+                offset,
+            );
+            let f1 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16))), scale),
+                offset,
+            );
+            let f2 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16))), scale),
+                offset,
+            );
+            let f3 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16))), scale),
+                offset,
+            );
+
+            let q0 = vld1q_f32(query.as_ptr().add(base));
+            let q1 = vld1q_f32(query.as_ptr().add(base + 4));
+            let q2 = vld1q_f32(query.as_ptr().add(base + 8));
+            let q3 = vld1q_f32(query.as_ptr().add(base + 12));
+
+            acc_dot = vfmaq_f32(acc_dot, q0, f0);
+            acc_dot = vfmaq_f32(acc_dot, q1, f1);
+            acc_dot = vfmaq_f32(acc_dot, q2, f2);
+            acc_dot = vfmaq_f32(acc_dot, q3, f3);
+
+            acc_norm = vfmaq_f32(acc_norm, f0, f0);
+            acc_norm = vfmaq_f32(acc_norm, f1, f1);
+            acc_norm = vfmaq_f32(acc_norm, f2, f2);
+            acc_norm = vfmaq_f32(acc_norm, f3, f3);
+        }
+
+        let mut dot = vaddvq_f32(acc_dot);
+        let mut norm = vaddvq_f32(acc_norm);
+
+        let base = chunks16 * 16;
+        for i in 0..remainder {
+            let v = super::u8_to_f32(*vec_u8.get_unchecked(base + i));
+            dot += *query.get_unchecked(base + i) * v;
+            norm += v * v;
+        }
+
+        (dot, norm)
+    }
+}
+
+// ============================================================================
+// Scalar fallback for fused dot+norm on quantized vectors
+// ============================================================================
+
+#[allow(dead_code)]
+fn fused_dot_norm_f16_scalar(query: &[f32], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+    let mut dot = 0.0f32;
+    let mut norm = 0.0f32;
+    for i in 0..dim {
+        let v = f16_to_f32(vec_f16[i]);
+        dot += query[i] * v;
+        norm += v * v;
+    }
+    (dot, norm)
+}
+
+#[allow(dead_code)]
+fn fused_dot_norm_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
+    let mut dot = 0.0f32;
+    let mut norm = 0.0f32;
+    for i in 0..dim {
+        let v = u8_to_f32(vec_u8[i]);
+        dot += query[i] * v;
+        norm += v * v;
+    }
+    (dot, norm)
+}
+
+// ============================================================================
+// Platform dispatch
+// ============================================================================
+
+#[inline]
+fn fused_dot_norm_f16(query: &[f32], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon_quant::fused_dot_norm_f16(query, vec_f16, dim) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        fused_dot_norm_f16_scalar(query, vec_f16, dim)
+    }
+}
+
+#[inline]
+fn fused_dot_norm_u8(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon_quant::fused_dot_norm_u8(query, vec_u8, dim) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        fused_dot_norm_u8_scalar(query, vec_u8, dim)
+    }
+}
+
+// ============================================================================
+// Public batch cosine scoring for quantized vectors
+// ============================================================================
+
+/// Batch cosine similarity: f32 query vs N contiguous f16 vectors.
+///
+/// `vectors_raw` is raw bytes: N vectors × dim × 2 bytes (f16 stored as u16).
+/// Converts f16→f32 in-register using SIMD, scores using fused dot+norm.
+/// Memory bandwidth is halved compared to f32 scoring.
+#[inline]
+pub fn batch_cosine_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
+    let n = scores.len();
     if dim == 0 || n == 0 {
         return;
     }
 
-    // Pre-compute query norm once
     let norm_q_sq = dot_product_f32(query, query, dim);
     if norm_q_sq < f32::EPSILON {
         for s in scores.iter_mut() {
@@ -1805,11 +2069,50 @@ pub fn batch_cosine_scores_strided(
     }
     let norm_q = norm_q_sq.sqrt();
 
-    for (i, score) in scores.iter_mut().enumerate() {
-        let start = i * stride;
-        let vec = &vectors[start..start + dim];
-        let (dot, norm_v_sq) = fused_dot_norm(query, vec, dim);
-        *score = if norm_v_sq < f32::EPSILON {
+    let vec_bytes = dim * 2;
+    debug_assert!(vectors_raw.len() >= n * vec_bytes);
+
+    for i in 0..n {
+        let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
+        let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
+
+        let (dot, norm_v_sq) = fused_dot_norm_f16(query, f16_slice, dim);
+        scores[i] = if norm_v_sq < f32::EPSILON {
+            0.0
+        } else {
+            dot / (norm_q * norm_v_sq.sqrt())
+        };
+    }
+}
+
+/// Batch cosine similarity: f32 query vs N contiguous u8 vectors.
+///
+/// `vectors_raw` is raw bytes: N vectors × dim bytes (u8, mapping [-1,1]→[0,255]).
+/// Converts u8→f32 using NEON widening chain (16 values/iteration), scores with FMA.
+/// Memory bandwidth is quartered compared to f32 scoring.
+#[inline]
+pub fn batch_cosine_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
+    let n = scores.len();
+    if dim == 0 || n == 0 {
+        return;
+    }
+
+    let norm_q_sq = dot_product_f32(query, query, dim);
+    if norm_q_sq < f32::EPSILON {
+        for s in scores.iter_mut() {
+            *s = 0.0;
+        }
+        return;
+    }
+    let norm_q = norm_q_sq.sqrt();
+
+    debug_assert!(vectors_raw.len() >= n * dim);
+
+    for i in 0..n {
+        let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
+
+        let (dot, norm_v_sq) = fused_dot_norm_u8(query, u8_slice, dim);
+        scores[i] = if norm_v_sq < f32::EPSILON {
             0.0
         } else {
             dot / (norm_q * norm_v_sq.sqrt())
@@ -2461,107 +2764,6 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_cosine_scores_strided_mrl() {
-        // Simulate MRL: 4 vectors at full_dim=8, query trimmed to dim=3
-        // Vectors: [v0(8 floats), v1(8 floats), v2(8 floats), v3(8 floats)]
-        // Only first 3 floats of each vector should be used
-        let query = vec![1.0f32, 0.0, 0.0]; // dim=3
-        let vectors = vec![
-            1.0, 0.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v0: identical prefix
-            0.0, 1.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v1: orthogonal prefix
-            -1.0, 0.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v2: opposite prefix
-            0.5, 0.5, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0, // v3: 45-degree prefix
-        ];
-        let mut scores = vec![0f32; 4];
-        batch_cosine_scores_strided(&query, &vectors, 3, 8, &mut scores);
-
-        assert!((scores[0] - 1.0).abs() < 1e-5, "identical: {}", scores[0]);
-        assert!(scores[1].abs() < 1e-5, "orthogonal: {}", scores[1]);
-        assert!((scores[2] - (-1.0)).abs() < 1e-5, "opposite: {}", scores[2]);
-        let expected_45 = 0.5f32 / (0.5f32.powi(2) + 0.5f32.powi(2)).sqrt();
-        assert!(
-            (scores[3] - expected_45).abs() < 1e-5,
-            "45deg: {}",
-            scores[3]
-        );
-    }
-
-    #[test]
-    fn test_batch_cosine_scores_strided_matches_trimmed() {
-        // Verify strided version matches manually-trimmed batch version
-        let full_dim = 128;
-        let trim_dim = 32; // MRL dimension
-        let n = 20;
-
-        let full_query: Vec<f32> = (0..full_dim).map(|i| (i as f32) * 0.1).collect();
-        let trimmed_query = &full_query[..trim_dim];
-        let vectors: Vec<f32> = (0..n * full_dim)
-            .map(|i| ((i * 7 + 3) as f32) * 0.01)
-            .collect();
-
-        // Strided: operate on full buffer with stride
-        let mut strided_scores = vec![0f32; n];
-        batch_cosine_scores_strided(
-            trimmed_query,
-            &vectors,
-            trim_dim,
-            full_dim,
-            &mut strided_scores,
-        );
-
-        // Manual trim: copy first trim_dim floats per vector, then batch
-        let trimmed_vectors: Vec<f32> = (0..n)
-            .flat_map(|i| {
-                vectors[i * full_dim..i * full_dim + trim_dim]
-                    .iter()
-                    .copied()
-            })
-            .collect();
-        let mut trimmed_scores = vec![0f32; n];
-        batch_cosine_scores(
-            trimmed_query,
-            &trimmed_vectors,
-            trim_dim,
-            &mut trimmed_scores,
-        );
-
-        for i in 0..n {
-            assert!(
-                (strided_scores[i] - trimmed_scores[i]).abs() < 1e-5,
-                "vec {}: strided={}, trimmed={}",
-                i,
-                strided_scores[i],
-                trimmed_scores[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_batch_cosine_scores_strided_equals_non_strided() {
-        // When stride == dim, should produce identical results to batch_cosine_scores
-        let dim = 64;
-        let n = 30;
-        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.1).collect();
-        let vectors: Vec<f32> = (0..n * dim).map(|i| ((i * 3 + 1) as f32) * 0.01).collect();
-
-        let mut scores_batch = vec![0f32; n];
-        batch_cosine_scores(&query, &vectors, dim, &mut scores_batch);
-
-        let mut scores_strided = vec![0f32; n];
-        batch_cosine_scores_strided(&query, &vectors, dim, dim, &mut scores_strided);
-
-        for i in 0..n {
-            assert!(
-                (scores_batch[i] - scores_strided[i]).abs() < 1e-6,
-                "vec {}: batch={}, strided={}",
-                i,
-                scores_batch[i],
-                scores_strided[i]
-            );
-        }
-    }
-
-    #[test]
     fn test_squared_euclidean_distance() {
         let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let b = vec![2.0f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
@@ -2587,5 +2789,141 @@ mod tests {
             expected,
             result
         );
+    }
+
+    // ================================================================
+    // f16 conversion tests
+    // ================================================================
+
+    #[test]
+    fn test_f16_roundtrip_normal() {
+        for &v in &[0.0f32, 1.0, -1.0, 0.5, -0.5, 0.333, 65504.0] {
+            let h = f32_to_f16(v);
+            let back = f16_to_f32(h);
+            let err = (back - v).abs() / v.abs().max(1e-6);
+            assert!(
+                err < 0.002,
+                "f16 roundtrip {v} → {h:#06x} → {back}, rel err {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_f16_special() {
+        // Zero
+        assert_eq!(f16_to_f32(f32_to_f16(0.0)), 0.0);
+        // Negative zero
+        assert_eq!(f32_to_f16(-0.0), 0x8000);
+        // Infinity
+        assert!(f16_to_f32(f32_to_f16(f32::INFINITY)).is_infinite());
+        // NaN
+        assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+    }
+
+    #[test]
+    fn test_f16_embedding_range() {
+        // Typical embedding values in [-1, 1]
+        let values: Vec<f32> = (-100..=100).map(|i| i as f32 / 100.0).collect();
+        for &v in &values {
+            let back = f16_to_f32(f32_to_f16(v));
+            assert!((back - v).abs() < 0.001, "f16 error for {v}: got {back}");
+        }
+    }
+
+    // ================================================================
+    // u8 conversion tests
+    // ================================================================
+
+    #[test]
+    fn test_u8_roundtrip() {
+        // Boundary values
+        assert_eq!(f32_to_u8_saturating(-1.0), 0);
+        assert_eq!(f32_to_u8_saturating(1.0), 255);
+        assert_eq!(f32_to_u8_saturating(0.0), 127); // ~127.5 truncated
+
+        // Saturation
+        assert_eq!(f32_to_u8_saturating(-2.0), 0);
+        assert_eq!(f32_to_u8_saturating(2.0), 255);
+    }
+
+    #[test]
+    fn test_u8_dequantize() {
+        assert!((u8_to_f32(0) - (-1.0)).abs() < 0.01);
+        assert!((u8_to_f32(255) - 1.0).abs() < 0.01);
+        assert!((u8_to_f32(127) - 0.0).abs() < 0.01);
+    }
+
+    // ================================================================
+    // Batch scoring tests for quantized vectors
+    // ================================================================
+
+    #[test]
+    fn test_batch_cosine_scores_f16() {
+        let query = vec![0.6f32, 0.8, 0.0, 0.0];
+        let dim = 4;
+        let vecs_f32 = vec![
+            0.6f32, 0.8, 0.0, 0.0, // identical to query
+            0.0, 0.0, 0.6, 0.8, // orthogonal
+        ];
+
+        // Quantize to f16
+        let mut f16_buf = vec![0u16; 8];
+        batch_f32_to_f16(&vecs_f32, &mut f16_buf);
+        let raw: &[u8] =
+            unsafe { std::slice::from_raw_parts(f16_buf.as_ptr() as *const u8, f16_buf.len() * 2) };
+
+        let mut scores = vec![0f32; 2];
+        batch_cosine_scores_f16(&query, raw, dim, &mut scores);
+
+        assert!(
+            (scores[0] - 1.0).abs() < 0.01,
+            "identical vectors: {}",
+            scores[0]
+        );
+        assert!(scores[1].abs() < 0.01, "orthogonal vectors: {}", scores[1]);
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_u8() {
+        let query = vec![0.6f32, 0.8, 0.0, 0.0];
+        let dim = 4;
+        let vecs_f32 = vec![
+            0.6f32, 0.8, 0.0, 0.0, // ~identical to query
+            -0.6, -0.8, 0.0, 0.0, // opposite
+        ];
+
+        // Quantize to u8
+        let mut u8_buf = vec![0u8; 8];
+        batch_f32_to_u8(&vecs_f32, &mut u8_buf);
+
+        let mut scores = vec![0f32; 2];
+        batch_cosine_scores_u8(&query, &u8_buf, dim, &mut scores);
+
+        assert!(scores[0] > 0.95, "similar vectors: {}", scores[0]);
+        assert!(scores[1] < -0.95, "opposite vectors: {}", scores[1]);
+    }
+
+    #[test]
+    fn test_batch_cosine_scores_f16_large_dim() {
+        // Test with typical embedding dimension
+        let dim = 768;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 / dim as f32) - 0.5).collect();
+        let vec2: Vec<f32> = query.iter().map(|x| x * 0.9 + 0.01).collect();
+
+        let mut all_vecs = query.clone();
+        all_vecs.extend_from_slice(&vec2);
+
+        let mut f16_buf = vec![0u16; all_vecs.len()];
+        batch_f32_to_f16(&all_vecs, &mut f16_buf);
+        let raw: &[u8] =
+            unsafe { std::slice::from_raw_parts(f16_buf.as_ptr() as *const u8, f16_buf.len() * 2) };
+
+        let mut scores = vec![0f32; 2];
+        batch_cosine_scores_f16(&query, raw, dim, &mut scores);
+
+        // Self-similarity should be ~1.0
+        assert!((scores[0] - 1.0).abs() < 0.01, "self-sim: {}", scores[0]);
+        // High similarity with scaled version
+        assert!(scores[1] > 0.99, "scaled-sim: {}", scores[1]);
     }
 }

@@ -31,8 +31,6 @@
 //!     # Dense vector with IVF-RaBitQ index
 //!     field embedding: dense_vector<768> [indexed<rabitq, centroids: "centroids.bin", nprobe: 32>]
 //!
-//!     # Dense vector with ScaNN index and MRL dimension
-//!     field embedding2: dense_vector<1536> [indexed<scann, centroids: "c.bin", codebook: "pq.bin", mrl_dim: 256>]
 //! }
 //! ```
 //!
@@ -43,13 +41,12 @@
 //! - `centroids: "path"` - path to pre-trained centroids file
 //! - `codebook: "path"` - path to PQ codebook (ScaNN only)
 //! - `nprobe: N` - number of clusters to probe (default: 32)
-//! - `mrl_dim: N` - Matryoshka dimension for index (uses truncated vectors)
 
 use pest::Parser;
 use pest_derive::Parser;
 
 use super::query_field_router::{QueryRouterRule, RoutingMode};
-use super::schema::{FieldType, Schema, SchemaBuilder};
+use super::schema::{DenseVectorQuantization, FieldType, Schema, SchemaBuilder};
 use crate::Result;
 use crate::error::Error;
 
@@ -209,7 +206,6 @@ struct IndexConfig {
     index_type: Option<super::schema::VectorIndexType>,
     num_clusters: Option<usize>,
     nprobe: Option<usize>,
-    mrl_dim: Option<usize>,
     build_threshold: Option<usize>,
     // Sparse vector index params
     quantization: Option<WeightQuantization>,
@@ -335,12 +331,6 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                 config.nprobe = Some(n.as_str().parse().unwrap_or(32));
             }
         }
-        Rule::mrl_dim_kwarg => {
-            // mrl_dim_kwarg = { "mrl_dim" ~ ":" ~ mrl_dim_spec }
-            if let Some(n) = p.into_inner().next() {
-                config.mrl_dim = Some(n.as_str().parse().unwrap_or(0));
-            }
-        }
         Rule::quantization_kwarg => {
             // quantization_kwarg = { "quantization" ~ ":" ~ quantization_spec }
             if let Some(q) = p.into_inner().next() {
@@ -463,7 +453,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 sparse_vector_config = Some(parse_sparse_vector_config(item));
             }
             Rule::dense_vector_config => {
-                // Parse dense_vector_params (keyword or positional) - only dims and mrl_dim
+                // Parse dense_vector_params (keyword or positional) - only dims
                 dense_vector_config = Some(parse_dense_vector_config(item));
             }
             Rule::attributes => {
@@ -518,11 +508,6 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
     // Apply nprobe if specified
     if let Some(nprobe) = idx_cfg.nprobe {
         config.nprobe = nprobe;
-    }
-
-    // Apply mrl_dim if specified
-    if idx_cfg.mrl_dim.is_some() {
-        config.mrl_dim = idx_cfg.mrl_dim;
     }
 
     // Apply build_threshold if specified
@@ -601,10 +586,11 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     }
 }
 
-/// Parse dense_vector_config - only dims
-/// All index-related params (including mrl_dim) are now in indexed<...> attribute
+/// Parse dense_vector_config - dims and optional quantization type
+/// All index-related params are in indexed<...> attribute
 fn parse_dense_vector_config(pair: pest::iterators::Pair<Rule>) -> DenseVectorConfig {
     let mut dim: usize = 0;
+    let mut quantization = DenseVectorQuantization::F32;
 
     // Navigate to dense_vector_params
     for params in pair.into_inner() {
@@ -612,19 +598,31 @@ fn parse_dense_vector_config(pair: pest::iterators::Pair<Rule>) -> DenseVectorCo
             for inner in params.into_inner() {
                 match inner.as_rule() {
                     Rule::dense_vector_keyword_params => {
-                        // Parse keyword args: dims: N
                         for kwarg in inner.into_inner() {
-                            if kwarg.as_rule() == Rule::dims_kwarg
-                                && let Some(d) = kwarg.into_inner().next()
-                            {
-                                dim = d.as_str().parse().unwrap_or(0);
+                            match kwarg.as_rule() {
+                                Rule::dims_kwarg => {
+                                    if let Some(d) = kwarg.into_inner().next() {
+                                        dim = d.as_str().parse().unwrap_or(0);
+                                    }
+                                }
+                                Rule::quant_type_spec => {
+                                    quantization = parse_quant_type(kwarg.as_str());
+                                }
+                                _ => {}
                             }
                         }
                     }
                     Rule::dense_vector_positional_params => {
-                        // Parse positional: just dimension
-                        if let Some(dim_pair) = inner.into_inner().next() {
-                            dim = dim_pair.as_str().parse().unwrap_or(0);
+                        for item in inner.into_inner() {
+                            match item.as_rule() {
+                                Rule::dimension_spec => {
+                                    dim = item.as_str().parse().unwrap_or(0);
+                                }
+                                Rule::quant_type_spec => {
+                                    quantization = parse_quant_type(item.as_str());
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     _ => {}
@@ -633,7 +631,15 @@ fn parse_dense_vector_config(pair: pest::iterators::Pair<Rule>) -> DenseVectorCo
         }
     }
 
-    DenseVectorConfig::new(dim)
+    DenseVectorConfig::new(dim).with_quantization(quantization)
+}
+
+fn parse_quant_type(s: &str) -> DenseVectorQuantization {
+    match s.trim() {
+        "f16" => DenseVectorQuantization::F16,
+        "uint8" | "u8" => DenseVectorQuantization::UInt8,
+        _ => DenseVectorQuantization::F32,
+    }
 }
 
 /// Parse default_fields definition
@@ -1433,28 +1439,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_vector_mrl_dim() {
-        // Test matryoshka/MRL dimension trimming (new syntax: mrl_dim in indexed<...>)
+    fn test_dense_vector_f16_quantization() {
+        use crate::dsl::schema::{DenseVectorQuantization, VectorIndexType};
+
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<1536> [indexed<mrl_dim: 256>]
-            }
-        "#;
-
-        let indexes = parse_sdl(sdl).unwrap();
-        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
-
-        assert_eq!(config.dim, 1536);
-        assert_eq!(config.mrl_dim, Some(256));
-        assert_eq!(config.index_dim(), 256);
-    }
-
-    #[test]
-    fn test_dense_vector_mrl_dim_with_num_clusters() {
-        // Test mrl_dim combined with other index options
-        let sdl = r#"
-            index documents {
-                field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 64, mrl_dim: 128>]
+                field embedding: dense_vector<768, f16> [indexed]
             }
         "#;
 
@@ -1462,18 +1452,52 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.mrl_dim, Some(128));
-        assert_eq!(config.index_dim(), 128);
-        assert_eq!(config.num_clusters, Some(256));
-        assert_eq!(config.nprobe, 64);
+        assert_eq!(config.quantization, DenseVectorQuantization::F16);
+        assert_eq!(config.index_type, VectorIndexType::RaBitQ);
     }
 
     #[test]
-    fn test_dense_vector_no_mrl_dim() {
-        // Test that index_dim() returns full dim when mrl_dim is not set
+    fn test_dense_vector_uint8_quantization() {
+        use crate::dsl::schema::DenseVectorQuantization;
+
         let sdl = r#"
             index documents {
-                field embedding: dense_vector<dims: 768> [indexed]
+                field embedding: dense_vector<1024, uint8> [indexed<ivf_rabitq>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 1024);
+        assert_eq!(config.quantization, DenseVectorQuantization::UInt8);
+    }
+
+    #[test]
+    fn test_dense_vector_u8_alias() {
+        use crate::dsl::schema::DenseVectorQuantization;
+
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<512, u8> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 512);
+        assert_eq!(config.quantization, DenseVectorQuantization::UInt8);
+    }
+
+    #[test]
+    fn test_dense_vector_default_f32_quantization() {
+        use crate::dsl::schema::DenseVectorQuantization;
+
+        // No quantization type → default f32
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<768> [indexed]
             }
         "#;
 
@@ -1481,8 +1505,24 @@ mod tests {
         let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
 
         assert_eq!(config.dim, 768);
-        assert_eq!(config.mrl_dim, None);
-        assert_eq!(config.index_dim(), 768);
+        assert_eq!(config.quantization, DenseVectorQuantization::F32);
+    }
+
+    #[test]
+    fn test_dense_vector_keyword_with_quantization() {
+        use crate::dsl::schema::DenseVectorQuantization;
+
+        let sdl = r#"
+            index documents {
+                field embedding: dense_vector<dims: 768, f16> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+
+        assert_eq!(config.dim, 768);
+        assert_eq!(config.quantization, DenseVectorQuantization::F16);
     }
 
     #[test]

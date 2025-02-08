@@ -38,8 +38,7 @@ use posting::{
 };
 use vectors::{DenseVectorBuilder, SparseVectorBuilder};
 
-// Re-export from vector_data for backwards compatibility
-pub use super::vector_data::FlatVectorData;
+use super::vector_data::FlatVectorData;
 
 /// Size of the document store buffer before writing to disk
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
@@ -326,11 +325,18 @@ impl SegmentBuilder {
 
         for (field, value) in doc.field_values() {
             let entry = self.schema.get_field_entry(*field);
-            if entry.is_none() || !entry.unwrap().indexed {
+            if entry.is_none() {
                 continue;
             }
 
             let entry = entry.unwrap();
+            // Dense vectors are written to .vectors when indexed || stored
+            // Other field types require indexed
+            let dominated_by_index = matches!(&entry.field_type, FieldType::DenseVector);
+            if !dominated_by_index && !entry.indexed {
+                continue;
+            }
+
             match (&entry.field_type, value) {
                 (FieldType::Text, FieldValue::Text(text)) => {
                     // Get current element ordinal for multi-valued fields
@@ -362,8 +368,10 @@ impl SegmentBuilder {
                 (FieldType::F64, FieldValue::F64(v)) => {
                     self.index_numeric_field(*field, doc_id, v.to_bits())?;
                 }
-                (FieldType::DenseVector, FieldValue::DenseVector(vec)) => {
-                    // Get current element ordinal for multi-valued fields
+                (FieldType::DenseVector, FieldValue::DenseVector(vec))
+                    if entry.indexed || entry.stored =>
+                {
+                    // Dense vectors written to .vectors (not .store) when indexed || stored
                     let element_ordinal = *self.current_element_ordinal.get(&field.0).unwrap_or(&0);
                     self.index_dense_vector_field(*field, doc_id, element_ordinal as u16, vec)?;
                     // Increment element ordinal for next value of this field
@@ -751,9 +759,10 @@ impl SegmentBuilder {
     /// a small header, then streams each field's raw f32 data directly to the writer.
     fn build_vectors_streaming(
         dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
-        _schema: &Schema,
+        schema: &Schema,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        use crate::dsl::DenseVectorQuantization;
         use byteorder::{LittleEndian, WriteBytesExt};
 
         let mut fields: Vec<(u32, DenseVectorBuilder)> = dense_vectors
@@ -766,13 +775,25 @@ impl SegmentBuilder {
             return Ok(());
         }
 
+        // Resolve quantization config per field from schema
+        let quants: Vec<DenseVectorQuantization> = fields
+            .iter()
+            .map(|(field_id, _)| {
+                schema
+                    .get_field_entry(Field(*field_id))
+                    .and_then(|e| e.dense_vector_config.as_ref())
+                    .map(|c| c.quantization)
+                    .unwrap_or(DenseVectorQuantization::F32)
+            })
+            .collect();
+
         // Compute sizes using deterministic formula (no serialization needed)
         let mut field_sizes: Vec<usize> = Vec::with_capacity(fields.len());
-        for (_field_id, builder) in &fields {
-            // Flat stores full-dimension vectors (MRL trimming only applies to ANN indexes)
+        for (i, (_field_id, builder)) in fields.iter().enumerate() {
             field_sizes.push(FlatVectorData::serialized_binary_size(
                 builder.dim,
                 builder.len(),
+                quants[i],
             ));
         }
 
@@ -796,13 +817,12 @@ impl SegmentBuilder {
         writer.write_all(&header)?;
 
         // Stream each field's data directly (builder → disk, no intermediate buffer)
-        for (_field_id, builder) in fields {
-            // Flat stores full-dimension vectors (no MRL trimming)
+        for (i, (_field_id, builder)) in fields.into_iter().enumerate() {
             FlatVectorData::serialize_binary_from_flat_streaming(
                 builder.dim,
                 &builder.vectors,
-                builder.dim,
                 &builder.doc_ids,
+                quants[i],
                 writer,
             )
             .map_err(crate::Error::Io)?;
