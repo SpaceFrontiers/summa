@@ -1748,7 +1748,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.4.73"
+version = "1.4.74"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.4.73"
+version = "1.4.74"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.4.73"
+version = "1.4.74"
 dependencies = [
  "anyhow",
  "clap",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.4.73"
+version = "1.4.74"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.4.73"
+version = "1.4.74"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -4536,9 +4536,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "typed-path"
-version = "0.12.2"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3015e6ce46d5ad8751e4a772543a30c7511468070e98e64e20165f8f81155b64"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typenum"
