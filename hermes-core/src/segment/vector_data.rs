@@ -9,6 +9,48 @@ use crate::directories::{AsyncFileRead, LazyFileSlice, OwnedBytes};
 use crate::dsl::DenseVectorQuantization;
 use crate::structures::simd::{batch_f32_to_f16, batch_f32_to_u8, f16_to_f32, u8_to_f32};
 
+/// Dequantize raw bytes to f32 based on storage quantization.
+///
+/// `raw` is the quantized byte slice, `out` receives the f32 values.
+/// `num_floats` is the number of f32 values to produce (= num_vectors × dim).
+/// Data-first file layout guarantees alignment for f32/f16 access.
+#[inline]
+pub fn dequantize_raw(
+    raw: &[u8],
+    quant: DenseVectorQuantization,
+    num_floats: usize,
+    out: &mut [f32],
+) {
+    debug_assert!(out.len() >= num_floats);
+    match quant {
+        DenseVectorQuantization::F32 => {
+            debug_assert!(
+                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                "f32 vector data not 4-byte aligned"
+            );
+            out[..num_floats].copy_from_slice(unsafe {
+                std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats)
+            });
+        }
+        DenseVectorQuantization::F16 => {
+            debug_assert!(
+                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+                "f16 vector data not 2-byte aligned"
+            );
+            let f16_slice =
+                unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, num_floats) };
+            for (i, &h) in f16_slice.iter().enumerate() {
+                out[i] = f16_to_f32(h);
+            }
+        }
+        DenseVectorQuantization::UInt8 => {
+            for (i, &b) in raw.iter().enumerate().take(num_floats) {
+                out[i] = u8_to_f32(b);
+            }
+        }
+    }
+}
+
 /// Magic number for binary flat vector format v3 ("FVD3" in little-endian)
 const FLAT_BINARY_MAGIC: u32 = 0x46564433;
 
@@ -220,27 +262,7 @@ impl LazyFlatVectorData {
             .await?;
         let raw = bytes.as_slice();
 
-        match self.quantization {
-            DenseVectorQuantization::F32 => unsafe {
-                std::ptr::copy_nonoverlapping(
-                    raw.as_ptr(),
-                    out.as_mut_ptr() as *mut u8,
-                    vec_byte_len,
-                );
-            },
-            DenseVectorQuantization::F16 => {
-                let f16_slice =
-                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, self.dim) };
-                for (i, &h) in f16_slice.iter().enumerate() {
-                    out[i] = f16_to_f32(h);
-                }
-            }
-            DenseVectorQuantization::UInt8 => {
-                for (i, &b) in raw.iter().enumerate().take(self.dim) {
-                    out[i] = u8_to_f32(b);
-                }
-            }
-        }
+        dequantize_raw(raw, self.quantization, self.dim, out);
         Ok(())
     }
 

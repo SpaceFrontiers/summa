@@ -19,8 +19,7 @@ use crate::directories::{AsyncFileRead, Directory, DirectoryWriter};
 use crate::dsl::{DenseVectorQuantization, FieldType, VectorIndexType};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
-use crate::segment::vector_data::FlatVectorData;
-use crate::structures::simd::{f16_to_f32, u8_to_f32};
+use crate::segment::vector_data::{FlatVectorData, dequantize_raw};
 
 /// Pre-serialized field data (ANN indexes, cluster merges)
 struct BlobField {
@@ -77,34 +76,7 @@ async fn feed_segment(
 
         // Dequantize raw bytes to f32 based on storage quantization
         f32_buf.resize(batch_floats, 0.0);
-        match quant {
-            DenseVectorQuantization::F32 => {
-                // Data-first file layout guarantees 4-byte alignment
-                debug_assert!(
-                    (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
-                    "f32 vector data not 4-byte aligned"
-                );
-                f32_buf.copy_from_slice(unsafe {
-                    std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats)
-                });
-            }
-            DenseVectorQuantization::F16 => {
-                debug_assert!(
-                    (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
-                    "f16 vector data not 2-byte aligned"
-                );
-                let f16_slice =
-                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, batch_floats) };
-                for (i, &h) in f16_slice.iter().enumerate() {
-                    f32_buf[i] = f16_to_f32(h);
-                }
-            }
-            DenseVectorQuantization::UInt8 => {
-                for (i, &b) in raw.iter().enumerate().take(batch_floats) {
-                    f32_buf[i] = u8_to_f32(b);
-                }
-            }
-        }
+        dequantize_raw(raw, quant, batch_floats, &mut f32_buf);
 
         for i in 0..batch_count {
             let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
