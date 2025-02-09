@@ -34,6 +34,15 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 .all(|(field, _)| meta.is_field_built(field.0))
         };
         if all_built {
+            // Ensure workers have trained structures (handles from_index cold start)
+            if self
+                .trained_structures
+                .read()
+                .ok()
+                .is_none_or(|g| g.is_none())
+            {
+                self.publish_trained_structures().await;
+            }
             return Ok(());
         }
 
@@ -190,6 +199,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Delete old centroids/codebook files
         for file in files_to_delete {
             let _ = self.directory.delete(std::path::Path::new(&file)).await;
+        }
+
+        // Clear shared trained structures so workers produce flat segments
+        // during retraining (avoids stale centroid mismatch)
+        if let Ok(mut guard) = self.trained_structures.write() {
+            *guard = None;
         }
 
         log::info!("Reset vector index state to Flat, triggering rebuild...");
