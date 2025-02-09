@@ -913,8 +913,8 @@ mod tests {
         assert_eq!(postings.len(), 200);
 
         // First 100 from A (unchanged)
-        for i in 0..100 {
-            assert_eq!(postings[i], (i as u32 * 2, i as u32 + 1));
+        for (i, p) in postings.iter().enumerate().take(100) {
+            assert_eq!(*p, (i as u32 * 2, i as u32 + 1));
         }
         // Next 100 from B (doc_id += 200)
         for i in 0..100 {
@@ -984,7 +984,7 @@ mod tests {
             .collect();
 
         let bpls: Vec<BlockPostingList> = segments.iter().map(|s| build_bpl(s)).collect();
-        let serialized: Vec<Vec<u8>> = bpls.iter().map(|b| serialize_bpl(b)).collect();
+        let serialized: Vec<Vec<u8>> = bpls.iter().map(serialize_bpl).collect();
 
         // Round 1: merge seg0+seg1 (offset=0,600), seg2+seg3 (offset=0,600)
         let mut merged_01 = Vec::new();
@@ -1023,32 +1023,17 @@ mod tests {
 
         // Verify TFs preserved through two rounds of merging
         // Creation formula: tf = (i + seg * 7) % 10 + 1
-        for i in 0..200 {
-            assert_eq!(postings[i].1, (i as u32 + 0 * 7) % 10 + 1, "seg0 tf[{}]", i);
-        }
-        for i in 0..200 {
-            assert_eq!(
-                postings[200 + i].1,
-                (i as u32 + 1 * 7) % 10 + 1,
-                "seg1 tf[{}]",
-                i
-            );
-        }
-        for i in 0..200 {
-            assert_eq!(
-                postings[400 + i].1,
-                (i as u32 + 2 * 7) % 10 + 1,
-                "seg2 tf[{}]",
-                i
-            );
-        }
-        for i in 0..200 {
-            assert_eq!(
-                postings[600 + i].1,
-                (i as u32 + 3 * 7) % 10 + 1,
-                "seg3 tf[{}]",
-                i
-            );
+        for seg in 0u32..4 {
+            for i in 0u32..200 {
+                let idx = (seg * 200 + i) as usize;
+                assert_eq!(
+                    postings[idx].1,
+                    (i + seg * 7) % 10 + 1,
+                    "seg{} tf[{}]",
+                    seg,
+                    i
+                );
+            }
         }
 
         // Verify seek works on final merged result
@@ -1086,7 +1071,7 @@ mod tests {
             );
         }
 
-        let serialized: Vec<Vec<u8>> = bpls.iter().map(|b| serialize_bpl(b)).collect();
+        let serialized: Vec<Vec<u8>> = bpls.iter().map(serialize_bpl).collect();
 
         // Compute offsets: each segment occupies max_doc+1 doc_id space
         let max_doc_per_seg = (docs_per_segment as u32 - 1) * docs_gap;
@@ -1123,8 +1108,7 @@ mod tests {
 
         // Verify seek across all block boundaries
         let mut it = merged_bpl.iterator();
-        for seg in 0..num_segments {
-            let expected_first = offsets[seg];
+        for (seg, &expected_first) in offsets.iter().enumerate() {
             assert_eq!(
                 it.seek(expected_first),
                 expected_first,

@@ -990,7 +990,7 @@ mod tests {
             .collect();
 
         let ppls: Vec<PositionPostingList> = segments.iter().map(|s| build_ppl(s)).collect();
-        let serialized: Vec<Vec<u8>> = ppls.iter().map(|p| serialize_ppl(p)).collect();
+        let serialized: Vec<Vec<u8>> = ppls.iter().map(serialize_ppl).collect();
 
         // Round 1: merge pairs
         let mut merged_01 = Vec::new();
@@ -1061,7 +1061,7 @@ mod tests {
             .collect();
 
         let ppls: Vec<PositionPostingList> = segments.iter().map(|s| build_ppl(s)).collect();
-        let serialized: Vec<Vec<u8>> = ppls.iter().map(|p| serialize_ppl(p)).collect();
+        let serialized: Vec<Vec<u8>> = ppls.iter().map(serialize_ppl).collect();
 
         let max_doc = (docs_per_segment as u32 - 1) * 2;
         let offsets: Vec<u32> = (0..num_segments)
@@ -1085,10 +1085,10 @@ mod tests {
         assert_eq!(all.len(), num_segments * docs_per_segment);
 
         // Verify positions for each segment
-        for seg in 0..num_segments {
+        for (seg, &offset) in offsets.iter().enumerate() {
             for i in 0..docs_per_segment {
                 let idx = seg * docs_per_segment + i;
-                let expected_doc = i as u32 * 2 + offsets[seg];
+                let expected_doc = i as u32 * 2 + offset;
                 assert_eq!(all[idx].0, expected_doc, "seg={} i={}", seg, i);
 
                 let n_pos = (i % 4) + 1;
