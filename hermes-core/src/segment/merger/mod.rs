@@ -86,8 +86,6 @@ fn doc_offsets(segments: &[SegmentReader]) -> Vec<u32> {
 pub struct MergeStats {
     /// Number of terms processed
     pub terms_processed: usize,
-    /// Peak memory usage in bytes (estimated)
-    pub peak_memory_bytes: usize,
     /// Term dictionary output size
     pub term_dict_bytes: usize,
     /// Postings output size
@@ -190,6 +188,7 @@ impl SegmentMerger {
         }
 
         // === Phase 2: merge store files (streaming) ===
+        let phase2_start = std::time::Instant::now();
         {
             let mut store_writer = OffsetWriter::new(dir.streaming_writer(&files.store).await?);
             {
@@ -211,16 +210,33 @@ impl SegmentMerger {
             stats.store_bytes = store_writer.offset() as usize;
             store_writer.finish()?;
         }
+        log::info!(
+            "[merge] store done: {} in {:.1}s",
+            format_bytes(stats.store_bytes),
+            phase2_start.elapsed().as_secs_f64()
+        );
 
-        // === Dense vectors ===
+        // === Phase 3: Dense vectors ===
+        let phase3_start = std::time::Instant::now();
         let vectors_bytes = self
             .merge_dense_vectors(dir, segments, &files, trained)
             .await?;
         stats.vectors_bytes = vectors_bytes;
+        log::info!(
+            "[merge] dense vectors done: {} in {:.1}s",
+            format_bytes(stats.vectors_bytes),
+            phase3_start.elapsed().as_secs_f64()
+        );
 
-        // === Mandatory: merge sparse vectors ===
+        // === Phase 4: merge sparse vectors ===
+        let phase4_start = std::time::Instant::now();
         let sparse_bytes = self.merge_sparse_vectors(dir, segments, &files).await?;
         stats.sparse_bytes = sparse_bytes;
+        log::info!(
+            "[merge] sparse vectors done: {} in {:.1}s",
+            format_bytes(stats.sparse_bytes),
+            phase4_start.elapsed().as_secs_f64()
+        );
 
         // === Mandatory: merge field stats + write meta ===
         let mut merged_field_stats: FxHashMap<u32, FieldStats> = FxHashMap::default();
@@ -395,7 +411,7 @@ impl SegmentMerger {
         }
 
         log::info!(
-            "[merge] complete: terms={}, segments={}, postings={}, positions={}",
+            "[merge] postings done: terms={}, segments={}, postings={}, positions={}",
             terms_processed,
             segments.len(),
             format_bytes(postings_out.offset() as usize),

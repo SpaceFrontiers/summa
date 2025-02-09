@@ -162,7 +162,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             .map(|t| t.codebooks.clone())
             .unwrap_or_default();
 
-        log::info!(
+        log::debug!(
             "[Index::open] trained_centroids fields={:?}, trained_codebooks fields={:?}",
             trained_centroids.keys().collect::<Vec<_>>(),
             trained_codebooks.keys().collect::<Vec<_>>(),
@@ -209,7 +209,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     pub async fn reader(&self) -> Result<&IndexReader<D>> {
         self.cached_reader
             .get_or_try_init(|| async {
-                IndexReader::from_segment_manager_with_reload_interval(
+                IndexReader::from_segment_manager(
                     Arc::clone(&self.schema),
                     Arc::clone(&self.segment_manager),
                     self.config.term_cache_blocks,

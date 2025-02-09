@@ -290,6 +290,7 @@ impl SegmentMerger {
             if let Some(ann) = ann_type {
                 let trained = trained.unwrap();
                 let mut total_fed = 0usize;
+                let ann_start = std::time::Instant::now();
 
                 let (index_type, bytes) = match ann {
                     VectorIndexType::Flat | VectorIndexType::RaBitQ => unreachable!(),
@@ -300,13 +301,30 @@ impl SegmentMerger {
 
                         for (seg_idx, segment) in segments.iter().enumerate() {
                             let offset = doc_offs[seg_idx];
-                            total_fed +=
+                            let fed =
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
                                     index.add_vector(centroids, &codebook, doc_id, ordinal, vec);
                                 })
                                 .await;
+                            total_fed += fed;
+                            if fed > 0 {
+                                log::debug!(
+                                    "[merge_vectors] field {} IVF: fed {} vectors from segment {} ({} total, {:.1}s)",
+                                    field.0,
+                                    fed,
+                                    seg_idx,
+                                    total_fed,
+                                    ann_start.elapsed().as_secs_f64()
+                                );
+                            }
                         }
 
+                        log::info!(
+                            "[merge_vectors] field {} IVF: serializing index ({} vectors, {:.1}s elapsed)",
+                            field.0,
+                            total_fed,
+                            ann_start.elapsed().as_secs_f64()
+                        );
                         let bytes =
                             crate::segment::ann_build::serialize_ivf_rabitq(index, codebook)?;
                         (crate::segment::ann_build::IVF_RABITQ_TYPE, bytes)
@@ -319,29 +337,48 @@ impl SegmentMerger {
 
                         for (seg_idx, segment) in segments.iter().enumerate() {
                             let offset = doc_offs[seg_idx];
-                            total_fed +=
+                            let fed =
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
                                     index.add_vector(centroids, codebook, doc_id, ordinal, vec);
                                 })
                                 .await;
+                            total_fed += fed;
+                            if fed > 0 {
+                                log::debug!(
+                                    "[merge_vectors] field {} ScaNN: fed {} vectors from segment {} ({} total, {:.1}s)",
+                                    field.0,
+                                    fed,
+                                    seg_idx,
+                                    total_fed,
+                                    ann_start.elapsed().as_secs_f64()
+                                );
+                            }
                         }
 
+                        log::info!(
+                            "[merge_vectors] field {} ScaNN: serializing index ({} vectors, {:.1}s elapsed)",
+                            field.0,
+                            total_fed,
+                            ann_start.elapsed().as_secs_f64()
+                        );
                         let bytes = crate::segment::ann_build::serialize_scann(index, codebook)?;
                         (crate::segment::ann_build::SCANN_TYPE, bytes)
                     }
                 };
 
+                log::info!(
+                    "[merge_vectors] field {} ANN(type={}) rebuilt: {} vectors, blob={}, {:.1}s",
+                    field.0,
+                    index_type,
+                    total_fed,
+                    super::format_bytes(bytes.len()),
+                    ann_start.elapsed().as_secs_f64()
+                );
                 blob_fields.push(BlobField {
                     field_id: field.0,
                     index_type,
                     data: bytes,
                 });
-                log::info!(
-                    "Rebuilt ANN(type={}) for field {} ({} vectors)",
-                    index_type,
-                    field.0,
-                    total_fed
-                );
             }
         }
 
@@ -398,6 +435,7 @@ impl SegmentMerger {
 
         // Stream data first — track offsets as we go
         use byteorder::{LittleEndian, WriteBytesExt};
+        let write_start = std::time::Instant::now();
         let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
         let mut toc: Vec<WrittenEntry> = Vec::with_capacity(total_entries);
 
@@ -479,6 +517,12 @@ impl SegmentMerger {
 
         let output_size = writer.offset() as usize;
         writer.finish()?;
+        log::info!(
+            "[merge_vectors] file written: {} ({} entries) in {:.1}s",
+            super::format_bytes(output_size),
+            toc.len(),
+            write_start.elapsed().as_secs_f64()
+        );
         Ok(output_size)
     }
 }

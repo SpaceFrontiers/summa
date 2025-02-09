@@ -6,12 +6,10 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
 
 use crate::directories::DirectoryWriter;
 use crate::dsl::Schema;
 use crate::error::Result;
-use crate::structures::CoarseCentroids;
 
 use super::Searcher;
 
@@ -37,25 +35,11 @@ pub struct IndexReader<D: DirectoryWriter + 'static> {
 }
 
 impl<D: DirectoryWriter + 'static> IndexReader<D> {
-    /// Create a new searcher from a segment manager
+    /// Create a new IndexReader from a segment manager
+    ///
+    /// Centroids are loaded dynamically from metadata on each reload,
+    /// so the reader always picks up centroids trained after Index::create().
     pub async fn from_segment_manager(
-        schema: Arc<Schema>,
-        segment_manager: Arc<crate::merge::SegmentManager<D>>,
-        trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-        term_cache_blocks: usize,
-    ) -> Result<Self> {
-        let _ = trained_centroids; // centroids now loaded dynamically from metadata
-        Self::from_segment_manager_with_reload_interval(
-            schema,
-            segment_manager,
-            term_cache_blocks,
-            1000, // default 1 second
-        )
-        .await
-    }
-
-    /// Create a new searcher from a segment manager with custom reload interval
-    pub async fn from_segment_manager_with_reload_interval(
         schema: Arc<Schema>,
         segment_manager: Arc<crate::merge::SegmentManager<D>>,
         term_cache_blocks: usize,

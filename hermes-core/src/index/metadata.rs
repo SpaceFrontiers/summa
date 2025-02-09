@@ -229,13 +229,13 @@ impl IndexMetadata {
         let mut centroids = rustc_hash::FxHashMap::default();
         let mut codebooks = rustc_hash::FxHashMap::default();
 
-        log::info!(
+        log::debug!(
             "[trained] loading trained structures, vector_fields={:?}",
             self.vector_fields.keys().collect::<Vec<_>>()
         );
 
         for (field_id, field_meta) in &self.vector_fields {
-            log::info!(
+            log::debug!(
                 "[trained] field {} state={:?} centroids_file={:?} codebook_file={:?}",
                 field_id,
                 field_meta.state,
@@ -243,7 +243,7 @@ impl IndexMetadata {
                 field_meta.codebook_file,
             );
             if !matches!(field_meta.state, VectorIndexState::Built { .. }) {
-                log::info!("[trained] field {} skipped (not Built)", field_id);
+                log::debug!("[trained] field {} skipped (not Built)", field_id);
                 continue;
             }
 
@@ -286,7 +286,7 @@ impl IndexMetadata {
                                     );
                                 }
                                 Ok(c) => {
-                                    log::info!(
+                                    log::debug!(
                                         "[trained] field {} loaded centroids ({} clusters)",
                                         field_id,
                                         c.num_clusters
@@ -333,7 +333,7 @@ impl IndexMetadata {
                                     );
                                 }
                                 Ok(c) => {
-                                    log::info!("[trained] field {} loaded codebook", field_id);
+                                    log::debug!("[trained] field {} loaded codebook", field_id);
                                     codebooks.insert(*field_id, Arc::new(c));
                                 }
                             }
