@@ -117,6 +117,21 @@ impl VectorIndex {
     }
 }
 
+/// Raw dimension data for zero-copy merge (no block deserialization).
+///
+/// Contains the skip entries (already in memory from segment open),
+/// metadata, and raw block data bytes read directly from mmap.
+pub struct DimRawData<'a> {
+    /// Skip entries for this dimension (borrowed from SparseIndex)
+    pub skip_entries: &'a [SparseSkipEntry],
+    /// Total document count in this dimension's posting list
+    pub doc_count: u32,
+    /// Global max weight across all blocks
+    pub global_max_weight: f32,
+    /// Raw block data bytes (single contiguous mmap read)
+    pub raw_block_data: crate::directories::OwnedBytes,
+}
+
 /// Sparse vector index for a field: lazy block loading via mmap
 ///
 /// Stores skip list per dimension (block metadata). Blocks loaded on-demand.
@@ -297,60 +312,35 @@ impl SparseIndex {
         dim_ids.iter().map(|&d| self.idf(d)).collect()
     }
 
-    /// Read ALL posting lists in a single bulk I/O operation.
+    /// Get merge-level info for a dimension: skip entries, doc_count, global_max_weight,
+    /// and raw block data bytes (single mmap read, zero deserialization).
     ///
-    /// Used during merge to avoid per-dimension reads (turns 100K+ individual
-    /// I/O calls into 1 read per segment per field).
-    pub async fn read_all_postings_bulk(
-        &self,
-    ) -> crate::Result<rustc_hash::FxHashMap<u32, Arc<BlockSparsePostingList>>> {
-        if self.dimensions.is_empty() {
-            return Ok(rustc_hash::FxHashMap::default());
+    /// Used by sparse merge for O(blocks) byte-level block stacking: the caller
+    /// writes a new header + adjusted skip entries + copies raw bytes directly,
+    /// avoiding deserialize → clone → re-serialize overhead entirely.
+    pub async fn read_dim_raw(&self, dim_id: u32) -> crate::Result<Option<DimRawData<'_>>> {
+        let dim = match self.get_dimension(dim_id) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let skip = self.dim_skip_entries(dim);
+        if skip.is_empty() {
+            return Ok(None);
         }
-
-        // Find extent of all block data so we can read in one shot
-        let mut max_end: u64 = 0;
-        for dim in self.dimensions.iter() {
-            for entry in self.dim_skip_entries(dim) {
-                let end = dim.data_offset + entry.offset as u64 + entry.length as u64;
-                max_end = max_end.max(end);
-            }
-        }
-
-        // Single bulk read of the entire data region
-        let all_data = self
+        // Total block data size: last entry's (offset + length)
+        let last = &skip[skip.len() - 1];
+        let total_bytes = last.offset as u64 + last.length as u64;
+        let raw = self
             .handle
-            .read_bytes_range(0..max_end)
+            .read_bytes_range(dim.data_offset..dim.data_offset + total_bytes)
             .await
             .map_err(crate::Error::Io)?;
-        let buf = all_data.as_slice();
-
-        // Parse all posting lists from the in-memory buffer
-        let mut result = rustc_hash::FxHashMap::with_capacity_and_hasher(
-            self.dimensions.len(),
-            Default::default(),
-        );
-
-        for dim in self.dimensions.iter() {
-            let skip = self.dim_skip_entries(dim);
-            let mut blocks = Vec::with_capacity(skip.len());
-            for entry in skip {
-                let abs_offset = (dim.data_offset + entry.offset as u64) as usize;
-                let block_data = &buf[abs_offset..abs_offset + entry.length as usize];
-                let block =
-                    SparseBlock::read(&mut Cursor::new(block_data)).map_err(crate::Error::Io)?;
-                blocks.push(block);
-            }
-            result.insert(
-                dim.dim_id,
-                Arc::new(BlockSparsePostingList {
-                    doc_count: dim.doc_count,
-                    blocks,
-                }),
-            );
-        }
-
-        Ok(result)
+        Ok(Some(DimRawData {
+            skip_entries: skip,
+            doc_count: dim.doc_count,
+            global_max_weight: dim.global_max_weight,
+            raw_block_data: raw,
+        }))
     }
 }
 
