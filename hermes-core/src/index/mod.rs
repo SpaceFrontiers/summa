@@ -162,6 +162,12 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             .map(|t| t.codebooks.clone())
             .unwrap_or_default();
 
+        log::info!(
+            "[Index::open] trained_centroids fields={:?}, trained_codebooks fields={:?}",
+            trained_centroids.keys().collect::<Vec<_>>(),
+            trained_codebooks.keys().collect::<Vec<_>>(),
+        );
+
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
             Arc::clone(&directory),
             Arc::clone(&schema),

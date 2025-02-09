@@ -229,35 +229,117 @@ impl IndexMetadata {
         let mut centroids = rustc_hash::FxHashMap::default();
         let mut codebooks = rustc_hash::FxHashMap::default();
 
+        log::info!(
+            "[trained] loading trained structures, vector_fields={:?}",
+            self.vector_fields.keys().collect::<Vec<_>>()
+        );
+
         for (field_id, field_meta) in &self.vector_fields {
+            log::info!(
+                "[trained] field {} state={:?} centroids_file={:?} codebook_file={:?}",
+                field_id,
+                field_meta.state,
+                field_meta.centroids_file,
+                field_meta.codebook_file,
+            );
             if !matches!(field_meta.state, VectorIndexState::Built { .. }) {
+                log::info!("[trained] field {} skipped (not Built)", field_id);
                 continue;
             }
 
             // Load centroids
-            if let Some(file) = &field_meta.centroids_file
-                && let Ok(slice) = dir.open_read(Path::new(file)).await
-                && let Ok(bytes) = slice.read_bytes().await
-                && let Ok(c) =
-                    serde_json::from_slice::<crate::structures::CoarseCentroids>(bytes.as_slice())
-            {
-                log::debug!(
-                    "[trained] field {} loaded centroids ({} clusters)",
-                    field_id,
-                    c.num_clusters
-                );
-                centroids.insert(*field_id, Arc::new(c));
+            match &field_meta.centroids_file {
+                None => {
+                    log::warn!(
+                        "[trained] field {} is Built but has no centroids_file",
+                        field_id
+                    );
+                }
+                Some(file) => match dir.open_read(Path::new(file)).await {
+                    Err(e) => {
+                        log::warn!(
+                            "[trained] field {} failed to open centroids file '{}': {}",
+                            field_id,
+                            file,
+                            e
+                        );
+                    }
+                    Ok(slice) => match slice.read_bytes().await {
+                        Err(e) => {
+                            log::warn!(
+                                "[trained] field {} failed to read centroids file '{}': {}",
+                                field_id,
+                                file,
+                                e
+                            );
+                        }
+                        Ok(bytes) => {
+                            match serde_json::from_slice::<crate::structures::CoarseCentroids>(
+                                bytes.as_slice(),
+                            ) {
+                                Err(e) => {
+                                    log::warn!(
+                                        "[trained] field {} failed to deserialize centroids from '{}': {}",
+                                        field_id,
+                                        file,
+                                        e
+                                    );
+                                }
+                                Ok(c) => {
+                                    log::info!(
+                                        "[trained] field {} loaded centroids ({} clusters)",
+                                        field_id,
+                                        c.num_clusters
+                                    );
+                                    centroids.insert(*field_id, Arc::new(c));
+                                }
+                            }
+                        }
+                    },
+                },
             }
 
             // Load codebook (for ScaNN)
-            if let Some(file) = &field_meta.codebook_file
-                && let Ok(slice) = dir.open_read(Path::new(file)).await
-                && let Ok(bytes) = slice.read_bytes().await
-                && let Ok(c) =
-                    serde_json::from_slice::<crate::structures::PQCodebook>(bytes.as_slice())
-            {
-                log::debug!("[trained] field {} loaded codebook", field_id);
-                codebooks.insert(*field_id, Arc::new(c));
+            match &field_meta.codebook_file {
+                None => {} // optional, not all index types use codebooks
+                Some(file) => match dir.open_read(Path::new(file)).await {
+                    Err(e) => {
+                        log::warn!(
+                            "[trained] field {} failed to open codebook file '{}': {}",
+                            field_id,
+                            file,
+                            e
+                        );
+                    }
+                    Ok(slice) => match slice.read_bytes().await {
+                        Err(e) => {
+                            log::warn!(
+                                "[trained] field {} failed to read codebook file '{}': {}",
+                                field_id,
+                                file,
+                                e
+                            );
+                        }
+                        Ok(bytes) => {
+                            match serde_json::from_slice::<crate::structures::PQCodebook>(
+                                bytes.as_slice(),
+                            ) {
+                                Err(e) => {
+                                    log::warn!(
+                                        "[trained] field {} failed to deserialize codebook from '{}': {}",
+                                        field_id,
+                                        file,
+                                        e
+                                    );
+                                }
+                                Ok(c) => {
+                                    log::info!("[trained] field {} loaded codebook", field_id);
+                                    codebooks.insert(*field_id, Arc::new(c));
+                                }
+                            }
+                        }
+                    },
+                },
             }
         }
 

@@ -1,13 +1,7 @@
-//! Shared ANN index construction and serialization helpers.
+//! Shared ANN index constants and construction helpers.
 //!
-//! Used by both `builder/mod.rs` (inline segment build) and
-//! `merger/dense_vectors.rs` (merge rebuild) to avoid duplicating
-//! the index creation + serialization logic.
-
-use crate::structures::{
-    CoarseCentroids, IVFPQConfig, IVFPQIndex, IVFRaBitQConfig, IVFRaBitQIndex, PQCodebook,
-    RaBitQCodebook, RaBitQConfig,
-};
+//! Constants are available on all platforms (including WASM).
+//! Builder/serialization functions are native-only.
 
 /// Index type discriminants stored in the vectors file TOC.
 pub const RABITQ_TYPE: u8 = 0;
@@ -15,7 +9,16 @@ pub const IVF_RABITQ_TYPE: u8 = 1;
 pub const SCANN_TYPE: u8 = 2;
 pub const FLAT_TYPE: u8 = 4;
 
+// --- Native-only builder/serialization functions ---
+
+#[cfg(feature = "native")]
+use crate::structures::{
+    CoarseCentroids, IVFPQConfig, IVFPQIndex, IVFRaBitQConfig, IVFRaBitQIndex, PQCodebook,
+    RaBitQCodebook, RaBitQConfig,
+};
+
 /// Create a fresh IVF-RaBitQ index and codebook ready for vector insertion.
+#[cfg(feature = "native")]
 pub fn new_ivf_rabitq(dim: usize, centroids: &CoarseCentroids) -> (IVFRaBitQIndex, RaBitQCodebook) {
     let rabitq_config = RaBitQConfig::new(dim);
     let codebook = RaBitQCodebook::new(rabitq_config);
@@ -25,6 +28,7 @@ pub fn new_ivf_rabitq(dim: usize, centroids: &CoarseCentroids) -> (IVFRaBitQInde
 }
 
 /// Serialize a populated IVF-RaBitQ index to bytes.
+#[cfg(feature = "native")]
 pub fn serialize_ivf_rabitq(
     index: IVFRaBitQIndex,
     codebook: RaBitQCodebook,
@@ -35,12 +39,14 @@ pub fn serialize_ivf_rabitq(
 }
 
 /// Create a fresh ScaNN (IVF-PQ) index ready for vector insertion.
+#[cfg(feature = "native")]
 pub fn new_scann(dim: usize, centroids: &CoarseCentroids, codebook: &PQCodebook) -> IVFPQIndex {
     let config = IVFPQConfig::new(dim);
     IVFPQIndex::new(config, centroids.version, codebook.version)
 }
 
 /// Serialize a populated ScaNN index to bytes.
+#[cfg(feature = "native")]
 pub fn serialize_scann(index: IVFPQIndex, codebook: &PQCodebook) -> crate::Result<Vec<u8>> {
     let data = super::ScaNNIndexData {
         codebook: codebook.clone(),

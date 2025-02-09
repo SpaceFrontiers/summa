@@ -1,4 +1,3 @@
-#[cfg(feature = "native")]
 pub(crate) mod ann_build;
 #[cfg(feature = "native")]
 mod builder;
@@ -14,12 +13,12 @@ mod vector_data;
 #[cfg(feature = "native")]
 pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
-pub use merger::{MergeStats, SegmentMerger, TrainedVectorStructures, delete_segment};
+pub use merger::{MergeStats, SegmentMerger, delete_segment};
 pub use reader::{AsyncSegmentReader, SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
 pub use store::*;
 #[cfg(feature = "native")]
 pub use tracker::{SegmentSnapshot, SegmentTracker};
-pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
+pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta, TrainedVectorStructures};
 pub use vector_data::{
     FlatVectorData, IVFRaBitQIndexData, LazyFlatVectorData, ScaNNIndexData, dequantize_raw,
 };

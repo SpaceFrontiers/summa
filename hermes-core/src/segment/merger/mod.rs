@@ -129,14 +129,8 @@ impl Ord for MergeEntry {
     }
 }
 
-/// Trained vector index structures for rebuilding segments with ANN indexes
-#[derive(Clone)]
-pub struct TrainedVectorStructures {
-    /// Trained centroids per field_id
-    pub centroids: rustc_hash::FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
-    /// Trained PQ codebooks per field_id (for ScaNN)
-    pub codebooks: rustc_hash::FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
-}
+// TrainedVectorStructures is defined in super::types (available on all platforms)
+pub use super::types::TrainedVectorStructures;
 
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {

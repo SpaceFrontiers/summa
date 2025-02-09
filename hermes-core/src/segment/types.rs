@@ -6,7 +6,20 @@ use std::path::PathBuf;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rustc_hash::FxHashMap;
 
+use std::sync::Arc;
+
 use crate::dsl::Field;
+
+/// Trained vector index structures for rebuilding segments with ANN indexes
+///
+/// Defined here (not in merger) so it's available on all platforms including WASM.
+#[derive(Clone)]
+pub struct TrainedVectorStructures {
+    /// Trained centroids per field_id
+    pub centroids: FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
+    /// Trained PQ codebooks per field_id (for ScaNN)
+    pub codebooks: FxHashMap<u32, Arc<crate::structures::PQCodebook>>,
+}
 
 /// Unique segment identifier (UUID7-like: 48-bit timestamp + 80-bit random)
 ///
