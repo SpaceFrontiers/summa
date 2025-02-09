@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 use crate::directories::DirectoryWriter;
 use crate::dsl::{DenseVectorConfig, Field, FieldType, VectorIndexType};
 use crate::error::{Error, Result};
-use crate::segment::{SegmentId, SegmentMerger, SegmentReader, TrainedVectorStructures};
+use crate::segment::{SegmentId, SegmentReader};
 
 use super::IndexWriter;
 
@@ -90,11 +90,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Ok(());
         }
 
-        // Wait for any background merges to complete before training.
-        // rebuild_segments_with_ann() calls replace_segments() which replaces
-        // merged segments — concurrent merges would operate on stale/deleted segments.
-        self.segment_manager.wait_for_merges().await;
-
         let segment_ids = self.segment_manager.get_segment_ids().await;
         if segment_ids.is_empty() {
             return Ok(());
@@ -110,13 +105,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             self.train_field_index(*field, config, &all_vectors).await?;
         }
 
-        // Publish trained structures to workers so new segments get ANN inline
+        // Publish trained structures to workers so new segments get ANN inline.
+        // Existing flat segments acquire ANN during regular background merges.
         self.publish_trained_structures().await;
 
-        log::info!("Vector index training complete. Rebuilding segments with ANN indexes...");
-
-        // Rebuild segments with ANN indexes using trained structures
-        self.rebuild_segments_with_ann().await?;
+        log::info!("Vector index training complete, new segments will have ANN inline");
 
         Ok(())
     }
@@ -143,93 +136,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             );
             *guard = Some(trained);
         }
-    }
-
-    /// Rebuild all segments with ANN indexes using trained centroids/codebooks
-    pub(super) async fn rebuild_segments_with_ann(&self) -> Result<()> {
-        // Pause background merges and wait for any in-flight ones to finish.
-        // rebuild replaces merged segments — concurrent merges would
-        // operate on stale/deleted segments.
-        self.segment_manager.pause_merges();
-        self.segment_manager.wait_for_merges().await;
-
-        let result = self.rebuild_segments_with_ann_inner().await;
-
-        // Always resume merges, even on error
-        self.segment_manager.resume_merges();
-
-        // Trigger merge check for any flat segments that appeared during rebuild
-        self.segment_manager.maybe_merge().await;
-
-        result
-    }
-
-    async fn rebuild_segments_with_ann_inner(&self) -> Result<()> {
-        // Load trained structures from metadata
-        let (trained_centroids, trained_codebooks) = {
-            let metadata_arc = self.segment_manager.metadata();
-            let meta = metadata_arc.read().await;
-            meta.load_trained_structures(self.directory.as_ref()).await
-        };
-
-        if trained_centroids.is_empty() {
-            log::info!("No trained structures to rebuild with");
-            return Ok(());
-        }
-
-        let trained = TrainedVectorStructures {
-            centroids: trained_centroids,
-            codebooks: trained_codebooks,
-        };
-
-        // Loop to catch segments committed during the merge (concurrent ingestion).
-        // Each pass merges all current segments into one ANN segment. If new segments
-        // appeared during the merge, we do another pass to include them.
-        const MAX_PASSES: usize = 3;
-        for pass in 0..MAX_PASSES {
-            let segment_ids = self.segment_manager.get_segment_ids().await;
-            if segment_ids.len() <= 1 {
-                break;
-            }
-
-            log::info!(
-                "[rebuild] pass {}: merging {} segments with ANN",
-                pass + 1,
-                segment_ids.len()
-            );
-
-            // Load all segment readers
-            let readers = self.load_segment_readers(&segment_ids).await?;
-
-            // Calculate total doc count for the merged segment
-            let total_docs: u32 = readers.iter().map(|r| r.meta().num_docs).sum();
-
-            // Merge all segments into one with ANN indexes
-            let merger = SegmentMerger::new(Arc::clone(&self.schema));
-            let new_segment_id = SegmentId::new();
-            merger
-                .merge_with_ann(self.directory.as_ref(), &readers, new_segment_id, &trained)
-                .await?;
-
-            // Atomically update segments and delete old ones via SegmentManager
-            self.segment_manager
-                .replace_segments(vec![(new_segment_id.to_hex(), total_docs)], segment_ids)
-                .await?;
-
-            // Check if new segments appeared during the merge
-            let remaining = self.segment_manager.get_segment_ids().await;
-            if remaining.len() <= 1 {
-                break;
-            }
-            log::info!(
-                "[rebuild] {} new segments appeared during pass {}, will re-merge",
-                remaining.len() - 1,
-                pass + 1
-            );
-        }
-
-        log::info!("Segments rebuilt with ANN indexes");
-        Ok(())
     }
 
     /// Get total vector count across all segments (for threshold checking)
@@ -472,32 +378,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
 
         Ok(all_vectors)
-    }
-
-    /// Load segment readers for given IDs
-    pub(super) async fn load_segment_readers(
-        &self,
-        segment_ids: &[String],
-    ) -> Result<Vec<SegmentReader>> {
-        let mut readers = Vec::new();
-        let mut doc_offset = 0u32;
-
-        for id_str in segment_ids {
-            let segment_id = SegmentId::from_hex(id_str)
-                .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = SegmentReader::open(
-                self.directory.as_ref(),
-                segment_id,
-                Arc::clone(&self.schema),
-                doc_offset,
-                self.config.term_cache_blocks,
-            )
-            .await?;
-            doc_offset += reader.meta().num_docs;
-            readers.push(reader);
-        }
-
-        Ok(readers)
     }
 
     /// Train index for a single field
