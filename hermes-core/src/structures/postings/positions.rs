@@ -133,16 +133,13 @@ impl PositionPostingList {
             let last_doc_id = block.last().unwrap().doc_id;
             skip_list.push((base_doc_id, last_doc_id, block_start));
 
-            // Write block
-            write_vint(&mut data, block.len() as u64)?;
+            // Write block: fixed u32 count + first_doc (8-byte prefix), then vint deltas
+            data.write_u32::<LittleEndian>(block.len() as u32)?;
+            data.write_u32::<LittleEndian>(base_doc_id)?;
 
             let mut prev_doc_id = base_doc_id;
             for (j, posting) in block.iter().enumerate() {
-                if j == 0 {
-                    // First doc in block: store absolute
-                    write_vint(&mut data, posting.doc_id as u64)?;
-                } else {
-                    // Rest: store delta
+                if j > 0 {
                     let delta = posting.doc_id - prev_doc_id;
                     write_vint(&mut data, delta as u64)?;
                 }
@@ -183,19 +180,26 @@ impl PositionPostingList {
             self.skip_list.is_empty() || self.doc_count.is_multiple_of(POSITION_BLOCK_SIZE as u32);
 
         if need_new_block {
-            // Start new block
+            // Start new block: fixed u32 count + first_doc (8-byte prefix)
             self.skip_list.push((doc_id, doc_id, block_start));
-            // Write count placeholder (will be 1 initially)
-            write_vint(&mut self.data, 1u64).unwrap();
-            // Write absolute doc_id for first in block
-            write_vint(&mut self.data, doc_id as u64).unwrap();
+            self.data.write_u32::<LittleEndian>(1u32).unwrap();
+            self.data.write_u32::<LittleEndian>(doc_id).unwrap();
         } else {
-            // Add to existing block - need to rewrite block count and add delta
+            // Add to existing block — update count in-place + add delta
             let last_block = self.skip_list.last_mut().unwrap();
             let prev_doc_id = last_block.1;
-            last_block.1 = doc_id; // Update last_doc_id
+            last_block.1 = doc_id;
 
-            // Write delta doc_id
+            // Patch count u32 at block start
+            let count_offset = last_block.2 as usize;
+            let old_count = u32::from_le_bytes(
+                self.data[count_offset..count_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            self.data[count_offset..count_offset + 4]
+                .copy_from_slice(&(old_count + 1).to_le_bytes());
+
             let delta = doc_id - prev_doc_id;
             write_vint(&mut self.data, delta as u64).unwrap();
         }
@@ -245,12 +249,14 @@ impl PositionPostingList {
         let offset = self.skip_list[block_idx].2 as usize;
         let mut reader = &self.data[offset..];
 
-        let count = read_vint(&mut reader).ok()? as usize;
-        let mut prev_doc_id = 0u32;
+        // Fixed 8-byte prefix: count(u32) + first_doc(u32)
+        let count = reader.read_u32::<LittleEndian>().ok()? as usize;
+        let first_doc = reader.read_u32::<LittleEndian>().ok()?;
+        let mut prev_doc_id = first_doc;
 
         for i in 0..count {
             let doc_id = if i == 0 {
-                read_vint(&mut reader).ok()? as u32
+                first_doc
             } else {
                 let delta = read_vint(&mut reader).ok()? as u32;
                 prev_doc_id + delta
@@ -343,20 +349,18 @@ impl PositionPostingList {
 
                 // Copy and adjust block data
                 let block_bytes = &source.data[src_offset as usize..next_offset];
-                let mut reader = block_bytes;
 
-                let count = read_vint(&mut reader)? as usize;
-                write_vint(&mut data, count as u64)?;
+                // Fixed 8-byte prefix: count(u32) + first_doc(u32)
+                let count = u32::from_le_bytes(block_bytes[0..4].try_into().unwrap());
+                let first_doc = u32::from_le_bytes(block_bytes[4..8].try_into().unwrap());
 
-                // Adjust first doc_id
-                let first_doc = read_vint(&mut reader)? as u32;
-                write_vint(&mut data, (first_doc + doc_offset) as u64)?;
-
-                // Copy remaining data unchanged
-                data.extend_from_slice(reader);
+                // Write patched prefix + copy rest verbatim
+                data.write_u32::<LittleEndian>(count)?;
+                data.write_u32::<LittleEndian>(first_doc + doc_offset)?;
+                data.extend_from_slice(&block_bytes[8..]);
 
                 skip_list.push((new_base, new_last, new_offset));
-                total_docs += count as u32;
+                total_docs += count;
             }
         }
 
@@ -365,6 +369,96 @@ impl PositionPostingList {
             data,
             doc_count: total_docs,
         })
+    }
+
+    /// Concatenate position lists directly from serialized bytes (zero intermediate allocation).
+    ///
+    /// Same approach as `BlockPostingList::concatenate_from_raw`: parses only
+    /// header + skip_list, then writes merged output with patched 8-byte block prefixes.
+    /// Returns doc_count.
+    pub fn concatenate_from_raw(
+        sources: &[(&[u8], u32)], // (serialized_bytes, doc_offset)
+        out: &mut Vec<u8>,
+    ) -> io::Result<u32> {
+        struct RawSource<'a> {
+            skip_list: Vec<(u32, u32, u32)>, // (base, last, offset)
+            data: &'a [u8],
+            doc_count: u32,
+            doc_offset: u32,
+        }
+
+        let mut parsed: Vec<RawSource<'_>> = Vec::with_capacity(sources.len());
+        for (raw, doc_offset) in sources {
+            let mut r = &raw[..];
+            let doc_count = r.read_u32::<LittleEndian>()?;
+            let skip_count = r.read_u32::<LittleEndian>()? as usize;
+            let mut skip_list = Vec::with_capacity(skip_count);
+            for _ in 0..skip_count {
+                let base = r.read_u32::<LittleEndian>()?;
+                let last = r.read_u32::<LittleEndian>()?;
+                let offset = r.read_u32::<LittleEndian>()?;
+                skip_list.push((base, last, offset));
+            }
+            let data_len = r.read_u32::<LittleEndian>()? as usize;
+            let header_size = raw.len() - r.len();
+            let data = &raw[header_size..header_size + data_len];
+            parsed.push(RawSource {
+                skip_list,
+                data,
+                doc_count,
+                doc_offset: *doc_offset,
+            });
+        }
+
+        let total_docs: u32 = parsed.iter().map(|s| s.doc_count).sum();
+        let total_blocks: usize = parsed.iter().map(|s| s.skip_list.len()).sum();
+        let data_size: usize = parsed.iter().map(|s| s.data.len()).sum();
+
+        out.reserve(8 + total_blocks * 12 + 4 + data_size);
+
+        // Header: doc_count + num_blocks
+        out.write_u32::<LittleEndian>(total_docs)?;
+        out.write_u32::<LittleEndian>(total_blocks as u32)?;
+
+        // Skip list with remapped offsets
+        let mut data_base_offset = 0u32;
+        let skip_list_start = out.len();
+        out.resize(skip_list_start + total_blocks * 12, 0);
+
+        let mut skip_idx = 0;
+        for src in &parsed {
+            let src_data_len = src.data.len() as u32;
+            for &(base, last, offset) in &src.skip_list {
+                let pos = skip_list_start + skip_idx * 12;
+                out[pos..pos + 4].copy_from_slice(&(base + src.doc_offset).to_le_bytes());
+                out[pos + 4..pos + 8].copy_from_slice(&(last + src.doc_offset).to_le_bytes());
+                out[pos + 8..pos + 12].copy_from_slice(&(data_base_offset + offset).to_le_bytes());
+                skip_idx += 1;
+            }
+            data_base_offset += src_data_len;
+        }
+
+        // data_len + block data with patched first_doc
+        out.write_u32::<LittleEndian>(data_base_offset)?;
+
+        for src in &parsed {
+            for (i, &(_, _, offset)) in src.skip_list.iter().enumerate() {
+                let start = offset as usize;
+                let end = if i + 1 < src.skip_list.len() {
+                    src.skip_list[i + 1].2 as usize
+                } else {
+                    src.data.len()
+                };
+                let block = &src.data[start..end];
+
+                out.extend_from_slice(&block[0..4]); // count (unchanged)
+                let first_doc = u32::from_le_bytes(block[4..8].try_into().unwrap());
+                out.extend_from_slice(&(first_doc + src.doc_offset).to_le_bytes());
+                out.extend_from_slice(&block[8..]); // rest verbatim
+            }
+        }
+
+        Ok(total_docs)
     }
 
     /// Get iterator over all postings (for phrase queries)
@@ -440,15 +534,17 @@ impl<'a> PositionPostingIterator<'a> {
         let offset = self.list.skip_list[block_idx].2 as usize;
         let mut reader = &self.list.data[offset..];
 
-        let count = read_vint(&mut reader).unwrap_or(0) as usize;
+        // Fixed 8-byte prefix: count(u32) + first_doc(u32)
+        let count = reader.read_u32::<LittleEndian>().unwrap_or(0) as usize;
+        let first_doc = reader.read_u32::<LittleEndian>().unwrap_or(0);
         self.block_postings.clear();
         self.block_postings.reserve(count);
 
-        let mut prev_doc_id = 0u32;
+        let mut prev_doc_id = first_doc;
 
         for i in 0..count {
             let doc_id = if i == 0 {
-                read_vint(&mut reader).unwrap_or(0) as u32
+                first_doc
             } else {
                 let delta = read_vint(&mut reader).unwrap_or(0) as u32;
                 prev_doc_id + delta

@@ -275,20 +275,20 @@ impl BlockPostingList {
             let last_doc_id = block.last().unwrap().doc_id;
             skip_list.push((base_doc_id, last_doc_id, block_start, block_max_tf));
 
-            // Write block - first doc is stored as absolute, rest as deltas
-            write_vint(&mut data, block.len() as u64)?;
+            // Write block: fixed u32 count + first_doc (8-byte prefix), then vint deltas
+            data.write_u32::<LittleEndian>(block.len() as u32)?;
+            data.write_u32::<LittleEndian>(base_doc_id)?;
 
             let mut prev_doc_id = base_doc_id;
             for (j, posting) in block.iter().enumerate() {
                 if j == 0 {
-                    // First doc in block: store absolute (will be adjusted during merge)
-                    write_vint(&mut data, posting.doc_id as u64)?;
+                    // First doc already in fixed prefix, just write tf
+                    write_vint(&mut data, posting.term_freq as u64)?;
                 } else {
-                    // Rest: store delta from previous
                     let delta = posting.doc_id - prev_doc_id;
                     write_vint(&mut data, delta as u64)?;
+                    write_vint(&mut data, posting.term_freq as u64)?;
                 }
-                write_vint(&mut data, posting.term_freq as u64)?;
                 prev_doc_id = posting.doc_id;
             }
 
@@ -419,25 +419,18 @@ impl BlockPostingList {
 
                     // Copy block data, but we need to adjust the first doc_id in the block
                     let block_bytes = &source.data[src_offset..src_offset + len];
-                    let mut reader = block_bytes;
 
-                    // Read count
-                    let count = read_vint(&mut reader)? as usize;
+                    // Fixed 8-byte prefix: count(u32) + first_doc(u32)
+                    let count = u32::from_le_bytes(block_bytes[0..4].try_into().unwrap());
+                    let first_doc = u32::from_le_bytes(block_bytes[4..8].try_into().unwrap());
 
-                    // Write count
-                    write_vint(&mut data, count as u64)?;
-
-                    // Read and adjust first doc_id
-                    let first_doc = read_vint(&mut reader)? as u32;
-                    let first_tf = read_vint(&mut reader)?;
-                    write_vint(&mut data, (first_doc + doc_offset) as u64)?;
-                    write_vint(&mut data, first_tf)?;
-
-                    // Copy remaining postings unchanged (they're deltas)
-                    data.extend_from_slice(reader);
+                    // Write patched prefix + copy rest verbatim
+                    data.write_u32::<LittleEndian>(count)?;
+                    data.write_u32::<LittleEndian>(first_doc + doc_offset)?;
+                    data.extend_from_slice(&block_bytes[8..]);
 
                     skip_list.push((new_base, new_last, new_offset, block_max_tf));
-                    total_docs += count as u32;
+                    total_docs += count;
                 }
             }
         }
@@ -448,6 +441,113 @@ impl BlockPostingList {
             doc_count: total_docs,
             max_tf,
         })
+    }
+
+    /// Concatenate posting lists directly from serialized bytes (zero intermediate allocation).
+    ///
+    /// Parses only the header + skip_list from each source's raw bytes (no data copy),
+    /// then writes the merged posting list with patched 8-byte block prefixes directly
+    /// to `out`. Returns `(doc_count, max_tf)`.
+    ///
+    /// Avoids: deserialize (data Vec alloc per source), concatenate_blocks (second data Vec),
+    /// serialize (third copy to buf). Instead: one output write per block.
+    pub fn concatenate_from_raw(
+        sources: &[(&[u8], u32)], // (serialized_bytes, doc_offset)
+        out: &mut Vec<u8>,
+    ) -> io::Result<(u32, u32)> {
+        // Parse headers + skip_lists from raw bytes (no data section copy)
+        struct RawSource<'a> {
+            skip_list: Vec<(u32, u32, u32, u32)>, // (base, last, offset, block_max_tf)
+            data: &'a [u8],                       // slice into raw bytes (data section only)
+            max_tf: u32,
+            doc_count: u32,
+            doc_offset: u32,
+        }
+
+        let mut parsed: Vec<RawSource<'_>> = Vec::with_capacity(sources.len());
+        for (raw, doc_offset) in sources {
+            let mut r = &raw[..];
+            let doc_count = r.read_u32::<LittleEndian>()?;
+            let max_tf = r.read_u32::<LittleEndian>()?;
+            let skip_count = r.read_u32::<LittleEndian>()? as usize;
+            let mut skip_list = Vec::with_capacity(skip_count);
+            for _ in 0..skip_count {
+                let base = r.read_u32::<LittleEndian>()?;
+                let last = r.read_u32::<LittleEndian>()?;
+                let offset = r.read_u32::<LittleEndian>()?;
+                let block_max_tf = r.read_u32::<LittleEndian>()?;
+                skip_list.push((base, last, offset, block_max_tf));
+            }
+            let data_len = r.read_u32::<LittleEndian>()? as usize;
+            // r now points to start of data section
+            let header_size = raw.len() - r.len();
+            let data = &raw[header_size..header_size + data_len];
+            parsed.push(RawSource {
+                skip_list,
+                data,
+                max_tf,
+                doc_count,
+                doc_offset: *doc_offset,
+            });
+        }
+
+        // Compute merged header values
+        let total_docs: u32 = parsed.iter().map(|s| s.doc_count).sum();
+        let merged_max_tf: u32 = parsed.iter().map(|s| s.max_tf).max().unwrap_or(0);
+        let total_blocks: usize = parsed.iter().map(|s| s.skip_list.len()).sum();
+
+        // Reserve output: header + skip_list + estimated data
+        let data_size: usize = parsed.iter().map(|s| s.data.len()).sum();
+        out.reserve(12 + total_blocks * 16 + 4 + data_size);
+
+        // Write header
+        out.write_u32::<LittleEndian>(total_docs)?;
+        out.write_u32::<LittleEndian>(merged_max_tf)?;
+        out.write_u32::<LittleEndian>(total_blocks as u32)?;
+
+        // Build merged skip_list with remapped offsets, write it
+        let mut data_base_offset = 0u32;
+        let skip_list_start = out.len();
+        // Placeholder for skip_list (will be filled in)
+        out.resize(skip_list_start + total_blocks * 16, 0);
+
+        let mut skip_idx = 0;
+        for src in &parsed {
+            let src_data_len = src.data.len() as u32;
+            for &(base, last, offset, block_max_tf) in &src.skip_list {
+                let pos = skip_list_start + skip_idx * 16;
+                out[pos..pos + 4].copy_from_slice(&(base + src.doc_offset).to_le_bytes());
+                out[pos + 4..pos + 8].copy_from_slice(&(last + src.doc_offset).to_le_bytes());
+                out[pos + 8..pos + 12].copy_from_slice(&(data_base_offset + offset).to_le_bytes());
+                out[pos + 12..pos + 16].copy_from_slice(&block_max_tf.to_le_bytes());
+                skip_idx += 1;
+            }
+            data_base_offset += src_data_len;
+        }
+
+        // Write data_len
+        out.write_u32::<LittleEndian>(data_base_offset)?;
+
+        // Write block data: for each source, copy blocks with patched first_doc
+        for src in &parsed {
+            for (i, &(_, _, offset, _)) in src.skip_list.iter().enumerate() {
+                let start = offset as usize;
+                let end = if i + 1 < src.skip_list.len() {
+                    src.skip_list[i + 1].2 as usize
+                } else {
+                    src.data.len()
+                };
+                let block = &src.data[start..end];
+
+                // Patch 8-byte prefix: count stays, first_doc += offset
+                out.extend_from_slice(&block[0..4]); // count (unchanged)
+                let first_doc = u32::from_le_bytes(block[4..8].try_into().unwrap());
+                out.extend_from_slice(&(first_doc + src.doc_offset).to_le_bytes());
+                out.extend_from_slice(&block[8..]); // rest verbatim
+            }
+        }
+
+        Ok((total_docs, merged_max_tf))
     }
 
     /// Create an iterator with skip support
@@ -518,21 +618,25 @@ impl<'a> BlockPostingIterator<'a> {
         let offset = self.block_list.skip_list[block_idx].2 as usize;
         let mut reader = &self.block_list.data[offset..];
 
-        let count = read_vint(&mut reader).unwrap_or(0) as usize;
+        // Fixed 8-byte prefix: count(u32) + first_doc(u32)
+        let count = reader.read_u32::<LittleEndian>().unwrap_or(0) as usize;
+        let first_doc = reader.read_u32::<LittleEndian>().unwrap_or(0);
         self.block_postings.clear();
         self.block_postings.reserve(count);
 
-        let mut prev_doc_id = 0u32;
+        let mut prev_doc_id = first_doc;
 
         for i in 0..count {
-            if let (Ok(value), Ok(tf)) = (read_vint(&mut reader), read_vint(&mut reader)) {
-                let doc_id = if i == 0 {
-                    // First doc in block: absolute value
-                    value as u32
-                } else {
-                    // Rest: delta from previous
-                    prev_doc_id + value as u32
-                };
+            if i == 0 {
+                // First doc from fixed prefix, read only tf
+                if let Ok(tf) = read_vint(&mut reader) {
+                    self.block_postings.push(Posting {
+                        doc_id: first_doc,
+                        term_freq: tf as u32,
+                    });
+                }
+            } else if let (Ok(delta), Ok(tf)) = (read_vint(&mut reader), read_vint(&mut reader)) {
+                let doc_id = prev_doc_id + delta as u32;
                 self.block_postings.push(Posting {
                     doc_id,
                     term_freq: tf as u32,

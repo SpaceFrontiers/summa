@@ -443,20 +443,22 @@ impl SegmentMerger {
 
         // === Merge postings ===
         let (posting_offset, posting_len, doc_count) = if all_external && sorted.len() > 1 {
-            // Fast path: block-level concatenation
-            let mut block_sources = Vec::with_capacity(sorted.len());
+            // Fast path: raw byte-level concatenation (no deserialize/re-serialize)
+            let mut raw_sources: Vec<(Vec<u8>, u32)> = Vec::with_capacity(sorted.len());
             for (seg_idx, ti, doc_off) in &sorted {
                 let (off, len) = ti.external_info().unwrap();
                 let bytes = segments[*seg_idx].read_postings(off, len).await?;
-                let bpl = BlockPostingList::deserialize(&mut bytes.as_slice())?;
-                block_sources.push((bpl, *doc_off));
+                raw_sources.push((bytes, *doc_off));
             }
-            let merged = BlockPostingList::concatenate_blocks(&block_sources)?;
-            let offset = postings_out.offset();
+            let refs: Vec<(&[u8], u32)> = raw_sources
+                .iter()
+                .map(|(b, off)| (b.as_slice(), *off))
+                .collect();
             buf.clear();
-            merged.serialize(buf)?;
+            let (doc_count, _max_tf) = BlockPostingList::concatenate_from_raw(&refs, buf)?;
+            let offset = postings_out.offset();
             postings_out.write_all(buf)?;
-            (offset, buf.len() as u32, merged.doc_count())
+            (offset, buf.len() as u32, doc_count)
         } else {
             // Decode all sources into a flat PostingList, remap doc IDs
             let mut merged = PostingList::new();
@@ -494,24 +496,24 @@ impl SegmentMerger {
 
         // === Merge positions (if any source has them) ===
         if any_positions {
-            let mut pos_sources = Vec::new();
+            let mut raw_pos: Vec<(Vec<u8>, u32)> = Vec::new();
             for (seg_idx, ti, doc_off) in &sorted {
                 if let Some((pos_off, pos_len)) = ti.position_info()
                     && let Some(bytes) = segments[*seg_idx]
                         .read_position_bytes(pos_off, pos_len)
                         .await?
                 {
-                    let pl = PositionPostingList::deserialize(&mut bytes.as_slice())
-                        .map_err(crate::Error::Io)?;
-                    pos_sources.push((pl, *doc_off));
+                    raw_pos.push((bytes, *doc_off));
                 }
             }
-            if !pos_sources.is_empty() {
-                let merged = PositionPostingList::concatenate_blocks(&pos_sources)
-                    .map_err(crate::Error::Io)?;
-                let offset = positions_out.offset();
+            if !raw_pos.is_empty() {
+                let refs: Vec<(&[u8], u32)> = raw_pos
+                    .iter()
+                    .map(|(b, off)| (b.as_slice(), *off))
+                    .collect();
                 buf.clear();
-                merged.serialize(buf).map_err(crate::Error::Io)?;
+                PositionPostingList::concatenate_from_raw(&refs, buf).map_err(crate::Error::Io)?;
+                let offset = positions_out.offset();
                 positions_out.write_all(buf)?;
                 return Ok(TermInfo::external_with_positions(
                     posting_offset,
