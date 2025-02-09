@@ -39,6 +39,12 @@ struct FlatStreamField {
 /// Batch size for streaming vector reads (1024 vectors at a time)
 const VECTOR_BATCH_SIZE: usize = 1024;
 
+/// Chunk size for streaming flat vector bytes during merge (8 MB)
+const FLAT_VECTOR_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Magic number for vectors file footer ("VEC2" in LE)
+const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
+
 /// Streams vectors from a segment's lazy flat data into an add_fn callback.
 ///
 /// Reads vectors in batches of VECTOR_BATCH_SIZE to bound memory usage.
@@ -399,9 +405,6 @@ impl SegmentMerger {
             return Ok(0);
         }
 
-        /// Magic number for vectors file footer ("VEC2" in LE)
-        const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
-
         struct WrittenEntry {
             field_id: u32,
             index_type: u8,
@@ -467,9 +470,8 @@ impl SegmentMerger {
                         let total_bytes = lazy_flat.vector_bytes_len();
                         let base_offset = lazy_flat.vectors_byte_offset();
                         let handle = lazy_flat.handle();
-                        const CHUNK: u64 = 8 * 1024 * 1024; // 8MB
-                        for chunk_start in (0..total_bytes).step_by(CHUNK as usize) {
-                            let chunk_end = (chunk_start + CHUNK).min(total_bytes);
+                        for chunk_start in (0..total_bytes).step_by(FLAT_VECTOR_CHUNK as usize) {
+                            let chunk_end = (chunk_start + FLAT_VECTOR_CHUNK).min(total_bytes);
                             let bytes = handle
                                 .read_bytes_range(
                                     base_offset + chunk_start..base_offset + chunk_end,
