@@ -185,20 +185,15 @@ impl SegmentMerger {
                 let refs: Vec<&crate::structures::IVFPQIndex> =
                     scann_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
 
-                let centroids_and_codebook = segments.iter().find_map(|s| {
-                    let centroids = s.coarse_centroids()?.clone();
-                    let (_, codebook) = s.get_scann_vector_index(field)?;
-                    Some((centroids, codebook))
-                });
+                let codebook = scann_indexes.first().map(|(_, cb)| cb);
 
                 match (
                     crate::structures::IVFPQIndex::merge(&refs, &doc_offs),
-                    centroids_and_codebook,
+                    codebook,
                 ) {
-                    (Ok(merged), Some((centroids, codebook))) => {
+                    (Ok(merged), Some(codebook)) => {
                         let index_data = crate::segment::ScaNNIndexData {
-                            centroids: (*centroids).clone(),
-                            codebook: (*codebook).clone(),
+                            codebook: (**codebook).clone(),
                             index: merged,
                         };
                         let bytes = index_data
@@ -215,9 +210,7 @@ impl SegmentMerger {
                         log::warn!("ScaNN merge failed: {}, falling back to rebuild", e);
                     }
                     (_, None) => {
-                        log::warn!(
-                            "ScaNN merge: missing centroids/codebook, falling back to rebuild"
-                        );
+                        log::warn!("ScaNN merge: missing codebook, falling back to rebuild");
                     }
                 }
             }
@@ -232,20 +225,15 @@ impl SegmentMerger {
                 let refs: Vec<&crate::structures::IVFRaBitQIndex> =
                     ivf_indexes.iter().map(|(idx, _)| idx.as_ref()).collect();
 
-                let centroids_and_codebook = segments.iter().find_map(|s| {
-                    let centroids = s.coarse_centroids()?.clone();
-                    let (_, codebook) = s.get_ivf_vector_index(field)?;
-                    Some((centroids, codebook))
-                });
+                let codebook = ivf_indexes.first().map(|(_, cb)| cb);
 
                 match (
                     crate::structures::IVFRaBitQIndex::merge(&refs, &doc_offs),
-                    centroids_and_codebook,
+                    codebook,
                 ) {
-                    (Ok(merged), Some((centroids, codebook))) => {
+                    (Ok(merged), Some(codebook)) => {
                         let index_data = crate::segment::IVFRaBitQIndexData {
-                            centroids: (*centroids).clone(),
-                            codebook: (*codebook).clone(),
+                            codebook: (**codebook).clone(),
                             index: merged,
                         };
                         let bytes = index_data
@@ -262,14 +250,12 @@ impl SegmentMerger {
                         log::warn!("IVF merge failed: {}, falling back to rebuild", e);
                     }
                     (_, None) => {
-                        log::warn!(
-                            "IVF merge: missing centroids/codebook, falling back to rebuild"
-                        );
+                        log::warn!("IVF merge: missing codebook, falling back to rebuild");
                     }
                 }
             }
 
-            // --- Try ANN rebuild from lazy flat vectors ---
+            // --- Try ANN rebuild from lazy flat vectors using trained structures ---
             let ann_type =
                 trained
                     .zip(config)
@@ -306,7 +292,6 @@ impl SegmentMerger {
                 let mut total_fed = 0usize;
 
                 match ann {
-                    // Flat and RaBitQ are filtered out by ann_type match above
                     VectorIndexType::Flat | VectorIndexType::RaBitQ => unreachable!(),
                     VectorIndexType::IvfRaBitQ => {
                         let centroids = &trained.centroids[&field.0];
@@ -330,7 +315,6 @@ impl SegmentMerger {
                         }
 
                         let index_data = crate::segment::IVFRaBitQIndexData {
-                            centroids: (**centroids).clone(),
                             codebook,
                             index: ivf_index,
                         };
@@ -369,7 +353,6 @@ impl SegmentMerger {
                         }
 
                         let index_data = crate::segment::ScaNNIndexData {
-                            centroids: (**centroids).clone(),
                             codebook: (**codebook).clone(),
                             index: ivf_pq_index,
                         };

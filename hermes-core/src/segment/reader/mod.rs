@@ -113,7 +113,6 @@ impl AsyncSegmentReader {
         let vectors_data = loader::load_vectors_file(dir, &files, &schema).await?;
         let vector_indexes = vectors_data.indexes;
         let flat_vectors = vectors_data.flat_vectors;
-        let coarse_centroids = vectors_data.coarse_centroids;
 
         // Load sparse vector indexes from .sparse file
         let sparse_indexes = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
@@ -143,7 +142,7 @@ impl AsyncSegmentReader {
             doc_id_offset,
             vector_indexes,
             flat_vectors,
-            coarse_centroids,
+            coarse_centroids: None,
             sparse_indexes,
             positions_handle,
         })
@@ -667,6 +666,11 @@ impl AsyncSegmentReader {
     /// Get coarse centroids (shared across IVF/ScaNN indexes)
     pub fn coarse_centroids(&self) -> Option<&Arc<CoarseCentroids>> {
         self.coarse_centroids.as_ref()
+    }
+
+    /// Set coarse centroids from index-level trained structures
+    pub fn set_coarse_centroids(&mut self, centroids: Arc<CoarseCentroids>) {
+        self.coarse_centroids = Some(centroids);
     }
 
     /// Get the ScaNN vector index for a field (if available)

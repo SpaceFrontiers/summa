@@ -79,6 +79,7 @@ impl<D: Directory + 'static> Searcher<D> {
             &directory,
             &schema,
             snapshot.segment_ids(),
+            &trained_centroids,
             term_cache_blocks,
         )
         .await;
@@ -104,8 +105,14 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        let (segments, default_fields, global_stats) =
-            Self::load_common(&directory, &schema, segment_ids, term_cache_blocks).await;
+        let (segments, default_fields, global_stats) = Self::load_common(
+            &directory,
+            &schema,
+            segment_ids,
+            &trained_centroids,
+            term_cache_blocks,
+        )
+        .await;
 
         #[cfg(feature = "native")]
         {
@@ -144,13 +151,21 @@ impl<D: Directory + 'static> Searcher<D> {
         directory: &Arc<D>,
         schema: &Arc<Schema>,
         segment_ids: &[String],
+        trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> (
         Vec<Arc<SegmentReader>>,
         Vec<crate::Field>,
         Arc<LazyGlobalStats>,
     ) {
-        let segments = Self::load_segments(directory, schema, segment_ids, term_cache_blocks).await;
+        let segments = Self::load_segments(
+            directory,
+            schema,
+            segment_ids,
+            trained_centroids,
+            term_cache_blocks,
+        )
+        .await;
         let default_fields = Self::build_default_fields(schema);
         let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
         (segments, default_fields, global_stats)
@@ -161,6 +176,7 @@ impl<D: Directory + 'static> Searcher<D> {
         directory: &Arc<D>,
         schema: &Arc<Schema>,
         segment_ids: &[String],
+        trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Vec<Arc<SegmentReader>> {
         // Parse segment IDs and filter invalid ones
@@ -208,6 +224,10 @@ impl<D: Directory + 'static> Searcher<D> {
         for (_, mut reader) in loaded {
             reader.set_doc_id_offset(doc_id_offset);
             doc_id_offset += reader.meta().num_docs;
+            // Inject index-level centroids into reader for IVF/ScaNN search
+            if let Some(centroids) = trained_centroids.values().next() {
+                reader.set_coarse_centroids(Arc::clone(centroids));
+            }
             segments.push(Arc::new(reader));
         }
 

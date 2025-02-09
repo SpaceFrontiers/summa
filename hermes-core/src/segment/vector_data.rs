@@ -354,11 +354,13 @@ impl LazyFlatVectorData {
     }
 }
 
-/// IVF-RaBitQ index data with embedded centroids and codebook
+/// IVF-RaBitQ index data (codebook + cluster assignments)
+///
+/// Centroids are stored at the index level (`field_X_centroids.bin`),
+/// not duplicated per segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IVFRaBitQIndexData {
     pub index: crate::structures::IVFRaBitQIndex,
-    pub centroids: crate::structures::CoarseCentroids,
     pub codebook: crate::structures::RaBitQCodebook,
 }
 
@@ -375,11 +377,13 @@ impl IVFRaBitQIndexData {
     }
 }
 
-/// ScaNN index data with embedded centroids and codebook
+/// ScaNN index data (codebook + cluster assignments)
+///
+/// Centroids are stored at the index level (`field_X_centroids.bin`),
+/// not duplicated per segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScaNNIndexData {
     pub index: crate::structures::IVFPQIndex,
-    pub centroids: crate::structures::CoarseCentroids,
     pub codebook: crate::structures::PQCodebook,
 }
 

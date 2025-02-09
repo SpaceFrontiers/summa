@@ -9,7 +9,7 @@ use std::io::Cursor;
 use crate::Result;
 use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
 use crate::dsl::Schema;
-use crate::structures::{CoarseCentroids, RaBitQIndex};
+use crate::structures::RaBitQIndex;
 
 use super::super::types::SegmentFiles;
 use super::super::vector_data::{IVFRaBitQIndexData, LazyFlatVectorData, ScaNNIndexData};
@@ -21,8 +21,6 @@ pub struct VectorsFileData {
     pub indexes: FxHashMap<u32, VectorIndex>,
     /// Lazy flat vectors per field — doc_ids in memory, vectors via mmap for reranking/merge
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
-    /// Shared coarse centroids for IVF/ScaNN search
-    pub coarse_centroids: Option<Arc<CoarseCentroids>>,
 }
 
 /// Magic number for vectors file footer ("VEC2" in LE)
@@ -45,12 +43,9 @@ pub async fn load_vectors_file<D: Directory>(
 ) -> Result<VectorsFileData> {
     let mut indexes = FxHashMap::default();
     let mut flat_vectors = FxHashMap::default();
-    let mut coarse_centroids: Option<Arc<CoarseCentroids>> = None;
-
     let empty = || VectorsFileData {
         indexes: FxHashMap::default(),
         flat_vectors: FxHashMap::default(),
-        coarse_centroids: None,
     };
 
     // Skip loading vectors file if schema has no dense vector fields
@@ -143,10 +138,9 @@ pub async fn load_vectors_file<D: Directory>(
                 }
             }
             2 => {
-                // ScaNN (IVF-PQ) with embedded centroids and codebook
+                // ScaNN (IVF-PQ) — centroids loaded separately at index level
                 let data = handle.read_bytes_range(offset..offset + length).await?;
                 if let Ok(scann_data) = ScaNNIndexData::from_bytes(data.as_slice()) {
-                    coarse_centroids = Some(Arc::new(scann_data.centroids));
                     indexes.insert(
                         field_id,
                         VectorIndex::ScaNN {
@@ -157,10 +151,9 @@ pub async fn load_vectors_file<D: Directory>(
                 }
             }
             1 => {
-                // IVF-RaBitQ with embedded centroids and codebook
+                // IVF-RaBitQ — centroids loaded separately at index level
                 let data = handle.read_bytes_range(offset..offset + length).await?;
                 if let Ok(ivf_data) = IVFRaBitQIndexData::from_bytes(data.as_slice()) {
-                    coarse_centroids = Some(Arc::new(ivf_data.centroids));
                     indexes.insert(
                         field_id,
                         VectorIndex::IVF {
@@ -190,7 +183,6 @@ pub async fn load_vectors_file<D: Directory>(
     Ok(VectorsFileData {
         indexes,
         flat_vectors,
-        coarse_centroids,
     })
 }
 
