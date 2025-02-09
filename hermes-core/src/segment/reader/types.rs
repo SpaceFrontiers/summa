@@ -121,13 +121,17 @@ impl VectorIndex {
 ///
 /// Stores skip list per dimension (block metadata). Blocks loaded on-demand.
 /// Memory: only skip list headers in RAM, block data via mmap (OS page cache).
+///
+/// Skip entries are stored in a single flat array shared across all dimensions
+/// (eliminates per-dimension heap allocations — one alloc instead of 73K+).
 #[derive(Clone)]
 pub struct SparseIndex {
     /// Mmap file handle for sparse data
     handle: LazyFileHandle,
-    /// Per-dimension data: [(dim_id, data_offset, doc_count, global_max_weight, skip_entries)]
-    /// Sorted by dim_id for binary search
+    /// Per-dimension data, sorted by dim_id for binary search
     dimensions: Arc<Vec<DimensionEntry>>,
+    /// All skip entries in a single flat array (dimensions reference slices via skip_start/skip_count)
+    skip_entries: Arc<Vec<SparseSkipEntry>>,
     /// Total document count in this segment (for IDF computation)
     pub total_docs: u32,
     /// Total sparse vectors in this segment (for multi-valued IDF)
@@ -144,8 +148,10 @@ pub struct DimensionEntry {
     pub doc_count: u32,
     /// Global max weight across all blocks
     pub global_max_weight: f32,
-    /// Skip list entries (block metadata)
-    pub skip_entries: Vec<SparseSkipEntry>,
+    /// Start index into the shared skip_entries flat array
+    pub skip_start: u32,
+    /// Number of skip entries for this dimension
+    pub skip_count: u32,
 }
 
 impl SparseIndex {
@@ -153,12 +159,14 @@ impl SparseIndex {
     pub fn new(
         handle: LazyFileHandle,
         dimensions: Vec<DimensionEntry>,
+        skip_entries: Vec<SparseSkipEntry>,
         total_docs: u32,
         total_vectors: u32,
     ) -> Self {
         Self {
             handle,
             dimensions: Arc::new(dimensions),
+            skip_entries: Arc::new(skip_entries),
             total_docs,
             total_vectors,
         }
@@ -173,13 +181,22 @@ impl SparseIndex {
             .map(|idx| &self.dimensions[idx])
     }
 
+    /// Get the skip entries slice for a dimension
+    #[inline]
+    fn dim_skip_entries(&self, dim: &DimensionEntry) -> &[SparseSkipEntry] {
+        let start = dim.skip_start as usize;
+        let end = start + dim.skip_count as usize;
+        &self.skip_entries[start..end]
+    }
+
     /// Load a single block via mmap (OS page cache handles caching)
     async fn load_block(
         &self,
         dim: &DimensionEntry,
         block_idx: usize,
     ) -> crate::Result<SparseBlock> {
-        let entry = &dim.skip_entries[block_idx];
+        let skip = self.dim_skip_entries(dim);
+        let entry = &skip[block_idx];
         let abs_offset = dim.data_offset + entry.offset as u64;
         let data = self
             .handle
@@ -201,8 +218,9 @@ impl SparseIndex {
         };
 
         // Load all blocks
-        let mut blocks = Vec::with_capacity(dim.skip_entries.len());
-        for i in 0..dim.skip_entries.len() {
+        let skip = self.dim_skip_entries(dim);
+        let mut blocks = Vec::with_capacity(skip.len());
+        for i in 0..skip.len() {
             let block = self.load_block(dim, i).await?;
             blocks.push(block);
         }
@@ -216,7 +234,7 @@ impl SparseIndex {
     /// Get skip list for a dimension (for block-max iteration without loading blocks)
     pub fn get_skip_list(&self, dim_id: u32) -> Option<(&[SparseSkipEntry], f32)> {
         self.get_dimension(dim_id)
-            .map(|d| (d.skip_entries.as_slice(), d.global_max_weight))
+            .map(|d| (self.dim_skip_entries(d), d.global_max_weight))
     }
 
     /// Load specific block for a dimension
@@ -229,7 +247,8 @@ impl SparseIndex {
             Some(d) => d,
             None => return Ok(None),
         };
-        if block_idx >= dim.skip_entries.len() {
+        let skip = self.dim_skip_entries(dim);
+        if block_idx >= skip.len() {
             return Ok(None);
         }
         Ok(Some(self.load_block(dim, block_idx).await?))
@@ -292,7 +311,7 @@ impl SparseIndex {
         // Find extent of all block data so we can read in one shot
         let mut max_end: u64 = 0;
         for dim in self.dimensions.iter() {
-            for entry in &dim.skip_entries {
+            for entry in self.dim_skip_entries(dim) {
                 let end = dim.data_offset + entry.offset as u64 + entry.length as u64;
                 max_end = max_end.max(end);
             }
@@ -313,8 +332,9 @@ impl SparseIndex {
         );
 
         for dim in self.dimensions.iter() {
-            let mut blocks = Vec::with_capacity(dim.skip_entries.len());
-            for entry in &dim.skip_entries {
+            let skip = self.dim_skip_entries(dim);
+            let mut blocks = Vec::with_capacity(skip.len());
+            for entry in skip {
                 let abs_offset = (dim.data_offset + entry.offset as u64) as usize;
                 let block_data = &buf[abs_offset..abs_offset + entry.length as usize];
                 let block =

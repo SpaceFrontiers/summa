@@ -254,7 +254,7 @@ pub async fn load_sparse_file<D: Directory>(
             u32::from_le_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
         pos += 9;
 
-        // Parse dimension entries with skip lists
+        // Parse dimension entries with skip lists into a flat array
         // Format per dimension:
         // - dim_id: u32
         // - data_offset: u64 (absolute offset to posting list data)
@@ -262,6 +262,7 @@ pub async fn load_sparse_file<D: Directory>(
         // - skip_entries: [SparseSkipEntry] × num_blocks (20 bytes each)
         let mut dimensions: Vec<super::types::DimensionEntry> =
             Vec::with_capacity(num_dims as usize);
+        let mut all_skip_entries: Vec<crate::structures::SparseSkipEntry> = Vec::new();
 
         for _ in 0..num_dims {
             let dim_id =
@@ -293,8 +294,8 @@ pub async fn load_sparse_file<D: Directory>(
             let num_blocks =
                 u32::from_le_bytes([pl_data[8], pl_data[9], pl_data[10], pl_data[11]]) as usize;
 
-            // Parse skip entries (20 bytes each: first_doc + last_doc + offset + length + max_weight)
-            let mut skip_entries = Vec::with_capacity(num_blocks);
+            // Parse skip entries into the shared flat array (20 bytes each)
+            let skip_start = all_skip_entries.len() as u32;
             let mut skip_pos = 12; // After header
             for _ in 0..num_blocks {
                 let first_doc = u32::from_le_bytes([
@@ -327,7 +328,7 @@ pub async fn load_sparse_file<D: Directory>(
                     pl_data[skip_pos + 18],
                     pl_data[skip_pos + 19],
                 ]);
-                skip_entries.push(crate::structures::SparseSkipEntry::new(
+                all_skip_entries.push(crate::structures::SparseSkipEntry::new(
                     first_doc, last_doc, offset, length, max_weight,
                 ));
                 skip_pos += 20;
@@ -340,7 +341,8 @@ pub async fn load_sparse_file<D: Directory>(
                 data_offset: data_offset + header_size as u64,
                 doc_count,
                 global_max_weight,
-                skip_entries,
+                skip_start,
+                skip_count: num_blocks as u32,
             });
         }
         // Ensure sorted by dim_id for binary search
@@ -352,15 +354,22 @@ pub async fn load_sparse_file<D: Directory>(
         let total_vectors = total_docs;
 
         log::debug!(
-            "Loaded sparse index for field {} (lazy): num_dims={}, total_docs={}",
+            "Loaded sparse index for field {} (lazy): num_dims={}, total_docs={}, skip_entries={}",
             field_id,
             num_dims,
-            total_docs
+            total_docs,
+            all_skip_entries.len()
         );
 
         indexes.insert(
             field_id,
-            SparseIndex::new(handle.clone(), dimensions, total_docs, total_vectors),
+            SparseIndex::new(
+                handle.clone(),
+                dimensions,
+                all_skip_entries,
+                total_docs,
+                total_vectors,
+            ),
         );
     }
 
