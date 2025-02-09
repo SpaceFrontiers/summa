@@ -443,7 +443,7 @@ impl SegmentMerger {
 
         // === Merge postings ===
         let (posting_offset, posting_len, doc_count) = if all_external && sorted.len() > 1 {
-            // Fast path: raw byte-level concatenation (no deserialize/re-serialize)
+            // Fast path: streaming merge (blocks → output writer, no buffering)
             let mut raw_sources: Vec<(Vec<u8>, u32)> = Vec::with_capacity(sorted.len());
             for (seg_idx, ti, doc_off) in &sorted {
                 let (off, len) = ti.external_info().unwrap();
@@ -454,11 +454,10 @@ impl SegmentMerger {
                 .iter()
                 .map(|(b, off)| (b.as_slice(), *off))
                 .collect();
-            buf.clear();
-            let (doc_count, _max_tf) = BlockPostingList::concatenate_from_raw(&refs, buf)?;
             let offset = postings_out.offset();
-            postings_out.write_all(buf)?;
-            (offset, buf.len() as u32, doc_count)
+            let (doc_count, bytes_written) =
+                BlockPostingList::concatenate_streaming(&refs, postings_out)?;
+            (offset, bytes_written as u32, doc_count)
         } else {
             // Decode all sources into a flat PostingList, remap doc IDs
             let mut merged = PostingList::new();
@@ -470,7 +469,7 @@ impl SegmentMerger {
                 } else {
                     let (off, len) = ti.external_info().unwrap();
                     let bytes = segments[*seg_idx].read_postings(off, len).await?;
-                    let bpl = BlockPostingList::deserialize(&mut bytes.as_slice())?;
+                    let bpl = BlockPostingList::deserialize(&bytes)?;
                     let mut it = bpl.iterator();
                     while it.doc() != TERMINATED {
                         merged.add(it.doc() + doc_off, it.term_freq());
@@ -511,16 +510,16 @@ impl SegmentMerger {
                     .iter()
                     .map(|(b, off)| (b.as_slice(), *off))
                     .collect();
-                buf.clear();
-                PositionPostingList::concatenate_from_raw(&refs, buf).map_err(crate::Error::Io)?;
                 let offset = positions_out.offset();
-                positions_out.write_all(buf)?;
+                let (_doc_count, bytes_written) =
+                    PositionPostingList::concatenate_streaming(&refs, positions_out)
+                        .map_err(crate::Error::Io)?;
                 return Ok(TermInfo::external_with_positions(
                     posting_offset,
                     posting_len,
                     doc_count,
                     offset,
-                    buf.len() as u32,
+                    bytes_written as u32,
                 ));
             }
         }

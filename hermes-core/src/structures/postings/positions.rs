@@ -284,42 +284,60 @@ impl PositionPostingList {
         None
     }
 
-    /// Serialize to bytes with block format
+    /// Serialize to bytes (footer-based: data first).
+    ///
+    /// Format:
+    /// ```text
+    /// [block data: data_len bytes]
+    /// [skip entries: N × 12 bytes (base_doc, last_doc, offset)]
+    /// [footer: data_len(4) + skip_count(4) + doc_count(4) = 12 bytes]
+    /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Write doc count
-        writer.write_u32::<LittleEndian>(self.doc_count)?;
+        // Data first
+        writer.write_all(&self.data)?;
 
-        // Write skip list
-        writer.write_u32::<LittleEndian>(self.skip_list.len() as u32)?;
+        // Skip list
         for (base_doc_id, last_doc_id, offset) in &self.skip_list {
             writer.write_u32::<LittleEndian>(*base_doc_id)?;
             writer.write_u32::<LittleEndian>(*last_doc_id)?;
             writer.write_u32::<LittleEndian>(*offset)?;
         }
 
-        // Write data
+        // Footer
         writer.write_u32::<LittleEndian>(self.data.len() as u32)?;
-        writer.write_all(&self.data)?;
+        writer.write_u32::<LittleEndian>(self.skip_list.len() as u32)?;
+        writer.write_u32::<LittleEndian>(self.doc_count)?;
 
         Ok(())
     }
 
-    /// Deserialize from bytes
-    pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let doc_count = reader.read_u32::<LittleEndian>()?;
-
-        let skip_count = reader.read_u32::<LittleEndian>()? as usize;
-        let mut skip_list = Vec::with_capacity(skip_count);
-        for _ in 0..skip_count {
-            let base_doc_id = reader.read_u32::<LittleEndian>()?;
-            let last_doc_id = reader.read_u32::<LittleEndian>()?;
-            let offset = reader.read_u32::<LittleEndian>()?;
-            skip_list.push((base_doc_id, last_doc_id, offset));
+    /// Deserialize from a byte slice (footer-based format).
+    pub fn deserialize(raw: &[u8]) -> io::Result<Self> {
+        if raw.len() < 12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "position data too short",
+            ));
         }
 
-        let data_len = reader.read_u32::<LittleEndian>()? as usize;
-        let mut data = vec![0u8; data_len];
-        reader.read_exact(&mut data)?;
+        // Parse footer (last 12 bytes)
+        let f = raw.len() - 12;
+        let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
+        let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
+
+        // Parse skip list (between data and footer)
+        let mut skip_list = Vec::with_capacity(skip_count);
+        let mut pos = data_len;
+        for _ in 0..skip_count {
+            let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
+            let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
+            let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
+            skip_list.push((base, last, offset));
+            pos += 12;
+        }
+
+        let data = raw[..data_len].to_vec();
 
         Ok(Self {
             skip_list,
@@ -371,17 +389,21 @@ impl PositionPostingList {
         })
     }
 
-    /// Concatenate position lists directly from serialized bytes (zero intermediate allocation).
+    /// Streaming merge: write blocks directly to output writer (bounded memory).
     ///
-    /// Same approach as `BlockPostingList::concatenate_from_raw`: parses only
-    /// header + skip_list, then writes merged output with patched 8-byte block prefixes.
-    /// Returns doc_count.
-    pub fn concatenate_from_raw(
-        sources: &[(&[u8], u32)], // (serialized_bytes, doc_offset)
-        out: &mut Vec<u8>,
-    ) -> io::Result<u32> {
+    /// Parses only footer + skip_list from each source (no data copy),
+    /// streams block data with patched 8-byte prefixes directly to `writer`,
+    /// then appends merged skip_list + footer.
+    ///
+    /// Memory per term: O(total_blocks × 12) for skip entries only.
+    ///
+    /// Returns `(doc_count, bytes_written)`.
+    pub fn concatenate_streaming<W: Write>(
+        sources: &[(&[u8], u32)],
+        writer: &mut W,
+    ) -> io::Result<(u32, usize)> {
         struct RawSource<'a> {
-            skip_list: Vec<(u32, u32, u32)>, // (base, last, offset)
+            skip_list: Vec<(u32, u32, u32)>,
             data: &'a [u8],
             doc_count: u32,
             doc_offset: u32,
@@ -389,60 +411,40 @@ impl PositionPostingList {
 
         let mut parsed: Vec<RawSource<'_>> = Vec::with_capacity(sources.len());
         for (raw, doc_offset) in sources {
-            let mut r = &raw[..];
-            let doc_count = r.read_u32::<LittleEndian>()?;
-            let skip_count = r.read_u32::<LittleEndian>()? as usize;
-            let mut skip_list = Vec::with_capacity(skip_count);
-            for _ in 0..skip_count {
-                let base = r.read_u32::<LittleEndian>()?;
-                let last = r.read_u32::<LittleEndian>()?;
-                let offset = r.read_u32::<LittleEndian>()?;
-                skip_list.push((base, last, offset));
+            if raw.len() < 12 {
+                continue;
             }
-            let data_len = r.read_u32::<LittleEndian>()? as usize;
-            let header_size = raw.len() - r.len();
-            let data = &raw[header_size..header_size + data_len];
+            let f = raw.len() - 12;
+            let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
+            let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
+            let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
+
+            let mut skip_list = Vec::with_capacity(skip_count);
+            let mut pos = data_len;
+            for _ in 0..skip_count {
+                let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
+                let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
+                let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
+                skip_list.push((base, last, offset));
+                pos += 12;
+            }
             parsed.push(RawSource {
                 skip_list,
-                data,
+                data: &raw[..data_len],
                 doc_count,
                 doc_offset: *doc_offset,
             });
         }
 
         let total_docs: u32 = parsed.iter().map(|s| s.doc_count).sum();
-        let total_blocks: usize = parsed.iter().map(|s| s.skip_list.len()).sum();
-        let data_size: usize = parsed.iter().map(|s| s.data.len()).sum();
 
-        out.reserve(8 + total_blocks * 12 + 4 + data_size);
-
-        // Header: doc_count + num_blocks
-        out.write_u32::<LittleEndian>(total_docs)?;
-        out.write_u32::<LittleEndian>(total_blocks as u32)?;
-
-        // Skip list with remapped offsets
-        let mut data_base_offset = 0u32;
-        let skip_list_start = out.len();
-        out.resize(skip_list_start + total_blocks * 12, 0);
-
-        let mut skip_idx = 0;
-        for src in &parsed {
-            let src_data_len = src.data.len() as u32;
-            for &(base, last, offset) in &src.skip_list {
-                let pos = skip_list_start + skip_idx * 12;
-                out[pos..pos + 4].copy_from_slice(&(base + src.doc_offset).to_le_bytes());
-                out[pos + 4..pos + 8].copy_from_slice(&(last + src.doc_offset).to_le_bytes());
-                out[pos + 8..pos + 12].copy_from_slice(&(data_base_offset + offset).to_le_bytes());
-                skip_idx += 1;
-            }
-            data_base_offset += src_data_len;
-        }
-
-        // data_len + block data with patched first_doc
-        out.write_u32::<LittleEndian>(data_base_offset)?;
+        // Phase 1: Stream block data with patched first_doc
+        let mut merged_skip: Vec<(u32, u32, u32)> = Vec::new();
+        let mut data_written = 0u32;
+        let mut patch_buf = [0u8; 8];
 
         for src in &parsed {
-            for (i, &(_, _, offset)) in src.skip_list.iter().enumerate() {
+            for (i, &(base, last, offset)) in src.skip_list.iter().enumerate() {
                 let start = offset as usize;
                 let end = if i + 1 < src.skip_list.len() {
                     src.skip_list[i + 1].2 as usize
@@ -451,14 +453,31 @@ impl PositionPostingList {
                 };
                 let block = &src.data[start..end];
 
-                out.extend_from_slice(&block[0..4]); // count (unchanged)
+                merged_skip.push((base + src.doc_offset, last + src.doc_offset, data_written));
+
+                patch_buf[0..4].copy_from_slice(&block[0..4]);
                 let first_doc = u32::from_le_bytes(block[4..8].try_into().unwrap());
-                out.extend_from_slice(&(first_doc + src.doc_offset).to_le_bytes());
-                out.extend_from_slice(&block[8..]); // rest verbatim
+                patch_buf[4..8].copy_from_slice(&(first_doc + src.doc_offset).to_le_bytes());
+                writer.write_all(&patch_buf)?;
+                writer.write_all(&block[8..])?;
+
+                data_written += block.len() as u32;
             }
         }
 
-        Ok(total_docs)
+        // Phase 2: Write skip_list + footer
+        for (base, last, offset) in &merged_skip {
+            writer.write_u32::<LittleEndian>(*base)?;
+            writer.write_u32::<LittleEndian>(*last)?;
+            writer.write_u32::<LittleEndian>(*offset)?;
+        }
+
+        writer.write_u32::<LittleEndian>(data_written)?;
+        writer.write_u32::<LittleEndian>(merged_skip.len() as u32)?;
+        writer.write_u32::<LittleEndian>(total_docs)?;
+
+        let total_bytes = data_written as usize + merged_skip.len() * 12 + 12;
+        Ok((total_docs, total_bytes))
     }
 
     /// Get iterator over all postings (for phrase queries)
@@ -735,8 +754,7 @@ mod tests {
         let mut bytes = Vec::new();
         list.serialize(&mut bytes).unwrap();
 
-        let mut cursor = std::io::Cursor::new(&bytes);
-        let deserialized = PositionPostingList::deserialize(&mut cursor).unwrap();
+        let deserialized = PositionPostingList::deserialize(&bytes).unwrap();
 
         assert_eq!(list.doc_count(), deserialized.doc_count());
 

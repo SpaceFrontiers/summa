@@ -289,7 +289,7 @@ impl AsyncSegmentReader {
         }
 
         let posting_bytes = self.postings_handle.read_bytes_range(start..end).await?;
-        let block_list = BlockPostingList::deserialize(&mut posting_bytes.as_slice())?;
+        let block_list = BlockPostingList::deserialize(posting_bytes.as_slice())?;
 
         Ok(Some(block_list))
     }
@@ -862,8 +862,6 @@ impl AsyncSegmentReader {
         field: Field,
         term: &[u8],
     ) -> Result<Option<crate::structures::PositionPostingList>> {
-        use std::io::Cursor;
-
         // Get positions handle
         let handle = match &self.positions_handle {
             Some(h) => h,
@@ -892,8 +890,7 @@ impl AsyncSegmentReader {
         let data = slice.read_bytes().await?;
 
         // Deserialize
-        let mut cursor = Cursor::new(data.as_slice());
-        let pos_list = crate::structures::PositionPostingList::deserialize(&mut cursor)?;
+        let pos_list = crate::structures::PositionPostingList::deserialize(data.as_slice())?;
 
         Ok(Some(pos_list))
     }
