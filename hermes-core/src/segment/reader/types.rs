@@ -1,7 +1,7 @@
 //! Types for segment reader
 
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::DocId;
 use crate::directories::{AsyncFileRead, LazyFileHandle};
@@ -14,21 +14,96 @@ use crate::structures::{
 ///
 /// Raw flat vectors are stored separately in [`LazyFlatVectorData`] and accessed
 /// via mmap for reranking and merge. This enum only holds ANN indexes.
+///
+/// IVF and ScaNN variants are **lazy**: raw bytes are stored on construction,
+/// bincode deserialization is deferred to first search access via `OnceLock`.
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
     /// RaBitQ - binary quantization, good for small datasets
     RaBitQ(Arc<RaBitQIndex>),
-    /// IVF-RaBitQ - inverted file with RaBitQ, good for medium datasets
-    IVF {
-        index: Arc<IVFRaBitQIndex>,
-        codebook: Arc<RaBitQCodebook>,
-    },
-    /// ScaNN (IVF-PQ) - product quantization with OPQ, best for large datasets
-    ScaNN {
-        index: Arc<IVFPQIndex>,
-        codebook: Arc<PQCodebook>,
-    },
+    /// IVF-RaBitQ - lazy deserialization on first access
+    IVF(Arc<LazyIVF>),
+    /// ScaNN (IVF-PQ) - lazy deserialization on first access
+    ScaNN(Arc<LazyScaNN>),
+}
+
+/// Lazy IVF-RaBitQ index — defers bincode deserialization to first access
+pub struct LazyIVF {
+    raw: Vec<u8>,
+    resolved: OnceLock<Option<(Arc<IVFRaBitQIndex>, Arc<RaBitQCodebook>)>>,
+}
+
+impl LazyIVF {
+    pub fn new(raw: Vec<u8>) -> Self {
+        Self {
+            raw,
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> Option<(&Arc<IVFRaBitQIndex>, &Arc<RaBitQCodebook>)> {
+        self.resolved
+            .get_or_init(|| {
+                match super::super::vector_data::IVFRaBitQIndexData::from_bytes(&self.raw) {
+                    Ok(data) => Some((Arc::new(data.index), Arc::new(data.codebook))),
+                    Err(e) => {
+                        log::warn!("[lazy_ivf] deserialization failed: {}", e);
+                        None
+                    }
+                }
+            })
+            .as_ref()
+            .map(|(i, c)| (i, c))
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        match self.resolved.get() {
+            Some(Some((index, codebook))) => {
+                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
+            }
+            _ => self.raw.len(),
+        }
+    }
+}
+
+/// Lazy ScaNN (IVF-PQ) index — defers bincode deserialization to first access
+pub struct LazyScaNN {
+    raw: Vec<u8>,
+    resolved: OnceLock<Option<(Arc<IVFPQIndex>, Arc<PQCodebook>)>>,
+}
+
+impl LazyScaNN {
+    pub fn new(raw: Vec<u8>) -> Self {
+        Self {
+            raw,
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> Option<(&Arc<IVFPQIndex>, &Arc<PQCodebook>)> {
+        self.resolved
+            .get_or_init(|| {
+                match super::super::vector_data::ScaNNIndexData::from_bytes(&self.raw) {
+                    Ok(data) => Some((Arc::new(data.index), Arc::new(data.codebook))),
+                    Err(e) => {
+                        log::warn!("[lazy_scann] deserialization failed: {}", e);
+                        None
+                    }
+                }
+            })
+            .as_ref()
+            .map(|(i, c)| (i, c))
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        match self.resolved.get() {
+            Some(Some((index, codebook))) => {
+                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
+            }
+            _ => self.raw.len(),
+        }
+    }
 }
 
 impl VectorIndex {
@@ -36,12 +111,8 @@ impl VectorIndex {
     pub fn estimated_memory_bytes(&self) -> usize {
         match self {
             VectorIndex::RaBitQ(idx) => idx.estimated_memory_bytes(),
-            VectorIndex::IVF { index, codebook } => {
-                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
-            }
-            VectorIndex::ScaNN { index, codebook } => {
-                index.estimated_memory_bytes() + codebook.estimated_memory_bytes()
-            }
+            VectorIndex::IVF(lazy) => lazy.estimated_memory_bytes(),
+            VectorIndex::ScaNN(lazy) => lazy.estimated_memory_bytes(),
         }
     }
 }

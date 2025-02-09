@@ -499,7 +499,10 @@ impl AsyncSegmentReader {
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
                 }
-                VectorIndex::IVF { index, codebook } => {
+                VectorIndex::IVF(lazy) => {
+                    let (index, codebook) = lazy.get().ok_or_else(|| {
+                        Error::Schema("IVF index deserialization failed".to_string())
+                    })?;
                     let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                         Error::Schema("IVF index requires coarse centroids".to_string())
                     })?;
@@ -511,7 +514,10 @@ impl AsyncSegmentReader {
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
                 }
-                VectorIndex::ScaNN { index, codebook } => {
+                VectorIndex::ScaNN(lazy) => {
+                    let (index, codebook) = lazy.get().ok_or_else(|| {
+                        Error::Schema("ScaNN index deserialization failed".to_string())
+                    })?;
                     let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
                         Error::Schema("ScaNN index requires coarse centroids".to_string())
                     })?;
@@ -658,7 +664,7 @@ impl AsyncSegmentReader {
         field: Field,
     ) -> Option<(Arc<IVFRaBitQIndex>, Arc<crate::structures::RaBitQCodebook>)> {
         match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::IVF { index, codebook }) => Some((index.clone(), codebook.clone())),
+            Some(VectorIndex::IVF(lazy)) => lazy.get().map(|(i, c)| (i.clone(), c.clone())),
             _ => None,
         }
     }
@@ -679,7 +685,7 @@ impl AsyncSegmentReader {
         field: Field,
     ) -> Option<(Arc<IVFPQIndex>, Arc<PQCodebook>)> {
         match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::ScaNN { index, codebook }) => Some((index.clone(), codebook.clone())),
+            Some(VectorIndex::ScaNN(lazy)) => lazy.get().map(|(i, c)| (i.clone(), c.clone())),
             _ => None,
         }
     }

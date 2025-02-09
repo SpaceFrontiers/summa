@@ -12,7 +12,7 @@ use crate::dsl::Schema;
 use crate::structures::RaBitQIndex;
 
 use super::super::types::SegmentFiles;
-use super::super::vector_data::{IVFRaBitQIndexData, LazyFlatVectorData, ScaNNIndexData};
+use super::super::vector_data::LazyFlatVectorData;
 use super::{SparseIndex, VectorIndex};
 
 /// Vectors file loading result
@@ -138,30 +138,24 @@ pub async fn load_vectors_file<D: Directory>(
                 }
             }
             2 => {
-                // ScaNN (IVF-PQ) — centroids loaded separately at index level
+                // ScaNN (IVF-PQ) — lazy: raw bytes stored, deserialized on first search
                 let data = handle.read_bytes_range(offset..offset + length).await?;
-                if let Ok(scann_data) = ScaNNIndexData::from_bytes(data.as_slice()) {
-                    indexes.insert(
-                        field_id,
-                        VectorIndex::ScaNN {
-                            index: Arc::new(scann_data.index),
-                            codebook: Arc::new(scann_data.codebook),
-                        },
-                    );
-                }
+                indexes.insert(
+                    field_id,
+                    VectorIndex::ScaNN(Arc::new(super::types::LazyScaNN::new(
+                        data.as_slice().to_vec(),
+                    ))),
+                );
             }
             1 => {
-                // IVF-RaBitQ — centroids loaded separately at index level
+                // IVF-RaBitQ — lazy: raw bytes stored, deserialized on first search
                 let data = handle.read_bytes_range(offset..offset + length).await?;
-                if let Ok(ivf_data) = IVFRaBitQIndexData::from_bytes(data.as_slice()) {
-                    indexes.insert(
-                        field_id,
-                        VectorIndex::IVF {
-                            index: Arc::new(ivf_data.index),
-                            codebook: Arc::new(ivf_data.codebook),
-                        },
-                    );
-                }
+                indexes.insert(
+                    field_id,
+                    VectorIndex::IVF(Arc::new(super::types::LazyIVF::new(
+                        data.as_slice().to_vec(),
+                    ))),
+                );
             }
             0 => {
                 // RaBitQ (standalone)
