@@ -1126,6 +1126,154 @@ mod tests {
         assert_eq!(decoded.len(), 6);
     }
 
+    /// Test the zero-copy merge path used by the actual sparse merger:
+    /// serialize → parse raw skip entries + block data → patch first_doc_id → reassemble.
+    /// This is the exact code path in `segment/merger/sparse_vectors.rs`.
+    #[test]
+    fn test_zero_copy_merge_patches_first_doc_id() {
+        use crate::structures::SparseSkipEntry;
+
+        // Build two multi-block posting lists
+        let postings1: Vec<(DocId, u16, f32)> = (0..200).map(|i| (i * 2, 0, i as f32)).collect();
+        let list1 =
+            BlockSparsePostingList::from_postings(&postings1, WeightQuantization::Float32).unwrap();
+        assert!(list1.num_blocks() > 1);
+
+        let postings2: Vec<(DocId, u16, f32)> = (0..150).map(|i| (i * 3, 1, i as f32)).collect();
+        let list2 =
+            BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
+
+        // Serialize both (this is what the builder writes to disk)
+        let mut bytes1 = Vec::new();
+        list1.serialize(&mut bytes1).unwrap();
+        let mut bytes2 = Vec::new();
+        list2.serialize(&mut bytes2).unwrap();
+
+        // --- Simulate read_dim_raw: parse header + skip entries, extract raw block data ---
+        fn parse_raw(data: &[u8]) -> (u32, f32, Vec<SparseSkipEntry>, &[u8]) {
+            let doc_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
+            let global_max = f32::from_le_bytes(data[4..8].try_into().unwrap());
+            let num_blocks = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+            let mut pos = 12;
+            let mut skip = Vec::new();
+            for _ in 0..num_blocks {
+                let first_doc = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                let last_doc = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+                let offset = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap());
+                let length = u32::from_le_bytes(data[pos + 12..pos + 16].try_into().unwrap());
+                let max_w = f32::from_le_bytes(data[pos + 16..pos + 20].try_into().unwrap());
+                skip.push(SparseSkipEntry::new(
+                    first_doc, last_doc, offset, length, max_w,
+                ));
+                pos += 20;
+            }
+            (doc_count, global_max, skip, &data[pos..])
+        }
+
+        let (dc1, gm1, skip1, raw1) = parse_raw(&bytes1);
+        let (dc2, gm2, skip2, raw2) = parse_raw(&bytes2);
+
+        // --- Simulate the merger's zero-copy reassembly ---
+        let doc_offset: u32 = 1000; // segment 2 starts at doc 1000
+        let total_docs = dc1 + dc2;
+        let global_max = gm1.max(gm2);
+        let total_blocks = (skip1.len() + skip2.len()) as u32;
+
+        let mut output = Vec::new();
+        // Write header
+        output.extend_from_slice(&total_docs.to_le_bytes());
+        output.extend_from_slice(&global_max.to_le_bytes());
+        output.extend_from_slice(&total_blocks.to_le_bytes());
+
+        // Write adjusted skip entries
+        let mut block_data_offset = 0u32;
+        for entry in &skip1 {
+            let adjusted = SparseSkipEntry::new(
+                entry.first_doc,
+                entry.last_doc,
+                block_data_offset + entry.offset,
+                entry.length,
+                entry.max_weight,
+            );
+            adjusted.write(&mut output).unwrap();
+        }
+        if let Some(last) = skip1.last() {
+            block_data_offset += last.offset + last.length;
+        }
+        for entry in &skip2 {
+            let adjusted = SparseSkipEntry::new(
+                entry.first_doc + doc_offset,
+                entry.last_doc + doc_offset,
+                block_data_offset + entry.offset,
+                entry.length,
+                entry.max_weight,
+            );
+            adjusted.write(&mut output).unwrap();
+        }
+
+        // Write raw block data: source 1 verbatim, source 2 with first_doc_id patched
+        output.extend_from_slice(raw1);
+
+        const FIRST_DOC_ID_OFFSET: usize = 8;
+        let mut buf2 = raw2.to_vec();
+        for entry in &skip2 {
+            let off = entry.offset as usize + FIRST_DOC_ID_OFFSET;
+            if off + 4 <= buf2.len() {
+                let old = u32::from_le_bytes(buf2[off..off + 4].try_into().unwrap());
+                let patched = (old + doc_offset).to_le_bytes();
+                buf2[off..off + 4].copy_from_slice(&patched);
+            }
+        }
+        output.extend_from_slice(&buf2);
+
+        // --- Deserialize the reassembled posting list and verify ---
+        let loaded = BlockSparsePostingList::deserialize(&mut Cursor::new(&output)).unwrap();
+        assert_eq!(loaded.doc_count(), 350);
+
+        let mut iter = loaded.iterator();
+
+        // Segment 1: docs 0, 2, 4, ..., 398
+        assert_eq!(iter.doc(), 0);
+        let doc = iter.seek(100);
+        assert_eq!(doc, 100);
+        let doc = iter.seek(398);
+        assert_eq!(doc, 398);
+
+        // Segment 2: docs 1000, 1003, 1006, ..., 1000 + 149*3 = 1447
+        let doc = iter.seek(1000);
+        assert_eq!(doc, 1000, "First doc of segment 2 should be 1000");
+        iter.advance();
+        assert_eq!(iter.doc(), 1003, "Second doc of segment 2 should be 1003");
+        let doc = iter.seek(1447);
+        assert_eq!(doc, 1447, "Last doc of segment 2 should be 1447");
+
+        // Exhausted
+        iter.advance();
+        assert_eq!(iter.doc(), super::TERMINATED);
+
+        // Also verify with merge_with_offsets to confirm identical results
+        let reference =
+            BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, doc_offset)]);
+        let mut ref_iter = reference.iterator();
+        let mut zc_iter = loaded.iterator();
+        while ref_iter.doc() != super::TERMINATED {
+            assert_eq!(
+                ref_iter.doc(),
+                zc_iter.doc(),
+                "Zero-copy and reference merge should produce identical doc_ids"
+            );
+            assert!(
+                (ref_iter.weight() - zc_iter.weight()).abs() < 0.01,
+                "Weights should match: {} vs {}",
+                ref_iter.weight(),
+                zc_iter.weight()
+            );
+            ref_iter.advance();
+            zc_iter.advance();
+        }
+        assert_eq!(zc_iter.doc(), super::TERMINATED);
+    }
+
     #[test]
     fn test_doc_count_single_value() {
         // Single-value: each doc_id appears once (ordinal always 0)

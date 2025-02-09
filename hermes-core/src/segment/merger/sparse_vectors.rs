@@ -154,9 +154,32 @@ impl SegmentMerger {
                     }
                 }
 
-                // Copy raw block data bytes directly from each source (zero deserialization)
-                for (raw, _) in &sources {
-                    writer.write_all(raw.raw_block_data.as_slice())?;
+                // Copy raw block data from each source, patching first_doc_id in each
+                // block header when doc_offset > 0.
+                // Block header layout: count(2) + doc_id_bits(1) + ordinal_bits(1)
+                //   + weight_quant(1) + pad(1) + pad(2) + first_doc_id(4, LE) + max_weight(4)
+                // So first_doc_id is at byte offset 8 within each block.
+                const FIRST_DOC_ID_OFFSET: usize = 8;
+                for (raw, doc_offset) in &sources {
+                    if *doc_offset == 0 {
+                        writer.write_all(raw.raw_block_data.as_slice())?;
+                    } else {
+                        let mut buf = raw.raw_block_data.as_slice().to_vec();
+                        for entry in raw.skip_entries {
+                            let off = entry.offset as usize + FIRST_DOC_ID_OFFSET;
+                            if off + 4 <= buf.len() {
+                                let old = u32::from_le_bytes([
+                                    buf[off],
+                                    buf[off + 1],
+                                    buf[off + 2],
+                                    buf[off + 3],
+                                ]);
+                                let patched = (old + doc_offset).to_le_bytes();
+                                buf[off..off + 4].copy_from_slice(&patched);
+                            }
+                        }
+                        writer.write_all(&buf)?;
+                    }
                 }
 
                 let posting_len = (writer.offset() - data_offset) as u32;
