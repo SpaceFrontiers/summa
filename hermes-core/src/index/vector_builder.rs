@@ -123,7 +123,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Publish trained structures to shared worker state so new segment builds
     /// include ANN indexes inline. Called after training completes.
-    async fn publish_trained_structures(&self) {
+    pub(super) async fn publish_trained_structures(&self) {
         let (trained_centroids, trained_codebooks) = {
             let metadata_arc = self.segment_manager.metadata();
             let meta = metadata_arc.read().await;

@@ -211,27 +211,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config.term_cache_blocks,
         ));
 
-        // Load trained structures from existing metadata (if previously built)
-        let (trained_centroids, trained_codebooks) = {
-            let metadata_arc = segment_manager.metadata();
-            let meta = metadata_arc.read().await;
-            meta.load_trained_structures(directory.as_ref()).await
-        };
-        let trained_structures = if !trained_centroids.is_empty() {
-            log::info!(
-                "[writer] loaded trained structures for {} fields on open",
-                trained_centroids.len()
-            );
-            Arc::new(std::sync::RwLock::new(Some(
-                crate::segment::TrainedVectorStructures {
-                    centroids: trained_centroids,
-                    codebooks: trained_codebooks,
-                },
-            )))
-        } else {
-            Arc::new(std::sync::RwLock::new(None))
-        };
-
         let pending_builds = Arc::new(AtomicUsize::new(0));
 
         // Limit concurrent segment builds to prevent OOM.
@@ -239,7 +218,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let max_concurrent_builds = num_workers.div_ceil(2).max(1);
         let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
 
-        // Create shared worker state
+        // Create shared worker state (trained structures loaded after construction)
+        let trained_structures = Arc::new(std::sync::RwLock::new(None));
         let worker_state = Arc::new(WorkerState {
             directory: Arc::clone(&directory),
             schema: Arc::clone(&schema),
@@ -267,7 +247,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             workers.push(handle);
         }
 
-        Ok(Self {
+        let writer = Self {
             directory,
             schema,
             config,
@@ -282,7 +262,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             segment_id_receiver: AsyncMutex::new(segment_id_receiver),
             pending_builds,
             flushed_segments: AsyncMutex::new(Vec::new()),
-        })
+        };
+
+        // Load any previously trained structures so new segments get ANN inline
+        writer.publish_trained_structures().await;
+
+        Ok(writer)
     }
 
     /// Create an IndexWriter from an existing Index
