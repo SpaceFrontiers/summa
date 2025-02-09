@@ -331,6 +331,80 @@ impl IndexMetadata {
             }
         }
 
+        // Fallback: if vector_fields didn't yield centroids, scan schema for
+        // dense vector fields and probe well-known file paths on disk.
+        // This handles cases where vector_fields is empty (e.g. old metadata
+        // format) but centroids files exist from a previous ANN build.
+        if centroids.is_empty() {
+            for (field, entry) in self.schema.fields() {
+                let config = match &entry.dense_vector_config {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let field_id = field.0;
+
+                // Skip if not an ANN type
+                if !matches!(
+                    config.index_type,
+                    VectorIndexType::IvfRaBitQ | VectorIndexType::ScaNN
+                ) {
+                    continue;
+                }
+
+                let centroids_file = format!("field_{}_centroids.bin", field_id);
+                if let Ok(slice) = dir.open_read(Path::new(&centroids_file)).await
+                    && let Ok(bytes) = slice.read_bytes().await
+                {
+                    match serde_json::from_slice::<crate::structures::CoarseCentroids>(
+                        bytes.as_slice(),
+                    ) {
+                        Ok(c) => {
+                            log::info!(
+                                "[trained] field {} loaded centroids from disk fallback ({} clusters)",
+                                field_id,
+                                c.num_clusters
+                            );
+                            centroids.insert(field_id, Arc::new(c));
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[trained] field {} centroids fallback deserialize failed: {}",
+                                field_id,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Try codebook (for ScaNN)
+                if matches!(config.index_type, VectorIndexType::ScaNN) {
+                    let codebook_file = format!("field_{}_codebook.bin", field_id);
+                    if let Ok(slice) = dir.open_read(Path::new(&codebook_file)).await
+                        && let Ok(bytes) = slice.read_bytes().await
+                    {
+                        match serde_json::from_slice::<crate::structures::PQCodebook>(
+                            bytes.as_slice(),
+                        ) {
+                            Ok(c) => {
+                                log::info!(
+                                    "[trained] field {} loaded codebook from disk fallback",
+                                    field_id
+                                );
+                                codebooks.insert(field_id, Arc::new(c));
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "[trained] field {} codebook fallback deserialize failed: {}",
+                                    field_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         (centroids, codebooks)
     }
 }

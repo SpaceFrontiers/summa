@@ -709,13 +709,40 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Calculate total doc count for the merged segment
         let total_docs: u32 = readers.iter().map(|r| r.meta().num_docs).sum();
 
-        // Merge into new segment
+        // Load trained structures to preserve ANN indexes during merge
+        let (trained_centroids, trained_codebooks) = {
+            let metadata_arc = self.segment_manager.metadata();
+            let meta = metadata_arc.read().await;
+            meta.load_trained_structures(self.directory.as_ref()).await
+        };
+
         let merger = SegmentMerger::new(Arc::clone(&self.schema));
         let new_segment_id = SegmentId::new();
-        merger
-            .merge(self.directory.as_ref(), &readers, new_segment_id)
-            .await
-            .map(|_| ())?;
+
+        if !trained_centroids.is_empty() {
+            log::info!(
+                "[force_merge] using merge_with_ann ({} trained fields) for {} segments -> {}",
+                trained_centroids.len(),
+                ids_to_merge.len(),
+                new_segment_id.to_hex()
+            );
+            let trained = crate::segment::TrainedVectorStructures {
+                centroids: trained_centroids,
+                codebooks: trained_codebooks,
+            };
+            merger
+                .merge_with_ann(self.directory.as_ref(), &readers, new_segment_id, &trained)
+                .await?;
+        } else {
+            log::debug!(
+                "[force_merge] no trained structures, using flat merge for {} segments -> {}",
+                ids_to_merge.len(),
+                new_segment_id.to_hex()
+            );
+            merger
+                .merge(self.directory.as_ref(), &readers, new_segment_id)
+                .await?;
+        }
 
         // Atomically update segments and delete old ones via SegmentManager
         self.segment_manager
