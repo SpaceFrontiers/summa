@@ -51,7 +51,7 @@ mod tests {
         doc.add_text(title, "Goodbye World");
         builder.add_document(doc).unwrap();
 
-        builder.build(&dir, segment_id).await.unwrap();
+        builder.build(&dir, segment_id, None).await.unwrap();
 
         // Open with async reader
         let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
@@ -105,7 +105,7 @@ mod tests {
         doc.add_dense_vector(embedding, vec![0.0, 0.0, 0.0, 1.0]);
         builder.add_document(doc).unwrap();
 
-        builder.build(&dir, segment_id).await.unwrap();
+        builder.build(&dir, segment_id, None).await.unwrap();
 
         let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
             .await
@@ -166,7 +166,7 @@ mod tests {
         doc.add_sparse_vector(sparse, vec![(2, 1.0), (3, 0.5)]);
         builder.add_document(doc).unwrap();
 
-        builder.build(&dir, segment_id).await.unwrap();
+        builder.build(&dir, segment_id, None).await.unwrap();
 
         let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
             .await

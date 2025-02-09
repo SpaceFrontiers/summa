@@ -661,6 +661,7 @@ impl SegmentBuilder {
         mut self,
         dir: &D,
         segment_id: SegmentId,
+        trained: Option<&super::TrainedVectorStructures>,
     ) -> Result<SegmentMeta> {
         // Flush any buffered data
         self.store_file.flush()?;
@@ -726,7 +727,7 @@ impl SegmentBuilder {
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
         if !dense_vectors.is_empty() {
             let mut writer = dir.streaming_writer(&files.vectors).await?;
-            Self::build_vectors_streaming(dense_vectors, &self.schema, &mut *writer)?;
+            Self::build_vectors_streaming(dense_vectors, &self.schema, trained, &mut *writer)?;
             writer.finish()?;
         }
 
@@ -760,9 +761,10 @@ impl SegmentBuilder {
     fn build_vectors_streaming(
         dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
         schema: &Schema,
+        trained: Option<&super::TrainedVectorStructures>,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        use crate::dsl::DenseVectorQuantization;
+        use crate::dsl::{DenseVectorQuantization, VectorIndexType};
         use byteorder::{LittleEndian, WriteBytesExt};
 
         let mut fields: Vec<(u32, DenseVectorBuilder)> = dense_vectors
@@ -805,13 +807,117 @@ impl SegmentBuilder {
         // Data starts at file offset 0 → mmap page-aligned, no alignment copies.
         struct TocEntry {
             field_id: u32,
+            index_type: u8,
             offset: u64,
             size: u64,
         }
-        let mut toc: Vec<TocEntry> = Vec::with_capacity(fields.len());
+        let mut toc: Vec<TocEntry> = Vec::with_capacity(fields.len() * 2);
         let mut current_offset = 0u64;
 
-        // Stream each field's data directly (builder → disk, no intermediate buffer)
+        // Pre-build ANN indexes while we still have access to the raw vectors.
+        // Each ANN blob is (field_id, index_type, serialized_bytes).
+        let mut ann_blobs: Vec<(u32, u8, Vec<u8>)> = Vec::new();
+        if let Some(trained) = trained {
+            for (field_id, builder) in &fields {
+                let config = schema
+                    .get_field_entry(Field(*field_id))
+                    .and_then(|e| e.dense_vector_config.as_ref());
+
+                if let Some(config) = config {
+                    match config.index_type {
+                        VectorIndexType::IvfRaBitQ if trained.centroids.contains_key(field_id) => {
+                            let centroids = &trained.centroids[field_id];
+                            let rabitq_config = crate::structures::RaBitQConfig::new(builder.dim);
+                            let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
+                            let ivf_config = crate::structures::IVFRaBitQConfig::new(builder.dim);
+                            let mut ivf_index = crate::structures::IVFRaBitQIndex::new(
+                                ivf_config,
+                                centroids.version,
+                                codebook.version,
+                            );
+
+                            // Add all vectors from the in-memory builder
+                            for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
+                                let vec_start = i * builder.dim;
+                                let vec_end = vec_start + builder.dim;
+                                let vec = &builder.vectors[vec_start..vec_end];
+                                ivf_index.add_vector(centroids, &codebook, *doc_id, *ordinal, vec);
+                            }
+
+                            let index_data = super::vector_data::IVFRaBitQIndexData {
+                                codebook,
+                                index: ivf_index,
+                            };
+                            match index_data.to_bytes() {
+                                Ok(bytes) => {
+                                    log::info!(
+                                        "[segment_build] built IVF-RaBitQ for field {} ({} vectors, {} bytes)",
+                                        field_id,
+                                        builder.doc_ids.len(),
+                                        bytes.len()
+                                    );
+                                    ann_blobs.push((*field_id, 1, bytes));
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[segment_build] IVF-RaBitQ serialize failed for field {}: {}",
+                                        field_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        VectorIndexType::ScaNN
+                            if trained.centroids.contains_key(field_id)
+                                && trained.codebooks.contains_key(field_id) =>
+                        {
+                            let centroids = &trained.centroids[field_id];
+                            let codebook = &trained.codebooks[field_id];
+                            let ivf_pq_config = crate::structures::IVFPQConfig::new(builder.dim);
+                            let mut ivf_pq_index = crate::structures::IVFPQIndex::new(
+                                ivf_pq_config,
+                                centroids.version,
+                                codebook.version,
+                            );
+
+                            for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
+                                let vec_start = i * builder.dim;
+                                let vec_end = vec_start + builder.dim;
+                                let vec = &builder.vectors[vec_start..vec_end];
+                                ivf_pq_index
+                                    .add_vector(centroids, codebook, *doc_id, *ordinal, vec);
+                            }
+
+                            let index_data = super::vector_data::ScaNNIndexData {
+                                codebook: (**codebook).clone(),
+                                index: ivf_pq_index,
+                            };
+                            match index_data.to_bytes() {
+                                Ok(bytes) => {
+                                    log::info!(
+                                        "[segment_build] built ScaNN for field {} ({} vectors, {} bytes)",
+                                        field_id,
+                                        builder.doc_ids.len(),
+                                        bytes.len()
+                                    );
+                                    ann_blobs.push((*field_id, 2, bytes));
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[segment_build] ScaNN serialize failed for field {}: {}",
+                                        field_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Stream each field's flat data directly (builder → disk, no intermediate buffer)
         for (i, (_field_id, builder)) in fields.into_iter().enumerate() {
             let data_offset = current_offset;
             FlatVectorData::serialize_binary_from_flat_streaming(
@@ -825,6 +931,7 @@ impl SegmentBuilder {
             current_offset += field_sizes[i] as u64;
             toc.push(TocEntry {
                 field_id: _field_id,
+                index_type: FLAT_BINARY_INDEX_TYPE,
                 offset: data_offset,
                 size: field_sizes[i] as u64,
             });
@@ -837,11 +944,30 @@ impl SegmentBuilder {
             // builder dropped here, freeing vector memory before next field
         }
 
+        // Write ANN blob entries after flat entries
+        for (field_id, index_type, blob) in ann_blobs {
+            let data_offset = current_offset;
+            let blob_len = blob.len() as u64;
+            writer.write_all(&blob)?;
+            current_offset += blob_len;
+            toc.push(TocEntry {
+                field_id,
+                index_type,
+                offset: data_offset,
+                size: blob_len,
+            });
+            let pad = (8 - (current_offset % 8)) % 8;
+            if pad > 0 {
+                writer.write_all(&[0u8; 8][..pad as usize])?;
+                current_offset += pad;
+            }
+        }
+
         // Write TOC entries
         let toc_offset = current_offset;
         for entry in &toc {
             writer.write_u32::<LittleEndian>(entry.field_id)?;
-            writer.write_u8(FLAT_BINARY_INDEX_TYPE)?;
+            writer.write_u8(entry.index_type)?;
             writer.write_u64::<LittleEndian>(entry.offset)?;
             writer.write_u64::<LittleEndian>(entry.size)?;
         }

@@ -130,6 +130,7 @@ impl Ord for MergeEntry {
 }
 
 /// Trained vector index structures for rebuilding segments with ANN indexes
+#[derive(Clone)]
 pub struct TrainedVectorStructures {
     /// Trained centroids per field_id
     pub centroids: rustc_hash::FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,

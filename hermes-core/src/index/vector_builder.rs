@@ -110,12 +110,39 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             self.train_field_index(*field, config, &all_vectors).await?;
         }
 
+        // Publish trained structures to workers so new segments get ANN inline
+        self.publish_trained_structures().await;
+
         log::info!("Vector index training complete. Rebuilding segments with ANN indexes...");
 
         // Rebuild segments with ANN indexes using trained structures
         self.rebuild_segments_with_ann().await?;
 
         Ok(())
+    }
+
+    /// Publish trained structures to shared worker state so new segment builds
+    /// include ANN indexes inline. Called after training completes.
+    async fn publish_trained_structures(&self) {
+        let (trained_centroids, trained_codebooks) = {
+            let metadata_arc = self.segment_manager.metadata();
+            let meta = metadata_arc.read().await;
+            meta.load_trained_structures(self.directory.as_ref()).await
+        };
+        if trained_centroids.is_empty() {
+            return;
+        }
+        let trained = crate::segment::TrainedVectorStructures {
+            centroids: trained_centroids,
+            codebooks: trained_codebooks,
+        };
+        if let Ok(mut guard) = self.trained_structures.write() {
+            log::info!(
+                "[writer] published trained structures to workers ({} fields)",
+                trained.centroids.len()
+            );
+            *guard = Some(trained);
+        }
     }
 
     /// Rebuild all segments with ANN indexes using trained centroids/codebooks
@@ -131,15 +158,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Always resume merges, even on error
         self.segment_manager.resume_merges();
 
+        // Trigger merge check for any flat segments that appeared during rebuild
+        self.segment_manager.maybe_merge().await;
+
         result
     }
 
     async fn rebuild_segments_with_ann_inner(&self) -> Result<()> {
-        let segment_ids = self.segment_manager.get_segment_ids().await;
-        if segment_ids.is_empty() {
-            return Ok(());
-        }
-
         // Load trained structures from metadata
         let (trained_centroids, trained_codebooks) = {
             let metadata_arc = self.segment_manager.metadata();
@@ -157,23 +182,51 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             codebooks: trained_codebooks,
         };
 
-        // Load all segment readers
-        let readers = self.load_segment_readers(&segment_ids).await?;
+        // Loop to catch segments committed during the merge (concurrent ingestion).
+        // Each pass merges all current segments into one ANN segment. If new segments
+        // appeared during the merge, we do another pass to include them.
+        const MAX_PASSES: usize = 3;
+        for pass in 0..MAX_PASSES {
+            let segment_ids = self.segment_manager.get_segment_ids().await;
+            if segment_ids.len() <= 1 {
+                break;
+            }
 
-        // Calculate total doc count for the merged segment
-        let total_docs: u32 = readers.iter().map(|r| r.meta().num_docs).sum();
+            log::info!(
+                "[rebuild] pass {}: merging {} segments with ANN",
+                pass + 1,
+                segment_ids.len()
+            );
 
-        // Merge all segments into one with ANN indexes
-        let merger = SegmentMerger::new(Arc::clone(&self.schema));
-        let new_segment_id = SegmentId::new();
-        merger
-            .merge_with_ann(self.directory.as_ref(), &readers, new_segment_id, &trained)
-            .await?;
+            // Load all segment readers
+            let readers = self.load_segment_readers(&segment_ids).await?;
 
-        // Atomically update segments and delete old ones via SegmentManager
-        self.segment_manager
-            .replace_segments(vec![(new_segment_id.to_hex(), total_docs)], segment_ids)
-            .await?;
+            // Calculate total doc count for the merged segment
+            let total_docs: u32 = readers.iter().map(|r| r.meta().num_docs).sum();
+
+            // Merge all segments into one with ANN indexes
+            let merger = SegmentMerger::new(Arc::clone(&self.schema));
+            let new_segment_id = SegmentId::new();
+            merger
+                .merge_with_ann(self.directory.as_ref(), &readers, new_segment_id, &trained)
+                .await?;
+
+            // Atomically update segments and delete old ones via SegmentManager
+            self.segment_manager
+                .replace_segments(vec![(new_segment_id.to_hex(), total_docs)], segment_ids)
+                .await?;
+
+            // Check if new segments appeared during the merge
+            let remaining = self.segment_manager.get_segment_ids().await;
+            if remaining.len() <= 1 {
+                break;
+            }
+            log::info!(
+                "[rebuild] {} new segments appeared during pass {}, will re-merge",
+                remaining.len() - 1,
+                pass + 1
+            );
+        }
 
         log::info!("Segments rebuilt with ANN indexes");
         Ok(())
