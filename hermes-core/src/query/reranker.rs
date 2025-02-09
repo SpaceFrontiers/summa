@@ -78,13 +78,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     let query = &config.vector;
     let query_dim = query.len();
     let segments = searcher.segment_readers();
-
-    // Build segment_id → index map for O(1) lookup
-    let seg_by_id: rustc_hash::FxHashMap<u128, usize> = segments
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.meta().id, i))
-        .collect();
+    let seg_by_id = searcher.segment_map();
 
     // Resolve each candidate → (segment, flat_idx, ordinal)
     struct VectorRead {

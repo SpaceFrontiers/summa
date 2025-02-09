@@ -249,13 +249,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         Ok(searcher.num_docs())
     }
 
-    /// Get a document by global doc_id
-    pub async fn doc(&self, doc_id: crate::DocId) -> Result<Option<crate::dsl::Document>> {
-        let reader = self.reader().await?;
-        let searcher = reader.searcher().await?;
-        searcher.doc(doc_id).await
-    }
-
     /// Get default fields for search
     pub fn default_fields(&self) -> Vec<crate::Field> {
         if !self.schema.default_fields().is_empty() {
@@ -392,22 +385,9 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         &self,
         address: &crate::query::DocAddress,
     ) -> Result<Option<crate::dsl::Document>> {
-        let segment_id = address.segment_id_u128().ok_or_else(|| {
-            crate::error::Error::Query(format!("Invalid segment ID: {}", address.segment_id))
-        })?;
-
         let reader = self.reader().await?;
         let searcher = reader.searcher().await?;
-
-        for segment in searcher.segment_readers() {
-            if segment.meta().id == segment_id {
-                // Convert global doc_id to segment-local doc_id
-                let local_doc_id = address.doc_id.wrapping_sub(segment.doc_id_offset());
-                return segment.doc(local_doc_id).await;
-            }
-        }
-
-        Ok(None)
+        searcher.get_document(address).await
     }
 
     /// Reload is no longer needed - reader handles this automatically
@@ -493,8 +473,10 @@ mod tests {
         assert_eq!(postings.len(), 1); // One segment
         assert_eq!(postings[0].1.doc_count(), 2); // Two docs with "world"
 
-        // Retrieve document
-        let doc = index.doc(0).await.unwrap().unwrap();
+        // Retrieve document via searcher snapshot
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        let doc = searcher.doc(0).await.unwrap().unwrap();
         assert_eq!(doc.get_first(title).unwrap().as_text(), Some("Hello World"));
     }
 
@@ -580,9 +562,11 @@ mod tests {
         assert_eq!(index.num_docs().await.unwrap(), 9);
 
         // Verify all documents accessible (order may vary with queue-based indexing)
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
         let mut found_docs = 0;
         for i in 0..9 {
-            if index.doc(i).await.unwrap().is_some() {
+            if searcher.doc(i).await.unwrap().is_some() {
                 found_docs += 1;
             }
         }
@@ -636,8 +620,10 @@ mod tests {
             "Doc should have field values"
         );
 
-        // Also verify doc retrieval directly by global doc_id
-        let doc = index.doc(0).await.unwrap().unwrap();
+        // Also verify doc retrieval via searcher snapshot
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        let doc = searcher.doc(0).await.unwrap().unwrap();
         assert!(
             !doc.field_values().is_empty(),
             "Doc should have field values"
@@ -716,7 +702,9 @@ mod tests {
         assert_eq!(index.num_docs().await.unwrap(), 2);
 
         // Verify document retrieval preserves all values
-        let doc = index.doc(0).await.unwrap().unwrap();
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        let doc = searcher.doc(0).await.unwrap().unwrap();
         let all_uris: Vec<_> = doc.get_all(uris).collect();
         assert_eq!(all_uris.len(), 2, "Should have 2 uris values");
         assert_eq!(all_uris[0].as_text(), Some("one"));
@@ -1128,8 +1116,10 @@ mod tests {
         );
 
         // Verify all docs retrievable
+        let reader1 = index.reader().await.unwrap();
+        let searcher1 = reader1.searcher().await.unwrap();
         for i in 0..50 {
-            let doc = index.doc(i).await.unwrap();
+            let doc = searcher1.doc(i).await.unwrap();
             assert!(doc.is_some(), "doc {} should exist after merge 1", i);
         }
 
@@ -1192,8 +1182,10 @@ mod tests {
         assert_eq!(results.hits.len(), 30, "round 2 docs after merge 2");
 
         // Verify all 80 docs retrievable
+        let reader2 = index.reader().await.unwrap();
+        let searcher2 = reader2.searcher().await.unwrap();
         for i in 0..80 {
-            let doc = index.doc(i).await.unwrap();
+            let doc = searcher2.doc(i).await.unwrap();
             assert!(doc.is_some(), "doc {} should exist after merge 2", i);
         }
     }
@@ -1271,8 +1263,10 @@ mod tests {
         }
 
         // Verify doc retrieval for every doc
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
         for i in 0..total_docs {
-            let doc = index.doc(i).await.unwrap();
+            let doc = searcher.doc(i).await.unwrap();
             assert!(doc.is_some(), "doc {} missing after merge", i);
         }
     }

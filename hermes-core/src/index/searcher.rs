@@ -39,6 +39,10 @@ pub struct Searcher<D: Directory + 'static> {
     trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
     /// Lazy global statistics for cross-segment IDF computation
     global_stats: Arc<LazyGlobalStats>,
+    /// O(1) segment lookup by segment_id
+    segment_map: FxHashMap<u128, usize>,
+    /// Cumulative doc counts for binary-search in doc(global_id)
+    doc_id_cumulative: Vec<u32>,
 }
 
 impl<D: Directory + 'static> Searcher<D> {
@@ -80,6 +84,7 @@ impl<D: Directory + 'static> Searcher<D> {
         )
         .await;
 
+        let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
         Ok(Self {
             _snapshot: snapshot,
             segments,
@@ -88,6 +93,8 @@ impl<D: Directory + 'static> Searcher<D> {
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
             trained_centroids,
             global_stats,
+            segment_map,
+            doc_id_cumulative,
         })
     }
 
@@ -112,6 +119,7 @@ impl<D: Directory + 'static> Searcher<D> {
         {
             let tracker = Arc::new(SegmentTracker::new());
             let snapshot = SegmentSnapshot::new(tracker, segment_ids.to_vec());
+            let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
             Ok(Self {
                 _snapshot: snapshot,
                 segments,
@@ -120,12 +128,15 @@ impl<D: Directory + 'static> Searcher<D> {
                 tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
                 trained_centroids,
                 global_stats,
+                segment_map,
+                doc_id_cumulative,
             })
         }
 
         #[cfg(not(feature = "native"))]
         {
             let _ = directory; // suppress unused warning
+            let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
             Ok(Self {
                 _phantom: std::marker::PhantomData,
                 segments,
@@ -134,6 +145,8 @@ impl<D: Directory + 'static> Searcher<D> {
                 tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
                 trained_centroids,
                 global_stats,
+                segment_map,
+                doc_id_cumulative,
             })
         }
     }
@@ -285,9 +298,27 @@ impl<D: Directory + 'static> Searcher<D> {
         &self.global_stats
     }
 
+    /// Build O(1) lookup tables from loaded segments
+    fn build_lookup_tables(segments: &[Arc<SegmentReader>]) -> (FxHashMap<u128, usize>, Vec<u32>) {
+        let mut segment_map = FxHashMap::default();
+        let mut cumulative = Vec::with_capacity(segments.len());
+        let mut acc = 0u32;
+        for (i, seg) in segments.iter().enumerate() {
+            segment_map.insert(seg.meta().id, i);
+            acc += seg.meta().num_docs;
+            cumulative.push(acc);
+        }
+        (segment_map, cumulative)
+    }
+
     /// Get total document count across all segments
     pub fn num_docs(&self) -> u32 {
-        self.segments.iter().map(|s| s.meta().num_docs).sum()
+        self.doc_id_cumulative.last().copied().unwrap_or(0)
+    }
+
+    /// Get O(1) segment_id → index map (used by reranker)
+    pub fn segment_map(&self) -> &FxHashMap<u128, usize> {
+        &self.segment_map
     }
 
     /// Get number of segments
@@ -295,18 +326,18 @@ impl<D: Directory + 'static> Searcher<D> {
         self.segments.len()
     }
 
-    /// Get a document by global doc_id
+    /// Get a document by global doc_id (binary search on cumulative offsets)
     pub async fn doc(&self, doc_id: u32) -> Result<Option<crate::dsl::Document>> {
-        let mut offset = 0u32;
-        for segment in &self.segments {
-            let segment_docs = segment.meta().num_docs;
-            if doc_id < offset + segment_docs {
-                let local_doc_id = doc_id - offset;
-                return segment.doc(local_doc_id).await;
-            }
-            offset += segment_docs;
+        let idx = self.doc_id_cumulative.partition_point(|&cum| cum <= doc_id);
+        if idx >= self.segments.len() {
+            return Ok(None);
         }
-        Ok(None)
+        let base = if idx == 0 {
+            0
+        } else {
+            self.doc_id_cumulative[idx - 1]
+        };
+        self.segments[idx].doc(doc_id - base).await
     }
 
     /// Search across all segments and return aggregated results
@@ -461,45 +492,13 @@ impl<D: Directory + 'static> Searcher<D> {
             .parse(query_str)
             .map_err(crate::error::Error::Query)?;
 
-        let fetch_limit = offset + limit;
-        let query_ref = query.as_ref();
+        let (results, _total_seen) = self
+            .search_internal(query.as_ref(), limit, offset, false)
+            .await?;
 
-        let futures: Vec<_> = self
-            .segments
-            .iter()
-            .map(|segment| {
-                let sid = segment.meta().id;
-                async move {
-                    let mut results =
-                        crate::query::search_segment(segment.as_ref(), query_ref, fetch_limit)
-                            .await?;
-                    for r in &mut results {
-                        r.segment_id = sid;
-                    }
-                    Ok::<_, crate::error::Error>(results)
-                }
-            })
-            .collect();
-
-        let batches = futures::future::try_join_all(futures).await?;
-        let mut all_results: Vec<crate::query::SearchResult> =
-            Vec::with_capacity(batches.iter().map(|b| b.len()).sum());
-        for batch in batches {
-            all_results.extend(batch);
-        }
-
-        all_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let total_hits = all_results.len() as u32;
-
-        let hits: Vec<crate::query::SearchHit> = all_results
+        let total_hits = results.len() as u32;
+        let hits: Vec<crate::query::SearchHit> = results
             .into_iter()
-            .skip(offset)
-            .take(limit)
             .map(|result| crate::query::SearchHit {
                 address: crate::query::DocAddress::new(result.segment_id, result.doc_id),
                 score: result.score,
@@ -543,12 +542,10 @@ impl<D: Directory + 'static> Searcher<D> {
             crate::error::Error::Query(format!("Invalid segment ID: {}", address.segment_id))
         })?;
 
-        for segment in &self.segments {
-            if segment.meta().id == segment_id {
-                // Convert global doc_id to segment-local doc_id
-                let local_doc_id = address.doc_id.wrapping_sub(segment.doc_id_offset());
-                return segment.doc(local_doc_id).await;
-            }
+        if let Some(&idx) = self.segment_map.get(&segment_id) {
+            let segment = &self.segments[idx];
+            let local_doc_id = address.doc_id.wrapping_sub(segment.doc_id_offset());
+            return segment.doc(local_doc_id).await;
         }
 
         Ok(None)

@@ -167,15 +167,9 @@ impl SegmentMerger {
                         let mut buf = raw.raw_block_data.as_slice().to_vec();
                         for entry in raw.skip_entries {
                             let off = entry.offset as usize + FIRST_DOC_ID_OFFSET;
-                            if off + 4 <= buf.len() {
-                                let old = u32::from_le_bytes([
-                                    buf[off],
-                                    buf[off + 1],
-                                    buf[off + 2],
-                                    buf[off + 3],
-                                ]);
-                                let patched = (old + doc_offset).to_le_bytes();
-                                buf[off..off + 4].copy_from_slice(&patched);
+                            if let Some(slot) = buf.get_mut(off..off + 4) {
+                                let old = u32::from_le_bytes(slot.try_into().unwrap());
+                                slot.copy_from_slice(&(old + doc_offset).to_le_bytes());
                             }
                         }
                         writer.write_all(&buf)?;

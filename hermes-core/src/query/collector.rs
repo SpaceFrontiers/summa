@@ -246,22 +246,15 @@ impl Collector for TopKCollector {
             Vec::new()
         };
 
-        if self.heap.len() < self.k {
-            self.heap.push(SearchResult {
-                doc_id,
-                score,
-                segment_id: 0,
-                positions,
-            });
-        } else {
+        if self.heap.len() >= self.k {
             self.heap.pop();
-            self.heap.push(SearchResult {
-                doc_id,
-                score,
-                segment_id: 0,
-                positions,
-            });
         }
+        self.heap.push(SearchResult {
+            doc_id,
+            score,
+            segment_id: 0,
+            positions,
+        });
     }
 
     fn needs_positions(&self) -> bool {
