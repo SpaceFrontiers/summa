@@ -1168,7 +1168,7 @@ impl SegmentBuilder {
 
         // Phase 3: Stream directly to writers (no intermediate Vec<u8> accumulation)
         let mut postings_offset = 0u64;
-        let mut writer = SSTableWriter::<TermInfo>::new(term_dict_writer);
+        let mut writer = SSTableWriter::<_, TermInfo>::new(term_dict_writer);
 
         for (key, serialized_posting) in serialized {
             let term_info = match serialized_posting {
@@ -1196,7 +1196,7 @@ impl SegmentBuilder {
             writer.insert(&key, &term_info)?;
         }
 
-        writer.finish()?;
+        let _ = writer.finish()?;
         Ok(())
     }
 

@@ -610,8 +610,8 @@ impl SSTableWriterConfig {
 /// - Configurable compression level
 /// - Block index prefix compression
 /// - Bloom filter for fast negative lookups
-pub struct SSTableWriter<'a, V: SSTableValue> {
-    writer: &'a mut dyn Write,
+pub struct SSTableWriter<W: Write, V: SSTableValue> {
+    writer: W,
     block_buffer: Vec<u8>,
     prev_key: Vec<u8>,
     index: Vec<BlockIndexEntry>,
@@ -628,14 +628,14 @@ pub struct SSTableWriter<'a, V: SSTableValue> {
     _phantom: std::marker::PhantomData<V>,
 }
 
-impl<'a, V: SSTableValue> SSTableWriter<'a, V> {
+impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
     /// Create a new SSTable writer with default configuration
-    pub fn new(writer: &'a mut dyn Write) -> Self {
+    pub fn new(writer: W) -> Self {
         Self::with_config(writer, SSTableWriterConfig::default())
     }
 
     /// Create a new SSTable writer with custom configuration
-    pub fn with_config(writer: &'a mut dyn Write, config: SSTableWriterConfig) -> Self {
+    pub fn with_config(writer: W, config: SSTableWriterConfig) -> Self {
         Self {
             writer,
             block_buffer: Vec::with_capacity(BLOCK_SIZE),
@@ -654,7 +654,7 @@ impl<'a, V: SSTableValue> SSTableWriter<'a, V> {
 
     /// Create a new SSTable writer with a pre-trained dictionary
     pub fn with_dictionary(
-        writer: &'a mut dyn Write,
+        writer: W,
         config: SSTableWriterConfig,
         dictionary: CompressionDict,
     ) -> Self {
@@ -736,7 +736,7 @@ impl<'a, V: SSTableValue> SSTableWriter<'a, V> {
         Ok(())
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
+    pub fn finish(mut self) -> io::Result<W> {
         // Flush any remaining data
         self.flush_block()?;
 
@@ -812,7 +812,7 @@ impl<'a, V: SSTableValue> SSTableWriter<'a, V> {
             .write_u8(self.config.compression_level.0 as u8)?;
         self.writer.write_u32::<LittleEndian>(SSTABLE_MAGIC)?;
 
-        Ok(())
+        Ok(self.writer)
     }
 }
 

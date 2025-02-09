@@ -265,11 +265,13 @@ impl SegmentMerger {
     ///
     /// This implementation uses a min-heap to merge terms from all segments
     /// in sorted order without loading all terms into memory at once.
-    /// Memory usage is O(num_segments) instead of O(total_terms).
     ///
     /// Optimization: For terms that exist in only one segment, we copy the
     /// posting data directly without decode/encode. Only terms that exist
     /// in multiple segments need full merge.
+    ///
+    /// SSTable entries are written inline during the merge loop (no buffering).
+    /// This is possible because SSTableWriter<W> is Send when W is Send.
     ///
     /// Returns the number of terms processed.
     async fn merge_postings(
@@ -278,15 +280,28 @@ impl SegmentMerger {
         term_dict: &mut OffsetWriter,
         postings_out: &mut OffsetWriter,
         positions_out: &mut OffsetWriter,
-        stats: &mut MergeStats,
+        _stats: &mut MergeStats,
     ) -> Result<usize> {
         let doc_offs = doc_offsets(segments);
 
-        // Bulk-prefetch all term dict blocks (1 I/O per segment instead of ~160)
-        for (i, segment) in segments.iter().enumerate() {
-            log::debug!("Prefetching term dict for segment {} ...", i);
-            segment.prefetch_term_dict().await?;
+        // Parallel prefetch all term dict blocks
+        let prefetch_start = std::time::Instant::now();
+        let mut futs = Vec::with_capacity(segments.len());
+        for segment in segments.iter() {
+            futs.push(segment.prefetch_term_dict());
         }
+        let results = futures::future::join_all(futs).await;
+        for (i, res) in results.into_iter().enumerate() {
+            res.map_err(|e| {
+                log::error!("Prefetch failed for segment {}: {}", i, e);
+                e
+            })?;
+        }
+        log::debug!(
+            "Prefetched {} term dicts in {:.1}s",
+            segments.len(),
+            prefetch_start.elapsed().as_secs_f64()
+        );
 
         // Create iterators for each segment's term dictionary
         let mut iterators: Vec<_> = segments.iter().map(|s| s.term_dict_iter()).collect();
@@ -304,9 +319,9 @@ impl SegmentMerger {
             }
         }
 
-        // Buffer term results - needed because SSTableWriter can't be held across await points
-        // Memory is bounded by unique terms (typically much smaller than postings)
-        let mut term_results: Vec<(Vec<u8>, TermInfo)> = Vec::new();
+        // Write SSTable entries inline — no buffering needed since
+        // SSTableWriter<&mut OffsetWriter> is Send (OffsetWriter is Send).
+        let mut term_dict_writer = SSTableWriter::<&mut OffsetWriter, TermInfo>::new(term_dict);
         let mut terms_processed = 0usize;
         let mut serialize_buf: Vec<u8> = Vec::new();
 
@@ -367,7 +382,10 @@ impl SegmentMerger {
                 )
                 .await?;
 
-            term_results.push((current_key, term_info));
+            // Write directly to SSTable (no buffering)
+            term_dict_writer
+                .insert(&current_key, &term_info)
+                .map_err(crate::Error::Io)?;
             terms_processed += 1;
 
             // Log progress every 100k terms
@@ -376,25 +394,15 @@ impl SegmentMerger {
             }
         }
 
-        // Track memory (only term_results is buffered; postings/positions stream to disk)
-        let results_mem = term_results.capacity() * std::mem::size_of::<(Vec<u8>, TermInfo)>();
-        stats.peak_memory_bytes = stats.peak_memory_bytes.max(results_mem);
-
         log::info!(
-            "[merge] complete: terms={}, segments={}, term_buffer={:.2} MB, postings={}, positions={}",
+            "[merge] complete: terms={}, segments={}, postings={}, positions={}",
             terms_processed,
             segments.len(),
-            results_mem as f64 / (1024.0 * 1024.0),
             format_bytes(postings_out.offset() as usize),
             format_bytes(positions_out.offset() as usize),
         );
 
-        // Write to SSTable (sync, no await points)
-        let mut writer = SSTableWriter::<TermInfo>::new(term_dict);
-        for (key, term_info) in term_results {
-            writer.insert(&key, &term_info)?;
-        }
-        writer.finish()?;
+        term_dict_writer.finish().map_err(crate::Error::Io)?;
 
         Ok(terms_processed)
     }
