@@ -368,6 +368,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let new_segment_id = SegmentId::new();
 
         let merge_result = if !trained_centroids.is_empty() {
+            log::info!(
+                "[merge] using merge_with_ann ({} trained fields) for {} segments -> {}",
+                trained_centroids.len(),
+                segment_ids_to_merge.len(),
+                new_segment_id.to_hex()
+            );
             let trained = crate::segment::TrainedVectorStructures {
                 centroids: trained_centroids,
                 codebooks: trained_codebooks,
@@ -376,6 +382,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .merge_with_ann(directory, &readers, new_segment_id, &trained)
                 .await
         } else {
+            log::debug!(
+                "[merge] no trained structures, using flat merge for {} segments -> {}",
+                segment_ids_to_merge.len(),
+                new_segment_id.to_hex()
+            );
             merger.merge(directory, &readers, new_segment_id).await
         };
 

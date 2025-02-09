@@ -233,27 +233,101 @@ impl IndexMetadata {
 
         for (field_id, field_meta) in &self.vector_fields {
             if !matches!(field_meta.state, VectorIndexState::Built { .. }) {
+                log::debug!("[trained] field {} not in Built state, skipping", field_id);
                 continue;
             }
 
             // Load centroids
-            if let Some(ref file) = field_meta.centroids_file
-                && let Ok(slice) = dir.open_read(Path::new(file)).await
-                && let Ok(bytes) = slice.read_bytes().await
-                && let Ok(c) =
-                    serde_json::from_slice::<crate::structures::CoarseCentroids>(bytes.as_slice())
-            {
-                centroids.insert(*field_id, Arc::new(c));
+            match &field_meta.centroids_file {
+                None => {
+                    log::warn!(
+                        "[trained] field {} is Built but centroids_file is None",
+                        field_id
+                    );
+                }
+                Some(file) => match dir.open_read(Path::new(file)).await {
+                    Err(e) => {
+                        log::warn!(
+                            "[trained] field {} centroids file '{}' open failed: {}",
+                            field_id,
+                            file,
+                            e
+                        );
+                    }
+                    Ok(slice) => match slice.read_bytes().await {
+                        Err(e) => {
+                            log::warn!(
+                                "[trained] field {} centroids file '{}' read failed: {}",
+                                field_id,
+                                file,
+                                e
+                            );
+                        }
+                        Ok(bytes) => {
+                            match serde_json::from_slice::<crate::structures::CoarseCentroids>(
+                                bytes.as_slice(),
+                            ) {
+                                Ok(c) => {
+                                    log::debug!(
+                                        "[trained] field {} loaded centroids ({} clusters)",
+                                        field_id,
+                                        c.num_clusters
+                                    );
+                                    centroids.insert(*field_id, Arc::new(c));
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[trained] field {} centroids deserialize failed: {}",
+                                        field_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    },
+                },
             }
 
             // Load codebook (for ScaNN)
-            if let Some(ref file) = field_meta.codebook_file
-                && let Ok(slice) = dir.open_read(Path::new(file)).await
-                && let Ok(bytes) = slice.read_bytes().await
-                && let Ok(c) =
-                    serde_json::from_slice::<crate::structures::PQCodebook>(bytes.as_slice())
-            {
-                codebooks.insert(*field_id, Arc::new(c));
+            match &field_meta.codebook_file {
+                None => {} // Not all index types have codebooks
+                Some(file) => match dir.open_read(Path::new(file)).await {
+                    Err(e) => {
+                        log::warn!(
+                            "[trained] field {} codebook file '{}' open failed: {}",
+                            field_id,
+                            file,
+                            e
+                        );
+                    }
+                    Ok(slice) => match slice.read_bytes().await {
+                        Err(e) => {
+                            log::warn!(
+                                "[trained] field {} codebook file '{}' read failed: {}",
+                                field_id,
+                                file,
+                                e
+                            );
+                        }
+                        Ok(bytes) => {
+                            match serde_json::from_slice::<crate::structures::PQCodebook>(
+                                bytes.as_slice(),
+                            ) {
+                                Ok(c) => {
+                                    log::debug!("[trained] field {} loaded codebook", field_id);
+                                    codebooks.insert(*field_id, Arc::new(c));
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[trained] field {} codebook deserialize failed: {}",
+                                        field_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    },
+                },
             }
         }
 

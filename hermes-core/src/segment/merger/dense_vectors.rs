@@ -286,6 +286,21 @@ impl SegmentMerger {
                         _ => None,
                     });
 
+            if ann_type.is_none() {
+                log::debug!(
+                    "[merge_vectors] field {}: no ANN path available (trained={}, config={}, ivf={}/{}, scann={}/{})",
+                    field.0,
+                    trained.is_some(),
+                    config
+                        .map(|c| format!("{:?}", c.index_type))
+                        .unwrap_or_else(|| "None".into()),
+                    ivf_indexes.len(),
+                    segments_with_flat,
+                    scann_indexes.len(),
+                    segments_with_flat,
+                );
+            }
+
             if let Some(ann) = ann_type {
                 let trained = trained.unwrap();
                 let mut total_fed = 0usize;
