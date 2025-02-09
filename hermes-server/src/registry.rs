@@ -145,6 +145,7 @@ impl IndexRegistry {
     /// Returns the handle so the caller can flush/wait on it before deleting files.
     /// Once evicted, no new operations can obtain references to this index.
     pub fn evict(&self, name: &str) -> Option<IndexHandle> {
+        self.open_locks.write().remove(name);
         self.handles.write().remove(name)
     }
 

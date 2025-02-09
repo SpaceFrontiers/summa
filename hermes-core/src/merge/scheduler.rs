@@ -286,7 +286,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         }
                         meta.add_segment(new_segment_id, merged_doc_count);
                         if let Err(e) = meta.save(directory.as_ref()).await {
-                            eprintln!("[merge] Failed to save metadata after merge: {:?}", e);
+                            log::error!("[merge] Failed to save metadata after merge: {:?}", e);
                         }
                     }
 
@@ -298,9 +298,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Background merge failed for segments {:?}: {:?}",
-                        segment_ids_to_merge, e
+                    log::error!(
+                        "[merge] Background merge failed for segments {:?}: {:?}",
+                        segment_ids_to_merge,
+                        e
                     );
                 }
             }
@@ -405,6 +406,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             );
             return Err(e);
         }
+
+        log::info!(
+            "[merge] total wall-clock: {:.1}s ({} segments, {} docs)",
+            load_start.elapsed().as_secs_f64(),
+            readers.len(),
+            total_docs,
+        );
 
         // Note: Segment deletion is handled by the caller via tracker
         Ok((new_segment_id.to_hex(), total_docs))

@@ -160,6 +160,7 @@ impl SegmentMerger {
         let files = SegmentFiles::new(new_segment_id.0);
 
         // === Phase 1: merge postings + positions (streaming) ===
+        let phase1_start = std::time::Instant::now();
         let mut postings_writer = OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
         let mut positions_writer = OffsetWriter::new(dir.streaming_writer(&files.positions).await?);
         let mut term_dict_writer = OffsetWriter::new(dir.streaming_writer(&files.term_dict).await?);
@@ -170,7 +171,6 @@ impl SegmentMerger {
                 &mut term_dict_writer,
                 &mut postings_writer,
                 &mut positions_writer,
-                &mut stats,
             )
             .await?;
         stats.terms_processed = terms_processed;
@@ -186,6 +186,14 @@ impl SegmentMerger {
             drop(positions_writer);
             let _ = dir.delete(&files.positions).await;
         }
+        log::info!(
+            "[merge] postings done: {} terms, term_dict={}, postings={}, positions={} in {:.1}s",
+            terms_processed,
+            format_bytes(stats.term_dict_bytes),
+            format_bytes(stats.postings_bytes),
+            format_bytes(positions_bytes as usize),
+            phase1_start.elapsed().as_secs_f64()
+        );
 
         // === Phase 2: merge store files (streaming) ===
         let phase2_start = std::time::Instant::now();
@@ -296,7 +304,6 @@ impl SegmentMerger {
         term_dict: &mut OffsetWriter,
         postings_out: &mut OffsetWriter,
         positions_out: &mut OffsetWriter,
-        _stats: &mut MergeStats,
     ) -> Result<usize> {
         let doc_offs = doc_offsets(segments);
 
@@ -409,14 +416,6 @@ impl SegmentMerger {
                 log::debug!("Merge progress: {} terms processed", terms_processed);
             }
         }
-
-        log::info!(
-            "[merge] postings done: terms={}, segments={}, postings={}, positions={}",
-            terms_processed,
-            segments.len(),
-            format_bytes(postings_out.offset() as usize),
-            format_bytes(positions_out.offset() as usize),
-        );
 
         term_dict_writer.finish().map_err(crate::Error::Io)?;
 

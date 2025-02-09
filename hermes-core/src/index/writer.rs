@@ -421,7 +421,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                                 builder = Some(b);
                             }
                             Err(e) => {
-                                eprintln!("Failed to create segment builder: {:?}", e);
+                                log::error!("Failed to create segment builder: {:?}", e);
                                 continue;
                             }
                         }
@@ -430,7 +430,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     // Index the document
                     let b = builder.as_mut().unwrap();
                     if let Err(e) = b.add_document(doc) {
-                        eprintln!("Failed to index document: {:?}", e);
+                        log::error!("Failed to index document: {:?}", e);
                         continue;
                     }
 
@@ -572,11 +572,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 }
                 Err(e) => {
                     log::error!(
-                        "[segment_build_failed] segment_id={} error={}",
+                        "[segment_build_failed] segment_id={} error={:?}",
                         segment_hex,
                         e
                     );
-                    eprintln!("Background segment build failed: {:?}", e);
                     // Signal failure with num_docs=0 so waiters don't block
                     (segment_hex, 0)
                 }

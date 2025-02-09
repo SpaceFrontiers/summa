@@ -71,7 +71,14 @@ async fn feed_segment(
         let batch_count = VECTOR_BATCH_SIZE.min(n - batch_start);
         let batch_bytes = match lazy_flat.read_vectors_batch(batch_start, batch_count).await {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => {
+                log::error!(
+                    "[merge_vectors] failed to read vector batch at offset {}: {:?}",
+                    batch_start,
+                    e
+                );
+                continue;
+            }
         };
         let raw = batch_bytes.as_slice();
         let batch_floats = batch_count * dim;
