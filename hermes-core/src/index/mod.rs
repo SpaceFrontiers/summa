@@ -212,7 +212,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
                 IndexReader::from_segment_manager_with_reload_interval(
                     Arc::clone(&self.schema),
                     Arc::clone(&self.segment_manager),
-                    self.trained_centroids.clone(),
                     self.config.term_cache_blocks,
                     self.config.reload_interval_ms,
                 )

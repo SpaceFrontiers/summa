@@ -26,8 +26,6 @@ pub struct IndexReader<D: DirectoryWriter + 'static> {
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Current searcher
     searcher: RwLock<Arc<Searcher<D>>>,
-    /// Trained centroids (injected into segment readers for IVF/ScaNN search)
-    trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
     /// Term cache blocks
     term_cache_blocks: usize,
     /// Last reload check time
@@ -46,10 +44,10 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
+        let _ = trained_centroids; // centroids now loaded dynamically from metadata
         Self::from_segment_manager_with_reload_interval(
             schema,
             segment_manager,
-            trained_centroids,
             term_cache_blocks,
             1000, // default 1 second
         )
@@ -60,26 +58,18 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
     pub async fn from_segment_manager_with_reload_interval(
         schema: Arc<Schema>,
         segment_manager: Arc<crate::merge::SegmentManager<D>>,
-        trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
         reload_interval_ms: u64,
     ) -> Result<Self> {
         // Get initial segment IDs
         let initial_segment_ids = segment_manager.get_segment_ids().await;
 
-        let reader = Self::create_reader(
-            &schema,
-            &segment_manager,
-            &trained_centroids,
-            term_cache_blocks,
-        )
-        .await?;
+        let reader = Self::create_reader(&schema, &segment_manager, term_cache_blocks).await?;
 
         Ok(Self {
             schema,
             segment_manager,
             searcher: RwLock::new(Arc::new(reader)),
-            trained_centroids,
             term_cache_blocks,
             last_reload_check: RwLock::new(std::time::Instant::now()),
             reload_check_interval: std::time::Duration::from_millis(reload_interval_ms),
@@ -88,13 +78,26 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
     }
 
     /// Create a new reader with fresh snapshot from segment manager
-    /// This avoids race conditions by using SegmentManager's locked metadata
+    ///
+    /// Loads trained centroids dynamically from metadata on every call,
+    /// so the reader always picks up centroids trained after Index::create().
     async fn create_reader(
         schema: &Arc<Schema>,
         segment_manager: &Arc<crate::merge::SegmentManager<D>>,
-        trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Result<Searcher<D>> {
+        // Load trained centroids from metadata (always fresh)
+        let trained = {
+            let metadata_arc = segment_manager.metadata();
+            let meta = metadata_arc.read().await;
+            meta.load_trained_structures(segment_manager.directory().as_ref())
+                .await
+        };
+        let trained_centroids = trained
+            .as_ref()
+            .map(|t| t.centroids.clone())
+            .unwrap_or_default();
+
         // Use SegmentManager's acquire_snapshot - non-blocking RwLock read
         let snapshot = segment_manager.acquire_snapshot().await;
 
@@ -102,7 +105,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             segment_manager.directory(),
             Arc::clone(schema),
             snapshot,
-            trained_centroids.clone(),
+            trained_centroids,
             term_cache_blocks,
         )
         .await
@@ -157,13 +160,9 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
 
     /// Internal reload with specific segment IDs
     async fn reload_with_segments(&self, new_segment_ids: Vec<String>) -> Result<()> {
-        let new_reader = Self::create_reader(
-            &self.schema,
-            &self.segment_manager,
-            &self.trained_centroids,
-            self.term_cache_blocks,
-        )
-        .await?;
+        let new_reader =
+            Self::create_reader(&self.schema, &self.segment_manager, self.term_cache_blocks)
+                .await?;
 
         // Swap in new searcher and update segment IDs
         *self.searcher.write() = Arc::new(new_reader);
