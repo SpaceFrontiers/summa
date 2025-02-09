@@ -447,23 +447,19 @@ impl BlockSparsePostingList {
     }
 
     fn find_block(&self, target: DocId) -> Option<usize> {
-        let mut lo = 0;
-        let mut hi = self.blocks.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let block = &self.blocks[mid];
-            let doc_ids = block.decode_doc_ids();
-            let last_doc = doc_ids.last().copied().unwrap_or(block.header.first_doc_id);
-            if last_doc < target {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+        if self.blocks.is_empty() {
+            return None;
         }
-        if lo < self.blocks.len() {
-            Some(lo)
+        // Binary search on first_doc_id: find the last block whose first_doc_id <= target.
+        // O(log N) header comparisons — no block decode needed.
+        let idx = self
+            .blocks
+            .partition_point(|b| b.header.first_doc_id <= target);
+        if idx == 0 {
+            // target < first_doc_id of block 0 — return block 0 so caller can check
+            Some(0)
         } else {
-            None
+            Some(idx - 1)
         }
     }
 }

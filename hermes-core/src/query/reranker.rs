@@ -80,16 +80,13 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     let segments = searcher.segment_readers();
     let seg_by_id = searcher.segment_map();
 
-    // Resolve each candidate → (segment, flat_idx, ordinal)
-    struct VectorRead {
-        candidate_idx: usize,
-        ordinal: u16,
-        segment_idx: usize,
-        flat_idx: usize,
-    }
-
-    let mut reads: Vec<VectorRead> = Vec::new();
+    // For each candidate, batch-read all its ordinals in one mmap call
+    // (vectors for the same doc are contiguous in the flat store)
+    let t_read = std::time::Instant::now();
+    let mut ordinal_scores: Vec<Vec<(u32, f32)>> = vec![Vec::new(); candidates.len()];
     let mut skipped = 0u32;
+    let mut total_vectors = 0usize;
+    let mut vec_buf = vec![0f32; query_dim];
 
     for (ci, candidate) in candidates.iter().enumerate() {
         let Some(&si) = seg_by_id.get(&candidate.segment_id) else {
@@ -114,19 +111,38 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
             continue;
         }
 
+        let count = entries.len();
+        total_vectors += count;
+
+        // One batch read for all ordinals of this doc (contiguous in flat store)
+        let batch = match lazy_flat.read_vectors_batch(start, count).await {
+            Ok(b) => b,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let vbs = lazy_flat.vector_byte_size();
+        let raw = batch.as_slice();
+
         for (j, &(_doc_id, ordinal)) in entries.iter().enumerate() {
-            reads.push(VectorRead {
-                candidate_idx: ci,
-                ordinal,
-                segment_idx: si,
-                flat_idx: start + j,
-            });
+            let offset = j * vbs;
+            crate::segment::dequantize_raw(
+                &raw[offset..offset + vbs],
+                lazy_flat.quantization,
+                query_dim,
+                &mut vec_buf,
+            );
+            let score = cosine_similarity(query, &vec_buf);
+            ordinal_scores[ci].push((ordinal as u32, score));
         }
     }
 
     let resolve_elapsed = t0.elapsed();
+    let read_score_elapsed = t_read.elapsed();
 
-    if reads.is_empty() {
+    if total_vectors == 0 {
         log::debug!(
             "[reranker] field {}: {} candidates, all skipped (no flat vectors)",
             field_id,
@@ -134,30 +150,6 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         );
         return Ok(Vec::new());
     }
-
-    // Sort by (segment, flat_idx) for sequential mmap access (page locality)
-    reads.sort_unstable_by_key(|r| (r.segment_idx, r.flat_idx));
-
-    // Read each vector from flat data and score with cosine similarity
-    let t_read = std::time::Instant::now();
-    let mut vec_buf = vec![0f32; query_dim];
-    let mut ordinal_scores: Vec<Vec<(u32, f32)>> = vec![Vec::new(); candidates.len()];
-
-    for r in &reads {
-        let lazy_flat = segments[r.segment_idx]
-            .flat_vectors()
-            .get(&field_id)
-            .unwrap();
-        if lazy_flat
-            .read_vector_into(r.flat_idx, &mut vec_buf)
-            .await
-            .is_ok()
-        {
-            let score = cosine_similarity(query, &vec_buf);
-            ordinal_scores[r.candidate_idx].push((r.ordinal as u32, score));
-        }
-    }
-    let read_score_elapsed = t_read.elapsed();
 
     // Combine per-candidate ordinal scores and build results
     let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
@@ -196,7 +188,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         candidates.len(),
         scored.len(),
         skipped,
-        reads.len(),
+        total_vectors,
         resolve_elapsed.as_secs_f64() * 1000.0,
         read_score_elapsed.as_secs_f64() * 1000.0,
         t0.elapsed().as_secs_f64() * 1000.0,

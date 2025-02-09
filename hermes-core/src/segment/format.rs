@@ -46,6 +46,7 @@ pub const DENSE_TOC_ENTRY_SIZE: u64 = 4 + 1 + 8 + 8; // 21
 ///
 /// Called after all field data has been written. `toc_offset` is the
 /// current file position (byte offset where the TOC starts).
+#[cfg(feature = "native")]
 pub fn write_dense_toc_and_footer(
     writer: &mut (impl std::io::Write + ?Sized),
     toc_offset: u64,
@@ -94,6 +95,7 @@ pub fn read_dense_toc(
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x32525053;
 
 /// Per-field TOC entry accumulated during sparse build/merge.
+#[cfg(feature = "native")]
 pub struct SparseFieldToc {
     pub field_id: u32,
     pub quantization: u8,
@@ -105,6 +107,7 @@ pub struct SparseFieldToc {
 ///
 /// Called after all posting data has been written. `toc_offset` is the
 /// current file position (byte offset where the TOC starts).
+#[cfg(feature = "native")]
 pub fn write_sparse_toc_and_footer(
     writer: &mut (impl std::io::Write + ?Sized),
     toc_offset: u64,
