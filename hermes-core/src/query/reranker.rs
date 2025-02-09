@@ -16,13 +16,8 @@ pub struct RerankerConfig {
     pub combiner: MultiValueCombiner,
 }
 
-/// Score a single document against the query vector.
-///
-/// Returns `None` if the document has no values for the given field,
-/// or if stored vectors have a different dimension than the query.
-///
-/// Returns `(combined_score, ordinal_scores)` where ordinal_scores contains
-/// per-vector scores sorted by score descending (best chunk first).
+/// Score a single document against the query vector (used by tests).
+#[cfg(test)]
 fn score_document(
     doc: &crate::dsl::Document,
     config: &RerankerConfig,
@@ -59,9 +54,13 @@ fn score_document(
 
 /// Rerank L1 candidates by exact dense vector distance.
 ///
-/// For each candidate, loads the stored document, extracts the dense vector field,
-/// computes squared Euclidean distance, and converts to a similarity score via
-/// `1 / (1 + dist)`. Multi-valued fields are combined using `config.combiner`.
+/// Reads vectors directly from flat vector data (mmap) instead of loading
+/// full documents from the store. This avoids store block decompression
+/// and document deserialization — typically 10-50× faster.
+///
+/// For each candidate, resolves the segment and flat vector index via
+/// binary search, reads the raw vector, dequantizes to f32, and scores
+/// with SIMD cosine similarity.
 ///
 /// Documents missing the vector field are skipped.
 pub async fn rerank<D: crate::directories::Directory + 'static>(
@@ -70,42 +69,125 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     config: &RerankerConfig,
     final_limit: usize,
 ) -> crate::error::Result<Vec<SearchResult>> {
-    if config.vector.is_empty() {
+    if config.vector.is_empty() || candidates.is_empty() {
         return Ok(Vec::new());
     }
 
     let t0 = std::time::Instant::now();
+    let field_id = config.field.0;
+    let query = &config.vector;
+    let query_dim = query.len();
+    let segments = searcher.segment_readers();
 
-    // Load all candidate documents in parallel
-    let doc_futures: Vec<_> = candidates.iter().map(|c| searcher.doc(c.doc_id)).collect();
-    let docs = futures::future::join_all(doc_futures).await;
-    let load_elapsed = t0.elapsed();
+    // Build segment_id → index map for O(1) lookup
+    let seg_by_id: rustc_hash::FxHashMap<u128, usize> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.meta().id, i))
+        .collect();
 
-    let t_score = std::time::Instant::now();
-    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
+    // Resolve each candidate → (segment, flat_idx, ordinal)
+    struct VectorRead {
+        candidate_idx: usize,
+        ordinal: u16,
+        segment_idx: usize,
+        flat_idx: usize,
+    }
+
+    let mut reads: Vec<VectorRead> = Vec::new();
     let mut skipped = 0u32;
 
-    let field_id = config.field.0;
+    for (ci, candidate) in candidates.iter().enumerate() {
+        let Some(&si) = seg_by_id.get(&candidate.segment_id) else {
+            skipped += 1;
+            continue;
+        };
 
-    for (candidate, doc_result) in candidates.iter().zip(docs) {
-        match doc_result {
-            Ok(Some(doc)) => {
-                if let Some((score, ordinal_positions)) = score_document(&doc, config) {
-                    scored.push(SearchResult {
-                        doc_id: candidate.doc_id,
-                        score,
-                        positions: vec![(field_id, ordinal_positions)],
-                    });
-                } else {
-                    skipped += 1;
-                }
-            }
-            _ => {
-                skipped += 1;
-            }
+        let local_doc_id = candidate.doc_id - segments[si].doc_id_offset();
+        let Some(lazy_flat) = segments[si].flat_vectors().get(&field_id) else {
+            skipped += 1;
+            continue;
+        };
+
+        if lazy_flat.dim != query_dim {
+            skipped += 1;
+            continue;
+        }
+
+        let (start, entries) = lazy_flat.flat_indexes_for_doc(local_doc_id);
+        if entries.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        for (j, &(_doc_id, ordinal)) in entries.iter().enumerate() {
+            reads.push(VectorRead {
+                candidate_idx: ci,
+                ordinal,
+                segment_idx: si,
+                flat_idx: start + j,
+            });
         }
     }
-    let score_elapsed = t_score.elapsed();
+
+    let resolve_elapsed = t0.elapsed();
+
+    if reads.is_empty() {
+        log::debug!(
+            "[reranker] field {}: {} candidates, all skipped (no flat vectors)",
+            field_id,
+            candidates.len()
+        );
+        return Ok(Vec::new());
+    }
+
+    // Sort by (segment, flat_idx) for sequential mmap access (page locality)
+    reads.sort_unstable_by_key(|r| (r.segment_idx, r.flat_idx));
+
+    // Read each vector from flat data and score with cosine similarity
+    let t_read = std::time::Instant::now();
+    let mut vec_buf = vec![0f32; query_dim];
+    let mut ordinal_scores: Vec<Vec<(u32, f32)>> = vec![Vec::new(); candidates.len()];
+
+    for r in &reads {
+        let lazy_flat = segments[r.segment_idx]
+            .flat_vectors()
+            .get(&field_id)
+            .unwrap();
+        if lazy_flat
+            .read_vector_into(r.flat_idx, &mut vec_buf)
+            .await
+            .is_ok()
+        {
+            let score = cosine_similarity(query, &vec_buf);
+            ordinal_scores[r.candidate_idx].push((r.ordinal as u32, score));
+        }
+    }
+    let read_score_elapsed = t_read.elapsed();
+
+    // Combine per-candidate ordinal scores and build results
+    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
+    for (ci, ordinals) in ordinal_scores.into_iter().enumerate() {
+        if ordinals.is_empty() {
+            continue;
+        }
+        let combined = config.combiner.combine(&ordinals);
+        let mut positions: Vec<ScoredPosition> = ordinals
+            .into_iter()
+            .map(|(ord, score)| ScoredPosition::new(ord, score))
+            .collect();
+        positions.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.push(SearchResult {
+            doc_id: candidates[ci].doc_id,
+            score: combined,
+            segment_id: candidates[ci].segment_id,
+            positions: vec![(field_id, positions)],
+        });
+    }
 
     scored.sort_by(|a, b| {
         b.score
@@ -115,13 +197,14 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     scored.truncate(final_limit);
 
     log::debug!(
-        "[reranker] field {}: {} candidates -> {} results (skipped {}): load_docs={:.1}ms score={:.1}ms total={:.1}ms",
+        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors): resolve={:.1}ms read+score={:.1}ms total={:.1}ms",
         field_id,
         candidates.len(),
         scored.len(),
         skipped,
-        load_elapsed.as_secs_f64() * 1000.0,
-        score_elapsed.as_secs_f64() * 1000.0,
+        reads.len(),
+        resolve_elapsed.as_secs_f64() * 1000.0,
+        read_score_elapsed.as_secs_f64() * 1000.0,
         t0.elapsed().as_secs_f64() * 1000.0,
     );
 

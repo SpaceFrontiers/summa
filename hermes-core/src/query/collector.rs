@@ -54,10 +54,17 @@ impl ScoredPosition {
 pub struct SearchResult {
     pub doc_id: DocId,
     pub score: Score,
+    /// Segment ID (set by searcher after collection)
+    #[serde(default, skip_serializing_if = "is_zero_u128")]
+    pub segment_id: u128,
     /// Matched positions per field: (field_id, scored_positions)
     /// Each position includes its individual score contribution
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub positions: Vec<(u32, Vec<ScoredPosition>)>,
+}
+
+fn is_zero_u128(v: &u128) -> bool {
+    *v == 0
 }
 
 /// Matched field info with ordinals (for multi-valued fields)
@@ -243,6 +250,7 @@ impl Collector for TopKCollector {
             self.heap.push(SearchResult {
                 doc_id,
                 score,
+                segment_id: 0,
                 positions,
             });
         } else {
@@ -250,6 +258,7 @@ impl Collector for TopKCollector {
             self.heap.push(SearchResult {
                 doc_id,
                 score,
+                segment_id: 0,
                 positions,
             });
         }

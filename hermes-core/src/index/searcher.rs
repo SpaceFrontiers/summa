@@ -379,7 +379,7 @@ impl<D: Directory + 'static> Searcher<D> {
             .map(|segment| {
                 let sid = segment.meta().id;
                 async move {
-                    let (results, segment_seen) = if collect_positions {
+                    let (mut results, segment_seen) = if collect_positions {
                         crate::query::search_segment_with_positions_and_count(
                             segment.as_ref(),
                             query,
@@ -394,19 +394,17 @@ impl<D: Directory + 'static> Searcher<D> {
                         )
                         .await?
                     };
-                    Ok::<_, crate::error::Error>((
-                        results
-                            .into_iter()
-                            .map(move |r| (sid, r))
-                            .collect::<Vec<_>>(),
-                        segment_seen,
-                    ))
+                    // Stamp segment_id on each result
+                    for r in &mut results {
+                        r.segment_id = sid;
+                    }
+                    Ok::<_, crate::error::Error>((results, segment_seen))
                 }
             })
             .collect();
 
         let batches = futures::future::try_join_all(futures).await?;
-        let mut all_results: Vec<(u128, crate::query::SearchResult)> = Vec::new();
+        let mut all_results: Vec<crate::query::SearchResult> = Vec::new();
         let mut total_seen: u32 = 0;
         for (batch, segment_seen) in batches {
             total_seen += segment_seen;
@@ -415,18 +413,13 @@ impl<D: Directory + 'static> Searcher<D> {
 
         // Sort by score descending
         all_results.sort_by(|a, b| {
-            b.1.score
-                .partial_cmp(&a.1.score)
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Apply offset and limit
-        let results = all_results
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, result)| result)
-            .collect();
+        let results = all_results.into_iter().skip(offset).take(limit).collect();
 
         Ok((results, total_seen))
     }
@@ -477,29 +470,27 @@ impl<D: Directory + 'static> Searcher<D> {
             .map(|segment| {
                 let sid = segment.meta().id;
                 async move {
-                    let results =
+                    let mut results =
                         crate::query::search_segment(segment.as_ref(), query_ref, fetch_limit)
                             .await?;
-                    Ok::<_, crate::error::Error>(
-                        results
-                            .into_iter()
-                            .map(move |r| (sid, r))
-                            .collect::<Vec<_>>(),
-                    )
+                    for r in &mut results {
+                        r.segment_id = sid;
+                    }
+                    Ok::<_, crate::error::Error>(results)
                 }
             })
             .collect();
 
         let batches = futures::future::try_join_all(futures).await?;
-        let mut all_results: Vec<(u128, crate::query::SearchResult)> =
+        let mut all_results: Vec<crate::query::SearchResult> =
             Vec::with_capacity(batches.iter().map(|b| b.len()).sum());
         for batch in batches {
             all_results.extend(batch);
         }
 
         all_results.sort_by(|a, b| {
-            b.1.score
-                .partial_cmp(&a.1.score)
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -509,8 +500,8 @@ impl<D: Directory + 'static> Searcher<D> {
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|(segment_id, result)| crate::query::SearchHit {
-                address: crate::query::DocAddress::new(segment_id, result.doc_id),
+            .map(|result| crate::query::SearchHit {
+                address: crate::query::DocAddress::new(result.segment_id, result.doc_id),
                 score: result.score,
                 matched_fields: result.extract_ordinals(),
             })
