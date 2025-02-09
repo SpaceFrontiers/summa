@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 use crate::directories::DirectoryWriter;
 use crate::dsl::Schema;
 use crate::error::Result;
-use crate::structures::{CoarseCentroids, PQCodebook};
+use crate::structures::CoarseCentroids;
 
 use super::Searcher;
 
@@ -26,10 +26,8 @@ pub struct IndexReader<D: DirectoryWriter + 'static> {
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Current searcher
     searcher: RwLock<Arc<Searcher<D>>>,
-    /// Trained centroids
+    /// Trained centroids (injected into segment readers for IVF/ScaNN search)
     trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-    /// Trained codebooks
-    trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
     /// Term cache blocks
     term_cache_blocks: usize,
     /// Last reload check time
@@ -46,14 +44,12 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         schema: Arc<Schema>,
         segment_manager: Arc<crate::merge::SegmentManager<D>>,
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-        trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
         Self::from_segment_manager_with_reload_interval(
             schema,
             segment_manager,
             trained_centroids,
-            trained_codebooks,
             term_cache_blocks,
             1000, // default 1 second
         )
@@ -65,7 +61,6 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         schema: Arc<Schema>,
         segment_manager: Arc<crate::merge::SegmentManager<D>>,
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-        trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
         reload_interval_ms: u64,
     ) -> Result<Self> {
@@ -76,7 +71,6 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             &schema,
             &segment_manager,
             &trained_centroids,
-            &trained_codebooks,
             term_cache_blocks,
         )
         .await?;
@@ -86,7 +80,6 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             segment_manager,
             searcher: RwLock::new(Arc::new(reader)),
             trained_centroids,
-            trained_codebooks,
             term_cache_blocks,
             last_reload_check: RwLock::new(std::time::Instant::now()),
             reload_check_interval: std::time::Duration::from_millis(reload_interval_ms),
@@ -100,7 +93,6 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         schema: &Arc<Schema>,
         segment_manager: &Arc<crate::merge::SegmentManager<D>>,
         trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
-        trained_codebooks: &FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Searcher<D>> {
         // Use SegmentManager's acquire_snapshot - non-blocking RwLock read
@@ -111,7 +103,6 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             Arc::clone(schema),
             snapshot,
             trained_centroids.clone(),
-            trained_codebooks.clone(),
             term_cache_blocks,
         )
         .await
@@ -170,7 +161,6 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             &self.schema,
             &self.segment_manager,
             &self.trained_centroids,
-            &self.trained_codebooks,
             self.term_cache_blocks,
         )
         .await?;

@@ -14,7 +14,7 @@ use crate::query::LazyGlobalStats;
 use crate::segment::{SegmentId, SegmentReader};
 #[cfg(feature = "native")]
 use crate::segment::{SegmentSnapshot, SegmentTracker};
-use crate::structures::{CoarseCentroids, PQCodebook};
+use crate::structures::CoarseCentroids;
 
 /// Searcher - provides search over loaded segments
 ///
@@ -35,10 +35,8 @@ pub struct Searcher<D: Directory + 'static> {
     default_fields: Vec<crate::Field>,
     /// Tokenizers
     tokenizers: Arc<crate::tokenizer::TokenizerRegistry>,
-    /// Trained centroids per field
+    /// Trained centroids per field (injected into segment readers for IVF/ScaNN search)
     trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-    /// Trained codebooks per field
-    trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
     /// Lazy global statistics for cross-segment IDF computation
     global_stats: Arc<LazyGlobalStats>,
 }
@@ -59,7 +57,6 @@ impl<D: Directory + 'static> Searcher<D> {
             schema,
             segment_ids,
             FxHashMap::default(),
-            FxHashMap::default(),
             term_cache_blocks,
         )
         .await
@@ -72,7 +69,6 @@ impl<D: Directory + 'static> Searcher<D> {
         schema: Arc<Schema>,
         snapshot: SegmentSnapshot<D>,
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-        trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
         let (segments, default_fields, global_stats) = Self::load_common(
@@ -91,7 +87,6 @@ impl<D: Directory + 'static> Searcher<D> {
             default_fields,
             tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
             trained_centroids,
-            trained_codebooks,
             global_stats,
         })
     }
@@ -102,7 +97,6 @@ impl<D: Directory + 'static> Searcher<D> {
         schema: Arc<Schema>,
         segment_ids: &[String],
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-        trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
         let (segments, default_fields, global_stats) = Self::load_common(
@@ -125,7 +119,6 @@ impl<D: Directory + 'static> Searcher<D> {
                 default_fields,
                 tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
                 trained_centroids,
-                trained_codebooks,
                 global_stats,
             })
         }
@@ -140,7 +133,6 @@ impl<D: Directory + 'static> Searcher<D> {
                 default_fields,
                 tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
                 trained_centroids,
-                trained_codebooks,
                 global_stats,
             })
         }
@@ -224,9 +216,9 @@ impl<D: Directory + 'static> Searcher<D> {
         for (_, mut reader) in loaded {
             reader.set_doc_id_offset(doc_id_offset);
             doc_id_offset += reader.meta().num_docs;
-            // Inject index-level centroids into reader for IVF/ScaNN search
-            if let Some(centroids) = trained_centroids.values().next() {
-                reader.set_coarse_centroids(Arc::clone(centroids));
+            // Inject per-field centroids into reader for IVF/ScaNN search
+            if !trained_centroids.is_empty() {
+                reader.set_coarse_centroids(trained_centroids.clone());
             }
             segments.push(Arc::new(reader));
         }
@@ -286,11 +278,6 @@ impl<D: Directory + 'static> Searcher<D> {
     /// Get trained centroids
     pub fn trained_centroids(&self) -> &FxHashMap<u32, Arc<CoarseCentroids>> {
         &self.trained_centroids
-    }
-
-    /// Get trained codebooks
-    pub fn trained_codebooks(&self) -> &FxHashMap<u32, Arc<PQCodebook>> {
-        &self.trained_codebooks
     }
 
     /// Get lazy global statistics for cross-segment IDF computation

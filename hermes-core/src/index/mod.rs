@@ -152,8 +152,15 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         let schema = Arc::new(metadata.schema.clone());
 
         // Load trained structures
-        let (trained_centroids, trained_codebooks) =
-            metadata.load_trained_structures(directory.as_ref()).await;
+        let trained = metadata.load_trained_structures(directory.as_ref()).await;
+        let trained_centroids = trained
+            .as_ref()
+            .map(|t| t.centroids.clone())
+            .unwrap_or_default();
+        let trained_codebooks = trained
+            .as_ref()
+            .map(|t| t.codebooks.clone())
+            .unwrap_or_default();
 
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
             Arc::clone(&directory),
@@ -200,7 +207,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
                     Arc::clone(&self.schema),
                     Arc::clone(&self.segment_manager),
                     self.trained_centroids.clone(),
-                    self.trained_codebooks.clone(),
                     self.config.term_cache_blocks,
                     self.config.reload_interval_ms,
                 )

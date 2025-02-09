@@ -126,19 +126,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Publish trained structures to shared worker state so new segment builds
     /// include ANN indexes inline. Called after training completes.
     pub(super) async fn publish_trained_structures(&self) {
-        let (trained_centroids, trained_codebooks) = {
+        let trained = {
             let metadata_arc = self.segment_manager.metadata();
             let meta = metadata_arc.read().await;
             meta.load_trained_structures(self.directory.as_ref()).await
         };
-        if trained_centroids.is_empty() {
-            return;
-        }
-        let trained = crate::segment::TrainedVectorStructures {
-            centroids: trained_centroids,
-            codebooks: trained_codebooks,
-        };
-        if let Ok(mut guard) = self.trained_structures.write() {
+        if let Some(trained) = trained
+            && let Ok(mut guard) = self.trained_structures.write()
+        {
             log::info!(
                 "[writer] published trained structures to workers ({} fields)",
                 trained.centroids.len()

@@ -14,9 +14,7 @@ use crate::DocId;
 use crate::directories::DirectoryWriter;
 use crate::dsl::{Document, Field, Schema};
 use crate::error::{Error, Result};
-use crate::segment::{
-    SegmentBuilder, SegmentBuilderConfig, SegmentId, SegmentMerger, SegmentReader,
-};
+use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
 use crate::tokenizer::BoxedTokenizer;
 
 use super::IndexConfig;
@@ -291,8 +289,17 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let max_concurrent_builds = num_workers.div_ceil(2).max(1);
         let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
 
-        // Create shared worker state
-        let trained_structures = Arc::new(std::sync::RwLock::new(None));
+        // Seed trained structures from Index (which already loaded them)
+        let initial_trained = if !index.trained_centroids.is_empty() {
+            Some(crate::segment::TrainedVectorStructures {
+                centroids: index.trained_centroids.clone(),
+                codebooks: index.trained_codebooks.clone(),
+            })
+        } else {
+            None
+        };
+        let trained_structures = Arc::new(std::sync::RwLock::new(initial_trained));
+
         let worker_state = Arc::new(WorkerState {
             directory: Arc::clone(&directory),
             schema: Arc::clone(&schema),
@@ -709,76 +716,28 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     // Vector index building methods are in vector_builder.rs
 
-    /// Merge all segments into one (called explicitly via force_merge)
+    /// Merge all segments into one (called explicitly via force_merge).
+    /// Delegates to SegmentManager::do_merge to avoid duplication.
     async fn do_merge(&self) -> Result<()> {
-        let segment_ids = self.segment_manager.get_segment_ids().await;
+        let ids_to_merge = self.segment_manager.get_segment_ids().await;
 
-        if segment_ids.len() < 2 {
+        if ids_to_merge.len() < 2 {
             return Ok(());
         }
 
-        let ids_to_merge: Vec<String> = segment_ids;
-
-        // Load segment readers
-        let mut readers = Vec::new();
-        let mut doc_offset = 0u32;
-
-        for id_str in &ids_to_merge {
-            let segment_id = SegmentId::from_hex(id_str)
-                .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = SegmentReader::open(
-                self.directory.as_ref(),
-                segment_id,
-                Arc::clone(&self.schema),
-                doc_offset,
-                self.config.term_cache_blocks,
-            )
-            .await?;
-            doc_offset += reader.meta().num_docs;
-            readers.push(reader);
-        }
-
-        // Calculate total doc count for the merged segment
-        let total_docs: u32 = readers.iter().map(|r| r.meta().num_docs).sum();
-
-        // Load trained structures to preserve ANN indexes during merge
-        let (trained_centroids, trained_codebooks) = {
-            let metadata_arc = self.segment_manager.metadata();
-            let meta = metadata_arc.read().await;
-            meta.load_trained_structures(self.directory.as_ref()).await
-        };
-
-        let merger = SegmentMerger::new(Arc::clone(&self.schema));
-        let new_segment_id = SegmentId::new();
-
-        if !trained_centroids.is_empty() {
-            log::info!(
-                "[force_merge] using merge_with_ann ({} trained fields) for {} segments -> {}",
-                trained_centroids.len(),
-                ids_to_merge.len(),
-                new_segment_id.to_hex()
-            );
-            let trained = crate::segment::TrainedVectorStructures {
-                centroids: trained_centroids,
-                codebooks: trained_codebooks,
-            };
-            merger
-                .merge_with_ann(self.directory.as_ref(), &readers, new_segment_id, &trained)
-                .await?;
-        } else {
-            log::debug!(
-                "[force_merge] no trained structures, using flat merge for {} segments -> {}",
-                ids_to_merge.len(),
-                new_segment_id.to_hex()
-            );
-            merger
-                .merge(self.directory.as_ref(), &readers, new_segment_id)
-                .await?;
-        }
+        let metadata_arc = self.segment_manager.metadata();
+        let (new_segment_id, total_docs) = crate::merge::SegmentManager::do_merge(
+            self.directory.as_ref(),
+            &self.schema,
+            &ids_to_merge,
+            self.config.term_cache_blocks,
+            &metadata_arc,
+        )
+        .await?;
 
         // Atomically update segments and delete old ones via SegmentManager
         self.segment_manager
-            .replace_segments(vec![(new_segment_id.to_hex(), total_docs)], ids_to_merge)
+            .replace_segments(vec![(new_segment_id, total_docs)], ids_to_merge)
             .await?;
 
         Ok(())

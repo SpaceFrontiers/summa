@@ -1,4 +1,6 @@
 #[cfg(feature = "native")]
+pub(crate) mod ann_build;
+#[cfg(feature = "native")]
 mod builder;
 #[cfg(feature = "native")]
 mod merger;

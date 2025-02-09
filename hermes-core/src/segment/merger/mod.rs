@@ -149,38 +149,15 @@ impl SegmentMerger {
     }
 
     /// Merge segments into one, streaming postings/positions/store directly to files.
-    pub async fn merge<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segments: &[SegmentReader],
-        new_segment_id: SegmentId,
-    ) -> Result<(SegmentMeta, MergeStats)> {
-        self.merge_core(dir, segments, new_segment_id, None).await
-    }
-
-    /// Merge segments with trained ANN structures available.
     ///
-    /// Dense vectors use O(1) cluster merge when possible (homogeneous IVF/ScaNN),
-    /// otherwise extracts raw vectors from all index types and rebuilds with
-    /// the provided trained structures.
-    pub async fn merge_with_ann<D: Directory + DirectoryWriter>(
-        &self,
-        dir: &D,
-        segments: &[SegmentReader],
-        new_segment_id: SegmentId,
-        trained: &TrainedVectorStructures,
-    ) -> Result<(SegmentMeta, MergeStats)> {
-        self.merge_core(dir, segments, new_segment_id, Some(trained))
-            .await
-    }
-
-    /// Core merge: handles all mandatory parts (postings, positions, store, sparse, field stats, meta)
-    /// and delegates dense vector handling based on available trained structures.
+    /// If `trained` is provided, dense vectors use O(1) cluster merge when possible
+    /// (homogeneous IVF/ScaNN), otherwise rebuilds ANN from trained structures.
+    /// Without trained structures, only flat vectors are merged.
     ///
     /// Uses streaming writers so postings, positions, and store data flow directly
     /// to files instead of buffering everything in memory. Only the term dictionary
     /// (compact key+TermInfo entries) is buffered.
-    async fn merge_core<D: Directory + DirectoryWriter>(
+    pub async fn merge<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],

@@ -801,7 +801,6 @@ impl SegmentBuilder {
 
         /// Magic number for vectors file footer ("VEC2" in LE)
         const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
-        const FLAT_BINARY_INDEX_TYPE: u8 = 4;
 
         // Data-first format: stream field data, then write TOC + footer at end.
         // Data starts at file offset 0 → mmap page-aligned, no alignment copies.
@@ -824,48 +823,18 @@ impl SegmentBuilder {
                     .and_then(|e| e.dense_vector_config.as_ref());
 
                 if let Some(config) = config {
-                    match config.index_type {
+                    let dim = builder.dim;
+                    let blob = match config.index_type {
                         VectorIndexType::IvfRaBitQ if trained.centroids.contains_key(field_id) => {
                             let centroids = &trained.centroids[field_id];
-                            let rabitq_config = crate::structures::RaBitQConfig::new(builder.dim);
-                            let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
-                            let ivf_config = crate::structures::IVFRaBitQConfig::new(builder.dim);
-                            let mut ivf_index = crate::structures::IVFRaBitQIndex::new(
-                                ivf_config,
-                                centroids.version,
-                                codebook.version,
-                            );
-
-                            // Add all vectors from the in-memory builder
+                            let (mut index, codebook) =
+                                super::ann_build::new_ivf_rabitq(dim, centroids);
                             for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
-                                let vec_start = i * builder.dim;
-                                let vec_end = vec_start + builder.dim;
-                                let vec = &builder.vectors[vec_start..vec_end];
-                                ivf_index.add_vector(centroids, &codebook, *doc_id, *ordinal, vec);
+                                let v = &builder.vectors[i * dim..(i + 1) * dim];
+                                index.add_vector(centroids, &codebook, *doc_id, *ordinal, v);
                             }
-
-                            let index_data = super::vector_data::IVFRaBitQIndexData {
-                                codebook,
-                                index: ivf_index,
-                            };
-                            match index_data.to_bytes() {
-                                Ok(bytes) => {
-                                    log::info!(
-                                        "[segment_build] built IVF-RaBitQ for field {} ({} vectors, {} bytes)",
-                                        field_id,
-                                        builder.doc_ids.len(),
-                                        bytes.len()
-                                    );
-                                    ann_blobs.push((*field_id, 1, bytes));
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[segment_build] IVF-RaBitQ serialize failed for field {}: {}",
-                                        field_id,
-                                        e
-                                    );
-                                }
-                            }
+                            super::ann_build::serialize_ivf_rabitq(index, codebook)
+                                .map(|b| (super::ann_build::IVF_RABITQ_TYPE, b))
                         }
                         VectorIndexType::ScaNN
                             if trained.centroids.contains_key(field_id)
@@ -873,45 +842,34 @@ impl SegmentBuilder {
                         {
                             let centroids = &trained.centroids[field_id];
                             let codebook = &trained.codebooks[field_id];
-                            let ivf_pq_config = crate::structures::IVFPQConfig::new(builder.dim);
-                            let mut ivf_pq_index = crate::structures::IVFPQIndex::new(
-                                ivf_pq_config,
-                                centroids.version,
-                                codebook.version,
-                            );
-
+                            let mut index = super::ann_build::new_scann(dim, centroids, codebook);
                             for (i, (doc_id, ordinal)) in builder.doc_ids.iter().enumerate() {
-                                let vec_start = i * builder.dim;
-                                let vec_end = vec_start + builder.dim;
-                                let vec = &builder.vectors[vec_start..vec_end];
-                                ivf_pq_index
-                                    .add_vector(centroids, codebook, *doc_id, *ordinal, vec);
+                                let v = &builder.vectors[i * dim..(i + 1) * dim];
+                                index.add_vector(centroids, codebook, *doc_id, *ordinal, v);
                             }
-
-                            let index_data = super::vector_data::ScaNNIndexData {
-                                codebook: (**codebook).clone(),
-                                index: ivf_pq_index,
-                            };
-                            match index_data.to_bytes() {
-                                Ok(bytes) => {
-                                    log::info!(
-                                        "[segment_build] built ScaNN for field {} ({} vectors, {} bytes)",
-                                        field_id,
-                                        builder.doc_ids.len(),
-                                        bytes.len()
-                                    );
-                                    ann_blobs.push((*field_id, 2, bytes));
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[segment_build] ScaNN serialize failed for field {}: {}",
-                                        field_id,
-                                        e
-                                    );
-                                }
-                            }
+                            super::ann_build::serialize_scann(index, codebook)
+                                .map(|b| (super::ann_build::SCANN_TYPE, b))
                         }
-                        _ => {}
+                        _ => continue,
+                    };
+                    match blob {
+                        Ok((index_type, bytes)) => {
+                            log::info!(
+                                "[segment_build] built ANN(type={}) for field {} ({} vectors, {} bytes)",
+                                index_type,
+                                field_id,
+                                builder.doc_ids.len(),
+                                bytes.len()
+                            );
+                            ann_blobs.push((*field_id, index_type, bytes));
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[segment_build] ANN serialize failed for field {}: {}",
+                                field_id,
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -931,7 +889,7 @@ impl SegmentBuilder {
             current_offset += field_sizes[i] as u64;
             toc.push(TocEntry {
                 field_id: _field_id,
-                index_type: FLAT_BINARY_INDEX_TYPE,
+                index_type: super::ann_build::FLAT_TYPE,
                 offset: data_offset,
                 size: field_sizes[i] as u64,
             });

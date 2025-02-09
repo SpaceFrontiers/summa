@@ -119,9 +119,10 @@ pub async fn load_vectors_file<D: Directory>(
     }
 
     // Load each entry — a field can have both Flat (lazy) and ANN (in-memory)
+    use crate::segment::ann_build;
     for (field_id, index_type, offset, length) in entries {
         match index_type {
-            4 => {
+            ann_build::FLAT_TYPE => {
                 // Flat binary — load lazily (only doc_ids in memory, vectors via mmap)
                 let slice = LazyFileSlice::from_handle_range(&handle, offset, length);
                 match LazyFlatVectorData::open(slice).await {
@@ -137,7 +138,7 @@ pub async fn load_vectors_file<D: Directory>(
                     }
                 }
             }
-            2 => {
+            ann_build::SCANN_TYPE => {
                 // ScaNN (IVF-PQ) — lazy: raw bytes stored, deserialized on first search
                 let data = handle.read_bytes_range(offset..offset + length).await?;
                 indexes.insert(
@@ -147,7 +148,7 @@ pub async fn load_vectors_file<D: Directory>(
                     ))),
                 );
             }
-            1 => {
+            ann_build::IVF_RABITQ_TYPE => {
                 // IVF-RaBitQ — lazy: raw bytes stored, deserialized on first search
                 let data = handle.read_bytes_range(offset..offset + length).await?;
                 indexes.insert(
@@ -157,7 +158,7 @@ pub async fn load_vectors_file<D: Directory>(
                     ))),
                 );
             }
-            0 => {
+            ann_build::RABITQ_TYPE => {
                 // RaBitQ (standalone)
                 let data = handle.read_bytes_range(offset..offset + length).await?;
                 if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data.as_slice()) {

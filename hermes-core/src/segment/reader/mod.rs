@@ -73,8 +73,8 @@ pub struct AsyncSegmentReader {
     vector_indexes: FxHashMap<u32, VectorIndex>,
     /// Lazy flat vectors per field — for reranking and merge (doc_ids in memory, vectors via mmap)
     flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
-    /// Shared coarse centroids for IVF search (loaded once)
-    coarse_centroids: Option<Arc<CoarseCentroids>>,
+    /// Per-field coarse centroids for IVF/ScaNN search
+    coarse_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
     /// Sparse vector indexes per field
     sparse_indexes: FxHashMap<u32, SparseIndex>,
     /// Position file handle for phrase queries (lazy loading)
@@ -142,7 +142,7 @@ impl AsyncSegmentReader {
             doc_id_offset,
             vector_indexes,
             flat_vectors,
-            coarse_centroids: None,
+            coarse_centroids: FxHashMap::default(),
             sparse_indexes,
             positions_handle,
         })
@@ -503,8 +503,11 @@ impl AsyncSegmentReader {
                     let (index, codebook) = lazy.get().ok_or_else(|| {
                         Error::Schema("IVF index deserialization failed".to_string())
                     })?;
-                    let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
-                        Error::Schema("IVF index requires coarse centroids".to_string())
+                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
+                        Error::Schema(format!(
+                            "IVF index requires coarse centroids for field {}",
+                            field.0
+                        ))
                     })?;
                     let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
                     let fetch_k = k * rerank_factor.max(1);
@@ -518,8 +521,11 @@ impl AsyncSegmentReader {
                     let (index, codebook) = lazy.get().ok_or_else(|| {
                         Error::Schema("ScaNN index deserialization failed".to_string())
                     })?;
-                    let centroids = self.coarse_centroids.as_ref().ok_or_else(|| {
-                        Error::Schema("ScaNN index requires coarse centroids".to_string())
+                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
+                        Error::Schema(format!(
+                            "ScaNN index requires coarse centroids for field {}",
+                            field.0
+                        ))
                     })?;
                     let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
                     let fetch_k = k * rerank_factor.max(1);
@@ -669,14 +675,14 @@ impl AsyncSegmentReader {
         }
     }
 
-    /// Get coarse centroids (shared across IVF/ScaNN indexes)
-    pub fn coarse_centroids(&self) -> Option<&Arc<CoarseCentroids>> {
-        self.coarse_centroids.as_ref()
+    /// Get coarse centroids for a field
+    pub fn coarse_centroids(&self, field_id: u32) -> Option<&Arc<CoarseCentroids>> {
+        self.coarse_centroids.get(&field_id)
     }
 
-    /// Set coarse centroids from index-level trained structures
-    pub fn set_coarse_centroids(&mut self, centroids: Arc<CoarseCentroids>) {
-        self.coarse_centroids = Some(centroids);
+    /// Set per-field coarse centroids from index-level trained structures
+    pub fn set_coarse_centroids(&mut self, centroids: FxHashMap<u32, Arc<CoarseCentroids>>) {
+        self.coarse_centroids = centroids;
     }
 
     /// Get the ScaNN vector index for a field (if available)

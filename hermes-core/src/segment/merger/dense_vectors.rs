@@ -201,7 +201,7 @@ impl SegmentMerger {
                             .map_err(|e| crate::Error::Serialization(e.to_string()))?;
                         blob_fields.push(BlobField {
                             field_id: field.0,
-                            index_type: 2,
+                            index_type: crate::segment::ann_build::SCANN_TYPE,
                             data: bytes,
                         });
                         continue; // ANN done, flat already queued
@@ -241,7 +241,7 @@ impl SegmentMerger {
                             .map_err(|e| crate::Error::Serialization(e.to_string()))?;
                         blob_fields.push(BlobField {
                             field_id: field.0,
-                            index_type: 1,
+                            index_type: crate::segment::ann_build::IVF_RABITQ_TYPE,
                             data: bytes,
                         });
                         continue; // ANN done, flat already queued
@@ -291,86 +291,57 @@ impl SegmentMerger {
                 let trained = trained.unwrap();
                 let mut total_fed = 0usize;
 
-                match ann {
+                let (index_type, bytes) = match ann {
                     VectorIndexType::Flat | VectorIndexType::RaBitQ => unreachable!(),
                     VectorIndexType::IvfRaBitQ => {
                         let centroids = &trained.centroids[&field.0];
-                        let rabitq_config = crate::structures::RaBitQConfig::new(dim);
-                        let codebook = crate::structures::RaBitQCodebook::new(rabitq_config);
-                        let ivf_config = crate::structures::IVFRaBitQConfig::new(dim);
-                        let mut ivf_index = crate::structures::IVFRaBitQIndex::new(
-                            ivf_config,
-                            centroids.version,
-                            codebook.version,
-                        );
+                        let (mut index, codebook) =
+                            crate::segment::ann_build::new_ivf_rabitq(dim, centroids);
 
                         for (seg_idx, segment) in segments.iter().enumerate() {
                             let offset = doc_offs[seg_idx];
                             total_fed +=
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
-                                    ivf_index
-                                        .add_vector(centroids, &codebook, doc_id, ordinal, vec);
+                                    index.add_vector(centroids, &codebook, doc_id, ordinal, vec);
                                 })
                                 .await;
                         }
 
-                        let index_data = crate::segment::IVFRaBitQIndexData {
-                            codebook,
-                            index: ivf_index,
-                        };
-                        let bytes = index_data
-                            .to_bytes()
-                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        blob_fields.push(BlobField {
-                            field_id: field.0,
-                            index_type: 1,
-                            data: bytes,
-                        });
-                        log::info!(
-                            "Rebuilt IVF-RaBitQ for field {} ({} vectors)",
-                            field.0,
-                            total_fed
-                        );
+                        let bytes =
+                            crate::segment::ann_build::serialize_ivf_rabitq(index, codebook)?;
+                        (crate::segment::ann_build::IVF_RABITQ_TYPE, bytes)
                     }
                     VectorIndexType::ScaNN => {
                         let centroids = &trained.centroids[&field.0];
                         let codebook = &trained.codebooks[&field.0];
-                        let ivf_pq_config = crate::structures::IVFPQConfig::new(dim);
-                        let mut ivf_pq_index = crate::structures::IVFPQIndex::new(
-                            ivf_pq_config,
-                            centroids.version,
-                            codebook.version,
-                        );
+                        let mut index =
+                            crate::segment::ann_build::new_scann(dim, centroids, codebook);
 
                         for (seg_idx, segment) in segments.iter().enumerate() {
                             let offset = doc_offs[seg_idx];
                             total_fed +=
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
-                                    ivf_pq_index
-                                        .add_vector(centroids, codebook, doc_id, ordinal, vec);
+                                    index.add_vector(centroids, codebook, doc_id, ordinal, vec);
                                 })
                                 .await;
                         }
 
-                        let index_data = crate::segment::ScaNNIndexData {
-                            codebook: (**codebook).clone(),
-                            index: ivf_pq_index,
-                        };
-                        let bytes = index_data
-                            .to_bytes()
-                            .map_err(|e| crate::Error::Serialization(e.to_string()))?;
-                        blob_fields.push(BlobField {
-                            field_id: field.0,
-                            index_type: 2,
-                            data: bytes,
-                        });
-                        log::info!(
-                            "Rebuilt ScaNN for field {} ({} vectors)",
-                            field.0,
-                            total_fed
-                        );
+                        let bytes = crate::segment::ann_build::serialize_scann(index, codebook)?;
+                        (crate::segment::ann_build::SCANN_TYPE, bytes)
                     }
-                }
+                };
+
+                blob_fields.push(BlobField {
+                    field_id: field.0,
+                    index_type,
+                    data: bytes,
+                });
+                log::info!(
+                    "Rebuilt ANN(type={}) for field {} ({} vectors)",
+                    index_type,
+                    field.0,
+                    total_fed
+                );
             }
         }
 
@@ -406,7 +377,7 @@ impl SegmentMerger {
         for (i, flat) in flat_fields.iter().enumerate() {
             pending.push(PendingEntry {
                 field_id: flat.field_id,
-                index_type: 4,
+                index_type: crate::segment::ann_build::FLAT_TYPE,
                 blob_idx: None,
                 flat_idx: Some(i),
             });

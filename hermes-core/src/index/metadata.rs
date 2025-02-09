@@ -216,16 +216,14 @@ impl IndexMetadata {
         Ok(())
     }
 
-    /// Load trained centroids and codebooks from index-level files
+    /// Load trained structures from index-level files for fields in Built state.
     ///
-    /// Returns (centroids_map, codebooks_map) for fields that are Built
+    /// Returns `Some(TrainedVectorStructures)` if at least one field has trained
+    /// centroids, `None` otherwise.
     pub async fn load_trained_structures<D: crate::directories::Directory>(
         &self,
         dir: &D,
-    ) -> (
-        rustc_hash::FxHashMap<u32, std::sync::Arc<crate::structures::CoarseCentroids>>,
-        rustc_hash::FxHashMap<u32, std::sync::Arc<crate::structures::PQCodebook>>,
-    ) {
+    ) -> Option<crate::segment::TrainedVectorStructures> {
         use std::sync::Arc;
 
         let mut centroids = rustc_hash::FxHashMap::default();
@@ -233,179 +231,44 @@ impl IndexMetadata {
 
         for (field_id, field_meta) in &self.vector_fields {
             if !matches!(field_meta.state, VectorIndexState::Built { .. }) {
-                log::debug!("[trained] field {} not in Built state, skipping", field_id);
                 continue;
             }
 
             // Load centroids
-            match &field_meta.centroids_file {
-                None => {
-                    log::warn!(
-                        "[trained] field {} is Built but centroids_file is None",
-                        field_id
-                    );
-                }
-                Some(file) => match dir.open_read(Path::new(file)).await {
-                    Err(e) => {
-                        log::warn!(
-                            "[trained] field {} centroids file '{}' open failed: {}",
-                            field_id,
-                            file,
-                            e
-                        );
-                    }
-                    Ok(slice) => match slice.read_bytes().await {
-                        Err(e) => {
-                            log::warn!(
-                                "[trained] field {} centroids file '{}' read failed: {}",
-                                field_id,
-                                file,
-                                e
-                            );
-                        }
-                        Ok(bytes) => {
-                            match serde_json::from_slice::<crate::structures::CoarseCentroids>(
-                                bytes.as_slice(),
-                            ) {
-                                Ok(c) => {
-                                    log::debug!(
-                                        "[trained] field {} loaded centroids ({} clusters)",
-                                        field_id,
-                                        c.num_clusters
-                                    );
-                                    centroids.insert(*field_id, Arc::new(c));
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[trained] field {} centroids deserialize failed: {}",
-                                        field_id,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    },
-                },
+            if let Some(file) = &field_meta.centroids_file
+                && let Ok(slice) = dir.open_read(Path::new(file)).await
+                && let Ok(bytes) = slice.read_bytes().await
+                && let Ok(c) =
+                    serde_json::from_slice::<crate::structures::CoarseCentroids>(bytes.as_slice())
+            {
+                log::debug!(
+                    "[trained] field {} loaded centroids ({} clusters)",
+                    field_id,
+                    c.num_clusters
+                );
+                centroids.insert(*field_id, Arc::new(c));
             }
 
             // Load codebook (for ScaNN)
-            match &field_meta.codebook_file {
-                None => {} // Not all index types have codebooks
-                Some(file) => match dir.open_read(Path::new(file)).await {
-                    Err(e) => {
-                        log::warn!(
-                            "[trained] field {} codebook file '{}' open failed: {}",
-                            field_id,
-                            file,
-                            e
-                        );
-                    }
-                    Ok(slice) => match slice.read_bytes().await {
-                        Err(e) => {
-                            log::warn!(
-                                "[trained] field {} codebook file '{}' read failed: {}",
-                                field_id,
-                                file,
-                                e
-                            );
-                        }
-                        Ok(bytes) => {
-                            match serde_json::from_slice::<crate::structures::PQCodebook>(
-                                bytes.as_slice(),
-                            ) {
-                                Ok(c) => {
-                                    log::debug!("[trained] field {} loaded codebook", field_id);
-                                    codebooks.insert(*field_id, Arc::new(c));
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[trained] field {} codebook deserialize failed: {}",
-                                        field_id,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    },
-                },
+            if let Some(file) = &field_meta.codebook_file
+                && let Ok(slice) = dir.open_read(Path::new(file)).await
+                && let Ok(bytes) = slice.read_bytes().await
+                && let Ok(c) =
+                    serde_json::from_slice::<crate::structures::PQCodebook>(bytes.as_slice())
+            {
+                log::debug!("[trained] field {} loaded codebook", field_id);
+                codebooks.insert(*field_id, Arc::new(c));
             }
         }
 
-        // Fallback: if vector_fields didn't yield centroids, scan schema for
-        // dense vector fields and probe well-known file paths on disk.
-        // This handles cases where vector_fields is empty (e.g. old metadata
-        // format) but centroids files exist from a previous ANN build.
         if centroids.is_empty() {
-            for (field, entry) in self.schema.fields() {
-                let config = match &entry.dense_vector_config {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let field_id = field.0;
-
-                // Skip if not an ANN type
-                if !matches!(
-                    config.index_type,
-                    VectorIndexType::IvfRaBitQ | VectorIndexType::ScaNN
-                ) {
-                    continue;
-                }
-
-                let centroids_file = format!("field_{}_centroids.bin", field_id);
-                if let Ok(slice) = dir.open_read(Path::new(&centroids_file)).await
-                    && let Ok(bytes) = slice.read_bytes().await
-                {
-                    match serde_json::from_slice::<crate::structures::CoarseCentroids>(
-                        bytes.as_slice(),
-                    ) {
-                        Ok(c) => {
-                            log::info!(
-                                "[trained] field {} loaded centroids from disk fallback ({} clusters)",
-                                field_id,
-                                c.num_clusters
-                            );
-                            centroids.insert(field_id, Arc::new(c));
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[trained] field {} centroids fallback deserialize failed: {}",
-                                field_id,
-                                e
-                            );
-                        }
-                    }
-                }
-
-                // Try codebook (for ScaNN)
-                if matches!(config.index_type, VectorIndexType::ScaNN) {
-                    let codebook_file = format!("field_{}_codebook.bin", field_id);
-                    if let Ok(slice) = dir.open_read(Path::new(&codebook_file)).await
-                        && let Ok(bytes) = slice.read_bytes().await
-                    {
-                        match serde_json::from_slice::<crate::structures::PQCodebook>(
-                            bytes.as_slice(),
-                        ) {
-                            Ok(c) => {
-                                log::info!(
-                                    "[trained] field {} loaded codebook from disk fallback",
-                                    field_id
-                                );
-                                codebooks.insert(field_id, Arc::new(c));
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "[trained] field {} codebook fallback deserialize failed: {}",
-                                    field_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            None
+        } else {
+            Some(crate::segment::TrainedVectorStructures {
+                centroids,
+                codebooks,
+            })
         }
-
-        (centroids, codebooks)
     }
 }
 
