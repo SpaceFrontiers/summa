@@ -488,6 +488,7 @@ impl AsyncSegmentReader {
         const BRUTE_FORCE_BATCH: usize = 4096;
 
         // Results are (doc_id, ordinal, score) where score = similarity (higher = better)
+        let t0 = std::time::Instant::now();
         let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
             // ANN search (RaBitQ, IVF, ScaNN)
             match index {
@@ -539,6 +540,13 @@ impl AsyncSegmentReader {
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force from lazy flat vectors (native-precision SIMD scoring)
             // Uses a top-k heap to avoid collecting and sorting all N candidates.
+            log::debug!(
+                "[search_dense] field {}: brute-force on {} vectors (dim={}, quant={:?})",
+                field.0,
+                lazy_flat.num_vectors,
+                lazy_flat.dim,
+                lazy_flat.quantization
+            );
             let dim = lazy_flat.dim;
             let n = lazy_flat.num_vectors;
             let quant = lazy_flat.quantization;
@@ -570,6 +578,13 @@ impl AsyncSegmentReader {
         } else {
             return Ok(Vec::new());
         };
+        let l1_elapsed = t0.elapsed();
+        log::debug!(
+            "[search_dense] field {}: L1 returned {} candidates in {:.1}ms",
+            field.0,
+            results.len(),
+            l1_elapsed.as_secs_f64() * 1000.0
+        );
 
         // Rerank ANN candidates using raw vectors from lazy flat (binary search lookup)
         // Uses native-precision SIMD scoring on quantized bytes — no dequantization overhead.
@@ -577,6 +592,7 @@ impl AsyncSegmentReader {
             && !results.is_empty()
             && let Some(lazy_flat) = lazy_flat
         {
+            let t_rerank = std::time::Instant::now();
             let dim = lazy_flat.dim;
             let quant = lazy_flat.quantization;
             let vbs = lazy_flat.vector_byte_size();
@@ -593,11 +609,13 @@ impl AsyncSegmentReader {
                 }
             }
 
+            let t_resolve = t_rerank.elapsed();
             if !resolved.is_empty() {
                 // Sort by flat_idx for sequential mmap access (better page locality)
                 resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
 
                 // Batch-read raw quantized bytes into contiguous buffer
+                let t_read = std::time::Instant::now();
                 let mut raw_buf = vec![0u8; resolved.len() * vbs];
                 for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
                     let _ = lazy_flat
@@ -608,18 +626,39 @@ impl AsyncSegmentReader {
                         .await;
                 }
 
+                let read_elapsed = t_read.elapsed();
+
                 // Native-precision batch SIMD cosine scoring
+                let t_score = std::time::Instant::now();
                 let mut scores = vec![0f32; resolved.len()];
                 Self::score_quantized_batch(query, &raw_buf, quant, dim, &mut scores);
+                let score_elapsed = t_score.elapsed();
 
                 // Write scores back to results
                 for (buf_idx, &(ri, _)) in resolved.iter().enumerate() {
                     results[ri].2 = scores[buf_idx];
                 }
+
+                log::debug!(
+                    "[search_dense] field {}: rerank {} vectors (dim={}, quant={:?}, {}B/vec): resolve={:.1}ms read={:.1}ms score={:.1}ms",
+                    field.0,
+                    resolved.len(),
+                    dim,
+                    quant,
+                    vbs,
+                    t_resolve.as_secs_f64() * 1000.0,
+                    read_elapsed.as_secs_f64() * 1000.0,
+                    score_elapsed.as_secs_f64() * 1000.0,
+                );
             }
 
             results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             results.truncate(k * rerank_factor.max(1));
+            log::debug!(
+                "[search_dense] field {}: rerank total={:.1}ms",
+                field.0,
+                t_rerank.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         // Track ordinals with individual scores for each doc_id

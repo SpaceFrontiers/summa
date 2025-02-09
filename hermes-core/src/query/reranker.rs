@@ -74,10 +74,14 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         return Ok(Vec::new());
     }
 
+    let t0 = std::time::Instant::now();
+
     // Load all candidate documents in parallel
     let doc_futures: Vec<_> = candidates.iter().map(|c| searcher.doc(c.doc_id)).collect();
     let docs = futures::future::join_all(doc_futures).await;
+    let load_elapsed = t0.elapsed();
 
+    let t_score = std::time::Instant::now();
     let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
     let mut skipped = 0u32;
 
@@ -101,13 +105,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
             }
         }
     }
-
-    if skipped > 0 {
-        log::debug!(
-            "[reranker] skipped {skipped}/{} candidates (missing/incompatible vector field)",
-            candidates.len()
-        );
-    }
+    let score_elapsed = t_score.elapsed();
 
     scored.sort_by(|a, b| {
         b.score
@@ -115,6 +113,17 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(final_limit);
+
+    log::debug!(
+        "[reranker] field {}: {} candidates -> {} results (skipped {}): load_docs={:.1}ms score={:.1}ms total={:.1}ms",
+        field_id,
+        candidates.len(),
+        scored.len(),
+        skipped,
+        load_elapsed.as_secs_f64() * 1000.0,
+        score_elapsed.as_secs_f64() * 1000.0,
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
 
     Ok(scored)
 }
