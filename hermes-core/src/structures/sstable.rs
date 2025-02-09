@@ -848,10 +848,14 @@ pub struct AsyncSSTableReader<V: SSTableValue> {
     _phantom: std::marker::PhantomData<V>,
 }
 
-/// LRU-style block cache
+/// FIFO block cache — O(1) lookup, insert, and eviction.
+///
+/// Uses VecDeque for eviction order (pop_front = O(1)) instead of
+/// Vec::remove(0) which is O(n). For small caches (16-64 blocks),
+/// FIFO performs nearly identically to LRU.
 struct BlockCache {
     blocks: FxHashMap<u64, Arc<Vec<u8>>>,
-    access_order: Vec<u64>,
+    insert_order: std::collections::VecDeque<u64>,
     max_blocks: usize,
 }
 
@@ -859,30 +863,28 @@ impl BlockCache {
     fn new(max_blocks: usize) -> Self {
         Self {
             blocks: FxHashMap::default(),
-            access_order: Vec::new(),
+            insert_order: std::collections::VecDeque::with_capacity(max_blocks),
             max_blocks,
         }
     }
 
-    fn get(&mut self, offset: u64) -> Option<Arc<Vec<u8>>> {
-        if let Some(block) = self.blocks.get(&offset) {
-            if let Some(pos) = self.access_order.iter().position(|&o| o == offset) {
-                self.access_order.remove(pos);
-                self.access_order.push(offset);
-            }
-            Some(Arc::clone(block))
-        } else {
-            None
-        }
+    fn get(&self, offset: u64) -> Option<Arc<Vec<u8>>> {
+        self.blocks.get(&offset).map(Arc::clone)
     }
 
     fn insert(&mut self, offset: u64, block: Arc<Vec<u8>>) {
-        while self.blocks.len() >= self.max_blocks && !self.access_order.is_empty() {
-            let evict_offset = self.access_order.remove(0);
-            self.blocks.remove(&evict_offset);
+        if self.blocks.contains_key(&offset) {
+            return; // already cached
+        }
+        while self.blocks.len() >= self.max_blocks {
+            if let Some(evict_offset) = self.insert_order.pop_front() {
+                self.blocks.remove(&evict_offset);
+            } else {
+                break;
+            }
         }
         self.blocks.insert(offset, block);
-        self.access_order.push(offset);
+        self.insert_order.push_back(offset);
     }
 }
 
@@ -1186,10 +1188,9 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             io::Error::new(io::ErrorKind::InvalidInput, "Block index out of range")
         })?;
 
-        // Check cache first
+        // Check cache first (read lock — concurrent cache hits don't serialize)
         {
-            let mut cache = self.cache.write();
-            if let Some(block) = cache.get(addr.offset) {
+            if let Some(block) = self.cache.read().get(addr.offset) {
                 return Ok(block);
             }
         }

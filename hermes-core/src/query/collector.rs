@@ -224,6 +224,15 @@ impl Collector for TopKCollector {
     fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]) {
         self.total_seen += 1;
 
+        // Only clone positions when the document will actually be kept in the heap.
+        // This avoids deep-cloning Vec<ScoredPosition> for documents that are
+        // immediately discarded (the common case for large result sets).
+        let dominated =
+            self.heap.len() >= self.k && self.heap.peek().is_some_and(|min| score <= min.score);
+        if dominated {
+            return;
+        }
+
         let positions = if self.collect_positions {
             positions.to_vec()
         } else {
@@ -236,9 +245,7 @@ impl Collector for TopKCollector {
                 score,
                 positions,
             });
-        } else if let Some(min) = self.heap.peek()
-            && score > min.score
-        {
+        } else {
             self.heap.pop();
             self.heap.push(SearchResult {
                 doc_id,
@@ -402,13 +409,13 @@ pub async fn collect_segment_with_limit<C: Collector>(
 
     let mut doc = scorer.doc();
     while doc != TERMINATED {
-        let positions = if needs_positions {
-            scorer.matched_positions().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         // Add doc_id_offset to convert segment-local ID to global ID
-        collector.collect(doc + doc_id_offset, scorer.score(), &positions);
+        if needs_positions {
+            let positions = scorer.matched_positions().unwrap_or_default();
+            collector.collect(doc + doc_id_offset, scorer.score(), &positions);
+        } else {
+            collector.collect(doc + doc_id_offset, scorer.score(), &[]);
+        }
         doc = scorer.advance();
     }
 
