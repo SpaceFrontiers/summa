@@ -411,8 +411,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Replace segment list atomically (for force merge / rebuild)
-    /// new_segments: Vec of (segment_id, num_docs) pairs
+    /// Replace specific old segments with new ones atomically.
+    ///
+    /// Only removes `old_to_delete` from metadata (not all segments), then adds
+    /// `new_segments`. This is safe against concurrent ingestion: segments committed
+    /// between `get_segment_ids()` and this call are preserved.
     pub async fn replace_segments(
         &self,
         new_segments: Vec<(String, u32)>,
@@ -425,7 +428,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         {
             let mut meta = self.metadata.write().await;
-            meta.segment_metas.clear();
+            for id in &old_to_delete {
+                meta.remove_segment(id);
+            }
             for (seg_id, num_docs) in new_segments {
                 meta.add_segment(seg_id, num_docs);
             }

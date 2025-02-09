@@ -91,9 +91,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
 
         // Wait for any background merges to complete before training.
-        // rebuild_segments_with_ann() calls replace_segments() which clears ALL
-        // segments atomically — concurrent merges would lose data or operate on
-        // stale/deleted segments.
+        // rebuild_segments_with_ann() calls replace_segments() which replaces
+        // merged segments — concurrent merges would operate on stale/deleted segments.
         self.segment_manager.wait_for_merges().await;
 
         let segment_ids = self.segment_manager.get_segment_ids().await;
@@ -122,8 +121,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Rebuild all segments with ANN indexes using trained centroids/codebooks
     pub(super) async fn rebuild_segments_with_ann(&self) -> Result<()> {
         // Pause background merges and wait for any in-flight ones to finish.
-        // rebuild replaces ALL segments atomically — concurrent merges would
-        // operate on stale/deleted segments or lose their output.
+        // rebuild replaces merged segments — concurrent merges would
+        // operate on stale/deleted segments.
         self.segment_manager.pause_merges();
         self.segment_manager.wait_for_merges().await;
 
