@@ -74,7 +74,12 @@ impl SearchService for SearchServiceImpl {
             let mut fields = HashMap::new();
 
             if !req.fields_to_load.is_empty()
-                && let Ok(Some(doc)) = searcher.doc(result.doc_id).await
+                && let Ok(Some(doc)) = searcher
+                    .get_document(&hermes_core::query::DocAddress::new(
+                        result.segment_id,
+                        result.doc_id,
+                    ))
+                    .await
             {
                 for field_name in &req.fields_to_load {
                     if let Some(field) = searcher.schema().get_field(field_name)

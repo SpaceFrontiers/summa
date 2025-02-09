@@ -75,16 +75,16 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        let (segments, default_fields, global_stats) = Self::load_common(
-            &directory,
-            &schema,
-            snapshot.segment_ids(),
-            &trained_centroids,
-            term_cache_blocks,
-        )
-        .await;
+        let (segments, default_fields, global_stats, segment_map, doc_id_cumulative) =
+            Self::load_common(
+                &directory,
+                &schema,
+                snapshot.segment_ids(),
+                &trained_centroids,
+                term_cache_blocks,
+            )
+            .await;
 
-        let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
         Ok(Self {
             _snapshot: snapshot,
             segments,
@@ -106,20 +106,20 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        let (segments, default_fields, global_stats) = Self::load_common(
-            &directory,
-            &schema,
-            segment_ids,
-            &trained_centroids,
-            term_cache_blocks,
-        )
-        .await;
+        let (segments, default_fields, global_stats, segment_map, doc_id_cumulative) =
+            Self::load_common(
+                &directory,
+                &schema,
+                segment_ids,
+                &trained_centroids,
+                term_cache_blocks,
+            )
+            .await;
 
         #[cfg(feature = "native")]
         {
             let tracker = Arc::new(SegmentTracker::new());
             let snapshot = SegmentSnapshot::new(tracker, segment_ids.to_vec());
-            let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
             Ok(Self {
                 _snapshot: snapshot,
                 segments,
@@ -136,7 +136,6 @@ impl<D: Directory + 'static> Searcher<D> {
         #[cfg(not(feature = "native"))]
         {
             let _ = directory; // suppress unused warning
-            let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
             Ok(Self {
                 _phantom: std::marker::PhantomData,
                 segments,
@@ -162,6 +161,8 @@ impl<D: Directory + 'static> Searcher<D> {
         Vec<Arc<SegmentReader>>,
         Vec<crate::Field>,
         Arc<LazyGlobalStats>,
+        FxHashMap<u128, usize>,
+        Vec<u32>,
     ) {
         let segments = Self::load_segments(
             directory,
@@ -173,7 +174,14 @@ impl<D: Directory + 'static> Searcher<D> {
         .await;
         let default_fields = Self::build_default_fields(schema);
         let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
-        (segments, default_fields, global_stats)
+        let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
+        (
+            segments,
+            default_fields,
+            global_stats,
+            segment_map,
+            doc_id_cumulative,
+        )
     }
 
     /// Load segment readers from IDs (parallel loading for performance)
