@@ -938,16 +938,16 @@ impl SegmentBuilder {
         Ok(())
     }
 
-    /// Stream sparse vectors directly to disk.
+    /// Stream sparse vectors directly to disk (footer-based format).
     ///
-    /// Serializes per-dimension posting lists (needed for header offset computation),
-    /// writes header, then streams each dimension's data directly to the writer.
-    /// Eliminates the triple-buffered approach (dim_bytes + all_data + output).
+    /// Data is written first (one dim at a time), then the TOC and footer
+    /// are appended. This matches the dense vectors format pattern.
     fn build_sparse_streaming(
         sparse_vectors: &mut FxHashMap<u32, SparseVectorBuilder>,
         schema: &Schema,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        use crate::segment::sparse_format::SPARSE_FOOTER_MAGIC;
         use crate::structures::{BlockSparsePostingList, WeightQuantization};
         use byteorder::{LittleEndian, WriteBytesExt};
 
@@ -955,12 +955,21 @@ impl SegmentBuilder {
             return Ok(());
         }
 
-        // Phase 1: Serialize all dims, keep bytes for offset computation
-        type DimEntry = (u32, Vec<u8>);
-        type FieldEntry = (u32, WeightQuantization, Vec<DimEntry>);
-        let mut field_data: Vec<FieldEntry> = Vec::new();
+        // Collect and sort fields
+        let mut field_ids: Vec<u32> = sparse_vectors.keys().copied().collect();
+        field_ids.sort_unstable();
 
-        for (&field_id, builder) in sparse_vectors.iter_mut() {
+        // Per-field TOC accumulated in memory (~16 bytes per dim)
+        struct FieldToc {
+            field_id: u32,
+            quantization: u8,
+            dims: Vec<(u32, u64, u32)>, // (dim_id, data_offset, data_length)
+        }
+        let mut field_tocs: Vec<FieldToc> = Vec::new();
+        let mut current_offset = 0u64;
+
+        for &field_id in &field_ids {
+            let builder = sparse_vectors.get_mut(&field_id).unwrap();
             if builder.is_empty() {
                 continue;
             }
@@ -977,9 +986,15 @@ impl SegmentBuilder {
             let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
             let pruning_fraction = sparse_config.and_then(|c| c.posting_list_pruning);
 
-            let mut dims: Vec<DimEntry> = Vec::new();
+            // Sort dim IDs for deterministic output
+            let mut dim_ids: Vec<u32> = builder.postings.keys().copied().collect();
+            dim_ids.sort_unstable();
 
-            for (&dim_id, postings) in builder.postings.iter_mut() {
+            let mut dim_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(dim_ids.len());
+            let mut serialize_buf = Vec::new();
+
+            for dim_id in dim_ids {
+                let postings = builder.postings.get_mut(&dim_id).unwrap();
                 postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
 
                 if let Some(fraction) = pruning_fraction
@@ -1004,58 +1019,46 @@ impl SegmentBuilder {
                 )
                 .map_err(crate::Error::Io)?;
 
-                let mut bytes = Vec::new();
-                block_list.serialize(&mut bytes).map_err(crate::Error::Io)?;
-                dims.push((dim_id, bytes));
+                serialize_buf.clear();
+                block_list
+                    .serialize(&mut serialize_buf)
+                    .map_err(crate::Error::Io)?;
+                writer.write_all(&serialize_buf)?;
+
+                dim_entries.push((dim_id, current_offset, serialize_buf.len() as u32));
+                current_offset += serialize_buf.len() as u64;
             }
 
-            dims.sort_by_key(|(id, _)| *id);
-            field_data.push((field_id, quantization, dims));
+            if !dim_entries.is_empty() {
+                field_tocs.push(FieldToc {
+                    field_id,
+                    quantization: quantization as u8,
+                    dims: dim_entries,
+                });
+            }
         }
 
-        if field_data.is_empty() {
+        if field_tocs.is_empty() {
             return Ok(());
         }
 
-        field_data.sort_by_key(|(id, _, _)| *id);
-
-        // Phase 2: Compute header size and offsets
-        // num_fields(u32) + per-field: field_id(u32) + quantization(u8) + num_dims(u32)
-        // per-dim: dim_id(u32) + offset(u64) + length(u32)
-        let per_dim_entry = size_of::<u32>() + size_of::<u64>() + size_of::<u32>();
-        let per_field_header = size_of::<u32>() + size_of::<u8>() + size_of::<u32>();
-        let mut header_size = size_of::<u32>() as u64;
-        for (_, _, dims) in &field_data {
-            header_size += per_field_header as u64;
-            header_size += (dims.len() as u64) * per_dim_entry as u64;
-        }
-
-        let mut header = Vec::with_capacity(header_size as usize);
-        header.write_u32::<LittleEndian>(field_data.len() as u32)?;
-
-        let mut current_offset = header_size;
-        for (field_id, quantization, dims) in &field_data {
-            header.write_u32::<LittleEndian>(*field_id)?;
-            header.write_u8(*quantization as u8)?;
-            header.write_u32::<LittleEndian>(dims.len() as u32)?;
-
-            for (dim_id, bytes) in dims {
-                header.write_u32::<LittleEndian>(*dim_id)?;
-                header.write_u64::<LittleEndian>(current_offset)?;
-                header.write_u32::<LittleEndian>(bytes.len() as u32)?;
-                current_offset += bytes.len() as u64;
+        // Write TOC at end
+        let toc_offset = current_offset;
+        for ftoc in &field_tocs {
+            writer.write_u32::<LittleEndian>(ftoc.field_id)?;
+            writer.write_u8(ftoc.quantization)?;
+            writer.write_u32::<LittleEndian>(ftoc.dims.len() as u32)?;
+            for &(dim_id, offset, length) in &ftoc.dims {
+                writer.write_u32::<LittleEndian>(dim_id)?;
+                writer.write_u64::<LittleEndian>(offset)?;
+                writer.write_u32::<LittleEndian>(length)?;
             }
         }
 
-        // Phase 3: Write header, then stream each dimension's data
-        writer.write_all(&header)?;
-
-        for (_, _, dims) in field_data {
-            for (_, bytes) in dims {
-                writer.write_all(&bytes)?;
-                // bytes dropped here — one dim at a time
-            }
-        }
+        // Write footer: toc_offset(8) + num_fields(4) + magic(4) = 16 bytes
+        writer.write_u64::<LittleEndian>(toc_offset)?;
+        writer.write_u32::<LittleEndian>(field_tocs.len() as u32)?;
+        writer.write_u32::<LittleEndian>(SPARSE_FOOTER_MAGIC)?;
 
         Ok(())
     }
