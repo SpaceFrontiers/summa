@@ -176,7 +176,7 @@ impl DirectoryWriter for MmapDirectory {
             tokio::fs::create_dir_all(parent).await?;
         }
         let file = std::fs::File::create(&full_path)?;
-        Ok(Box::new(FileStreamingWriter { file, written: 0 }))
+        Ok(Box::new(FileStreamingWriter::new(file)))
     }
 }
 

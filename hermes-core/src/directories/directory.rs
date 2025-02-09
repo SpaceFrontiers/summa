@@ -7,8 +7,6 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
-#[cfg(feature = "native")]
-use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -435,11 +433,27 @@ impl StreamingWriter for BufferedStreamingWriter {
     }
 }
 
-/// StreamingWriter backed by std::fs::File for filesystem directories.
+/// Buffer size for FileStreamingWriter (8 MB).
+/// Large enough to coalesce millions of tiny writes (e.g. per-vector doc_id writes)
+/// into efficient sequential I/O.
+#[cfg(feature = "native")]
+const FILE_STREAMING_BUF_SIZE: usize = 8 * 1024 * 1024;
+
+/// StreamingWriter backed by a buffered std::fs::File for filesystem directories.
 #[cfg(feature = "native")]
 pub(crate) struct FileStreamingWriter {
-    pub(crate) file: std::fs::File,
+    pub(crate) file: io::BufWriter<std::fs::File>,
     pub(crate) written: u64,
+}
+
+#[cfg(feature = "native")]
+impl FileStreamingWriter {
+    pub(crate) fn new(file: std::fs::File) -> Self {
+        Self {
+            file: io::BufWriter::with_capacity(FILE_STREAMING_BUF_SIZE, file),
+            written: 0,
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -457,9 +471,9 @@ impl io::Write for FileStreamingWriter {
 
 #[cfg(feature = "native")]
 impl StreamingWriter for FileStreamingWriter {
-    fn finish(mut self: Box<Self>) -> io::Result<()> {
-        self.file.flush()?;
-        self.file.sync_all()?;
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        let file = self.file.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -775,7 +789,7 @@ impl DirectoryWriter for FsDirectory {
             tokio::fs::create_dir_all(parent).await?;
         }
         let file = std::fs::File::create(&full_path)?;
-        Ok(Box::new(FileStreamingWriter { file, written: 0 }))
+        Ok(Box::new(FileStreamingWriter::new(file)))
     }
 }
 

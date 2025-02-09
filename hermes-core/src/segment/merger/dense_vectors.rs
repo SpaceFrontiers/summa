@@ -460,7 +460,7 @@ impl SegmentMerger {
                         let total_bytes = lazy_flat.vector_bytes_len();
                         let base_offset = lazy_flat.vectors_byte_offset();
                         let handle = lazy_flat.handle();
-                        const CHUNK: u64 = 1024 * 1024; // 1MB
+                        const CHUNK: u64 = 8 * 1024 * 1024; // 8MB
                         for chunk_start in (0..total_bytes).step_by(CHUNK as usize) {
                             let chunk_end = (chunk_start + CHUNK).min(total_bytes);
                             let bytes = handle
@@ -474,14 +474,17 @@ impl SegmentMerger {
                     }
                 }
 
-                // Pass 2: stream doc_ids with offset adjustment
+                // Pass 2: stream doc_ids with offset adjustment (buffered per segment)
                 for (seg_idx, segment) in segments.iter().enumerate() {
                     if let Some(lazy_flat) = segment.flat_vectors().get(&entry.field_id) {
                         let offset = doc_offs[seg_idx];
+                        let count = lazy_flat.doc_ids.len();
+                        let mut buf = Vec::with_capacity(count * 6);
                         for &(doc_id, ordinal) in &lazy_flat.doc_ids {
-                            writer.write_all(&(offset + doc_id).to_le_bytes())?;
-                            writer.write_all(&ordinal.to_le_bytes())?;
+                            buf.extend_from_slice(&(offset + doc_id).to_le_bytes());
+                            buf.extend_from_slice(&ordinal.to_le_bytes());
                         }
+                        writer.write_all(&buf)?;
                     }
                 }
             }
