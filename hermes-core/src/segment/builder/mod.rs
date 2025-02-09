@@ -765,7 +765,6 @@ impl SegmentBuilder {
         writer: &mut dyn Write,
     ) -> Result<()> {
         use crate::dsl::{DenseVectorQuantization, VectorIndexType};
-        use byteorder::{LittleEndian, WriteBytesExt};
 
         let mut fields: Vec<(u32, DenseVectorBuilder)> = dense_vectors
             .into_iter()
@@ -799,17 +798,11 @@ impl SegmentBuilder {
             ));
         }
 
-        use crate::segment::format::VECTORS_FOOTER_MAGIC;
+        use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
 
         // Data-first format: stream field data, then write TOC + footer at end.
         // Data starts at file offset 0 → mmap page-aligned, no alignment copies.
-        struct TocEntry {
-            field_id: u32,
-            index_type: u8,
-            offset: u64,
-            size: u64,
-        }
-        let mut toc: Vec<TocEntry> = Vec::with_capacity(fields.len() * 2);
+        let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(fields.len() * 2);
         let mut current_offset = 0u64;
 
         // Pre-build ANN indexes while we still have access to the raw vectors.
@@ -886,7 +879,7 @@ impl SegmentBuilder {
             )
             .map_err(crate::Error::Io)?;
             current_offset += field_sizes[i] as u64;
-            toc.push(TocEntry {
+            toc.push(DenseVectorTocEntry {
                 field_id: _field_id,
                 index_type: super::ann_build::FLAT_TYPE,
                 offset: data_offset,
@@ -907,7 +900,7 @@ impl SegmentBuilder {
             let blob_len = blob.len() as u64;
             writer.write_all(&blob)?;
             current_offset += blob_len;
-            toc.push(TocEntry {
+            toc.push(DenseVectorTocEntry {
                 field_id,
                 index_type,
                 offset: data_offset,
@@ -920,19 +913,8 @@ impl SegmentBuilder {
             }
         }
 
-        // Write TOC entries
-        let toc_offset = current_offset;
-        for entry in &toc {
-            writer.write_u32::<LittleEndian>(entry.field_id)?;
-            writer.write_u8(entry.index_type)?;
-            writer.write_u64::<LittleEndian>(entry.offset)?;
-            writer.write_u64::<LittleEndian>(entry.size)?;
-        }
-
-        // Write footer: toc_offset(8) + num_fields(4) + magic(4)
-        writer.write_u64::<LittleEndian>(toc_offset)?;
-        writer.write_u32::<LittleEndian>(toc.len() as u32)?;
-        writer.write_u32::<LittleEndian>(VECTORS_FOOTER_MAGIC)?;
+        // Write TOC + footer
+        write_dense_toc_and_footer(writer, current_offset, &toc)?;
 
         Ok(())
     }

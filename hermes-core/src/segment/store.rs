@@ -25,6 +25,33 @@ use crate::dsl::{Document, Schema};
 const STORE_MAGIC: u32 = 0x53544F52; // "STOR"
 const STORE_VERSION: u32 = 2; // Version 2 supports dictionaries
 
+/// Write block index + footer to a store file.
+///
+/// Shared by `StoreWriter::finish`, `StoreWriter::finish` (empty), and `StoreMerger::finish`.
+fn write_store_index_and_footer(
+    writer: &mut (impl Write + ?Sized),
+    index: &[StoreBlockIndex],
+    data_end_offset: u64,
+    dict_offset: u64,
+    num_docs: u32,
+    has_dict: bool,
+) -> io::Result<()> {
+    writer.write_u32::<LittleEndian>(index.len() as u32)?;
+    for entry in index {
+        writer.write_u32::<LittleEndian>(entry.first_doc_id)?;
+        writer.write_u64::<LittleEndian>(entry.offset)?;
+        writer.write_u32::<LittleEndian>(entry.length)?;
+        writer.write_u32::<LittleEndian>(entry.num_docs)?;
+    }
+    writer.write_u64::<LittleEndian>(data_end_offset)?;
+    writer.write_u64::<LittleEndian>(dict_offset)?;
+    writer.write_u32::<LittleEndian>(num_docs)?;
+    writer.write_u32::<LittleEndian>(if has_dict { 1 } else { 0 })?;
+    writer.write_u32::<LittleEndian>(STORE_VERSION)?;
+    writer.write_u32::<LittleEndian>(STORE_MAGIC)?;
+    Ok(())
+}
+
 /// Block size for document store (256KB for better compression)
 /// Larger blocks = better compression ratio but more memory per block load
 pub const STORE_BLOCK_SIZE: usize = 256 * 1024;
@@ -289,15 +316,7 @@ impl<'a> EagerParallelStoreWriter<'a> {
         }
 
         if self.compressed_blocks.is_empty() {
-            // Write empty store
-            let data_end_offset = 0u64;
-            self.writer.write_u32::<LittleEndian>(0)?; // num blocks
-            self.writer.write_u64::<LittleEndian>(data_end_offset)?;
-            self.writer.write_u64::<LittleEndian>(0)?; // dict offset
-            self.writer.write_u32::<LittleEndian>(0)?; // num docs
-            self.writer.write_u32::<LittleEndian>(0)?; // has_dict
-            self.writer.write_u32::<LittleEndian>(STORE_VERSION)?;
-            self.writer.write_u32::<LittleEndian>(STORE_MAGIC)?;
+            write_store_index_and_footer(&mut self.writer, &[], 0, 0, 0, false)?;
             return Ok(0);
         }
 
@@ -334,24 +353,15 @@ impl<'a> EagerParallelStoreWriter<'a> {
             None
         };
 
-        // Write index
-        self.writer.write_u32::<LittleEndian>(index.len() as u32)?;
-        for entry in &index {
-            self.writer.write_u32::<LittleEndian>(entry.first_doc_id)?;
-            self.writer.write_u64::<LittleEndian>(entry.offset)?;
-            self.writer.write_u32::<LittleEndian>(entry.length)?;
-            self.writer.write_u32::<LittleEndian>(entry.num_docs)?;
-        }
-
-        // Write footer
-        self.writer.write_u64::<LittleEndian>(data_end_offset)?;
-        self.writer
-            .write_u64::<LittleEndian>(dict_offset.unwrap_or(0))?;
-        self.writer.write_u32::<LittleEndian>(self.next_doc_id)?;
-        self.writer
-            .write_u32::<LittleEndian>(if self.dict.is_some() { 1 } else { 0 })?;
-        self.writer.write_u32::<LittleEndian>(STORE_VERSION)?;
-        self.writer.write_u32::<LittleEndian>(STORE_MAGIC)?;
+        // Write index + footer
+        write_store_index_and_footer(
+            &mut self.writer,
+            &index,
+            data_end_offset,
+            dict_offset.unwrap_or(0),
+            self.next_doc_id,
+            self.dict.is_some(),
+        )?;
 
         Ok(self.next_doc_id)
     }
@@ -820,23 +830,15 @@ impl<'a, W: Write> StoreMerger<'a, W> {
         // No dictionary support for merged stores (would need same dict across all sources)
         let dict_offset = 0u64;
 
-        // Write index
-        self.writer
-            .write_u32::<LittleEndian>(self.index.len() as u32)?;
-        for entry in &self.index {
-            self.writer.write_u32::<LittleEndian>(entry.first_doc_id)?;
-            self.writer.write_u64::<LittleEndian>(entry.offset)?;
-            self.writer.write_u32::<LittleEndian>(entry.length)?;
-            self.writer.write_u32::<LittleEndian>(entry.num_docs)?;
-        }
-
-        // Write footer
-        self.writer.write_u64::<LittleEndian>(data_end_offset)?;
-        self.writer.write_u64::<LittleEndian>(dict_offset)?;
-        self.writer.write_u32::<LittleEndian>(self.next_doc_id)?;
-        self.writer.write_u32::<LittleEndian>(0)?; // has_dict = false
-        self.writer.write_u32::<LittleEndian>(STORE_VERSION)?;
-        self.writer.write_u32::<LittleEndian>(STORE_MAGIC)?;
+        // Write index + footer
+        write_store_index_and_footer(
+            self.writer,
+            &self.index,
+            data_end_offset,
+            dict_offset,
+            self.next_doc_id,
+            false,
+        )?;
 
         Ok(self.next_doc_id)
     }

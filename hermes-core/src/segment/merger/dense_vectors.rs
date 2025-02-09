@@ -17,7 +17,7 @@ use super::doc_offsets;
 use crate::Result;
 use crate::directories::{AsyncFileRead, Directory, DirectoryWriter};
 use crate::dsl::{DenseVectorQuantization, FieldType, VectorIndexType};
-use crate::segment::format::VECTORS_FOOTER_MAGIC;
+use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::segment::vector_data::{FlatVectorData, dequantize_raw};
@@ -403,13 +403,6 @@ impl SegmentMerger {
             return Ok(0);
         }
 
-        struct WrittenEntry {
-            field_id: u32,
-            index_type: u8,
-            data_offset: u64,
-            data_size: u64,
-        }
-
         // Build write order: sort by (field_id, index_type)
         struct PendingEntry {
             field_id: u32,
@@ -442,10 +435,9 @@ impl SegmentMerger {
         });
 
         // Stream data first — track offsets as we go
-        use byteorder::{LittleEndian, WriteBytesExt};
         let write_start = std::time::Instant::now();
         let mut writer = OffsetWriter::new(dir.streaming_writer(&files.vectors).await?);
-        let mut toc: Vec<WrittenEntry> = Vec::with_capacity(total_entries);
+        let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(total_entries);
 
         for entry in &pending {
             let data_offset = writer.offset();
@@ -497,11 +489,11 @@ impl SegmentMerger {
             }
 
             let data_size = writer.offset() - data_offset;
-            toc.push(WrittenEntry {
+            toc.push(DenseVectorTocEntry {
                 field_id: entry.field_id,
                 index_type: entry.index_type,
-                data_offset,
-                data_size,
+                offset: data_offset,
+                size: data_size,
             });
 
             // Pad to 8-byte boundary so next field's mmap slice is aligned
@@ -511,19 +503,9 @@ impl SegmentMerger {
             }
         }
 
-        // Write TOC at end
+        // Write TOC + footer
         let toc_offset = writer.offset();
-        for entry in &toc {
-            writer.write_u32::<LittleEndian>(entry.field_id)?;
-            writer.write_u8(entry.index_type)?;
-            writer.write_u64::<LittleEndian>(entry.data_offset)?;
-            writer.write_u64::<LittleEndian>(entry.data_size)?;
-        }
-
-        // Write footer: toc_offset(8) + num_fields(4) + magic(4) = 16 bytes
-        writer.write_u64::<LittleEndian>(toc_offset)?;
-        writer.write_u32::<LittleEndian>(toc.len() as u32)?;
-        writer.write_u32::<LittleEndian>(VECTORS_FOOTER_MAGIC)?;
+        write_dense_toc_and_footer(&mut writer, toc_offset, &toc)?;
 
         let output_size = writer.offset() as usize;
         writer.finish()?;

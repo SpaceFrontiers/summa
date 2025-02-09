@@ -29,6 +29,65 @@ pub const FLAT_BINARY_HEADER_SIZE: usize = 16;
 /// Per-doc_id entry size: doc_id(u32) + ordinal(u16)
 pub const DOC_ID_ENTRY_SIZE: usize = std::mem::size_of::<u32>() + std::mem::size_of::<u16>();
 
+/// Per-field TOC entry for `.vectors` file.
+/// Shared by builder, merger, and reader.
+/// Wire format: field_id(4) + index_type(1) + offset(8) + size(8) = 21 bytes.
+pub struct DenseVectorTocEntry {
+    pub field_id: u32,
+    pub index_type: u8,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Size in bytes of a single dense vector TOC entry on disk.
+pub const DENSE_TOC_ENTRY_SIZE: u64 = 4 + 1 + 8 + 8; // 21
+
+/// Write dense vector TOC entries + footer to writer.
+///
+/// Called after all field data has been written. `toc_offset` is the
+/// current file position (byte offset where the TOC starts).
+pub fn write_dense_toc_and_footer(
+    writer: &mut (impl std::io::Write + ?Sized),
+    toc_offset: u64,
+    entries: &[DenseVectorTocEntry],
+) -> std::io::Result<()> {
+    use byteorder::{LittleEndian, WriteBytesExt};
+
+    for e in entries {
+        writer.write_u32::<LittleEndian>(e.field_id)?;
+        writer.write_u8(e.index_type)?;
+        writer.write_u64::<LittleEndian>(e.offset)?;
+        writer.write_u64::<LittleEndian>(e.size)?;
+    }
+    writer.write_u64::<LittleEndian>(toc_offset)?;
+    writer.write_u32::<LittleEndian>(entries.len() as u32)?;
+    writer.write_u32::<LittleEndian>(VECTORS_FOOTER_MAGIC)?;
+    Ok(())
+}
+
+/// Read dense vector TOC entries from raw bytes (already loaded from file).
+pub fn read_dense_toc(
+    toc_bytes: &[u8],
+    num_fields: u32,
+) -> std::io::Result<Vec<DenseVectorTocEntry>> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+    let mut cursor = std::io::Cursor::new(toc_bytes);
+    let mut entries = Vec::with_capacity(num_fields as usize);
+    for _ in 0..num_fields {
+        let field_id = cursor.read_u32::<LittleEndian>()?;
+        let index_type = cursor.read_u8().unwrap_or(255);
+        let offset = cursor.read_u64::<LittleEndian>()?;
+        let size = cursor.read_u64::<LittleEndian>()?;
+        entries.push(DenseVectorTocEntry {
+            field_id,
+            index_type,
+            offset,
+            size,
+        });
+    }
+    Ok(entries)
+}
+
 // ── Sparse vectors (.sparse) ────────────────────────────────────────────────
 
 /// Magic number for `.sparse` file footer ("SPR2" in LE)

@@ -23,7 +23,9 @@ pub struct VectorsFileData {
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
 }
 
-use crate::segment::format::{FOOTER_SIZE, VECTORS_FOOTER_MAGIC};
+use crate::segment::format::{
+    DENSE_TOC_ENTRY_SIZE, DenseVectorTocEntry, FOOTER_SIZE, VECTORS_FOOTER_MAGIC, read_dense_toc,
+};
 
 /// Load dense vector indexes from unified .vectors file
 ///
@@ -73,43 +75,26 @@ pub async fn load_vectors_file<D: Directory>(
     let num_fields = cursor.read_u32::<LittleEndian>()?;
     let magic = cursor.read_u32::<LittleEndian>()?;
 
-    let entries = if magic == VECTORS_FOOTER_MAGIC && toc_offset < file_size - FOOTER_SIZE {
-        // New format: TOC at end
-        let toc_size = num_fields as u64 * 21;
-        let toc_bytes = handle
-            .read_bytes_range(toc_offset..toc_offset + toc_size)
-            .await?;
-        let mut cursor = Cursor::new(toc_bytes.as_slice());
-        let mut entries = Vec::with_capacity(num_fields as usize);
-        for _ in 0..num_fields {
-            let field_id = cursor.read_u32::<LittleEndian>()?;
-            let index_type = cursor.read_u8().unwrap_or(255);
-            let offset = cursor.read_u64::<LittleEndian>()?;
-            let length = cursor.read_u64::<LittleEndian>()?;
-            entries.push((field_id, index_type, offset, length));
-        }
-        entries
-    } else {
-        // Legacy format: header at start (num_fields(4) + entries)
-        let header_bytes = handle.read_bytes_range(0..4).await?;
-        let mut cursor = Cursor::new(header_bytes.as_slice());
-        let num_fields = cursor.read_u32::<LittleEndian>()?;
-        if num_fields == 0 {
-            return Ok(empty());
-        }
-        let entries_size = num_fields as u64 * 21;
-        let entries_bytes = handle.read_bytes_range(4..4 + entries_size).await?;
-        let mut cursor = Cursor::new(entries_bytes.as_slice());
-        let mut entries = Vec::with_capacity(num_fields as usize);
-        for _ in 0..num_fields {
-            let field_id = cursor.read_u32::<LittleEndian>()?;
-            let index_type = cursor.read_u8().unwrap_or(255);
-            let offset = cursor.read_u64::<LittleEndian>()?;
-            let length = cursor.read_u64::<LittleEndian>()?;
-            entries.push((field_id, index_type, offset, length));
-        }
-        entries
-    };
+    let entries: Vec<DenseVectorTocEntry> =
+        if magic == VECTORS_FOOTER_MAGIC && toc_offset < file_size - FOOTER_SIZE {
+            // New format: TOC at end
+            let toc_size = num_fields as u64 * DENSE_TOC_ENTRY_SIZE;
+            let toc_bytes = handle
+                .read_bytes_range(toc_offset..toc_offset + toc_size)
+                .await?;
+            read_dense_toc(toc_bytes.as_slice(), num_fields)?
+        } else {
+            // Legacy format: header at start (num_fields(4) + entries)
+            let header_bytes = handle.read_bytes_range(0..4).await?;
+            let mut cursor = Cursor::new(header_bytes.as_slice());
+            let num_fields = cursor.read_u32::<LittleEndian>()?;
+            if num_fields == 0 {
+                return Ok(empty());
+            }
+            let entries_size = num_fields as u64 * DENSE_TOC_ENTRY_SIZE;
+            let entries_bytes = handle.read_bytes_range(4..4 + entries_size).await?;
+            read_dense_toc(entries_bytes.as_slice(), num_fields)?
+        };
 
     if entries.is_empty() {
         return Ok(empty());
@@ -117,7 +102,13 @@ pub async fn load_vectors_file<D: Directory>(
 
     // Load each entry — a field can have both Flat (lazy) and ANN (in-memory)
     use crate::segment::ann_build;
-    for (field_id, index_type, offset, length) in entries {
+    for DenseVectorTocEntry {
+        field_id,
+        index_type,
+        offset,
+        size: length,
+    } in entries
+    {
         match index_type {
             ann_build::FLAT_TYPE => {
                 // Flat binary — load lazily (only doc_ids in memory, vectors via mmap)
