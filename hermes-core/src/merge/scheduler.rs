@@ -329,34 +329,52 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         term_cache_blocks: usize,
         metadata: &RwLock<IndexMetadata>,
     ) -> Result<(String, u32)> {
-        // Load segment readers
-        let mut readers = Vec::new();
-        let mut doc_offset = 0u32;
-        let mut total_docs = 0u32;
+        let load_start = std::time::Instant::now();
 
-        for id_str in segment_ids_to_merge {
-            let segment_id = SegmentId::from_hex(id_str)
-                .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = match SegmentReader::open(
-                directory,
-                segment_id,
-                Arc::new(schema.clone()),
-                doc_offset,
-                term_cache_blocks,
-            )
-            .await
-            {
-                Ok(r) => r,
+        // Parse segment IDs upfront
+        let segment_ids: Vec<SegmentId> = segment_ids_to_merge
+            .iter()
+            .map(|id_str| {
+                SegmentId::from_hex(id_str)
+                    .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Load segment readers in parallel (doc_offset=0; merger computes its own)
+        let schema_arc = Arc::new(schema.clone());
+        let futures: Vec<_> = segment_ids
+            .iter()
+            .map(|&sid| {
+                let sch = Arc::clone(&schema_arc);
+                async move { SegmentReader::open(directory, sid, sch, 0, term_cache_blocks).await }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        let mut readers = Vec::with_capacity(results.len());
+        let mut total_docs = 0u32;
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(r) => {
+                    total_docs += r.meta().num_docs;
+                    readers.push(r);
+                }
                 Err(e) => {
-                    eprintln!("[merge] Failed to open segment {}: {:?}", id_str, e);
+                    log::error!(
+                        "[merge] Failed to open segment {}: {:?}",
+                        segment_ids_to_merge[i],
+                        e
+                    );
                     return Err(e);
                 }
-            };
-            let num_docs = reader.meta().num_docs;
-            total_docs += num_docs;
-            doc_offset += num_docs;
-            readers.push(reader);
+            }
         }
+
+        log::info!(
+            "[merge] loaded {} segment readers in {:.1}s",
+            readers.len(),
+            load_start.elapsed().as_secs_f64()
+        );
 
         // Load trained structures (if any) for ANN-aware merging
         let trained = {
@@ -364,7 +382,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             meta.load_trained_structures(directory).await
         };
 
-        let merger = SegmentMerger::new(Arc::new(schema.clone()));
+        let merger = SegmentMerger::new(schema_arc);
         let new_segment_id = SegmentId::new();
 
         log::info!(
@@ -379,7 +397,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .await;
 
         if let Err(e) = merge_result {
-            eprintln!(
+            log::error!(
                 "[merge] Merge failed for segments {:?} -> {}: {:?}",
                 segment_ids_to_merge,
                 new_segment_id.to_hex(),

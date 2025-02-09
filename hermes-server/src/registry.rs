@@ -19,6 +19,8 @@ pub struct IndexHandle {
 pub struct IndexRegistry {
     /// Single map: name → handle (index + writer together)
     handles: RwLock<HashMap<String, IndexHandle>>,
+    /// Per-index open locks to prevent concurrent Index::open for the same name
+    open_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) data_dir: PathBuf,
     config: IndexConfig,
 }
@@ -27,13 +29,37 @@ impl IndexRegistry {
     pub fn new(data_dir: PathBuf, config: IndexConfig) -> Self {
         Self {
             handles: RwLock::new(HashMap::new()),
+            open_locks: RwLock::new(HashMap::new()),
             data_dir,
             config,
         }
     }
 
     /// Get or open an index
+    ///
+    /// Uses a per-index mutex to prevent concurrent Index::open for the same name.
+    /// Without this, two concurrent requests can both miss the cache and open the
+    /// index twice (wasting ~30s loading segments redundantly).
     pub async fn get_or_open_index(&self, name: &str) -> Result<Arc<Index<MmapDirectory>>, Status> {
+        // Fast path: already cached
+        if let Some(h) = self.handles.read().get(name) {
+            return Ok(Arc::clone(&h.index));
+        }
+
+        // Get or create per-index open lock
+        let lock = {
+            let mut locks = self.open_locks.write();
+            Arc::clone(
+                locks
+                    .entry(name.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+
+        // Serialize open attempts for the same index name
+        let _guard = lock.lock().await;
+
+        // Re-check cache after acquiring lock (another task may have opened it)
         if let Some(h) = self.handles.read().get(name) {
             return Ok(Arc::clone(&h.index));
         }
@@ -52,12 +78,7 @@ impl IndexRegistry {
         let index = Arc::new(index);
         let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
 
-        let mut handles = self.handles.write();
-        // Double-check after acquiring write lock
-        if let Some(h) = handles.get(name) {
-            return Ok(Arc::clone(&h.index));
-        }
-        handles.insert(
+        self.handles.write().insert(
             name.to_string(),
             IndexHandle {
                 index: Arc::clone(&index),
