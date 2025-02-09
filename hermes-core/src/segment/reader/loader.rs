@@ -23,10 +23,7 @@ pub struct VectorsFileData {
     pub flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
 }
 
-/// Magic number for vectors file footer ("VEC2" in LE)
-const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
-/// Footer size: toc_offset(8) + num_fields(4) + magic(4) = 16 bytes
-const VECTORS_FOOTER_SIZE: u64 = 16;
+use crate::segment::format::{FOOTER_SIZE, VECTORS_FOOTER_MAGIC};
 
 /// Load dense vector indexes from unified .vectors file
 ///
@@ -63,20 +60,20 @@ pub async fn load_vectors_file<D: Directory>(
     };
 
     let file_size = handle.len();
-    if file_size < VECTORS_FOOTER_SIZE {
+    if file_size < FOOTER_SIZE {
         return Ok(empty());
     }
 
     // Try new format: read footer (last 16 bytes)
     let footer_bytes = handle
-        .read_bytes_range(file_size - VECTORS_FOOTER_SIZE..file_size)
+        .read_bytes_range(file_size - FOOTER_SIZE..file_size)
         .await?;
     let mut cursor = Cursor::new(footer_bytes.as_slice());
     let toc_offset = cursor.read_u64::<LittleEndian>()?;
     let num_fields = cursor.read_u32::<LittleEndian>()?;
     let magic = cursor.read_u32::<LittleEndian>()?;
 
-    let entries = if magic == VECTORS_FOOTER_MAGIC && toc_offset < file_size - VECTORS_FOOTER_SIZE {
+    let entries = if magic == VECTORS_FOOTER_MAGIC && toc_offset < file_size - FOOTER_SIZE {
         // New format: TOC at end
         let toc_size = num_fields as u64 * 21;
         let toc_bytes = handle
@@ -198,7 +195,7 @@ pub async fn load_sparse_file<D: Directory>(
     total_docs: u32,
     schema: &Schema,
 ) -> Result<FxHashMap<u32, SparseIndex>> {
-    use crate::segment::sparse_format::{SPARSE_FOOTER_MAGIC, SPARSE_FOOTER_SIZE};
+    use crate::segment::format::{FOOTER_SIZE, SPARSE_FOOTER_MAGIC};
 
     let mut indexes = FxHashMap::default();
 
@@ -220,7 +217,7 @@ pub async fn load_sparse_file<D: Directory>(
     };
 
     let file_size = handle.len();
-    if file_size < SPARSE_FOOTER_SIZE {
+    if file_size < FOOTER_SIZE {
         return Ok(indexes);
     }
 
@@ -232,7 +229,7 @@ pub async fn load_sparse_file<D: Directory>(
     let data = all_bytes.as_slice();
 
     // Parse footer (last 16 bytes): toc_offset(8) + num_fields(4) + magic(4)
-    let footer_start = data.len() - SPARSE_FOOTER_SIZE as usize;
+    let footer_start = data.len() - FOOTER_SIZE as usize;
     let toc_offset = u64::from_le_bytes(data[footer_start..footer_start + 8].try_into().unwrap());
     let num_fields = u32::from_le_bytes(
         data[footer_start + 8..footer_start + 12]

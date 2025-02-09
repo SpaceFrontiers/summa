@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::directories::{AsyncFileRead, LazyFileSlice, OwnedBytes};
 use crate::dsl::DenseVectorQuantization;
+use crate::segment::format::{DOC_ID_ENTRY_SIZE, FLAT_BINARY_HEADER_SIZE, FLAT_BINARY_MAGIC};
 use crate::structures::simd::{batch_f32_to_f16, batch_f32_to_u8, f16_to_f32, u8_to_f32};
 
 /// Dequantize raw bytes to f32 based on storage quantization.
@@ -50,14 +51,6 @@ pub fn dequantize_raw(
         }
     }
 }
-
-/// Magic number for binary flat vector format v3 ("FVD3" in little-endian)
-const FLAT_BINARY_MAGIC: u32 = 0x46564433;
-
-/// Binary header: magic(u32) + dim(u32) + num_vectors(u32) + quant_type(u8) + padding(3)
-const FLAT_BINARY_HEADER_SIZE: usize = 16;
-/// Per-doc_id entry: doc_id(u32) + ordinal(u16)
-const DOC_ID_ENTRY_SIZE: usize = size_of::<u32>() + size_of::<u16>();
 
 /// Flat vector binary format helpers for writing.
 ///

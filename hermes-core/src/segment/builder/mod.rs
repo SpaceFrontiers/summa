@@ -799,8 +799,7 @@ impl SegmentBuilder {
             ));
         }
 
-        /// Magic number for vectors file footer ("VEC2" in LE)
-        const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
+        use crate::segment::format::VECTORS_FOOTER_MAGIC;
 
         // Data-first format: stream field data, then write TOC + footer at end.
         // Data starts at file offset 0 → mmap page-aligned, no alignment copies.
@@ -947,9 +946,8 @@ impl SegmentBuilder {
         schema: &Schema,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        use crate::segment::sparse_format::SPARSE_FOOTER_MAGIC;
+        use crate::segment::format::{SparseFieldToc, write_sparse_toc_and_footer};
         use crate::structures::{BlockSparsePostingList, WeightQuantization};
-        use byteorder::{LittleEndian, WriteBytesExt};
 
         if sparse_vectors.is_empty() {
             return Ok(());
@@ -959,13 +957,7 @@ impl SegmentBuilder {
         let mut field_ids: Vec<u32> = sparse_vectors.keys().copied().collect();
         field_ids.sort_unstable();
 
-        // Per-field TOC accumulated in memory (~16 bytes per dim)
-        struct FieldToc {
-            field_id: u32,
-            quantization: u8,
-            dims: Vec<(u32, u64, u32)>, // (dim_id, data_offset, data_length)
-        }
-        let mut field_tocs: Vec<FieldToc> = Vec::new();
+        let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
         let mut current_offset = 0u64;
 
         for &field_id in &field_ids {
@@ -1030,7 +1022,7 @@ impl SegmentBuilder {
             }
 
             if !dim_entries.is_empty() {
-                field_tocs.push(FieldToc {
+                field_tocs.push(SparseFieldToc {
                     field_id,
                     quantization: quantization as u8,
                     dims: dim_entries,
@@ -1042,23 +1034,8 @@ impl SegmentBuilder {
             return Ok(());
         }
 
-        // Write TOC at end
         let toc_offset = current_offset;
-        for ftoc in &field_tocs {
-            writer.write_u32::<LittleEndian>(ftoc.field_id)?;
-            writer.write_u8(ftoc.quantization)?;
-            writer.write_u32::<LittleEndian>(ftoc.dims.len() as u32)?;
-            for &(dim_id, offset, length) in &ftoc.dims {
-                writer.write_u32::<LittleEndian>(dim_id)?;
-                writer.write_u64::<LittleEndian>(offset)?;
-                writer.write_u32::<LittleEndian>(length)?;
-            }
-        }
-
-        // Write footer: toc_offset(8) + num_fields(4) + magic(4) = 16 bytes
-        writer.write_u64::<LittleEndian>(toc_offset)?;
-        writer.write_u32::<LittleEndian>(field_tocs.len() as u32)?;
-        writer.write_u32::<LittleEndian>(SPARSE_FOOTER_MAGIC)?;
+        write_sparse_toc_and_footer(writer, toc_offset, &field_tocs).map_err(crate::Error::Io)?;
 
         Ok(())
     }

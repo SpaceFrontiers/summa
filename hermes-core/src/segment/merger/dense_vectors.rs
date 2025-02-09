@@ -17,6 +17,7 @@ use super::doc_offsets;
 use crate::Result;
 use crate::directories::{AsyncFileRead, Directory, DirectoryWriter};
 use crate::dsl::{DenseVectorQuantization, FieldType, VectorIndexType};
+use crate::segment::format::VECTORS_FOOTER_MAGIC;
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::segment::vector_data::{FlatVectorData, dequantize_raw};
@@ -41,9 +42,6 @@ const VECTOR_BATCH_SIZE: usize = 1024;
 
 /// Chunk size for streaming flat vector bytes during merge (8 MB)
 const FLAT_VECTOR_CHUNK: u64 = 8 * 1024 * 1024;
-
-/// Magic number for vectors file footer ("VEC2" in LE)
-const VECTORS_FOOTER_MAGIC: u32 = 0x32434556;
 
 /// Streams vectors from a segment's lazy flat data into an add_fn callback.
 ///

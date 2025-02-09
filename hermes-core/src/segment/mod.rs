@@ -1,10 +1,10 @@
 pub(crate) mod ann_build;
 #[cfg(feature = "native")]
 mod builder;
+pub(crate) mod format;
 #[cfg(feature = "native")]
 mod merger;
 mod reader;
-pub(crate) mod sparse_format;
 mod store;
 #[cfg(feature = "native")]
 mod tracker;

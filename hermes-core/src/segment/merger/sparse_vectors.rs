@@ -21,8 +21,8 @@ use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::FieldType;
 use crate::segment::SparseIndex;
+use crate::segment::format::{SparseFieldToc, write_sparse_toc_and_footer};
 use crate::segment::reader::SegmentReader;
-use crate::segment::sparse_format::SPARSE_FOOTER_MAGIC;
 use crate::segment::types::SegmentFiles;
 use crate::structures::SparseSkipEntry;
 
@@ -61,13 +61,7 @@ impl SegmentMerger {
 
         let mut writer = OffsetWriter::new(dir.streaming_writer(&files.sparse).await?);
 
-        // Per-field TOC accumulated in memory (~16 bytes per dim — tiny)
-        struct FieldToc {
-            field_id: u32,
-            quantization: u8,
-            dims: Vec<(u32, u64, u32)>, // (dim_id, data_offset, data_length)
-        }
-        let mut field_tocs: Vec<FieldToc> = Vec::new();
+        let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
 
         for (field, sparse_config) in &sparse_fields {
             let quantization = sparse_config
@@ -171,7 +165,7 @@ impl SegmentMerger {
             }
 
             if !dim_entries.is_empty() {
-                field_tocs.push(FieldToc {
+                field_tocs.push(SparseFieldToc {
                     field_id: field.0,
                     quantization: quantization as u8,
                     dims: dim_entries,
@@ -185,23 +179,9 @@ impl SegmentMerger {
             return Ok(0);
         }
 
-        // Write TOC at end of file
         let toc_offset = writer.offset();
-        for ftoc in &field_tocs {
-            writer.write_u32::<LittleEndian>(ftoc.field_id)?;
-            writer.write_u8(ftoc.quantization)?;
-            writer.write_u32::<LittleEndian>(ftoc.dims.len() as u32)?;
-            for &(dim_id, offset, length) in &ftoc.dims {
-                writer.write_u32::<LittleEndian>(dim_id)?;
-                writer.write_u64::<LittleEndian>(offset)?;
-                writer.write_u32::<LittleEndian>(length)?;
-            }
-        }
-
-        // Write footer: toc_offset(8) + num_fields(4) + magic(4)
-        writer.write_u64::<LittleEndian>(toc_offset)?;
-        writer.write_u32::<LittleEndian>(field_tocs.len() as u32)?;
-        writer.write_u32::<LittleEndian>(SPARSE_FOOTER_MAGIC)?;
+        write_sparse_toc_and_footer(&mut writer, toc_offset, &field_tocs)
+            .map_err(crate::Error::Io)?;
 
         let output_size = writer.offset() as usize;
         writer.finish()?;
