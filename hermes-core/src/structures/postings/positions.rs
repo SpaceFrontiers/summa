@@ -888,4 +888,246 @@ mod tests {
         iter.advance();
         assert_eq!(iter.doc(), u32::MAX); // exhausted
     }
+
+    /// Helper: build a PositionPostingList from (doc_id, positions) pairs
+    fn build_ppl(entries: &[(u32, Vec<u32>)]) -> PositionPostingList {
+        let postings: Vec<PostingWithPositions> = entries
+            .iter()
+            .map(|(doc_id, positions)| PostingWithPositions {
+                doc_id: *doc_id,
+                term_freq: positions.len() as u32,
+                positions: positions.clone(),
+            })
+            .collect();
+        PositionPostingList::from_postings(&postings).unwrap()
+    }
+
+    /// Helper: serialize a PositionPostingList to bytes
+    fn serialize_ppl(ppl: &PositionPostingList) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ppl.serialize(&mut buf).unwrap();
+        buf
+    }
+
+    /// Helper: collect all (doc_id, positions) from a PositionPostingIterator
+    fn collect_positions(ppl: &PositionPostingList) -> Vec<(u32, Vec<u32>)> {
+        let mut result = Vec::new();
+        let mut it = ppl.iter();
+        while it.doc() != u32::MAX {
+            result.push((it.doc(), it.positions().to_vec()));
+            it.advance();
+        }
+        result
+    }
+
+    #[test]
+    fn test_concatenate_streaming_matches_blocks() {
+        // Build 3 segments with positions
+        let seg_a: Vec<(u32, Vec<u32>)> = (0..150)
+            .map(|i| (i * 2, vec![i * 10, i * 10 + 3]))
+            .collect();
+        let seg_b: Vec<(u32, Vec<u32>)> = (0..100).map(|i| (i * 5, vec![i * 7])).collect();
+        let seg_c: Vec<(u32, Vec<u32>)> = (0..80).map(|i| (i * 3, vec![i, i + 1, i + 2])).collect();
+
+        let ppl_a = build_ppl(&seg_a);
+        let ppl_b = build_ppl(&seg_b);
+        let ppl_c = build_ppl(&seg_c);
+
+        let offset_b = 500u32;
+        let offset_c = 1000u32;
+
+        // Method 1: concatenate_blocks (reference)
+        let ref_merged = PositionPostingList::concatenate_blocks(&[
+            (ppl_a.clone(), 0),
+            (ppl_b.clone(), offset_b),
+            (ppl_c.clone(), offset_c),
+        ])
+        .unwrap();
+        let mut ref_buf = Vec::new();
+        ref_merged.serialize(&mut ref_buf).unwrap();
+
+        // Method 2: concatenate_streaming
+        let bytes_a = serialize_ppl(&ppl_a);
+        let bytes_b = serialize_ppl(&ppl_b);
+        let bytes_c = serialize_ppl(&ppl_c);
+
+        let sources: Vec<(&[u8], u32)> =
+            vec![(&bytes_a, 0), (&bytes_b, offset_b), (&bytes_c, offset_c)];
+        let mut stream_buf = Vec::new();
+        let (doc_count, bytes_written) =
+            PositionPostingList::concatenate_streaming(&sources, &mut stream_buf).unwrap();
+
+        assert_eq!(doc_count, 330);
+        assert_eq!(bytes_written, stream_buf.len());
+
+        // Deserialize both and compare all postings + positions
+        let ref_posts = collect_positions(&PositionPostingList::deserialize(&ref_buf).unwrap());
+        let stream_posts =
+            collect_positions(&PositionPostingList::deserialize(&stream_buf).unwrap());
+
+        assert_eq!(ref_posts.len(), stream_posts.len());
+        for (i, (r, s)) in ref_posts.iter().zip(stream_posts.iter()).enumerate() {
+            assert_eq!(r.0, s.0, "doc_id mismatch at {}", i);
+            assert_eq!(r.1, s.1, "positions mismatch at doc {}", r.0);
+        }
+    }
+
+    #[test]
+    fn test_positions_multi_round_merge() {
+        // Round 0: 4 segments with distinct positions
+        let segments: Vec<Vec<(u32, Vec<u32>)>> = (0..4)
+            .map(|seg| {
+                (0..200)
+                    .map(|i| {
+                        let pos_count = (i % 3) + 1;
+                        let positions: Vec<u32> = (0..pos_count)
+                            .map(|p| (seg * 1000 + i * 10 + p) as u32)
+                            .collect();
+                        (i as u32 * 3, positions)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let ppls: Vec<PositionPostingList> = segments.iter().map(|s| build_ppl(s)).collect();
+        let serialized: Vec<Vec<u8>> = ppls.iter().map(|p| serialize_ppl(p)).collect();
+
+        // Round 1: merge pairs
+        let mut merged_01 = Vec::new();
+        let sources_01: Vec<(&[u8], u32)> = vec![(&serialized[0], 0), (&serialized[1], 600)];
+        let (dc_01, _) =
+            PositionPostingList::concatenate_streaming(&sources_01, &mut merged_01).unwrap();
+        assert_eq!(dc_01, 400);
+
+        let mut merged_23 = Vec::new();
+        let sources_23: Vec<(&[u8], u32)> = vec![(&serialized[2], 0), (&serialized[3], 600)];
+        let (dc_23, _) =
+            PositionPostingList::concatenate_streaming(&sources_23, &mut merged_23).unwrap();
+        assert_eq!(dc_23, 400);
+
+        // Round 2: merge intermediate results
+        let mut final_merged = Vec::new();
+        let sources_final: Vec<(&[u8], u32)> = vec![(&merged_01, 0), (&merged_23, 1200)];
+        let (dc_final, _) =
+            PositionPostingList::concatenate_streaming(&sources_final, &mut final_merged).unwrap();
+        assert_eq!(dc_final, 800);
+
+        // Verify all positions survived two rounds of merging
+        let final_ppl = PositionPostingList::deserialize(&final_merged).unwrap();
+        let all = collect_positions(&final_ppl);
+        assert_eq!(all.len(), 800);
+
+        // Spot-check: first doc of each original segment
+        // Seg0: doc_id=0, positions from seg=0
+        assert_eq!(all[0].0, 0);
+        assert_eq!(all[0].1, vec![0]); // seg=0, i=0, pos_count=1, pos=0*1000+0*10+0=0
+
+        // Seg1: doc_id=600, positions from seg=1
+        assert_eq!(all[200].0, 600);
+        assert_eq!(all[200].1, vec![1000]); // seg=1, i=0, pos_count=1, pos=1*1000+0*10+0=1000
+
+        // Seg2: doc_id=1200, positions from seg=2
+        assert_eq!(all[400].0, 1200);
+        assert_eq!(all[400].1, vec![2000]); // seg=2, i=0, pos_count=1, pos=2*1000+0*10+0=2000
+
+        // Verify seek + positions on the final merged list
+        let mut it = final_ppl.iter();
+        it.seek(1200);
+        assert_eq!(it.doc(), 1200);
+        assert_eq!(it.positions(), &[2000]);
+
+        // Verify get_positions (binary search path)
+        let pos = final_ppl.get_positions(600).unwrap();
+        assert_eq!(pos, vec![1000]);
+    }
+
+    #[test]
+    fn test_positions_large_scale_merge() {
+        // 5 segments × 500 docs, each doc has 1-4 positions
+        let num_segments = 5usize;
+        let docs_per_segment = 500usize;
+
+        let segments: Vec<Vec<(u32, Vec<u32>)>> = (0..num_segments)
+            .map(|seg| {
+                (0..docs_per_segment)
+                    .map(|i| {
+                        let n_pos = (i % 4) + 1;
+                        let positions: Vec<u32> =
+                            (0..n_pos).map(|p| (p * 5 + seg) as u32).collect();
+                        (i as u32 * 2, positions)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let ppls: Vec<PositionPostingList> = segments.iter().map(|s| build_ppl(s)).collect();
+        let serialized: Vec<Vec<u8>> = ppls.iter().map(|p| serialize_ppl(p)).collect();
+
+        let max_doc = (docs_per_segment as u32 - 1) * 2;
+        let offsets: Vec<u32> = (0..num_segments)
+            .map(|i| i as u32 * (max_doc + 1))
+            .collect();
+
+        let sources: Vec<(&[u8], u32)> = serialized
+            .iter()
+            .zip(offsets.iter())
+            .map(|(b, o)| (b.as_slice(), *o))
+            .collect();
+
+        let mut merged = Vec::new();
+        let (doc_count, _) =
+            PositionPostingList::concatenate_streaming(&sources, &mut merged).unwrap();
+        assert_eq!(doc_count, (num_segments * docs_per_segment) as u32);
+
+        // Deserialize and verify all positions
+        let merged_ppl = PositionPostingList::deserialize(&merged).unwrap();
+        let all = collect_positions(&merged_ppl);
+        assert_eq!(all.len(), num_segments * docs_per_segment);
+
+        // Verify positions for each segment
+        for seg in 0..num_segments {
+            for i in 0..docs_per_segment {
+                let idx = seg * docs_per_segment + i;
+                let expected_doc = i as u32 * 2 + offsets[seg];
+                assert_eq!(all[idx].0, expected_doc, "seg={} i={}", seg, i);
+
+                let n_pos = (i % 4) + 1;
+                let expected_positions: Vec<u32> =
+                    (0..n_pos).map(|p| (p * 5 + seg) as u32).collect();
+                assert_eq!(
+                    all[idx].1, expected_positions,
+                    "positions mismatch seg={} i={}",
+                    seg, i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_positions_streaming_single_source() {
+        let entries: Vec<(u32, Vec<u32>)> =
+            (0..300).map(|i| (i * 4, vec![i * 2, i * 2 + 1])).collect();
+        let ppl = build_ppl(&entries);
+        let direct = serialize_ppl(&ppl);
+
+        let sources: Vec<(&[u8], u32)> = vec![(&direct, 0)];
+        let mut streamed = Vec::new();
+        PositionPostingList::concatenate_streaming(&sources, &mut streamed).unwrap();
+
+        let p1 = collect_positions(&PositionPostingList::deserialize(&direct).unwrap());
+        let p2 = collect_positions(&PositionPostingList::deserialize(&streamed).unwrap());
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn test_positions_edge_single_doc() {
+        let ppl_a = build_ppl(&[(0, vec![42, 43, 44])]);
+        let ppl_b = build_ppl(&[(0, vec![100])]);
+
+        let merged = PositionPostingList::concatenate_blocks(&[(ppl_a, 0), (ppl_b, 1)]).unwrap();
+
+        assert_eq!(merged.doc_count(), 2);
+        assert_eq!(merged.get_positions(0).unwrap(), vec![42, 43, 44]);
+        assert_eq!(merged.get_positions(1).unwrap(), vec![100]);
+    }
 }

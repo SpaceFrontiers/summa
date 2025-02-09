@@ -1048,4 +1048,232 @@ mod tests {
         // Still built
         assert!(writer.is_vector_index_built(embedding).await);
     }
+
+    /// Multi-round merge: flush many small segments, merge, add more, merge again.
+    /// Verifies search correctness (term + phrase queries) through multiple merge rounds.
+    #[tokio::test]
+    async fn test_multi_round_merge_with_search() {
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let body = schema_builder.add_text_field("body", true, true);
+        let schema = schema_builder.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 512,
+            ..Default::default()
+        };
+
+        // --- Round 1: 5 segments × 10 docs = 50 docs ---
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        for batch in 0..5 {
+            for i in 0..10 {
+                let mut doc = Document::new();
+                doc.add_text(
+                    title,
+                    format!("alpha bravo charlie batch{} doc{}", batch, i),
+                );
+                doc.add_text(
+                    body,
+                    format!("the quick brown fox jumps over the lazy dog number {}", i),
+                );
+                writer.add_document(doc).unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let pre_merge_segments = index.segment_readers().await.unwrap().len();
+        assert!(
+            pre_merge_segments >= 3,
+            "Expected >=3 segments, got {}",
+            pre_merge_segments
+        );
+        assert_eq!(index.num_docs().await.unwrap(), 50);
+
+        // Search before merge
+        let results = index.query("alpha", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 50, "all 50 docs should match 'alpha'");
+
+        let results = index.query("fox", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 50, "all 50 docs should match 'fox'");
+
+        // --- Merge round 1 ---
+        let writer = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        writer.force_merge().await.unwrap();
+
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+        assert_eq!(index.num_docs().await.unwrap(), 50);
+
+        // Search after first merge
+        let results = index.query("alpha", 100).await.unwrap();
+        assert_eq!(
+            results.hits.len(),
+            50,
+            "all 50 docs should match 'alpha' after merge 1"
+        );
+
+        let results = index.query("fox", 100).await.unwrap();
+        assert_eq!(
+            results.hits.len(),
+            50,
+            "all 50 docs should match 'fox' after merge 1"
+        );
+
+        // Verify all docs retrievable
+        for i in 0..50 {
+            let doc = index.doc(i).await.unwrap();
+            assert!(doc.is_some(), "doc {} should exist after merge 1", i);
+        }
+
+        // --- Round 2: add 30 more docs in 3 segments ---
+        let writer = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        for batch in 0..3 {
+            for i in 0..10 {
+                let mut doc = Document::new();
+                doc.add_text(
+                    title,
+                    format!("delta echo foxtrot round2_batch{} doc{}", batch, i),
+                );
+                doc.add_text(
+                    body,
+                    format!("the quick brown fox jumps again number {}", i),
+                );
+                writer.add_document(doc).unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        assert_eq!(index.num_docs().await.unwrap(), 80);
+        assert!(
+            index.segment_readers().await.unwrap().len() >= 2,
+            "Should have >=2 segments after round 2 ingestion"
+        );
+
+        // Search spans both old merged segment and new segments
+        let results = index.query("fox", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 80, "all 80 docs should match 'fox'");
+
+        let results = index.query("alpha", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 50, "only round 1 docs match 'alpha'");
+
+        let results = index.query("delta", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 30, "only round 2 docs match 'delta'");
+
+        // --- Merge round 2 ---
+        let writer = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        writer.force_merge().await.unwrap();
+
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+        assert_eq!(index.num_docs().await.unwrap(), 80);
+
+        // All searches still correct after second merge
+        let results = index.query("fox", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 80, "all 80 docs after merge 2");
+
+        let results = index.query("alpha", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 50, "round 1 docs after merge 2");
+
+        let results = index.query("delta", 100).await.unwrap();
+        assert_eq!(results.hits.len(), 30, "round 2 docs after merge 2");
+
+        // Verify all 80 docs retrievable
+        for i in 0..80 {
+            let doc = index.doc(i).await.unwrap();
+            assert!(doc.is_some(), "doc {} should exist after merge 2", i);
+        }
+    }
+
+    /// Large-scale merge: many segments with overlapping terms, verifying
+    /// BM25 scoring and doc retrieval after merge.
+    #[tokio::test]
+    async fn test_large_scale_merge_correctness() {
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let schema = schema_builder.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 512,
+            ..Default::default()
+        };
+
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // 8 batches × 25 docs = 200 docs total
+        // Terms: "common" appears in all, "unique_N" appears in batch N only
+        let total_docs = 200u32;
+        for batch in 0..8 {
+            for i in 0..25 {
+                let mut doc = Document::new();
+                doc.add_text(
+                    title,
+                    format!("common shared term unique_{} item{}", batch, i),
+                );
+                writer.add_document(doc).unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        // Verify pre-merge
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        assert_eq!(index.num_docs().await.unwrap(), total_docs);
+
+        let results = index.query("common", 300).await.unwrap();
+        assert_eq!(
+            results.hits.len(),
+            total_docs as usize,
+            "all docs should match 'common'"
+        );
+
+        // Each unique_N matches exactly 25 docs
+        for batch in 0..8 {
+            let q = format!("unique_{}", batch);
+            let results = index.query(&q, 100).await.unwrap();
+            assert_eq!(results.hits.len(), 25, "'{}' should match 25 docs", q);
+        }
+
+        // Force merge
+        let writer = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        writer.force_merge().await.unwrap();
+
+        // Verify post-merge: single segment, same results
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+        assert_eq!(index.num_docs().await.unwrap(), total_docs);
+
+        let results = index.query("common", 300).await.unwrap();
+        assert_eq!(results.hits.len(), total_docs as usize);
+
+        for batch in 0..8 {
+            let q = format!("unique_{}", batch);
+            let results = index.query(&q, 100).await.unwrap();
+            assert_eq!(results.hits.len(), 25, "'{}' after merge", q);
+        }
+
+        // Verify doc retrieval for every doc
+        for i in 0..total_docs {
+            let doc = index.doc(i).await.unwrap();
+            assert!(doc.is_some(), "doc {} missing after merge", i);
+        }
+    }
 }

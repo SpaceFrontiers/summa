@@ -864,4 +864,356 @@ mod tests {
         }
         assert_eq!(iter2.doc(), TERMINATED);
     }
+
+    /// Helper: collect all (doc_id, tf) from a BlockPostingIterator
+    fn collect_postings(bpl: &BlockPostingList) -> Vec<(u32, u32)> {
+        let mut result = Vec::new();
+        let mut it = bpl.iterator();
+        while it.doc() != TERMINATED {
+            result.push((it.doc(), it.term_freq()));
+            it.advance();
+        }
+        result
+    }
+
+    /// Helper: build a BlockPostingList from (doc_id, tf) pairs
+    fn build_bpl(postings: &[(u32, u32)]) -> BlockPostingList {
+        let mut pl = PostingList::new();
+        for &(doc_id, tf) in postings {
+            pl.push(doc_id, tf);
+        }
+        BlockPostingList::from_posting_list(&pl).unwrap()
+    }
+
+    /// Helper: serialize a BlockPostingList to bytes
+    fn serialize_bpl(bpl: &BlockPostingList) -> Vec<u8> {
+        let mut buf = Vec::new();
+        bpl.serialize(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn test_concatenate_blocks_two_segments() {
+        // Segment A: docs 0,2,4,...,198 (100 docs, tf=1..100)
+        let a: Vec<(u32, u32)> = (0..100).map(|i| (i * 2, i + 1)).collect();
+        let bpl_a = build_bpl(&a);
+
+        // Segment B: docs 0,3,6,...,297 (100 docs, tf=2..101)
+        let b: Vec<(u32, u32)> = (0..100).map(|i| (i * 3, i + 2)).collect();
+        let bpl_b = build_bpl(&b);
+
+        // Merge: segment B starts at doc_offset=200
+        let merged =
+            BlockPostingList::concatenate_blocks(&[(bpl_a.clone(), 0), (bpl_b.clone(), 200)])
+                .unwrap();
+
+        assert_eq!(merged.doc_count(), 200);
+
+        let postings = collect_postings(&merged);
+        assert_eq!(postings.len(), 200);
+
+        // First 100 from A (unchanged)
+        for i in 0..100 {
+            assert_eq!(postings[i], (i as u32 * 2, i as u32 + 1));
+        }
+        // Next 100 from B (doc_id += 200)
+        for i in 0..100 {
+            assert_eq!(postings[100 + i], (i as u32 * 3 + 200, i as u32 + 2));
+        }
+    }
+
+    #[test]
+    fn test_concatenate_streaming_matches_blocks() {
+        // Build 3 segments with different doc distributions
+        let seg_a: Vec<(u32, u32)> = (0..250).map(|i| (i * 2, (i % 7) + 1)).collect();
+        let seg_b: Vec<(u32, u32)> = (0..180).map(|i| (i * 5, (i % 3) + 1)).collect();
+        let seg_c: Vec<(u32, u32)> = (0..90).map(|i| (i * 10, (i % 11) + 1)).collect();
+
+        let bpl_a = build_bpl(&seg_a);
+        let bpl_b = build_bpl(&seg_b);
+        let bpl_c = build_bpl(&seg_c);
+
+        let offset_b = 1000u32;
+        let offset_c = 2000u32;
+
+        // Method 1: concatenate_blocks (in-memory reference)
+        let ref_merged = BlockPostingList::concatenate_blocks(&[
+            (bpl_a.clone(), 0),
+            (bpl_b.clone(), offset_b),
+            (bpl_c.clone(), offset_c),
+        ])
+        .unwrap();
+        let mut ref_buf = Vec::new();
+        ref_merged.serialize(&mut ref_buf).unwrap();
+
+        // Method 2: concatenate_streaming (footer-based, writes to output)
+        let bytes_a = serialize_bpl(&bpl_a);
+        let bytes_b = serialize_bpl(&bpl_b);
+        let bytes_c = serialize_bpl(&bpl_c);
+
+        let sources: Vec<(&[u8], u32)> =
+            vec![(&bytes_a, 0), (&bytes_b, offset_b), (&bytes_c, offset_c)];
+        let mut stream_buf = Vec::new();
+        let (doc_count, bytes_written) =
+            BlockPostingList::concatenate_streaming(&sources, &mut stream_buf).unwrap();
+
+        assert_eq!(doc_count, 520); // 250 + 180 + 90
+        assert_eq!(bytes_written, stream_buf.len());
+
+        // Deserialize both and verify identical postings
+        let ref_postings = collect_postings(&BlockPostingList::deserialize(&ref_buf).unwrap());
+        let stream_postings =
+            collect_postings(&BlockPostingList::deserialize(&stream_buf).unwrap());
+
+        assert_eq!(ref_postings.len(), stream_postings.len());
+        for (i, (r, s)) in ref_postings.iter().zip(stream_postings.iter()).enumerate() {
+            assert_eq!(r, s, "mismatch at posting {}", i);
+        }
+    }
+
+    #[test]
+    fn test_multi_round_merge() {
+        // Simulate 3 rounds of merging (like tiered merge policy)
+        //
+        // Round 0: 4 small segments built independently
+        // Round 1: merge pairs → 2 medium segments
+        // Round 2: merge those → 1 large segment
+
+        let segments: Vec<Vec<(u32, u32)>> = (0..4)
+            .map(|seg| (0..200).map(|i| (i * 3, (i + seg * 7) % 10 + 1)).collect())
+            .collect();
+
+        let bpls: Vec<BlockPostingList> = segments.iter().map(|s| build_bpl(s)).collect();
+        let serialized: Vec<Vec<u8>> = bpls.iter().map(|b| serialize_bpl(b)).collect();
+
+        // Round 1: merge seg0+seg1 (offset=0,600), seg2+seg3 (offset=0,600)
+        let mut merged_01 = Vec::new();
+        let sources_01: Vec<(&[u8], u32)> = vec![(&serialized[0], 0), (&serialized[1], 600)];
+        let (dc_01, _) =
+            BlockPostingList::concatenate_streaming(&sources_01, &mut merged_01).unwrap();
+        assert_eq!(dc_01, 400);
+
+        let mut merged_23 = Vec::new();
+        let sources_23: Vec<(&[u8], u32)> = vec![(&serialized[2], 0), (&serialized[3], 600)];
+        let (dc_23, _) =
+            BlockPostingList::concatenate_streaming(&sources_23, &mut merged_23).unwrap();
+        assert_eq!(dc_23, 400);
+
+        // Round 2: merge the two intermediate results (offset=0, 1200)
+        let mut final_merged = Vec::new();
+        let sources_final: Vec<(&[u8], u32)> = vec![(&merged_01, 0), (&merged_23, 1200)];
+        let (dc_final, _) =
+            BlockPostingList::concatenate_streaming(&sources_final, &mut final_merged).unwrap();
+        assert_eq!(dc_final, 800);
+
+        // Verify final result has all 800 postings with correct doc_ids
+        let final_bpl = BlockPostingList::deserialize(&final_merged).unwrap();
+        let postings = collect_postings(&final_bpl);
+        assert_eq!(postings.len(), 800);
+
+        // Verify doc_id ordering (must be monotonically non-decreasing within segments,
+        // and segment boundaries at 0, 600, 1200, 1800)
+        // Seg0: 0..597, Seg1: 600..1197, Seg2: 1200..1797, Seg3: 1800..2397
+        assert_eq!(postings[0].0, 0); // first doc of seg0
+        assert_eq!(postings[199].0, 597); // last doc of seg0 (199*3)
+        assert_eq!(postings[200].0, 600); // first doc of seg1 (0+600)
+        assert_eq!(postings[399].0, 1197); // last doc of seg1 (597+600)
+        assert_eq!(postings[400].0, 1200); // first doc of seg2
+        assert_eq!(postings[799].0, 2397); // last doc of seg3
+
+        // Verify TFs preserved through two rounds of merging
+        // Creation formula: tf = (i + seg * 7) % 10 + 1
+        for i in 0..200 {
+            assert_eq!(postings[i].1, (i as u32 + 0 * 7) % 10 + 1, "seg0 tf[{}]", i);
+        }
+        for i in 0..200 {
+            assert_eq!(
+                postings[200 + i].1,
+                (i as u32 + 1 * 7) % 10 + 1,
+                "seg1 tf[{}]",
+                i
+            );
+        }
+        for i in 0..200 {
+            assert_eq!(
+                postings[400 + i].1,
+                (i as u32 + 2 * 7) % 10 + 1,
+                "seg2 tf[{}]",
+                i
+            );
+        }
+        for i in 0..200 {
+            assert_eq!(
+                postings[600 + i].1,
+                (i as u32 + 3 * 7) % 10 + 1,
+                "seg3 tf[{}]",
+                i
+            );
+        }
+
+        // Verify seek works on final merged result
+        let mut it = final_bpl.iterator();
+        assert_eq!(it.seek(600), 600);
+        assert_eq!(it.seek(1200), 1200);
+        assert_eq!(it.seek(2397), 2397);
+        assert_eq!(it.seek(2398), TERMINATED);
+    }
+
+    #[test]
+    fn test_large_scale_merge() {
+        // 5 segments × 2000 docs each = 10,000 total docs
+        // Each segment has 16 blocks (2000/128 = 15.6 → 16 blocks)
+        let num_segments = 5;
+        let docs_per_segment = 2000;
+        let docs_gap = 3; // doc_ids: 0, 3, 6, ...
+
+        let segments: Vec<Vec<(u32, u32)>> = (0..num_segments)
+            .map(|seg| {
+                (0..docs_per_segment)
+                    .map(|i| (i as u32 * docs_gap, (i as u32 + seg as u32) % 20 + 1))
+                    .collect()
+            })
+            .collect();
+
+        let bpls: Vec<BlockPostingList> = segments.iter().map(|s| build_bpl(s)).collect();
+
+        // Verify each segment has multiple blocks
+        for bpl in &bpls {
+            assert!(
+                bpl.num_blocks() >= 15,
+                "expected >=15 blocks, got {}",
+                bpl.num_blocks()
+            );
+        }
+
+        let serialized: Vec<Vec<u8>> = bpls.iter().map(|b| serialize_bpl(b)).collect();
+
+        // Compute offsets: each segment occupies max_doc+1 doc_id space
+        let max_doc_per_seg = (docs_per_segment as u32 - 1) * docs_gap;
+        let offsets: Vec<u32> = (0..num_segments)
+            .map(|i| i as u32 * (max_doc_per_seg + 1))
+            .collect();
+
+        let sources: Vec<(&[u8], u32)> = serialized
+            .iter()
+            .zip(offsets.iter())
+            .map(|(b, o)| (b.as_slice(), *o))
+            .collect();
+
+        let mut merged = Vec::new();
+        let (doc_count, _) =
+            BlockPostingList::concatenate_streaming(&sources, &mut merged).unwrap();
+        assert_eq!(doc_count, (num_segments * docs_per_segment) as u32);
+
+        // Deserialize and verify
+        let merged_bpl = BlockPostingList::deserialize(&merged).unwrap();
+        let postings = collect_postings(&merged_bpl);
+        assert_eq!(postings.len(), num_segments * docs_per_segment);
+
+        // Verify all doc_ids are strictly monotonically increasing across segment boundaries
+        for i in 1..postings.len() {
+            assert!(
+                postings[i].0 > postings[i - 1].0 || (i % docs_per_segment == 0), // new segment can have lower absolute ID
+                "doc_id not increasing at {}: {} vs {}",
+                i,
+                postings[i - 1].0,
+                postings[i].0,
+            );
+        }
+
+        // Verify seek across all block boundaries
+        let mut it = merged_bpl.iterator();
+        for seg in 0..num_segments {
+            let expected_first = offsets[seg];
+            assert_eq!(
+                it.seek(expected_first),
+                expected_first,
+                "seek to segment {} start",
+                seg
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_edge_cases() {
+        // Single doc per segment
+        let bpl_a = build_bpl(&[(0, 5)]);
+        let bpl_b = build_bpl(&[(0, 3)]);
+
+        let merged =
+            BlockPostingList::concatenate_blocks(&[(bpl_a.clone(), 0), (bpl_b.clone(), 1)])
+                .unwrap();
+        assert_eq!(merged.doc_count(), 2);
+        let p = collect_postings(&merged);
+        assert_eq!(p, vec![(0, 5), (1, 3)]);
+
+        // Exactly BLOCK_SIZE docs (single full block)
+        let exact_block: Vec<(u32, u32)> = (0..BLOCK_SIZE as u32).map(|i| (i, i % 5 + 1)).collect();
+        let bpl_exact = build_bpl(&exact_block);
+        assert_eq!(bpl_exact.num_blocks(), 1);
+
+        let bytes = serialize_bpl(&bpl_exact);
+        let mut out = Vec::new();
+        let sources: Vec<(&[u8], u32)> = vec![(&bytes, 0), (&bytes, BLOCK_SIZE as u32)];
+        let (dc, _) = BlockPostingList::concatenate_streaming(&sources, &mut out).unwrap();
+        assert_eq!(dc, BLOCK_SIZE as u32 * 2);
+
+        let merged = BlockPostingList::deserialize(&out).unwrap();
+        let postings = collect_postings(&merged);
+        assert_eq!(postings.len(), BLOCK_SIZE * 2);
+        // Second segment's docs offset by BLOCK_SIZE
+        assert_eq!(postings[BLOCK_SIZE].0, BLOCK_SIZE as u32);
+
+        // BLOCK_SIZE + 1 docs (two blocks: 128 + 1)
+        let over_block: Vec<(u32, u32)> = (0..BLOCK_SIZE as u32 + 1).map(|i| (i * 2, 1)).collect();
+        let bpl_over = build_bpl(&over_block);
+        assert_eq!(bpl_over.num_blocks(), 2);
+    }
+
+    #[test]
+    fn test_streaming_roundtrip_single_source() {
+        // Streaming merge with a single source should produce equivalent output to serialize
+        let docs: Vec<(u32, u32)> = (0..500).map(|i| (i * 7, i % 15 + 1)).collect();
+        let bpl = build_bpl(&docs);
+        let direct = serialize_bpl(&bpl);
+
+        let sources: Vec<(&[u8], u32)> = vec![(&direct, 0)];
+        let mut streamed = Vec::new();
+        BlockPostingList::concatenate_streaming(&sources, &mut streamed).unwrap();
+
+        // Both should deserialize to identical postings
+        let p1 = collect_postings(&BlockPostingList::deserialize(&direct).unwrap());
+        let p2 = collect_postings(&BlockPostingList::deserialize(&streamed).unwrap());
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn test_max_tf_preserved_through_merge() {
+        // Segment A: max_tf = 50
+        let mut a = Vec::new();
+        for i in 0..200 {
+            a.push((i * 2, if i == 100 { 50 } else { 1 }));
+        }
+        let bpl_a = build_bpl(&a);
+        assert_eq!(bpl_a.max_tf(), 50);
+
+        // Segment B: max_tf = 30
+        let mut b = Vec::new();
+        for i in 0..200 {
+            b.push((i * 2, if i == 50 { 30 } else { 2 }));
+        }
+        let bpl_b = build_bpl(&b);
+        assert_eq!(bpl_b.max_tf(), 30);
+
+        // After merge, max_tf should be max(50, 30) = 50
+        let bytes_a = serialize_bpl(&bpl_a);
+        let bytes_b = serialize_bpl(&bpl_b);
+        let sources: Vec<(&[u8], u32)> = vec![(&bytes_a, 0), (&bytes_b, 1000)];
+        let mut out = Vec::new();
+        BlockPostingList::concatenate_streaming(&sources, &mut out).unwrap();
+
+        let merged = BlockPostingList::deserialize(&out).unwrap();
+        assert_eq!(merged.max_tf(), 50);
+        assert_eq!(merged.doc_count(), 400);
+    }
 }
