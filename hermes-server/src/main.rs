@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
         registry: Arc::clone(&registry),
     };
 
+    info!("Hermes server v{}", env!("CARGO_PKG_VERSION"));
     info!("Starting Hermes server on {}", addr);
     info!("Data directory: {:?}", args.data_dir);
     info!("Max indexing memory: {} MB", args.max_indexing_memory_mb);
