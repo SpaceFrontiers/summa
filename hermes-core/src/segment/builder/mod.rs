@@ -124,6 +124,9 @@ pub struct SegmentBuilder {
 
     /// Incrementally tracked memory estimate (avoids expensive stats() calls)
     estimated_memory: usize,
+
+    /// Reusable buffer for document serialization (avoids per-document allocation)
+    doc_serialize_buffer: Vec<u8>,
 }
 
 impl SegmentBuilder {
@@ -181,6 +184,7 @@ impl SegmentBuilder {
             position_enabled_fields,
             current_element_ordinal: FxHashMap::default(),
             estimated_memory: 0,
+            doc_serialize_buffer: Vec::with_capacity(256),
         })
     }
 
@@ -649,15 +653,15 @@ impl SegmentBuilder {
         Ok(())
     }
 
-    /// Write document to streaming store
+    /// Write document to streaming store (reuses internal buffer to avoid per-doc allocation)
     fn write_document_to_store(&mut self, doc: &Document) -> Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
 
-        let doc_bytes = super::store::serialize_document(doc, &self.schema)?;
+        super::store::serialize_document_into(doc, &self.schema, &mut self.doc_serialize_buffer)?;
 
         self.store_file
-            .write_u32::<LittleEndian>(doc_bytes.len() as u32)?;
-        self.store_file.write_all(&doc_bytes)?;
+            .write_u32::<LittleEndian>(self.doc_serialize_buffer.len() as u32)?;
+        self.store_file.write_all(&self.doc_serialize_buffer)?;
 
         Ok(())
     }

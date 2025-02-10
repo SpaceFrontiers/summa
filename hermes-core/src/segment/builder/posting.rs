@@ -28,7 +28,7 @@ pub(super) struct PostingListBuilder {
 impl PostingListBuilder {
     pub fn new() -> Self {
         Self {
-            postings: Vec::new(),
+            postings: Vec::with_capacity(4),
         }
     }
 
@@ -75,7 +75,9 @@ impl PositionPostingListBuilder {
             positions.push(position);
             return;
         }
-        self.postings.push((doc_id, vec![position]));
+        let mut positions = Vec::with_capacity(4);
+        positions.push(position);
+        self.postings.push((doc_id, positions));
     }
 }
 

@@ -69,7 +69,9 @@ impl IndexService for IndexServiceImpl {
         let doc_count = documents.len() as u32;
         let indexed_count = {
             let w = writer.read().await;
-            w.add_documents(documents).unwrap_or(0) as u32
+            w.add_documents(documents)
+                .map_err(|e| Status::internal(format!("Failed to index documents: {}", e)))?
+                as u32
         };
         let index_errors = doc_count - indexed_count;
 

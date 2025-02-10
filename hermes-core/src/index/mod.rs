@@ -81,7 +81,7 @@ impl Default for IndexConfig {
 
         Self {
             num_threads: indexing_threads,
-            num_indexing_threads: 1,
+            num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
             term_cache_blocks: 256,
             store_cache_blocks: 32,

@@ -75,7 +75,21 @@ const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel(7);
 ///     6=DenseVector:  count:u32 + count*f32
 ///     7=Json:         len:u32 + json utf8
 pub fn serialize_document(doc: &Document, schema: &Schema) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(256);
+    serialize_document_into(doc, schema, &mut buf)?;
+    Ok(buf)
+}
+
+/// Serialize a document into a reusable buffer (clears it first).
+/// Avoids per-document allocation when called in a loop.
+pub fn serialize_document_into(
+    doc: &Document,
+    schema: &Schema,
+    buf: &mut Vec<u8>,
+) -> io::Result<()> {
     use crate::dsl::FieldValue;
+
+    buf.clear();
 
     let stored: Vec<_> = doc
         .field_values()
@@ -89,7 +103,6 @@ pub fn serialize_document(doc: &Document, schema: &Schema) -> io::Result<Vec<u8>
         })
         .collect();
 
-    let mut buf = Vec::with_capacity(256);
     buf.write_u16::<LittleEndian>(stored.len() as u16)?;
 
     for (field, value) in &stored {
@@ -145,7 +158,7 @@ pub fn serialize_document(doc: &Document, schema: &Schema) -> io::Result<Vec<u8>
         }
     }
 
-    Ok(buf)
+    Ok(())
 }
 
 /// Compressed block result
