@@ -172,12 +172,11 @@ impl ScoreCollector {
 
     /// Convert to sorted top-k results (descending by score)
     pub fn into_sorted_results(self) -> Vec<(DocId, f32, u16)> {
-        let mut results: Vec<_> = self
-            .heap
-            .into_vec()
-            .into_iter()
-            .map(|e| (e.doc_id, e.score, e.ordinal))
-            .collect();
+        let heap_vec = self.heap.into_vec();
+        let mut results: Vec<(DocId, f32, u16)> = Vec::with_capacity(heap_vec.len());
+        for e in heap_vec {
+            results.push((e.doc_id, e.score, e.ordinal));
+        }
 
         // Sort by score descending, then doc_id ascending
         results.sort_by(|a, b| {
@@ -744,6 +743,11 @@ impl<'a> BmpExecutor<'a> {
         // the old O(n) select_nth_unstable every 32 blocks.
         let mut top_k = ScoreCollector::new(self.k);
 
+        // Reusable decode buffers — avoids 3 allocations per block
+        let mut doc_ids_buf: Vec<u32> = Vec::with_capacity(128);
+        let mut weights_buf: Vec<f32> = Vec::with_capacity(128);
+        let mut ordinals_buf: Vec<u16> = Vec::with_capacity(128);
+
         // Process blocks in contribution-descending order, loading each on-demand
         while let Some(entry) = block_queue.pop() {
             // Update remaining max for this term
@@ -769,21 +773,21 @@ impl<'a> BmpExecutor<'a> {
                 None => continue,
             };
 
-            // Decode and accumulate scores
-            let doc_ids = block.decode_doc_ids();
-            let weights = block.decode_weights();
-            let ordinals = block.decode_ordinals();
+            // Decode into reusable buffers (avoids alloc per block)
+            block.decode_doc_ids_into(&mut doc_ids_buf);
+            block.decode_weights_into(&mut weights_buf);
+            block.decode_ordinals_into(&mut ordinals_buf);
             let qw = self.query_terms[entry.term_idx].1;
 
             for i in 0..block.header.count as usize {
-                let score_contribution = qw * weights[i];
-                let key = (doc_ids[i] as u64) << 16 | ordinals[i] as u64;
+                let score_contribution = qw * weights_buf[i];
+                let key = (doc_ids_buf[i] as u64) << 16 | ordinals_buf[i] as u64;
                 let acc = accumulators.entry(key).or_insert(0.0);
                 *acc += score_contribution;
                 // Update top-k tracker with new accumulated score.
                 // ScoreCollector handles duplicates by keeping the entry with
                 // the highest score — stale lower entries are evicted naturally.
-                top_k.insert_with_ordinal(doc_ids[i], *acc, ordinals[i]);
+                top_k.insert_with_ordinal(doc_ids_buf[i], *acc, ordinals_buf[i]);
             }
 
             blocks_processed += 1;

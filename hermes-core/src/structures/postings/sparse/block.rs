@@ -127,36 +127,59 @@ impl SparseBlock {
     }
 
     pub fn decode_doc_ids(&self) -> Vec<DocId> {
+        let mut out = Vec::with_capacity(self.header.count as usize);
+        self.decode_doc_ids_into(&mut out);
+        out
+    }
+
+    /// Decode doc IDs into an existing Vec (avoids allocation on reuse).
+    pub fn decode_doc_ids_into(&self, out: &mut Vec<DocId>) {
         let count = self.header.count as usize;
-        let mut doc_ids = Vec::with_capacity(count);
-        doc_ids.push(self.header.first_doc_id);
+        out.clear();
+        out.push(self.header.first_doc_id);
 
         if count > 1 {
             let deltas = unpack_bit_array(&self.doc_ids_data, self.header.doc_id_bits, count - 1);
             let mut prev = self.header.first_doc_id;
             for delta in deltas {
                 prev += delta;
-                doc_ids.push(prev);
+                out.push(prev);
             }
         }
-        doc_ids
     }
 
     pub fn decode_ordinals(&self) -> Vec<u16> {
+        let mut out = Vec::with_capacity(self.header.count as usize);
+        self.decode_ordinals_into(&mut out);
+        out
+    }
+
+    /// Decode ordinals into an existing Vec (avoids allocation on reuse).
+    pub fn decode_ordinals_into(&self, out: &mut Vec<u16>) {
         let count = self.header.count as usize;
+        out.clear();
         if self.header.ordinal_bits == 0 {
-            vec![0u16; count]
+            out.resize(count, 0u16);
         } else {
-            unpack_bit_array_u16(&self.ordinals_data, self.header.ordinal_bits, count)
+            unpack_bit_array_u16_into(&self.ordinals_data, self.header.ordinal_bits, count, out);
         }
     }
 
     pub fn decode_weights(&self) -> Vec<f32> {
-        decode_weights(
+        let mut out = Vec::with_capacity(self.header.count as usize);
+        self.decode_weights_into(&mut out);
+        out
+    }
+
+    /// Decode weights into an existing Vec (avoids allocation on reuse).
+    pub fn decode_weights_into(&self, out: &mut Vec<f32>) {
+        out.clear();
+        decode_weights_into(
             &self.weights_data,
             self.header.weight_quant,
             self.header.count as usize,
-        )
+            out,
+        );
     }
 
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -498,9 +521,9 @@ impl<'a> BlockSparsePostingIterator<'a> {
 
     fn load_block(&mut self, block_idx: usize) {
         if let Some(block) = self.posting_list.blocks.get(block_idx) {
-            self.current_doc_ids = block.decode_doc_ids();
-            self.current_ordinals = block.decode_ordinals();
-            self.current_weights = block.decode_weights();
+            block.decode_doc_ids_into(&mut self.current_doc_ids);
+            block.decode_ordinals_into(&mut self.current_ordinals);
+            block.decode_weights_into(&mut self.current_weights);
             self.block_idx = block_idx;
             self.in_block_idx = 0;
         }
@@ -708,17 +731,16 @@ fn unpack_bit_array(data: &[u8], bits: u8, count: usize) -> Vec<u32> {
     result
 }
 
-fn unpack_bit_array_u16(data: &[u8], bits: u8, count: usize) -> Vec<u16> {
+fn unpack_bit_array_u16_into(data: &[u8], bits: u8, count: usize, out: &mut Vec<u16>) {
     if bits == 0 || count == 0 {
-        return vec![0; count];
+        out.resize(count, 0u16);
+        return;
     }
-    let mut result = Vec::with_capacity(count);
     let mut bit_pos = 0usize;
     for _ in 0..count {
-        result.push(unpack_value(data, bit_pos, bits) as u16);
+        out.push(unpack_value(data, bit_pos, bits) as u16);
         bit_pos += bits as usize;
     }
-    result
 }
 
 #[inline]
@@ -801,20 +823,19 @@ fn encode_weights(weights: &[f32], quant: WeightQuantization) -> io::Result<Vec<
     Ok(data)
 }
 
-fn decode_weights(data: &[u8], quant: WeightQuantization, count: usize) -> Vec<f32> {
+fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out: &mut Vec<f32>) {
     let mut cursor = Cursor::new(data);
-    let mut weights = Vec::with_capacity(count);
     match quant {
         WeightQuantization::Float32 => {
             for _ in 0..count {
-                weights.push(cursor.read_f32::<LittleEndian>().unwrap_or(0.0));
+                out.push(cursor.read_f32::<LittleEndian>().unwrap_or(0.0));
             }
         }
         WeightQuantization::Float16 => {
             use half::f16;
             for _ in 0..count {
                 let bits = cursor.read_u16::<LittleEndian>().unwrap_or(0);
-                weights.push(f16::from_bits(bits).to_f32());
+                out.push(f16::from_bits(bits).to_f32());
             }
         }
         WeightQuantization::UInt8 => {
@@ -822,7 +843,7 @@ fn decode_weights(data: &[u8], quant: WeightQuantization, count: usize) -> Vec<f
             let min = cursor.read_f32::<LittleEndian>().unwrap_or(0.0);
             for _ in 0..count {
                 let q = cursor.read_u8().unwrap_or(0);
-                weights.push(q as f32 * scale + min);
+                out.push(q as f32 * scale + min);
             }
         }
         WeightQuantization::UInt4 => {
@@ -831,16 +852,15 @@ fn decode_weights(data: &[u8], quant: WeightQuantization, count: usize) -> Vec<f
             let mut i = 0;
             while i < count {
                 let byte = cursor.read_u8().unwrap_or(0);
-                weights.push((byte & 0x0F) as f32 * scale + min);
+                out.push((byte & 0x0F) as f32 * scale + min);
                 i += 1;
                 if i < count {
-                    weights.push((byte >> 4) as f32 * scale + min);
+                    out.push((byte >> 4) as f32 * scale + min);
                     i += 1;
                 }
             }
         }
     }
-    weights
 }
 
 #[cfg(test)]
