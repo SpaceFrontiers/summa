@@ -560,7 +560,7 @@ impl<'a> BlockSparsePostingIterator<'a> {
             && last_doc >= target
         {
             let remaining = &self.current_doc_ids[self.in_block_idx..];
-            let pos = remaining.partition_point(|&d| d < target);
+            let pos = crate::structures::simd::find_first_ge_u32(remaining, target);
             self.in_block_idx += pos;
             if self.in_block_idx >= self.current_doc_ids.len() {
                 self.block_idx += 1;
@@ -576,7 +576,7 @@ impl<'a> BlockSparsePostingIterator<'a> {
         // Find correct block
         if let Some(block_idx) = self.posting_list.find_block(target) {
             self.load_block(block_idx);
-            let pos = self.current_doc_ids.partition_point(|&d| d < target);
+            let pos = crate::structures::simd::find_first_ge_u32(&self.current_doc_ids, target);
             self.in_block_idx = pos;
             if self.in_block_idx >= self.current_doc_ids.len() {
                 self.block_idx += 1;

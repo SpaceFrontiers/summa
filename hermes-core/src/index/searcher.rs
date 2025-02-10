@@ -546,6 +546,19 @@ impl<D: Directory + 'static> Searcher<D> {
         &self,
         address: &crate::query::DocAddress,
     ) -> Result<Option<crate::dsl::Document>> {
+        self.get_document_with_fields(address, None).await
+    }
+
+    /// Get a document by address, hydrating only the specified field IDs.
+    ///
+    /// If `fields` is `None`, all fields are hydrated (including dense vectors).
+    /// If `fields` is `Some(set)`, only dense vector fields in the set are read
+    /// from flat storage — skipping expensive mmap reads for unrequested vectors.
+    pub async fn get_document_with_fields(
+        &self,
+        address: &crate::query::DocAddress,
+        fields: Option<&rustc_hash::FxHashSet<u32>>,
+    ) -> Result<Option<crate::dsl::Document>> {
         let segment_id = address.segment_id_u128().ok_or_else(|| {
             crate::error::Error::Query(format!("Invalid segment ID: {}", address.segment_id))
         })?;
@@ -553,7 +566,7 @@ impl<D: Directory + 'static> Searcher<D> {
         if let Some(&idx) = self.segment_map.get(&segment_id) {
             let segment = &self.segments[idx];
             let local_doc_id = address.doc_id.wrapping_sub(segment.doc_id_offset());
-            return segment.doc(local_doc_id).await;
+            return segment.doc_with_fields(local_doc_id, fields).await;
         }
 
         Ok(None)

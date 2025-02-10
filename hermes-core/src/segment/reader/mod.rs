@@ -299,6 +299,19 @@ impl AsyncSegmentReader {
     /// Dense vector fields are hydrated from LazyFlatVectorData (not stored in .store).
     /// Uses binary search on sorted doc_ids for O(log N) lookup.
     pub async fn doc(&self, local_doc_id: DocId) -> Result<Option<Document>> {
+        self.doc_with_fields(local_doc_id, None).await
+    }
+
+    /// Get document by local doc_id, hydrating only the specified fields.
+    ///
+    /// If `fields` is `None`, all fields (including dense vectors) are hydrated.
+    /// If `fields` is `Some(set)`, only dense vector fields in the set are hydrated,
+    /// skipping expensive mmap reads + dequantization for unrequested vector fields.
+    pub async fn doc_with_fields(
+        &self,
+        local_doc_id: DocId,
+        fields: Option<&rustc_hash::FxHashSet<u32>>,
+    ) -> Result<Option<Document>> {
         let mut doc = match self.store.get(local_doc_id, &self.schema).await {
             Ok(Some(d)) => d,
             Ok(None) => return Ok(None),
@@ -307,6 +320,13 @@ impl AsyncSegmentReader {
 
         // Hydrate dense vector fields from flat vector data
         for (&field_id, lazy_flat) in &self.flat_vectors {
+            // Skip vector fields not in the requested set
+            if let Some(set) = fields
+                && !set.contains(&field_id)
+            {
+                continue;
+            }
+
             let (start, entries) = lazy_flat.flat_indexes_for_doc(local_doc_id);
             for (j, &(_doc_id, _ordinal)) in entries.iter().enumerate() {
                 let flat_idx = start + j;

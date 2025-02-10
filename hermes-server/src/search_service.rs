@@ -68,6 +68,21 @@ impl SearchService for SearchServiceImpl {
                 .map_err(|e| Status::internal(format!("Search failed: {}", e)))?
         };
 
+        // Resolve requested field names to field IDs once (not per-hit).
+        // Only vector fields in this set will be hydrated from flat storage.
+        let requested_field_ids: Option<rustc_hash::FxHashSet<u32>> =
+            if req.fields_to_load.is_empty() {
+                None
+            } else {
+                Some(
+                    req.fields_to_load
+                        .iter()
+                        .filter_map(|name| searcher.schema().get_field(name))
+                        .map(|f| f.0)
+                        .collect(),
+                )
+            };
+
         // Convert to response with optional field loading
         let mut hits = Vec::new();
         for result in results {
@@ -75,10 +90,10 @@ impl SearchService for SearchServiceImpl {
 
             if !req.fields_to_load.is_empty()
                 && let Ok(Some(doc)) = searcher
-                    .get_document(&hermes_core::query::DocAddress::new(
-                        result.segment_id,
-                        result.doc_id,
-                    ))
+                    .get_document_with_fields(
+                        &hermes_core::query::DocAddress::new(result.segment_id, result.doc_id),
+                        requested_field_ids.as_ref(),
+                    )
                     .await
             {
                 for field_name in &req.fields_to_load {

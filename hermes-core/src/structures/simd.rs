@@ -3172,3 +3172,255 @@ mod tests {
         assert!(scores[1] > 0.99, "scaled-sim: {}", scores[1]);
     }
 }
+
+// ============================================================================
+// SIMD-accelerated linear scan for sorted u32 slices (within-block seek)
+// ============================================================================
+
+/// Find index of first element >= `target` in a sorted `u32` slice.
+///
+/// Equivalent to `slice.partition_point(|&d| d < target)` but uses SIMD to
+/// scan 4 elements per cycle. Faster than binary search for slices ≤ 256
+/// elements because it avoids the data-dependency chain inherent in binary
+/// search (~8-10 cycles/iteration vs ~1-2 cycles/iteration for SIMD scan).
+///
+/// Returns `slice.len()` if no element >= `target`.
+#[inline]
+pub fn find_first_ge_u32(slice: &[u32], target: u32) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon::is_available() {
+            return unsafe { find_first_ge_u32_neon(slice, target) };
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse::is_available() {
+            return unsafe { find_first_ge_u32_sse(slice, target) };
+        }
+    }
+
+    // Scalar fallback (WASM, other architectures)
+    slice.partition_point(|&d| d < target)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn find_first_ge_u32_neon(slice: &[u32], target: u32) -> usize {
+    use std::arch::aarch64::*;
+
+    let n = slice.len();
+    let ptr = slice.as_ptr();
+    let target_vec = vdupq_n_u32(target);
+    // Bit positions for each lane: [1, 2, 4, 8]
+    let bit_mask: uint32x4_t = core::mem::transmute([1u32, 2u32, 4u32, 8u32]);
+
+    let chunks = n / 16;
+    let mut base = 0usize;
+
+    // Process 16 elements per iteration (4 × 4-wide NEON compares)
+    for _ in 0..chunks {
+        let v0 = vld1q_u32(ptr.add(base));
+        let v1 = vld1q_u32(ptr.add(base + 4));
+        let v2 = vld1q_u32(ptr.add(base + 8));
+        let v3 = vld1q_u32(ptr.add(base + 12));
+
+        let c0 = vcgeq_u32(v0, target_vec);
+        let c1 = vcgeq_u32(v1, target_vec);
+        let c2 = vcgeq_u32(v2, target_vec);
+        let c3 = vcgeq_u32(v3, target_vec);
+
+        let m0 = vaddvq_u32(vandq_u32(c0, bit_mask));
+        if m0 != 0 {
+            return base + m0.trailing_zeros() as usize;
+        }
+        let m1 = vaddvq_u32(vandq_u32(c1, bit_mask));
+        if m1 != 0 {
+            return base + 4 + m1.trailing_zeros() as usize;
+        }
+        let m2 = vaddvq_u32(vandq_u32(c2, bit_mask));
+        if m2 != 0 {
+            return base + 8 + m2.trailing_zeros() as usize;
+        }
+        let m3 = vaddvq_u32(vandq_u32(c3, bit_mask));
+        if m3 != 0 {
+            return base + 12 + m3.trailing_zeros() as usize;
+        }
+        base += 16;
+    }
+
+    // Process remaining 4 elements at a time
+    while base + 4 <= n {
+        let vals = vld1q_u32(ptr.add(base));
+        let cmp = vcgeq_u32(vals, target_vec);
+        let mask = vaddvq_u32(vandq_u32(cmp, bit_mask));
+        if mask != 0 {
+            return base + mask.trailing_zeros() as usize;
+        }
+        base += 4;
+    }
+
+    // Scalar remainder (0-3 elements)
+    while base < n {
+        if *slice.get_unchecked(base) >= target {
+            return base;
+        }
+        base += 1;
+    }
+    n
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2", enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn find_first_ge_u32_sse(slice: &[u32], target: u32) -> usize {
+    use std::arch::x86_64::*;
+
+    let n = slice.len();
+    let ptr = slice.as_ptr();
+
+    // For unsigned >= comparison: XOR with 0x80000000 converts to signed domain
+    let sign_flip = _mm_set1_epi32(i32::MIN);
+    let target_xor = _mm_xor_si128(_mm_set1_epi32(target as i32), sign_flip);
+
+    let chunks = n / 16;
+    let mut base = 0usize;
+
+    // Process 16 elements per iteration (4 × 4-wide SSE compares)
+    for _ in 0..chunks {
+        let v0 = _mm_xor_si128(_mm_loadu_si128(ptr.add(base) as *const __m128i), sign_flip);
+        let v1 = _mm_xor_si128(
+            _mm_loadu_si128(ptr.add(base + 4) as *const __m128i),
+            sign_flip,
+        );
+        let v2 = _mm_xor_si128(
+            _mm_loadu_si128(ptr.add(base + 8) as *const __m128i),
+            sign_flip,
+        );
+        let v3 = _mm_xor_si128(
+            _mm_loadu_si128(ptr.add(base + 12) as *const __m128i),
+            sign_flip,
+        );
+
+        // ge = eq | gt (in signed domain after XOR)
+        let ge0 = _mm_or_si128(
+            _mm_cmpeq_epi32(v0, target_xor),
+            _mm_cmpgt_epi32(v0, target_xor),
+        );
+        let m0 = _mm_movemask_ps(_mm_castsi128_ps(ge0)) as u32;
+        if m0 != 0 {
+            return base + m0.trailing_zeros() as usize;
+        }
+
+        let ge1 = _mm_or_si128(
+            _mm_cmpeq_epi32(v1, target_xor),
+            _mm_cmpgt_epi32(v1, target_xor),
+        );
+        let m1 = _mm_movemask_ps(_mm_castsi128_ps(ge1)) as u32;
+        if m1 != 0 {
+            return base + 4 + m1.trailing_zeros() as usize;
+        }
+
+        let ge2 = _mm_or_si128(
+            _mm_cmpeq_epi32(v2, target_xor),
+            _mm_cmpgt_epi32(v2, target_xor),
+        );
+        let m2 = _mm_movemask_ps(_mm_castsi128_ps(ge2)) as u32;
+        if m2 != 0 {
+            return base + 8 + m2.trailing_zeros() as usize;
+        }
+
+        let ge3 = _mm_or_si128(
+            _mm_cmpeq_epi32(v3, target_xor),
+            _mm_cmpgt_epi32(v3, target_xor),
+        );
+        let m3 = _mm_movemask_ps(_mm_castsi128_ps(ge3)) as u32;
+        if m3 != 0 {
+            return base + 12 + m3.trailing_zeros() as usize;
+        }
+        base += 16;
+    }
+
+    // Process remaining 4 elements at a time
+    while base + 4 <= n {
+        let vals = _mm_xor_si128(_mm_loadu_si128(ptr.add(base) as *const __m128i), sign_flip);
+        let ge = _mm_or_si128(
+            _mm_cmpeq_epi32(vals, target_xor),
+            _mm_cmpgt_epi32(vals, target_xor),
+        );
+        let mask = _mm_movemask_ps(_mm_castsi128_ps(ge)) as u32;
+        if mask != 0 {
+            return base + mask.trailing_zeros() as usize;
+        }
+        base += 4;
+    }
+
+    // Scalar remainder (0-3 elements)
+    while base < n {
+        if *slice.get_unchecked(base) >= target {
+            return base;
+        }
+        base += 1;
+    }
+    n
+}
+
+#[cfg(test)]
+mod find_first_ge_tests {
+    use super::find_first_ge_u32;
+
+    #[test]
+    fn test_find_first_ge_basic() {
+        let data: Vec<u32> = (0..128).map(|i| i * 3).collect(); // [0, 3, 6, ..., 381]
+        assert_eq!(find_first_ge_u32(&data, 0), 0);
+        assert_eq!(find_first_ge_u32(&data, 1), 1); // first >= 1 is 3 at idx 1
+        assert_eq!(find_first_ge_u32(&data, 3), 1);
+        assert_eq!(find_first_ge_u32(&data, 4), 2); // first >= 4 is 6 at idx 2
+        assert_eq!(find_first_ge_u32(&data, 381), 127);
+        assert_eq!(find_first_ge_u32(&data, 382), 128); // past end
+    }
+
+    #[test]
+    fn test_find_first_ge_matches_partition_point() {
+        let data: Vec<u32> = vec![1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75];
+        for target in 0..80 {
+            let expected = data.partition_point(|&d| d < target);
+            let actual = find_first_ge_u32(&data, target);
+            assert_eq!(actual, expected, "target={}", target);
+        }
+    }
+
+    #[test]
+    fn test_find_first_ge_small_slices() {
+        // Empty
+        assert_eq!(find_first_ge_u32(&[], 5), 0);
+        // Single element
+        assert_eq!(find_first_ge_u32(&[10], 5), 0);
+        assert_eq!(find_first_ge_u32(&[10], 10), 0);
+        assert_eq!(find_first_ge_u32(&[10], 11), 1);
+        // Three elements (< SIMD width)
+        assert_eq!(find_first_ge_u32(&[2, 4, 6], 5), 2);
+    }
+
+    #[test]
+    fn test_find_first_ge_full_block() {
+        // Simulate a full 128-entry block
+        let data: Vec<u32> = (100..228).collect();
+        assert_eq!(find_first_ge_u32(&data, 100), 0);
+        assert_eq!(find_first_ge_u32(&data, 150), 50);
+        assert_eq!(find_first_ge_u32(&data, 227), 127);
+        assert_eq!(find_first_ge_u32(&data, 228), 128);
+        assert_eq!(find_first_ge_u32(&data, 99), 0);
+    }
+
+    #[test]
+    fn test_find_first_ge_u32_max() {
+        // Test with large u32 values (unsigned correctness)
+        let data = vec![u32::MAX - 10, u32::MAX - 5, u32::MAX - 1, u32::MAX];
+        assert_eq!(find_first_ge_u32(&data, u32::MAX - 10), 0);
+        assert_eq!(find_first_ge_u32(&data, u32::MAX - 7), 1);
+        assert_eq!(find_first_ge_u32(&data, u32::MAX), 3);
+    }
+}

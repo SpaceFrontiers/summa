@@ -585,6 +585,7 @@ pub struct BlockPostingIterator<'a> {
     block_list: std::borrow::Cow<'a, BlockPostingList>,
     current_block: usize,
     block_postings: Vec<Posting>,
+    block_doc_ids: Vec<u32>,
     position_in_block: usize,
     exhausted: bool,
 }
@@ -600,6 +601,7 @@ impl<'a> BlockPostingIterator<'a> {
             block_list: std::borrow::Cow::Borrowed(block_list),
             current_block: 0,
             block_postings: Vec::new(),
+            block_doc_ids: Vec::new(),
             position_in_block: 0,
             exhausted,
         };
@@ -615,6 +617,7 @@ impl<'a> BlockPostingIterator<'a> {
             block_list: std::borrow::Cow::Owned(block_list),
             current_block: 0,
             block_postings: Vec::new(),
+            block_doc_ids: Vec::new(),
             position_in_block: 0,
             exhausted,
         };
@@ -641,6 +644,8 @@ impl<'a> BlockPostingIterator<'a> {
         let first_doc = reader.read_u32::<LittleEndian>().unwrap_or(0);
         self.block_postings.clear();
         self.block_postings.reserve(count);
+        self.block_doc_ids.clear();
+        self.block_doc_ids.reserve(count);
 
         let mut prev_doc_id = first_doc;
 
@@ -652,6 +657,7 @@ impl<'a> BlockPostingIterator<'a> {
                         doc_id: first_doc,
                         term_freq: tf as u32,
                     });
+                    self.block_doc_ids.push(first_doc);
                 }
             } else if let (Ok(delta), Ok(tf)) = (read_vint(&mut reader), read_vint(&mut reader)) {
                 let doc_id = prev_doc_id + delta as u32;
@@ -659,6 +665,7 @@ impl<'a> BlockPostingIterator<'a> {
                     doc_id,
                     term_freq: tf as u32,
                 });
+                self.block_doc_ids.push(doc_id);
                 prev_doc_id = doc_id;
             }
         }
@@ -714,9 +721,9 @@ impl<'a> BlockPostingIterator<'a> {
             self.load_block(block_idx);
         }
 
-        // Binary search within block on decoded doc_ids
-        let pos =
-            self.block_postings[self.position_in_block..].partition_point(|p| p.doc_id < target);
+        // SIMD linear scan within block on cached doc_ids
+        let remaining = &self.block_doc_ids[self.position_in_block..];
+        let pos = crate::structures::simd::find_first_ge_u32(remaining, target);
         self.position_in_block += pos;
 
         if self.position_in_block >= self.block_postings.len() {
