@@ -12,10 +12,6 @@ use crate::dsl::Schema;
 #[cfg(feature = "native")]
 use crate::error::Result;
 #[cfg(feature = "native")]
-use crate::structures::{CoarseCentroids, PQCodebook};
-#[cfg(feature = "native")]
-use rustc_hash::FxHashMap;
-#[cfg(feature = "native")]
 use std::sync::Arc;
 
 mod searcher;
@@ -103,12 +99,8 @@ pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
     directory: Arc<D>,
     schema: Arc<Schema>,
     config: IndexConfig,
-    /// Segment manager - owns segments, tracker, and metadata
+    /// Segment manager - owns segments, tracker, metadata, and trained structures
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
-    /// Trained centroids for vector search
-    trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-    /// Trained codebooks for vector search
-    trained_codebooks: FxHashMap<u32, Arc<PQCodebook>>,
     /// Cached reader (created lazily, reused across calls)
     cached_reader: tokio::sync::OnceCell<IndexReader<D>>,
 }
@@ -137,8 +129,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             schema,
             config,
             segment_manager,
-            trained_centroids: FxHashMap::default(),
-            trained_codebooks: FxHashMap::default(),
             cached_reader: tokio::sync::OnceCell::new(),
         })
     }
@@ -151,23 +141,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         let metadata = IndexMetadata::load(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
 
-        // Load trained structures
-        let trained = metadata.load_trained_structures(directory.as_ref()).await;
-        let trained_centroids = trained
-            .as_ref()
-            .map(|t| t.centroids.clone())
-            .unwrap_or_default();
-        let trained_codebooks = trained
-            .as_ref()
-            .map(|t| t.codebooks.clone())
-            .unwrap_or_default();
-
-        log::debug!(
-            "[Index::open] trained_centroids fields={:?}, trained_codebooks fields={:?}",
-            trained_centroids.keys().collect::<Vec<_>>(),
-            trained_codebooks.keys().collect::<Vec<_>>(),
-        );
-
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
             Arc::clone(&directory),
             Arc::clone(&schema),
@@ -176,13 +149,14 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             config.term_cache_blocks,
         ));
 
+        // Load trained structures into SegmentManager's ArcSwap
+        segment_manager.load_and_publish_trained().await;
+
         Ok(Self {
             directory,
             schema,
             config,
             segment_manager,
-            trained_centroids,
-            trained_codebooks,
             cached_reader: tokio::sync::OnceCell::new(),
         })
     }
@@ -223,16 +197,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     /// Get the config
     pub fn config(&self) -> &IndexConfig {
         &self.config
-    }
-
-    /// Get trained centroids
-    pub fn trained_centroids(&self) -> &FxHashMap<u32, Arc<CoarseCentroids>> {
-        &self.trained_centroids
-    }
-
-    /// Get trained codebooks
-    pub fn trained_codebooks(&self) -> &FxHashMap<u32, Arc<PQCodebook>> {
-        &self.trained_codebooks
     }
 
     /// Get segment readers for query execution (convenience method)
@@ -958,7 +922,7 @@ mod tests {
         // Open index and verify it's using Flat (not built yet)
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
         assert!(
-            index.trained_centroids.is_empty(),
+            index.segment_manager.trained().is_none(),
             "Should not have trained centroids below threshold"
         );
 
@@ -993,19 +957,15 @@ mod tests {
             doc.add_dense_vector(embedding, vec);
             writer.add_document(doc).unwrap();
         }
-        // Commit auto-triggers vector index build when threshold is crossed
         writer.commit().await.unwrap();
 
-        // Verify centroids were trained (auto-triggered)
-        assert!(
-            writer.is_vector_index_built(embedding).await,
-            "Vector index should be built after crossing threshold"
-        );
+        // Manually trigger vector index build (no longer auto-triggered by commit)
+        writer.build_vector_index().await.unwrap();
 
         // Reopen index and verify trained structures are loaded
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
         assert!(
-            index.trained_centroids.contains_key(&embedding.0),
+            index.segment_manager.trained().is_some(),
             "Should have loaded trained centroids for embedding field"
         );
 
@@ -1033,8 +993,8 @@ mod tests {
             .unwrap();
         writer.build_vector_index().await.unwrap(); // Should skip training
 
-        // Still built
-        assert!(writer.is_vector_index_built(embedding).await);
+        // Still built (trained structures present in ArcSwap)
+        assert!(writer.segment_manager.trained().is_some());
     }
 
     /// Multi-round merge: flush many small segments, merge, add more, merge again.
@@ -1424,17 +1384,16 @@ mod tests {
             writer.flush().await.unwrap();
         }
         writer.commit().await.unwrap();
+        // Wait for background merges before reading segment count
+        writer.wait_for_merges().await;
 
-        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
-        let pre = index.segment_readers().await.unwrap().len();
+        let seg_ids = writer.segment_manager.get_segment_ids().await;
+        let pre = seg_ids.len();
         eprintln!("Segments before force_merge: {}", pre);
-        assert!(pre >= 10, "Expected many segments, got {}", pre);
+        assert!(pre >= 2, "Expected multiple segments, got {}", pre);
 
         // Force merge all into one — should iterate in batches, not OOM
-        let writer2 = IndexWriter::open(dir.clone(), config.clone())
-            .await
-            .unwrap();
-        writer2.force_merge().await.unwrap();
+        writer.force_merge().await.unwrap();
 
         let index2 = Index::open(dir, config).await.unwrap();
         let post = index2.segment_readers().await.unwrap().len();

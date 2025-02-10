@@ -23,6 +23,7 @@ zstd = { workspace = true }
 rustc-hash = { workspace = true }
 smallvec = { workspace = true }
 parking_lot = { workspace = true }
+arc-swap = "1"
 crossbeam-channel = { workspace = true, optional = true }
 num_cpus = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }

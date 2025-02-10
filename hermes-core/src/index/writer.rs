@@ -47,7 +47,7 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) directory: Arc<D>,
     pub(super) schema: Arc<Schema>,
     pub(super) config: IndexConfig,
-    #[allow(dead_code)] // Used for creating new builders in worker_state
+    #[allow(dead_code)]
     builder_config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
     /// Per-worker channel senders - round-robin distribution
@@ -57,18 +57,10 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     /// Worker task handles - kept alive to prevent premature shutdown
     #[allow(dead_code)]
     workers: Vec<JoinHandle<()>>,
-    /// Shared state for workers
-    #[allow(dead_code)]
+    /// Shared state for workers (used by flush to collect build handles)
     worker_state: Arc<WorkerState<D>>,
     /// Segment manager - owns metadata.json, handles segments and background merging
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
-    /// Shared trained structures — same Arc as in WorkerState
-    pub(super) trained_structures:
-        Arc<std::sync::RwLock<Option<crate::segment::TrainedVectorStructures>>>,
-    /// Channel receiver for completed segment IDs and doc counts
-    segment_id_receiver: AsyncMutex<mpsc::UnboundedReceiver<(String, u32)>>,
-    /// Count of in-flight background builds
-    pending_builds: Arc<AtomicUsize>,
     /// Segments flushed to disk but not yet registered in metadata
     flushed_segments: AsyncMutex<Vec<(String, u32)>>,
 }
@@ -80,15 +72,16 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     config: IndexConfig,
     builder_config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
-    segment_id_sender: mpsc::UnboundedSender<(String, u32)>,
+    /// In-flight build count for memory-pressure heuristic (informational only).
     pending_builds: Arc<AtomicUsize>,
     /// Limits concurrent segment builds to prevent OOM from unbounded build parallelism.
     /// Workers block at acquire, providing natural backpressure.
     build_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Trained vector structures (centroids/codebooks) shared with workers.
-    /// When present, new segments are built with ANN indexes inline.
-    /// Updated after training completes; read by spawn_segment_build.
-    trained_structures: Arc<std::sync::RwLock<Option<crate::segment::TrainedVectorStructures>>>,
+    /// JoinHandles for in-flight segment builds. flush() takes + awaits them.
+    /// This replaces the old channel approach which had a TOCTOU race causing hangs.
+    build_handles: AsyncMutex<Vec<JoinHandle<(String, u32)>>>,
+    /// Segment manager — workers read trained structures from its ArcSwap (lock-free).
+    segment_manager: Arc<crate::merge::SegmentManager<D>>,
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
@@ -107,9 +100,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
 
-        // Create channel for background builds to report completed segment IDs
-        let (segment_id_sender, segment_id_receiver) = mpsc::unbounded_channel();
-
         // Initialize metadata with schema
         let metadata = super::IndexMetadata::new((*schema).clone());
 
@@ -125,42 +115,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Save initial metadata
         segment_manager.update_metadata(|_| {}).await?;
 
-        let pending_builds = Arc::new(AtomicUsize::new(0));
-
-        // Limit concurrent segment builds to prevent OOM.
-        // With N workers, allow at most ceil(N/2) concurrent builds.
-        let num_workers = config.num_indexing_threads.max(1);
-        let max_concurrent_builds = num_workers.div_ceil(2).max(1);
-        let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
-
-        // Create shared worker state
-        let trained_structures = Arc::new(std::sync::RwLock::new(None));
-        let worker_state = Arc::new(WorkerState {
-            directory: Arc::clone(&directory),
-            schema: Arc::clone(&schema),
-            config: config.clone(),
-            builder_config: builder_config.clone(),
-            tokenizers: FxHashMap::default(),
-            segment_id_sender,
-            pending_builds: Arc::clone(&pending_builds),
-            build_semaphore,
-            trained_structures: Arc::clone(&trained_structures),
-        });
-
-        // Create per-worker unbounded channels and spawn workers
-        let mut worker_senders = Vec::with_capacity(num_workers);
-        let mut workers = Vec::with_capacity(num_workers);
-
-        for _ in 0..num_workers {
-            let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
-            worker_senders.push(tx);
-
-            let state = Arc::clone(&worker_state);
-            let handle = tokio::spawn(async move {
-                Self::worker_loop(state, rx).await;
-            });
-            workers.push(handle);
-        }
+        let (worker_state, worker_senders, workers) = Self::spawn_workers(
+            &directory,
+            &schema,
+            &config,
+            &builder_config,
+            &segment_manager,
+        );
 
         Ok(Self {
             directory,
@@ -173,9 +134,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             workers,
             worker_state,
             segment_manager,
-            trained_structures,
-            segment_id_receiver: AsyncMutex::new(segment_id_receiver),
-            pending_builds,
             flushed_segments: AsyncMutex::new(Vec::new()),
         })
     }
@@ -197,9 +155,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let metadata = super::IndexMetadata::load(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
 
-        // Create channel for background builds to report completed segment IDs
-        let (segment_id_sender, segment_id_receiver) = mpsc::unbounded_channel();
-
         // Create segment manager - owns metadata.json
         let segment_manager = Arc::new(crate::merge::SegmentManager::new(
             Arc::clone(&directory),
@@ -209,43 +164,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             config.term_cache_blocks,
         ));
 
-        let pending_builds = Arc::new(AtomicUsize::new(0));
+        // Load previously trained structures so merges use ANN
+        segment_manager.load_and_publish_trained().await;
 
-        // Limit concurrent segment builds to prevent OOM.
-        let num_workers = config.num_indexing_threads.max(1);
-        let max_concurrent_builds = num_workers.div_ceil(2).max(1);
-        let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
+        let (worker_state, worker_senders, workers) = Self::spawn_workers(
+            &directory,
+            &schema,
+            &config,
+            &builder_config,
+            &segment_manager,
+        );
 
-        // Create shared worker state (trained structures loaded after construction)
-        let trained_structures = Arc::new(std::sync::RwLock::new(None));
-        let worker_state = Arc::new(WorkerState {
-            directory: Arc::clone(&directory),
-            schema: Arc::clone(&schema),
-            config: config.clone(),
-            builder_config: builder_config.clone(),
-            tokenizers: FxHashMap::default(),
-            segment_id_sender,
-            pending_builds: Arc::clone(&pending_builds),
-            build_semaphore,
-            trained_structures: Arc::clone(&trained_structures),
-        });
-
-        // Create per-worker unbounded channels and spawn workers
-        let mut worker_senders = Vec::with_capacity(num_workers);
-        let mut workers = Vec::with_capacity(num_workers);
-
-        for _ in 0..num_workers {
-            let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
-            worker_senders.push(tx);
-
-            let state = Arc::clone(&worker_state);
-            let handle = tokio::spawn(async move {
-                Self::worker_loop(state, rx).await;
-            });
-            workers.push(handle);
-        }
-
-        let writer = Self {
+        Ok(Self {
             directory,
             schema,
             config,
@@ -256,16 +186,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             workers,
             worker_state,
             segment_manager,
-            trained_structures,
-            segment_id_receiver: AsyncMutex::new(segment_id_receiver),
-            pending_builds,
             flushed_segments: AsyncMutex::new(Vec::new()),
-        };
-
-        // Load any previously trained structures so new segments get ANN inline
-        writer.publish_trained_structures().await;
-
-        Ok(writer)
+        })
     }
 
     /// Create an IndexWriter from an existing Index
@@ -279,40 +201,57 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let config = index.config.clone();
         let builder_config = crate::segment::SegmentBuilderConfig::default();
 
-        // Create channel for background builds
-        let (segment_id_sender, segment_id_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (worker_state, worker_senders, workers) = Self::spawn_workers(
+            &directory,
+            &schema,
+            &config,
+            &builder_config,
+            &segment_manager,
+        );
 
-        let pending_builds = Arc::new(AtomicUsize::new(0));
+        Self {
+            directory,
+            schema,
+            config,
+            builder_config,
+            tokenizers: FxHashMap::default(),
+            worker_senders,
+            next_worker: AtomicUsize::new(0),
+            workers,
+            worker_state,
+            segment_manager,
+            flushed_segments: AsyncMutex::new(Vec::new()),
+        }
+    }
 
-        // Limit concurrent segment builds to prevent OOM.
+    /// Shared worker setup — deduplicates create/open/from_index.
+    #[allow(clippy::type_complexity)]
+    fn spawn_workers(
+        directory: &Arc<D>,
+        schema: &Arc<Schema>,
+        config: &IndexConfig,
+        builder_config: &SegmentBuilderConfig,
+        segment_manager: &Arc<crate::merge::SegmentManager<D>>,
+    ) -> (
+        Arc<WorkerState<D>>,
+        Vec<tokio::sync::mpsc::UnboundedSender<WorkerMessage>>,
+        Vec<JoinHandle<()>>,
+    ) {
         let num_workers = config.num_indexing_threads.max(1);
         let max_concurrent_builds = num_workers.div_ceil(2).max(1);
-        let build_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds));
-
-        // Seed trained structures from Index (which already loaded them)
-        let initial_trained = if !index.trained_centroids.is_empty() {
-            Some(crate::segment::TrainedVectorStructures {
-                centroids: index.trained_centroids.clone(),
-                codebooks: index.trained_codebooks.clone(),
-            })
-        } else {
-            None
-        };
-        let trained_structures = Arc::new(std::sync::RwLock::new(initial_trained));
 
         let worker_state = Arc::new(WorkerState {
-            directory: Arc::clone(&directory),
-            schema: Arc::clone(&schema),
+            directory: Arc::clone(directory),
+            schema: Arc::clone(schema),
             config: config.clone(),
             builder_config: builder_config.clone(),
             tokenizers: FxHashMap::default(),
-            segment_id_sender,
-            pending_builds: Arc::clone(&pending_builds),
-            build_semaphore,
-            trained_structures: Arc::clone(&trained_structures),
+            pending_builds: Arc::new(AtomicUsize::new(0)),
+            build_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builds)),
+            build_handles: AsyncMutex::new(Vec::new()),
+            segment_manager: Arc::clone(segment_manager),
         });
 
-        // Create per-worker channels and spawn workers
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
@@ -327,22 +266,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             workers.push(handle);
         }
 
-        Self {
-            directory,
-            schema,
-            config,
-            builder_config,
-            tokenizers: FxHashMap::default(),
-            worker_senders,
-            next_worker: AtomicUsize::new(0),
-            workers,
-            worker_state,
-            segment_manager,
-            trained_structures,
-            segment_id_receiver: AsyncMutex::new(segment_id_receiver),
-            pending_builds,
-            flushed_segments: AsyncMutex::new(Vec::new()),
-        }
+        (worker_state, worker_senders, workers)
     }
 
     /// Get the schema
@@ -390,7 +314,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         mut receiver: mpsc::UnboundedReceiver<WorkerMessage>,
     ) {
         let mut builder: Option<SegmentBuilder> = None;
-        let mut _doc_count = 0u32;
+        let mut doc_count = 0u32;
 
         loop {
             // Receive from own channel - no mutex contention
@@ -434,7 +358,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         continue;
                     }
 
-                    _doc_count += 1;
+                    doc_count += 1;
 
                     // Periodically recalibrate memory estimate using capacity-based
                     // calculation. The incremental tracker undercounts by ~33% because
@@ -454,7 +378,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     let builder_memory = b.estimated_memory_bytes();
 
                     // Log memory usage periodically
-                    if _doc_count.is_multiple_of(10_000) {
+                    if doc_count.is_multiple_of(10_000) {
                         log::debug!(
                             "[indexing] docs={}, memory={:.2} MB, limit={:.2} MB",
                             b.num_docs(),
@@ -466,9 +390,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     // Require minimum 100 docs before flushing to avoid tiny segments
                     // (sparse vectors with many dims can hit memory limit quickly)
                     const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
-                    let doc_count = b.num_docs();
+                    let num_docs = b.num_docs();
 
-                    if builder_memory >= per_worker_limit && doc_count >= MIN_DOCS_BEFORE_FLUSH {
+                    if builder_memory >= per_worker_limit && num_docs >= MIN_DOCS_BEFORE_FLUSH {
                         // Get detailed stats for debugging memory issues
                         let stats = b.stats();
                         let mb = stats.memory_breakdown;
@@ -488,7 +412,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         );
                         let full_builder = builder.take().unwrap();
                         Self::spawn_segment_build(&state, full_builder).await;
-                        _doc_count = 0;
+                        doc_count = 0;
                     }
                 }
                 WorkerMessage::Flush(respond) => {
@@ -515,7 +439,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         );
                         Self::spawn_segment_build(&state, b).await;
                     }
-                    _doc_count = 0;
+                    doc_count = 0;
                     // Signal that flush is complete for this worker
                     let _ = respond.send(());
                 }
@@ -530,15 +454,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let directory = Arc::clone(&state.directory);
         let segment_id = SegmentId::new();
         let segment_hex = segment_id.to_hex();
-        let sender = state.segment_id_sender.clone();
         let pending_builds = Arc::clone(&state.pending_builds);
 
-        // Snapshot trained structures for this build (cheap Arc clone)
-        let trained = state
-            .trained_structures
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone());
+        // Snapshot trained structures from SegmentManager's ArcSwap (lock-free)
+        let trained = state.segment_manager.trained();
 
         let doc_count = builder.num_docs();
         let memory_bytes = builder.estimated_memory_bytes();
@@ -553,11 +472,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         pending_builds.fetch_add(1, Ordering::SeqCst);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _permit = permit; // held for build duration, released on drop
             let build_start = std::time::Instant::now();
             let result = match builder
-                .build(directory.as_ref(), segment_id, trained.as_ref())
+                .build(directory.as_ref(), segment_id, trained.as_deref())
                 .await
             {
                 Ok(meta) => {
@@ -576,30 +495,25 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         segment_hex,
                         e
                     );
-                    // Signal failure with num_docs=0 so waiters don't block
                     (segment_hex, 0)
                 }
             };
-            // Always send to channel and decrement - even on failure
-            // This ensures flush()/commit() doesn't hang waiting for messages
-            let _ = sender.send(result);
             pending_builds.fetch_sub(1, Ordering::SeqCst);
+            result
         });
+
+        // Push JoinHandle — flush() takes + awaits these. No TOCTOU race.
+        state.build_handles.lock().await.push(handle);
     }
 
     /// Get the number of pending background builds
     pub fn pending_build_count(&self) -> usize {
-        self.pending_builds.load(Ordering::SeqCst)
-    }
-
-    /// Get the number of pending background merges
-    pub fn pending_merge_count(&self) -> usize {
-        self.segment_manager.pending_merge_count()
+        self.worker_state.pending_builds.load(Ordering::SeqCst)
     }
 
     /// Check merge policy and spawn background merges if needed
     ///
-    /// This is called automatically after segment builds complete via SegmentManager.
+    /// This is called automatically after commit via SegmentManager.
     /// Can also be called manually to trigger merge checking.
     pub async fn maybe_merge(&self) {
         self.segment_manager.maybe_merge().await;
@@ -618,7 +532,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Acquire a snapshot of current segments for reading
     /// The snapshot holds references - segments won't be deleted while snapshot exists
-    pub async fn acquire_snapshot(&self) -> crate::segment::SegmentSnapshot<D> {
+    pub async fn acquire_snapshot(&self) -> crate::segment::SegmentSnapshot {
         self.segment_manager.acquire_snapshot().await
     }
 
@@ -636,131 +550,78 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Flush all workers - serializes in-memory data to segment files on disk
     ///
     /// Sends flush signals to all workers, waits for them to acknowledge,
-    /// then waits for ALL pending background builds to complete.
+    /// then awaits ALL in-flight build JoinHandles.
     /// Completed segments are accumulated in `flushed_segments` but NOT
     /// registered in metadata - only `commit()` does that.
     ///
     /// Workers continue running and can accept new documents after flush.
     pub async fn flush(&self) -> Result<()> {
-        // Send flush signal to each worker's channel
+        // 1. Send flush signal to each worker's channel
         let mut responses = Vec::with_capacity(self.worker_senders.len());
 
         for sender in &self.worker_senders {
             let (tx, rx) = oneshot::channel();
             if sender.send(WorkerMessage::Flush(tx)).is_err() {
-                // Channel closed, worker may have exited
                 continue;
             }
             responses.push(rx);
         }
 
-        // Wait for all workers to acknowledge flush
+        // 2. Wait for all workers to acknowledge flush.
+        //    After ack, all spawn_segment_build calls have completed
+        //    (handles pushed to build_handles).
         for rx in responses {
             let _ = rx.await;
         }
 
-        // Wait for ALL pending builds to complete and collect results
-        let mut receiver = self.segment_id_receiver.lock().await;
-        while self.pending_builds.load(Ordering::SeqCst) > 0 {
-            if let Some((segment_hex, num_docs)) = receiver.recv().await {
-                if num_docs > 0 {
+        // 3. Take all build JoinHandles and await them.
+        //    JoinHandle can't lose signals — no TOCTOU race.
+        let handles: Vec<JoinHandle<(String, u32)>> =
+            std::mem::take(&mut *self.worker_state.build_handles.lock().await);
+        for handle in handles {
+            match handle.await {
+                Ok((segment_hex, num_docs)) if num_docs > 0 => {
                     self.flushed_segments
                         .lock()
                         .await
                         .push((segment_hex, num_docs));
                 }
-            } else {
-                break; // Channel closed
-            }
-        }
-
-        // Drain any remaining messages (builds that completed between checks)
-        while let Ok((segment_hex, num_docs)) = receiver.try_recv() {
-            if num_docs > 0 {
-                self.flushed_segments
-                    .lock()
-                    .await
-                    .push((segment_hex, num_docs));
+                Ok(_) => {} // build failed (0 docs)
+                Err(e) => log::error!("[flush] build task panicked: {:?}", e),
             }
         }
 
         Ok(())
     }
 
-    /// Commit all pending segments to metadata and wait for completion
+    /// Commit all pending segments to metadata.
     ///
-    /// Calls `flush()` to serialize all in-memory data to disk, then
-    /// registers flushed segments in metadata. This provides transactional
-    /// semantics: on crash before commit, orphan files are cleaned up by
-    /// `cleanup_orphan_segments()`.
-    ///
-    /// **Auto-triggers vector index build** when threshold is crossed for any field.
+    /// Tantivy-style: flush → atomic commit → merge evaluation. Nothing else.
+    /// Vector training is decoupled — call `build_vector_index()` manually.
     pub async fn commit(&self) -> Result<()> {
-        // Flush all workers and wait for builds to complete
+        // 1. Flush workers (like tantivy's prepare_commit joining threads)
         self.flush().await?;
 
-        // Phase 1: Register all segments in a single metadata write.
-        // No merge triggering here — segment files are safe to read.
+        // 2. Atomic commit through SegmentManager (like tantivy: SM.commit + save_metas)
         let segments = std::mem::take(&mut *self.flushed_segments.lock().await);
-        self.segment_manager
-            .register_segments_batch(segments)
-            .await?;
+        self.segment_manager.commit(segments).await?;
 
-        // Phase 2: Post-processing (reads segment files).
-        // Safe because no background merges have been spawned yet.
-        self.maybe_build_vector_index().await?;
-
-        // Phase 3: Trigger merge evaluation against the complete segment set.
-        // Background merges start AFTER all commit work is done.
+        // 3. Merge evaluation (like tantivy: consider_merge_options)
         self.segment_manager.maybe_merge().await;
 
         Ok(())
     }
 
-    // Vector index building methods are in vector_builder.rs
-
-    /// Merge all segments into one (called explicitly via force_merge).
-    /// Iteratively merges in batches of FORCE_MERGE_BATCH until ≤1 segment remains.
-    async fn do_merge(&self) -> Result<()> {
-        use crate::merge::consts::FORCE_MERGE_BATCH;
-        loop {
-            let ids_to_merge = self.segment_manager.get_segment_ids().await;
-            if ids_to_merge.len() < 2 {
-                return Ok(());
-            }
-
-            // Take up to FORCE_MERGE_BATCH segments per round
-            let batch: Vec<String> = ids_to_merge.into_iter().take(FORCE_MERGE_BATCH).collect();
-
-            log::info!("[force_merge] merging batch of {} segments", batch.len(),);
-
-            let metadata_arc = self.segment_manager.metadata();
-            let (new_segment_id, total_docs) = crate::merge::SegmentManager::do_merge(
-                self.directory.as_ref(),
-                &self.schema,
-                &batch,
-                self.config.term_cache_blocks,
-                &metadata_arc,
-            )
-            .await?;
-
-            // Atomically update segments and delete old ones via SegmentManager
-            self.segment_manager
-                .replace_segments(vec![(new_segment_id, total_docs)], batch)
-                .await?;
-        }
-    }
-
-    /// Force merge all segments into one
+    /// Force merge all segments into one.
+    /// Flushes + commits pending docs, then merges. Does NOT trigger background
+    /// merges — force_merge handles everything itself.
     pub async fn force_merge(&self) -> Result<()> {
-        // First commit all pending documents (waits for completion)
-        self.commit().await?;
-        // Wait for any background merges to complete (avoid race with segment deletion)
-        self.wait_for_merges().await;
-        // Then merge all segments
-        self.do_merge().await
+        // Flush + commit without triggering maybe_merge (would be wasteful & racy)
+        self.flush().await?;
+        let segments = std::mem::take(&mut *self.flushed_segments.lock().await);
+        self.segment_manager.commit(segments).await?;
+        self.segment_manager.force_merge().await
     }
 
-    // Vector index methods (build_vector_index, rebuild_vector_index, etc.)
-    // are implemented in vector_builder.rs
+    // Vector index methods (build_vector_index, etc.) are in vector_builder.rs
 }

@@ -224,6 +224,15 @@ impl IndexMetadata {
         &self,
         dir: &D,
     ) -> Option<crate::segment::TrainedVectorStructures> {
+        Self::load_trained_from_fields(&self.vector_fields, dir).await
+    }
+
+    /// Load trained structures from a pre-cloned vector_fields map.
+    /// Use this when you need to release a lock before doing disk I/O.
+    pub async fn load_trained_from_fields<D: crate::directories::Directory>(
+        vector_fields: &HashMap<u32, FieldVectorMeta>,
+        dir: &D,
+    ) -> Option<crate::segment::TrainedVectorStructures> {
         use std::sync::Arc;
 
         let mut centroids = rustc_hash::FxHashMap::default();
@@ -231,10 +240,10 @@ impl IndexMetadata {
 
         log::debug!(
             "[trained] loading trained structures, vector_fields={:?}",
-            self.vector_fields.keys().collect::<Vec<_>>()
+            vector_fields.keys().collect::<Vec<_>>()
         );
 
-        for (field_id, field_meta) in &self.vector_fields {
+        for (field_id, field_meta) in vector_fields {
             log::debug!(
                 "[trained] field {} state={:?} centroids_file={:?} codebook_file={:?}",
                 field_id,

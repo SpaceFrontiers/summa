@@ -63,20 +63,14 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
 
     /// Create a new reader with fresh snapshot from segment manager
     ///
-    /// Loads trained centroids dynamically from metadata on every call,
-    /// so the reader always picks up centroids trained after Index::create().
+    /// Reads trained centroids from SegmentManager's ArcSwap (lock-free).
     async fn create_reader(
         schema: &Arc<Schema>,
         segment_manager: &Arc<crate::merge::SegmentManager<D>>,
         term_cache_blocks: usize,
     ) -> Result<Searcher<D>> {
-        // Load trained centroids from metadata (always fresh)
-        let trained = {
-            let metadata_arc = segment_manager.metadata();
-            let meta = metadata_arc.read().await;
-            meta.load_trained_structures(segment_manager.directory().as_ref())
-                .await
-        };
+        // Read trained centroids from ArcSwap (lock-free)
+        let trained = segment_manager.trained();
         let trained_centroids = trained
             .as_ref()
             .map(|t| t.centroids.clone())

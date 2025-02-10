@@ -23,9 +23,8 @@ use crate::structures::CoarseCentroids;
 pub struct Searcher<D: Directory + 'static> {
     /// Segment snapshot holding refs - prevents deletion during native use
     #[cfg(feature = "native")]
-    _snapshot: SegmentSnapshot<D>,
-    /// Phantom data for wasm builds
-    #[cfg(not(feature = "native"))]
+    _snapshot: SegmentSnapshot,
+    /// PhantomData for the directory generic
     _phantom: std::marker::PhantomData<D>,
     /// Loaded segment readers
     segments: Vec<Arc<SegmentReader>>,
@@ -71,7 +70,7 @@ impl<D: Directory + 'static> Searcher<D> {
     pub(crate) async fn from_snapshot(
         directory: Arc<D>,
         schema: Arc<Schema>,
-        snapshot: SegmentSnapshot<D>,
+        snapshot: SegmentSnapshot,
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
@@ -87,6 +86,7 @@ impl<D: Directory + 'static> Searcher<D> {
 
         Ok(Self {
             _snapshot: snapshot,
+            _phantom: std::marker::PhantomData,
             segments,
             schema,
             default_fields,
@@ -117,37 +117,25 @@ impl<D: Directory + 'static> Searcher<D> {
             .await;
 
         #[cfg(feature = "native")]
-        {
+        let _snapshot = {
             let tracker = Arc::new(SegmentTracker::new());
-            let snapshot = SegmentSnapshot::new(tracker, segment_ids.to_vec());
-            Ok(Self {
-                _snapshot: snapshot,
-                segments,
-                schema,
-                default_fields,
-                tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
-                trained_centroids,
-                global_stats,
-                segment_map,
-                doc_id_cumulative,
-            })
-        }
+            SegmentSnapshot::new(tracker, segment_ids.to_vec())
+        };
 
-        #[cfg(not(feature = "native"))]
-        {
-            let _ = directory; // suppress unused warning
-            Ok(Self {
-                _phantom: std::marker::PhantomData,
-                segments,
-                schema,
-                default_fields,
-                tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
-                trained_centroids,
-                global_stats,
-                segment_map,
-                doc_id_cumulative,
-            })
-        }
+        let _ = directory; // suppress unused warning on wasm
+        Ok(Self {
+            #[cfg(feature = "native")]
+            _snapshot,
+            _phantom: std::marker::PhantomData,
+            segments,
+            schema,
+            default_fields,
+            tokenizers: Arc::new(crate::tokenizer::TokenizerRegistry::default()),
+            trained_centroids,
+            global_stats,
+            segment_map,
+            doc_id_cumulative,
+        })
     }
 
     /// Common loading logic shared by create and from_snapshot

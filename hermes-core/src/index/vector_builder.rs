@@ -1,9 +1,8 @@
 //! Vector index building for IndexWriter
 //!
-//! This module handles:
-//! - Training centroids/codebooks from accumulated Flat vectors
-//! - Rebuilding segments with ANN indexes
-//! - Threshold-based auto-triggering of vector index builds
+//! Training is **manual-only** — decoupled from commit.
+//! Call `build_vector_index()` explicitly when ready.
+//! ANN indexes are built naturally during subsequent merges.
 
 use std::sync::Arc;
 
@@ -17,75 +16,15 @@ use crate::segment::{SegmentId, SegmentReader};
 use super::IndexWriter;
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
-    /// Check if any dense vector field should be built and trigger training
-    pub(super) async fn maybe_build_vector_index(&self) -> Result<()> {
-        let dense_fields = self.get_dense_vector_fields();
-        if dense_fields.is_empty() {
-            return Ok(());
-        }
-
-        // Quick check: if all fields are already built, skip entirely
-        // This avoids loading segments just to count vectors when index is already built
-        let all_built = {
-            let metadata_arc = self.segment_manager.metadata();
-            let meta = metadata_arc.read().await;
-            dense_fields
-                .iter()
-                .all(|(field, _)| meta.is_field_built(field.0))
-        };
-        if all_built {
-            // Ensure workers have trained structures (handles from_index cold start)
-            if self
-                .trained_structures
-                .read()
-                .ok()
-                .is_none_or(|g| g.is_none())
-            {
-                self.publish_trained_structures().await;
-            }
-            return Ok(());
-        }
-
-        // Count total vectors across all segments.
-        // Safe during commit: no background merges are running yet (Phase 2).
-        let segment_ids = self.segment_manager.get_segment_ids().await;
-        let total_vectors = self.count_flat_vectors(&segment_ids).await;
-
-        // Update total in metadata and check if any field should be built
-        let should_build = {
-            let metadata_arc = self.segment_manager.metadata();
-            let mut meta = metadata_arc.write().await;
-            meta.total_vectors = total_vectors;
-            dense_fields.iter().any(|(field, config)| {
-                let threshold = config.build_threshold.unwrap_or(1000);
-                meta.should_build_field(field.0, threshold)
-            })
-        };
-
-        if should_build {
-            log::info!(
-                "Threshold crossed ({} vectors), auto-triggering vector index build",
-                total_vectors
-            );
-            self.build_vector_index().await?;
-        }
-
-        Ok(())
-    }
-
-    /// Build vector index from accumulated Flat vectors (trains ONCE)
+    /// Train vector index from accumulated Flat vectors (manual, not auto-triggered).
     ///
-    /// This trains centroids/codebooks from ALL vectors across all segments.
-    /// Training happens only ONCE - subsequent calls are no-ops if already built.
+    /// 1. Acquires a snapshot (segments safe to read)
+    /// 2. Collects vectors for training
+    /// 3. Trains centroids/codebooks
+    /// 4. Updates metadata (marks fields as Built)
+    /// 5. Publishes to ArcSwap — merges will use these automatically
     ///
-    /// **Note:** This is auto-triggered by `commit()` when threshold is crossed.
-    /// You typically don't need to call this manually.
-    ///
-    /// The process:
-    /// 1. Check if already built (skip if so)
-    /// 2. Collect all vectors from all segments
-    /// 3. Train centroids/codebooks based on schema's index_type
-    /// 4. Update metadata to mark as built (prevents re-training)
+    /// Existing flat segments get ANN during normal merges. No rebuild needed.
     pub async fn build_vector_index(&self) -> Result<()> {
         let dense_fields = self.get_dense_vector_fields();
         if dense_fields.is_empty() {
@@ -100,14 +39,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Ok(());
         }
 
+        // Acquire snapshot — segments won't be deleted while we read them
         let snapshot = self.segment_manager.acquire_snapshot().await;
         let segment_ids = snapshot.segment_ids();
         if segment_ids.is_empty() {
             return Ok(());
         }
 
-        // Collect all vectors from all segments for fields that need building
-        // Snapshot holds refs — segments won't be deleted while we read them.
+        // Collect vectors for training
         let all_vectors = self
             .collect_vectors_for_training(segment_ids, &fields_to_build)
             .await?;
@@ -117,54 +56,17 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             self.train_field_index(*field, config, &all_vectors).await?;
         }
 
-        // Publish trained structures to workers so new segments get ANN inline.
-        // Existing flat segments acquire ANN during regular background merges.
-        self.publish_trained_structures().await;
+        // Publish to ArcSwap — merges and new segment builds will use these
+        self.segment_manager.load_and_publish_trained().await;
 
-        log::info!("Vector index training complete, new segments will have ANN inline");
+        log::info!("Vector index training complete, ANN will be built during merges");
 
         Ok(())
     }
 
-    /// Publish trained structures to shared worker state so new segment builds
-    /// include ANN indexes inline. Called after training completes.
-    pub(super) async fn publish_trained_structures(&self) {
-        let trained = {
-            let metadata_arc = self.segment_manager.metadata();
-            let meta = metadata_arc.read().await;
-            meta.load_trained_structures(self.directory.as_ref()).await
-        };
-        if let Some(trained) = trained
-            && let Ok(mut guard) = self.trained_structures.write()
-        {
-            log::info!(
-                "[writer] published trained structures to workers ({} fields)",
-                trained.centroids.len()
-            );
-            *guard = Some(trained);
-        }
-    }
-
-    /// Get total vector count across all segments (for threshold checking)
-    pub async fn total_vector_count(&self) -> usize {
-        let metadata_arc = self.segment_manager.metadata();
-        metadata_arc.read().await.total_vectors
-    }
-
-    /// Check if vector index has been built for a field
-    pub async fn is_vector_index_built(&self, field: Field) -> bool {
-        let metadata_arc = self.segment_manager.metadata();
-        metadata_arc.read().await.is_field_built(field.0)
-    }
-
-    /// Rebuild vector index by retraining centroids/codebooks
+    /// Rebuild vector index by retraining centroids/codebooks.
     ///
-    /// Use this when:
-    /// - Significant new data has been added and you want better centroids
-    /// - You want to change the number of clusters
-    /// - The vector distribution has changed significantly
-    ///
-    /// This resets the Built state to Flat, then triggers a fresh training.
+    /// Resets Built state to Flat, clears trained structures, then trains fresh.
     pub async fn rebuild_vector_index(&self) -> Result<()> {
         let dense_fields = self.get_dense_vector_fields();
         if dense_fields.is_empty() {
@@ -172,42 +74,37 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         }
         let dense_fields: Vec<Field> = dense_fields.into_iter().map(|(f, _)| f).collect();
 
-        // Collect files to delete and reset fields to Flat state
-        let files_to_delete = {
-            let metadata_arc = self.segment_manager.metadata();
-            let mut meta = metadata_arc.write().await;
-            let mut files = Vec::new();
-            for field in &dense_fields {
-                if let Some(field_meta) = meta.vector_fields.get_mut(&field.0) {
-                    field_meta.state = super::VectorIndexState::Flat;
-                    if let Some(ref f) = field_meta.centroids_file {
-                        files.push(f.clone());
+        // Reset fields to Flat and collect files to delete
+        let dense_field_ids: Vec<u32> = dense_fields.iter().map(|f| f.0).collect();
+        let mut files_to_delete = Vec::new();
+        self.segment_manager
+            .update_metadata(|meta| {
+                for field_id in &dense_field_ids {
+                    if let Some(field_meta) = meta.vector_fields.get_mut(field_id) {
+                        field_meta.state = super::VectorIndexState::Flat;
+                        if let Some(ref f) = field_meta.centroids_file {
+                            files_to_delete.push(f.clone());
+                        }
+                        if let Some(ref f) = field_meta.codebook_file {
+                            files_to_delete.push(f.clone());
+                        }
+                        field_meta.centroids_file = None;
+                        field_meta.codebook_file = None;
                     }
-                    if let Some(ref f) = field_meta.codebook_file {
-                        files.push(f.clone());
-                    }
-                    field_meta.centroids_file = None;
-                    field_meta.codebook_file = None;
                 }
-            }
-            meta.save(self.directory.as_ref()).await?;
-            files
-        };
+            })
+            .await?;
 
-        // Delete old centroids/codebook files
+        // Delete old files
         for file in files_to_delete {
             let _ = self.directory.delete(std::path::Path::new(&file)).await;
         }
 
-        // Clear shared trained structures so workers produce flat segments
-        // during retraining (avoids stale centroid mismatch)
-        if let Ok(mut guard) = self.trained_structures.write() {
-            *guard = None;
-        }
+        // Clear ArcSwap so workers produce flat segments during retraining
+        self.segment_manager.clear_trained();
 
         log::info!("Reset vector index state to Flat, triggering rebuild...");
 
-        // Now build fresh
         self.build_vector_index().await
     }
 
@@ -238,51 +135,22 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         &self,
         dense_fields: &[(Field, DenseVectorConfig)],
     ) -> Vec<(Field, DenseVectorConfig)> {
-        let metadata_arc = self.segment_manager.metadata();
-        let meta = metadata_arc.read().await;
+        let field_ids: Vec<u32> = dense_fields.iter().map(|(f, _)| f.0).collect();
+        let built: Vec<u32> = self
+            .segment_manager
+            .read_metadata(|meta| {
+                field_ids
+                    .iter()
+                    .filter(|fid| meta.is_field_built(**fid))
+                    .copied()
+                    .collect()
+            })
+            .await;
         dense_fields
             .iter()
-            .filter(|(field, _)| !meta.is_field_built(field.0))
+            .filter(|(field, _)| !built.contains(&field.0))
             .cloned()
             .collect()
-    }
-
-    /// Count flat vectors across all segments
-    /// Only loads segments that have a vectors file to avoid unnecessary I/O
-    async fn count_flat_vectors(&self, segment_ids: &[String]) -> usize {
-        let mut total_vectors = 0usize;
-        let mut doc_offset = 0u32;
-
-        for id_str in segment_ids {
-            let Some(segment_id) = SegmentId::from_hex(id_str) else {
-                continue;
-            };
-
-            // Quick check: skip segments without vectors file
-            let files = crate::segment::SegmentFiles::new(segment_id.0);
-            if !self.directory.exists(&files.vectors).await.unwrap_or(false) {
-                // No vectors file - segment has no vectors, skip loading
-                continue;
-            }
-
-            // Only load segments that have vectors
-            if let Ok(reader) = SegmentReader::open(
-                self.directory.as_ref(),
-                segment_id,
-                Arc::clone(&self.schema),
-                doc_offset,
-                self.config.term_cache_blocks,
-            )
-            .await
-            {
-                for flat_data in reader.flat_vectors().values() {
-                    total_vectors += flat_data.num_vectors;
-                }
-                doc_offset += reader.meta().num_docs;
-            }
-        }
-
-        total_vectors
     }
 
     /// Collect vectors from segments for training, with sampling for large datasets.
