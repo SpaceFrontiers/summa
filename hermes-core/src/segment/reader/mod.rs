@@ -120,18 +120,29 @@ impl AsyncSegmentReader {
         // Open positions file handle (if exists) - offsets are now in TermInfo
         let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
 
-        // Log segment loading stats (compact format: ~24 bytes per active dim in hashmap)
-        let sparse_dims: usize = sparse_indexes.values().map(|s| s.num_dimensions()).sum();
-        let sparse_mem = sparse_dims * 24; // HashMap entry overhead
-        log::debug!(
-            "[segment] loaded {:016x}: docs={}, sparse_dims={}, sparse_mem={:.2} KB, dense_flat={}, dense_ann={}",
-            segment_id.0,
-            meta.num_docs,
-            sparse_dims,
-            sparse_mem as f64 / 1024.0,
-            flat_vectors.len(),
-            vector_indexes.len()
-        );
+        // Log segment loading stats
+        {
+            let mut parts = vec![format!(
+                "[segment] loaded {:016x}: docs={}",
+                segment_id.0, meta.num_docs
+            )];
+            if !vector_indexes.is_empty() || !flat_vectors.is_empty() {
+                parts.push(format!(
+                    "dense: {} ann + {} flat fields",
+                    vector_indexes.len(),
+                    flat_vectors.len()
+                ));
+            }
+            for (field_id, idx) in &sparse_indexes {
+                parts.push(format!(
+                    "sparse field {}: {} dims, ~{:.1} KB",
+                    field_id,
+                    idx.num_dimensions(),
+                    idx.num_dimensions() as f64 * 24.0 / 1024.0
+                ));
+            }
+            log::debug!("{}", parts.join(", "));
+        }
 
         Ok(Self {
             meta,

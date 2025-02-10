@@ -2,8 +2,11 @@
 //!
 //! Architecture:
 //! - **Single mutation queue**: All metadata mutations serialize through `tokio::sync::Mutex<ManagerState>`.
-//! - **Single background merge**: At most one merge runs at a time, tracked via RAII `MergeGuard`.
-//!   A single `JoinHandle` is kept for `wait_for_merging_thread`.
+//! - **Concurrent merges**: Multiple non-overlapping merges can run in parallel.
+//!   Each merge registers its segment IDs in `MergeInventory` via RAII `MergeGuard`.
+//!   New merges are rejected only if they share segments with an active merge.
+//! - **Auto-trigger**: Each completed merge re-evaluates the merge policy and spawns
+//!   new merges if eligible (cascading merges for higher tiers).
 //! - **ArcSwap for trained**: Lock-free reads of trained vector structures.
 //!
 //! # Locking model (deadlock-free by construction)
@@ -16,7 +19,7 @@
 //!
 //! Lock-free state:
 //!   trained                — arc_swap::ArcSwapOption, no ordering constraint
-//!   merge_handle           — tokio::sync::Mutex, never held with state
+//!   merge_handles          — tokio::sync::Mutex, never held with state
 //! ```
 //!
 //! **Rule:** Never hold a sync lock while `.await`-ing.
@@ -41,11 +44,12 @@ use super::{MergePolicy, SegmentInfo};
 // RAII merge tracking
 // ============================================================================
 
-/// Tracks which segments are involved in the active merge.
+/// Tracks which segments are involved in active merges.
 ///
-/// At most one merge runs at a time. Uses RAII via `MergeGuard`: when the
-/// merge task finishes (success, failure, or panic), the guard drops and
-/// segments are automatically unregistered. No manual cleanup.
+/// Supports multiple concurrent merges. Each merge registers its segment IDs;
+/// a new merge is rejected only if any of its segments overlap with an active merge.
+/// Uses RAII via `MergeGuard`: when a merge task ends, the guard drops and
+/// its segment IDs are automatically unregistered.
 struct MergeInventory {
     inner: parking_lot::Mutex<HashSet<String>>,
 }
@@ -58,17 +62,21 @@ impl MergeInventory {
     }
 
     /// Try to register a merge. Returns `MergeGuard` on success, `None` if
-    /// a merge is already active.
+    /// any of the requested segments are already in an active merge.
     fn try_register(self: &Arc<Self>, segment_ids: Vec<String>) -> Option<MergeGuard> {
         let mut inner = self.inner.lock();
-        if !inner.is_empty() {
-            return None;
+        // Check for overlap with any active merge
+        for id in &segment_ids {
+            if inner.contains(id) {
+                return None;
+            }
         }
         for id in &segment_ids {
             inner.insert(id.clone());
         }
         Some(MergeGuard {
             inventory: Arc::clone(self),
+            segment_ids,
         })
     }
 
@@ -76,23 +84,22 @@ impl MergeInventory {
     fn snapshot(&self) -> HashSet<String> {
         self.inner.lock().clone()
     }
-
-    /// Whether a merge is currently active
-    fn is_active(&self) -> bool {
-        !self.inner.lock().is_empty()
-    }
 }
 
 /// RAII guard for a merge operation.
 /// Dropped when the merge task completes (success, failure, or panic) —
-/// automatically unregisters all segment IDs from the inventory.
+/// automatically unregisters this merge's segment IDs from the inventory.
 struct MergeGuard {
     inventory: Arc<MergeInventory>,
+    segment_ids: Vec<String>,
 }
 
 impl Drop for MergeGuard {
     fn drop(&mut self) {
-        self.inventory.inner.lock().clear();
+        let mut inner = self.inventory.inner.lock();
+        for id in &self.segment_ids {
+            inner.remove(id);
+        }
     }
 }
 
@@ -113,9 +120,8 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// unregistered when the merge task ends (via MergeGuard drop).
     merge_inventory: Arc<MergeInventory>,
 
-    /// In-flight merge JoinHandle — only used by `wait_for_merging_thread`.
-    /// At most one background merge runs at a time.
-    merge_handle: AsyncMutex<Option<JoinHandle<()>>>,
+    /// In-flight merge JoinHandles — supports multiple concurrent merges.
+    merge_handles: AsyncMutex<Vec<JoinHandle<()>>>,
 
     /// Trained vector structures — lock-free reads via ArcSwap.
     trained: ArcSwapOption<TrainedVectorStructures>,
@@ -175,7 +181,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 merge_policy,
             }),
             merge_inventory: Arc::new(MergeInventory::new()),
-            merge_handle: AsyncMutex::new(None),
+            merge_handles: AsyncMutex::new(Vec::new()),
             trained: ArcSwapOption::new(None),
             tracker,
             delete_fn,
@@ -284,18 +290,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         st.metadata.save(self.directory.as_ref()).await
     }
 
-    /// Evaluate merge policy and spawn a single background merge if needed.
+    /// Evaluate merge policy and spawn background merges for all eligible candidates.
     ///
     /// Single lock scope: builds segment list AND calls find_merges atomically
     /// to prevent stale-list races with concurrent replace_segments.
-    /// Only spawns one merge — the next merge is evaluated on the next commit.
+    /// Candidates whose segments overlap with active merges are skipped.
+    /// Each completed merge auto-triggers another evaluation.
     pub async fn maybe_merge(self: &Arc<Self>) {
-        if self.merge_inventory.is_active() {
-            log::debug!("[maybe_merge] merge already active, skipping");
-            return;
+        // Drain completed handles first to keep the Vec small
+        {
+            let mut handles = self.merge_handles.lock().await;
+            handles.retain(|h| !h.is_finished());
         }
 
-        let candidate = {
+        let candidates = {
             let st = self.state.lock().await;
 
             let segments: Vec<SegmentInfo> = st
@@ -311,20 +319,35 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             log::debug!("[maybe_merge] {} eligible segments", segments.len());
 
-            st.merge_policy.find_merge(&segments)
+            st.merge_policy.find_merges(&segments)
         };
 
-        if let Some(c) = candidate {
-            self.spawn_merge(c.segment_ids).await;
+        if candidates.is_empty() {
+            return;
+        }
+
+        log::debug!("[maybe_merge] {} merge candidates", candidates.len());
+
+        let mut new_handles = Vec::new();
+        for c in candidates {
+            if let Some(h) = self.spawn_merge(c.segment_ids) {
+                new_handles.push(h);
+            }
+        }
+        if !new_handles.is_empty() {
+            self.merge_handles.lock().await.extend(new_handles);
         }
     }
 
-    /// Spawn a single background merge task with RAII tracking.
+    /// Spawn a background merge task with RAII tracking.
     ///
     /// Pre-generates the output segment ID. `MergeGuard` registers all segment IDs
     /// (old + output) in `merge_inventory`. When the task ends (success, failure, or
     /// panic), the guard drops and segments are automatically unregistered.
-    async fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) {
+    ///
+    /// On completion, the task auto-triggers `maybe_merge` to evaluate cascading merges.
+    /// Returns the JoinHandle if the merge was spawned, None if it was skipped.
+    fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) -> Option<JoinHandle<()>> {
         let output_id = SegmentId::new();
         let output_hex = output_id.to_hex();
 
@@ -334,15 +357,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let guard = match self.merge_inventory.try_register(all_ids) {
             Some(g) => g,
             None => {
-                log::debug!("[spawn_merge] skipped: merge already active");
-                return;
+                log::debug!("[spawn_merge] skipped: segments overlap with active merge");
+                return None;
             }
         };
 
         let sm = Arc::clone(self);
         let ids = segment_ids_to_merge;
 
-        let handle = tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let _guard = guard;
 
             let trained_snap = sm.trained();
@@ -371,9 +394,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
             }
             // _guard drops here → segment IDs unregistered from inventory
-        });
 
-        *self.merge_handle.lock().await = Some(handle);
+            // Auto-trigger: re-evaluate merge policy after this merge completes.
+            // The merged output may now be eligible for a higher-tier merge.
+            sm.maybe_merge().await;
+        }))
     }
 
     /// Atomically replace old segments with a new merged segment.
@@ -492,27 +517,33 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok((output_hex, total_docs.min(u32::MAX as u64) as u32))
     }
 
-    /// Wait for the current in-flight merge to complete (if any).
+    /// Wait for all current in-flight merges to complete.
     pub async fn wait_for_merging_thread(self: &Arc<Self>) {
-        if let Some(h) = self.merge_handle.lock().await.take() {
+        let handles: Vec<JoinHandle<()>> =
+            { std::mem::take(&mut *self.merge_handles.lock().await) };
+        for h in handles {
             let _ = h.await;
         }
     }
 
     /// Wait for all eligible merges to complete, including cascading merges.
     ///
-    /// After each merge finishes, re-evaluates the merge policy and waits for
-    /// any newly spawned merge. Loops until no more merges are triggered.
+    /// Drains current handles, then re-evaluates. Loops until no more merges
+    /// are triggered (each completed merge also auto-triggers, so this catches
+    /// any stragglers).
     pub async fn wait_for_all_merges(self: &Arc<Self>) {
         loop {
-            let handle = self.merge_handle.lock().await.take();
-            match handle {
-                Some(h) => {
-                    let _ = h.await;
-                }
-                None => break,
+            let handles: Vec<JoinHandle<()>> =
+                { std::mem::take(&mut *self.merge_handles.lock().await) };
+            if handles.is_empty() {
+                break;
             }
-            self.maybe_merge().await;
+            for h in handles {
+                let _ = h.await;
+            }
+            // Merge tasks auto-trigger maybe_merge on completion, but give
+            // a moment for any newly spawned tasks to register their handles.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -625,34 +656,42 @@ mod tests {
     #[test]
     fn test_inventory_guard_drop_unregisters() {
         let inv = Arc::new(MergeInventory::new());
-        let ids = vec!["a".into(), "b".into()];
         {
-            let guard = inv.try_register(ids).unwrap();
-            assert!(inv.is_active());
+            let _guard = inv.try_register(vec!["a".into(), "b".into()]).unwrap();
             let snap = inv.snapshot();
             assert!(snap.contains("a"));
             assert!(snap.contains("b"));
-            drop(guard);
         }
-        assert!(!inv.is_active());
+        // Guard dropped → segments unregistered
         assert!(inv.snapshot().is_empty());
     }
 
     #[test]
-    fn test_inventory_single_active_merge() {
+    fn test_inventory_concurrent_non_overlapping_merges() {
         let inv = Arc::new(MergeInventory::new());
         let _g1 = inv.try_register(vec!["a".into(), "b".into()]).unwrap();
-        assert!(inv.is_active());
+        // Non-overlapping merge succeeds concurrently
+        let _g2 = inv.try_register(vec!["c".into(), "d".into()]).unwrap();
+        let snap = inv.snapshot();
+        assert_eq!(snap.len(), 4);
 
-        // Second merge rejected — only one at a time
-        let result = inv.try_register(vec!["c".into(), "d".into()]);
-        assert!(result.is_none());
-
-        // Drop first → slot opens
+        // Drop first guard — only its segments are removed
         drop(_g1);
-        assert!(!inv.is_active());
-        let result = inv.try_register(vec!["c".into(), "d".into()]);
-        assert!(result.is_some());
+        let snap = inv.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert!(snap.contains("c"));
+        assert!(snap.contains("d"));
+    }
+
+    #[test]
+    fn test_inventory_overlapping_merge_rejected() {
+        let inv = Arc::new(MergeInventory::new());
+        let _g1 = inv.try_register(vec!["a".into(), "b".into()]).unwrap();
+        // Overlapping merge rejected (shares "b")
+        assert!(inv.try_register(vec!["b".into(), "c".into()]).is_none());
+        // After drop, the overlapping merge succeeds
+        drop(_g1);
+        assert!(inv.try_register(vec!["b".into(), "c".into()]).is_some());
     }
 
     #[test]

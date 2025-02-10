@@ -30,8 +30,9 @@ pub struct MergeCandidate {
 ///
 /// Implementations decide when segments should be merged and which ones.
 pub trait MergePolicy: Send + Sync + Debug {
-    /// Given the current segments, return a merge candidate (if any).
-    fn find_merge(&self, segments: &[SegmentInfo]) -> Option<MergeCandidate>;
+    /// Given the current segments, return all eligible merge candidates.
+    /// Multiple candidates can run concurrently as long as they don't share segments.
+    fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<MergeCandidate>;
 
     /// Clone the policy into a boxed trait object
     fn clone_box(&self) -> Box<dyn MergePolicy>;
@@ -48,8 +49,8 @@ impl Clone for Box<dyn MergePolicy> {
 pub struct NoMergePolicy;
 
 impl MergePolicy for NoMergePolicy {
-    fn find_merge(&self, _segments: &[SegmentInfo]) -> Option<MergeCandidate> {
-        None
+    fn find_merges(&self, _segments: &[SegmentInfo]) -> Vec<MergeCandidate> {
+        Vec::new()
     }
 
     fn clone_box(&self) -> Box<dyn MergePolicy> {
@@ -127,9 +128,9 @@ impl TieredMergePolicy {
 }
 
 impl MergePolicy for TieredMergePolicy {
-    fn find_merge(&self, segments: &[SegmentInfo]) -> Option<MergeCandidate> {
+    fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<MergeCandidate> {
         if segments.len() < 2 {
-            return None;
+            return Vec::new();
         }
 
         // Group segments by tier
@@ -141,17 +142,18 @@ impl MergePolicy for TieredMergePolicy {
             tiers.entry(tier).or_default().push(seg);
         }
 
-        // Return the first valid candidate (single merge at a time)
-        for (_tier, tier_segments) in tiers {
+        // Produce one candidate per qualifying tier (all can run concurrently)
+        let mut candidates = Vec::new();
+        for tier_segments in tiers.values() {
             if tier_segments.len() >= self.segments_per_tier {
-                let mut sorted: Vec<_> = tier_segments;
+                let mut sorted: Vec<_> = tier_segments.clone();
                 sorted.sort_by_key(|s| s.num_docs);
 
                 let chunk = &sorted[..sorted.len().min(self.max_merge_at_once)];
                 if chunk.len() >= 2 {
                     let total_docs: u64 = chunk.iter().map(|s| s.num_docs as u64).sum();
                     if total_docs <= self.max_merged_docs as u64 {
-                        return Some(MergeCandidate {
+                        candidates.push(MergeCandidate {
                             segment_ids: chunk.iter().map(|s| s.id.clone()).collect(),
                         });
                     }
@@ -159,7 +161,7 @@ impl MergePolicy for TieredMergePolicy {
             }
         }
 
-        None
+        candidates
     }
 
     fn clone_box(&self) -> Box<dyn MergePolicy> {
@@ -207,7 +209,7 @@ mod tests {
             },
         ];
 
-        assert!(policy.find_merge(&segments).is_none());
+        assert!(policy.find_merges(&segments).is_empty());
     }
 
     #[test]
@@ -225,8 +227,38 @@ mod tests {
             })
             .collect();
 
-        let candidate = policy.find_merge(&segments).unwrap();
-        assert!(candidate.segment_ids.len() >= 3);
+        let candidates = policy.find_merges(&segments);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].segment_ids.len() >= 3);
+    }
+
+    #[test]
+    fn test_tiered_policy_multiple_tiers() {
+        let policy = TieredMergePolicy {
+            segments_per_tier: 3,
+            ..Default::default()
+        };
+
+        // 4 segments in tier 0 + 3 segments in tier 1
+        let mut segments: Vec<_> = (0..4)
+            .map(|i| SegmentInfo {
+                id: format!("small_{}", i),
+                num_docs: 100 + i * 10,
+            })
+            .collect();
+        for i in 0..3 {
+            segments.push(SegmentInfo {
+                id: format!("medium_{}", i),
+                num_docs: 2000 + i * 500,
+            });
+        }
+
+        let candidates = policy.find_merges(&segments);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "should produce candidates for both tiers"
+        );
     }
 
     #[test]
@@ -244,6 +276,6 @@ mod tests {
             },
         ];
 
-        assert!(policy.find_merge(&segments).is_none());
+        assert!(policy.find_merges(&segments).is_empty());
     }
 }
