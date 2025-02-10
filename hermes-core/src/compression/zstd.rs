@@ -5,7 +5,7 @@
 //! - Trained dictionaries for even better compression of similar documents
 //! - Larger block sizes to improve compression efficiency
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 /// Compression level (1-22 for zstd)
 #[derive(Debug, Clone, Copy)]
@@ -85,17 +85,28 @@ pub fn compress_with_dict(
 }
 
 /// Decompress data using Zstd
+///
+/// Uses the bulk (single-shot) API which reads the content size from
+/// the frame header and allocates the exact output buffer upfront,
+/// avoiding the repeated reallocations of the streaming API.
 pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::decode_all(data).map_err(io::Error::other)
+    // 512KB upper bound covers store blocks (256KB uncompressed).
+    // The bulk API reads the frame's content-size field if available
+    // (zstd always writes it) and allocates exactly, falling back to
+    // this capacity as a hard limit.
+    zstd::bulk::decompress(data, 512 * 1024).map_err(io::Error::other)
 }
 
 /// Decompress data using Zstd with a trained dictionary
+///
+/// Uses the bulk API with pre-allocated output to avoid repeated
+/// reallocations of the streaming `read_to_end` approach.
 pub fn decompress_with_dict(data: &[u8], dict: &CompressionDict) -> io::Result<Vec<u8>> {
-    let mut decoder =
-        zstd::Decoder::with_dictionary(data, &dict.raw_dict).map_err(io::Error::other)?;
-    let mut result = Vec::new();
-    decoder.read_to_end(&mut result)?;
-    Ok(result)
+    let mut decompressor =
+        zstd::bulk::Decompressor::with_dictionary(&dict.raw_dict).map_err(io::Error::other)?;
+    decompressor
+        .decompress(data, 512 * 1024)
+        .map_err(io::Error::other)
 }
 
 #[cfg(test)]

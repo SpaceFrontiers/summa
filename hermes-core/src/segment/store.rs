@@ -466,8 +466,8 @@ impl AsyncStoreReader {
             ));
         }
 
-        // Load dictionary if present
-        let dict = if has_dict && dict_offset > 0 {
+        // Load dictionary if present, and compute index_start in one pass
+        let (dict, index_start) = if has_dict && dict_offset > 0 {
             let dict_start = dict_offset;
             let dict_len_bytes = file_handle
                 .read_bytes_range(dict_start..dict_start + 4)
@@ -476,21 +476,13 @@ impl AsyncStoreReader {
             let dict_bytes = file_handle
                 .read_bytes_range(dict_start + 4..dict_start + 4 + dict_len)
                 .await?;
-            Some(CompressionDict::from_bytes(dict_bytes.to_vec()))
+            let idx_start = dict_start + 4 + dict_len;
+            (
+                Some(CompressionDict::from_bytes(dict_bytes.to_vec())),
+                idx_start,
+            )
         } else {
-            None
-        };
-
-        // Calculate index location
-        let index_start = if has_dict && dict_offset > 0 {
-            let dict_start = dict_offset;
-            let dict_len_bytes = file_handle
-                .read_bytes_range(dict_start..dict_start + 4)
-                .await?;
-            let dict_len = (&dict_len_bytes[..]).read_u32::<LittleEndian>()? as u64;
-            dict_start + 4 + dict_len
-        } else {
-            data_end_offset
+            (None, data_end_offset)
         };
         let index_end = file_len - 32;
 
