@@ -235,14 +235,18 @@ impl<'a> EagerParallelStoreWriter<'a> {
     }
 
     pub fn store(&mut self, doc: &Document, schema: &Schema) -> io::Result<DocId> {
+        let doc_bytes = serialize_document(doc, schema)?;
+        self.store_raw(&doc_bytes)
+    }
+
+    /// Store pre-serialized document bytes directly (avoids deserialize+reserialize roundtrip).
+    pub fn store_raw(&mut self, doc_bytes: &[u8]) -> io::Result<DocId> {
         let doc_id = self.next_doc_id;
         self.next_doc_id += 1;
 
-        let doc_bytes = serialize_document(doc, schema)?;
-
         self.block_buffer
             .write_u32::<LittleEndian>(doc_bytes.len() as u32)?;
-        self.block_buffer.extend_from_slice(&doc_bytes);
+        self.block_buffer.extend_from_slice(doc_bytes);
 
         if self.block_buffer.len() >= STORE_BLOCK_SIZE {
             self.spawn_compression();

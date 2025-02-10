@@ -81,6 +81,10 @@ pub struct SegmentBuilder {
     /// Avoids allocating a new hashmap for each document
     local_tf_buffer: FxHashMap<Spur, u32>,
 
+    /// Reusable buffer for per-document position tracking (when positions enabled)
+    /// Avoids allocating a new hashmap for each text field per document
+    local_positions: FxHashMap<Spur, Vec<u32>>,
+
     /// Reusable buffer for tokenization to avoid per-token String allocations
     token_buffer: String,
 
@@ -151,6 +155,7 @@ impl SegmentBuilder {
             num_indexed_fields,
             field_to_slot,
             local_tf_buffer: FxHashMap::default(),
+            local_positions: FxHashMap::default(),
             token_buffer: String::with_capacity(64),
             config,
             dense_vectors: FxHashMap::default(),
@@ -427,11 +432,12 @@ impl SegmentBuilder {
 
         // Phase 1: Aggregate term frequencies within this document
         // Also collect positions if enabled
-        // Reuse buffer to avoid allocations
+        // Reuse buffers to avoid allocations
         self.local_tf_buffer.clear();
-
-        // For position tracking: term -> list of positions in this text
-        let mut local_positions: FxHashMap<Spur, Vec<u32>> = FxHashMap::default();
+        // Clear position Vecs in-place (keeps allocated capacity for reuse)
+        for v in self.local_positions.values_mut() {
+            v.clear();
+        }
 
         let mut token_position = 0u32;
 
@@ -472,7 +478,7 @@ impl SegmentBuilder {
                     // Full: encode both
                     PositionMode::Full => (element_ordinal << 20) | token_position,
                 };
-                local_positions
+                self.local_positions
                     .entry(term_spur)
                     .or_default()
                     .push(encoded_pos);
@@ -507,7 +513,7 @@ impl SegmentBuilder {
 
             // Add positions if enabled
             if position_mode.is_some()
-                && let Some(positions) = local_positions.get(&term_spur)
+                && let Some(positions) = self.local_positions.get(&term_spur)
             {
                 let is_new_pos_term = !self.position_index.contains_key(&term_key);
                 let pos_posting = self
@@ -1050,6 +1056,7 @@ impl SegmentBuilder {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut current_offset = 0u64;
+        let mut buf = Vec::new();
 
         for (key, pos_builder) in entries {
             let mut pos_list = PositionPostingList::with_capacity(pos_builder.postings.len());
@@ -1057,8 +1064,8 @@ impl SegmentBuilder {
                 pos_list.push(doc_id, positions);
             }
 
-            // Serialize to a temp buffer to get exact length, then write
-            let mut buf = Vec::new();
+            // Serialize to reusable buffer, then write
+            buf.clear();
             pos_list.serialize(&mut buf).map_err(crate::Error::Io)?;
             writer.write_all(&buf)?;
 
@@ -1097,31 +1104,40 @@ impl SegmentBuilder {
         term_entries.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         // Phase 2: Parallel serialization
+        // For inline-eligible terms (no positions, few postings), extract doc_ids/tfs
+        // directly from CompactPosting without creating an intermediate PostingList.
         let serialized: Vec<(Vec<u8>, SerializedPosting)> = term_entries
             .into_par_iter()
             .map(|(key, posting_builder)| {
+                let has_positions = position_offsets.contains_key(&key);
+
+                // Fast path: try inline first (avoids PostingList + BlockPostingList allocs)
+                if !has_positions {
+                    let doc_ids: Vec<u32> =
+                        posting_builder.postings.iter().map(|p| p.doc_id).collect();
+                    let term_freqs: Vec<u32> = posting_builder
+                        .postings
+                        .iter()
+                        .map(|p| p.term_freq as u32)
+                        .collect();
+                    if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
+                        return Ok((key, SerializedPosting::Inline(inline)));
+                    }
+                }
+
+                // Slow path: build full PostingList → BlockPostingList → serialize
                 let mut full_postings = PostingList::with_capacity(posting_builder.len());
                 for p in &posting_builder.postings {
                     full_postings.push(p.doc_id, p.term_freq as u32);
                 }
 
-                let doc_ids: Vec<u32> = full_postings.iter().map(|p| p.doc_id).collect();
-                let term_freqs: Vec<u32> = full_postings.iter().map(|p| p.term_freq).collect();
-
-                let has_positions = position_offsets.contains_key(&key);
-                let result = if !has_positions
-                    && let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs)
-                {
-                    SerializedPosting::Inline(inline)
-                } else {
-                    let mut posting_bytes = Vec::new();
-                    let block_list =
-                        crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
-                    block_list.serialize(&mut posting_bytes)?;
-                    SerializedPosting::External {
-                        bytes: posting_bytes,
-                        doc_count: full_postings.doc_count(),
-                    }
+                let mut posting_bytes = Vec::new();
+                let block_list =
+                    crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
+                block_list.serialize(&mut posting_bytes)?;
+                let result = SerializedPosting::External {
+                    bytes: posting_bytes,
+                    doc_count: full_postings.doc_count(),
                 };
 
                 Ok((key, result))
@@ -1164,11 +1180,12 @@ impl SegmentBuilder {
 
     /// Stream compressed document store directly to disk.
     ///
-    /// Reads documents from temp file, compresses in parallel batches,
-    /// and writes directly to the streaming writer (no Vec<u8> accumulation).
+    /// Reads pre-serialized document bytes from temp file and passes them
+    /// directly to the store writer via `store_raw`, avoiding the
+    /// deserialize→Document→reserialize roundtrip entirely.
     fn build_store_streaming(
         store_path: &PathBuf,
-        schema: &Schema,
+        _schema: &Schema,
         num_compression_threads: usize,
         compression_level: CompressionLevel,
         writer: &mut dyn Write,
@@ -1178,7 +1195,14 @@ impl SegmentBuilder {
         let file = File::open(store_path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-        let mut doc_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut store_writer = EagerParallelStoreWriter::with_compression_level(
+            writer,
+            num_compression_threads,
+            compression_level,
+        );
+
+        // Stream pre-serialized doc bytes directly — no deserialization needed.
+        // Temp file format: [doc_len: u32 LE][doc_bytes: doc_len bytes] repeated.
         let mut offset = 0usize;
         while offset + 4 <= mmap.len() {
             let doc_len = u32::from_le_bytes([
@@ -1193,29 +1217,9 @@ impl SegmentBuilder {
                 break;
             }
 
-            doc_ranges.push((offset, doc_len));
+            let doc_bytes = &mmap[offset..offset + doc_len];
+            store_writer.store_raw(doc_bytes)?;
             offset += doc_len;
-        }
-
-        const BATCH_SIZE: usize = 10_000;
-        let mut store_writer = EagerParallelStoreWriter::with_compression_level(
-            writer,
-            num_compression_threads,
-            compression_level,
-        );
-
-        for batch in doc_ranges.chunks(BATCH_SIZE) {
-            let batch_docs: Vec<Document> = batch
-                .par_iter()
-                .filter_map(|&(start, len)| {
-                    let doc_bytes = &mmap[start..start + len];
-                    super::store::deserialize_document(doc_bytes, schema).ok()
-                })
-                .collect();
-
-            for doc in &batch_docs {
-                store_writer.store(doc, schema)?;
-            }
         }
 
         store_writer.finish()?;
