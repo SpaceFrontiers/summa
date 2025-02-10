@@ -333,9 +333,9 @@ impl BlockSparsePostingList {
         // Write skip list entries
         let mut offset = 0u32;
         for (block, bytes) in self.blocks.iter().zip(block_bytes.iter()) {
+            let first_doc = block.header.first_doc_id;
             let doc_ids = block.decode_doc_ids();
-            let first_doc = doc_ids.first().copied().unwrap_or(0);
-            let last_doc = doc_ids.last().copied().unwrap_or(0);
+            let last_doc = doc_ids.last().copied().unwrap_or(first_doc);
             let length = bytes.len() as u32;
 
             let entry =
@@ -397,7 +397,8 @@ impl BlockSparsePostingList {
     }
 
     pub fn decode_all(&self) -> Vec<(DocId, u16, f32)> {
-        let mut result = Vec::with_capacity(self.doc_count as usize);
+        let total_postings: usize = self.blocks.iter().map(|b| b.header.count as usize).sum();
+        let mut result = Vec::with_capacity(total_postings);
         for block in &self.blocks {
             let doc_ids = block.decode_doc_ids();
             let ordinals = block.decode_ordinals();
@@ -473,6 +474,7 @@ pub struct BlockSparsePostingIterator<'a> {
     block_idx: usize,
     in_block_idx: usize,
     current_doc_ids: Vec<DocId>,
+    current_ordinals: Vec<u16>,
     current_weights: Vec<f32>,
     exhausted: bool,
 }
@@ -484,6 +486,7 @@ impl<'a> BlockSparsePostingIterator<'a> {
             block_idx: 0,
             in_block_idx: 0,
             current_doc_ids: Vec::new(),
+            current_ordinals: Vec::new(),
             current_weights: Vec::new(),
             exhausted: posting_list.blocks.is_empty(),
         };
@@ -496,6 +499,7 @@ impl<'a> BlockSparsePostingIterator<'a> {
     fn load_block(&mut self, block_idx: usize) {
         if let Some(block) = self.posting_list.blocks.get(block_idx) {
             self.current_doc_ids = block.decode_doc_ids();
+            self.current_ordinals = block.decode_ordinals();
             self.current_weights = block.decode_weights();
             self.block_idx = block_idx;
             self.in_block_idx = 0;
@@ -521,12 +525,10 @@ impl<'a> BlockSparsePostingIterator<'a> {
     }
 
     pub fn ordinal(&self) -> u16 {
-        if let Some(block) = self.posting_list.blocks.get(self.block_idx) {
-            let ordinals = block.decode_ordinals();
-            ordinals.get(self.in_block_idx).copied().unwrap_or(0)
-        } else {
-            0
-        }
+        self.current_ordinals
+            .get(self.in_block_idx)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn advance(&mut self) -> DocId {
@@ -553,19 +555,19 @@ impl<'a> BlockSparsePostingIterator<'a> {
             return self.doc();
         }
 
-        // Check current block
+        // Check current block — binary search within decoded doc_ids
         if let Some(&last_doc) = self.current_doc_ids.last()
             && last_doc >= target
         {
-            while !self.exhausted && self.doc() < target {
-                self.in_block_idx += 1;
-                if self.in_block_idx >= self.current_doc_ids.len() {
-                    self.block_idx += 1;
-                    if self.block_idx >= self.posting_list.blocks.len() {
-                        self.exhausted = true;
-                    } else {
-                        self.load_block(self.block_idx);
-                    }
+            let remaining = &self.current_doc_ids[self.in_block_idx..];
+            let pos = remaining.partition_point(|&d| d < target);
+            self.in_block_idx += pos;
+            if self.in_block_idx >= self.current_doc_ids.len() {
+                self.block_idx += 1;
+                if self.block_idx >= self.posting_list.blocks.len() {
+                    self.exhausted = true;
+                } else {
+                    self.load_block(self.block_idx);
                 }
             }
             return self.doc();
@@ -574,11 +576,8 @@ impl<'a> BlockSparsePostingIterator<'a> {
         // Find correct block
         if let Some(block_idx) = self.posting_list.find_block(target) {
             self.load_block(block_idx);
-            while self.in_block_idx < self.current_doc_ids.len()
-                && self.current_doc_ids[self.in_block_idx] < target
-            {
-                self.in_block_idx += 1;
-            }
+            let pos = self.current_doc_ids.partition_point(|&d| d < target);
+            self.in_block_idx = pos;
             if self.in_block_idx >= self.current_doc_ids.len() {
                 self.block_idx += 1;
                 if self.block_idx >= self.posting_list.blocks.len() {

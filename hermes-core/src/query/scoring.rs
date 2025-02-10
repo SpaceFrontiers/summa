@@ -733,13 +733,16 @@ impl<'a> BmpExecutor<'a> {
             remaining_max.push(term_remaining);
         }
 
-        // Document accumulators: (doc_id, ordinal) -> accumulated_score
-        // Using (doc_id, ordinal) as key ensures scores from different ordinals
-        // are NOT mixed together for multi-valued sparse vector fields.
-        let mut accumulators: FxHashMap<(DocId, u16), f32> = FxHashMap::default();
+        // Document accumulators: packed (doc_id << 16 | ordinal) -> accumulated_score
+        // Using packed u64 key: single-word FxHash vs tuple hashing overhead.
+        // (doc_id, ordinal) ensures scores from different ordinals are NOT mixed.
+        let mut accumulators: FxHashMap<u64, f32> = FxHashMap::default();
         let mut blocks_processed = 0u64;
         let mut blocks_skipped = 0u64;
-        let mut kth_threshold = 0.0f32;
+
+        // Incremental top-k tracker for threshold — O(log k) per insert vs
+        // the old O(n) select_nth_unstable every 32 blocks.
+        let mut top_k = ScoreCollector::new(self.k);
 
         // Process blocks in contribution-descending order, loading each on-demand
         while let Some(entry) = block_queue.pop() {
@@ -749,8 +752,8 @@ impl<'a> BmpExecutor<'a> {
             // Early termination: check if total remaining across all terms
             // can beat the current k-th best accumulated score
             let total_remaining: f32 = remaining_max.iter().sum();
-            let adjusted_threshold = kth_threshold * self.heap_factor;
-            if accumulators.len() >= self.k && total_remaining <= adjusted_threshold {
+            let adjusted_threshold = top_k.threshold() * self.heap_factor;
+            if top_k.len() >= self.k && total_remaining <= adjusted_threshold {
                 blocks_skipped += block_queue.len() as u64;
                 debug!(
                     "BMP early termination after {} blocks: remaining={:.4} <= threshold={:.4}",
@@ -774,31 +777,26 @@ impl<'a> BmpExecutor<'a> {
 
             for i in 0..block.header.count as usize {
                 let score_contribution = qw * weights[i];
-                *accumulators.entry((doc_ids[i], ordinals[i])).or_insert(0.0) += score_contribution;
+                let key = (doc_ids[i] as u64) << 16 | ordinals[i] as u64;
+                let acc = accumulators.entry(key).or_insert(0.0);
+                *acc += score_contribution;
+                // Update top-k tracker with new accumulated score.
+                // ScoreCollector handles duplicates by keeping the entry with
+                // the highest score — stale lower entries are evicted naturally.
+                top_k.insert_with_ordinal(doc_ids[i], *acc, ordinals[i]);
             }
 
             blocks_processed += 1;
-
-            // Periodically recompute k-th best score from accumulators for
-            // early termination. select_nth_unstable is O(n) but only runs
-            // every 32 blocks, amortizing the cost.
-            if blocks_processed.is_multiple_of(32) && accumulators.len() >= self.k {
-                let mut scores: Vec<f32> = accumulators.values().copied().collect();
-                scores.select_nth_unstable_by(self.k - 1, |a, b| {
-                    b.partial_cmp(a).unwrap_or(Ordering::Equal)
-                });
-                kth_threshold = scores[self.k - 1];
-            }
         }
 
-        // Collect top-k directly from accumulators
+        // Collect top-k directly from accumulators (use final accumulated scores)
         let num_accumulators = accumulators.len();
         let mut scored: Vec<ScoredDoc> = accumulators
             .into_iter()
-            .map(|((doc_id, ordinal), score)| ScoredDoc {
-                doc_id,
+            .map(|(key, score)| ScoredDoc {
+                doc_id: (key >> 16) as DocId,
                 score,
-                ordinal,
+                ordinal: (key & 0xFFFF) as u16,
             })
             .collect();
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));

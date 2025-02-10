@@ -1,9 +1,35 @@
 //! L2 reranker: rerank L1 candidates by exact dense vector distance on stored vectors
 
 use crate::dsl::Field;
-use crate::structures::simd::cosine_similarity;
 
 use super::{MultiValueCombiner, ScoredPosition, SearchResult};
+
+/// Batch SIMD cosine scoring — dispatches to native-precision scorer by quantization type.
+/// Scores all vectors in one pass without per-vector dequantization overhead.
+#[inline]
+fn score_batch(
+    query: &[f32],
+    raw: &[u8],
+    quant: crate::dsl::DenseVectorQuantization,
+    dim: usize,
+    scores: &mut [f32],
+) {
+    use crate::dsl::DenseVectorQuantization;
+    match quant {
+        DenseVectorQuantization::F32 => {
+            let num_floats = scores.len() * dim;
+            let vectors: &[f32] =
+                unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
+            crate::structures::simd::batch_cosine_scores(query, vectors, dim, scores);
+        }
+        DenseVectorQuantization::F16 => {
+            crate::structures::simd::batch_cosine_scores_f16(query, raw, dim, scores);
+        }
+        DenseVectorQuantization::UInt8 => {
+            crate::structures::simd::batch_cosine_scores_u8(query, raw, dim, scores);
+        }
+    }
+}
 
 /// Configuration for L2 dense vector reranking
 #[derive(Debug, Clone)]
@@ -17,6 +43,8 @@ pub struct RerankerConfig {
 }
 
 /// Score a single document against the query vector (used by tests).
+#[cfg(test)]
+use crate::structures::simd::cosine_similarity;
 #[cfg(test)]
 fn score_document(
     doc: &crate::dsl::Document,
@@ -82,11 +110,9 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
 
     // For each candidate, batch-read all its ordinals in one mmap call
     // (vectors for the same doc are contiguous in the flat store)
-    let t_read = std::time::Instant::now();
     let mut ordinal_scores: Vec<Vec<(u32, f32)>> = vec![Vec::new(); candidates.len()];
     let mut skipped = 0u32;
     let mut total_vectors = 0usize;
-    let mut vec_buf = vec![0f32; query_dim];
 
     for (ci, candidate) in candidates.iter().enumerate() {
         let Some(&si) = seg_by_id.get(&candidate.segment_id) else {
@@ -123,24 +149,18 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
             }
         };
 
-        let vbs = lazy_flat.vector_byte_size();
         let raw = batch.as_slice();
 
+        // Batch SIMD scoring: scores all vectors in one pass without per-vector dequantization
+        let mut scores = vec![0f32; count];
+        score_batch(query, raw, lazy_flat.quantization, query_dim, &mut scores);
+
         for (j, &(_doc_id, ordinal)) in entries.iter().enumerate() {
-            let offset = j * vbs;
-            crate::segment::dequantize_raw(
-                &raw[offset..offset + vbs],
-                lazy_flat.quantization,
-                query_dim,
-                &mut vec_buf,
-            );
-            let score = cosine_similarity(query, &vec_buf);
-            ordinal_scores[ci].push((ordinal as u32, score));
+            ordinal_scores[ci].push((ordinal as u32, scores[j]));
         }
     }
 
-    let resolve_elapsed = t0.elapsed();
-    let read_score_elapsed = t_read.elapsed();
+    let read_score_elapsed = t0.elapsed();
 
     if total_vectors == 0 {
         log::debug!(
@@ -183,13 +203,12 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     scored.truncate(final_limit);
 
     log::debug!(
-        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors): resolve={:.1}ms read+score={:.1}ms total={:.1}ms",
+        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors): read+score={:.1}ms total={:.1}ms",
         field_id,
         candidates.len(),
         scored.len(),
         skipped,
         total_vectors,
-        resolve_elapsed.as_secs_f64() * 1000.0,
         read_score_elapsed.as_secs_f64() * 1000.0,
         t0.elapsed().as_secs_f64() * 1000.0,
     );
