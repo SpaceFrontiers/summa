@@ -170,7 +170,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Register a new segment with its doc count, persist metadata, and trigger merge check
     ///
     /// This is the main entry point for adding segments after builds complete.
-    pub async fn register_segment(&self, segment_id: String, num_docs: u32) -> Result<()> {
+    pub async fn register_segment(
+        self: &Arc<Self>,
+        segment_id: String,
+        num_docs: u32,
+    ) -> Result<()> {
         {
             let mut meta = self.metadata.write().await;
             if !meta.has_segment(&segment_id) {
@@ -187,11 +191,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Check merge policy and spawn background merges if needed
     /// Uses doc counts from metadata - no segment loading required
-    pub async fn maybe_merge(&self) {
+    pub async fn maybe_merge(self: &Arc<Self>) {
         // Get current segment info from metadata (no segment loading!)
         let segments: Vec<SegmentInfo> = {
             let meta = self.metadata.read().await;
             let merging = self.merging_segments.read();
+
+            log::debug!(
+                "[maybe_merge] meta has {} segments, {} merging, paused={}, pending_merges={}",
+                meta.segment_metas.len(),
+                merging.len(),
+                self.merge_paused.load(Ordering::SeqCst),
+                self.pending_merges.load(Ordering::SeqCst),
+            );
 
             // Filter out segments currently being merged or pending deletion
             meta.segment_metas
@@ -207,6 +219,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         // Ask merge policy for candidates
         let candidates = self.merge_policy.find_merges(&segments);
+
+        log::debug!(
+            "[maybe_merge] {} eligible segments -> {} merge candidates",
+            segments.len(),
+            candidates.len(),
+        );
 
         for candidate in candidates {
             if candidate.segment_ids.len() >= 2 {
@@ -226,13 +244,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Spawn a background merge task
-    fn spawn_merge(&self, segment_ids_to_merge: Vec<String>) {
+    fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) {
         // Skip if merges are paused (during ANN rebuild)
         if self.merge_paused.load(Ordering::SeqCst) {
+            log::debug!("[spawn_merge] skipped: merges paused");
             return;
         }
         // Limit concurrent merges to avoid overwhelming the system during heavy indexing
         if self.pending_merges.load(Ordering::SeqCst) >= MAX_CONCURRENT_MERGES {
+            log::debug!(
+                "[spawn_merge] skipped: pending_merges >= {}",
+                MAX_CONCURRENT_MERGES
+            );
             return;
         }
 
@@ -260,6 +283,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let merge_complete = Arc::clone(&self.merge_complete);
         let tracker = Arc::clone(&self.tracker);
         let term_cache_blocks = self.term_cache_blocks;
+        let self_clone = Arc::clone(self);
 
         pending_merges.fetch_add(1, Ordering::SeqCst);
 
@@ -317,6 +341,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             // Decrement pending merges counter and notify waiters
             pending_merges.fetch_sub(1, Ordering::SeqCst);
             merge_complete.notify_waiters();
+
+            // Re-evaluate merge policy — there may be more segments to merge
+            // that were blocked by MAX_CONCURRENT_MERGES during commit
+            self_clone.maybe_merge().await;
         });
     }
 

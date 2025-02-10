@@ -1270,4 +1270,62 @@ mod tests {
             assert!(doc.is_some(), "doc {} missing after merge", i);
         }
     }
+
+    /// Test that auto-merge is triggered by the merge policy during commit,
+    /// without calling force_merge. Uses MmapDirectory and higher parallelism
+    /// to reproduce production conditions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_auto_merge_triggered() {
+        use crate::directories::MmapDirectory;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let body = schema_builder.add_text_field("body", true, true);
+        let schema = schema_builder.build();
+
+        // Aggressive policy: merge when 3 segments in same tier
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 4096,
+            num_indexing_threads: 4,
+            merge_policy: Box::new(crate::merge::TieredMergePolicy::aggressive()),
+            ..Default::default()
+        };
+
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Create 12 segments with ~50 docs each (4x the aggressive threshold of 3)
+        for batch in 0..12 {
+            for i in 0..50 {
+                let mut doc = Document::new();
+                doc.add_text(title, format!("document_{} batch_{} alpha bravo", i, batch));
+                doc.add_text(
+                    body,
+                    format!(
+                        "the quick brown fox jumps over lazy dog number {} round {}",
+                        i, batch
+                    ),
+                );
+                writer.add_document(doc).unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        // Give background merges time to complete
+        writer.wait_for_merges().await;
+
+        // After commit + auto-merge, segment count should be reduced
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let segment_count = index.segment_readers().await.unwrap().len();
+        eprintln!("Segments after auto-merge: {}", segment_count);
+        assert!(
+            segment_count < 12,
+            "Expected auto-merge to reduce segments from 12, got {}",
+            segment_count
+        );
+    }
 }
