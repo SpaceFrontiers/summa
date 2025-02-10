@@ -104,7 +104,7 @@ impl SegmentMerger {
 
             for &dim_id in &all_dims {
                 // Collect raw data from each segment (skip entries + raw block bytes)
-                let mut sources = Vec::new();
+                let mut sources = Vec::with_capacity(segments.len());
                 for (seg_idx, sparse_idx) in sparse_indexes.iter().enumerate() {
                     if let Some(idx) = sparse_idx
                         && let Some(raw) = idx.read_dim_raw(dim_id).await?
@@ -160,19 +160,38 @@ impl SegmentMerger {
                 //   + weight_quant(1) + pad(1) + pad(2) + first_doc_id(4, LE) + max_weight(4)
                 // So first_doc_id is at byte offset 8 within each block.
                 const FIRST_DOC_ID_OFFSET: usize = 8;
+                const BLOCK_HEADER_SIZE: usize = 16;
                 for (raw, doc_offset) in &sources {
+                    let data = raw.raw_block_data.as_slice();
                     if *doc_offset == 0 {
-                        writer.write_all(raw.raw_block_data.as_slice())?;
+                        writer.write_all(data)?;
                     } else {
-                        let mut buf = raw.raw_block_data.as_slice().to_vec();
-                        for entry in raw.skip_entries {
-                            let off = entry.offset as usize + FIRST_DOC_ID_OFFSET;
-                            if let Some(slot) = buf.get_mut(off..off + 4) {
-                                let old = u32::from_le_bytes(slot.try_into().unwrap());
-                                slot.copy_from_slice(&(old + doc_offset).to_le_bytes());
+                        // Write block-by-block, patching 4-byte first_doc_id inline.
+                        // Avoids cloning the entire raw_block_data buffer.
+                        for (i, entry) in raw.skip_entries.iter().enumerate() {
+                            let start = entry.offset as usize;
+                            let end = if i + 1 < raw.skip_entries.len() {
+                                raw.skip_entries[i + 1].offset as usize
+                            } else {
+                                data.len()
+                            };
+                            let block = &data[start..end];
+                            if block.len() >= BLOCK_HEADER_SIZE {
+                                // Write header prefix (before first_doc_id)
+                                writer.write_all(&block[..FIRST_DOC_ID_OFFSET])?;
+                                // Write patched first_doc_id
+                                let old = u32::from_le_bytes(
+                                    block[FIRST_DOC_ID_OFFSET..FIRST_DOC_ID_OFFSET + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                writer.write_all(&(old + doc_offset).to_le_bytes())?;
+                                // Write remainder of block
+                                writer.write_all(&block[FIRST_DOC_ID_OFFSET + 4..])?;
+                            } else {
+                                writer.write_all(block)?;
                             }
                         }
-                        writer.write_all(&buf)?;
                     }
                 }
 

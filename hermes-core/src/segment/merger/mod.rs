@@ -347,15 +347,17 @@ impl SegmentMerger {
         let mut term_dict_writer = SSTableWriter::<&mut OffsetWriter, TermInfo>::new(term_dict);
         let mut terms_processed = 0usize;
         let mut serialize_buf: Vec<u8> = Vec::new();
+        // Pre-allocate sources buffer outside loop — reused for every term
+        let mut sources: Vec<(usize, TermInfo, u32)> = Vec::with_capacity(segments.len());
 
         while !heap.is_empty() {
-            // Get the smallest key
+            // Get the smallest key (move, not clone)
             let first = heap.pop().unwrap();
-            let current_key = first.key.clone();
+            let current_key = first.key;
 
             // Collect all entries with the same key
-            let mut sources: Vec<(usize, TermInfo, u32)> =
-                vec![(first.segment_idx, first.term_info, first.doc_offset)];
+            sources.clear();
+            sources.push((first.segment_idx, first.term_info, first.doc_offset));
 
             // Advance the iterator that provided this entry
             if let Some((key, term_info)) = iterators[first.segment_idx]
