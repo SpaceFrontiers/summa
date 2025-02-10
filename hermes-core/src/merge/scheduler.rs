@@ -173,18 +173,28 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         segment_id: String,
         num_docs: u32,
     ) -> Result<()> {
-        {
-            let mut meta = self.metadata.write().await;
-            if !meta.has_segment(&segment_id) {
-                meta.add_segment(segment_id.clone(), num_docs);
-                self.tracker.register(&segment_id);
-            }
-            meta.save(self.directory.as_ref()).await?;
-        }
+        self.register_segments_batch(vec![(segment_id, num_docs)])
+            .await?;
 
         // Check if we should trigger a merge (non-blocking)
         self.maybe_merge().await;
         Ok(())
+    }
+
+    /// Register multiple segments in a single metadata write.
+    ///
+    /// Unlike `register_segment`, this does NOT trigger merge evaluation.
+    /// Used by `commit()` to batch-register all flushed segments, then
+    /// trigger merges separately after post-processing is done.
+    pub async fn register_segments_batch(&self, segments: Vec<(String, u32)>) -> Result<()> {
+        let mut meta = self.metadata.write().await;
+        for (segment_id, num_docs) in segments {
+            if !meta.has_segment(&segment_id) {
+                meta.add_segment(segment_id.clone(), num_docs);
+                self.tracker.register(&segment_id);
+            }
+        }
+        meta.save(self.directory.as_ref()).await
     }
 
     /// Check merge policy and spawn background merges if needed

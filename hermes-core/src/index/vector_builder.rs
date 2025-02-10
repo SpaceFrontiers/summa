@@ -46,7 +46,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Ok(());
         }
 
-        // Count total vectors across all segments
+        // Count total vectors across all segments.
+        // Safe during commit: no background merges are running yet (Phase 2).
         let segment_ids = self.segment_manager.get_segment_ids().await;
         let total_vectors = self.count_flat_vectors(&segment_ids).await;
 
@@ -99,14 +100,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Ok(());
         }
 
-        let segment_ids = self.segment_manager.get_segment_ids().await;
+        let snapshot = self.segment_manager.acquire_snapshot().await;
+        let segment_ids = snapshot.segment_ids();
         if segment_ids.is_empty() {
             return Ok(());
         }
 
         // Collect all vectors from all segments for fields that need building
+        // Snapshot holds refs — segments won't be deleted while we read them.
         let all_vectors = self
-            .collect_vectors_for_training(&segment_ids, &fields_to_build)
+            .collect_vectors_for_training(segment_ids, &fields_to_build)
             .await?;
 
         // Train centroids/codebooks for each field
@@ -299,30 +302,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let mut total_skipped = 0usize;
 
         for id_str in segment_ids {
-            let Some(segment_id) = SegmentId::from_hex(id_str) else {
-                continue;
-            };
-            // Segment may have been deleted by a concurrent background merge
-            // between get_segment_ids() and now — skip gracefully.
-            let reader = match SegmentReader::open(
+            let segment_id = SegmentId::from_hex(id_str)
+                .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
+            let reader = SegmentReader::open(
                 self.directory.as_ref(),
                 segment_id,
                 Arc::clone(&self.schema),
                 doc_offset,
                 self.config.term_cache_blocks,
             )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!(
-                        "[vector_builder] skipping segment {} during training: {:?}",
-                        id_str,
-                        e
-                    );
-                    continue;
-                }
-            };
+            .await?;
 
             for (field_id, lazy_flat) in reader.flat_vectors() {
                 if !fields_to_build.iter().any(|(f, _)| f.0 == *field_id) {

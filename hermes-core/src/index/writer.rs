@@ -699,16 +699,20 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Flush all workers and wait for builds to complete
         self.flush().await?;
 
-        // Register all flushed segments in metadata
+        // Phase 1: Register all segments in a single metadata write.
+        // No merge triggering here — segment files are safe to read.
         let segments = std::mem::take(&mut *self.flushed_segments.lock().await);
-        for (segment_hex, num_docs) in segments {
-            self.segment_manager
-                .register_segment(segment_hex, num_docs)
-                .await?;
-        }
+        self.segment_manager
+            .register_segments_batch(segments)
+            .await?;
 
-        // Auto-trigger vector index build if threshold crossed
+        // Phase 2: Post-processing (reads segment files).
+        // Safe because no background merges have been spawned yet.
         self.maybe_build_vector_index().await?;
+
+        // Phase 3: Trigger merge evaluation against the complete segment set.
+        // Background merges start AFTER all commit work is done.
+        self.segment_manager.maybe_merge().await;
 
         Ok(())
     }
