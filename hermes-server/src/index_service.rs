@@ -17,6 +17,35 @@ pub struct IndexServiceImpl {
     pub registry: Arc<IndexRegistry>,
 }
 
+impl IndexServiceImpl {
+    /// Convert a batch of streaming proto messages to Documents off the async
+    /// runtime (spawn_blocking) and feed them to the index writer.
+    async fn flush_stream_batch(
+        batch: Vec<IndexDocumentRequest>,
+        index: &Arc<hermes_core::Index<hermes_core::MmapDirectory>>,
+        writer: &Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::MmapDirectory>>>,
+    ) -> Result<u32, Status> {
+        let schema = index.schema().clone();
+        let docs = tokio::task::spawn_blocking(move || {
+            batch
+                .into_iter()
+                .map(|req| convert_proto_to_document(&req.fields, &schema))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Conversion task failed: {}", e)))?
+        .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
+
+        let count = docs.len() as u32;
+        let w = writer.read().await;
+        for doc in docs {
+            w.add_document(doc)
+                .map_err(|e| Status::internal(format!("Failed to index: {}", e)))?;
+        }
+        Ok(count)
+    }
+}
+
 #[tonic::async_trait]
 impl IndexService for IndexServiceImpl {
     async fn create_index(
@@ -102,9 +131,23 @@ impl IndexService for IndexServiceImpl {
         > = None;
         let mut current_index_name: Option<String> = None;
 
+        // Buffer messages and batch-convert off the async runtime to avoid
+        // blocking tokio threads with CPU-bound proto → Document conversion.
+        const STREAM_BATCH_SIZE: usize = 64;
+        let mut batch: Vec<IndexDocumentRequest> = Vec::with_capacity(STREAM_BATCH_SIZE);
+
         while let Some(req) = stream.message().await? {
-            // Get or switch index/writer if index changed
             let needs_switch = current_index_name.as_ref() != Some(&req.index_name);
+
+            // Flush current batch before switching indexes
+            if needs_switch && !batch.is_empty() {
+                indexed_count += Self::flush_stream_batch(
+                    std::mem::take(&mut batch),
+                    current_index.as_ref().unwrap(),
+                    current_writer.as_ref().unwrap(),
+                )
+                .await?;
+            }
 
             if needs_switch {
                 let index = self.registry.get_or_open_index(&req.index_name).await?;
@@ -114,23 +157,30 @@ impl IndexService for IndexServiceImpl {
                 current_index_name = Some(req.index_name.clone());
             }
 
-            let writer = current_writer
-                .as_ref()
-                .ok_or_else(|| Status::internal("No index selected for streaming"))?;
-            let index = current_index
-                .as_ref()
-                .ok_or_else(|| Status::internal("No index selected for streaming"))?;
+            batch.push(req);
 
-            let doc = convert_proto_to_document(&req.fields, index.schema())
-                .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
+            if batch.len() >= STREAM_BATCH_SIZE {
+                indexed_count += Self::flush_stream_batch(
+                    std::mem::take(&mut batch),
+                    current_index.as_ref().unwrap(),
+                    current_writer.as_ref().unwrap(),
+                )
+                .await?;
+            }
+        }
 
-            writer
-                .read()
-                .await
-                .add_document(doc)
-                .map_err(|e| Status::internal(format!("Failed to index document: {}", e)))?;
-
-            indexed_count += 1;
+        // Flush remaining batch
+        if !batch.is_empty() {
+            indexed_count += Self::flush_stream_batch(
+                batch,
+                current_index
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("No index selected"))?,
+                current_writer
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("No writer selected"))?,
+            )
+            .await?;
         }
 
         Ok(Response::new(IndexDocumentsResponse { indexed_count }))

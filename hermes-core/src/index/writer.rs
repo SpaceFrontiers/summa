@@ -20,16 +20,17 @@
 //!   Async I/O (segment file writes) is bridged via `Handle::block_on()`.
 //! - **Fixed per-worker memory budget**: `max_indexing_memory_bytes / num_workers`.
 //! - **Two-phase commit**:
-//!   1. `prepare_commit()` — closes queue, drains workers, segments written to disk.
+//!   1. `prepare_commit()` — closes queue, workers flush builders to disk.
 //!      Returns a `PreparedCommit` guard. No new documents accepted until resolved.
-//!   2. `PreparedCommit::commit()` — registers segments in metadata, respawns workers.
-//!   3. `PreparedCommit::abort()` — discards prepared segments, respawns workers.
+//!   2. `PreparedCommit::commit()` — registers segments in metadata, resumes workers.
+//!   3. `PreparedCommit::abort()` — discards prepared segments, resumes workers.
 //!   4. `commit()` — convenience: `prepare_commit().await?.commit().await`.
 //!
 //! Since `prepare_commit`/`commit` take `&mut self`, Rust’s borrow checker
 //! guarantees no concurrent `add_document` calls during the commit window.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap;
 
@@ -60,11 +61,11 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) schema: Arc<Schema>,
     pub(super) config: IndexConfig,
     /// MPMC sender — `try_send(&self)` is thread-safe, no lock needed.
-    /// Replaced on each commit cycle.
+    /// Replaced on each commit cycle (workers get new receiver via resume).
     doc_sender: async_channel::Sender<Document>,
-    /// Worker OS thread handles — replaced on each commit cycle.
+    /// Worker OS thread handles — long-lived, survive across commits.
     workers: Vec<std::thread::JoinHandle<()>>,
-    /// Shared worker state (immutable config + mutable segment output)
+    /// Shared worker state (immutable config + mutable segment output + sync)
     worker_state: Arc<WorkerState<D>>,
     /// Segment manager — owns metadata.json, handles segments and background merging
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
@@ -84,6 +85,28 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Segments built by workers, collected by `prepare_commit()`. Sync mutex for sub-μs push.
     built_segments: parking_lot::Mutex<Vec<(String, u32)>>,
+
+    // === Worker lifecycle synchronization ===
+    // Workers survive across commits. On prepare_commit the channel is closed;
+    // workers flush their builders, increment flush_count, then wait on
+    // resume_cvar for a new receiver. commit/abort creates a fresh channel
+    // and wakes them.
+    /// Number of workers that have completed their flush.
+    flush_count: AtomicUsize,
+    /// Mutex + condvar for prepare_commit to wait on all workers flushed.
+    flush_mutex: parking_lot::Mutex<()>,
+    flush_cvar: parking_lot::Condvar,
+    /// Holds the new channel receiver after commit/abort. Workers clone from this.
+    resume_receiver: parking_lot::Mutex<Option<async_channel::Receiver<Document>>>,
+    /// Monotonically increasing epoch, bumped by each resume_workers call.
+    /// Workers compare against their local epoch to avoid re-cloning a stale receiver.
+    resume_epoch: AtomicUsize,
+    /// Condvar for workers to wait for resume (new channel) or shutdown.
+    resume_cvar: parking_lot::Condvar,
+    /// When true, workers should exit permanently (IndexWriter dropped).
+    shutdown: AtomicBool,
+    /// Total number of worker threads.
+    num_workers: usize,
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
@@ -189,6 +212,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             memory_budget_per_worker: config.max_indexing_memory_bytes / num_workers,
             segment_manager: Arc::clone(&segment_manager),
             built_segments: parking_lot::Mutex::new(Vec::new()),
+            flush_count: AtomicUsize::new(0),
+            flush_mutex: parking_lot::Mutex::new(()),
+            flush_cvar: parking_lot::Condvar::new(),
+            resume_receiver: parking_lot::Mutex::new(None),
+            resume_epoch: AtomicUsize::new(0),
+            resume_cvar: parking_lot::Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            num_workers,
         });
         let (doc_sender, workers) = Self::spawn_workers(&worker_state, num_workers);
 
@@ -275,78 +306,115 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     // Worker loop
     // ========================================================================
 
-    /// Worker loop — runs on a dedicated OS thread.
+    /// Worker loop — runs on a dedicated OS thread, survives across commits.
     ///
-    /// Pulls documents from the shared MPMC queue (blocking recv), indexes them
-    /// (CPU-intensive: tokenization, posting list updates), and builds segments
-    /// inline when the memory budget is exceeded.
-    ///
-    /// Async I/O (segment file writes) is bridged via `Handle::block_on()`.
-    /// Exits when the channel is closed (prepare_commit closes the sender).
+    /// Outer loop: each iteration processes one commit cycle.
+    ///   Inner loop: pull documents from MPMC queue, index them, build segments
+    ///   when memory budget is exceeded.
+    ///   On channel close (prepare_commit): flush current builder, signal
+    ///   flush_count, wait for resume with new receiver.
+    ///   On shutdown (Drop): exit permanently.
     fn worker_loop(
         state: Arc<WorkerState<D>>,
-        receiver: async_channel::Receiver<Document>,
+        initial_receiver: async_channel::Receiver<Document>,
         handle: tokio::runtime::Handle,
     ) {
-        let mut builder: Option<SegmentBuilder> = None;
+        let mut receiver = initial_receiver;
+        let mut my_epoch = 0usize;
 
-        while let Ok(doc) = receiver.recv_blocking() {
-            // Initialize builder if needed
-            if builder.is_none() {
-                match SegmentBuilder::new(Arc::clone(&state.schema), state.builder_config.clone()) {
-                    Ok(mut b) => {
-                        for (field, tokenizer) in state.tokenizers.read().iter() {
-                            b.set_tokenizer(*field, tokenizer.clone_box());
+        loop {
+            let mut builder: Option<SegmentBuilder> = None;
+
+            while let Ok(doc) = receiver.recv_blocking() {
+                // Initialize builder if needed
+                if builder.is_none() {
+                    match SegmentBuilder::new(
+                        Arc::clone(&state.schema),
+                        state.builder_config.clone(),
+                    ) {
+                        Ok(mut b) => {
+                            for (field, tokenizer) in state.tokenizers.read().iter() {
+                                b.set_tokenizer(*field, tokenizer.clone_box());
+                            }
+                            builder = Some(b);
                         }
-                        builder = Some(b);
+                        Err(e) => {
+                            log::error!("Failed to create segment builder: {:?}", e);
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        log::error!("Failed to create segment builder: {:?}", e);
-                        continue;
-                    }
+                }
+
+                let b = builder.as_mut().unwrap();
+                if let Err(e) = b.add_document(doc) {
+                    log::error!("Failed to index document: {:?}", e);
+                    continue;
+                }
+
+                let builder_memory = b.estimated_memory_bytes();
+
+                if b.num_docs() & 0x3FFF == 0 {
+                    log::debug!(
+                        "[indexing] docs={}, memory={:.2} MB, budget={:.2} MB",
+                        b.num_docs(),
+                        builder_memory as f64 / (1024.0 * 1024.0),
+                        state.memory_budget_per_worker as f64 / (1024.0 * 1024.0)
+                    );
+                }
+
+                // Require minimum 100 docs before flushing to avoid tiny segments
+                const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
+
+                if builder_memory >= state.memory_budget_per_worker
+                    && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH
+                {
+                    log::info!(
+                        "[indexing] memory budget reached, building segment: \
+                         docs={}, memory={:.2} MB, budget={:.2} MB",
+                        b.num_docs(),
+                        builder_memory as f64 / (1024.0 * 1024.0),
+                        state.memory_budget_per_worker as f64 / (1024.0 * 1024.0),
+                    );
+                    let full_builder = builder.take().unwrap();
+                    Self::build_segment_inline(&state, full_builder, &handle);
                 }
             }
 
-            let b = builder.as_mut().unwrap();
-            if let Err(e) = b.add_document(doc) {
-                log::error!("Failed to index document: {:?}", e);
-                continue;
-            }
-
-            let builder_memory = b.estimated_memory_bytes();
-
-            if b.num_docs() & 0x3FFF == 0 {
-                log::debug!(
-                    "[indexing] docs={}, memory={:.2} MB, budget={:.2} MB",
-                    b.num_docs(),
-                    builder_memory as f64 / (1024.0 * 1024.0),
-                    state.memory_budget_per_worker as f64 / (1024.0 * 1024.0)
-                );
-            }
-
-            // Require minimum 100 docs before flushing to avoid tiny segments
-            const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
-
-            if builder_memory >= state.memory_budget_per_worker
-                && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH
+            // Channel closed — flush current builder
+            if let Some(b) = builder.take()
+                && b.num_docs() > 0
             {
-                log::info!(
-                    "[indexing] memory budget reached, building segment: \
-                     docs={}, memory={:.2} MB, budget={:.2} MB",
-                    b.num_docs(),
-                    builder_memory as f64 / (1024.0 * 1024.0),
-                    state.memory_budget_per_worker as f64 / (1024.0 * 1024.0),
-                );
-                let full_builder = builder.take().unwrap();
-                Self::build_segment_inline(&state, full_builder, &handle);
+                Self::build_segment_inline(&state, b, &handle);
             }
-        }
 
-        // Channel closed — build remaining docs
-        if let Some(b) = builder.take()
-            && b.num_docs() > 0
-        {
-            Self::build_segment_inline(&state, b, &handle);
+            // Signal flush completion
+            let prev = state.flush_count.fetch_add(1, Ordering::Release);
+            if prev + 1 == state.num_workers {
+                // Last worker — wake prepare_commit
+                let _lock = state.flush_mutex.lock();
+                state.flush_cvar.notify_one();
+            }
+
+            // Wait for resume (new channel) or shutdown.
+            // Check resume_epoch to avoid re-cloning a stale receiver from
+            // a previous cycle.
+            {
+                let mut lock = state.resume_receiver.lock();
+                loop {
+                    if state.shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let current_epoch = state.resume_epoch.load(Ordering::Acquire);
+                    if current_epoch > my_epoch
+                        && let Some(rx) = lock.as_ref()
+                    {
+                        receiver = rx.clone();
+                        my_epoch = current_epoch;
+                        break;
+                    }
+                    state.resume_cvar.wait(&mut lock);
+                }
+            }
         }
     }
 
@@ -434,29 +502,36 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.cleanup_orphan_segments().await
     }
 
-    /// Prepare commit — close queue, drain workers, collect built segments.
+    /// Prepare commit — signal workers to flush, wait for completion, collect segments.
     ///
     /// All documents sent via `add_document` before this call are guaranteed
     /// to be written to segment files on disk. Segments are NOT yet registered
     /// in metadata — call `PreparedCommit::commit()` for that.
     ///
-    /// Between prepare and commit, the caller can do external work (WAL sync,
-    /// replication, etc.) knowing that `abort()` is possible if something fails.
+    /// Workers are NOT destroyed — they flush their builders and wait for
+    /// `resume_workers()` to give them a new channel.
     ///
-    /// `add_document` will return `Closed` error until commit/abort respawns workers.
+    /// `add_document` will return `Closed` error until commit/abort resumes workers.
     pub async fn prepare_commit(&mut self) -> Result<PreparedCommit<'_, D>> {
-        // 1. Close channel → workers drain remaining docs and exit
+        // 1. Close channel → workers drain remaining docs and flush builders
         self.doc_sender.close();
 
-        // 2. Join worker OS threads (via spawn_blocking to avoid blocking tokio)
-        let workers = std::mem::take(&mut self.workers);
+        // Wake any workers still waiting on resume_cvar from previous cycle.
+        // They'll clone the stale receiver, enter recv_blocking, get Err
+        // immediately (sender already closed), flush, and signal completion.
+        self.worker_state.resume_cvar.notify_all();
+
+        // 2. Wait for all workers to complete their flush (via spawn_blocking
+        //    to avoid blocking the tokio runtime)
+        let state = Arc::clone(&self.worker_state);
         tokio::task::spawn_blocking(move || {
-            for w in workers {
-                let _ = w.join();
+            let mut lock = state.flush_mutex.lock();
+            while state.flush_count.load(Ordering::Acquire) < state.num_workers {
+                state.flush_cvar.wait(&mut lock);
             }
         })
         .await
-        .map_err(|e| Error::Internal(format!("Failed to join workers: {}", e)))?;
+        .map_err(|e| Error::Internal(format!("Failed to wait for workers: {}", e)))?;
 
         // 3. Collect built segments
         let built = std::mem::take(&mut *self.worker_state.built_segments.lock());
@@ -482,20 +557,31 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.force_merge().await
     }
 
-    /// Respawn workers with a fresh channel. Called after commit or abort.
+    /// Resume workers with a fresh channel. Called after commit or abort.
     ///
-    /// If the tokio runtime has shut down (e.g., program exit), this is a no-op
-    /// to avoid panicking in `Handle::current()`. The writer is left in a
-    /// degraded state (closed channel, no workers) — `add_document` will return
-    /// `Closed` errors, which is acceptable during shutdown.
-    fn respawn_workers(&mut self) {
+    /// Workers are already alive — just give them a new channel and wake them.
+    /// If the tokio runtime has shut down (e.g., program exit), this is a no-op.
+    fn resume_workers(&mut self) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let num_workers = self.config.num_indexing_threads.max(1);
-        let (sender, workers) = Self::spawn_workers(&self.worker_state, num_workers);
+
+        // Reset flush count for next cycle
+        self.worker_state.flush_count.store(0, Ordering::Release);
+
+        // Create new channel
+        let (sender, receiver) = async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
         self.doc_sender = sender;
-        self.workers = workers;
+
+        // Set new receiver, bump epoch, and wake all workers
+        {
+            let mut lock = self.worker_state.resume_receiver.lock();
+            *lock = Some(receiver);
+        }
+        self.worker_state
+            .resume_epoch
+            .fetch_add(1, Ordering::Release);
+        self.worker_state.resume_cvar.notify_all();
     }
 
     // Vector index methods (build_vector_index, etc.) are in vector_builder.rs
@@ -503,7 +589,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
 impl<D: DirectoryWriter + 'static> Drop for IndexWriter<D> {
     fn drop(&mut self) {
+        // 1. Signal permanent shutdown
+        self.worker_state.shutdown.store(true, Ordering::Release);
+        // 2. Close channel to wake workers blocked on recv_blocking
         self.doc_sender.close();
+        // 3. Wake workers that might be waiting on resume_cvar
+        self.worker_state.resume_cvar.notify_all();
+        // 4. Join worker threads
         for w in std::mem::take(&mut self.workers) {
             let _ = w.join();
         }
@@ -522,22 +614,22 @@ pub struct PreparedCommit<'a, D: DirectoryWriter + 'static> {
 }
 
 impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
-    /// Finalize: register segments in metadata, evaluate merge policy, respawn workers.
+    /// Finalize: register segments in metadata, evaluate merge policy, resume workers.
     pub async fn commit(mut self) -> Result<()> {
         self.is_resolved = true;
         let segments = std::mem::take(&mut self.writer.flushed_segments);
         self.writer.segment_manager.commit(segments).await?;
         self.writer.segment_manager.maybe_merge().await;
-        self.writer.respawn_workers();
+        self.writer.resume_workers();
         Ok(())
     }
 
-    /// Abort: discard prepared segments, respawn workers.
+    /// Abort: discard prepared segments, resume workers.
     /// Segment files become orphans (cleaned up by `cleanup_orphan_segments`).
     pub fn abort(mut self) {
         self.is_resolved = true;
         self.writer.flushed_segments.clear();
-        self.writer.respawn_workers();
+        self.writer.resume_workers();
     }
 }
 
@@ -546,7 +638,7 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
         if !self.is_resolved {
             log::warn!("PreparedCommit dropped without commit/abort — auto-aborting");
             self.writer.flushed_segments.clear();
-            self.writer.respawn_workers();
+            self.writer.resume_workers();
         }
     }
 }
