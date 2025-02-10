@@ -23,7 +23,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock as SyncRwLock;
 use tokio::sync::{Notify, RwLock};
@@ -65,8 +65,6 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     merge_complete: Arc<Notify>,
     /// Segment lifecycle tracker for reference counting
     tracker: Arc<SegmentTracker>,
-    /// Pause flag to prevent new merges during ANN rebuild
-    merge_paused: Arc<AtomicBool>,
 }
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
@@ -94,7 +92,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             term_cache_blocks,
             merge_complete: Arc::new(Notify::new()),
             tracker,
-            merge_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -206,10 +203,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let merging = self.merging_segments.read();
 
             log::debug!(
-                "[maybe_merge] meta has {} segments, {} merging, paused={}, pending_merges={}",
+                "[maybe_merge] meta has {} segments, {} merging, pending_merges={}",
                 meta.segment_metas.len(),
                 merging.len(),
-                self.merge_paused.load(Ordering::SeqCst),
                 self.pending_merges.load(Ordering::SeqCst),
             );
 
@@ -241,23 +237,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Pause background merges (used during ANN rebuild to prevent races)
-    pub fn pause_merges(&self) {
-        self.merge_paused.store(true, Ordering::SeqCst);
-    }
-
-    /// Resume background merges
-    pub fn resume_merges(&self) {
-        self.merge_paused.store(false, Ordering::SeqCst);
-    }
-
     /// Spawn a background merge task
     fn spawn_merge(&self, segment_ids_to_merge: Vec<String>) {
-        // Skip if merges are paused (during ANN rebuild)
-        if self.merge_paused.load(Ordering::SeqCst) {
-            log::debug!("[spawn_merge] skipped: merges paused");
-            return;
-        }
         // Limit concurrent merges to avoid overwhelming the system during heavy indexing
         if self.pending_merges.load(Ordering::SeqCst) >= MAX_CONCURRENT_MERGES {
             log::debug!(
