@@ -38,7 +38,7 @@ use crate::segment::{SegmentMerger, SegmentReader};
 use super::{MergePolicy, SegmentInfo};
 
 /// Maximum number of concurrent merge operations
-const MAX_CONCURRENT_MERGES: usize = 2;
+const MAX_CONCURRENT_MERGES: usize = 4;
 
 /// Segment manager - coordinates segment registration and background merging
 ///
@@ -338,9 +338,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
             }
 
-            // Decrement pending merges counter and notify waiters
+            // Decrement pending merges counter and notify waiters.
+            // Use notify_one() instead of notify_waiters() to store a permit
+            // when no waiter is listening — prevents lost-notification hang
+            // if the waiter is between its pending_merges check and .await.
             pending_merges.fetch_sub(1, Ordering::SeqCst);
-            merge_complete.notify_waiters();
+            merge_complete.notify_one();
 
             // Re-evaluate merge policy — there may be more segments to merge
             // that were blocked by MAX_CONCURRENT_MERGES during commit

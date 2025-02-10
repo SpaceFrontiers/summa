@@ -1328,4 +1328,54 @@ mod tests {
             segment_count
         );
     }
+
+    /// Stress test: force_merge with many segments (iterative batching).
+    /// Verifies that merging 50 segments doesn't OOM or exhaust file descriptors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_force_merge_many_segments() {
+        use crate::directories::MmapDirectory;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let schema = schema_builder.build();
+
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 512,
+            ..Default::default()
+        };
+
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Create 50 tiny segments
+        for batch in 0..50 {
+            for i in 0..3 {
+                let mut doc = Document::new();
+                doc.add_text(title, format!("term_{} batch_{}", i, batch));
+                writer.add_document(doc).unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let pre = index.segment_readers().await.unwrap().len();
+        eprintln!("Segments before force_merge: {}", pre);
+        assert!(pre >= 10, "Expected many segments, got {}", pre);
+
+        // Force merge all into one — should iterate in batches, not OOM
+        let writer2 = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        writer2.force_merge().await.unwrap();
+
+        let index2 = Index::open(dir, config).await.unwrap();
+        let post = index2.segment_readers().await.unwrap().len();
+        eprintln!("Segments after force_merge: {}", post);
+        assert_eq!(post, 1);
+        assert_eq!(index2.num_docs().await.unwrap(), 150);
+    }
 }
