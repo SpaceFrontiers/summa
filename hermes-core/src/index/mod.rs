@@ -1329,6 +1329,64 @@ mod tests {
         );
     }
 
+    /// Regression test: commit with dense vector fields + aggressive merge policy.
+    /// Exercises the race where background merge deletes segment files while
+    /// maybe_build_vector_index → collect_vectors_for_training tries to open them.
+    /// Before the fix, this would fail with "IO error: No such file or directory".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_commit_with_vectors_and_background_merge() {
+        use crate::directories::MmapDirectory;
+        use crate::dsl::DenseVectorConfig;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        // RaBitQ with very low build_threshold so vector index building triggers during commit
+        let vec_config = DenseVectorConfig::new(8).with_build_threshold(10);
+        let embedding =
+            schema_builder.add_dense_vector_field_with_config("embedding", true, true, vec_config);
+        let schema = schema_builder.build();
+
+        // Aggressive merge: triggers background merges at 3 segments per tier
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 4096,
+            num_indexing_threads: 4,
+            merge_policy: Box::new(crate::merge::TieredMergePolicy::aggressive()),
+            ..Default::default()
+        };
+
+        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Create 12 segments with vectors — enough to trigger both
+        // background merges (aggressive policy) and vector index building (threshold=10)
+        for batch in 0..12 {
+            for i in 0..5 {
+                let mut doc = Document::new();
+                doc.add_text(title, format!("doc_{}_batch_{}", i, batch));
+                // 8-dim random vector
+                let vec: Vec<f32> = (0..8).map(|j| (i * 8 + j + batch) as f32 * 0.1).collect();
+                doc.add_dense_vector(embedding, vec);
+                writer.add_document(doc).unwrap();
+            }
+            writer.flush().await.unwrap();
+        }
+
+        // This commit triggers:
+        // 1. register_segment × 12 → maybe_merge → background merges
+        // 2. maybe_build_vector_index → collect_vectors_for_training
+        // The race: step 1 deletes segment files while step 2 reads them.
+        writer.commit().await.unwrap();
+        writer.wait_for_merges().await;
+
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let num_docs = index.num_docs().await.unwrap();
+        assert_eq!(num_docs, 60, "Expected 60 docs, got {}", num_docs);
+    }
+
     /// Stress test: force_merge with many segments (iterative batching).
     /// Verifies that merging 50 segments doesn't OOM or exhaust file descriptors.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

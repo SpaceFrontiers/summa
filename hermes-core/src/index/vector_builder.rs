@@ -299,16 +299,30 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let mut total_skipped = 0usize;
 
         for id_str in segment_ids {
-            let segment_id = SegmentId::from_hex(id_str)
-                .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", id_str)))?;
-            let reader = SegmentReader::open(
+            let Some(segment_id) = SegmentId::from_hex(id_str) else {
+                continue;
+            };
+            // Segment may have been deleted by a concurrent background merge
+            // between get_segment_ids() and now — skip gracefully.
+            let reader = match SegmentReader::open(
                 self.directory.as_ref(),
                 segment_id,
                 Arc::clone(&self.schema),
                 doc_offset,
                 self.config.term_cache_blocks,
             )
-            .await?;
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "[vector_builder] skipping segment {} during training: {:?}",
+                        id_str,
+                        e
+                    );
+                    continue;
+                }
+            };
 
             for (field_id, lazy_flat) in reader.flat_vectors() {
                 if !fields_to_build.iter().any(|(f, _)| f.0 == *field_id) {
