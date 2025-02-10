@@ -151,8 +151,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync> = {
             let dir = Arc::clone(&directory);
             Arc::new(move |segment_ids| {
+                // Guard: if the tokio runtime is gone (program exit), skip async
+                // deletion. Segment files become orphans cleaned up on next startup.
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    return;
+                };
                 let dir = Arc::clone(&dir);
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     for segment_id in segment_ids {
                         log::info!(
                             "[segment_cleanup] deleting deferred segment {}",
@@ -487,10 +492,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok((output_hex, total_docs.min(u32::MAX as u64) as u32))
     }
 
-    /// Wait for the merge to complete.
+    /// Wait for the current in-flight merge to complete (if any).
     pub async fn wait_for_merging_thread(self: &Arc<Self>) {
         if let Some(h) = self.merge_handle.lock().await.take() {
             let _ = h.await;
+        }
+    }
+
+    /// Wait for all eligible merges to complete, including cascading merges.
+    ///
+    /// After each merge finishes, re-evaluates the merge policy and waits for
+    /// any newly spawned merge. Loops until no more merges are triggered.
+    pub async fn wait_for_all_merges(self: &Arc<Self>) {
+        loop {
+            let handle = self.merge_handle.lock().await.take();
+            match handle {
+                Some(h) => {
+                    let _ = h.await;
+                }
+                None => break,
+            }
+            self.maybe_merge().await;
         }
     }
 

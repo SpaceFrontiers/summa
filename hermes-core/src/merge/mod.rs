@@ -149,8 +149,8 @@ impl MergePolicy for TieredMergePolicy {
 
                 let chunk = &sorted[..sorted.len().min(self.max_merge_at_once)];
                 if chunk.len() >= 2 {
-                    let total_docs: u32 = chunk.iter().map(|s| s.num_docs).sum();
-                    if total_docs <= self.max_merged_docs {
+                    let total_docs: u64 = chunk.iter().map(|s| s.num_docs as u64).sum();
+                    if total_docs <= self.max_merged_docs as u64 {
                         return Some(MergeCandidate {
                             segment_ids: chunk.iter().map(|s| s.id.clone()).collect(),
                         });

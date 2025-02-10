@@ -412,6 +412,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.wait_for_merging_thread().await;
     }
 
+    /// Wait for all eligible merges to complete, including cascading merges.
+    pub async fn wait_for_all_merges(&self) {
+        self.segment_manager.wait_for_all_merges().await;
+    }
+
     /// Get the segment tracker for sharing with readers.
     pub fn tracker(&self) -> std::sync::Arc<crate::segment::SegmentTracker> {
         self.segment_manager.tracker()
