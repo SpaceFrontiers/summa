@@ -174,22 +174,26 @@ impl MergePolicy for TieredMergePolicy {
 
         let mut candidates = Vec::new();
 
-        // Find tiers with enough segments to merge
+        // Find tiers with enough segments to merge.
+        // Generate multiple non-overlapping candidates per tier so a single
+        // maybe_merge() call can spawn parallel merges for the whole tier.
         for (_tier, tier_segments) in tiers {
             if tier_segments.len() >= self.segments_per_tier {
                 // Sort by doc count (merge smaller ones first)
                 let mut sorted: Vec<_> = tier_segments;
                 sorted.sort_by_key(|s| s.num_docs);
 
-                // Take up to max_merge_at_once segments
-                let to_merge: Vec<_> = sorted.into_iter().take(self.max_merge_at_once).collect();
-
-                // Check total docs limit
-                let total_docs: u32 = to_merge.iter().map(|s| s.num_docs).sum();
-                if total_docs <= self.max_merged_docs && to_merge.len() >= 2 {
-                    candidates.push(MergeCandidate {
-                        segment_ids: to_merge.into_iter().map(|s| s.id.clone()).collect(),
-                    });
+                // Chunk into batches of max_merge_at_once
+                for chunk in sorted.chunks(self.max_merge_at_once) {
+                    if chunk.len() < 2 {
+                        continue;
+                    }
+                    let total_docs: u32 = chunk.iter().map(|s| s.num_docs).sum();
+                    if total_docs <= self.max_merged_docs {
+                        candidates.push(MergeCandidate {
+                            segment_ids: chunk.iter().map(|s| s.id.clone()).collect(),
+                        });
+                    }
                 }
             }
         }

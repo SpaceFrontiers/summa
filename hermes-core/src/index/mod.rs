@@ -1315,16 +1315,22 @@ mod tests {
         }
         writer.commit().await.unwrap();
 
+        let pre_merge = writer.segment_manager.get_segment_ids().await.len();
+
         // Give background merges time to complete
         writer.wait_for_merges().await;
 
         // After commit + auto-merge, segment count should be reduced
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
         let segment_count = index.segment_readers().await.unwrap().len();
-        eprintln!("Segments after auto-merge: {}", segment_count);
+        eprintln!(
+            "Segments: {} before merge, {} after auto-merge",
+            pre_merge, segment_count
+        );
         assert!(
-            segment_count < 12,
-            "Expected auto-merge to reduce segments from 12, got {}",
+            segment_count < pre_merge,
+            "Expected auto-merge to reduce segments from {}, got {}",
+            pre_merge,
             segment_count
         );
     }

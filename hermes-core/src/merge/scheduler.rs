@@ -469,26 +469,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok((new_segment_id.to_hex(), total_docs))
     }
 
-    /// Wait for all pending merges to complete, then re-evaluate.
-    ///
-    /// After background merges finish, there may be remaining segments that
-    /// couldn't be merged earlier because MAX_CONCURRENT_MERGES was reached.
-    /// This method loops: drain pending merges → re-evaluate → repeat,
-    /// until no new merges are spawned.
-    pub async fn wait_for_merges(self: &Arc<Self>) {
-        loop {
-            // Wait for all in-flight merges to finish
-            while self.pending_merges.load(Ordering::SeqCst) > 0 {
-                self.merge_complete.notified().await;
-            }
-
-            // Re-evaluate: spawn merges for segments that were blocked earlier
-            self.maybe_merge().await;
-
-            // If maybe_merge didn't spawn anything, we're truly done
-            if self.pending_merges.load(Ordering::SeqCst) == 0 {
-                return;
-            }
+    /// Wait for all in-flight background merges to complete.
+    pub async fn wait_for_merges(&self) {
+        while self.pending_merges.load(Ordering::SeqCst) > 0 {
+            self.merge_complete.notified().await;
         }
     }
 
