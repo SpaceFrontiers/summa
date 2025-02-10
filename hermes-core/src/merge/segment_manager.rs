@@ -84,6 +84,11 @@ impl MergeInventory {
     fn snapshot(&self) -> HashSet<String> {
         self.inner.lock().clone()
     }
+
+    /// Check if a specific segment is currently involved in a merge.
+    fn contains(&self, segment_id: &str) -> bool {
+        self.inner.lock().contains(segment_id)
+    }
 }
 
 /// RAII guard for a merge operation.
@@ -298,8 +303,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ///
     /// Single lock scope: builds segment list AND calls find_merges atomically
     /// to prevent stale-list races with concurrent replace_segments.
-    /// Candidates whose segments overlap with active merges are skipped.
-    /// Each completed merge auto-triggers another evaluation.
+    /// Segments already involved in active merges are excluded from policy evaluation
+    /// so the policy only sees truly available segments.
+    ///
+    /// Note: `max_concurrent_merges` is a soft limit — concurrent auto-triggers
+    /// may briefly exceed it by one or two due to TOCTOU between slot counting
+    /// and handle registration.
     pub async fn maybe_merge(self: &Arc<Self>) {
         // Drain completed handles and check how many slots are available
         let slots_available = {
@@ -316,11 +325,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let candidates = {
             let st = self.state.lock().await;
 
+            // Exclude segments that are pending deletion OR already in an active merge.
+            // Without the in-merge filter, the policy would generate candidates that
+            // overlap with running merges (rejected by try_register) and miss valid
+            // merges of the remaining free segments.
             let segments: Vec<SegmentInfo> = st
                 .metadata
                 .segment_metas
                 .iter()
-                .filter(|(id, _)| !self.tracker.is_pending_deletion(id))
+                .filter(|(id, _)| {
+                    !self.tracker.is_pending_deletion(id) && !self.merge_inventory.contains(id)
+                })
                 .map(|(id, info)| SegmentInfo {
                     id: id.clone(),
                     num_docs: info.num_docs,
@@ -545,9 +560,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Wait for all eligible merges to complete, including cascading merges.
     ///
-    /// Drains current handles, then re-evaluates. Loops until no more merges
-    /// are triggered (each completed merge also auto-triggers, so this catches
-    /// any stragglers).
+    /// Drains current handles, then loops. Each completed merge auto-triggers
+    /// `maybe_merge` (which pushes new handles) before its JoinHandle resolves,
+    /// so by the time `h.await` returns all cascading handles are registered.
     pub async fn wait_for_all_merges(self: &Arc<Self>) {
         loop {
             let handles: Vec<JoinHandle<()>> =
@@ -558,9 +573,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             for h in handles {
                 let _ = h.await;
             }
-            // Merge tasks auto-trigger maybe_merge on completion, but give
-            // a moment for any newly spawned tasks to register their handles.
-            tokio::task::yield_now().await;
         }
     }
 
@@ -571,8 +583,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     pub async fn force_merge(self: &Arc<Self>) -> Result<()> {
         const FORCE_MERGE_BATCH: usize = 64;
 
-        // First wait for any in-flight background merges
-        self.wait_for_merging_thread().await;
+        // Wait for all in-flight background merges (including cascading)
+        // before starting forced merges to avoid try_register conflicts.
+        self.wait_for_all_merges().await;
 
         loop {
             let ids_to_merge = self.get_segment_ids().await;
