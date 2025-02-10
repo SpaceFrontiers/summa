@@ -159,45 +159,57 @@ impl SegmentMerger {
         let mut stats = MergeStats::default();
         let files = SegmentFiles::new(new_segment_id.0);
 
-        // === Phase 1: merge postings + positions (streaming) ===
-        let phase1_start = std::time::Instant::now();
-        let mut postings_writer = OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
-        let mut positions_writer = OffsetWriter::new(dir.streaming_writer(&files.positions).await?);
-        let mut term_dict_writer = OffsetWriter::new(dir.streaming_writer(&files.term_dict).await?);
+        // === All 4 phases concurrent: postings || store || dense || sparse ===
+        // Each phase reads from independent parts of source segments (SSTable,
+        // store blocks, flat vectors, sparse index) and writes to independent
+        // output files. No phase consumes another's output.
+        // tokio::try_join! interleaves I/O across the four futures on the same task.
+        let merge_start = std::time::Instant::now();
 
-        let terms_processed = self
-            .merge_postings(
-                segments,
-                &mut term_dict_writer,
-                &mut postings_writer,
-                &mut positions_writer,
-            )
-            .await?;
-        stats.terms_processed = terms_processed;
-        stats.postings_bytes = postings_writer.offset() as usize;
-        stats.term_dict_bytes = term_dict_writer.offset() as usize;
-        let positions_bytes = positions_writer.offset();
+        let postings_fut = async {
+            let mut postings_writer =
+                OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
+            let mut positions_writer =
+                OffsetWriter::new(dir.streaming_writer(&files.positions).await?);
+            let mut term_dict_writer =
+                OffsetWriter::new(dir.streaming_writer(&files.term_dict).await?);
 
-        postings_writer.finish()?;
-        term_dict_writer.finish()?;
-        if positions_bytes > 0 {
-            positions_writer.finish()?;
-        } else {
-            drop(positions_writer);
-            let _ = dir.delete(&files.positions).await;
-        }
-        log::info!(
-            "[merge] postings done: {} terms, term_dict={}, postings={}, positions={} in {:.1}s",
-            terms_processed,
-            format_bytes(stats.term_dict_bytes),
-            format_bytes(stats.postings_bytes),
-            format_bytes(positions_bytes as usize),
-            phase1_start.elapsed().as_secs_f64()
-        );
+            let terms_processed = self
+                .merge_postings(
+                    segments,
+                    &mut term_dict_writer,
+                    &mut postings_writer,
+                    &mut positions_writer,
+                )
+                .await?;
 
-        // === Phase 2: merge store files (streaming) ===
-        let phase2_start = std::time::Instant::now();
-        {
+            let postings_bytes = postings_writer.offset() as usize;
+            let term_dict_bytes = term_dict_writer.offset() as usize;
+            let positions_bytes = positions_writer.offset();
+
+            postings_writer.finish()?;
+            term_dict_writer.finish()?;
+            if positions_bytes > 0 {
+                positions_writer.finish()?;
+            } else {
+                drop(positions_writer);
+                let _ = dir.delete(&files.positions).await;
+            }
+            log::info!(
+                "[merge] postings done: {} terms, term_dict={}, postings={}, positions={}",
+                terms_processed,
+                format_bytes(term_dict_bytes),
+                format_bytes(postings_bytes),
+                format_bytes(positions_bytes as usize),
+            );
+            Ok::<(usize, usize, usize), crate::Error>((
+                terms_processed,
+                term_dict_bytes,
+                postings_bytes,
+            ))
+        };
+
+        let store_fut = async {
             let mut store_writer = OffsetWriter::new(dir.streaming_writer(&files.store).await?);
             {
                 let mut store_merger = StoreMerger::new(&mut store_writer);
@@ -215,35 +227,32 @@ impl SegmentMerger {
                 }
                 store_merger.finish()?;
             }
-            stats.store_bytes = store_writer.offset() as usize;
+            let bytes = store_writer.offset() as usize;
             store_writer.finish()?;
-        }
-        log::info!(
-            "[merge] store done: {} in {:.1}s",
-            format_bytes(stats.store_bytes),
-            phase2_start.elapsed().as_secs_f64()
-        );
+            Ok::<usize, crate::Error>(bytes)
+        };
 
-        // === Phase 3: Dense vectors ===
-        let phase3_start = std::time::Instant::now();
-        let vectors_bytes = self
-            .merge_dense_vectors(dir, segments, &files, trained)
-            .await?;
+        let dense_fut = async {
+            self.merge_dense_vectors(dir, segments, &files, trained)
+                .await
+        };
+
+        let sparse_fut = async { self.merge_sparse_vectors(dir, segments, &files).await };
+
+        let (postings_result, store_bytes, vectors_bytes, sparse_bytes) =
+            tokio::try_join!(postings_fut, store_fut, dense_fut, sparse_fut)?;
+        stats.terms_processed = postings_result.0;
+        stats.term_dict_bytes = postings_result.1;
+        stats.postings_bytes = postings_result.2;
+        stats.store_bytes = store_bytes;
         stats.vectors_bytes = vectors_bytes;
-        log::info!(
-            "[merge] dense vectors done: {} in {:.1}s",
-            format_bytes(stats.vectors_bytes),
-            phase3_start.elapsed().as_secs_f64()
-        );
-
-        // === Phase 4: merge sparse vectors ===
-        let phase4_start = std::time::Instant::now();
-        let sparse_bytes = self.merge_sparse_vectors(dir, segments, &files).await?;
         stats.sparse_bytes = sparse_bytes;
         log::info!(
-            "[merge] sparse vectors done: {} in {:.1}s",
+            "[merge] all phases done: store={}, dense={}, sparse={} in {:.1}s",
+            format_bytes(stats.store_bytes),
+            format_bytes(stats.vectors_bytes),
             format_bytes(stats.sparse_bytes),
-            phase4_start.elapsed().as_secs_f64()
+            merge_start.elapsed().as_secs_f64()
         );
 
         // === Mandatory: merge field stats + write meta ===

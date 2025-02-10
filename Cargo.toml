@@ -27,7 +27,7 @@ categories = ["database", "text-processing"]
 hermes-core = { version = "1.6.12", path = "hermes-core", default-features = false }
 
 # Async runtime
-tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
 async-trait = "0.1"
 futures = "0.3"
 

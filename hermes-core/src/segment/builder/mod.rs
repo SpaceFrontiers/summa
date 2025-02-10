@@ -689,60 +689,91 @@ impl SegmentBuilder {
             FxHashMap::default()
         };
 
-        // Phase 2: Build postings + store — stream directly to disk
+        // Phase 2: 4-way parallel build — postings, store, dense vectors, sparse vectors
+        // These are fully independent: different source data, different output files.
         let inverted_index = std::mem::take(&mut self.inverted_index);
         let term_interner = std::mem::replace(&mut self.term_interner, Rodeo::new());
         let store_path = self.store_path.clone();
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
+        let dense_vectors = std::mem::take(&mut self.dense_vectors);
+        let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
+        let schema = &self.schema;
 
-        // Create streaming writers (async) before entering sync build phases
+        // Pre-create all streaming writers (async) before entering sync rayon scope
         let mut term_dict_writer = dir.streaming_writer(&files.term_dict).await?;
         let mut postings_writer = dir.streaming_writer(&files.postings).await?;
         let mut store_writer = dir.streaming_writer(&files.store).await?;
+        let mut vectors_writer = if !dense_vectors.is_empty() {
+            Some(dir.streaming_writer(&files.vectors).await?)
+        } else {
+            None
+        };
+        let mut sparse_writer = if !sparse_vectors.is_empty() {
+            Some(dir.streaming_writer(&files.sparse).await?)
+        } else {
+            None
+        };
 
-        let (postings_result, store_result) = rayon::join(
+        let ((postings_result, store_result), (vectors_result, sparse_result)) = rayon::join(
             || {
-                Self::build_postings_streaming(
-                    inverted_index,
-                    term_interner,
-                    &position_offsets,
-                    &mut *term_dict_writer,
-                    &mut *postings_writer,
+                rayon::join(
+                    || {
+                        Self::build_postings_streaming(
+                            inverted_index,
+                            term_interner,
+                            &position_offsets,
+                            &mut *term_dict_writer,
+                            &mut *postings_writer,
+                        )
+                    },
+                    || {
+                        Self::build_store_streaming(
+                            &store_path,
+                            num_compression_threads,
+                            compression_level,
+                            &mut *store_writer,
+                        )
+                    },
                 )
             },
             || {
-                Self::build_store_streaming(
-                    &store_path,
-                    num_compression_threads,
-                    compression_level,
-                    &mut *store_writer,
+                rayon::join(
+                    || -> Result<()> {
+                        if let Some(ref mut w) = vectors_writer {
+                            Self::build_vectors_streaming(
+                                dense_vectors,
+                                schema,
+                                trained,
+                                &mut **w,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                    || -> Result<()> {
+                        if let Some(ref mut w) = sparse_writer {
+                            Self::build_sparse_streaming(&mut sparse_vectors, schema, &mut **w)?;
+                        }
+                        Ok(())
+                    },
                 )
             },
         );
         postings_result?;
         store_result?;
+        vectors_result?;
+        sparse_result?;
         term_dict_writer.finish()?;
         postings_writer.finish()?;
         store_writer.finish()?;
+        if let Some(w) = vectors_writer {
+            w.finish()?;
+        }
+        if let Some(w) = sparse_writer {
+            w.finish()?;
+        }
         drop(position_offsets);
-
-        // Phase 3: Dense vectors — stream directly to disk
-        let dense_vectors = std::mem::take(&mut self.dense_vectors);
-        if !dense_vectors.is_empty() {
-            let mut writer = dir.streaming_writer(&files.vectors).await?;
-            Self::build_vectors_streaming(dense_vectors, &self.schema, trained, &mut *writer)?;
-            writer.finish()?;
-        }
-
-        // Phase 4: Sparse vectors — stream directly to disk
-        let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
-        if !sparse_vectors.is_empty() {
-            let mut writer = dir.streaming_writer(&files.sparse).await?;
-            Self::build_sparse_streaming(&mut sparse_vectors, &self.schema, &mut *writer)?;
-            drop(sparse_vectors);
-            writer.finish()?;
-        }
+        drop(sparse_vectors);
 
         let meta = SegmentMeta {
             id: segment_id.0,
@@ -809,16 +840,16 @@ impl SegmentBuilder {
         let mut toc: Vec<DenseVectorTocEntry> = Vec::with_capacity(fields.len() * 2);
         let mut current_offset = 0u64;
 
-        // Pre-build ANN indexes while we still have access to the raw vectors.
-        // Each ANN blob is (field_id, index_type, serialized_bytes).
-        let mut ann_blobs: Vec<(u32, u8, Vec<u8>)> = Vec::new();
-        if let Some(trained) = trained {
-            for (field_id, builder) in &fields {
-                let config = schema
-                    .get_field_entry(Field(*field_id))
-                    .and_then(|e| e.dense_vector_config.as_ref());
+        // Pre-build ANN indexes in parallel across fields.
+        // Each field's ANN build is independent (different vectors, different centroids).
+        let ann_blobs: Vec<(u32, u8, Vec<u8>)> = if let Some(trained) = trained {
+            fields
+                .par_iter()
+                .filter_map(|(field_id, builder)| {
+                    let config = schema
+                        .get_field_entry(Field(*field_id))
+                        .and_then(|e| e.dense_vector_config.as_ref())?;
 
-                if let Some(config) = config {
                     let dim = builder.dim;
                     let blob = match config.index_type {
                         VectorIndexType::IvfRaBitQ if trained.centroids.contains_key(field_id) => {
@@ -846,7 +877,7 @@ impl SegmentBuilder {
                             super::ann_build::serialize_scann(index, codebook)
                                 .map(|b| (super::ann_build::SCANN_TYPE, b))
                         }
-                        _ => continue,
+                        _ => return None,
                     };
                     match blob {
                         Ok((index_type, bytes)) => {
@@ -857,7 +888,7 @@ impl SegmentBuilder {
                                 builder.doc_ids.len(),
                                 bytes.len()
                             );
-                            ann_blobs.push((*field_id, index_type, bytes));
+                            Some((*field_id, index_type, bytes))
                         }
                         Err(e) => {
                             log::warn!(
@@ -865,11 +896,14 @@ impl SegmentBuilder {
                                 field_id,
                                 e
                             );
+                            None
                         }
                     }
-                }
-            }
-        }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Stream each field's flat data directly (builder → disk, no intermediate buffer)
         for (i, (_field_id, builder)) in fields.into_iter().enumerate() {
@@ -964,47 +998,51 @@ impl SegmentBuilder {
             let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
             let pruning_fraction = sparse_config.and_then(|c| c.posting_list_pruning);
 
-            // Sort dim IDs for deterministic output
-            let mut dim_ids: Vec<u32> = builder.postings.keys().copied().collect();
-            dim_ids.sort_unstable();
+            // Parallel: sort + prune + serialize each dimension independently,
+            // then write sequentially. Each dimension's pipeline is CPU-bound
+            // and fully independent.
+            let mut dims: Vec<_> = std::mem::take(&mut builder.postings).into_iter().collect();
+            dims.sort_unstable_by_key(|(id, _)| *id);
 
-            let mut dim_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(dim_ids.len());
-            let mut serialize_buf = Vec::new();
+            let serialized_dims: Vec<(u32, Vec<u8>)> = dims
+                .into_par_iter()
+                .map(|(dim_id, mut postings)| {
+                    postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
 
-            for dim_id in dim_ids {
-                let postings = builder.postings.get_mut(&dim_id).unwrap();
-                postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
+                    if let Some(fraction) = pruning_fraction
+                        && postings.len() > 1
+                        && fraction < 1.0
+                    {
+                        let original_len = postings.len();
+                        postings.sort_by(|a, b| {
+                            b.2.abs()
+                                .partial_cmp(&a.2.abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
+                        postings.truncate(keep);
+                        postings.sort_unstable_by_key(|(d, o, _)| (*d, *o));
+                    }
 
-                if let Some(fraction) = pruning_fraction
-                    && postings.len() > 1
-                    && fraction < 1.0
-                {
-                    let original_len = postings.len();
-                    postings.sort_by(|a, b| {
-                        b.2.abs()
-                            .partial_cmp(&a.2.abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
-                    postings.truncate(keep);
-                    postings.sort_unstable_by_key(|(d, o, _)| (*d, *o));
-                }
-
-                let block_list = BlockSparsePostingList::from_postings_with_block_size(
-                    postings,
-                    quantization,
-                    block_size,
-                )
-                .map_err(crate::Error::Io)?;
-
-                serialize_buf.clear();
-                block_list
-                    .serialize(&mut serialize_buf)
+                    let block_list = BlockSparsePostingList::from_postings_with_block_size(
+                        &postings,
+                        quantization,
+                        block_size,
+                    )
                     .map_err(crate::Error::Io)?;
-                writer.write_all(&serialize_buf)?;
 
-                dim_entries.push((dim_id, current_offset, serialize_buf.len() as u32));
-                current_offset += serialize_buf.len() as u64;
+                    let mut buf = Vec::new();
+                    block_list.serialize(&mut buf).map_err(crate::Error::Io)?;
+                    Ok((dim_id, buf))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            // Sequential write (preserves deterministic offset tracking)
+            let mut dim_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(serialized_dims.len());
+            for (dim_id, buf) in &serialized_dims {
+                writer.write_all(buf)?;
+                dim_entries.push((*dim_id, current_offset, buf.len() as u32));
+                current_offset += buf.len() as u64;
             }
 
             if !dim_entries.is_empty() {
