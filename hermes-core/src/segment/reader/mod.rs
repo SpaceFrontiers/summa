@@ -300,7 +300,7 @@ impl AsyncSegmentReader {
         }
 
         let posting_bytes = self.postings_handle.read_bytes_range(start..end).await?;
-        let block_list = BlockPostingList::deserialize(posting_bytes.as_slice())?;
+        let block_list = BlockPostingList::deserialize_zero_copy(posting_bytes)?;
 
         Ok(Some(block_list))
     }

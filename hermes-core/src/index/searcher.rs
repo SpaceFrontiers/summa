@@ -431,22 +431,73 @@ impl<D: Directory + 'static> Searcher<D> {
             .collect();
 
         let batches = futures::future::try_join_all(futures).await?;
-        let mut all_results: Vec<crate::query::SearchResult> = Vec::new();
         let mut total_seen: u32 = 0;
-        for (batch, segment_seen) in batches {
-            total_seen += segment_seen;
-            all_results.extend(batch);
+
+        // K-way merge: each batch is already sorted by score descending.
+        // Use a max-heap of (score, batch_idx, position) to merge in O(N log K).
+        use std::cmp::Ordering;
+        struct MergeEntry {
+            score: f32,
+            batch_idx: usize,
+            pos: usize,
+        }
+        impl PartialEq for MergeEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.score == other.score
+            }
+        }
+        impl Eq for MergeEntry {}
+        impl PartialOrd for MergeEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for MergeEntry {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.score
+                    .partial_cmp(&other.score)
+                    .unwrap_or(Ordering::Equal)
+            }
         }
 
-        // Sort by score descending
-        all_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
+            Vec::with_capacity(batches.len());
+        for (batch, segment_seen) in batches {
+            total_seen += segment_seen;
+            if !batch.is_empty() {
+                sorted_batches.push(batch);
+            }
+        }
 
-        // Apply offset and limit
-        let results = all_results.into_iter().skip(offset).take(limit).collect();
+        let mut heap = std::collections::BinaryHeap::with_capacity(sorted_batches.len());
+        for (i, batch) in sorted_batches.iter().enumerate() {
+            heap.push(MergeEntry {
+                score: batch[0].score,
+                batch_idx: i,
+                pos: 0,
+            });
+        }
+
+        let mut results = Vec::with_capacity(fetch_limit.min(total_seen as usize));
+        let mut emitted = 0usize;
+        while let Some(entry) = heap.pop() {
+            if emitted >= fetch_limit {
+                break;
+            }
+            let batch = &sorted_batches[entry.batch_idx];
+            if emitted >= offset {
+                results.push(batch[entry.pos].clone());
+            }
+            emitted += 1;
+            let next_pos = entry.pos + 1;
+            if next_pos < batch.len() {
+                heap.push(MergeEntry {
+                    score: batch[next_pos].score,
+                    batch_idx: entry.batch_idx,
+                    pos: next_pos,
+                });
+            }
+        }
 
         Ok((results, total_seen))
     }

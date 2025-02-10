@@ -23,8 +23,9 @@
 //! ```
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
+use super::posting_common::{read_vint, write_vint};
 use crate::DocId;
 
 /// Block size for position posting list (same as regular posting list)
@@ -484,36 +485,6 @@ impl PositionPostingList {
     pub fn iter(&self) -> PositionPostingIterator<'_> {
         PositionPostingIterator::new(self)
     }
-}
-
-/// Write variable-length integer (same as posting.rs)
-fn write_vint<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            writer.write_u8(byte)?;
-            break;
-        } else {
-            writer.write_u8(byte | 0x80)?;
-        }
-    }
-    Ok(())
-}
-
-/// Read variable-length integer (same as posting.rs)
-fn read_vint<R: Read>(reader: &mut R) -> io::Result<u64> {
-    let mut result = 0u64;
-    let mut shift = 0;
-    loop {
-        let byte = reader.read_u8()?;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    Ok(result)
 }
 
 /// Iterator over block-based position posting list

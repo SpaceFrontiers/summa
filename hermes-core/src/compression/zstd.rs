@@ -84,28 +84,36 @@ pub fn compress_with_dict(
     encoder.finish().map_err(io::Error::other)
 }
 
+/// Upper bound for decompressed output (512KB covers 256KB store blocks).
+const DECOMPRESS_CAPACITY: usize = 512 * 1024;
+
 /// Decompress data using Zstd
 ///
-/// Uses the bulk (single-shot) API which reads the content size from
-/// the frame header and allocates the exact output buffer upfront,
-/// avoiding the repeated reallocations of the streaming API.
+/// Reuses a thread-local `Decompressor` to avoid re-initializing the
+/// zstd context on every call. The bulk API reads the content-size
+/// field from the frame header and allocates the exact output buffer.
 pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
-    // 512KB upper bound covers store blocks (256KB uncompressed).
-    // The bulk API reads the frame's content-size field if available
-    // (zstd always writes it) and allocates exactly, falling back to
-    // this capacity as a hard limit.
-    zstd::bulk::decompress(data, 512 * 1024).map_err(io::Error::other)
+    thread_local! {
+        static DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> =
+            std::cell::RefCell::new(zstd::bulk::Decompressor::new().unwrap());
+    }
+    DECOMPRESSOR.with(|dc| {
+        dc.borrow_mut()
+            .decompress(data, DECOMPRESS_CAPACITY)
+            .map_err(io::Error::other)
+    })
 }
 
 /// Decompress data using Zstd with a trained dictionary
 ///
-/// Uses the bulk API with pre-allocated output to avoid repeated
-/// reallocations of the streaming `read_to_end` approach.
+/// Note: dictionary decompressors are NOT reused via thread-local because
+/// each store/sstable may use a different dictionary. The caller (block
+/// cache) ensures this is called only on cache misses.
 pub fn decompress_with_dict(data: &[u8], dict: &CompressionDict) -> io::Result<Vec<u8>> {
     let mut decompressor =
         zstd::bulk::Decompressor::with_dictionary(&dict.raw_dict).map_err(io::Error::other)?;
     decompressor
-        .decompress(data, 512 * 1024)
+        .decompress(data, DECOMPRESS_CAPACITY)
         .map_err(io::Error::other)
 }
 

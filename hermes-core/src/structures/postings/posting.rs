@@ -5,7 +5,9 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
+use super::posting_common::{read_vint, write_vint};
 use crate::DocId;
+use crate::directories::OwnedBytes;
 
 /// A posting entry containing doc_id and term frequency
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,16 +143,12 @@ impl<'a> PostingListIterator<'a> {
         self.doc()
     }
 
-    /// Seek to first doc_id >= target
+    /// Seek to first doc_id >= target (binary search on remaining postings)
     pub fn seek(&mut self, target: DocId) -> DocId {
-        // Binary search for efficiency
-        while self.position < self.postings.len() {
-            if self.postings[self.position].doc_id >= target {
-                return self.postings[self.position].doc_id;
-            }
-            self.position += 1;
-        }
-        TERMINATED
+        let remaining = &self.postings[self.position..];
+        let offset = remaining.partition_point(|p| p.doc_id < target);
+        self.position += offset;
+        self.doc()
     }
 
     /// Size hint for remaining elements
@@ -162,77 +160,6 @@ impl<'a> PostingListIterator<'a> {
 /// Sentinel value indicating iterator is exhausted
 pub const TERMINATED: DocId = DocId::MAX;
 
-/// Write variable-length integer (1-9 bytes)
-fn write_vint<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            writer.write_u8(byte)?;
-            return Ok(());
-        } else {
-            writer.write_u8(byte | 0x80)?;
-        }
-    }
-}
-
-/// Read variable-length integer
-fn read_vint<R: Read>(reader: &mut R) -> io::Result<u64> {
-    let mut result = 0u64;
-    let mut shift = 0;
-
-    loop {
-        let byte = reader.read_u8()?;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint too long",
-            ));
-        }
-    }
-}
-
-/// Compact posting list stored as raw bytes (for memory-mapped access)
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct CompactPostingList {
-    data: Vec<u8>,
-    doc_count: u32,
-}
-
-#[allow(dead_code)]
-impl CompactPostingList {
-    /// Create from a posting list
-    pub fn from_posting_list(list: &PostingList) -> io::Result<Self> {
-        let mut data = Vec::new();
-        list.serialize(&mut data)?;
-        Ok(Self {
-            doc_count: list.len() as u32,
-            data,
-        })
-    }
-
-    /// Get the raw bytes
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Number of documents in the posting list
-    pub fn doc_count(&self) -> u32 {
-        self.doc_count
-    }
-
-    /// Deserialize back to PostingList
-    pub fn to_posting_list(&self) -> io::Result<PostingList> {
-        PostingList::deserialize(&mut &self.data[..])
-    }
-}
-
 /// Block-based posting list for skip-list style access
 /// Each block contains up to BLOCK_SIZE postings
 pub const BLOCK_SIZE: usize = 128;
@@ -243,8 +170,8 @@ pub struct BlockPostingList {
     /// base_doc_id is the first doc_id in the block (absolute, not delta)
     /// block_max_tf enables Block-Max WAND optimization
     skip_list: Vec<(DocId, DocId, u32, u32)>,
-    /// Compressed posting data
-    data: Vec<u8>,
+    /// Compressed posting data (OwnedBytes for zero-copy mmap support)
+    data: OwnedBytes,
     /// Total number of postings
     doc_count: u32,
     /// Maximum term frequency across all postings (for WAND upper bound)
@@ -297,7 +224,7 @@ impl BlockPostingList {
 
         Ok(Self {
             skip_list,
-            data,
+            data: OwnedBytes::new(data),
             doc_count: postings.len() as u32,
             max_tf,
         })
@@ -360,7 +287,45 @@ impl BlockPostingList {
             pos += 16;
         }
 
-        let data = raw[..data_len].to_vec();
+        let data = OwnedBytes::new(raw[..data_len].to_vec());
+
+        Ok(Self {
+            skip_list,
+            data,
+            max_tf,
+            doc_count,
+        })
+    }
+
+    /// Zero-copy deserialization from OwnedBytes.
+    /// The data section is sliced from the source without copying.
+    pub fn deserialize_zero_copy(raw: OwnedBytes) -> io::Result<Self> {
+        if raw.len() < 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "posting data too short",
+            ));
+        }
+
+        let f = raw.len() - 16;
+        let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
+        let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
+        let max_tf = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
+
+        let mut skip_list = Vec::with_capacity(skip_count);
+        let mut pos = data_len;
+        for _ in 0..skip_count {
+            let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
+            let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
+            let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
+            let block_max_tf = u32::from_le_bytes(raw[pos + 12..pos + 16].try_into().unwrap());
+            skip_list.push((base, last, offset, block_max_tf));
+            pos += 16;
+        }
+
+        // Zero-copy: slice references the source OwnedBytes (backed by mmap or Arc<Vec>)
+        let data = raw.slice(0..data_len);
 
         Ok(Self {
             skip_list,
@@ -455,7 +420,7 @@ impl BlockPostingList {
 
         Ok(Self {
             skip_list,
-            data,
+            data: OwnedBytes::new(data),
             doc_count: total_docs,
             max_tf,
         })
@@ -581,11 +546,15 @@ impl BlockPostingList {
 
 /// Iterator over block posting list with skip support
 /// Can be either borrowed or owned via Cow
+///
+/// Uses struct-of-arrays layout: separate Vec<u32> for doc_ids and term_freqs.
+/// This is more cache-friendly for SIMD seek (contiguous doc_ids) and halves
+/// memory vs the previous AoS + separate doc_ids approach.
 pub struct BlockPostingIterator<'a> {
     block_list: std::borrow::Cow<'a, BlockPostingList>,
     current_block: usize,
-    block_postings: Vec<Posting>,
     block_doc_ids: Vec<u32>,
+    block_tfs: Vec<u32>,
     position_in_block: usize,
     exhausted: bool,
 }
@@ -600,8 +569,8 @@ impl<'a> BlockPostingIterator<'a> {
         let mut iter = Self {
             block_list: std::borrow::Cow::Borrowed(block_list),
             current_block: 0,
-            block_postings: Vec::new(),
             block_doc_ids: Vec::new(),
+            block_tfs: Vec::new(),
             position_in_block: 0,
             exhausted,
         };
@@ -616,8 +585,8 @@ impl<'a> BlockPostingIterator<'a> {
         let mut iter = BlockPostingIterator {
             block_list: std::borrow::Cow::Owned(block_list),
             current_block: 0,
-            block_postings: Vec::new(),
             block_doc_ids: Vec::new(),
+            block_tfs: Vec::new(),
             position_in_block: 0,
             exhausted,
         };
@@ -642,10 +611,10 @@ impl<'a> BlockPostingIterator<'a> {
         // Fixed 8-byte prefix: count(u32) + first_doc(u32)
         let count = reader.read_u32::<LittleEndian>().unwrap_or(0) as usize;
         let first_doc = reader.read_u32::<LittleEndian>().unwrap_or(0);
-        self.block_postings.clear();
-        self.block_postings.reserve(count);
         self.block_doc_ids.clear();
         self.block_doc_ids.reserve(count);
+        self.block_tfs.clear();
+        self.block_tfs.reserve(count);
 
         let mut prev_doc_id = first_doc;
 
@@ -653,19 +622,13 @@ impl<'a> BlockPostingIterator<'a> {
             if i == 0 {
                 // First doc from fixed prefix, read only tf
                 if let Ok(tf) = read_vint(&mut reader) {
-                    self.block_postings.push(Posting {
-                        doc_id: first_doc,
-                        term_freq: tf as u32,
-                    });
                     self.block_doc_ids.push(first_doc);
+                    self.block_tfs.push(tf as u32);
                 }
             } else if let (Ok(delta), Ok(tf)) = (read_vint(&mut reader), read_vint(&mut reader)) {
                 let doc_id = prev_doc_id + delta as u32;
-                self.block_postings.push(Posting {
-                    doc_id,
-                    term_freq: tf as u32,
-                });
                 self.block_doc_ids.push(doc_id);
+                self.block_tfs.push(tf as u32);
                 prev_doc_id = doc_id;
             }
         }
@@ -674,18 +637,18 @@ impl<'a> BlockPostingIterator<'a> {
     pub fn doc(&self) -> DocId {
         if self.exhausted {
             TERMINATED
-        } else if self.position_in_block < self.block_postings.len() {
-            self.block_postings[self.position_in_block].doc_id
+        } else if self.position_in_block < self.block_doc_ids.len() {
+            self.block_doc_ids[self.position_in_block]
         } else {
             TERMINATED
         }
     }
 
     pub fn term_freq(&self) -> u32 {
-        if self.exhausted || self.position_in_block >= self.block_postings.len() {
+        if self.exhausted || self.position_in_block >= self.block_tfs.len() {
             0
         } else {
-            self.block_postings[self.position_in_block].term_freq
+            self.block_tfs[self.position_in_block]
         }
     }
 
@@ -695,7 +658,7 @@ impl<'a> BlockPostingIterator<'a> {
         }
 
         self.position_in_block += 1;
-        if self.position_in_block >= self.block_postings.len() {
+        if self.position_in_block >= self.block_doc_ids.len() {
             self.load_block(self.current_block + 1);
         }
         self.doc()
@@ -726,7 +689,7 @@ impl<'a> BlockPostingIterator<'a> {
         let pos = crate::structures::simd::find_first_ge_u32(remaining, target);
         self.position_in_block += pos;
 
-        if self.position_in_block >= self.block_postings.len() {
+        if self.position_in_block >= self.block_doc_ids.len() {
             self.load_block(self.current_block + 1);
         }
         self.doc()

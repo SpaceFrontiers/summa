@@ -278,10 +278,43 @@ impl AsyncFileRead for LazyFileSlice {
     }
 }
 
+/// Backing store for OwnedBytes — supports both heap Vec and mmap.
+#[derive(Clone)]
+enum SharedBytes {
+    Vec(Arc<Vec<u8>>),
+    #[cfg(feature = "native")]
+    Mmap(Arc<memmap2::Mmap>),
+}
+
+impl SharedBytes {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            SharedBytes::Vec(v) => v.as_slice(),
+            #[cfg(feature = "native")]
+            SharedBytes::Mmap(m) => m.as_ref(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SharedBytes::Vec(v) => write!(f, "Vec(len={})", v.len()),
+            #[cfg(feature = "native")]
+            SharedBytes::Mmap(m) => write!(f, "Mmap(len={})", m.len()),
+        }
+    }
+}
+
 /// Owned bytes with cheap cloning (Arc-backed)
+///
+/// Supports two backing stores:
+/// - `Vec<u8>` for owned data (RamDirectory, FsDirectory, decompressed blocks)
+/// - `Mmap` for zero-copy memory-mapped files (MmapDirectory, native only)
 #[derive(Debug, Clone)]
 pub struct OwnedBytes {
-    data: Arc<Vec<u8>>,
+    data: SharedBytes,
     range: Range<usize>,
 }
 
@@ -289,15 +322,43 @@ impl OwnedBytes {
     pub fn new(data: Vec<u8>) -> Self {
         let len = data.len();
         Self {
-            data: Arc::new(data),
+            data: SharedBytes::Vec(Arc::new(data)),
             range: 0..len,
         }
     }
 
     pub fn empty() -> Self {
         Self {
-            data: Arc::new(Vec::new()),
+            data: SharedBytes::Vec(Arc::new(Vec::new())),
             range: 0..0,
+        }
+    }
+
+    /// Create from a pre-existing Arc<Vec<u8>> with a sub-range.
+    /// Used by RamDirectory and CachingDirectory to share data without copying.
+    pub(crate) fn from_arc_vec(data: Arc<Vec<u8>>, range: Range<usize>) -> Self {
+        Self {
+            data: SharedBytes::Vec(data),
+            range,
+        }
+    }
+
+    /// Create from a memory-mapped file (zero-copy).
+    #[cfg(feature = "native")]
+    pub(crate) fn from_mmap(mmap: Arc<memmap2::Mmap>) -> Self {
+        let len = mmap.len();
+        Self {
+            data: SharedBytes::Mmap(mmap),
+            range: 0..len,
+        }
+    }
+
+    /// Create from a memory-mapped file with a sub-range (zero-copy).
+    #[cfg(feature = "native")]
+    pub(crate) fn from_mmap_range(mmap: Arc<memmap2::Mmap>, range: Range<usize>) -> Self {
+        Self {
+            data: SharedBytes::Mmap(mmap),
+            range,
         }
     }
 
@@ -313,13 +374,13 @@ impl OwnedBytes {
         let start = self.range.start + range.start;
         let end = self.range.start + range.end;
         Self {
-            data: Arc::clone(&self.data),
+            data: self.data.clone(),
             range: start..end,
         }
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[self.range.clone()]
+        &self.data.as_bytes()[self.range.clone()]
     }
 
     pub fn to_vec(&self) -> Vec<u8> {
@@ -544,10 +605,10 @@ impl Directory for RamDirectory {
             .get(path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
 
-        Ok(FileSlice::new(OwnedBytes {
-            data: Arc::clone(data),
-            range: 0..data.len(),
-        }))
+        Ok(FileSlice::new(OwnedBytes::from_arc_vec(
+            Arc::clone(data),
+            0..data.len(),
+        )))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -566,10 +627,7 @@ impl Directory for RamDirectory {
             ));
         }
 
-        Ok(OwnedBytes {
-            data: Arc::clone(data),
-            range: start..end,
-        })
+        Ok(OwnedBytes::from_arc_vec(Arc::clone(data), start..end))
     }
 
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
@@ -610,10 +668,7 @@ impl Directory for RamDirectory {
                         "Range out of bounds",
                     ));
                 }
-                Ok(OwnedBytes {
-                    data: Arc::clone(data),
-                    range: start..end,
-                })
+                Ok(OwnedBytes::from_arc_vec(Arc::clone(data), start..end))
             })
         });
 
@@ -842,10 +897,10 @@ impl<D: Directory> Directory for CachingDirectory<D> {
     async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
         // Check cache first
         if let Some(data) = self.cache.read().get(path) {
-            return Ok(FileSlice::new(OwnedBytes {
-                data: Arc::clone(data),
-                range: 0..data.len(),
-            }));
+            return Ok(FileSlice::new(OwnedBytes::from_arc_vec(
+                Arc::clone(data),
+                0..data.len(),
+            )));
         }
 
         // Read from inner and potentially cache
@@ -862,10 +917,7 @@ impl<D: Directory> Directory for CachingDirectory<D> {
         if let Some(data) = self.cache.read().get(path) {
             let start = range.start as usize;
             let end = range.end as usize;
-            return Ok(OwnedBytes {
-                data: Arc::clone(data),
-                range: start..end,
-            });
+            return Ok(OwnedBytes::from_arc_vec(Arc::clone(data), start..end));
         }
 
         self.inner.read_range(path, range).await

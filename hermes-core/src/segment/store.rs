@@ -24,7 +24,6 @@ use crate::dsl::{Document, Schema};
 
 const STORE_MAGIC: u32 = 0x53544F52; // "STOR"
 const STORE_VERSION: u32 = 2; // Version 2 supports dictionaries
-
 /// Write block index + footer to a store file.
 ///
 /// Shared by `StoreWriter::finish`, `StoreWriter::finish` (empty), and `StoreMerger::finish`.
@@ -409,13 +408,13 @@ pub struct AsyncStoreReader {
     cache: RwLock<StoreBlockCache>,
 }
 
-/// FIFO block cache — O(1) lookup, insert, and eviction.
+/// LRU block cache — O(1) lookup/insert, amortized O(n) promotion.
 ///
-/// Uses VecDeque for eviction order (pop_front = O(1)) instead of
-/// Vec::remove(0) which is O(n). get() is &self for read-lock compatibility.
+/// On `get()`, promotes accessed entry to MRU position.
+/// For typical cache sizes (16-64 blocks), the linear promote scan is negligible.
 struct StoreBlockCache {
-    blocks: FxHashMap<DocId, Arc<Vec<u8>>>,
-    insert_order: std::collections::VecDeque<DocId>,
+    blocks: FxHashMap<DocId, Arc<[u8]>>,
+    lru_order: std::collections::VecDeque<DocId>,
     max_blocks: usize,
 }
 
@@ -423,28 +422,41 @@ impl StoreBlockCache {
     fn new(max_blocks: usize) -> Self {
         Self {
             blocks: FxHashMap::default(),
-            insert_order: std::collections::VecDeque::with_capacity(max_blocks),
+            lru_order: std::collections::VecDeque::with_capacity(max_blocks),
             max_blocks,
         }
     }
 
-    fn get(&self, first_doc_id: DocId) -> Option<Arc<Vec<u8>>> {
-        self.blocks.get(&first_doc_id).map(Arc::clone)
+    fn get(&mut self, first_doc_id: DocId) -> Option<Arc<[u8]>> {
+        if self.blocks.contains_key(&first_doc_id) {
+            self.promote(first_doc_id);
+            self.blocks.get(&first_doc_id).map(Arc::clone)
+        } else {
+            None
+        }
     }
 
-    fn insert(&mut self, first_doc_id: DocId, block: Arc<Vec<u8>>) {
+    fn insert(&mut self, first_doc_id: DocId, block: Arc<[u8]>) {
         if self.blocks.contains_key(&first_doc_id) {
-            return; // already cached
+            self.promote(first_doc_id);
+            return;
         }
         while self.blocks.len() >= self.max_blocks {
-            if let Some(evict) = self.insert_order.pop_front() {
+            if let Some(evict) = self.lru_order.pop_front() {
                 self.blocks.remove(&evict);
             } else {
                 break;
             }
         }
         self.blocks.insert(first_doc_id, block);
-        self.insert_order.push_back(first_doc_id);
+        self.lru_order.push_back(first_doc_id);
+    }
+
+    fn promote(&mut self, key: DocId) {
+        if let Some(pos) = self.lru_order.iter().position(|&k| k == key) {
+            self.lru_order.remove(pos);
+            self.lru_order.push_back(key);
+        }
     }
 }
 
@@ -592,10 +604,10 @@ impl AsyncStoreReader {
         deserialize_document(doc_bytes, schema).map(Some)
     }
 
-    async fn load_block(&self, entry: &StoreBlockIndex) -> io::Result<Arc<Vec<u8>>> {
-        // Check cache first (read lock — concurrent cache hits don't serialize)
+    async fn load_block(&self, entry: &StoreBlockIndex) -> io::Result<Arc<[u8]>> {
+        // Check cache (write lock for LRU promotion on hit)
         {
-            if let Some(block) = self.cache.read().get(entry.first_doc_id) {
+            if let Some(block) = self.cache.write().get(entry.first_doc_id) {
                 return Ok(block);
             }
         }
@@ -612,7 +624,7 @@ impl AsyncStoreReader {
             crate::compression::decompress(compressed.as_slice())?
         };
 
-        let block = Arc::new(decompressed);
+        let block: Arc<[u8]> = Arc::from(decompressed);
 
         // Insert into cache
         {

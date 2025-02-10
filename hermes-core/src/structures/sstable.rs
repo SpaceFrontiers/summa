@@ -33,7 +33,6 @@ use crate::directories::{AsyncFileRead, LazyFileHandle, LazyFileSlice, OwnedByte
 /// SSTable magic number - version 4 with memory-efficient index
 /// Uses FST-based or mmap'd block index to avoid heap allocation
 pub const SSTABLE_MAGIC: u32 = 0x53544234; // "STB4"
-
 /// Block size for SSTable (16KB default)
 pub const BLOCK_SIZE: usize = 16 * 1024;
 
@@ -49,7 +48,6 @@ pub const BLOOM_HASH_COUNT: usize = 7;
 // ============================================================================
 // Bloom Filter Implementation
 // ============================================================================
-
 /// Simple bloom filter for key existence checks
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
@@ -150,6 +148,18 @@ impl BloomFilter {
         12 + self.bits.len() * 8
     }
 
+    /// Insert a pre-computed hash pair into the filter
+    pub fn insert_hashed(&mut self, h1: u64, h2: u64) {
+        for i in 0..self.num_hashes {
+            let bit_pos = self.get_bit_pos(h1, h2, i);
+            let word_idx = bit_pos / 64;
+            let bit_idx = bit_pos % 64;
+            if word_idx < self.bits.len() {
+                self.bits[word_idx] |= 1u64 << bit_idx;
+            }
+        }
+    }
+
     /// Compute two hash values using FNV-1a variant
     fn hash_pair(&self, key: &[u8]) -> (u64, u64) {
         // FNV-1a hash
@@ -174,6 +184,22 @@ impl BloomFilter {
     fn get_bit_pos(&self, h1: u64, h2: u64, i: usize) -> usize {
         (h1.wrapping_add((i as u64).wrapping_mul(h2)) % (self.num_bits as u64)) as usize
     }
+}
+
+/// Compute bloom filter hash pair for a key (standalone, no BloomFilter needed).
+/// Uses the same FNV-1a double-hashing as BloomFilter::hash_pair.
+fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
+    let mut h1: u64 = 0xcbf29ce484222325;
+    for &byte in key {
+        h1 ^= byte as u64;
+        h1 = h1.wrapping_mul(0x100000001b3);
+    }
+    let mut h2: u64 = 0x84222325cbf29ce4;
+    for &byte in key {
+        h2 = h2.wrapping_mul(0x100000001b3);
+        h2 ^= byte as u64;
+    }
+    (h1, h2)
 }
 
 /// SSTable value trait
@@ -653,10 +679,9 @@ pub struct SSTableWriter<W: Write, V: SSTableValue> {
     config: SSTableWriterConfig,
     /// Pre-trained dictionary for compression (optional)
     dictionary: Option<CompressionDict>,
-    /// All keys for bloom filter
-    all_keys: Vec<Vec<u8>>,
-    /// Bloom filter (built at finish time)
-    bloom_filter: Option<BloomFilter>,
+    /// Bloom filter key hashes — compact (u64, u64) pairs instead of full keys.
+    /// Filter is built at finish() time with correct sizing.
+    bloom_hashes: Vec<(u64, u64)>,
     _phantom: std::marker::PhantomData<V>,
 }
 
@@ -678,8 +703,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             block_first_key: None,
             config,
             dictionary: None,
-            all_keys: Vec::new(),
-            bloom_filter: None,
+            bloom_hashes: Vec::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -700,8 +724,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             block_first_key: None,
             config,
             dictionary: Some(dictionary),
-            all_keys: Vec::new(),
-            bloom_filter: None,
+            bloom_hashes: Vec::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -711,9 +734,9 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             self.block_first_key = Some(key.to_vec());
         }
 
-        // Collect keys for bloom filter
+        // Store compact hash pair for bloom filter (16 bytes vs ~48+ per key)
         if self.config.use_bloom_filter {
-            self.all_keys.push(key.to_vec());
+            self.bloom_hashes.push(bloom_hash_pair(key));
         }
 
         let prefix_len = common_prefix_len(&self.prev_key, key);
@@ -772,14 +795,17 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
         // Flush any remaining data
         self.flush_block()?;
 
-        // Build bloom filter from collected keys
-        if self.config.use_bloom_filter && !self.all_keys.is_empty() {
-            let mut bloom = BloomFilter::new(self.all_keys.len(), self.config.bloom_bits_per_key);
-            for key in &self.all_keys {
-                bloom.insert(key);
+        // Build bloom filter from collected hashes (properly sized)
+        let bloom_filter = if self.config.use_bloom_filter && !self.bloom_hashes.is_empty() {
+            let mut bloom =
+                BloomFilter::new(self.bloom_hashes.len(), self.config.bloom_bits_per_key);
+            for (h1, h2) in &self.bloom_hashes {
+                bloom.insert_hashed(*h1, *h2);
             }
-            self.bloom_filter = Some(bloom);
-        }
+            Some(bloom)
+        } else {
+            None
+        };
 
         let data_end_offset = self.current_offset;
 
@@ -812,7 +838,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
         self.current_offset += 4 + index_bytes.len() as u64;
 
         // Write bloom filter if present
-        let bloom_offset = if let Some(ref bloom) = self.bloom_filter {
+        let bloom_offset = if let Some(ref bloom) = bloom_filter {
             let bloom_data = bloom.to_bytes();
             let offset = self.current_offset;
             self.writer.write_all(&bloom_data)?;
@@ -880,14 +906,15 @@ pub struct AsyncSSTableReader<V: SSTableValue> {
     _phantom: std::marker::PhantomData<V>,
 }
 
-/// FIFO block cache — O(1) lookup, insert, and eviction.
+/// LRU block cache — O(1) lookup/insert, amortized O(n) promotion.
 ///
-/// Uses VecDeque for eviction order (pop_front = O(1)) instead of
-/// Vec::remove(0) which is O(n). For small caches (16-64 blocks),
-/// FIFO performs nearly identically to LRU.
+/// On `get()`, promotes the accessed entry to MRU position.
+/// On eviction, removes the LRU entry (front of VecDeque).
+/// For typical cache sizes (16-64 blocks), the linear scan in
+/// `promote()` is negligible compared to I/O savings.
 struct BlockCache {
-    blocks: FxHashMap<u64, Arc<Vec<u8>>>,
-    insert_order: std::collections::VecDeque<u64>,
+    blocks: FxHashMap<u64, Arc<[u8]>>,
+    lru_order: std::collections::VecDeque<u64>,
     max_blocks: usize,
 }
 
@@ -895,28 +922,42 @@ impl BlockCache {
     fn new(max_blocks: usize) -> Self {
         Self {
             blocks: FxHashMap::default(),
-            insert_order: std::collections::VecDeque::with_capacity(max_blocks),
+            lru_order: std::collections::VecDeque::with_capacity(max_blocks),
             max_blocks,
         }
     }
 
-    fn get(&self, offset: u64) -> Option<Arc<Vec<u8>>> {
-        self.blocks.get(&offset).map(Arc::clone)
+    fn get(&mut self, offset: u64) -> Option<Arc<[u8]>> {
+        if self.blocks.contains_key(&offset) {
+            self.promote(offset);
+            self.blocks.get(&offset).map(Arc::clone)
+        } else {
+            None
+        }
     }
 
-    fn insert(&mut self, offset: u64, block: Arc<Vec<u8>>) {
+    fn insert(&mut self, offset: u64, block: Arc<[u8]>) {
         if self.blocks.contains_key(&offset) {
-            return; // already cached
+            self.promote(offset);
+            return;
         }
         while self.blocks.len() >= self.max_blocks {
-            if let Some(evict_offset) = self.insert_order.pop_front() {
+            if let Some(evict_offset) = self.lru_order.pop_front() {
                 self.blocks.remove(&evict_offset);
             } else {
                 break;
             }
         }
         self.blocks.insert(offset, block);
-        self.insert_order.push_back(offset);
+        self.lru_order.push_back(offset);
+    }
+
+    /// Move entry to MRU position (back of deque)
+    fn promote(&mut self, offset: u64) {
+        if let Some(pos) = self.lru_order.iter().position(|&k| k == offset) {
+            self.lru_order.remove(pos);
+            self.lru_order.push_back(offset);
+        }
     }
 }
 
@@ -1207,7 +1248,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             } else {
                 crate::compression::decompress(compressed)?
             };
-            cache.insert(addr.offset, Arc::new(decompressed));
+            cache.insert(addr.offset, Arc::from(decompressed));
         }
 
         Ok(())
@@ -1215,14 +1256,14 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
     /// Load a block (checks cache first, then loads from FileSlice)
     /// Uses dictionary decompression if dictionary is present
-    async fn load_block(&self, block_idx: usize) -> io::Result<Arc<Vec<u8>>> {
+    async fn load_block(&self, block_idx: usize) -> io::Result<Arc<[u8]>> {
         let addr = self.block_index.get_addr(block_idx).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Block index out of range")
         })?;
 
-        // Check cache first (read lock — concurrent cache hits don't serialize)
+        // Check cache (write lock for LRU promotion on hit)
         {
-            if let Some(block) = self.cache.read().get(addr.offset) {
+            if let Some(block) = self.cache.write().get(addr.offset) {
                 return Ok(block);
             }
         }
@@ -1245,7 +1286,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             crate::compression::decompress(compressed.as_slice())?
         };
 
-        let block = Arc::new(decompressed);
+        let block: Arc<[u8]> = Arc::from(decompressed);
 
         // Insert into cache
         {
@@ -1307,7 +1348,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         for block_idx in 0..self.block_index.len() {
             let block_data = self.load_block(block_idx).await?;
-            let mut reader = block_data.as_slice();
+            let mut reader = &block_data[..];
             let mut current_key = Vec::new();
 
             while !reader.is_empty() {
@@ -1332,7 +1373,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 pub struct AsyncSSTableIterator<'a, V: SSTableValue> {
     reader: &'a AsyncSSTableReader<V>,
     current_block: usize,
-    block_data: Option<Arc<Vec<u8>>>,
+    block_data: Option<Arc<[u8]>>,
     block_offset: usize,
     current_key: Vec<u8>,
     finished: bool,

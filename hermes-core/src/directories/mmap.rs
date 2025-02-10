@@ -76,9 +76,8 @@ impl Directory for MmapDirectory {
 
     async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
         let mmap = self.mmap_file(path)?;
-        // Copy data - mmap will be dropped after this, OS page cache handles rest
-        let bytes = mmap.to_vec();
-        Ok(FileSlice::new(OwnedBytes::new(bytes)))
+        // Zero-copy: OwnedBytes references the mmap directly
+        Ok(FileSlice::new(OwnedBytes::from_mmap(mmap)))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -93,7 +92,8 @@ impl Directory for MmapDirectory {
             ));
         }
 
-        Ok(OwnedBytes::new(mmap[start..end].to_vec()))
+        // Zero-copy: slice references the mmap directly
+        Ok(OwnedBytes::from_mmap_range(mmap, start..end))
     }
 
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
@@ -127,11 +127,8 @@ impl Directory for MmapDirectory {
                     ));
                 }
 
-                // Hint the OS to prefetch these pages before the memcpy
-                #[cfg(unix)]
-                let _ = mmap.advise_range(memmap2::Advice::WillNeed, start, end - start);
-
-                Ok(OwnedBytes::new(mmap[start..end].to_vec()))
+                // Zero-copy: slice references the mmap directly
+                Ok(OwnedBytes::from_mmap_range(mmap, start..end))
             })
         });
 
