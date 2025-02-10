@@ -63,6 +63,8 @@ pub struct IndexConfig {
     pub optimization: crate::structures::IndexOptimization,
     /// Reload interval in milliseconds for IndexReader (how often to check for new segments)
     pub reload_interval_ms: u64,
+    /// Maximum number of concurrent background merges (default: 4)
+    pub max_concurrent_merges: usize,
 }
 
 impl Default for IndexConfig {
@@ -87,6 +89,7 @@ impl Default for IndexConfig {
             merge_policy: Box::new(crate::merge::TieredMergePolicy::default()),
             optimization: crate::structures::IndexOptimization::default(),
             reload_interval_ms: 1000, // 1 second default
+            max_concurrent_merges: 4,
         }
     }
 }
@@ -124,6 +127,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             metadata,
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
+            config.max_concurrent_merges,
         ));
 
         // Save initial metadata
@@ -152,6 +156,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
             metadata,
             config.merge_policy.clone_box(),
             config.term_cache_blocks,
+            config.max_concurrent_merges,
         ));
 
         // Load trained structures into SegmentManager's ArcSwap

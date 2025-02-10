@@ -138,6 +138,8 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     schema: Arc<crate::dsl::Schema>,
     /// Term cache blocks for segment readers during merge
     term_cache_blocks: usize,
+    /// Maximum number of concurrent background merges
+    max_concurrent_merges: usize,
 }
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
@@ -148,6 +150,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         metadata: IndexMetadata,
         merge_policy: Box<dyn MergePolicy>,
         term_cache_blocks: usize,
+        max_concurrent_merges: usize,
     ) -> Self {
         let tracker = Arc::new(SegmentTracker::new());
         for seg_id in metadata.segment_metas.keys() {
@@ -188,6 +191,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             directory,
             schema,
             term_cache_blocks,
+            max_concurrent_merges: max_concurrent_merges.max(1),
         }
     }
 
@@ -297,10 +301,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Candidates whose segments overlap with active merges are skipped.
     /// Each completed merge auto-triggers another evaluation.
     pub async fn maybe_merge(self: &Arc<Self>) {
-        // Drain completed handles first to keep the Vec small
-        {
+        // Drain completed handles and check how many slots are available
+        let slots_available = {
             let mut handles = self.merge_handles.lock().await;
             handles.retain(|h| !h.is_finished());
+            self.max_concurrent_merges.saturating_sub(handles.len())
+        };
+
+        if slots_available == 0 {
+            log::debug!("[maybe_merge] at max concurrent merges, skipping");
+            return;
         }
 
         let candidates = {
@@ -326,10 +336,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             return;
         }
 
-        log::debug!("[maybe_merge] {} merge candidates", candidates.len());
+        log::debug!(
+            "[maybe_merge] {} merge candidates, {} slots available",
+            candidates.len(),
+            slots_available
+        );
 
         let mut new_handles = Vec::new();
         for c in candidates {
+            if new_handles.len() >= slots_available {
+                break;
+            }
             if let Some(h) = self.spawn_merge(c.segment_ids) {
                 new_handles.push(h);
             }
