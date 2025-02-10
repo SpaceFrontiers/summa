@@ -87,7 +87,7 @@ impl Default for TieredMergePolicy {
     fn default() -> Self {
         Self {
             segments_per_tier: 10,
-            max_merge_at_once: 10,
+            max_merge_at_once: 100,
             tier_factor: 10.0,
             tier_floor: 1000,
             max_merged_docs: 5_000_000,

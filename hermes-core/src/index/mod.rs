@@ -1634,4 +1634,111 @@ mod tests {
             "Multiple merge rounds should produce gen >= 1"
         );
     }
+
+    /// Sustained indexing: verify segment count stays O(logN) bounded.
+    ///
+    /// Indexes many small batches with aggressive merge policy and checks that
+    /// the segment count never grows unbounded. With tiered merging the count
+    /// should stay roughly O(segments_per_tier * num_tiers) ≈ O(log(N)).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_segment_count_bounded_during_sustained_indexing() {
+        use crate::directories::MmapDirectory;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, false);
+        let schema = schema_builder.build();
+
+        let policy = crate::merge::TieredMergePolicy {
+            segments_per_tier: 3,
+            max_merge_at_once: 5,
+            tier_factor: 10.0,
+            tier_floor: 50,
+            max_merged_docs: 1_000_000,
+        };
+
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 4096, // tiny budget → frequent flushes
+            num_indexing_threads: 1,
+            merge_policy: Box::new(policy),
+            max_concurrent_merges: 4,
+            ..Default::default()
+        };
+
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        let num_commits = 40;
+        let docs_per_commit = 30;
+        let total_docs = num_commits * docs_per_commit;
+        let mut max_segments_seen = 0usize;
+
+        for commit_idx in 0..num_commits {
+            for i in 0..docs_per_commit {
+                let mut doc = Document::new();
+                doc.add_text(
+                    title,
+                    format!("doc_{} text", commit_idx * docs_per_commit + i),
+                );
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+
+            // Give background merges a moment to run
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let seg_count = writer.segment_manager.get_segment_ids().await.len();
+            max_segments_seen = max_segments_seen.max(seg_count);
+        }
+
+        // Wait for all merges to finish
+        writer.wait_for_all_merges().await;
+
+        let final_segments = writer.segment_manager.get_segment_ids().await.len();
+        let final_docs: u64 = writer
+            .segment_manager
+            .read_metadata(|m| {
+                m.segment_metas
+                    .values()
+                    .map(|s| s.num_docs as u64)
+                    .sum::<u64>()
+            })
+            .await;
+
+        eprintln!(
+            "Sustained indexing: {} commits, {} total docs, final segments={}, max segments seen={}",
+            num_commits, total_docs, final_segments, max_segments_seen
+        );
+
+        // With 1200 docs and segments_per_tier=3, tier_floor=50:
+        // tier 0: ≤50 docs, tier 1: 50-500, tier 2: 500-5000
+        // We should have at most ~3 segments per tier * ~3 tiers ≈ 9-12 segments at peak.
+        // The key invariant: segment count must NOT grow linearly with commits.
+        // 40 commits should NOT produce 40 segments.
+        let max_allowed = num_commits / 2; // generous: at most half the commits as segments
+        assert!(
+            max_segments_seen <= max_allowed,
+            "Segment count grew too fast: max seen {} > allowed {} (out of {} commits). \
+             Merging is not keeping up.",
+            max_segments_seen,
+            max_allowed,
+            num_commits
+        );
+
+        // After all merges complete, should be well under the limit
+        assert!(
+            final_segments <= 10,
+            "After all merges, expected ≤10 segments, got {}",
+            final_segments
+        );
+
+        // No data loss
+        assert_eq!(
+            final_docs, total_docs as u64,
+            "Expected {} docs, metadata reports {}",
+            total_docs, final_docs
+        );
+    }
 }
