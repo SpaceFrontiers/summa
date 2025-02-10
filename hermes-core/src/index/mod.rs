@@ -26,7 +26,7 @@ mod writer;
 #[cfg(feature = "native")]
 pub use reader::IndexReader;
 #[cfg(feature = "native")]
-pub use writer::IndexWriter;
+pub use writer::{IndexWriter, PreparedCommit};
 
 mod metadata;
 pub use metadata::{FieldVectorMeta, INDEX_META_FILENAME, IndexMetadata, VectorIndexState};
@@ -68,14 +68,19 @@ pub struct IndexConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         #[cfg(feature = "native")]
-        let cpus = num_cpus::get().max(1);
+        let indexing_threads = crate::default_indexing_threads();
         #[cfg(not(feature = "native"))]
-        let cpus = 1;
+        let indexing_threads = 1;
+
+        #[cfg(feature = "native")]
+        let compression_threads = crate::default_compression_threads();
+        #[cfg(not(feature = "native"))]
+        let compression_threads = 1;
 
         Self {
-            num_threads: cpus,
+            num_threads: indexing_threads,
             num_indexing_threads: 1,
-            num_compression_threads: cpus,
+            num_compression_threads: compression_threads,
             term_cache_blocks: 256,
             store_cache_blocks: 32,
             max_indexing_memory_bytes: 256 * 1024 * 1024, // 256 MB default
@@ -354,12 +359,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         searcher.get_document(address).await
     }
 
-    /// Reload is no longer needed - reader handles this automatically
-    pub async fn reload(&self) -> Result<()> {
-        // No-op - reader reloads automatically based on policy
-        Ok(())
-    }
-
     /// Get posting lists for a term across all segments
     pub async fn get_postings(
         &self,
@@ -393,8 +392,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     }
 }
 
-// TODO: Add back warmup_and_save_slice_cache when slice caching is re-integrated
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,7 +409,7 @@ mod tests {
         let config = IndexConfig::default();
 
         // Create index and add documents
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -456,7 +453,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -492,7 +489,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -503,9 +500,8 @@ mod tests {
                 doc.add_text(title, format!("Document {} batch {}", i, batch));
                 writer.add_document(doc).unwrap();
             }
-            writer.flush().await.unwrap();
+            writer.commit().await.unwrap();
         }
-        writer.commit().await.unwrap();
 
         // Should have multiple segments (at least 2, one per flush with docs)
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
@@ -515,7 +511,7 @@ mod tests {
         );
 
         // Force merge
-        let writer = IndexWriter::open(dir.clone(), config.clone())
+        let mut writer = IndexWriter::open(dir.clone(), config.clone())
             .await
             .unwrap();
         writer.force_merge().await.unwrap();
@@ -547,7 +543,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -607,7 +603,7 @@ mod tests {
         let config = IndexConfig::default();
 
         // Create index with some documents
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -643,7 +639,7 @@ mod tests {
         let config = IndexConfig::default();
 
         // Create index and add document with multi-value field
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -719,7 +715,7 @@ mod tests {
         let config = IndexConfig::default();
 
         // Create index with documents containing various terms
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -830,7 +826,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -904,7 +900,7 @@ mod tests {
         let config = IndexConfig::default();
 
         // Phase 1: Add vectors below threshold (should use Flat index)
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -945,7 +941,7 @@ mod tests {
         assert!(!results.is_empty(), "Flat search should return results");
 
         // Phase 2: Add more vectors to cross threshold
-        let writer = IndexWriter::open(dir.clone(), config.clone())
+        let mut writer = IndexWriter::open(dir.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1013,7 +1009,7 @@ mod tests {
         };
 
         // --- Round 1: 5 segments × 10 docs = 50 docs ---
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1030,9 +1026,8 @@ mod tests {
                 );
                 writer.add_document(doc).unwrap();
             }
-            writer.flush().await.unwrap();
+            writer.commit().await.unwrap();
         }
-        writer.commit().await.unwrap();
 
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
         let pre_merge_segments = index.segment_readers().await.unwrap().len();
@@ -1051,7 +1046,7 @@ mod tests {
         assert_eq!(results.hits.len(), 50, "all 50 docs should match 'fox'");
 
         // --- Merge round 1 ---
-        let writer = IndexWriter::open(dir.clone(), config.clone())
+        let mut writer = IndexWriter::open(dir.clone(), config.clone())
             .await
             .unwrap();
         writer.force_merge().await.unwrap();
@@ -1084,7 +1079,7 @@ mod tests {
         }
 
         // --- Round 2: add 30 more docs in 3 segments ---
-        let writer = IndexWriter::open(dir.clone(), config.clone())
+        let mut writer = IndexWriter::open(dir.clone(), config.clone())
             .await
             .unwrap();
         for batch in 0..3 {
@@ -1100,9 +1095,8 @@ mod tests {
                 );
                 writer.add_document(doc).unwrap();
             }
-            writer.flush().await.unwrap();
+            writer.commit().await.unwrap();
         }
-        writer.commit().await.unwrap();
 
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
         assert_eq!(index.num_docs().await.unwrap(), 80);
@@ -1122,7 +1116,7 @@ mod tests {
         assert_eq!(results.hits.len(), 30, "only round 2 docs match 'delta'");
 
         // --- Merge round 2 ---
-        let writer = IndexWriter::open(dir.clone(), config.clone())
+        let mut writer = IndexWriter::open(dir.clone(), config.clone())
             .await
             .unwrap();
         writer.force_merge().await.unwrap();
@@ -1164,7 +1158,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1180,9 +1174,8 @@ mod tests {
                 );
                 writer.add_document(doc).unwrap();
             }
-            writer.flush().await.unwrap();
+            writer.commit().await.unwrap();
         }
-        writer.commit().await.unwrap();
 
         // Verify pre-merge
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
@@ -1203,7 +1196,7 @@ mod tests {
         }
 
         // Force merge
-        let writer = IndexWriter::open(dir.clone(), config.clone())
+        let mut writer = IndexWriter::open(dir.clone(), config.clone())
             .await
             .unwrap();
         writer.force_merge().await.unwrap();
@@ -1253,7 +1246,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1271,14 +1264,16 @@ mod tests {
                 );
                 writer.add_document(doc).unwrap();
             }
-            writer.flush().await.unwrap();
+            writer.commit().await.unwrap();
         }
-        writer.commit().await.unwrap();
 
         let pre_merge = writer.segment_manager.get_segment_ids().await.len();
 
-        // Give background merges time to complete
-        writer.wait_for_merges().await;
+        // wait_for_merging_thread waits for the single in-flight merge. After it completes,
+        // re-evaluate since segments accumulated while the merge was running.
+        writer.wait_for_merging_thread().await;
+        writer.maybe_merge().await;
+        writer.wait_for_merging_thread().await;
 
         // After commit + auto-merge, segment count should be reduced
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
@@ -1323,7 +1318,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1338,15 +1333,9 @@ mod tests {
                 doc.add_dense_vector(embedding, vec);
                 writer.add_document(doc).unwrap();
             }
-            writer.flush().await.unwrap();
+            writer.commit().await.unwrap();
         }
-
-        // This commit triggers:
-        // 1. register_segment × 12 → maybe_merge → background merges
-        // 2. maybe_build_vector_index → collect_vectors_for_training
-        // The race: step 1 deletes segment files while step 2 reads them.
-        writer.commit().await.unwrap();
-        writer.wait_for_merges().await;
+        writer.wait_for_merging_thread().await;
 
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
         let num_docs = index.num_docs().await.unwrap();
@@ -1370,7 +1359,7 @@ mod tests {
             ..Default::default()
         };
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1381,11 +1370,10 @@ mod tests {
                 doc.add_text(title, format!("term_{} batch_{}", i, batch));
                 writer.add_document(doc).unwrap();
             }
-            writer.flush().await.unwrap();
+            writer.commit().await.unwrap();
         }
-        writer.commit().await.unwrap();
         // Wait for background merges before reading segment count
-        writer.wait_for_merges().await;
+        writer.wait_for_merging_thread().await;
 
         let seg_ids = writer.segment_manager.get_segment_ids().await;
         let pre = seg_ids.len();
@@ -1400,5 +1388,245 @@ mod tests {
         eprintln!("Segments after force_merge: {}", post);
         assert_eq!(post, 1);
         assert_eq!(index2.num_docs().await.unwrap(), 150);
+    }
+
+    /// Test that background merges produce correct generation metadata.
+    /// Creates many segments with aggressive policy, commits, waits for merges,
+    /// and verifies that merged segments have generation >= 1 with correct ancestors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_background_merge_generation() {
+        use crate::directories::MmapDirectory;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let schema = schema_builder.build();
+
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 4096,
+            num_indexing_threads: 2,
+            merge_policy: Box::new(crate::merge::TieredMergePolicy::aggressive()),
+            ..Default::default()
+        };
+
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Create 15 small segments — enough for aggressive policy to trigger merges
+        for batch in 0..15 {
+            for i in 0..5 {
+                let mut doc = Document::new();
+                doc.add_text(title, format!("doc_{}_batch_{}", i, batch));
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+        }
+        writer.wait_for_merging_thread().await;
+
+        // Read metadata and verify generation tracking
+        let metas = writer
+            .segment_manager
+            .read_metadata(|m| m.segment_metas.clone())
+            .await;
+
+        let max_gen = metas.values().map(|m| m.generation).max().unwrap_or(0);
+        eprintln!(
+            "Segments after merge: {}, max generation: {}",
+            metas.len(),
+            max_gen
+        );
+
+        // Background merges should have produced at least one merged segment (gen >= 1)
+        assert!(
+            max_gen >= 1,
+            "Expected at least one merged segment (gen >= 1), got max_gen={}",
+            max_gen
+        );
+
+        // Every merged segment (gen > 0) must have non-empty ancestors
+        for (id, info) in &metas {
+            if info.generation > 0 {
+                assert!(
+                    !info.ancestors.is_empty(),
+                    "Segment {} has gen={} but no ancestors",
+                    id,
+                    info.generation
+                );
+            } else {
+                assert!(
+                    info.ancestors.is_empty(),
+                    "Fresh segment {} has gen=0 but has ancestors",
+                    id
+                );
+            }
+        }
+    }
+
+    /// Test that merging preserves every single document.
+    /// Indexes 1000+ unique documents across many segments, force-merges,
+    /// and verifies exact doc count and that every unique term is searchable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_merge_preserves_all_documents() {
+        use crate::directories::MmapDirectory;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let schema = schema_builder.build();
+
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 4096,
+            ..Default::default()
+        };
+
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        let total_docs = 1200;
+        let docs_per_batch = 60;
+        let batches = total_docs / docs_per_batch;
+
+        // Each doc has a unique term "uid_N" for verification
+        for batch in 0..batches {
+            for i in 0..docs_per_batch {
+                let doc_num = batch * docs_per_batch + i;
+                let mut doc = Document::new();
+                doc.add_text(
+                    title,
+                    format!("uid_{} common_term batch_{}", doc_num, batch),
+                );
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+        }
+
+        let pre_segments = writer.segment_manager.get_segment_ids().await.len();
+        assert!(
+            pre_segments >= 2,
+            "Need multiple segments, got {}",
+            pre_segments
+        );
+
+        // Force merge to single segment
+        writer.force_merge().await.unwrap();
+
+        let index = Index::open(dir, config).await.unwrap();
+        assert_eq!(index.segment_readers().await.unwrap().len(), 1);
+        assert_eq!(
+            index.num_docs().await.unwrap(),
+            total_docs as u32,
+            "Doc count mismatch after force_merge"
+        );
+
+        // Verify every unique document is searchable
+        let results = index.query("common_term", total_docs + 100).await.unwrap();
+        assert_eq!(
+            results.hits.len(),
+            total_docs,
+            "common_term should match all docs"
+        );
+
+        // Spot-check unique IDs across the range
+        for check in [0, 1, total_docs / 2, total_docs - 1] {
+            let q = format!("uid_{}", check);
+            let results = index.query(&q, 10).await.unwrap();
+            assert_eq!(results.hits.len(), 1, "'{}' should match exactly 1 doc", q);
+        }
+    }
+
+    /// Multi-round commit+merge: verify doc count grows correctly
+    /// and no documents are lost across multiple merge cycles.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_multi_round_merge_doc_integrity() {
+        use crate::directories::MmapDirectory;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let schema = schema_builder.build();
+
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 4096,
+            num_indexing_threads: 2,
+            merge_policy: Box::new(crate::merge::TieredMergePolicy::aggressive()),
+            ..Default::default()
+        };
+
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        let mut expected_total = 0u64;
+
+        // 4 rounds of: add docs → commit → wait for merges → verify count
+        for round in 0..4 {
+            let docs_this_round = 50 + round * 25; // 50, 75, 100, 125
+            for batch in 0..5 {
+                for i in 0..docs_this_round / 5 {
+                    let mut doc = Document::new();
+                    doc.add_text(
+                        title,
+                        format!("round_{}_batch_{}_doc_{} searchable", round, batch, i),
+                    );
+                    writer.add_document(doc).unwrap();
+                }
+                writer.commit().await.unwrap();
+            }
+            writer.wait_for_merging_thread().await;
+
+            expected_total += docs_this_round as u64;
+
+            let actual = writer
+                .segment_manager
+                .read_metadata(|m| {
+                    m.segment_metas
+                        .values()
+                        .map(|s| s.num_docs as u64)
+                        .sum::<u64>()
+                })
+                .await;
+
+            assert_eq!(
+                actual, expected_total,
+                "Round {}: expected {} docs, metadata reports {}",
+                round, expected_total, actual
+            );
+        }
+
+        // Final verify: open fresh and query
+        let index = Index::open(dir, config).await.unwrap();
+        assert_eq!(index.num_docs().await.unwrap(), expected_total as u32);
+
+        let results = index
+            .query("searchable", expected_total as usize + 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.hits.len(),
+            expected_total as usize,
+            "All docs should match 'searchable'"
+        );
+
+        // Check generation grew across rounds
+        let metas = index
+            .segment_manager()
+            .read_metadata(|m| m.segment_metas.clone())
+            .await;
+        let max_gen = metas.values().map(|m| m.generation).max().unwrap_or(0);
+        eprintln!(
+            "Final: {} segments, {} docs, max generation={}",
+            metas.len(),
+            expected_total,
+            max_gen
+        );
+        assert!(
+            max_gen >= 1,
+            "Multiple merge rounds should produce gen >= 1"
+        );
     }
 }

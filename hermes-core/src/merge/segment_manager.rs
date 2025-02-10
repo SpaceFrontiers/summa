@@ -1,23 +1,22 @@
 //! Segment manager — coordinates segment commit, background merging, and trained structures.
 //!
-//! Architecture (tantivy-inspired):
+//! Architecture:
 //! - **Single mutation queue**: All metadata mutations serialize through `tokio::sync::Mutex<ManagerState>`.
-//!   This is the async equivalent of tantivy's single-threaded rayon pool.
-//! - **JoinHandle merge tracking**: Background merges tracked via `Vec<JoinHandle>`, not `AtomicUsize + Notify`.
-//! - **Explicit `end_merge`**: No Drop guards — merge cleanup always runs after merge completes.
+//! - **Single background merge**: At most one merge runs at a time, tracked via RAII `MergeGuard`.
+//!   A single `JoinHandle` is kept for `wait_for_merging_thread`.
 //! - **ArcSwap for trained**: Lock-free reads of trained vector structures.
 //!
 //! # Locking model (deadlock-free by construction)
 //!
 //! ```text
 //! Lock ordering (acquire in this order):
-//!   1. state           — tokio::sync::Mutex, held for mutations + disk I/O
-//!   2. merging         — parking_lot::Mutex (sync), sub-μs hold
-//!   3. tracker.inner   — parking_lot::Mutex (sync), sub-μs hold
+//!   1. state               — tokio::sync::Mutex, held for mutations + disk I/O
+//!   2. merge_inventory     — parking_lot::Mutex (sync), sub-μs hold, RAII via MergeGuard
+//!   3. tracker.inner       — parking_lot::Mutex (sync), sub-μs hold
 //!
 //! Lock-free state:
-//!   trained            — arc_swap::ArcSwapOption, no ordering constraint
-//!   merge_handles      — tokio::sync::Mutex, never held with state
+//!   trained                — arc_swap::ArcSwapOption, no ordering constraint
+//!   merge_handle           — tokio::sync::Mutex, never held with state
 //! ```
 //!
 //! **Rule:** Never hold a sync lock while `.await`-ing.
@@ -36,8 +35,66 @@ use crate::segment::{SegmentId, SegmentSnapshot, SegmentTracker, TrainedVectorSt
 #[cfg(feature = "native")]
 use crate::segment::{SegmentMerger, SegmentReader};
 
-use super::consts::MAX_CONCURRENT_MERGES;
 use super::{MergePolicy, SegmentInfo};
+
+// ============================================================================
+// RAII merge tracking
+// ============================================================================
+
+/// Tracks which segments are involved in the active merge.
+///
+/// At most one merge runs at a time. Uses RAII via `MergeGuard`: when the
+/// merge task finishes (success, failure, or panic), the guard drops and
+/// segments are automatically unregistered. No manual cleanup.
+struct MergeInventory {
+    inner: parking_lot::Mutex<HashSet<String>>,
+}
+
+impl MergeInventory {
+    fn new() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Try to register a merge. Returns `MergeGuard` on success, `None` if
+    /// a merge is already active.
+    fn try_register(self: &Arc<Self>, segment_ids: Vec<String>) -> Option<MergeGuard> {
+        let mut inner = self.inner.lock();
+        if !inner.is_empty() {
+            return None;
+        }
+        for id in &segment_ids {
+            inner.insert(id.clone());
+        }
+        Some(MergeGuard {
+            inventory: Arc::clone(self),
+        })
+    }
+
+    /// Snapshot of all in-merge segment IDs (for cleanup_orphan_segments)
+    fn snapshot(&self) -> HashSet<String> {
+        self.inner.lock().clone()
+    }
+
+    /// Whether a merge is currently active
+    fn is_active(&self) -> bool {
+        !self.inner.lock().is_empty()
+    }
+}
+
+/// RAII guard for a merge operation.
+/// Dropped when the merge task completes (success, failure, or panic) —
+/// automatically unregisters all segment IDs from the inventory.
+struct MergeGuard {
+    inventory: Arc<MergeInventory>,
+}
+
+impl Drop for MergeGuard {
+    fn drop(&mut self) {
+        self.inventory.inner.lock().clear();
+    }
+}
 
 /// All mutable state behind the single async Mutex.
 struct ManagerState {
@@ -49,21 +106,25 @@ struct ManagerState {
 ///
 /// SOLE owner of `metadata.json`. All metadata mutations go through `state` Mutex.
 pub struct SegmentManager<D: DirectoryWriter + 'static> {
-    /// Serializes ALL metadata mutations (tantivy's single-threaded pool equivalent).
+    /// Serializes ALL metadata mutations.
     state: AsyncMutex<ManagerState>,
 
-    /// Segments currently being merged. `parking_lot::Mutex` because `end_merge`
-    /// needs sync access from the spawned task after merge completes.
-    merging: parking_lot::Mutex<HashSet<String>>,
+    /// RAII merge tracking: segments are registered on merge start, automatically
+    /// unregistered when the merge task ends (via MergeGuard drop).
+    merge_inventory: Arc<MergeInventory>,
 
-    /// In-flight merge JoinHandles. Replaces `AtomicUsize + Notify`.
-    merge_handles: AsyncMutex<Vec<JoinHandle<()>>>,
+    /// In-flight merge JoinHandle — only used by `wait_for_merging_thread`.
+    /// At most one background merge runs at a time.
+    merge_handle: AsyncMutex<Option<JoinHandle<()>>>,
 
     /// Trained vector structures — lock-free reads via ArcSwap.
     trained: ArcSwapOption<TrainedVectorStructures>,
 
     /// Reference counting for safe segment deletion (sync Mutex for Drop).
     tracker: Arc<SegmentTracker>,
+
+    /// Cached deletion callback for snapshots (avoids allocation per acquire_snapshot).
+    delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync>,
 
     /// Directory for segment I/O
     directory: Arc<D>,
@@ -87,15 +148,32 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             tracker.register(seg_id);
         }
 
+        let delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync> = {
+            let dir = Arc::clone(&directory);
+            Arc::new(move |segment_ids| {
+                let dir = Arc::clone(&dir);
+                tokio::spawn(async move {
+                    for segment_id in segment_ids {
+                        log::info!(
+                            "[segment_cleanup] deleting deferred segment {}",
+                            segment_id.0
+                        );
+                        let _ = crate::segment::delete_segment(dir.as_ref(), segment_id).await;
+                    }
+                });
+            })
+        };
+
         Self {
             state: AsyncMutex::new(ManagerState {
                 metadata,
                 merge_policy,
             }),
-            merging: parking_lot::Mutex::new(HashSet::new()),
-            merge_handles: AsyncMutex::new(Vec::new()),
+            merge_inventory: Arc::new(MergeInventory::new()),
+            merge_handle: AsyncMutex::new(None),
             trained: ArcSwapOption::new(None),
             tracker,
+            delete_fn,
             directory,
             schema,
             term_cache_blocks,
@@ -116,11 +194,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self.trained.load_full()
     }
 
-    /// Publish trained vector structures (lock-free via ArcSwap)
-    pub fn publish_trained(&self, trained: TrainedVectorStructures) {
-        self.trained.store(Some(Arc::new(trained)));
-    }
-
     /// Load trained structures from disk and publish to ArcSwap.
     /// Copies metadata under lock, releases lock, then does disk I/O.
     pub async fn load_and_publish_trained(&self) {
@@ -138,12 +211,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Clear trained structures (sets ArcSwap to None)
-    pub fn clear_trained(&self) {
+    pub(crate) fn clear_trained(&self) {
         self.trained.store(None);
     }
 
     /// Read metadata with a closure (no persist)
-    pub async fn read_metadata<F, R>(&self, f: F) -> R
+    pub(crate) async fn read_metadata<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&IndexMetadata) -> R,
     {
@@ -152,7 +225,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Update metadata with a closure and persist atomically
-    pub async fn update_metadata<F>(&self, f: F) -> Result<()>
+    pub(crate) async fn update_metadata<F>(&self, f: F) -> Result<()>
     where
         F: FnOnce(&mut IndexMetadata),
     {
@@ -170,21 +243,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             self.tracker.acquire(&segment_ids)
         };
 
-        let dir = Arc::clone(&self.directory);
-        let delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync> = Arc::new(move |segment_ids| {
-            let dir = Arc::clone(&dir);
-            tokio::spawn(async move {
-                for segment_id in segment_ids {
-                    log::info!(
-                        "[segment_cleanup] deleting deferred segment {}",
-                        segment_id.0
-                    );
-                    let _ = crate::segment::delete_segment(dir.as_ref(), segment_id).await;
-                }
-            });
-        });
-
-        SegmentSnapshot::with_delete_fn(Arc::clone(&self.tracker), acquired, delete_fn)
+        SegmentSnapshot::with_delete_fn(
+            Arc::clone(&self.tracker),
+            acquired,
+            Arc::clone(&self.delete_fn),
+        )
     }
 
     /// Get the segment tracker
@@ -205,7 +268,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 #[cfg(feature = "native")]
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Atomic commit: register new segments + persist metadata.
-    /// Like tantivy's `segment_manager.commit()` + `save_metas()`.
     pub async fn commit(&self, new_segments: Vec<(String, u32)>) -> Result<()> {
         let mut st = self.state.lock().await;
         for (segment_id, num_docs) in new_segments {
@@ -217,125 +279,100 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         st.metadata.save(self.directory.as_ref()).await
     }
 
-    /// Evaluate merge policy and spawn background merges if needed.
-    /// Like tantivy's `consider_merge_options()`.
+    /// Evaluate merge policy and spawn a single background merge if needed.
     ///
     /// Single lock scope: builds segment list AND calls find_merges atomically
-    /// to prevent stale-list races with concurrent end_merge.
+    /// to prevent stale-list races with concurrent replace_segments.
+    /// Only spawns one merge — the next merge is evaluated on the next commit.
     pub async fn maybe_merge(self: &Arc<Self>) {
-        let (candidates, num_eligible, num_merging) = {
+        if self.merge_inventory.is_active() {
+            log::debug!("[maybe_merge] merge already active, skipping");
+            return;
+        }
+
+        let candidate = {
             let st = self.state.lock().await;
-            let merging = self.merging.lock();
 
             let segments: Vec<SegmentInfo> = st
                 .metadata
                 .segment_metas
                 .iter()
-                .filter(|(id, _)| !merging.contains(*id) && !self.tracker.is_pending_deletion(id))
+                .filter(|(id, _)| !self.tracker.is_pending_deletion(id))
                 .map(|(id, info)| SegmentInfo {
                     id: id.clone(),
                     num_docs: info.num_docs,
-                    size_bytes: None,
                 })
                 .collect();
 
-            let num_merging = merging.len();
-            let num_eligible = segments.len();
-            let candidates = st.merge_policy.find_merges(&segments);
-            (candidates, num_eligible, num_merging)
+            log::debug!("[maybe_merge] {} eligible segments", segments.len());
+
+            st.merge_policy.find_merge(&segments)
         };
 
-        log::debug!(
-            "[maybe_merge] {} eligible segments, {} merging -> {} merge candidates",
-            num_eligible,
-            num_merging,
-            candidates.len(),
-        );
-
-        for candidate in candidates {
-            if candidate.segment_ids.len() >= 2 {
-                self.spawn_merge(candidate.segment_ids).await;
-            }
+        if let Some(c) = candidate {
+            self.spawn_merge(c.segment_ids).await;
         }
     }
 
-    /// Spawn a background merge task. Tracks via JoinHandle (no AtomicUsize/Notify).
+    /// Spawn a single background merge task with RAII tracking.
+    ///
+    /// Pre-generates the output segment ID. `MergeGuard` registers all segment IDs
+    /// (old + output) in `merge_inventory`. When the task ends (success, failure, or
+    /// panic), the guard drops and segments are automatically unregistered.
     async fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) {
-        // Limit concurrent merges
-        {
-            let handles = self.merge_handles.lock().await;
-            if handles.len() >= MAX_CONCURRENT_MERGES {
-                log::debug!(
-                    "[spawn_merge] skipped: {} active merges >= {}",
-                    handles.len(),
-                    MAX_CONCURRENT_MERGES
-                );
-                return;
-            }
-        }
+        let output_id = SegmentId::new();
+        let output_hex = output_id.to_hex();
 
-        // Atomically check and mark segments as merging
-        {
-            let mut merging = self.merging.lock();
-            if segment_ids_to_merge.iter().any(|id| merging.contains(id)) {
+        let mut all_ids = segment_ids_to_merge.clone();
+        all_ids.push(output_hex);
+
+        let guard = match self.merge_inventory.try_register(all_ids) {
+            Some(g) => g,
+            None => {
+                log::debug!("[spawn_merge] skipped: merge already active");
                 return;
             }
-            for id in &segment_ids_to_merge {
-                merging.insert(id.clone());
-            }
-        }
+        };
 
         let sm = Arc::clone(self);
         let ids = segment_ids_to_merge;
 
         let handle = tokio::spawn(async move {
+            let _guard = guard;
+
             let trained_snap = sm.trained();
             let result = Self::do_merge(
                 sm.directory.as_ref(),
                 &sm.schema,
                 &ids,
+                output_id,
                 sm.term_cache_blocks,
                 trained_snap.as_deref(),
             )
             .await;
 
-            // Explicit end_merge — ALWAYS runs (tantivy pattern, no Drop guard)
-            sm.end_merge(&ids, result).await;
-        });
-
-        self.merge_handles.lock().await.push(handle);
-    }
-
-    /// Complete a merge: update metadata, clean up merging set, delete old segments.
-    /// Always called after merge (success or failure). Like tantivy's `end_merge`.
-    async fn end_merge(&self, old_ids: &[String], result: Result<(String, u32)>) {
-        // 1. Remove from merging set (sync, sub-μs)
-        {
-            let mut merging = self.merging.lock();
-            for id in old_ids {
-                merging.remove(id);
-            }
-        }
-
-        // 2. On success: replace segments in metadata + delete old files
-        match result {
-            Ok((new_id, doc_count)) => {
-                if let Err(e) = self.replace_segments(old_ids, new_id, doc_count).await {
-                    log::error!("[merge] Failed to replace segments after merge: {:?}", e);
+            match result {
+                Ok((new_id, doc_count)) => {
+                    if let Err(e) = sm.replace_segments(&ids, new_id, doc_count).await {
+                        log::error!("[merge] Failed to replace segments after merge: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "[merge] Background merge failed for segments {:?}: {:?}",
+                        ids,
+                        e
+                    );
                 }
             }
-            Err(e) => {
-                log::error!(
-                    "[merge] Background merge failed for segments {:?}: {:?}",
-                    old_ids,
-                    e
-                );
-            }
-        }
+            // _guard drops here → segment IDs unregistered from inventory
+        });
+
+        *self.merge_handle.lock().await = Some(handle);
     }
 
     /// Atomically replace old segments with a new merged segment.
-    /// Shared by end_merge and force_merge.
+    /// Computes merge generation as max(parent gens) + 1 and records ancestors.
     async fn replace_segments(
         &self,
         old_ids: &[String],
@@ -346,10 +383,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         {
             let mut st = self.state.lock().await;
+            // Compute generation from parents before removing them
+            let parent_gen = old_ids
+                .iter()
+                .filter_map(|id| st.metadata.segment_metas.get(id))
+                .map(|info| info.generation)
+                .max()
+                .unwrap_or(0);
+            let ancestors: Vec<String> = old_ids.to_vec();
+
             for id in old_ids {
                 st.metadata.remove_segment(id);
             }
-            st.metadata.add_segment(new_id, doc_count);
+            st.metadata
+                .add_merged_segment(new_id, doc_count, ancestors, parent_gen + 1);
             st.metadata.save(self.directory.as_ref()).await?;
         }
 
@@ -361,14 +408,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Perform the actual merge operation (pure function — no shared state access).
+    /// `output_segment_id` is pre-generated by the caller so it can be tracked in `merge_inventory`.
     /// Returns (new_segment_id_hex, total_doc_count).
-    pub async fn do_merge(
+    pub(crate) async fn do_merge(
         directory: &D,
-        schema: &crate::dsl::Schema,
+        schema: &Arc<crate::dsl::Schema>,
         segment_ids_to_merge: &[String],
+        output_segment_id: SegmentId,
         term_cache_blocks: usize,
         trained: Option<&TrainedVectorStructures>,
     ) -> Result<(String, u32)> {
+        let output_hex = output_segment_id.to_hex();
         let load_start = std::time::Instant::now();
 
         let segment_ids: Vec<SegmentId> = segment_ids_to_merge
@@ -379,7 +429,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let schema_arc = Arc::new(schema.clone());
+        let schema_arc = Arc::clone(schema);
         let futures: Vec<_> = segment_ids
             .iter()
             .map(|&sid| {
@@ -390,11 +440,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let results = futures::future::join_all(futures).await;
         let mut readers = Vec::with_capacity(results.len());
-        let mut total_docs = 0u32;
+        let mut total_docs = 0u64;
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok(r) => {
-                    total_docs += r.meta().num_docs;
+                    total_docs += r.meta().num_docs as u64;
                     readers.push(r);
                 }
                 Err(e) => {
@@ -414,29 +464,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             load_start.elapsed().as_secs_f64()
         );
 
-        let merger = SegmentMerger::new(schema_arc);
-        let new_segment_id = SegmentId::new();
+        let merger = SegmentMerger::new(Arc::clone(schema));
 
         log::info!(
             "[merge] {} segments -> {} (trained={})",
             segment_ids_to_merge.len(),
-            new_segment_id.to_hex(),
+            output_hex,
             trained.map_or(0, |t| t.centroids.len())
         );
 
-        let merge_result = merger
-            .merge(directory, &readers, new_segment_id, trained)
-            .await;
-
-        if let Err(e) = merge_result {
-            log::error!(
-                "[merge] Merge failed for segments {:?} -> {}: {:?}",
-                segment_ids_to_merge,
-                new_segment_id.to_hex(),
-                e
-            );
-            return Err(e);
-        }
+        merger
+            .merge(directory, &readers, output_segment_id, trained)
+            .await?;
 
         log::info!(
             "[merge] total wall-clock: {:.1}s ({} segments, {} docs)",
@@ -445,25 +484,25 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             total_docs,
         );
 
-        Ok((new_segment_id.to_hex(), total_docs))
+        Ok((output_hex, total_docs.min(u32::MAX as u64) as u32))
     }
 
-    /// Wait for all in-flight background merges to complete.
-    /// Uses JoinHandle — can't lose notifications (fixes the hang bug).
-    pub async fn wait_for_merges(&self) {
-        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.merge_handles.lock().await);
-        for handle in handles {
-            let _ = handle.await;
+    /// Wait for the merge to complete.
+    pub async fn wait_for_merging_thread(self: &Arc<Self>) {
+        if let Some(h) = self.merge_handle.lock().await.take() {
+            let _ = h.await;
         }
     }
 
     /// Force merge all segments into one. Iterates in batches until ≤1 segment remains.
-    /// Moved from IndexWriter to centralize all merge logic in SegmentManager.
+    ///
+    /// Each batch is registered in `merge_inventory` via `MergeGuard` to prevent
+    /// `maybe_merge` from spawning a conflicting background merge.
     pub async fn force_merge(self: &Arc<Self>) -> Result<()> {
-        use super::consts::FORCE_MERGE_BATCH;
+        const FORCE_MERGE_BATCH: usize = 64;
 
         // First wait for any in-flight background merges
-        self.wait_for_merges().await;
+        self.wait_for_merging_thread().await;
 
         loop {
             let ids_to_merge = self.get_segment_ids().await;
@@ -475,11 +514,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             log::info!("[force_merge] merging batch of {} segments", batch.len());
 
+            let output_id = SegmentId::new();
+            let output_hex = output_id.to_hex();
+
+            // Register batch + output in inventory so maybe_merge skips them.
+            let mut all_ids = batch.clone();
+            all_ids.push(output_hex);
+            let _guard = match self.merge_inventory.try_register(all_ids) {
+                Some(g) => g,
+                None => {
+                    // A background merge slipped in — wait for it, then retry the loop
+                    self.wait_for_merging_thread().await;
+                    continue;
+                }
+            };
+
             let trained_snap = self.trained();
             let (new_segment_id, total_docs) = Self::do_merge(
                 self.directory.as_ref(),
                 &self.schema,
                 &batch,
+                output_id,
                 self.term_cache_blocks,
                 trained_snap.as_deref(),
             )
@@ -487,19 +542,29 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             self.replace_segments(&batch, new_segment_id, total_docs)
                 .await?;
+
+            // _guard drops here → segments unregistered from inventory
         }
     }
 
     /// Clean up orphan segment files not registered in metadata.
     ///
-    /// Waits for in-flight merges first — a merge creates segment files before
-    /// updating metadata, so without waiting we'd delete freshly merged segments.
+    /// Non-blocking: reads both metadata and `merge_inventory` to determine which
+    /// segments are legitimate. In-flight merge outputs are protected by the inventory.
     pub async fn cleanup_orphan_segments(&self) -> Result<usize> {
-        self.wait_for_merges().await;
-
-        let registered_set: HashSet<String> = {
+        // Read BOTH sets under the same state lock to prevent TOCTOU:
+        // without this, a merge completing between the two reads could make
+        // its output segment invisible to both sets → wrongly deleted.
+        let (registered_set, in_merge_set) = {
             let st = self.state.lock().await;
-            st.metadata.segment_metas.keys().cloned().collect()
+            let registered = st
+                .metadata
+                .segment_metas
+                .keys()
+                .cloned()
+                .collect::<HashSet<String>>();
+            let in_merge = self.merge_inventory.snapshot();
+            (registered, in_merge)
         };
 
         let mut orphan_ids: HashSet<String> = HashSet::new();
@@ -509,7 +574,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 let filename = entry.to_string_lossy();
                 if filename.starts_with("seg_") && filename.len() > 37 {
                     let hex_part = &filename[4..36];
-                    if !registered_set.contains(hex_part) {
+                    if !registered_set.contains(hex_part) && !in_merge_set.contains(hex_part) {
                         orphan_ids.insert(hex_part.to_string());
                     }
                 }
@@ -528,5 +593,53 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
 
         Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inventory_guard_drop_unregisters() {
+        let inv = Arc::new(MergeInventory::new());
+        let ids = vec!["a".into(), "b".into()];
+        {
+            let guard = inv.try_register(ids).unwrap();
+            assert!(inv.is_active());
+            let snap = inv.snapshot();
+            assert!(snap.contains("a"));
+            assert!(snap.contains("b"));
+            drop(guard);
+        }
+        assert!(!inv.is_active());
+        assert!(inv.snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_inventory_single_active_merge() {
+        let inv = Arc::new(MergeInventory::new());
+        let _g1 = inv.try_register(vec!["a".into(), "b".into()]).unwrap();
+        assert!(inv.is_active());
+
+        // Second merge rejected — only one at a time
+        let result = inv.try_register(vec!["c".into(), "d".into()]);
+        assert!(result.is_none());
+
+        // Drop first → slot opens
+        drop(_g1);
+        assert!(!inv.is_active());
+        let result = inv.try_register(vec!["c".into(), "d".into()]);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_inventory_snapshot() {
+        let inv = Arc::new(MergeInventory::new());
+        let _g = inv.try_register(vec!["x".into(), "y".into()]).unwrap();
+        let snap = inv.snapshot();
+        assert!(snap.contains("x"));
+        assert!(snap.contains("y"));
+        assert!(!snap.contains("z"));
     }
 }

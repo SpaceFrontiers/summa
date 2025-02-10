@@ -5,12 +5,10 @@
 
 use std::fmt::Debug;
 
-pub mod consts;
-
 #[cfg(feature = "native")]
-mod scheduler;
+mod segment_manager;
 #[cfg(feature = "native")]
-pub use scheduler::SegmentManager;
+pub use segment_manager::SegmentManager;
 
 /// Information about a segment for merge decisions
 #[derive(Debug, Clone)]
@@ -19,8 +17,6 @@ pub struct SegmentInfo {
     pub id: String,
     /// Number of documents in the segment
     pub num_docs: u32,
-    /// Approximate size in bytes (if known)
-    pub size_bytes: Option<u64>,
 }
 
 /// A merge operation specifying which segments to merge
@@ -34,11 +30,8 @@ pub struct MergeCandidate {
 ///
 /// Implementations decide when segments should be merged and which ones.
 pub trait MergePolicy: Send + Sync + Debug {
-    /// Given the current segments, return merge candidates (if any)
-    ///
-    /// Each `MergeCandidate` represents a group of segments that should be merged.
-    /// Multiple candidates can be returned for parallel merging.
-    fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<MergeCandidate>;
+    /// Given the current segments, return a merge candidate (if any).
+    fn find_merge(&self, segments: &[SegmentInfo]) -> Option<MergeCandidate>;
 
     /// Clone the policy into a boxed trait object
     fn clone_box(&self) -> Box<dyn MergePolicy>;
@@ -55,8 +48,8 @@ impl Clone for Box<dyn MergePolicy> {
 pub struct NoMergePolicy;
 
 impl MergePolicy for NoMergePolicy {
-    fn find_merges(&self, _segments: &[SegmentInfo]) -> Vec<MergeCandidate> {
-        Vec::new()
+    fn find_merge(&self, _segments: &[SegmentInfo]) -> Option<MergeCandidate> {
+        None
     }
 
     fn clone_box(&self) -> Box<dyn MergePolicy> {
@@ -122,30 +115,6 @@ impl TieredMergePolicy {
         }
     }
 
-    /// Set segments per tier
-    pub fn with_segments_per_tier(mut self, n: usize) -> Self {
-        self.segments_per_tier = n;
-        self
-    }
-
-    /// Set max merge at once
-    pub fn with_max_merge_at_once(mut self, n: usize) -> Self {
-        self.max_merge_at_once = n;
-        self
-    }
-
-    /// Set tier factor
-    pub fn with_tier_factor(mut self, factor: f64) -> Self {
-        self.tier_factor = factor;
-        self
-    }
-
-    /// Set tier floor (minimum docs before tiering starts)
-    pub fn with_tier_floor(mut self, floor: u32) -> Self {
-        self.tier_floor = floor;
-        self
-    }
-
     /// Compute the tier for a segment based on its doc count
     fn compute_tier(&self, num_docs: u32) -> usize {
         if num_docs <= self.tier_floor {
@@ -158,9 +127,9 @@ impl TieredMergePolicy {
 }
 
 impl MergePolicy for TieredMergePolicy {
-    fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<MergeCandidate> {
+    fn find_merge(&self, segments: &[SegmentInfo]) -> Option<MergeCandidate> {
         if segments.len() < 2 {
-            return Vec::new();
+            return None;
         }
 
         // Group segments by tier
@@ -172,25 +141,17 @@ impl MergePolicy for TieredMergePolicy {
             tiers.entry(tier).or_default().push(seg);
         }
 
-        let mut candidates = Vec::new();
-
-        // Find tiers with enough segments to merge.
-        // Generate multiple non-overlapping candidates per tier so a single
-        // maybe_merge() call can spawn parallel merges for the whole tier.
+        // Return the first valid candidate (single merge at a time)
         for (_tier, tier_segments) in tiers {
             if tier_segments.len() >= self.segments_per_tier {
-                // Sort by doc count (merge smaller ones first)
                 let mut sorted: Vec<_> = tier_segments;
                 sorted.sort_by_key(|s| s.num_docs);
 
-                // Chunk into batches of max_merge_at_once
-                for chunk in sorted.chunks(self.max_merge_at_once) {
-                    if chunk.len() < 2 {
-                        continue;
-                    }
+                let chunk = &sorted[..sorted.len().min(self.max_merge_at_once)];
+                if chunk.len() >= 2 {
                     let total_docs: u32 = chunk.iter().map(|s| s.num_docs).sum();
                     if total_docs <= self.max_merged_docs {
-                        candidates.push(MergeCandidate {
+                        return Some(MergeCandidate {
                             segment_ids: chunk.iter().map(|s| s.id.clone()).collect(),
                         });
                     }
@@ -198,7 +159,7 @@ impl MergePolicy for TieredMergePolicy {
             }
         }
 
-        candidates
+        None
     }
 
     fn clone_box(&self) -> Box<dyn MergePolicy> {
@@ -239,17 +200,14 @@ mod tests {
             SegmentInfo {
                 id: "a".into(),
                 num_docs: 100,
-                size_bytes: None,
             },
             SegmentInfo {
                 id: "b".into(),
                 num_docs: 200,
-                size_bytes: None,
             },
         ];
 
-        let merges = policy.find_merges(&segments);
-        assert!(merges.is_empty());
+        assert!(policy.find_merge(&segments).is_none());
     }
 
     #[test]
@@ -264,13 +222,11 @@ mod tests {
             .map(|i| SegmentInfo {
                 id: format!("seg_{}", i),
                 num_docs: 100 + i * 10,
-                size_bytes: None,
             })
             .collect();
 
-        let merges = policy.find_merges(&segments);
-        assert_eq!(merges.len(), 1);
-        assert!(merges[0].segment_ids.len() >= 3);
+        let candidate = policy.find_merge(&segments).unwrap();
+        assert!(candidate.segment_ids.len() >= 3);
     }
 
     #[test]
@@ -281,16 +237,13 @@ mod tests {
             SegmentInfo {
                 id: "a".into(),
                 num_docs: 100,
-                size_bytes: None,
             },
             SegmentInfo {
                 id: "b".into(),
                 num_docs: 200,
-                size_bytes: None,
             },
         ];
 
-        let merges = policy.find_merges(&segments);
-        assert!(merges.is_empty());
+        assert!(policy.find_merge(&segments).is_none());
     }
 }

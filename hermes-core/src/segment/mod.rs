@@ -43,7 +43,7 @@ mod tests {
 
         // Build segment using sync builder
         let config = SegmentBuilderConfig::default();
-        let mut builder = SegmentBuilder::new((*schema).clone(), config).unwrap();
+        let mut builder = SegmentBuilder::new(Arc::clone(&schema), config).unwrap();
 
         let mut doc = crate::dsl::Document::new();
         doc.add_text(title, "Hello World");
@@ -89,7 +89,7 @@ mod tests {
         let segment_id = SegmentId::new();
 
         let config = SegmentBuilderConfig::default();
-        let mut builder = SegmentBuilder::new((*schema).clone(), config).unwrap();
+        let mut builder = SegmentBuilder::new(Arc::clone(&schema), config).unwrap();
 
         // Doc 0: single vector
         let mut doc = crate::dsl::Document::new();
@@ -150,7 +150,7 @@ mod tests {
         let segment_id = SegmentId::new();
 
         let config = SegmentBuilderConfig::default();
-        let mut builder = SegmentBuilder::new((*schema).clone(), config).unwrap();
+        let mut builder = SegmentBuilder::new(Arc::clone(&schema), config).unwrap();
 
         // Doc 0: single sparse vector
         let mut doc = crate::dsl::Document::new();

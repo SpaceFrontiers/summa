@@ -214,11 +214,11 @@ impl IndexService for IndexServiceImpl {
         //    The write lock waits for all concurrent read locks (batch_index, etc.)
         //    to finish, then holds exclusive access through file deletion.
         if let Some(handle) = handle {
-            let w = handle.writer.write().await;
-            if let Err(e) = w.flush().await {
-                warn!(index_name = %req.index_name, error = %e, "Error flushing writer during delete");
+            let mut w = handle.writer.write().await;
+            if let Err(e) = w.commit().await {
+                warn!(index_name = %req.index_name, error = %e, "Error committing writer during delete");
             }
-            w.wait_for_merges().await;
+            w.wait_for_merging_thread().await;
         }
 
         // 3. Delete directory — safe because:

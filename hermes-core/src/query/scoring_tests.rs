@@ -79,7 +79,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -135,7 +135,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -196,7 +196,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -243,7 +243,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -316,7 +316,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -360,7 +360,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -417,7 +417,7 @@ mod tests {
         };
 
         // Single writer, multiple commits to create segments
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -467,7 +467,7 @@ mod tests {
         let config = IndexConfig::default();
 
         // Single writer, multiple commits
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -499,7 +499,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -525,7 +525,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -555,7 +555,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -607,7 +607,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -646,7 +646,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -682,7 +682,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -718,7 +718,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -742,7 +742,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -797,7 +797,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -860,7 +860,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -919,7 +919,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -972,7 +972,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1020,7 +1020,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1090,7 +1090,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1133,7 +1133,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 
@@ -1190,7 +1190,7 @@ mod tests {
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
 
-        let writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
             .unwrap();
 

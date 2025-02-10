@@ -24,6 +24,7 @@ rustc-hash = { workspace = true }
 smallvec = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = "1"
+async-channel = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true, optional = true }
 num_cpus = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
@@ -76,7 +77,7 @@ tokio = { workspace = true }
 
 [features]
 default = ["native"]
-native = ["dep:tokio", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:kentro", "dep:ndarray", "dep:nalgebra", "dep:tokenizers", "dep:fst", "dep:hf-hub"]
+native = ["dep:tokio", "dep:async-channel", "dep:crossbeam-channel", "dep:num_cpus", "dep:rayon", "dep:bumpalo", "dep:lasso", "dep:memmap2", "dep:uuid", "dep:kentro", "dep:ndarray", "dep:nalgebra", "dep:tokenizers", "dep:fst", "dep:hf-hub"]
 wasm = ["dep:tokenizers"]
 http = ["dep:reqwest", "dep:instant"]
 

@@ -1,4 +1,4 @@
-//! Error types for minisearch
+//! Error types for hermes
 
 use std::io;
 
@@ -30,6 +30,9 @@ pub enum Error {
 
     #[error("Query error: {0}")]
     Query(String),
+
+    #[error("Indexing queue full — apply backpressure")]
+    QueueFull,
 
     #[error("Internal error: {0}")]
     Internal(String),

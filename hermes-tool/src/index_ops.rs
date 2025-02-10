@@ -52,7 +52,7 @@ pub async fn init_index_from_sdl(index_path: PathBuf, sdl: String) -> Result<()>
 }
 
 async fn index_from_reader<R: BufRead>(
-    writer: &IndexWriter<FsDirectory>,
+    writer: &mut IndexWriter<FsDirectory>,
     reader: R,
     progress_interval: usize,
 ) -> Result<usize> {
@@ -107,7 +107,7 @@ async fn index_from_reader<R: BufRead>(
     // Wait for any in-flight background merges to complete before returning
     // Otherwise they will be cancelled when the IndexWriter/runtime is dropped
     info!("Waiting for background merges to complete...");
-    writer.wait_for_merges().await;
+    writer.wait_for_merging_thread().await;
 
     release_memory_to_os();
 
@@ -158,7 +158,7 @@ pub async fn index_documents(
         optimization: optimization_mode,
         ..default_config
     };
-    let writer = IndexWriter::open(dir, config.clone()).await?;
+    let mut writer = IndexWriter::open(dir, config.clone()).await?;
 
     info!("Opened index at {:?}", index_path);
     info!(
@@ -181,13 +181,13 @@ pub async fn index_documents(
         info!("Reading documents from stdin...");
         let stdin = io::stdin();
         let reader = stdin.lock();
-        index_from_reader(&writer, reader, progress_interval).await?
+        index_from_reader(&mut writer, reader, progress_interval).await?
     } else if let Some(path) = documents_path {
         info!("Reading documents from {:?}", path);
         let file = File::open(&path)
             .with_context(|| format!("Failed to open documents file: {:?}", path))?;
         let reader = BufReader::new(file);
-        index_from_reader(&writer, reader, progress_interval).await?
+        index_from_reader(&mut writer, reader, progress_interval).await?
     } else {
         anyhow::bail!("Either --documents or --stdin must be specified");
     };
@@ -199,7 +199,7 @@ pub async fn index_documents(
 pub async fn commit_index(index_path: PathBuf) -> Result<()> {
     let dir = FsDirectory::new(&index_path);
     let config = IndexConfig::default();
-    let writer = IndexWriter::open(dir, config).await?;
+    let mut writer = IndexWriter::open(dir, config).await?;
 
     writer.commit().await?;
     info!("Committed index at {:?}", index_path);
@@ -210,7 +210,7 @@ pub async fn commit_index(index_path: PathBuf) -> Result<()> {
 pub async fn merge_index(index_path: PathBuf) -> Result<()> {
     let dir = FsDirectory::new(&index_path);
     let config = IndexConfig::default();
-    let writer = IndexWriter::open(dir, config).await?;
+    let mut writer = IndexWriter::open(dir, config).await?;
 
     info!("Starting force merge...");
     writer.force_merge().await?;

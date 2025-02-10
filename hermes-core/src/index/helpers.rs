@@ -160,7 +160,7 @@ impl IndexingStats {
 /// Each line should be a valid JSON object. Documents are parsed according
 /// to the schema and indexed. Returns statistics about the indexing operation.
 pub async fn index_documents_from_reader<D, R>(
-    writer: &IndexWriter<D>,
+    writer: &mut IndexWriter<D>,
     reader: R,
     progress_callback: Option<&dyn Fn(usize)>,
 ) -> Result<IndexingStats>
@@ -168,7 +168,7 @@ where
     D: Directory + DirectoryWriter,
     R: BufRead,
 {
-    let schema = writer.schema().clone();
+    let schema = writer.schema();
     let mut stats = IndexingStats::default();
     let start_time = std::time::Instant::now();
 
@@ -186,7 +186,7 @@ where
             }
         };
 
-        let doc = match Document::from_json(&json, &schema) {
+        let doc = match Document::from_json(&json, schema) {
             Some(d) => d,
             None => {
                 stats.errors += 1;
@@ -213,8 +213,8 @@ pub async fn index_json_document<D>(writer: &IndexWriter<D>, json: &serde_json::
 where
     D: Directory + DirectoryWriter,
 {
-    let schema = writer.schema().clone();
-    let doc = Document::from_json(json, &schema)
+    let schema = writer.schema();
+    let doc = Document::from_json(json, schema)
         .ok_or_else(|| Error::Document("Failed to parse JSON document".to_string()))?;
     writer.add_document(doc)?;
     Ok(())
@@ -270,14 +270,14 @@ mod tests {
 
         let dir = RamDirectory::new();
         let config = IndexConfig::default();
-        let writer = IndexWriter::create(dir, schema, config).await.unwrap();
+        let mut writer = IndexWriter::create(dir, schema, config).await.unwrap();
 
         let jsonl = r#"{"title": "Doc 1"}
 {"title": "Doc 2"}
 {"title": "Doc 3"}"#;
 
         let reader = std::io::Cursor::new(jsonl);
-        let stats = index_documents_from_reader(&writer, reader, None)
+        let stats = index_documents_from_reader(&mut writer, reader, None)
             .await
             .unwrap();
 

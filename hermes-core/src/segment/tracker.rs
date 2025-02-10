@@ -91,7 +91,10 @@ impl SegmentTracker {
                 continue;
             };
 
-            let ref_count = inner.ref_counts.get(id_str).copied().unwrap_or(0);
+            // Skip segments not tracked (already deleted or never registered)
+            let Some(&ref_count) = inner.ref_counts.get(id_str) else {
+                continue;
+            };
 
             if ref_count == 0 {
                 inner.ref_counts.remove(id_str);
@@ -117,17 +120,6 @@ impl SegmentTracker {
             .get(segment_id)
             .copied()
             .unwrap_or(0)
-    }
-
-    /// Get current segment IDs (excluding those pending deletion)
-    pub fn get_active_segments(&self) -> Vec<String> {
-        let inner = self.inner.lock();
-        inner
-            .ref_counts
-            .keys()
-            .filter(|id| !inner.pending_deletions.contains_key(*id))
-            .cloned()
-            .collect()
     }
 }
 
@@ -213,7 +205,6 @@ mod tests {
 
     const SEG1: &str = "00000000000000000000000000000001";
     const SEG2: &str = "00000000000000000000000000000002";
-    const SEG3: &str = "00000000000000000000000000000003";
 
     #[test]
     fn test_tracker_register_and_acquire() {
@@ -274,19 +265,68 @@ mod tests {
     }
 
     #[test]
-    fn test_tracker_active_segments() {
+    fn test_tracker_double_mark_for_deletion() {
+        let tracker = SegmentTracker::new();
+        tracker.register(SEG1);
+
+        let ready1 = tracker.mark_for_deletion(&[SEG1.to_string()]);
+        assert_eq!(ready1.len(), 1);
+
+        // Second mark: segment already removed from ref_counts, should return empty
+        let ready2 = tracker.mark_for_deletion(&[SEG1.to_string()]);
+        assert!(ready2.is_empty());
+    }
+
+    #[test]
+    fn test_tracker_acquire_unregistered() {
         let tracker = SegmentTracker::new();
 
+        // Acquire a segment that was never registered — or_insert(0) makes it ref_count=1
+        let acquired = tracker.acquire(&[SEG1.to_string()]);
+        assert_eq!(acquired.len(), 1);
+        assert_eq!(tracker.ref_count(SEG1), 1);
+    }
+
+    #[test]
+    fn test_tracker_release_without_acquire() {
+        let tracker = SegmentTracker::new();
+        tracker.register(SEG1);
+
+        // Release without acquire — should not panic, ref stays at 0 (saturating_sub)
+        let deleted = tracker.release(&[SEG1.to_string()]);
+        assert!(deleted.is_empty());
+        assert_eq!(tracker.ref_count(SEG1), 0);
+    }
+
+    #[test]
+    fn test_snapshot_drop_triggers_deferred_delete() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tracker = Arc::new(SegmentTracker::new());
         tracker.register(SEG1);
         tracker.register(SEG2);
-        tracker.register(SEG3);
 
-        tracker.acquire(&[SEG2.to_string()]);
-        tracker.mark_for_deletion(&[SEG2.to_string()]);
+        let delete_count = Arc::new(AtomicUsize::new(0));
+        let dc = Arc::clone(&delete_count);
+        let delete_fn: Arc<dyn Fn(Vec<SegmentId>) + Send + Sync> = Arc::new(move |ids| {
+            dc.fetch_add(ids.len(), Ordering::SeqCst);
+        });
 
-        let active = tracker.get_active_segments();
-        assert!(active.contains(&SEG1.to_string()));
-        assert!(!active.contains(&SEG2.to_string()));
-        assert!(active.contains(&SEG3.to_string()));
+        // Take a snapshot holding refs to both segments
+        let acquired = tracker.acquire(&[SEG1.to_string(), SEG2.to_string()]);
+        let snapshot =
+            SegmentSnapshot::with_delete_fn(Arc::clone(&tracker), acquired, Arc::clone(&delete_fn));
+
+        // Mark both for deletion — should be deferred (refs > 0)
+        let ready = tracker.mark_for_deletion(&[SEG1.to_string(), SEG2.to_string()]);
+        assert!(ready.is_empty());
+        assert!(tracker.is_pending_deletion(SEG1));
+        assert!(tracker.is_pending_deletion(SEG2));
+
+        // Drop snapshot → refs go to 0 → delete_fn called
+        drop(snapshot);
+        assert_eq!(delete_count.load(Ordering::SeqCst), 2);
+        assert!(!tracker.is_pending_deletion(SEG1));
+        assert!(!tracker.is_pending_deletion(SEG2));
     }
 }

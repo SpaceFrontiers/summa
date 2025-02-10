@@ -14,9 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::dsl::VectorIndexType;
+use crate::dsl::{Schema, VectorIndexType};
 use crate::error::{Error, Result};
-use crate::schema::Schema;
 
 /// Metadata file name at index level
 pub const INDEX_META_FILENAME: &str = "metadata.json";
@@ -44,6 +43,10 @@ pub enum VectorIndexState {
 pub struct SegmentMetaInfo {
     /// Number of documents in this segment
     pub num_docs: u32,
+    /// Parent segment IDs that were merged to produce this segment (empty for fresh segments)
+    pub ancestors: Vec<String>,
+    /// Merge generation: 0 for fresh segments, max(parent generations) + 1 for merged segments
+    pub generation: u32,
 }
 
 /// Per-field vector index metadata
@@ -101,10 +104,34 @@ impl IndexMetadata {
         ids
     }
 
-    /// Add or update a segment with its doc count
+    /// Add a fresh segment (gen=0, no ancestors)
     pub fn add_segment(&mut self, segment_id: String, num_docs: u32) {
-        self.segment_metas
-            .insert(segment_id, SegmentMetaInfo { num_docs });
+        self.segment_metas.insert(
+            segment_id,
+            SegmentMetaInfo {
+                num_docs,
+                ancestors: Vec::new(),
+                generation: 0,
+            },
+        );
+    }
+
+    /// Add a merged segment with lineage info
+    pub fn add_merged_segment(
+        &mut self,
+        segment_id: String,
+        num_docs: u32,
+        ancestors: Vec<String>,
+        generation: u32,
+    ) {
+        self.segment_metas.insert(
+            segment_id,
+            SegmentMetaInfo {
+                num_docs,
+                ancestors,
+                generation,
+            },
+        );
     }
 
     /// Remove a segment
@@ -216,19 +243,8 @@ impl IndexMetadata {
         Ok(())
     }
 
-    /// Load trained structures from index-level files for fields in Built state.
-    ///
-    /// Returns `Some(TrainedVectorStructures)` if at least one field has trained
-    /// centroids, `None` otherwise.
-    pub async fn load_trained_structures<D: crate::directories::Directory>(
-        &self,
-        dir: &D,
-    ) -> Option<crate::segment::TrainedVectorStructures> {
-        Self::load_trained_from_fields(&self.vector_fields, dir).await
-    }
-
-    /// Load trained structures from a pre-cloned vector_fields map.
-    /// Use this when you need to release a lock before doing disk I/O.
+    /// Load trained structures from a vector_fields map.
+    /// Accepts a pre-cloned map so callers can release locks before disk I/O.
     pub async fn load_trained_from_fields<D: crate::directories::Directory>(
         vector_fields: &HashMap<u32, FieldVectorMeta>,
         dir: &D,
@@ -283,9 +299,14 @@ impl IndexMetadata {
                             );
                         }
                         Ok(bytes) => {
-                            match serde_json::from_slice::<crate::structures::CoarseCentroids>(
-                                bytes.as_slice(),
-                            ) {
+                            match bincode::serde::decode_from_slice::<
+                                crate::structures::CoarseCentroids,
+                                _,
+                            >(
+                                bytes.as_slice(), bincode::config::standard()
+                            )
+                            .map(|(v, _)| v)
+                            {
                                 Err(e) => {
                                     log::warn!(
                                         "[trained] field {} failed to deserialize centroids from '{}': {}",
@@ -330,9 +351,14 @@ impl IndexMetadata {
                             );
                         }
                         Ok(bytes) => {
-                            match serde_json::from_slice::<crate::structures::PQCodebook>(
-                                bytes.as_slice(),
-                            ) {
+                            match bincode::serde::decode_from_slice::<
+                                crate::structures::PQCodebook,
+                                _,
+                            >(
+                                bytes.as_slice(), bincode::config::standard()
+                            )
+                            .map(|(v, _)| v)
+                            {
                                 Err(e) => {
                                     log::warn!(
                                         "[trained] field {} failed to deserialize codebook from '{}': {}",
@@ -453,5 +479,37 @@ mod tests {
         assert_eq!(loaded.segment_doc_count("seg1"), Some(100));
         assert_eq!(loaded.total_vectors, meta.total_vectors);
         assert!(loaded.vector_fields.contains_key(&0));
+    }
+
+    #[test]
+    fn test_merged_segment_lineage() {
+        let mut meta = IndexMetadata::new(test_schema());
+        meta.add_segment("a".to_string(), 50);
+        meta.add_segment("b".to_string(), 75);
+
+        // Fresh segments: gen=0, no ancestors
+        assert_eq!(meta.segment_metas["a"].generation, 0);
+        assert!(meta.segment_metas["a"].ancestors.is_empty());
+
+        // Merge a+b → c
+        meta.add_merged_segment(
+            "c".to_string(),
+            125,
+            vec!["a".to_string(), "b".to_string()],
+            1,
+        );
+        assert_eq!(meta.segment_metas["c"].generation, 1);
+        assert_eq!(meta.segment_metas["c"].ancestors, vec!["a", "b"]);
+        assert_eq!(meta.segment_doc_count("c"), Some(125));
+
+        // Merge c+d → e (gen should be 2)
+        meta.add_segment("d".to_string(), 30);
+        meta.add_merged_segment(
+            "e".to_string(),
+            155,
+            vec!["c".to_string(), "d".to_string()],
+            2,
+        );
+        assert_eq!(meta.segment_metas["e"].generation, 2);
     }
 }

@@ -27,6 +27,8 @@ use rustc_hash::FxHashMap;
 use crate::compression::CompressionLevel;
 
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
+use std::sync::Arc;
+
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
@@ -43,6 +45,17 @@ use super::vector_data::FlatVectorData;
 /// Size of the document store buffer before writing to disk
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
+/// Memory overhead per new term in the inverted index:
+/// HashMap entry control byte + padding + TermKey + PostingListBuilder + Vec header
+const NEW_TERM_OVERHEAD: usize = size_of::<TermKey>() + size_of::<PostingListBuilder>() + 24;
+
+/// Memory overhead per newly interned string: Spur + arena pointers (2 × usize)
+const INTERN_OVERHEAD: usize = size_of::<Spur>() + 2 * size_of::<usize>();
+
+/// Memory overhead per new term in the position index
+const NEW_POS_TERM_OVERHEAD: usize =
+    size_of::<TermKey>() + size_of::<PositionPostingListBuilder>() + 24;
+
 /// Segment builder with optimized memory usage
 ///
 /// Features:
@@ -50,7 +63,7 @@ const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
 /// - Uses string interning for terms (reduced allocations)
 /// - Uses hashbrown HashMap (faster than BTreeMap)
 pub struct SegmentBuilder {
-    schema: Schema,
+    schema: Arc<Schema>,
     config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
 
@@ -88,6 +101,9 @@ pub struct SegmentBuilder {
     /// Reusable buffer for tokenization to avoid per-token String allocations
     token_buffer: String,
 
+    /// Reusable buffer for numeric field term encoding (avoids format!() alloc per call)
+    numeric_buffer: String,
+
     /// Dense vector storage per field: field -> (doc_ids, vectors)
     /// Vectors are stored as flat f32 arrays for efficient RaBitQ indexing
     dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
@@ -112,7 +128,7 @@ pub struct SegmentBuilder {
 
 impl SegmentBuilder {
     /// Create a new segment builder
-    pub fn new(schema: Schema, config: SegmentBuilderConfig) -> Result<Self> {
+    pub fn new(schema: Arc<Schema>, config: SegmentBuilderConfig) -> Result<Self> {
         let segment_id = uuid::Uuid::new_v4();
         let store_path = config
             .temp_dir
@@ -157,6 +173,7 @@ impl SegmentBuilder {
             local_tf_buffer: FxHashMap::default(),
             local_positions: FxHashMap::default(),
             token_buffer: String::with_capacity(64),
+            numeric_buffer: String::with_capacity(32),
             config,
             dense_vectors: FxHashMap::default(),
             sparse_vectors: FxHashMap::default(),
@@ -171,6 +188,14 @@ impl SegmentBuilder {
         self.tokenizers.insert(field, tokenizer);
     }
 
+    /// Get the current element ordinal for a field and increment it.
+    /// Used for multi-valued fields (text, dense_vector, sparse_vector).
+    fn next_element_ordinal(&mut self, field_id: u32) -> u32 {
+        let ordinal = *self.current_element_ordinal.get(&field_id).unwrap_or(&0);
+        *self.current_element_ordinal.entry(field_id).or_insert(0) += 1;
+        ordinal
+    }
+
     pub fn num_docs(&self) -> u32 {
         self.next_doc_id
     }
@@ -179,14 +204,6 @@ impl SegmentBuilder {
     #[inline]
     pub fn estimated_memory_bytes(&self) -> usize {
         self.estimated_memory
-    }
-
-    /// Recalibrate incremental memory estimate using capacity-based calculation.
-    /// More expensive than estimated_memory_bytes() — O(terms + dims) vs O(1) —
-    /// but accounts for Vec capacity growth (doubling) and HashMap table overhead.
-    /// Call periodically (e.g. every 1000 docs) to prevent drift.
-    pub fn recalibrate_memory(&mut self) {
-        self.estimated_memory = self.stats().estimated_memory_bytes;
     }
 
     /// Count total unique sparse dimensions across all fields
@@ -329,37 +346,28 @@ impl SegmentBuilder {
         self.current_element_ordinal.clear();
 
         for (field, value) in doc.field_values() {
-            let entry = self.schema.get_field_entry(*field);
-            if entry.is_none() {
+            let Some(entry) = self.schema.get_field_entry(*field) else {
                 continue;
-            }
+            };
 
-            let entry = entry.unwrap();
             // Dense vectors are written to .vectors when indexed || stored
             // Other field types require indexed
-            let dominated_by_index = matches!(&entry.field_type, FieldType::DenseVector);
-            if !dominated_by_index && !entry.indexed {
+            if !matches!(&entry.field_type, FieldType::DenseVector) && !entry.indexed {
                 continue;
             }
 
             match (&entry.field_type, value) {
                 (FieldType::Text, FieldValue::Text(text)) => {
-                    // Get current element ordinal for multi-valued fields
-                    let element_ordinal = *self.current_element_ordinal.get(&field.0).unwrap_or(&0);
+                    let element_ordinal = self.next_element_ordinal(field.0);
                     let token_count =
                         self.index_text_field(*field, doc_id, text, element_ordinal)?;
-                    // Increment element ordinal for next value of this field
-                    *self.current_element_ordinal.entry(field.0).or_insert(0) += 1;
 
-                    // Update field statistics
                     let stats = self.field_stats.entry(field.0).or_default();
                     stats.total_tokens += token_count as u64;
-                    // Only count each document once, even for multi-value fields
                     if element_ordinal == 0 {
                         stats.doc_count += 1;
                     }
 
-                    // Store field length compactly
                     if let Some(&slot) = self.field_to_slot.get(&field.0) {
                         self.doc_field_lengths[base_idx + slot] = token_count;
                     }
@@ -376,23 +384,12 @@ impl SegmentBuilder {
                 (FieldType::DenseVector, FieldValue::DenseVector(vec))
                     if entry.indexed || entry.stored =>
                 {
-                    // Dense vectors written to .vectors (not .store) when indexed || stored
-                    let element_ordinal = *self.current_element_ordinal.get(&field.0).unwrap_or(&0);
-                    self.index_dense_vector_field(*field, doc_id, element_ordinal as u16, vec)?;
-                    // Increment element ordinal for next value of this field
-                    *self.current_element_ordinal.entry(field.0).or_insert(0) += 1;
+                    let ordinal = self.next_element_ordinal(field.0);
+                    self.index_dense_vector_field(*field, doc_id, ordinal as u16, vec)?;
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
-                    // Get current element ordinal for multi-valued fields
-                    let element_ordinal = *self.current_element_ordinal.get(&field.0).unwrap_or(&0);
-                    self.index_sparse_vector_field(
-                        *field,
-                        doc_id,
-                        element_ordinal as u16,
-                        entries,
-                    )?;
-                    // Increment element ordinal for next value of this field
-                    *self.current_element_ordinal.entry(field.0).or_insert(0) += 1;
+                    let ordinal = self.next_element_ordinal(field.0);
+                    self.index_sparse_vector_field(*field, doc_id, ordinal as u16, entries)?;
                 }
                 _ => {}
             }
@@ -406,11 +403,9 @@ impl SegmentBuilder {
 
     /// Index a text field using interned terms
     ///
-    /// Optimization: Zero-allocation inline tokenization + term frequency aggregation.
-    /// Instead of allocating a String per token, we:
-    /// 1. Iterate over whitespace-split words
-    /// 2. Build lowercase token in a reusable buffer
-    /// 3. Intern directly from the buffer
+    /// Uses a custom tokenizer when set for the field (via `set_tokenizer`),
+    /// otherwise falls back to an inline zero-allocation path (split_whitespace
+    /// + lowercase + strip non-alphanumeric).
     ///
     /// If position recording is enabled for this field, also records token positions
     /// encoded as (element_ordinal << 20) | token_position.
@@ -441,50 +436,71 @@ impl SegmentBuilder {
 
         let mut token_position = 0u32;
 
-        // Zero-allocation tokenization: iterate words, lowercase inline, intern directly
-        for word in text.split_whitespace() {
-            // Build lowercase token in reusable buffer
-            self.token_buffer.clear();
-            for c in word.chars() {
-                if c.is_alphanumeric() {
-                    for lc in c.to_lowercase() {
-                        self.token_buffer.push(lc);
-                    }
+        // Tokenize: use custom tokenizer if set, else inline zero-alloc path.
+        // The owned Vec<Token> is computed first so the immutable borrow of
+        // self.tokenizers ends before we mutate other fields.
+        let custom_tokens = self.tokenizers.get(&field).map(|t| t.tokenize(text));
+
+        if let Some(tokens) = custom_tokens {
+            // Custom tokenizer path
+            for token in &tokens {
+                let is_new_string = !self.term_interner.contains(&token.text);
+                let term_spur = self.term_interner.get_or_intern(&token.text);
+                if is_new_string {
+                    self.estimated_memory += token.text.len() + INTERN_OVERHEAD;
+                }
+                *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
+
+                if let Some(mode) = position_mode {
+                    let encoded_pos = match mode {
+                        PositionMode::Ordinal => element_ordinal << 20,
+                        PositionMode::TokenPosition => token.position,
+                        PositionMode::Full => (element_ordinal << 20) | token.position,
+                    };
+                    self.local_positions
+                        .entry(term_spur)
+                        .or_default()
+                        .push(encoded_pos);
                 }
             }
+            token_position = tokens.len() as u32;
+        } else {
+            // Inline zero-allocation path: split_whitespace + lowercase + strip non-alphanumeric
+            for word in text.split_whitespace() {
+                self.token_buffer.clear();
+                for c in word.chars() {
+                    if c.is_alphanumeric() {
+                        for lc in c.to_lowercase() {
+                            self.token_buffer.push(lc);
+                        }
+                    }
+                }
 
-            if self.token_buffer.is_empty() {
-                continue;
+                if self.token_buffer.is_empty() {
+                    continue;
+                }
+
+                let is_new_string = !self.term_interner.contains(&self.token_buffer);
+                let term_spur = self.term_interner.get_or_intern(&self.token_buffer);
+                if is_new_string {
+                    self.estimated_memory += self.token_buffer.len() + INTERN_OVERHEAD;
+                }
+                *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
+
+                if let Some(mode) = position_mode {
+                    let encoded_pos = match mode {
+                        PositionMode::Ordinal => element_ordinal << 20,
+                        PositionMode::TokenPosition => token_position,
+                        PositionMode::Full => (element_ordinal << 20) | token_position,
+                    };
+                    self.local_positions
+                        .entry(term_spur)
+                        .or_default()
+                        .push(encoded_pos);
+                }
+
+                token_position += 1;
             }
-
-            // Intern the term directly from buffer - O(1) amortized
-            let is_new_string = !self.term_interner.contains(&self.token_buffer);
-            let term_spur = self.term_interner.get_or_intern(&self.token_buffer);
-            if is_new_string {
-                use std::mem::size_of;
-                // string bytes + Spur + arena overhead (2 pointers)
-                self.estimated_memory +=
-                    self.token_buffer.len() + size_of::<Spur>() + 2 * size_of::<usize>();
-            }
-            *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
-
-            // Record position based on mode
-            if let Some(mode) = position_mode {
-                let encoded_pos = match mode {
-                    // Ordinal only: just store element ordinal (token position = 0)
-                    PositionMode::Ordinal => element_ordinal << 20,
-                    // Token position only: just store token position (ordinal = 0)
-                    PositionMode::TokenPosition => token_position,
-                    // Full: encode both
-                    PositionMode::Full => (element_ordinal << 20) | token_position,
-                };
-                self.local_positions
-                    .entry(term_spur)
-                    .or_default()
-                    .push(encoded_pos);
-            }
-
-            token_position += 1;
         }
 
         // Phase 2: Insert aggregated terms into inverted index
@@ -502,16 +518,11 @@ impl SegmentBuilder {
                 .or_insert_with(PostingListBuilder::new);
             posting.add(doc_id, tf);
 
-            // Incremental memory tracking
-            use std::mem::size_of;
             self.estimated_memory += size_of::<CompactPosting>();
             if is_new_term {
-                // HashMap entry overhead + PostingListBuilder + Vec header
-                self.estimated_memory +=
-                    size_of::<TermKey>() + size_of::<PostingListBuilder>() + 24;
+                self.estimated_memory += NEW_TERM_OVERHEAD;
             }
 
-            // Add positions if enabled
             if position_mode.is_some()
                 && let Some(positions) = self.local_positions.get(&term_spur)
             {
@@ -523,11 +534,9 @@ impl SegmentBuilder {
                 for &pos in positions {
                     pos_posting.add_position(doc_id, pos);
                 }
-                // Incremental memory tracking for position index
                 self.estimated_memory += positions.len() * size_of::<u32>();
                 if is_new_pos_term {
-                    self.estimated_memory +=
-                        size_of::<TermKey>() + size_of::<PositionPostingListBuilder>() + 24;
+                    self.estimated_memory += NEW_POS_TERM_OVERHEAD;
                 }
             }
         }
@@ -536,12 +545,12 @@ impl SegmentBuilder {
     }
 
     fn index_numeric_field(&mut self, field: Field, doc_id: DocId, value: u64) -> Result<()> {
-        use std::mem::size_of;
+        use std::fmt::Write;
 
-        // For numeric fields, we use a special encoding
-        let term_str = format!("__num_{}", value);
-        let is_new_string = !self.term_interner.contains(&term_str);
-        let term_spur = self.term_interner.get_or_intern(&term_str);
+        self.numeric_buffer.clear();
+        write!(self.numeric_buffer, "__num_{}", value).unwrap();
+        let is_new_string = !self.term_interner.contains(&self.numeric_buffer);
+        let term_spur = self.term_interner.get_or_intern(&self.numeric_buffer);
 
         let term_key = TermKey {
             field: field.0,
@@ -555,13 +564,12 @@ impl SegmentBuilder {
             .or_insert_with(PostingListBuilder::new);
         posting.add(doc_id, 1);
 
-        // Incremental memory tracking
         self.estimated_memory += size_of::<CompactPosting>();
         if is_new_term {
-            self.estimated_memory += size_of::<TermKey>() + size_of::<PostingListBuilder>() + 24;
+            self.estimated_memory += NEW_TERM_OVERHEAD;
         }
         if is_new_string {
-            self.estimated_memory += term_str.len() + size_of::<Spur>() + 2 * size_of::<usize>();
+            self.estimated_memory += self.numeric_buffer.len() + INTERN_OVERHEAD;
         }
 
         Ok(())
@@ -592,9 +600,7 @@ impl SegmentBuilder {
 
         builder.add(doc_id, ordinal, vector);
 
-        // Incremental memory tracking
-        use std::mem::{size_of, size_of_val};
-        self.estimated_memory += size_of_val(vector) + size_of::<(DocId, u16)>();
+        self.estimated_memory += std::mem::size_of_val(vector) + size_of::<(DocId, u16)>();
 
         Ok(())
     }
@@ -631,8 +637,6 @@ impl SegmentBuilder {
                 continue;
             }
 
-            // Incremental memory tracking
-            use std::mem::size_of;
             let is_new_dim = !builder.postings.contains_key(&dim_id);
             builder.add(dim_id, doc_id, ordinal, weight);
             self.estimated_memory += size_of::<(DocId, u16, f32)>();

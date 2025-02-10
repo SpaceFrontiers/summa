@@ -330,14 +330,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(())
     }
 
-    /// Serialize a trained structure to JSON and save to an index-level file.
+    /// Serialize a trained structure to bincode and save to an index-level file.
     async fn save_trained_artifact(
         &self,
         artifact: &impl serde::Serialize,
         filename: &str,
     ) -> Result<()> {
-        let bytes =
-            serde_json::to_vec(artifact).map_err(|e| Error::Serialization(e.to_string()))?;
+        let bytes = bincode::serde::encode_to_vec(artifact, bincode::config::standard())
+            .map_err(|e| Error::Serialization(e.to_string()))?;
         self.directory
             .write(std::path::Path::new(filename), &bytes)
             .await?;

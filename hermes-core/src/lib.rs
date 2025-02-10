@@ -1,6 +1,6 @@
 //! Hermes - A minimal async search engine library
 //!
-//! Inspired by tantivy/summavy, this library provides:
+//! Features:
 //! - Fully async IO with Directory abstraction for network/local/memory storage
 //! - SSTable-based term dictionary with hot cache and lazy loading
 //! - Bitpacked posting lists with block-level skip info
@@ -26,13 +26,6 @@ pub use dsl::{
     Document, Field, FieldDef, FieldEntry, FieldType, FieldValue, IndexDef, QueryLanguageParser,
     Schema, SchemaBuilder, SdlParser, parse_sdl, parse_single_index,
 };
-
-// Backwards compatibility alias
-pub mod schema {
-    pub use crate::dsl::{
-        Document, Field, FieldEntry, FieldType, FieldValue, Schema, SchemaBuilder,
-    };
-}
 
 // Re-exports from structures
 pub use structures::{
@@ -97,3 +90,17 @@ pub use merge::{MergeCandidate, MergePolicy, NoMergePolicy, SegmentInfo, TieredM
 pub type DocId = u32;
 pub type TermFreq = u32;
 pub type Score = f32;
+
+/// Default number of indexing threads (cpu / 2, minimum 1).
+/// Centralized so all configs share one definition.
+#[cfg(feature = "native")]
+pub fn default_indexing_threads() -> usize {
+    (num_cpus::get() / 2).max(1)
+}
+
+/// Default number of compression threads (cpu / 4, minimum 1).
+/// Centralized so all configs share one definition.
+#[cfg(feature = "native")]
+pub fn default_compression_threads() -> usize {
+    (num_cpus::get() / 4).max(1)
+}
