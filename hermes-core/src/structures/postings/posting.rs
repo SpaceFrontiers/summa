@@ -699,30 +699,30 @@ impl<'a> BlockPostingIterator<'a> {
             return TERMINATED;
         }
 
-        let target_block = self
+        // Binary search on skip_list: find first block whose last_doc >= target
+        let block_idx = self
             .block_list
             .skip_list
-            .iter()
-            .position(|(_, last_doc, _, _)| *last_doc >= target);
+            .partition_point(|(_, last_doc, _, _)| *last_doc < target);
 
-        if let Some(block_idx) = target_block {
-            if block_idx != self.current_block {
-                self.load_block(block_idx);
-            }
-
-            while self.position_in_block < self.block_postings.len() {
-                if self.block_postings[self.position_in_block].doc_id >= target {
-                    return self.doc();
-                }
-                self.position_in_block += 1;
-            }
-
-            self.load_block(self.current_block + 1);
-            self.seek(target)
-        } else {
+        if block_idx >= self.block_list.skip_list.len() {
             self.exhausted = true;
-            TERMINATED
+            return TERMINATED;
         }
+
+        if block_idx != self.current_block {
+            self.load_block(block_idx);
+        }
+
+        // Binary search within block on decoded doc_ids
+        let pos =
+            self.block_postings[self.position_in_block..].partition_point(|p| p.doc_id < target);
+        self.position_in_block += pos;
+
+        if self.position_in_block >= self.block_postings.len() {
+            self.load_block(self.current_block + 1);
+        }
+        self.doc()
     }
 
     /// Skip to the next block, returning the first doc_id in the new block

@@ -552,6 +552,7 @@ impl AsyncSegmentReader {
             let quant = lazy_flat.quantization;
             let fetch_k = k * rerank_factor.max(1);
             let mut collector = crate::query::ScoreCollector::new(fetch_k);
+            let mut scores = vec![0f32; BRUTE_FORCE_BATCH];
 
             for batch_start in (0..n).step_by(BRUTE_FORCE_BATCH) {
                 let batch_count = BRUTE_FORCE_BATCH.min(n - batch_start);
@@ -561,8 +562,7 @@ impl AsyncSegmentReader {
                     .map_err(crate::Error::Io)?;
                 let raw = batch_bytes.as_slice();
 
-                let mut scores = vec![0f32; batch_count];
-                Self::score_quantized_batch(query, raw, quant, dim, &mut scores);
+                Self::score_quantized_batch(query, raw, quant, dim, &mut scores[..batch_count]);
 
                 for (i, &score) in scores.iter().enumerate().take(batch_count) {
                     let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
@@ -777,13 +777,13 @@ impl AsyncSegmentReader {
 
         // Filter query terms to only those present in the index
         let mut matched_terms: Vec<(u32, f32)> = Vec::with_capacity(vector.len());
-        let mut missing_tokens = Vec::new();
+        let mut missing_count = 0usize;
 
         for &(dim_id, query_weight) in vector {
             if sparse_index.has_dimension(dim_id) {
                 matched_terms.push((dim_id, query_weight));
             } else {
-                missing_tokens.push(dim_id);
+                missing_count += 1;
             }
         }
 
@@ -791,25 +791,9 @@ impl AsyncSegmentReader {
             "Sparse vector search: query_tokens={}, matched={}, missing={}, index_dimensions={}",
             query_tokens,
             matched_terms.len(),
-            missing_tokens.len(),
+            missing_count,
             index_dimensions
         );
-
-        if log::log_enabled!(log::Level::Debug) {
-            let query_details: Vec<_> = vector
-                .iter()
-                .take(30)
-                .map(|(id, w)| format!("{}:{:.3}", id, w))
-                .collect();
-            log::debug!("Query tokens (id:weight): [{}]", query_details.join(", "));
-        }
-
-        if !missing_tokens.is_empty() {
-            log::debug!(
-                "Missing token IDs (not in index): {:?}",
-                missing_tokens.iter().take(20).collect::<Vec<_>>()
-            );
-        }
 
         if matched_terms.is_empty() {
             log::debug!("Sparse vector search: no matching tokens, returning empty");
