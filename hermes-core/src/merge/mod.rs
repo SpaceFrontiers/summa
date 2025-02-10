@@ -73,7 +73,8 @@ impl MergePolicy for NoMergePolicy {
 pub struct TieredMergePolicy {
     /// Minimum number of segments in a tier before merging (default: 10)
     pub segments_per_tier: usize,
-    /// Maximum number of segments to merge at once (default: 10)
+    /// Maximum number of segments to merge at once (default: 10).
+    /// Should be close to segments_per_tier to prevent giant merges.
     pub max_merge_at_once: usize,
     /// Factor between tier sizes (default: 10.0)
     pub tier_factor: f64,
@@ -87,7 +88,7 @@ impl Default for TieredMergePolicy {
     fn default() -> Self {
         Self {
             segments_per_tier: 10,
-            max_merge_at_once: 100,
+            max_merge_at_once: 10,
             tier_factor: 10.0,
             tier_floor: 1000,
             max_merged_docs: 5_000_000,
@@ -164,9 +165,9 @@ impl MergePolicy for TieredMergePolicy {
                     break;
                 }
                 // Ratio guard: don't include a segment that dwarfs the accumulated group.
-                // Use tier_floor as minimum baseline so very small segments can always accumulate.
-                let effective_total = total_docs.max(self.tier_floor as u64);
-                if next_docs > effective_total * max_ratio {
+                // Uses the actual accumulated total — NOT inflated by tier_floor — so
+                // a group of tiny segments won't attract a previously-merged large segment.
+                if next_docs > total_docs * max_ratio {
                     break;
                 }
                 group.push(j);
@@ -418,6 +419,56 @@ mod tests {
                 total
             );
         }
+    }
+
+    #[test]
+    fn test_tiered_policy_large_segment_not_remerged_with_small() {
+        // Simulates the user scenario: after merging, we have one large segment
+        // and a few new small segments from recent commits. The large segment
+        // should NOT be re-merged — only the small ones should merge together
+        // once there are enough of them.
+        let policy = TieredMergePolicy::default(); // segments_per_tier=10
+        // 1 large segment (from previous merge) + 5 new small segments
+        let mut segments = vec![SegmentInfo {
+            id: "large_merged".into(),
+            num_docs: 50_000,
+        }];
+        for i in 0..5 {
+            segments.push(SegmentInfo {
+                id: format!("new_{}", i),
+                num_docs: 500,
+            });
+        }
+
+        // Should NOT merge: only 5 small segments (< segments_per_tier=10),
+        // and the large segment is too big to join their group.
+        let candidates = policy.find_merges(&segments);
+        assert!(
+            candidates.is_empty(),
+            "should not re-merge large segment with 5 small ones: {:?}",
+            candidates
+        );
+
+        // Now add 5 more small segments (total 10) — those should merge together,
+        // but the large segment should still be excluded.
+        for i in 5..10 {
+            segments.push(SegmentInfo {
+                id: format!("new_{}", i),
+                num_docs: 500,
+            });
+        }
+
+        let candidates = policy.find_merges(&segments);
+        assert_eq!(candidates.len(), 1, "should merge the 10 small segments");
+        assert!(
+            !candidates[0].segment_ids.contains(&"large_merged".into()),
+            "large segment must NOT be in the merge group"
+        );
+        assert_eq!(
+            candidates[0].segment_ids.len(),
+            10,
+            "all 10 small segments should be merged"
+        );
     }
 
     #[test]
