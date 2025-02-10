@@ -18,10 +18,11 @@ pub(super) struct DenseVectorBuilder {
 
 impl DenseVectorBuilder {
     pub fn new(dim: usize) -> Self {
+        // Pre-allocate for ~16 vectors to avoid early reallocation chains
         Self {
             dim,
-            doc_ids: Vec::new(),
-            vectors: Vec::new(),
+            doc_ids: Vec::with_capacity(16),
+            vectors: Vec::with_capacity(16 * dim),
         }
     }
 

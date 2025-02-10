@@ -91,21 +91,24 @@ pub fn serialize_document_into(
 
     buf.clear();
 
-    let stored: Vec<_> = doc
+    // Two-pass approach avoids allocating a Vec just to count + iterate stored fields.
+    let is_stored = |field: &crate::dsl::Field, value: &FieldValue| -> bool {
+        // Dense vectors live in .vectors (LazyFlatVectorData), not in .store
+        if matches!(value, FieldValue::DenseVector(_)) {
+            return false;
+        }
+        schema.get_field_entry(*field).is_some_and(|e| e.stored)
+    };
+
+    let stored_count = doc
         .field_values()
         .iter()
-        .filter(|(field, value)| {
-            // Dense vectors live in .vectors (LazyFlatVectorData), not in .store
-            if matches!(value, crate::dsl::FieldValue::DenseVector(_)) {
-                return false;
-            }
-            schema.get_field_entry(*field).is_some_and(|e| e.stored)
-        })
-        .collect();
+        .filter(|(field, value)| is_stored(field, value))
+        .count();
 
-    buf.write_u16::<LittleEndian>(stored.len() as u16)?;
+    buf.write_u16::<LittleEndian>(stored_count as u16)?;
 
-    for (field, value) in &stored {
+    for (field, value) in doc.field_values().iter().filter(|(f, v)| is_stored(f, v)) {
         buf.write_u16::<LittleEndian>(field.0 as u16)?;
         match value {
             FieldValue::Text(s) => {

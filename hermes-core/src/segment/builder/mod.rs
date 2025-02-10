@@ -1156,17 +1156,17 @@ impl SegmentBuilder {
                 let has_positions = position_offsets.contains_key(&key);
 
                 // Fast path: try inline first (avoids PostingList + BlockPostingList allocs)
-                if !has_positions {
-                    let doc_ids: Vec<u32> =
-                        posting_builder.postings.iter().map(|p| p.doc_id).collect();
-                    let term_freqs: Vec<u32> = posting_builder
-                        .postings
-                        .iter()
-                        .map(|p| p.term_freq as u32)
-                        .collect();
-                    if let Some(inline) = TermInfo::try_inline(&doc_ids, &term_freqs) {
-                        return Ok((key, SerializedPosting::Inline(inline)));
-                    }
+                // Uses try_inline_iter to avoid allocating two Vec<u32> per term.
+                if !has_positions
+                    && let Some(inline) = TermInfo::try_inline_iter(
+                        posting_builder.postings.len(),
+                        posting_builder
+                            .postings
+                            .iter()
+                            .map(|p| (p.doc_id, p.term_freq as u32)),
+                    )
+                {
+                    return Ok((key, SerializedPosting::Inline(inline)));
                 }
 
                 // Slow path: build full PostingList → BlockPostingList → serialize

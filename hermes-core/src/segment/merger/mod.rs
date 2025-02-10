@@ -409,7 +409,7 @@ impl SegmentMerger {
             let term_info = self
                 .merge_term(
                     segments,
-                    &sources,
+                    &mut sources,
                     postings_out,
                     positions_out,
                     &mut serialize_buf,
@@ -441,22 +441,25 @@ impl SegmentMerger {
     async fn merge_term(
         &self,
         segments: &[SegmentReader],
-        sources: &[(usize, TermInfo, u32)],
+        sources: &mut [(usize, TermInfo, u32)],
         postings_out: &mut OffsetWriter,
         positions_out: &mut OffsetWriter,
         buf: &mut Vec<u8>,
     ) -> Result<TermInfo> {
-        let mut sorted: Vec<_> = sources.to_vec();
-        sorted.sort_by_key(|(_, _, off)| *off);
+        sources.sort_by_key(|(_, _, off)| *off);
 
-        let any_positions = sorted.iter().any(|(_, ti, _)| ti.position_info().is_some());
-        let all_external = sorted.iter().all(|(_, ti, _)| ti.external_info().is_some());
+        let any_positions = sources
+            .iter()
+            .any(|(_, ti, _)| ti.position_info().is_some());
+        let all_external = sources
+            .iter()
+            .all(|(_, ti, _)| ti.external_info().is_some());
 
         // === Merge postings ===
-        let (posting_offset, posting_len, doc_count) = if all_external && sorted.len() > 1 {
+        let (posting_offset, posting_len, doc_count) = if all_external && sources.len() > 1 {
             // Fast path: streaming merge (blocks → output writer, no buffering)
-            let mut raw_sources: Vec<(Vec<u8>, u32)> = Vec::with_capacity(sorted.len());
-            for (seg_idx, ti, doc_off) in &sorted {
+            let mut raw_sources: Vec<(Vec<u8>, u32)> = Vec::with_capacity(sources.len());
+            for (seg_idx, ti, doc_off) in sources.iter() {
                 let (off, len) = ti.external_info().unwrap();
                 let bytes = segments[*seg_idx].read_postings(off, len).await?;
                 raw_sources.push((bytes, *doc_off));
@@ -472,7 +475,7 @@ impl SegmentMerger {
         } else {
             // Decode all sources into a flat PostingList, remap doc IDs
             let mut merged = PostingList::new();
-            for (seg_idx, ti, doc_off) in &sorted {
+            for (seg_idx, ti, doc_off) in sources.iter() {
                 if let Some((ids, tfs)) = ti.decode_inline() {
                     for (id, tf) in ids.into_iter().zip(tfs) {
                         merged.add(id + doc_off, tf);
@@ -489,12 +492,13 @@ impl SegmentMerger {
                 }
             }
             // Try to inline (only when no positions)
-            if !any_positions {
-                let ids: Vec<u32> = merged.iter().map(|p| p.doc_id).collect();
-                let tfs: Vec<u32> = merged.iter().map(|p| p.term_freq).collect();
-                if let Some(inline) = TermInfo::try_inline(&ids, &tfs) {
-                    return Ok(inline);
-                }
+            if !any_positions
+                && let Some(inline) = TermInfo::try_inline_iter(
+                    merged.doc_count() as usize,
+                    merged.iter().map(|p| (p.doc_id, p.term_freq)),
+                )
+            {
+                return Ok(inline);
             }
             let offset = postings_out.offset();
             let block = BlockPostingList::from_posting_list(&merged)?;
@@ -507,7 +511,7 @@ impl SegmentMerger {
         // === Merge positions (if any source has them) ===
         if any_positions {
             let mut raw_pos: Vec<(Vec<u8>, u32)> = Vec::new();
-            for (seg_idx, ti, doc_off) in &sorted {
+            for (seg_idx, ti, doc_off) in sources.iter() {
                 if let Some((pos_off, pos_len)) = ti.position_info()
                     && let Some(bytes) = segments[*seg_idx]
                         .read_position_bytes(pos_off, pos_len)

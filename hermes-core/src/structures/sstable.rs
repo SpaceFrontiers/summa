@@ -335,6 +335,41 @@ impl TermInfo {
         })
     }
 
+    /// Try to create an inline TermInfo from an iterator of (doc_id, term_freq) pairs.
+    /// Zero-allocation alternative to `try_inline` — avoids collecting into Vec<u32>.
+    /// `count` is the number of postings (must match iterator length).
+    pub fn try_inline_iter(count: usize, iter: impl Iterator<Item = (u32, u32)>) -> Option<Self> {
+        if count > MAX_INLINE_POSTINGS || count == 0 {
+            return None;
+        }
+
+        let mut data = [0u8; 16];
+        let mut cursor = std::io::Cursor::new(&mut data[..]);
+        let mut prev_doc_id = 0u32;
+
+        for (doc_id, tf) in iter {
+            let delta = doc_id - prev_doc_id;
+            if write_vint(&mut cursor, delta as u64).is_err() {
+                return None;
+            }
+            if write_vint(&mut cursor, tf as u64).is_err() {
+                return None;
+            }
+            prev_doc_id = doc_id;
+        }
+
+        let data_len = cursor.position() as u8;
+        if data_len > 16 {
+            return None;
+        }
+
+        Some(TermInfo::Inline {
+            doc_freq: count as u8,
+            data,
+            data_len,
+        })
+    }
+
     /// Get document frequency
     pub fn doc_freq(&self) -> u32 {
         match self {
