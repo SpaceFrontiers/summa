@@ -4,9 +4,9 @@
 //! - **String interning**: Terms are interned using `lasso` to avoid repeated allocations
 //! - **hashbrown HashMap**: O(1) average insertion instead of BTreeMap's O(log n)
 //! - **Streaming document store**: Documents written to disk immediately
-//! - **Incremental posting flush**: Large posting lists flushed to temp file
-//! - **Memory-mapped intermediate files**: Reduces memory pressure
-//! - **Arena allocation**: Batch allocations for reduced fragmentation
+//! - **Zero-copy store build**: Pre-serialized doc bytes passed directly to compressor
+//! - **Parallel posting serialization**: Rayon parallel sort + serialize
+//! - **Inline posting fast path**: Small terms skip PostingList/BlockPostingList entirely
 
 mod config;
 mod posting;
@@ -693,7 +693,6 @@ impl SegmentBuilder {
         let inverted_index = std::mem::take(&mut self.inverted_index);
         let term_interner = std::mem::replace(&mut self.term_interner, Rodeo::new());
         let store_path = self.store_path.clone();
-        let schema_clone = self.schema.clone();
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
 
@@ -715,7 +714,6 @@ impl SegmentBuilder {
             || {
                 Self::build_store_streaming(
                     &store_path,
-                    &schema_clone,
                     num_compression_threads,
                     compression_level,
                     &mut *store_writer,
@@ -1185,7 +1183,6 @@ impl SegmentBuilder {
     /// deserialize→Document→reserialize roundtrip entirely.
     fn build_store_streaming(
         store_path: &PathBuf,
-        _schema: &Schema,
         num_compression_threads: usize,
         compression_level: CompressionLevel,
         writer: &mut dyn Write,
