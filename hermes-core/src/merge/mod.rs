@@ -5,6 +5,8 @@
 
 use std::fmt::Debug;
 
+pub mod consts;
+
 #[cfg(feature = "native")]
 mod scheduler;
 #[cfg(feature = "native")]

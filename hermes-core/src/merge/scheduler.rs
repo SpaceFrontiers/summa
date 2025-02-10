@@ -35,10 +35,8 @@ use crate::segment::{SegmentId, SegmentSnapshot, SegmentTracker};
 #[cfg(feature = "native")]
 use crate::segment::{SegmentMerger, SegmentReader};
 
+use super::consts::MAX_CONCURRENT_MERGES;
 use super::{MergePolicy, SegmentInfo};
-
-/// Maximum number of concurrent merge operations
-const MAX_CONCURRENT_MERGES: usize = 4;
 
 /// Segment manager - coordinates segment registration and background merging
 ///
@@ -244,7 +242,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     }
 
     /// Spawn a background merge task
-    fn spawn_merge(self: &Arc<Self>, segment_ids_to_merge: Vec<String>) {
+    fn spawn_merge(&self, segment_ids_to_merge: Vec<String>) {
         // Skip if merges are paused (during ANN rebuild)
         if self.merge_paused.load(Ordering::SeqCst) {
             log::debug!("[spawn_merge] skipped: merges paused");
@@ -283,11 +281,39 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let merge_complete = Arc::clone(&self.merge_complete);
         let tracker = Arc::clone(&self.tracker);
         let term_cache_blocks = self.term_cache_blocks;
-        let self_clone = Arc::clone(self);
 
         pending_merges.fetch_add(1, Ordering::SeqCst);
 
         tokio::spawn(async move {
+            // Drop guard: ensures merging_segments cleanup and pending_merges
+            // decrement even if do_merge panics. Without this, a panic would
+            // permanently wedge those segments and hang wait_for_merges.
+            struct MergeGuard {
+                segment_ids: Vec<String>,
+                merging_segments: Arc<SyncRwLock<HashSet<String>>>,
+                pending_merges: Arc<AtomicUsize>,
+                merge_complete: Arc<Notify>,
+            }
+            impl Drop for MergeGuard {
+                fn drop(&mut self) {
+                    {
+                        let mut merging = self.merging_segments.write();
+                        for id in &self.segment_ids {
+                            merging.remove(id);
+                        }
+                    }
+                    self.pending_merges.fetch_sub(1, Ordering::SeqCst);
+                    self.merge_complete.notify_one();
+                }
+            }
+
+            let _guard = MergeGuard {
+                segment_ids: segment_ids_to_merge.clone(),
+                merging_segments,
+                pending_merges,
+                merge_complete,
+            };
+
             let result = Self::do_merge(
                 directory.as_ref(),
                 &schema,
@@ -330,24 +356,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
             }
 
-            // Remove from merging set
-            {
-                let mut merging = merging_segments.write();
-                for id in &segment_ids_to_merge {
-                    merging.remove(id);
-                }
-            }
-
-            // Decrement pending merges counter and notify waiters.
-            // Use notify_one() instead of notify_waiters() to store a permit
-            // when no waiter is listening — prevents lost-notification hang
-            // if the waiter is between its pending_merges check and .await.
-            pending_merges.fetch_sub(1, Ordering::SeqCst);
-            merge_complete.notify_one();
-
-            // Re-evaluate merge policy — there may be more segments to merge
-            // that were blocked by MAX_CONCURRENT_MERGES during commit
-            self_clone.maybe_merge().await;
+            // _guard drops here: removes from merging_segments, decrements
+            // pending_merges, and calls notify_one().
         });
     }
 
@@ -449,10 +459,26 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok((new_segment_id.to_hex(), total_docs))
     }
 
-    /// Wait for all pending merges to complete
-    pub async fn wait_for_merges(&self) {
-        while self.pending_merges.load(Ordering::SeqCst) > 0 {
-            self.merge_complete.notified().await;
+    /// Wait for all pending merges to complete, then re-evaluate.
+    ///
+    /// After background merges finish, there may be remaining segments that
+    /// couldn't be merged earlier because MAX_CONCURRENT_MERGES was reached.
+    /// This method loops: drain pending merges → re-evaluate → repeat,
+    /// until no new merges are spawned.
+    pub async fn wait_for_merges(self: &Arc<Self>) {
+        loop {
+            // Wait for all in-flight merges to finish
+            while self.pending_merges.load(Ordering::SeqCst) > 0 {
+                self.merge_complete.notified().await;
+            }
+
+            // Re-evaluate: spawn merges for segments that were blocked earlier
+            self.maybe_merge().await;
+
+            // If maybe_merge didn't spawn anything, we're truly done
+            if self.pending_merges.load(Ordering::SeqCst) == 0 {
+                return;
+            }
         }
     }
 

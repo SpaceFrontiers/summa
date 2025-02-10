@@ -715,13 +715,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     // Vector index building methods are in vector_builder.rs
 
-    /// Maximum segments to merge in a single pass.
-    /// Keeps file descriptor and memory usage bounded during force_merge.
-    const FORCE_MERGE_BATCH: usize = 64;
-
     /// Merge all segments into one (called explicitly via force_merge).
     /// Iteratively merges in batches of FORCE_MERGE_BATCH until ≤1 segment remains.
     async fn do_merge(&self) -> Result<()> {
+        use crate::merge::consts::FORCE_MERGE_BATCH;
         loop {
             let ids_to_merge = self.segment_manager.get_segment_ids().await;
             if ids_to_merge.len() < 2 {
@@ -729,10 +726,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             }
 
             // Take up to FORCE_MERGE_BATCH segments per round
-            let batch: Vec<String> = ids_to_merge
-                .into_iter()
-                .take(Self::FORCE_MERGE_BATCH)
-                .collect();
+            let batch: Vec<String> = ids_to_merge.into_iter().take(FORCE_MERGE_BATCH).collect();
 
             log::info!("[force_merge] merging batch of {} segments", batch.len(),);
 
