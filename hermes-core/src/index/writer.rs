@@ -323,71 +323,83 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let mut my_epoch = 0usize;
 
         loop {
-            let mut builder: Option<SegmentBuilder> = None;
+            // Wrap the recv+build phase in catch_unwind so a panic doesn't
+            // prevent flush_count from being signaled (which would hang
+            // prepare_commit forever).
+            let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut builder: Option<SegmentBuilder> = None;
 
-            while let Ok(doc) = receiver.recv_blocking() {
-                // Initialize builder if needed
-                if builder.is_none() {
-                    match SegmentBuilder::new(
-                        Arc::clone(&state.schema),
-                        state.builder_config.clone(),
-                    ) {
-                        Ok(mut b) => {
-                            for (field, tokenizer) in state.tokenizers.read().iter() {
-                                b.set_tokenizer(*field, tokenizer.clone_box());
+                while let Ok(doc) = receiver.recv_blocking() {
+                    // Initialize builder if needed
+                    if builder.is_none() {
+                        match SegmentBuilder::new(
+                            Arc::clone(&state.schema),
+                            state.builder_config.clone(),
+                        ) {
+                            Ok(mut b) => {
+                                for (field, tokenizer) in state.tokenizers.read().iter() {
+                                    b.set_tokenizer(*field, tokenizer.clone_box());
+                                }
+                                builder = Some(b);
                             }
-                            builder = Some(b);
+                            Err(e) => {
+                                log::error!("Failed to create segment builder: {:?}", e);
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            log::error!("Failed to create segment builder: {:?}", e);
-                            continue;
-                        }
+                    }
+
+                    let b = builder.as_mut().unwrap();
+                    if let Err(e) = b.add_document(doc) {
+                        log::error!("Failed to index document: {:?}", e);
+                        continue;
+                    }
+
+                    let builder_memory = b.estimated_memory_bytes();
+
+                    if b.num_docs() & 0x3FFF == 0 {
+                        log::debug!(
+                            "[indexing] docs={}, memory={:.2} MB, budget={:.2} MB",
+                            b.num_docs(),
+                            builder_memory as f64 / (1024.0 * 1024.0),
+                            state.memory_budget_per_worker as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+
+                    // Require minimum 100 docs before flushing to avoid tiny segments
+                    const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
+
+                    if builder_memory >= state.memory_budget_per_worker
+                        && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH
+                    {
+                        log::info!(
+                            "[indexing] memory budget reached, building segment: \
+                             docs={}, memory={:.2} MB, budget={:.2} MB",
+                            b.num_docs(),
+                            builder_memory as f64 / (1024.0 * 1024.0),
+                            state.memory_budget_per_worker as f64 / (1024.0 * 1024.0),
+                        );
+                        let full_builder = builder.take().unwrap();
+                        Self::build_segment_inline(&state, full_builder, &handle);
                     }
                 }
 
-                let b = builder.as_mut().unwrap();
-                if let Err(e) = b.add_document(doc) {
-                    log::error!("Failed to index document: {:?}", e);
-                    continue;
-                }
-
-                let builder_memory = b.estimated_memory_bytes();
-
-                if b.num_docs() & 0x3FFF == 0 {
-                    log::debug!(
-                        "[indexing] docs={}, memory={:.2} MB, budget={:.2} MB",
-                        b.num_docs(),
-                        builder_memory as f64 / (1024.0 * 1024.0),
-                        state.memory_budget_per_worker as f64 / (1024.0 * 1024.0)
-                    );
-                }
-
-                // Require minimum 100 docs before flushing to avoid tiny segments
-                const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
-
-                if builder_memory >= state.memory_budget_per_worker
-                    && b.num_docs() >= MIN_DOCS_BEFORE_FLUSH
+                // Channel closed — flush current builder
+                if let Some(b) = builder.take()
+                    && b.num_docs() > 0
                 {
-                    log::info!(
-                        "[indexing] memory budget reached, building segment: \
-                         docs={}, memory={:.2} MB, budget={:.2} MB",
-                        b.num_docs(),
-                        builder_memory as f64 / (1024.0 * 1024.0),
-                        state.memory_budget_per_worker as f64 / (1024.0 * 1024.0),
-                    );
-                    let full_builder = builder.take().unwrap();
-                    Self::build_segment_inline(&state, full_builder, &handle);
+                    Self::build_segment_inline(&state, b, &handle);
                 }
+            }));
+
+            if build_result.is_err() {
+                log::error!(
+                    "[worker] panic during indexing cycle — documents in this cycle may be lost"
+                );
             }
 
-            // Channel closed — flush current builder
-            if let Some(b) = builder.take()
-                && b.num_docs() > 0
-            {
-                Self::build_segment_inline(&state, b, &handle);
-            }
-
-            // Signal flush completion
+            // Signal flush completion (always, even after panic — prevents
+            // prepare_commit from hanging)
             let prev = state.flush_count.fetch_add(1, Ordering::Release);
             if prev + 1 == state.num_workers {
                 // Last worker — wake prepare_commit

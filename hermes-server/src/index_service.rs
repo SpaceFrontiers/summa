@@ -20,21 +20,30 @@ pub struct IndexServiceImpl {
 impl IndexServiceImpl {
     /// Convert a batch of streaming proto messages to Documents off the async
     /// runtime (spawn_blocking) and feed them to the index writer.
+    /// Returns (indexed_count, recycled_batch_vec) — the Vec is drained but
+    /// retains its capacity so the caller can reuse it.
     async fn flush_stream_batch(
         batch: Vec<IndexDocumentRequest>,
-        index: &Arc<hermes_core::Index<hermes_core::MmapDirectory>>,
+        schema: &Arc<hermes_core::Schema>,
         writer: &Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::MmapDirectory>>>,
-    ) -> Result<u32, Status> {
-        let schema = index.schema().clone();
-        let docs = tokio::task::spawn_blocking(move || {
-            batch
-                .into_iter()
-                .map(|req| convert_proto_to_document(&req.fields, &schema))
-                .collect::<Result<Vec<_>, _>>()
+    ) -> Result<(u32, Vec<IndexDocumentRequest>), Status> {
+        let schema = Arc::clone(schema);
+        let (docs, recycled) = tokio::task::spawn_blocking(move || {
+            let mut docs = Vec::with_capacity(batch.len());
+            for req in &batch {
+                match convert_proto_to_document(&req.fields, &schema) {
+                    Ok(doc) => docs.push(doc),
+                    Err(e) => {
+                        tracing::warn!("Skipping invalid document in stream batch: {}", e);
+                    }
+                }
+            }
+            let mut recycled = batch;
+            recycled.clear();
+            (docs, recycled)
         })
         .await
-        .map_err(|e| Status::internal(format!("Conversion task failed: {}", e)))?
-        .map_err(|e| Status::invalid_argument(format!("Invalid document: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Conversion task failed: {}", e)))?;
 
         let count = docs.len() as u32;
         let w = writer.read().await;
@@ -42,7 +51,7 @@ impl IndexServiceImpl {
             w.add_document(doc)
                 .map_err(|e| Status::internal(format!("Failed to index: {}", e)))?;
         }
-        Ok(count)
+        Ok((count, recycled))
     }
 }
 
@@ -125,7 +134,7 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<IndexDocumentsResponse>, Status> {
         let mut stream = request.into_inner();
         let mut indexed_count = 0u32;
-        let mut current_index: Option<Arc<hermes_core::Index<hermes_core::MmapDirectory>>> = None;
+        let mut current_schema: Option<Arc<hermes_core::Schema>> = None;
         let mut current_writer: Option<
             Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::MmapDirectory>>>,
         > = None;
@@ -141,18 +150,20 @@ impl IndexService for IndexServiceImpl {
 
             // Flush current batch before switching indexes
             if needs_switch && !batch.is_empty() {
-                indexed_count += Self::flush_stream_batch(
-                    std::mem::take(&mut batch),
-                    current_index.as_ref().unwrap(),
+                let (count, recycled) = Self::flush_stream_batch(
+                    batch,
+                    current_schema.as_ref().unwrap(),
                     current_writer.as_ref().unwrap(),
                 )
                 .await?;
+                indexed_count += count;
+                batch = recycled;
             }
 
             if needs_switch {
                 let index = self.registry.get_or_open_index(&req.index_name).await?;
                 let writer = self.registry.get_writer(&req.index_name).await?;
-                current_index = Some(index);
+                current_schema = Some(Arc::clone(index.schema_arc()));
                 current_writer = Some(writer);
                 current_index_name = Some(req.index_name.clone());
             }
@@ -160,20 +171,22 @@ impl IndexService for IndexServiceImpl {
             batch.push(req);
 
             if batch.len() >= STREAM_BATCH_SIZE {
-                indexed_count += Self::flush_stream_batch(
-                    std::mem::take(&mut batch),
-                    current_index.as_ref().unwrap(),
+                let (count, recycled) = Self::flush_stream_batch(
+                    batch,
+                    current_schema.as_ref().unwrap(),
                     current_writer.as_ref().unwrap(),
                 )
                 .await?;
+                indexed_count += count;
+                batch = recycled;
             }
         }
 
         // Flush remaining batch
         if !batch.is_empty() {
-            indexed_count += Self::flush_stream_batch(
+            let (count, _recycled) = Self::flush_stream_batch(
                 batch,
-                current_index
+                current_schema
                     .as_ref()
                     .ok_or_else(|| Status::internal("No index selected"))?,
                 current_writer
@@ -181,6 +194,7 @@ impl IndexService for IndexServiceImpl {
                     .ok_or_else(|| Status::internal("No writer selected"))?,
             )
             .await?;
+            indexed_count += count;
         }
 
         Ok(Response::new(IndexDocumentsResponse { indexed_count }))

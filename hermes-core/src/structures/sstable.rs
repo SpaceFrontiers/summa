@@ -359,9 +359,6 @@ impl TermInfo {
         }
 
         let data_len = cursor.position() as u8;
-        if data_len > 16 {
-            return None;
-        }
 
         Some(TermInfo::Inline {
             doc_freq: count as u8,

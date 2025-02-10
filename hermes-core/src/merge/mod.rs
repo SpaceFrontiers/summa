@@ -167,7 +167,8 @@ impl MergePolicy for TieredMergePolicy {
                 // Ratio guard: don't include a segment that dwarfs the accumulated group.
                 // Uses the actual accumulated total — NOT inflated by tier_floor — so
                 // a group of tiny segments won't attract a previously-merged large segment.
-                if next_docs > total_docs * max_ratio {
+                // max(1) prevents a zero-doc starting segment from blocking all accumulation.
+                if next_docs > total_docs.max(1) * max_ratio {
                     break;
                 }
                 group.push(j);

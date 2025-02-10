@@ -176,6 +176,11 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         &self.schema
     }
 
+    /// Get the schema as an Arc reference (avoids clone when Arc is needed)
+    pub fn schema_arc(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
     /// Get a reference to the underlying directory
     pub fn directory(&self) -> &D {
         &self.directory
