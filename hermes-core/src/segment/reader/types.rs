@@ -399,6 +399,21 @@ impl SparseIndex {
         ))
     }
 
+    /// Like `get_skip_range` but also returns `block_data_offset` for use with
+    /// `load_block_direct`. Avoids needing a second dim_id lookup later.
+    ///
+    /// Returns `(skip_start, skip_count, max_weight, block_data_offset)`.
+    #[inline]
+    pub fn get_skip_range_full(&self, dim_id: u32) -> Option<(usize, usize, f32, u32)> {
+        let idx = self.dims.find(dim_id)?;
+        Some((
+            self.dims.skip_starts[idx] as usize,
+            self.dims.skip_counts[idx] as usize,
+            self.dims.max_weights[idx],
+            self.dims.block_offsets[idx],
+        ))
+    }
+
     /// Load a contiguous range of blocks for a dimension in a single mmap read.
     ///
     /// Returns individual `SparseBlock`s parsed from the coalesced byte range.
@@ -466,6 +481,32 @@ impl SparseIndex {
             return Ok(None);
         }
         Ok(Some(self.load_block_at(idx, block_idx).await?))
+    }
+
+    /// Load a block using pre-resolved skip_start and block_data_offset.
+    ///
+    /// Avoids the dim_id binary search in `get_block` — intended for cursors
+    /// that resolved the dimension index once at construction time.
+    pub async fn load_block_direct(
+        &self,
+        skip_start: usize,
+        block_data_offset: u32,
+        block_idx: usize,
+    ) -> crate::Result<Option<SparseBlock>> {
+        let entry = self.read_skip_entry(skip_start + block_idx);
+        let base = block_data_offset as u64;
+        let abs_offset = base + entry.offset as u64;
+        let data = self
+            .handle
+            .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
+            .await
+            .map_err(crate::Error::Io)?;
+        Ok(Some(SparseBlock::from_owned_bytes(data).map_err(|e| {
+            crate::Error::Corruption(format!(
+                "direct block load skip_start={} block_idx={} offset={} length={} base={}: {e}",
+                skip_start, block_idx, entry.offset, entry.length, base
+            ))
+        })?))
     }
 
     /// Check if dimension exists

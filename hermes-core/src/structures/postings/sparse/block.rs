@@ -686,6 +686,8 @@ pub struct BlockSparsePostingIterator<'a> {
     current_doc_ids: Vec<DocId>,
     current_ordinals: Vec<u16>,
     current_weights: Vec<f32>,
+    /// Whether ordinals have been decoded for current block (lazy decode)
+    ordinals_decoded: bool,
     exhausted: bool,
 }
 
@@ -695,9 +697,10 @@ impl<'a> BlockSparsePostingIterator<'a> {
             posting_list,
             block_idx: 0,
             in_block_idx: 0,
-            current_doc_ids: Vec::new(),
-            current_ordinals: Vec::new(),
-            current_weights: Vec::new(),
+            current_doc_ids: Vec::with_capacity(128),
+            current_ordinals: Vec::with_capacity(128),
+            current_weights: Vec::with_capacity(128),
+            ordinals_decoded: false,
             exhausted: posting_list.blocks.is_empty(),
         };
         if !iter.exhausted {
@@ -709,32 +712,46 @@ impl<'a> BlockSparsePostingIterator<'a> {
     fn load_block(&mut self, block_idx: usize) {
         if let Some(block) = self.posting_list.blocks.get(block_idx) {
             block.decode_doc_ids_into(&mut self.current_doc_ids);
-            block.decode_ordinals_into(&mut self.current_ordinals);
             block.decode_weights_into(&mut self.current_weights);
+            // Defer ordinal decode until ordinal() is called (lazy)
+            self.ordinals_decoded = false;
             self.block_idx = block_idx;
             self.in_block_idx = 0;
         }
     }
 
+    /// Ensure ordinals are decoded for the current block (lazy decode)
+    #[inline]
+    fn ensure_ordinals_decoded(&mut self) {
+        if !self.ordinals_decoded {
+            if let Some(block) = self.posting_list.blocks.get(self.block_idx) {
+                block.decode_ordinals_into(&mut self.current_ordinals);
+            }
+            self.ordinals_decoded = true;
+        }
+    }
+
+    #[inline]
     pub fn doc(&self) -> DocId {
         if self.exhausted {
             TERMINATED
         } else {
-            self.current_doc_ids
-                .get(self.in_block_idx)
-                .copied()
-                .unwrap_or(TERMINATED)
+            // Safety: load_block guarantees in_block_idx < current_doc_ids.len()
+            self.current_doc_ids[self.in_block_idx]
         }
     }
 
+    #[inline]
     pub fn weight(&self) -> f32 {
-        self.current_weights
-            .get(self.in_block_idx)
-            .copied()
-            .unwrap_or(0.0)
+        if self.exhausted {
+            return 0.0;
+        }
+        // Safety: load_block guarantees in_block_idx < current_weights.len()
+        self.current_weights[self.in_block_idx]
     }
 
-    pub fn ordinal(&self) -> u16 {
+    pub fn ordinal(&mut self) -> u16 {
+        self.ensure_ordinals_decoded();
         self.current_ordinals
             .get(self.in_block_idx)
             .copied()

@@ -19,6 +19,7 @@ import {
   Document,
   SearchHit,
   SearchResponse,
+  SearchTimings,
   IndexInfo,
   SearchOptions,
   Combiner,
@@ -210,10 +211,20 @@ export class HermesClient {
       ),
     }));
 
+    const timings: SearchTimings | undefined = response.timings
+      ? {
+          searchUs: Number(response.timings.searchUs),
+          rerankUs: Number(response.timings.rerankUs),
+          loadUs: Number(response.timings.loadUs),
+          totalUs: Number(response.timings.totalUs),
+        }
+      : undefined;
+
     return {
       hits,
       totalHits: response.totalHits,
       tookMs: response.tookMs,
+      timings,
     };
   }
 

@@ -176,6 +176,15 @@ message SearchResponse {
   repeated SearchHit hits = 1;
   uint32 total_hits = 2;
   uint64 took_ms = 3;
+  SearchTimings timings = 4;
+}
+
+// Detailed timing breakdown for search phases (all values in microseconds)
+message SearchTimings {
+  uint64 search_us = 1;       // L1 retrieval (query scoring across segments)
+  uint64 rerank_us = 2;       // L2 reranking (dense vector rescoring)
+  uint64 load_us = 3;         // Document field loading from store
+  uint64 total_us = 4;        // Wall-clock total (includes overhead)
 }
 
 // Get document request/response

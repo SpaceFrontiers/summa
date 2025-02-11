@@ -10,11 +10,20 @@ export interface SearchHit {
   fields: Record<string, any>;
 }
 
+/** Detailed timing breakdown for search phases (all values in microseconds). */
+export interface SearchTimings {
+  searchUs: number;
+  rerankUs: number;
+  loadUs: number;
+  totalUs: number;
+}
+
 /** Search response with hits and metadata. */
 export interface SearchResponse {
   hits: SearchHit[];
   totalHits: number;
   tookMs: number;
+  timings?: SearchTimings;
 }
 
 /** Information about an index. */

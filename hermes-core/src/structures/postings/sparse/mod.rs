@@ -169,9 +169,18 @@ impl SparseSkipList {
         self.global_max_weight
     }
 
-    /// Find block index containing doc_id >= target
+    /// Find block index containing doc_id >= target (binary search, O(log n))
     pub fn find_block(&self, target: DocId) -> Option<usize> {
-        self.entries.iter().position(|e| e.last_doc >= target)
+        if self.entries.is_empty() {
+            return None;
+        }
+        // Binary search: find first entry where last_doc >= target
+        let idx = self.entries.partition_point(|e| e.last_doc < target);
+        if idx < self.entries.len() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     /// Iterate over entries

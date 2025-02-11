@@ -30,12 +30,23 @@ class SearchHit:
 
 
 @dataclass
+class SearchTimings:
+    """Detailed timing breakdown for search phases (all values in microseconds)."""
+
+    search_us: int
+    rerank_us: int
+    load_us: int
+    total_us: int
+
+
+@dataclass
 class SearchResponse:
     """Search response with hits and metadata."""
 
     hits: list[SearchHit]
     total_hits: int
     took_ms: int
+    timings: SearchTimings | None = None
 
 
 @dataclass

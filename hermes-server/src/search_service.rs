@@ -48,8 +48,9 @@ impl SearchService for SearchServiceImpl {
             req.limit as usize
         };
 
-        // Search using Searcher (with count of total docs scored)
-        let (results, total_seen) = if let Some(reranker) = &req.reranker {
+        // ── Phase 1: L1 search ──────────────────────────────────────────────
+        let t_search = Instant::now();
+        let (results, total_seen, rerank_config) = if let Some(reranker) = &req.reranker {
             let config = convert_reranker(reranker, reader.schema())
                 .map_err(|e| Status::invalid_argument(format!("Invalid reranker: {}", e)))?;
             let l1_limit = if reranker.limit == 0 {
@@ -57,16 +58,33 @@ impl SearchService for SearchServiceImpl {
             } else {
                 reranker.limit as usize
             };
-            searcher
-                .search_and_rerank(core_query.as_ref(), l1_limit, limit, &config)
+            let (candidates, seen) = searcher
+                .search_with_count(core_query.as_ref(), l1_limit)
                 .await
-                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?
+                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
+            (candidates, seen, Some((config, limit)))
         } else {
-            searcher
+            let (results, seen) = searcher
                 .search_with_positions(core_query.as_ref(), limit)
                 .await
-                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?
+                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
+            (results, seen, None)
         };
+        let search_us = t_search.elapsed().as_micros() as u64;
+
+        // ── Phase 2: L2 reranking (optional) ────────────────────────────────
+        let t_rerank = Instant::now();
+        let results = if let Some((config, final_limit)) = rerank_config {
+            hermes_core::query::rerank(&searcher, &results, &config, final_limit)
+                .await
+                .map_err(|e| Status::internal(format!("Rerank failed: {}", e)))?
+        } else {
+            results
+        };
+        let rerank_us = t_rerank.elapsed().as_micros() as u64;
+
+        // ── Phase 3: Document field loading ─────────────────────────────────
+        let t_load = Instant::now();
 
         // Resolve requested field names to field IDs once (not per-hit).
         // Only vector fields in this set will be hydrated from flat storage.
@@ -124,14 +142,22 @@ impl SearchService for SearchServiceImpl {
                 ordinal_scores,
             });
         }
+        let load_us = t_load.elapsed().as_micros() as u64;
 
-        let took_ms = start.elapsed().as_millis() as u64;
+        let total_us = start.elapsed().as_micros() as u64;
+        let took_ms = total_us / 1000;
 
         // total_seen = number of documents that were actually scored across all segments
         Ok(Response::new(SearchResponse {
             hits,
             total_hits: total_seen,
             took_ms,
+            timings: Some(SearchTimings {
+                search_us,
+                rerank_us,
+                load_us,
+                total_us,
+            }),
         }))
     }
 

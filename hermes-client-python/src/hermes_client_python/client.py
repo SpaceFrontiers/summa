@@ -11,7 +11,7 @@ from grpc import aio
 
 from . import hermes_pb2 as pb
 from . import hermes_pb2_grpc as pb_grpc
-from .types import Document, IndexInfo, SearchHit, SearchResponse
+from .types import Document, IndexInfo, SearchHit, SearchResponse, SearchTimings
 
 
 class HermesClient:
@@ -399,10 +399,21 @@ class HermesClient:
             for hit in response.hits
         ]
 
+        timings = None
+        if response.HasField("timings"):
+            t = response.timings
+            timings = SearchTimings(
+                search_us=t.search_us,
+                rerank_us=t.rerank_us,
+                load_us=t.load_us,
+                total_us=t.total_us,
+            )
+
         return SearchResponse(
             hits=hits,
             total_hits=response.total_hits,
             took_ms=response.took_ms,
+            timings=timings,
         )
 
     async def get_document(self, index_name: str, doc_id: int) -> Document | None:
