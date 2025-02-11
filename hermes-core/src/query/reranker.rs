@@ -13,16 +13,27 @@ use crate::dsl::Field;
 
 use super::{MultiValueCombiner, ScoredPosition, SearchResult};
 
-/// Batch SIMD scoring — dispatches to cosine or dot-product scorer by quantization + unit_norm.
+/// Precomputed query data for dense reranking (computed once, reused across segments).
+struct PrecompQuery<'a> {
+    query: &'a [f32],
+    inv_norm_q: f32,
+    query_f16: &'a [u16],
+}
+
+/// Batch SIMD scoring with precomputed query norm + f16 query.
 #[inline]
-fn score_batch(
-    query: &[f32],
+#[allow(clippy::too_many_arguments)]
+fn score_batch_precomp(
+    pq: &PrecompQuery<'_>,
     raw: &[u8],
     quant: crate::dsl::DenseVectorQuantization,
     dim: usize,
     scores: &mut [f32],
     unit_norm: bool,
 ) {
+    let query = pq.query;
+    let inv_norm_q = pq.inv_norm_q;
+    let query_f16 = pq.query_f16;
     use crate::dsl::DenseVectorQuantization;
     use crate::structures::simd;
     match (quant, unit_norm) {
@@ -30,25 +41,25 @@ fn score_batch(
             let num_floats = scores.len() * dim;
             let vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
-            simd::batch_cosine_scores(query, vectors, dim, scores);
+            simd::batch_cosine_scores_precomp(query, vectors, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::F32, true) => {
             let num_floats = scores.len() * dim;
             let vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
-            simd::batch_dot_scores(query, vectors, dim, scores);
+            simd::batch_dot_scores_precomp(query, vectors, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::F16, false) => {
-            simd::batch_cosine_scores_f16(query, raw, dim, scores);
+            simd::batch_cosine_scores_f16_precomp(query_f16, raw, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::F16, true) => {
-            simd::batch_dot_scores_f16(query, raw, dim, scores);
+            simd::batch_dot_scores_f16_precomp(query_f16, raw, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::UInt8, false) => {
-            simd::batch_cosine_scores_u8(query, raw, dim, scores);
+            simd::batch_cosine_scores_u8_precomp(query, raw, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::UInt8, true) => {
-            simd::batch_dot_scores_u8(query, raw, dim, scores);
+            simd::batch_dot_scores_u8_precomp(query, raw, dim, scores, inv_norm_q);
         }
     }
 }
@@ -130,6 +141,21 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     let query_dim = query.len();
     let segments = searcher.segment_readers();
     let seg_by_id = searcher.segment_map();
+
+    // Precompute query inverse-norm and f16 query once (reused across all segments)
+    use crate::structures::simd;
+    let norm_q_sq = simd::dot_product_f32(query, query, query_dim);
+    let inv_norm_q = if norm_q_sq < f32::EPSILON {
+        0.0
+    } else {
+        simd::fast_inv_sqrt(norm_q_sq)
+    };
+    let query_f16: Vec<u16> = query.iter().map(|&v| simd::f32_to_f16(v)).collect();
+    let pq = PrecompQuery {
+        query,
+        inv_norm_q,
+        query_f16: &query_f16,
+    };
 
     // ── Phase 1: Group candidates by segment ──────────────────────────────
     let mut segment_groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
@@ -225,8 +251,8 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
 
         // Single batch SIMD scoring for all vectors in this segment
         scores_buf.resize(n, 0.0);
-        score_batch(
-            query,
+        score_batch_precomp(
+            &pq,
             &raw_buf[..n * vbs],
             quant,
             query_dim,

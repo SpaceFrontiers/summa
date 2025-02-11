@@ -1449,6 +1449,9 @@ pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { dot_product_f32_avx512(a, b, count) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { dot_product_f32_avx2(a, b, count) };
         }
@@ -1471,23 +1474,42 @@ pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
 unsafe fn dot_product_f32_neon(a: &[f32], b: &[f32], count: usize) -> f32 {
     use std::arch::aarch64::*;
 
-    let chunks = count / 4;
-    let remainder = count % 4;
+    let chunks16 = count / 16;
+    let remainder = count % 16;
 
-    let mut acc = vdupq_n_f32(0.0);
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
 
-    for chunk in 0..chunks {
-        let base = chunk * 4;
-        let va = vld1q_f32(a.as_ptr().add(base));
-        let vb = vld1q_f32(b.as_ptr().add(base));
-        acc = vfmaq_f32(acc, va, vb);
+    for c in 0..chunks16 {
+        let base = c * 16;
+        acc0 = vfmaq_f32(
+            acc0,
+            vld1q_f32(a.as_ptr().add(base)),
+            vld1q_f32(b.as_ptr().add(base)),
+        );
+        acc1 = vfmaq_f32(
+            acc1,
+            vld1q_f32(a.as_ptr().add(base + 4)),
+            vld1q_f32(b.as_ptr().add(base + 4)),
+        );
+        acc2 = vfmaq_f32(
+            acc2,
+            vld1q_f32(a.as_ptr().add(base + 8)),
+            vld1q_f32(b.as_ptr().add(base + 8)),
+        );
+        acc3 = vfmaq_f32(
+            acc3,
+            vld1q_f32(a.as_ptr().add(base + 12)),
+            vld1q_f32(b.as_ptr().add(base + 12)),
+        );
     }
 
-    // Horizontal sum
+    let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
     let mut sum = vaddvq_f32(acc);
 
-    // Handle remainder
-    let base = chunks * 4;
+    let base = chunks16 * 16;
     for i in 0..remainder {
         sum += a[base + i] * b[base + i];
     }
@@ -1501,17 +1523,39 @@ unsafe fn dot_product_f32_neon(a: &[f32], b: &[f32], count: usize) -> f32 {
 unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32], count: usize) -> f32 {
     use std::arch::x86_64::*;
 
-    let chunks = count / 8;
-    let remainder = count % 8;
+    let chunks32 = count / 32;
+    let remainder = count % 32;
 
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
 
-    for chunk in 0..chunks {
-        let base = chunk * 8;
-        let va = _mm256_loadu_ps(a.as_ptr().add(base));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(base));
-        acc = _mm256_fmadd_ps(va, vb, acc);
+    for c in 0..chunks32 {
+        let base = c * 32;
+        acc0 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base)),
+            _mm256_loadu_ps(b.as_ptr().add(base)),
+            acc0,
+        );
+        acc1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base + 8)),
+            _mm256_loadu_ps(b.as_ptr().add(base + 8)),
+            acc1,
+        );
+        acc2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base + 16)),
+            _mm256_loadu_ps(b.as_ptr().add(base + 16)),
+            acc2,
+        );
+        acc3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base + 24)),
+            _mm256_loadu_ps(b.as_ptr().add(base + 24)),
+            acc3,
+        );
     }
+
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
 
     // Horizontal sum: 256-bit → 128-bit → scalar
     let hi = _mm256_extractf128_ps(acc, 1);
@@ -1524,7 +1568,7 @@ unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32], count: usize) -> f32 {
 
     let mut sum = _mm_cvtss_f32(final_sum);
 
-    let base = chunks * 8;
+    let base = chunks32 * 32;
     for i in 0..remainder {
         sum += a[base + i] * b[base + i];
     }
@@ -1565,6 +1609,103 @@ unsafe fn dot_product_f32_sse(a: &[f32], b: &[f32], count: usize) -> f32 {
     }
 
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_product_f32_avx512(a: &[f32], b: &[f32], count: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let chunks64 = count / 64;
+    let remainder = count % 64;
+
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+
+    for c in 0..chunks64 {
+        let base = c * 64;
+        acc0 = _mm512_fmadd_ps(
+            _mm512_loadu_ps(a.as_ptr().add(base)),
+            _mm512_loadu_ps(b.as_ptr().add(base)),
+            acc0,
+        );
+        acc1 = _mm512_fmadd_ps(
+            _mm512_loadu_ps(a.as_ptr().add(base + 16)),
+            _mm512_loadu_ps(b.as_ptr().add(base + 16)),
+            acc1,
+        );
+        acc2 = _mm512_fmadd_ps(
+            _mm512_loadu_ps(a.as_ptr().add(base + 32)),
+            _mm512_loadu_ps(b.as_ptr().add(base + 32)),
+            acc2,
+        );
+        acc3 = _mm512_fmadd_ps(
+            _mm512_loadu_ps(a.as_ptr().add(base + 48)),
+            _mm512_loadu_ps(b.as_ptr().add(base + 48)),
+            acc3,
+        );
+    }
+
+    let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+    let mut sum = _mm512_reduce_add_ps(acc);
+
+    let base = chunks64 * 64;
+    for i in 0..remainder {
+        sum += a[base + i] * b[base + i];
+    }
+
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn fused_dot_norm_avx512(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
+    use std::arch::x86_64::*;
+
+    let chunks64 = count / 64;
+    let remainder = count % 64;
+
+    let mut d0 = _mm512_setzero_ps();
+    let mut d1 = _mm512_setzero_ps();
+    let mut d2 = _mm512_setzero_ps();
+    let mut d3 = _mm512_setzero_ps();
+    let mut n0 = _mm512_setzero_ps();
+    let mut n1 = _mm512_setzero_ps();
+    let mut n2 = _mm512_setzero_ps();
+    let mut n3 = _mm512_setzero_ps();
+
+    for c in 0..chunks64 {
+        let base = c * 64;
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(base));
+        d0 = _mm512_fmadd_ps(_mm512_loadu_ps(a.as_ptr().add(base)), vb0, d0);
+        n0 = _mm512_fmadd_ps(vb0, vb0, n0);
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(base + 16));
+        d1 = _mm512_fmadd_ps(_mm512_loadu_ps(a.as_ptr().add(base + 16)), vb1, d1);
+        n1 = _mm512_fmadd_ps(vb1, vb1, n1);
+        let vb2 = _mm512_loadu_ps(b.as_ptr().add(base + 32));
+        d2 = _mm512_fmadd_ps(_mm512_loadu_ps(a.as_ptr().add(base + 32)), vb2, d2);
+        n2 = _mm512_fmadd_ps(vb2, vb2, n2);
+        let vb3 = _mm512_loadu_ps(b.as_ptr().add(base + 48));
+        d3 = _mm512_fmadd_ps(_mm512_loadu_ps(a.as_ptr().add(base + 48)), vb3, d3);
+        n3 = _mm512_fmadd_ps(vb3, vb3, n3);
+    }
+
+    let acc_dot = _mm512_add_ps(_mm512_add_ps(d0, d1), _mm512_add_ps(d2, d3));
+    let acc_norm = _mm512_add_ps(_mm512_add_ps(n0, n1), _mm512_add_ps(n2, n3));
+    let mut dot = _mm512_reduce_add_ps(acc_dot);
+    let mut norm = _mm512_reduce_add_ps(acc_norm);
+
+    let base = chunks64 * 64;
+    for i in 0..remainder {
+        dot += a[base + i] * b[base + i];
+        norm += b[base + i] * b[base + i];
+    }
+
+    (dot, norm)
 }
 
 /// Find maximum value in f32 array with SIMD acceleration
@@ -1677,6 +1818,9 @@ fn fused_dot_norm(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { fused_dot_norm_avx512(a, b, count) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { fused_dot_norm_avx2(a, b, count) };
         }
@@ -1701,24 +1845,44 @@ fn fused_dot_norm(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
 unsafe fn fused_dot_norm_neon(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
     use std::arch::aarch64::*;
 
-    let chunks = count / 4;
-    let remainder = count % 4;
+    let chunks16 = count / 16;
+    let remainder = count % 16;
 
-    let mut acc_dot = vdupq_n_f32(0.0);
-    let mut acc_norm = vdupq_n_f32(0.0);
+    let mut d0 = vdupq_n_f32(0.0);
+    let mut d1 = vdupq_n_f32(0.0);
+    let mut d2 = vdupq_n_f32(0.0);
+    let mut d3 = vdupq_n_f32(0.0);
+    let mut n0 = vdupq_n_f32(0.0);
+    let mut n1 = vdupq_n_f32(0.0);
+    let mut n2 = vdupq_n_f32(0.0);
+    let mut n3 = vdupq_n_f32(0.0);
 
-    for chunk in 0..chunks {
-        let base = chunk * 4;
-        let va = vld1q_f32(a.as_ptr().add(base));
-        let vb = vld1q_f32(b.as_ptr().add(base));
-        acc_dot = vfmaq_f32(acc_dot, va, vb);
-        acc_norm = vfmaq_f32(acc_norm, vb, vb);
+    for c in 0..chunks16 {
+        let base = c * 16;
+        let va0 = vld1q_f32(a.as_ptr().add(base));
+        let vb0 = vld1q_f32(b.as_ptr().add(base));
+        d0 = vfmaq_f32(d0, va0, vb0);
+        n0 = vfmaq_f32(n0, vb0, vb0);
+        let va1 = vld1q_f32(a.as_ptr().add(base + 4));
+        let vb1 = vld1q_f32(b.as_ptr().add(base + 4));
+        d1 = vfmaq_f32(d1, va1, vb1);
+        n1 = vfmaq_f32(n1, vb1, vb1);
+        let va2 = vld1q_f32(a.as_ptr().add(base + 8));
+        let vb2 = vld1q_f32(b.as_ptr().add(base + 8));
+        d2 = vfmaq_f32(d2, va2, vb2);
+        n2 = vfmaq_f32(n2, vb2, vb2);
+        let va3 = vld1q_f32(a.as_ptr().add(base + 12));
+        let vb3 = vld1q_f32(b.as_ptr().add(base + 12));
+        d3 = vfmaq_f32(d3, va3, vb3);
+        n3 = vfmaq_f32(n3, vb3, vb3);
     }
 
+    let acc_dot = vaddq_f32(vaddq_f32(d0, d1), vaddq_f32(d2, d3));
+    let acc_norm = vaddq_f32(vaddq_f32(n0, n1), vaddq_f32(n2, n3));
     let mut dot = vaddvq_f32(acc_dot);
     let mut norm = vaddvq_f32(acc_norm);
 
-    let base = chunks * 4;
+    let base = chunks16 * 16;
     for i in 0..remainder {
         dot += a[base + i] * b[base + i];
         norm += b[base + i] * b[base + i];
@@ -1733,19 +1897,36 @@ unsafe fn fused_dot_norm_neon(a: &[f32], b: &[f32], count: usize) -> (f32, f32) 
 unsafe fn fused_dot_norm_avx2(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
     use std::arch::x86_64::*;
 
-    let chunks = count / 8;
-    let remainder = count % 8;
+    let chunks32 = count / 32;
+    let remainder = count % 32;
 
-    let mut acc_dot = _mm256_setzero_ps();
-    let mut acc_norm = _mm256_setzero_ps();
+    let mut d0 = _mm256_setzero_ps();
+    let mut d1 = _mm256_setzero_ps();
+    let mut d2 = _mm256_setzero_ps();
+    let mut d3 = _mm256_setzero_ps();
+    let mut n0 = _mm256_setzero_ps();
+    let mut n1 = _mm256_setzero_ps();
+    let mut n2 = _mm256_setzero_ps();
+    let mut n3 = _mm256_setzero_ps();
 
-    for chunk in 0..chunks {
-        let base = chunk * 8;
-        let va = _mm256_loadu_ps(a.as_ptr().add(base));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(base));
-        acc_dot = _mm256_fmadd_ps(va, vb, acc_dot);
-        acc_norm = _mm256_fmadd_ps(vb, vb, acc_norm);
+    for c in 0..chunks32 {
+        let base = c * 32;
+        let vb0 = _mm256_loadu_ps(b.as_ptr().add(base));
+        d0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(base)), vb0, d0);
+        n0 = _mm256_fmadd_ps(vb0, vb0, n0);
+        let vb1 = _mm256_loadu_ps(b.as_ptr().add(base + 8));
+        d1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(base + 8)), vb1, d1);
+        n1 = _mm256_fmadd_ps(vb1, vb1, n1);
+        let vb2 = _mm256_loadu_ps(b.as_ptr().add(base + 16));
+        d2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(base + 16)), vb2, d2);
+        n2 = _mm256_fmadd_ps(vb2, vb2, n2);
+        let vb3 = _mm256_loadu_ps(b.as_ptr().add(base + 24));
+        d3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(base + 24)), vb3, d3);
+        n3 = _mm256_fmadd_ps(vb3, vb3, n3);
     }
+
+    let acc_dot = _mm256_add_ps(_mm256_add_ps(d0, d1), _mm256_add_ps(d2, d3));
+    let acc_norm = _mm256_add_ps(_mm256_add_ps(n0, n1), _mm256_add_ps(n2, n3));
 
     // Horizontal sums: 256→128→scalar
     let hi_d = _mm256_extractf128_ps(acc_dot, 1);
@@ -1764,7 +1945,7 @@ unsafe fn fused_dot_norm_avx2(a: &[f32], b: &[f32], count: usize) -> (f32, f32) 
     let shuf2_n = _mm_movehl_ps(sums_n, sums_n);
     let mut norm = _mm_cvtss_f32(_mm_add_ss(sums_n, shuf2_n));
 
-    let base = chunks * 8;
+    let base = chunks32 * 32;
     for i in 0..remainder {
         dot += a[base + i] * b[base + i];
         norm += b[base + i] * b[base + i];
@@ -1821,7 +2002,7 @@ unsafe fn fused_dot_norm_sse(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
 /// for ~23-bit precision — sufficient for cosine similarity scoring.
 /// ~3-5x faster than `1.0 / x.sqrt()` on most architectures.
 #[inline]
-fn fast_inv_sqrt(x: f32) -> f32 {
+pub fn fast_inv_sqrt(x: f32) -> f32 {
     let half = 0.5 * x;
     let i = 0x5F37_5A86_u32.wrapping_sub(x.to_bits() >> 1);
     let y = f32::from_bits(i);
@@ -2729,6 +2910,131 @@ pub fn batch_dot_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, scores
         let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
         let dot = dot_product_u8_quant(query, u8_slice, dim);
         scores[i] = dot * inv_norm_q;
+    }
+}
+
+// ============================================================================
+// Precomputed-norm batch scoring (avoids redundant query norm + f16 conversion)
+// ============================================================================
+
+/// Batch cosine: f32 query vs N f32 vectors, with precomputed `inv_norm_q`.
+#[inline]
+pub fn batch_cosine_scores_precomp(
+    query: &[f32],
+    vectors: &[f32],
+    dim: usize,
+    scores: &mut [f32],
+    inv_norm_q: f32,
+) {
+    let n = scores.len();
+    debug_assert!(vectors.len() >= n * dim);
+    for i in 0..n {
+        let vec = &vectors[i * dim..(i + 1) * dim];
+        let (dot, norm_v_sq) = fused_dot_norm(query, vec, dim);
+        scores[i] = if norm_v_sq < f32::EPSILON {
+            0.0
+        } else {
+            dot * inv_norm_q * fast_inv_sqrt(norm_v_sq)
+        };
+    }
+}
+
+/// Batch cosine: precomputed `inv_norm_q` + `query_f16` vs N f16 vectors.
+#[inline]
+pub fn batch_cosine_scores_f16_precomp(
+    query_f16: &[u16],
+    vectors_raw: &[u8],
+    dim: usize,
+    scores: &mut [f32],
+    inv_norm_q: f32,
+) {
+    let n = scores.len();
+    let vec_bytes = dim * 2;
+    debug_assert!(vectors_raw.len() >= n * vec_bytes);
+    for i in 0..n {
+        let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
+        let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
+        let (dot, norm_v_sq) = fused_dot_norm_f16(query_f16, f16_slice, dim);
+        scores[i] = if norm_v_sq < f32::EPSILON {
+            0.0
+        } else {
+            dot * inv_norm_q * fast_inv_sqrt(norm_v_sq)
+        };
+    }
+}
+
+/// Batch cosine: precomputed `inv_norm_q` vs N u8 vectors.
+#[inline]
+pub fn batch_cosine_scores_u8_precomp(
+    query: &[f32],
+    vectors_raw: &[u8],
+    dim: usize,
+    scores: &mut [f32],
+    inv_norm_q: f32,
+) {
+    let n = scores.len();
+    debug_assert!(vectors_raw.len() >= n * dim);
+    for i in 0..n {
+        let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
+        let (dot, norm_v_sq) = fused_dot_norm_u8(query, u8_slice, dim);
+        scores[i] = if norm_v_sq < f32::EPSILON {
+            0.0
+        } else {
+            dot * inv_norm_q * fast_inv_sqrt(norm_v_sq)
+        };
+    }
+}
+
+/// Batch dot-product: precomputed `inv_norm_q` vs N f32 unit-norm vectors.
+#[inline]
+pub fn batch_dot_scores_precomp(
+    query: &[f32],
+    vectors: &[f32],
+    dim: usize,
+    scores: &mut [f32],
+    inv_norm_q: f32,
+) {
+    let n = scores.len();
+    debug_assert!(vectors.len() >= n * dim);
+    for i in 0..n {
+        let vec = &vectors[i * dim..(i + 1) * dim];
+        scores[i] = dot_product_f32(query, vec, dim) * inv_norm_q;
+    }
+}
+
+/// Batch dot-product: precomputed `inv_norm_q` + `query_f16` vs N f16 unit-norm vectors.
+#[inline]
+pub fn batch_dot_scores_f16_precomp(
+    query_f16: &[u16],
+    vectors_raw: &[u8],
+    dim: usize,
+    scores: &mut [f32],
+    inv_norm_q: f32,
+) {
+    let n = scores.len();
+    let vec_bytes = dim * 2;
+    debug_assert!(vectors_raw.len() >= n * vec_bytes);
+    for i in 0..n {
+        let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
+        let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
+        scores[i] = dot_product_f16_quant(query_f16, f16_slice, dim) * inv_norm_q;
+    }
+}
+
+/// Batch dot-product: precomputed `inv_norm_q` vs N u8 unit-norm vectors.
+#[inline]
+pub fn batch_dot_scores_u8_precomp(
+    query: &[f32],
+    vectors_raw: &[u8],
+    dim: usize,
+    scores: &mut [f32],
+    inv_norm_q: f32,
+) {
+    let n = scores.len();
+    debug_assert!(vectors_raw.len() >= n * dim);
+    for i in 0..n {
+        let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
+        scores[i] = dot_product_u8_quant(query, u8_slice, dim) * inv_norm_q;
     }
 }
 

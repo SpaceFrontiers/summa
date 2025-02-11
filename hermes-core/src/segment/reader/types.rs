@@ -316,7 +316,7 @@ impl SparseIndex {
 
     /// Parse a single skip entry from the zero-copy skip section
     #[inline]
-    fn read_skip_entry(&self, entry_idx: usize) -> SparseSkipEntry {
+    pub fn read_skip_entry(&self, entry_idx: usize) -> SparseSkipEntry {
         let off = entry_idx * SparseSkipEntry::SIZE;
         let d = &self.skip_bytes[off..off + SparseSkipEntry::SIZE];
         SparseSkipEntry {
@@ -378,6 +378,68 @@ impl SparseIndex {
     pub fn get_skip_list(&self, dim_id: u32) -> Option<(Vec<SparseSkipEntry>, f32)> {
         let idx = self.dims.find(dim_id)?;
         Some((self.dim_skip_entries_vec(idx), self.dims.max_weights[idx]))
+    }
+
+    /// Get skip range for a dimension — zero-alloc alternative to `get_skip_list`.
+    ///
+    /// Returns `(skip_start, skip_count, max_weight)` where `skip_start` is the
+    /// index into the skip section. Access individual entries via `read_skip_entry(skip_start + i)`.
+    #[inline]
+    pub fn get_skip_range(&self, dim_id: u32) -> Option<(usize, usize, f32)> {
+        let idx = self.dims.find(dim_id)?;
+        Some((
+            self.dims.skip_starts[idx] as usize,
+            self.dims.skip_counts[idx] as usize,
+            self.dims.max_weights[idx],
+        ))
+    }
+
+    /// Load a contiguous range of blocks for a dimension in a single mmap read.
+    ///
+    /// Returns individual `SparseBlock`s parsed from the coalesced byte range.
+    /// This reduces mmap syscalls when processing superblocks (up to 8 blocks).
+    pub async fn get_blocks_range(
+        &self,
+        dim_id: u32,
+        block_start: usize,
+        block_count: usize,
+    ) -> crate::Result<Vec<SparseBlock>> {
+        let idx = match self.dims.find(dim_id) {
+            Some(i) => i,
+            None => return Ok(Vec::new()),
+        };
+        let skip_start = self.dims.skip_starts[idx] as usize;
+        let total_blocks = self.dims.skip_counts[idx] as usize;
+        if block_start >= total_blocks || block_count == 0 {
+            return Ok(Vec::new());
+        }
+        let end = (block_start + block_count).min(total_blocks);
+        let base = self.dims.block_offsets[idx] as u64;
+
+        // Compute the byte range covering all blocks [block_start..end)
+        let first_entry = self.read_skip_entry(skip_start + block_start);
+        let last_entry = self.read_skip_entry(skip_start + end - 1);
+        let range_start = base + first_entry.offset as u64;
+        let range_end = base + last_entry.offset as u64 + last_entry.length as u64;
+
+        // Single coalesced mmap read
+        let range_data = self
+            .handle
+            .read_bytes_range(range_start..range_end)
+            .await
+            .map_err(crate::Error::Io)?;
+
+        // Slice into individual blocks
+        let mut blocks = Vec::with_capacity(end - block_start);
+        for bi in block_start..end {
+            let entry = self.read_skip_entry(skip_start + bi);
+            let rel_offset = entry.offset as u64 - first_entry.offset as u64;
+            let block_bytes =
+                range_data.slice(rel_offset as usize..rel_offset as usize + entry.length as usize);
+            blocks.push(SparseBlock::from_owned_bytes(block_bytes)?);
+        }
+
+        Ok(blocks)
     }
 
     /// Load specific block for a dimension
