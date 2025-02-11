@@ -1,6 +1,6 @@
 //! Zstd compression backend with dictionary support
 //!
-////! For static indexes, we use:
+//! For static indexes, we use:
 //! - Maximum compression level (22) for best compression ratio
 //! - Trained dictionaries for even better compression of similar documents
 //! - Larger block sizes to improve compression efficiency
@@ -115,15 +115,33 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
 
 /// Decompress data using Zstd with a trained dictionary
 ///
-/// Note: dictionary decompressors are NOT reused via thread-local because
-/// each store/sstable may use a different dictionary. The caller (block
-/// cache) ensures this is called only on cache misses.
+/// Caches the dictionary decompressor in a thread-local, keyed by the
+/// dictionary's data pointer. Since a given `AsyncStoreReader` always holds
+/// the same `CompressionDict` (behind `Arc<OwnedBytes>`), the pointer is
+/// stable for the reader's lifetime. The decompressor is only rebuilt when
+/// a different dictionary is encountered (e.g., switching between segments).
 pub fn decompress_with_dict(data: &[u8], dict: &CompressionDict) -> io::Result<Vec<u8>> {
-    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict.raw_dict.as_slice())
-        .map_err(io::Error::other)?;
-    decompressor
-        .decompress(data, DECOMPRESS_CAPACITY)
-        .map_err(io::Error::other)
+    thread_local! {
+        static DICT_DC: std::cell::RefCell<Option<(usize, zstd::bulk::Decompressor<'static>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    // Use the raw dict slice pointer as a stable identity key.
+    let dict_key = dict.as_bytes().as_ptr() as usize;
+
+    DICT_DC.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // Rebuild decompressor only if dict changed
+        if slot.as_ref().is_none_or(|(k, _)| *k != dict_key) {
+            let dc = zstd::bulk::Decompressor::with_dictionary(dict.as_bytes())
+                .map_err(io::Error::other)?;
+            *slot = Some((dict_key, dc));
+        }
+        slot.as_mut()
+            .unwrap()
+            .1
+            .decompress(data, DECOMPRESS_CAPACITY)
+            .map_err(io::Error::other)
+    })
 }
 
 #[cfg(test)]

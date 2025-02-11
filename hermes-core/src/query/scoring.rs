@@ -98,6 +98,9 @@ pub struct ScoreCollector {
     /// Min-heap of top-k entries (lowest score at top for eviction)
     heap: BinaryHeap<HeapEntry>,
     pub k: usize,
+    /// Cached threshold: avoids repeated heap.peek() in hot loops.
+    /// Updated only when the heap changes (insert/pop).
+    cached_threshold: f32,
 }
 
 impl ScoreCollector {
@@ -108,17 +111,24 @@ impl ScoreCollector {
         Self {
             heap: BinaryHeap::with_capacity(capacity),
             k,
+            cached_threshold: 0.0,
         }
     }
 
     /// Current score threshold (minimum score to enter top-k)
     #[inline]
     pub fn threshold(&self) -> f32 {
-        if self.heap.len() >= self.k {
+        self.cached_threshold
+    }
+
+    /// Recompute cached threshold from heap state
+    #[inline]
+    fn update_threshold(&mut self) {
+        self.cached_threshold = if self.heap.len() >= self.k {
             self.heap.peek().map(|e| e.score).unwrap_or(0.0)
         } else {
             0.0
-        }
+        };
     }
 
     /// Insert a document score. Returns true if inserted in top-k.
@@ -138,14 +148,16 @@ impl ScoreCollector {
                 score,
                 ordinal,
             });
+            self.update_threshold();
             true
-        } else if score > self.threshold() {
+        } else if score > self.cached_threshold {
             self.heap.push(HeapEntry {
                 doc_id,
                 score,
                 ordinal,
             });
             self.heap.pop(); // Remove lowest
+            self.update_threshold();
             true
         } else {
             false
@@ -155,7 +167,7 @@ impl ScoreCollector {
     /// Check if a score could potentially enter top-k
     #[inline]
     pub fn would_enter(&self, score: f32) -> bool {
-        self.heap.len() < self.k || score > self.threshold()
+        self.heap.len() < self.k || score > self.cached_threshold
     }
 
     /// Get number of documents collected so far
@@ -313,12 +325,22 @@ impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
                 break;
             }
 
-            // Find minimum doc_id across essential scorers [partition..n)
+            // Single fused pass over essential scorers: find min_doc and
+            // accumulate conjunction/block-max upper bounds simultaneously.
+            // This replaces 3 separate iterations with 1, reducing cache misses.
             let mut min_doc = u32::MAX;
+            let mut present_upper = 0.0f32;
+            let mut block_max_sum = 0.0f32;
             for i in partition..n {
                 let doc = self.scorers[i].doc();
                 if doc < min_doc {
                     min_doc = doc;
+                    // New min_doc — reset accumulators to this scorer only
+                    present_upper = self.scorers[i].max_score();
+                    block_max_sum = self.scorers[i].current_block_max_score();
+                } else if doc == min_doc {
+                    present_upper += self.scorers[i].max_score();
+                    block_max_sum += self.scorers[i].current_block_max_score();
                 }
             }
 
@@ -335,44 +357,30 @@ impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
 
             // --- Conjunction optimization (Lucene-style) ---
             // Check if enough essential terms are present at min_doc.
-            // Sum max_scores of essential terms AT min_doc. If that plus
-            // non-essential upper can't beat threshold, skip this doc.
-            if self.collector.len() >= self.collector.k {
-                let present_upper: f32 = (partition..n)
-                    .filter(|&i| self.scorers[i].doc() == min_doc)
-                    .map(|i| self.scorers[i].max_score())
-                    .sum();
-
-                if present_upper + non_essential_upper <= adjusted_threshold {
-                    // Not enough essential terms present - advance past min_doc
-                    for i in partition..n {
-                        if self.scorers[i].doc() == min_doc {
-                            self.scorers[i].advance();
-                        }
+            if self.collector.len() >= self.collector.k
+                && present_upper + non_essential_upper <= adjusted_threshold
+            {
+                for i in partition..n {
+                    if self.scorers[i].doc() == min_doc {
+                        self.scorers[i].advance();
                     }
-                    conjunction_skipped += 1;
-                    continue;
                 }
+                conjunction_skipped += 1;
+                continue;
             }
 
             // --- Block-max pruning ---
-            // Sum block-max scores for essential scorers at min_doc.
             // If block-max sum + non-essential upper can't beat threshold, skip blocks.
-            if self.collector.len() >= self.collector.k {
-                let block_max_sum: f32 = (partition..n)
-                    .filter(|&i| self.scorers[i].doc() == min_doc)
-                    .map(|i| self.scorers[i].current_block_max_score())
-                    .sum();
-
-                if block_max_sum + non_essential_upper <= adjusted_threshold {
-                    for i in partition..n {
-                        if self.scorers[i].doc() == min_doc {
-                            self.scorers[i].skip_to_next_block();
-                        }
+            if self.collector.len() >= self.collector.k
+                && block_max_sum + non_essential_upper <= adjusted_threshold
+            {
+                for i in partition..n {
+                    if self.scorers[i].doc() == min_doc {
+                        self.scorers[i].skip_to_next_block();
                     }
-                    blocks_skipped += 1;
-                    continue;
                 }
+                blocks_skipped += 1;
+                continue;
             }
 
             // --- Score essential scorers ---
@@ -725,14 +733,18 @@ impl<'a> BmpExecutor<'a> {
         // Build priority queue from skip entries, grouped into superblocks
         let mut block_queue: BinaryHeap<BmpBlockEntry> = BinaryHeap::new();
         let mut remaining_max: Vec<f32> = Vec::with_capacity(num_terms);
+        // Pre-resolved skip_start per term (avoids repeated dim_id binary search)
+        let mut term_skip_starts: Vec<usize> = Vec::with_capacity(num_terms);
         let mut global_min_doc = u32::MAX;
         let mut global_max_doc = 0u32;
 
         for (term_idx, &(dim_id, qw)) in self.query_terms.iter().enumerate() {
             let mut term_remaining = 0.0f32;
+            let mut term_skip_start = 0usize;
 
             let abs_qw = qw.abs();
             if let Some((skip_start, skip_count, _global_max)) = si.get_skip_range(dim_id) {
+                term_skip_start = skip_start;
                 // Group blocks into superblocks of BMP_SUPERBLOCK_SIZE
                 let mut sb_start = 0;
                 while sb_start < skip_count {
@@ -755,6 +767,7 @@ impl<'a> BmpExecutor<'a> {
                 }
             }
             remaining_max.push(term_remaining);
+            term_skip_starts.push(term_skip_start);
         }
 
         // Hybrid accumulator: flat array for ordinal=0, FxHashMap for multi-ordinal
@@ -815,17 +828,14 @@ impl<'a> BmpExecutor<'a> {
                 .get_blocks_range(dim_id, entry.block_start, entry.block_count)
                 .await?;
 
-            // Pre-resolve skip_start once for per-block pruning (avoid repeated binary search)
-            let skip_start_opt = si.get_skip_range(dim_id).map(|(s, _, _)| s);
+            let skip_start = term_skip_starts[entry.term_idx];
             let adjusted_threshold2 = top_k.threshold() * self.heap_factor;
 
             for (blk_offset, block) in sb_blocks.into_iter().enumerate() {
                 let blk_idx = entry.block_start + blk_offset;
 
                 // Per-block pruning within superblock
-                if top_k.len() >= self.k
-                    && let Some(skip_start) = skip_start_opt
-                {
+                if top_k.len() >= self.k {
                     let skip = si.read_skip_entry(skip_start + blk_idx);
                     let blk_contrib = abs_qw * skip.max_weight;
                     if blk_contrib + total_remaining <= adjusted_threshold2 {

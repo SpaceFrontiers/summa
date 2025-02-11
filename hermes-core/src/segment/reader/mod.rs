@@ -320,10 +320,24 @@ impl AsyncSegmentReader {
         local_doc_id: DocId,
         fields: Option<&rustc_hash::FxHashSet<u32>>,
     ) -> Result<Option<Document>> {
-        let mut doc = match self.store.get(local_doc_id, &self.schema).await {
-            Ok(Some(d)) => d,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(Error::from(e)),
+        let mut doc = match fields {
+            Some(set) => {
+                let field_ids: Vec<u32> = set.iter().copied().collect();
+                match self
+                    .store
+                    .get_fields(local_doc_id, &self.schema, &field_ids)
+                    .await
+                {
+                    Ok(Some(d)) => d,
+                    Ok(None) => return Ok(None),
+                    Err(e) => return Err(Error::from(e)),
+                }
+            }
+            None => match self.store.get(local_doc_id, &self.schema).await {
+                Ok(Some(d)) => d,
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(Error::from(e)),
+            },
         };
 
         // Hydrate dense vector fields from flat vector data

@@ -314,6 +314,12 @@ impl SparseIndex {
         }
     }
 
+    /// Total number of skip entries across all dimensions
+    #[inline]
+    fn skip_entry_count(&self) -> usize {
+        self.skip_bytes.len() / SparseSkipEntry::SIZE
+    }
+
     /// Parse a single skip entry from the zero-copy skip section
     #[inline]
     pub fn read_skip_entry(&self, entry_idx: usize) -> SparseSkipEntry {
@@ -493,6 +499,9 @@ impl SparseIndex {
         block_data_offset: u32,
         block_idx: usize,
     ) -> crate::Result<Option<SparseBlock>> {
+        if skip_start + block_idx >= self.skip_entry_count() {
+            return Ok(None);
+        }
         let entry = self.read_skip_entry(skip_start + block_idx);
         let base = block_data_offset as u64;
         let abs_offset = base + entry.offset as u64;

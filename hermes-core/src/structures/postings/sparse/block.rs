@@ -750,12 +750,13 @@ impl<'a> BlockSparsePostingIterator<'a> {
         self.current_weights[self.in_block_idx]
     }
 
+    #[inline]
     pub fn ordinal(&mut self) -> u16 {
+        if self.exhausted {
+            return 0;
+        }
         self.ensure_ordinals_decoded();
-        self.current_ordinals
-            .get(self.in_block_idx)
-            .copied()
-            .unwrap_or(0)
+        self.current_ordinals[self.in_block_idx]
     }
 
     pub fn advance(&mut self) -> DocId {

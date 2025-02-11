@@ -569,8 +569,8 @@ impl<'a> BlockPostingIterator<'a> {
         let mut iter = Self {
             block_list: std::borrow::Cow::Borrowed(block_list),
             current_block: 0,
-            block_doc_ids: Vec::new(),
-            block_tfs: Vec::new(),
+            block_doc_ids: Vec::with_capacity(BLOCK_SIZE),
+            block_tfs: Vec::with_capacity(BLOCK_SIZE),
             position_in_block: 0,
             exhausted,
         };
@@ -585,8 +585,8 @@ impl<'a> BlockPostingIterator<'a> {
         let mut iter = BlockPostingIterator {
             block_list: std::borrow::Cow::Owned(block_list),
             current_block: 0,
-            block_doc_ids: Vec::new(),
-            block_tfs: Vec::new(),
+            block_doc_ids: Vec::with_capacity(BLOCK_SIZE),
+            block_tfs: Vec::with_capacity(BLOCK_SIZE),
             position_in_block: 0,
             exhausted,
         };

@@ -212,22 +212,17 @@ impl BloomFilter {
         }
     }
 
-    /// Compute two hash values using FNV-1a variant
+    /// Compute two hash values using FNV-1a variant (single pass over key bytes)
+    #[inline]
     fn hash_pair(&self, key: &[u8]) -> (u64, u64) {
-        // FNV-1a hash
         let mut h1: u64 = 0xcbf29ce484222325;
+        let mut h2: u64 = 0x84222325cbf29ce4;
         for &byte in key {
             h1 ^= byte as u64;
             h1 = h1.wrapping_mul(0x100000001b3);
-        }
-
-        // Second hash using different seed
-        let mut h2: u64 = 0x84222325cbf29ce4;
-        for &byte in key {
             h2 = h2.wrapping_mul(0x100000001b3);
             h2 ^= byte as u64;
         }
-
         (h1, h2)
     }
 
@@ -239,15 +234,14 @@ impl BloomFilter {
 }
 
 /// Compute bloom filter hash pair for a key (standalone, no BloomFilter needed).
-/// Uses the same FNV-1a double-hashing as BloomFilter::hash_pair.
+/// Uses the same FNV-1a double-hashing as BloomFilter::hash_pair (single pass).
+#[inline]
 fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     let mut h1: u64 = 0xcbf29ce484222325;
+    let mut h2: u64 = 0x84222325cbf29ce4;
     for &byte in key {
         h1 ^= byte as u64;
         h1 = h1.wrapping_mul(0x100000001b3);
-    }
-    let mut h2: u64 = 0x84222325cbf29ce4;
-    for &byte in key {
         h2 = h2.wrapping_mul(0x100000001b3);
         h2 ^= byte as u64;
     }

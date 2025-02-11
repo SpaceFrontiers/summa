@@ -2,7 +2,7 @@
 //!
 //! Optimized for static indexes:
 //! - Maximum compression level (22) for best compression ratio
-//! - Larger block sizes (64KB) for better compression efficiency
+//! - Larger block sizes (256KB) for better compression efficiency
 //! - Optional trained dictionary support for even better compression
 //! - Parallel compression support for faster indexing
 //!
@@ -24,9 +24,20 @@ use crate::dsl::{Document, Schema};
 
 const STORE_MAGIC: u32 = 0x53544F52; // "STOR"
 const STORE_VERSION: u32 = 2; // Version 2 supports dictionaries
+/// Block size for document store (256KB for better compression)
+/// Larger blocks = better compression ratio but more memory per block load
+pub const STORE_BLOCK_SIZE: usize = 256 * 1024;
+
+/// Default dictionary size (4KB is a good balance)
+pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
+
+/// Default compression level for document store
+#[cfg(feature = "native")]
+const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel(3);
+
 /// Write block index + footer to a store file.
 ///
-/// Shared by `StoreWriter::finish`, `StoreWriter::finish` (empty), and `StoreMerger::finish`.
+/// Shared by `EagerParallelStoreWriter::finish` and `StoreMerger::finish`.
 fn write_store_index_and_footer(
     writer: &mut (impl Write + ?Sized),
     index: &[StoreBlockIndex],
@@ -50,17 +61,6 @@ fn write_store_index_and_footer(
     writer.write_u32::<LittleEndian>(STORE_MAGIC)?;
     Ok(())
 }
-
-/// Block size for document store (256KB for better compression)
-/// Larger blocks = better compression ratio but more memory per block load
-pub const STORE_BLOCK_SIZE: usize = 256 * 1024;
-
-/// Default dictionary size (64KB is a good balance)
-pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
-
-/// Default compression level for document store
-#[cfg(feature = "native")]
-const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel(7);
 
 /// Binary document format:
 ///   num_fields: u16
@@ -183,6 +183,8 @@ struct CompressedBlock {
 pub struct EagerParallelStoreWriter<'a> {
     writer: &'a mut dyn Write,
     block_buffer: Vec<u8>,
+    /// Reusable buffer for document serialization (avoids per-doc allocation)
+    serialize_buf: Vec<u8>,
     /// Compressed blocks ready to be written (may arrive out of order)
     compressed_blocks: Vec<CompressedBlock>,
     /// Handles for in-flight compression tasks
@@ -210,6 +212,7 @@ impl<'a> EagerParallelStoreWriter<'a> {
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
+            serialize_buf: Vec::with_capacity(512),
             compressed_blocks: Vec::new(),
             pending_handles: Vec::new(),
             next_seq: 0,
@@ -239,6 +242,7 @@ impl<'a> EagerParallelStoreWriter<'a> {
         Self {
             writer,
             block_buffer: Vec::with_capacity(STORE_BLOCK_SIZE),
+            serialize_buf: Vec::with_capacity(512),
             compressed_blocks: Vec::new(),
             pending_handles: Vec::new(),
             next_seq: 0,
@@ -250,8 +254,16 @@ impl<'a> EagerParallelStoreWriter<'a> {
     }
 
     pub fn store(&mut self, doc: &Document, schema: &Schema) -> io::Result<DocId> {
-        let doc_bytes = serialize_document(doc, schema)?;
-        self.store_raw(&doc_bytes)
+        serialize_document_into(doc, schema, &mut self.serialize_buf)?;
+        let doc_id = self.next_doc_id;
+        self.next_doc_id += 1;
+        self.block_buffer
+            .write_u32::<LittleEndian>(self.serialize_buf.len() as u32)?;
+        self.block_buffer.extend_from_slice(&self.serialize_buf);
+        if self.block_buffer.len() >= STORE_BLOCK_SIZE {
+            self.spawn_compression();
+        }
+        Ok(doc_id)
     }
 
     /// Store pre-serialized document bytes directly (avoids deserialize+reserialize roundtrip).
@@ -408,12 +420,77 @@ pub struct AsyncStoreReader {
     cache: RwLock<StoreBlockCache>,
 }
 
+/// Decompressed block with pre-built doc offset table.
+///
+/// The offset table is built once on decompression: `offsets[i]` is the byte
+/// position in `data` where doc `i`'s length prefix starts. This turns the
+/// O(n) linear scan per `get()` into O(1) direct indexing.
+struct CachedBlock {
+    data: Vec<u8>,
+    /// Byte offset of each doc's length prefix within `data`.
+    /// `offsets.len()` == number of docs in the block.
+    offsets: Vec<u32>,
+}
+
+impl CachedBlock {
+    fn build(data: Vec<u8>, num_docs: u32) -> io::Result<Self> {
+        let mut offsets = Vec::with_capacity(num_docs as usize);
+        let mut pos = 0usize;
+        for _ in 0..num_docs {
+            if pos + 4 > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated block while building offset table",
+                ));
+            }
+            offsets.push(pos as u32);
+            let doc_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
+            pos += 4 + doc_len;
+        }
+        Ok(Self { data, offsets })
+    }
+
+    /// Get doc bytes by index within the block (O(1))
+    fn doc_bytes(&self, doc_offset_in_block: u32) -> io::Result<&[u8]> {
+        let idx = doc_offset_in_block as usize;
+        if idx >= self.offsets.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "doc offset out of range",
+            ));
+        }
+        let start = self.offsets[idx] as usize;
+        if start + 4 > self.data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated doc length",
+            ));
+        }
+        let doc_len = u32::from_le_bytes([
+            self.data[start],
+            self.data[start + 1],
+            self.data[start + 2],
+            self.data[start + 3],
+        ]) as usize;
+        let data_start = start + 4;
+        if data_start + doc_len > self.data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "doc data overflow",
+            ));
+        }
+        Ok(&self.data[data_start..data_start + doc_len])
+    }
+}
+
 /// LRU block cache — O(1) lookup/insert, amortized O(n) promotion.
 ///
 /// On `get()`, promotes accessed entry to MRU position.
 /// For typical cache sizes (16-64 blocks), the linear promote scan is negligible.
 struct StoreBlockCache {
-    blocks: FxHashMap<DocId, Arc<[u8]>>,
+    blocks: FxHashMap<DocId, Arc<CachedBlock>>,
     lru_order: std::collections::VecDeque<DocId>,
     max_blocks: usize,
 }
@@ -427,16 +504,18 @@ impl StoreBlockCache {
         }
     }
 
-    fn get(&mut self, first_doc_id: DocId) -> Option<Arc<[u8]>> {
-        if self.blocks.contains_key(&first_doc_id) {
-            self.promote(first_doc_id);
-            self.blocks.get(&first_doc_id).map(Arc::clone)
-        } else {
-            None
-        }
+    /// Check cache without LRU promotion (safe for read-lock fast path)
+    fn peek(&self, first_doc_id: DocId) -> Option<Arc<CachedBlock>> {
+        self.blocks.get(&first_doc_id).map(Arc::clone)
     }
 
-    fn insert(&mut self, first_doc_id: DocId, block: Arc<[u8]>) {
+    fn get(&mut self, first_doc_id: DocId) -> Option<Arc<CachedBlock>> {
+        let block = self.blocks.get(&first_doc_id).map(Arc::clone)?;
+        self.promote(first_doc_id);
+        Some(block)
+    }
+
+    fn insert(&mut self, first_doc_id: DocId, block: Arc<CachedBlock>) {
         if self.blocks.contains_key(&first_doc_id) {
             self.promote(first_doc_id);
             return;
@@ -566,7 +645,36 @@ impl AsyncStoreReader {
             return Ok(None);
         }
 
-        // Find block containing this doc_id
+        let (entry, block) = self.find_and_load_block(doc_id).await?;
+        let doc_bytes = block.doc_bytes(doc_id - entry.first_doc_id)?;
+        deserialize_document(doc_bytes, schema).map(Some)
+    }
+
+    /// Get specific fields of a document by doc_id (async - may load block)
+    ///
+    /// Only deserializes the requested fields, skipping over unwanted data.
+    /// Much faster than `get()` when documents have large fields (text bodies,
+    /// vectors) that aren't needed for the response.
+    pub async fn get_fields(
+        &self,
+        doc_id: DocId,
+        schema: &Schema,
+        field_ids: &[u32],
+    ) -> io::Result<Option<Document>> {
+        if doc_id >= self.num_docs {
+            return Ok(None);
+        }
+
+        let (entry, block) = self.find_and_load_block(doc_id).await?;
+        let doc_bytes = block.doc_bytes(doc_id - entry.first_doc_id)?;
+        deserialize_document_fields(doc_bytes, schema, field_ids).map(Some)
+    }
+
+    /// Find the block index entry and load/cache the block for a given doc_id
+    async fn find_and_load_block(
+        &self,
+        doc_id: DocId,
+    ) -> io::Result<(&StoreBlockIndex, Arc<CachedBlock>)> {
         let block_idx = self
             .index
             .binary_search_by(|entry| {
@@ -581,31 +689,19 @@ impl AsyncStoreReader {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Doc not found in index"))?;
 
         let entry = &self.index[block_idx];
-        let block_data = self.load_block(entry).await?;
-
-        // Find document within block
-        let doc_offset_in_block = doc_id - entry.first_doc_id;
-        let mut reader = &block_data[..];
-
-        for _ in 0..doc_offset_in_block {
-            let doc_len = reader.read_u32::<LittleEndian>()? as usize;
-            if doc_len > reader.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid doc length",
-                ));
-            }
-            reader = &reader[doc_len..];
-        }
-
-        let doc_len = reader.read_u32::<LittleEndian>()? as usize;
-        let doc_bytes = &reader[..doc_len];
-
-        deserialize_document(doc_bytes, schema).map(Some)
+        let block = self.load_block(entry).await?;
+        Ok((entry, block))
     }
 
-    async fn load_block(&self, entry: &StoreBlockIndex) -> io::Result<Arc<[u8]>> {
-        // Check cache (write lock for LRU promotion on hit)
+    async fn load_block(&self, entry: &StoreBlockIndex) -> io::Result<Arc<CachedBlock>> {
+        // Fast path: read lock to check cache (allows concurrent readers)
+        {
+            let cache = self.cache.read();
+            if let Some(block) = cache.peek(entry.first_doc_id) {
+                return Ok(block);
+            }
+        }
+        // Slow path: write lock for LRU promotion or insert
         {
             if let Some(block) = self.cache.write().get(entry.first_doc_id) {
                 return Ok(block);
@@ -624,7 +720,9 @@ impl AsyncStoreReader {
             crate::compression::decompress(compressed.as_slice())?
         };
 
-        let block: Arc<[u8]> = Arc::from(decompressed);
+        // Build offset table for O(1) doc lookup within the block
+        let cached = CachedBlock::build(decompressed, entry.num_docs)?;
+        let block = Arc::new(cached);
 
         // Insert into cache
         {
@@ -636,7 +734,33 @@ impl AsyncStoreReader {
     }
 }
 
-pub fn deserialize_document(data: &[u8], _schema: &Schema) -> io::Result<Document> {
+/// Deserialize only specific fields from document bytes.
+///
+/// Skips over unwanted fields without allocating their values — just advances
+/// the reader past their length-prefixed data. For large documents with many
+/// fields (e.g., full text body), this avoids allocating/copying data that
+/// the caller doesn't need.
+pub fn deserialize_document_fields(
+    data: &[u8],
+    schema: &Schema,
+    field_ids: &[u32],
+) -> io::Result<Document> {
+    deserialize_document_inner(data, schema, Some(field_ids))
+}
+
+/// Deserialize all fields from document bytes.
+///
+/// Delegates to the shared field-parsing core with no field filter.
+pub fn deserialize_document(data: &[u8], schema: &Schema) -> io::Result<Document> {
+    deserialize_document_inner(data, schema, None)
+}
+
+/// Shared deserialization core. `field_filter = None` means all fields wanted.
+fn deserialize_document_inner(
+    data: &[u8],
+    _schema: &Schema,
+    field_filter: Option<&[u32]>,
+) -> io::Result<Document> {
     use crate::dsl::Field;
 
     let mut reader = data;
@@ -645,80 +769,109 @@ pub fn deserialize_document(data: &[u8], _schema: &Schema) -> io::Result<Documen
 
     for _ in 0..num_fields {
         let field_id = reader.read_u16::<LittleEndian>()?;
-        let field = Field(field_id as u32);
         let type_tag = reader.read_u8()?;
+
+        let wanted = field_filter.is_none_or(|ids| ids.contains(&(field_id as u32)));
 
         match type_tag {
             0 => {
                 // Text
                 let len = reader.read_u32::<LittleEndian>()? as usize;
-                let s = std::str::from_utf8(&reader[..len])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                doc.add_text(field, s);
+                if wanted {
+                    let s = std::str::from_utf8(&reader[..len])
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    doc.add_text(Field(field_id as u32), s);
+                }
                 reader = &reader[len..];
             }
             1 => {
                 // U64
-                doc.add_u64(field, reader.read_u64::<LittleEndian>()?);
+                let v = reader.read_u64::<LittleEndian>()?;
+                if wanted {
+                    doc.add_u64(Field(field_id as u32), v);
+                }
             }
             2 => {
                 // I64
-                doc.add_i64(field, reader.read_i64::<LittleEndian>()?);
+                let v = reader.read_i64::<LittleEndian>()?;
+                if wanted {
+                    doc.add_i64(Field(field_id as u32), v);
+                }
             }
             3 => {
                 // F64
-                doc.add_f64(field, reader.read_f64::<LittleEndian>()?);
+                let v = reader.read_f64::<LittleEndian>()?;
+                if wanted {
+                    doc.add_f64(Field(field_id as u32), v);
+                }
             }
             4 => {
                 // Bytes
                 let len = reader.read_u32::<LittleEndian>()? as usize;
-                doc.add_bytes(field, reader[..len].to_vec());
+                if wanted {
+                    doc.add_bytes(Field(field_id as u32), reader[..len].to_vec());
+                }
                 reader = &reader[len..];
             }
             5 => {
                 // SparseVector
                 let count = reader.read_u32::<LittleEndian>()? as usize;
-                let mut entries = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let idx = reader.read_u32::<LittleEndian>()?;
-                    let val = reader.read_f32::<LittleEndian>()?;
-                    entries.push((idx, val));
+                if wanted {
+                    let mut entries = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let idx = reader.read_u32::<LittleEndian>()?;
+                        let val = reader.read_f32::<LittleEndian>()?;
+                        entries.push((idx, val));
+                    }
+                    doc.add_sparse_vector(Field(field_id as u32), entries);
+                } else {
+                    let skip = count * 8;
+                    if skip > reader.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "sparse vector skip overflow",
+                        ));
+                    }
+                    reader = &reader[skip..];
                 }
-                doc.add_sparse_vector(field, entries);
             }
             6 => {
                 // DenseVector
                 let count = reader.read_u32::<LittleEndian>()? as usize;
                 let byte_len = count * 4;
-                if reader.len() < byte_len {
+                if byte_len > reader.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "dense vector field {}: need {} bytes but only {} remain",
-                            field.0,
-                            byte_len,
-                            reader.len()
-                        ),
+                        "dense vector truncated",
                     ));
                 }
-                let mut values = vec![0.0f32; count];
-                // Read raw f32 bytes directly
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        reader.as_ptr(),
-                        values.as_mut_ptr() as *mut u8,
-                        byte_len,
-                    );
+                if wanted {
+                    let mut values = vec![0.0f32; count];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            reader.as_ptr(),
+                            values.as_mut_ptr() as *mut u8,
+                            byte_len,
+                        );
+                    }
+                    doc.add_dense_vector(Field(field_id as u32), values);
                 }
                 reader = &reader[byte_len..];
-                doc.add_dense_vector(field, values);
             }
             7 => {
                 // Json
                 let len = reader.read_u32::<LittleEndian>()? as usize;
-                let v: serde_json::Value = serde_json::from_slice(&reader[..len])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                doc.add_json(field, v);
+                if len > reader.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "json field truncated",
+                    ));
+                }
+                if wanted {
+                    let v: serde_json::Value = serde_json::from_slice(&reader[..len])
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    doc.add_json(Field(field_id as u32), v);
+                }
                 reader = &reader[len..];
             }
             _ => {
