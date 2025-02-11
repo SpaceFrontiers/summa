@@ -4,6 +4,7 @@
 //! Uses SegmentManager as authoritative source for segment state.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 
@@ -32,6 +33,8 @@ pub struct IndexReader<D: DirectoryWriter + 'static> {
     reload_check_interval: std::time::Duration,
     /// Current segment IDs (to detect changes)
     current_segment_ids: RwLock<Vec<String>>,
+    /// Guard against concurrent reloads
+    reloading: AtomicBool,
 }
 
 impl<D: DirectoryWriter + 'static> IndexReader<D> {
@@ -58,6 +61,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             last_reload_check: RwLock::new(std::time::Instant::now()),
             reload_check_interval: std::time::Duration::from_millis(reload_interval_ms),
             current_segment_ids: RwLock::new(initial_segment_ids),
+            reloading: AtomicBool::new(false),
         })
     }
 
@@ -95,6 +99,10 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
     }
 
     /// Get current searcher (reloads only if segments changed)
+    ///
+    /// Uses an `AtomicBool` guard to prevent concurrent reloads: if another
+    /// caller is already reloading, subsequent callers return the current
+    /// searcher immediately instead of triggering a duplicate reload.
     pub async fn searcher(&self) -> Result<Arc<Searcher<D>>> {
         // Check if we should check for segment changes
         let should_check = {
@@ -103,31 +111,47 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         };
 
         if should_check {
-            // Update check time first to avoid concurrent checks
-            *self.last_reload_check.write() = std::time::Instant::now();
-
-            // Get current segment IDs from segment manager (non-blocking)
-            let new_segment_ids = self.segment_manager.get_segment_ids().await;
-
-            // Check if segments actually changed
-            let segments_changed = {
-                let current = self.current_segment_ids.read();
-                *current != new_segment_ids
-            };
-
-            if segments_changed {
-                let old_count = self.current_segment_ids.read().len();
-                let new_count = new_segment_ids.len();
-                log::info!(
-                    "[index_reload] old_count={} new_count={}",
-                    old_count,
-                    new_count
-                );
-                self.reload_with_segments(new_segment_ids).await?;
+            // Try to acquire the reload guard (non-blocking)
+            if self
+                .reloading
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                // We won the race — do the reload check
+                let result = self.do_reload_check().await;
+                self.reloading.store(false, Ordering::Release);
+                result?;
             }
+            // Otherwise another reload is in progress — just return current searcher
         }
 
         Ok(Arc::clone(&*self.searcher.read()))
+    }
+
+    /// Actual reload check (called under the `reloading` guard)
+    async fn do_reload_check(&self) -> Result<()> {
+        *self.last_reload_check.write() = std::time::Instant::now();
+
+        // Get current segment IDs from segment manager
+        let new_segment_ids = self.segment_manager.get_segment_ids().await;
+
+        // Check if segments actually changed
+        let segments_changed = {
+            let current = self.current_segment_ids.read();
+            *current != new_segment_ids
+        };
+
+        if segments_changed {
+            let old_count = self.current_segment_ids.read().len();
+            let new_count = new_segment_ids.len();
+            log::info!(
+                "[index_reload] old_count={} new_count={}",
+                old_count,
+                new_count
+            );
+            self.reload_with_segments(new_segment_ids).await?;
+        }
+        Ok(())
     }
 
     /// Force reload reader with fresh snapshot

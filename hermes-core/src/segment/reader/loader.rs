@@ -127,23 +127,21 @@ pub async fn load_vectors_file<D: Directory>(
                 }
             }
             ann_build::SCANN_TYPE => {
-                // ScaNN (IVF-PQ) — lazy: raw bytes stored, deserialized on first search
+                // ScaNN (IVF-PQ) — lazy: OwnedBytes stored (zero-copy mmap ref),
+                // deserialized on first search. No heap copy during segment load.
                 let data = handle.read_bytes_range(offset..offset + length).await?;
                 indexes.insert(
                     field_id,
-                    VectorIndex::ScaNN(Arc::new(super::types::LazyScaNN::new(
-                        data.as_slice().to_vec(),
-                    ))),
+                    VectorIndex::ScaNN(Arc::new(super::types::LazyScaNN::new(data))),
                 );
             }
             ann_build::IVF_RABITQ_TYPE => {
-                // IVF-RaBitQ — lazy: raw bytes stored, deserialized on first search
+                // IVF-RaBitQ — lazy: OwnedBytes stored (zero-copy mmap ref),
+                // deserialized on first search. No heap copy during segment load.
                 let data = handle.read_bytes_range(offset..offset + length).await?;
                 indexes.insert(
                     field_id,
-                    VectorIndex::IVF(Arc::new(super::types::LazyIVF::new(
-                        data.as_slice().to_vec(),
-                    ))),
+                    VectorIndex::IVF(Arc::new(super::types::LazyIVF::new(data))),
                 );
             }
             ann_build::RABITQ_TYPE => {
@@ -212,26 +210,20 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Read ENTIRE sparse file in one I/O call - much faster than multiple small reads
-    let all_bytes = match handle.read_bytes_range(0..file_size).await {
+    // Read only footer (16 bytes) — not the entire file
+    let footer_bytes = match handle
+        .read_bytes_range(file_size - FOOTER_SIZE..file_size)
+        .await
+    {
         Ok(d) => d,
         Err(_) => return Ok(indexes),
     };
-    let data = all_bytes.as_slice();
+    let fb = footer_bytes.as_slice();
 
-    // Parse footer (last 16 bytes): toc_offset(8) + num_fields(4) + magic(4)
-    let footer_start = data.len() - FOOTER_SIZE as usize;
-    let toc_offset = u64::from_le_bytes(data[footer_start..footer_start + 8].try_into().unwrap());
-    let num_fields = u32::from_le_bytes(
-        data[footer_start + 8..footer_start + 12]
-            .try_into()
-            .unwrap(),
-    );
-    let magic = u32::from_le_bytes(
-        data[footer_start + 12..footer_start + 16]
-            .try_into()
-            .unwrap(),
-    );
+    // Parse footer: toc_offset(8) + num_fields(4) + magic(4)
+    let toc_offset = u64::from_le_bytes(fb[0..8].try_into().unwrap());
+    let num_fields = u32::from_le_bytes(fb[8..12].try_into().unwrap());
+    let magic = u32::from_le_bytes(fb[12..16].try_into().unwrap());
 
     if magic != SPARSE_FOOTER_MAGIC {
         return Err(crate::Error::Corruption(format!(
@@ -251,55 +243,110 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Parse TOC from toc_offset
-    let mut pos = toc_offset as usize;
+    // Read only the TOC section (toc_offset .. footer_start) — skip all posting block data
+    let toc_end = file_size - FOOTER_SIZE;
+    let toc_bytes = handle.read_bytes_range(toc_offset..toc_end).await?;
+    let toc_data = toc_bytes.as_slice();
+    let mut pos = 0usize;
 
+    // First pass: parse TOC to collect dimension metadata (dim_id, data_offset, posting_length)
+    // without reading any posting data yet.
+    struct DimTocEntry {
+        dim_id: u32,
+        data_offset: u64,
+        posting_length: u32,
+    }
+    struct FieldToc {
+        field_id: u32,
+        dims: Vec<DimTocEntry>,
+    }
+    let mut field_tocs = Vec::with_capacity(num_fields as usize);
     for _ in 0..num_fields {
-        // Read field header: field_id(4) + quant(1) + num_dims(4) = 9 bytes
-        let field_id = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        let _quantization = data[pos + 4];
-        let num_dims =
-            u32::from_le_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
+        // Field header: field_id(4) + quant(1) + num_dims(4) = 9 bytes
+        let field_id = u32::from_le_bytes([
+            toc_data[pos],
+            toc_data[pos + 1],
+            toc_data[pos + 2],
+            toc_data[pos + 3],
+        ]);
+        let _quantization = toc_data[pos + 4];
+        let ndims = u32::from_le_bytes([
+            toc_data[pos + 5],
+            toc_data[pos + 6],
+            toc_data[pos + 7],
+            toc_data[pos + 8],
+        ]);
         pos += 9;
 
-        // Parse dimension entries with skip lists into a flat array
-        let mut dimensions: Vec<super::types::DimensionEntry> =
-            Vec::with_capacity(num_dims as usize);
-        let mut all_skip_entries: Vec<crate::structures::SparseSkipEntry> = Vec::new();
-
-        for _ in 0..num_dims {
-            let dim_id =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let mut dims = Vec::with_capacity(ndims as usize);
+        for _ in 0..ndims {
+            let dim_id = u32::from_le_bytes([
+                toc_data[pos],
+                toc_data[pos + 1],
+                toc_data[pos + 2],
+                toc_data[pos + 3],
+            ]);
             let data_offset = u64::from_le_bytes([
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-                data[pos + 8],
-                data[pos + 9],
-                data[pos + 10],
-                data[pos + 11],
+                toc_data[pos + 4],
+                toc_data[pos + 5],
+                toc_data[pos + 6],
+                toc_data[pos + 7],
+                toc_data[pos + 8],
+                toc_data[pos + 9],
+                toc_data[pos + 10],
+                toc_data[pos + 11],
             ]);
             let posting_length = u32::from_le_bytes([
-                data[pos + 12],
-                data[pos + 13],
-                data[pos + 14],
-                data[pos + 15],
+                toc_data[pos + 12],
+                toc_data[pos + 13],
+                toc_data[pos + 14],
+                toc_data[pos + 15],
             ]);
             pos += 16;
+            dims.push(DimTocEntry {
+                dim_id,
+                data_offset,
+                posting_length,
+            });
+        }
+        field_tocs.push(FieldToc { field_id, dims });
+    }
 
-            // Read posting list header from data_offset to get skip list
-            let pl_data =
-                &data[data_offset as usize..(data_offset + posting_length as u64) as usize];
+    // Second pass: for each field, compute the contiguous header+skip region and
+    // read it in a single I/O call (avoids per-dimension reads).
+    for ftoc in &field_tocs {
+        if ftoc.dims.is_empty() {
+            continue;
+        }
+
+        // Posting data for dimensions within a field is written sequentially, so
+        // the headers+skip entries form a prefix of each posting, laid out one
+        // after another. We read the entire posting region and parse only the
+        // header+skip portion of each dimension, ignoring block data bytes.
+        let region_start = ftoc.dims.first().unwrap().data_offset;
+        let last = ftoc.dims.last().unwrap();
+        let region_end = last.data_offset + last.posting_length as u64;
+        let region_bytes = handle.read_bytes_range(region_start..region_end).await?;
+        let region = region_bytes.as_slice();
+
+        let mut dimensions: Vec<super::types::DimensionEntry> = Vec::with_capacity(ftoc.dims.len());
+        let mut all_skip_entries: Vec<crate::structures::SparseSkipEntry> = Vec::new();
+
+        for dim_entry in &ftoc.dims {
+            // Offset within region
+            let local = (dim_entry.data_offset - region_start) as usize;
+            let pl_data = &region[local..local + dim_entry.posting_length as usize];
+
+            // Parse posting header: doc_count(4) + global_max_weight(4) + num_blocks(4)
             let doc_count = u32::from_le_bytes([pl_data[0], pl_data[1], pl_data[2], pl_data[3]]);
             let global_max_weight =
                 f32::from_le_bytes([pl_data[4], pl_data[5], pl_data[6], pl_data[7]]);
             let num_blocks =
                 u32::from_le_bytes([pl_data[8], pl_data[9], pl_data[10], pl_data[11]]) as usize;
 
-            // Parse skip entries into the shared flat array (20 bytes each)
+            // Parse skip entries (20 bytes each)
             let skip_start = all_skip_entries.len() as u32;
-            let mut skip_pos = 12; // After header
+            let mut skip_pos = 12;
             for _ in 0..num_blocks {
                 let first_doc = u32::from_le_bytes([
                     pl_data[skip_pos],
@@ -337,11 +384,11 @@ pub async fn load_sparse_file<D: Directory>(
                 skip_pos += 20;
             }
 
-            // data_offset points to start of posting list, block data starts after header + skip list
+            // data_offset points to posting start; block data starts after header + skip list
             let header_size = 12 + num_blocks * 20;
             dimensions.push(super::types::DimensionEntry {
-                dim_id,
-                data_offset: data_offset + header_size as u64,
+                dim_id: dim_entry.dim_id,
+                data_offset: dim_entry.data_offset + header_size as u64,
                 doc_count,
                 global_max_weight,
                 skip_start,
@@ -358,14 +405,14 @@ pub async fn load_sparse_file<D: Directory>(
 
         log::debug!(
             "Loaded sparse index for field {} (lazy): num_dims={}, total_docs={}, skip_entries={}",
-            field_id,
-            num_dims,
+            ftoc.field_id,
+            ftoc.dims.len(),
             total_docs,
             all_skip_entries.len()
         );
 
         indexes.insert(
-            field_id,
+            ftoc.field_id,
             SparseIndex::new(
                 handle.clone(),
                 dimensions,

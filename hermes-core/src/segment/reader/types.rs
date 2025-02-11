@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
 
 use crate::DocId;
-use crate::directories::{AsyncFileRead, LazyFileHandle};
+use crate::directories::{AsyncFileRead, LazyFileHandle, OwnedBytes};
 use crate::structures::{
     BlockSparsePostingList, IVFPQIndex, IVFRaBitQIndex, PQCodebook, RaBitQCodebook, RaBitQIndex,
     SparseBlock, SparseSkipEntry,
@@ -15,8 +15,9 @@ use crate::structures::{
 /// Raw flat vectors are stored separately in [`LazyFlatVectorData`] and accessed
 /// via mmap for reranking and merge. This enum only holds ANN indexes.
 ///
-/// IVF and ScaNN variants are **lazy**: raw bytes are stored on construction,
-/// bincode deserialization is deferred to first search access via `OnceLock`.
+/// IVF and ScaNN variants are **lazy**: `OwnedBytes` (zero-copy mmap ref) are
+/// stored on construction, bincode deserialization is deferred to first search
+/// access via `OnceLock`. No heap copies during segment load.
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
@@ -29,13 +30,16 @@ pub enum VectorIndex {
 }
 
 /// Lazy IVF-RaBitQ index — defers bincode deserialization to first access
+///
+/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
+/// The mmap pages are only paged into physical RAM when deserialization happens.
 pub struct LazyIVF {
-    raw: Vec<u8>,
+    raw: OwnedBytes,
     resolved: OnceLock<Option<(Arc<IVFRaBitQIndex>, Arc<RaBitQCodebook>)>>,
 }
 
 impl LazyIVF {
-    pub fn new(raw: Vec<u8>) -> Self {
+    pub fn new(raw: OwnedBytes) -> Self {
         Self {
             raw,
             resolved: OnceLock::new(),
@@ -68,13 +72,16 @@ impl LazyIVF {
 }
 
 /// Lazy ScaNN (IVF-PQ) index — defers bincode deserialization to first access
+///
+/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
+/// The mmap pages are only paged into physical RAM when deserialization happens.
 pub struct LazyScaNN {
-    raw: Vec<u8>,
+    raw: OwnedBytes,
     resolved: OnceLock<Option<(Arc<IVFPQIndex>, Arc<PQCodebook>)>>,
 }
 
 impl LazyScaNN {
-    pub fn new(raw: Vec<u8>) -> Self {
+    pub fn new(raw: OwnedBytes) -> Self {
         Self {
             raw,
             resolved: OnceLock::new(),
