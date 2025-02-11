@@ -139,7 +139,64 @@ impl SegmentMerger {
                 const FIRST_DOC_ID_OFFSET: usize = 8;
                 const BLOCK_HEADER_SIZE: usize = 16;
 
-                for (raw, doc_offset) in &sources {
+                for (src_idx, (raw, doc_offset)) in sources.iter().enumerate() {
+                    let data = raw.raw_block_data.as_slice();
+
+                    // Validate source skip entries before merging
+                    for (i, entry) in raw.skip_entries.iter().enumerate() {
+                        // Check block count in raw header bytes
+                        let start = entry.offset as usize;
+                        if start + BLOCK_HEADER_SIZE > data.len() {
+                            return Err(crate::Error::Corruption(format!(
+                                "[merge] dim_id={} src={} block={}/{}: skip offset {} + header {} > data_len {}",
+                                dim_id,
+                                src_idx,
+                                i,
+                                raw.skip_entries.len(),
+                                start,
+                                BLOCK_HEADER_SIZE,
+                                data.len()
+                            )));
+                        }
+                        let block_count = u16::from_le_bytes([data[start], data[start + 1]]);
+                        if block_count == 0 {
+                            let hex: String = data[start..]
+                                .iter()
+                                .take(32)
+                                .map(|x| format!("{x:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            return Err(crate::Error::Corruption(format!(
+                                "[merge] dim_id={} src={} block={}/{}: count=0 at offset={} length={} (first_32=[{}])",
+                                dim_id,
+                                src_idx,
+                                i,
+                                raw.skip_entries.len(),
+                                entry.offset,
+                                entry.length,
+                                hex
+                            )));
+                        }
+
+                        // Check contiguity: offset[i] + length[i] == offset[i+1]
+                        if i + 1 < raw.skip_entries.len() {
+                            let expected_next = entry.offset + entry.length;
+                            let actual_next = raw.skip_entries[i + 1].offset;
+                            if expected_next != actual_next {
+                                return Err(crate::Error::Corruption(format!(
+                                    "[merge] dim_id={} src={} block={}: non-contiguous blocks: offset({}) + length({}) = {} != next_offset({})",
+                                    dim_id,
+                                    src_idx,
+                                    i,
+                                    entry.offset,
+                                    entry.length,
+                                    expected_next,
+                                    actual_next
+                                )));
+                            }
+                        }
+                    }
+
                     // Adjust skip entries (doc offsets + block data offsets)
                     for entry in &raw.skip_entries {
                         all_skip_entries.push(SparseSkipEntry::new(
@@ -156,7 +213,6 @@ impl SegmentMerger {
                     }
 
                     // Write raw block data, patching first_doc_id when doc_offset > 0
-                    let data = raw.raw_block_data.as_slice();
                     if *doc_offset == 0 {
                         writer.write_all(data)?;
                     } else {
@@ -168,18 +224,24 @@ impl SegmentMerger {
                                 data.len()
                             };
                             let block = &data[start..end];
-                            if block.len() >= BLOCK_HEADER_SIZE {
-                                writer.write_all(&block[..FIRST_DOC_ID_OFFSET])?;
-                                let old = u32::from_le_bytes(
-                                    block[FIRST_DOC_ID_OFFSET..FIRST_DOC_ID_OFFSET + 4]
-                                        .try_into()
-                                        .unwrap(),
-                                );
-                                writer.write_all(&(old + doc_offset).to_le_bytes())?;
-                                writer.write_all(&block[FIRST_DOC_ID_OFFSET + 4..])?;
-                            } else {
-                                writer.write_all(block)?;
+                            if block.len() < BLOCK_HEADER_SIZE {
+                                return Err(crate::Error::Corruption(format!(
+                                    "[merge] dim_id={} src={} block={}: block too small: {} < {}",
+                                    dim_id,
+                                    src_idx,
+                                    i,
+                                    block.len(),
+                                    BLOCK_HEADER_SIZE
+                                )));
                             }
+                            writer.write_all(&block[..FIRST_DOC_ID_OFFSET])?;
+                            let old = u32::from_le_bytes(
+                                block[FIRST_DOC_ID_OFFSET..FIRST_DOC_ID_OFFSET + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            writer.write_all(&(old + doc_offset).to_le_bytes())?;
+                            writer.write_all(&block[FIRST_DOC_ID_OFFSET + 4..])?;
                         }
                     }
                 }

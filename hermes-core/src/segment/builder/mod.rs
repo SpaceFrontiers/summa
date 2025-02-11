@@ -1043,6 +1043,37 @@ impl SegmentBuilder {
                     let doc_count = block_list.doc_count;
                     let (block_data, skip_entries) =
                         block_list.serialize_v3().map_err(crate::Error::Io)?;
+
+                    // Validate serialized blocks: count>0, contiguous offsets
+                    for (i, entry) in skip_entries.iter().enumerate() {
+                        let off = entry.offset as usize;
+                        if off + 2 > block_data.len() {
+                            return Err(crate::Error::Corruption(format!(
+                                "[build] dim_id={} block={}/{}: offset {} + 2 > data_len {}",
+                                dim_id, i, skip_entries.len(), off, block_data.len()
+                            )));
+                        }
+                        let cnt = u16::from_le_bytes([block_data[off], block_data[off + 1]]);
+                        if cnt == 0 {
+                            let hex: String = block_data[off..].iter().take(32)
+                                .map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+                            return Err(crate::Error::Corruption(format!(
+                                "[build] dim_id={} block={}/{}: count=0 (first_32=[{}])",
+                                dim_id, i, skip_entries.len(), hex
+                            )));
+                        }
+                        if i + 1 < skip_entries.len() {
+                            let expected = entry.offset + entry.length;
+                            let actual = skip_entries[i + 1].offset;
+                            if expected != actual {
+                                return Err(crate::Error::Corruption(format!(
+                                    "[build] dim_id={} block={}: non-contiguous: {} + {} = {} != {}",
+                                    dim_id, i, entry.offset, entry.length, expected, actual
+                                )));
+                            }
+                        }
+                    }
+
                     Ok((dim_id, doc_count, block_data, skip_entries))
                 })
                 .collect::<Result<Vec<_>>>()?;

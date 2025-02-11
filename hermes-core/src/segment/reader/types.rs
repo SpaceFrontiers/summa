@@ -348,7 +348,12 @@ impl SparseIndex {
             .await
             .map_err(crate::Error::Io)?;
 
-        SparseBlock::from_owned_bytes(data)
+        SparseBlock::from_owned_bytes(data).map_err(|e| {
+            crate::Error::Corruption(format!(
+                "dim_id={} block_idx={} offset={} length={} base={}: {e}",
+                self.dims.dim_ids[dim_idx], block_idx, entry.offset, entry.length, base
+            ))
+        })
     }
 
     /// Get posting list for a dimension (loads all blocks via mmap)
@@ -436,7 +441,12 @@ impl SparseIndex {
             let rel_offset = entry.offset as u64 - first_entry.offset as u64;
             let block_bytes =
                 range_data.slice(rel_offset as usize..rel_offset as usize + entry.length as usize);
-            blocks.push(SparseBlock::from_owned_bytes(block_bytes)?);
+            blocks.push(SparseBlock::from_owned_bytes(block_bytes).map_err(|e| {
+                crate::Error::Corruption(format!(
+                    "dim_id={} block={}/{} skip_entry(offset={},length={}) base={}: {e}",
+                    dim_id, bi, total_blocks, entry.offset, entry.length, base
+                ))
+            })?);
         }
 
         Ok(blocks)

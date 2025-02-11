@@ -316,6 +316,20 @@ impl SparseBlock {
         let header =
             BlockHeader::read(&mut cursor).map_err(|e| crate::Error::Corruption(e.to_string()))?;
 
+        if header.count == 0 {
+            let hex: String = b
+                .iter()
+                .take(32)
+                .map(|x| format!("{x:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(crate::Error::Corruption(format!(
+                "sparse block has count=0 (data_len={}, first_32_bytes=[{}])",
+                b.len(),
+                hex
+            )));
+        }
+
         let p = BlockHeader::SIZE;
         let doc_ids_len = u16::from_le_bytes([b[p], b[p + 1]]) as usize;
         let ordinals_len = u16::from_le_bytes([b[p + 2], b[p + 3]]) as usize;
@@ -325,6 +339,26 @@ impl SparseBlock {
         let data_start = p + 8;
         let ord_start = data_start + doc_ids_len;
         let wt_start = ord_start + ordinals_len;
+        let expected_end = wt_start + weights_len;
+
+        if expected_end > b.len() {
+            let hex: String = b
+                .iter()
+                .take(32)
+                .map(|x| format!("{x:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(crate::Error::Corruption(format!(
+                "sparse block sub-block overflow: count={} doc_ids={}B ords={}B wts={}B need={}B have={}B (first_32=[{}])",
+                header.count,
+                doc_ids_len,
+                ordinals_len,
+                weights_len,
+                expected_end,
+                b.len(),
+                hex
+            )));
+        }
 
         Ok(Self {
             header,
