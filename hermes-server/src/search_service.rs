@@ -22,7 +22,6 @@ impl SearchService for SearchServiceImpl {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        let start = Instant::now();
         let req = request.into_inner();
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
@@ -49,6 +48,7 @@ impl SearchService for SearchServiceImpl {
         };
 
         // ── Phase 1: L1 search ──────────────────────────────────────────────
+        let start = Instant::now();
         let t_search = Instant::now();
         let (results, total_seen, rerank_config) = if let Some(reranker) = &req.reranker {
             let config = convert_reranker(reranker, reader.schema())
