@@ -292,6 +292,35 @@ impl LazyFlatVectorData {
             .await
     }
 
+    /// Find flat index range for a given doc_id (non-allocating).
+    ///
+    /// Returns `(start_index, count)` — the flat vector index range for this doc_id.
+    /// Use `get_doc_id(start + i)` for `i in 0..count` to read individual entries.
+    /// More efficient than `flat_indexes_for_doc` as it avoids Vec allocation.
+    pub fn flat_indexes_for_doc_range(&self, doc_id: u32) -> (usize, usize) {
+        let n = self.num_vectors;
+        let start = {
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.doc_id_at(mid) < doc_id {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        let mut count = 0;
+        let mut i = start;
+        while i < n && self.doc_id_at(i) == doc_id {
+            count += 1;
+            i += 1;
+        }
+        (start, count)
+    }
+
     /// Find flat indexes for a given doc_id via binary search on sorted doc_ids.
     ///
     /// doc_ids are sorted by (doc_id, ordinal) — segment builder adds docs

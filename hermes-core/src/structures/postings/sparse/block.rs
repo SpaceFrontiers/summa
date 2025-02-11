@@ -10,6 +10,7 @@ use std::io::{self, Cursor, Read, Write};
 
 use super::config::WeightQuantization;
 use crate::DocId;
+use crate::directories::OwnedBytes;
 use crate::structures::postings::TERMINATED;
 use crate::structures::simd;
 
@@ -67,9 +68,12 @@ impl BlockHeader {
 #[derive(Debug, Clone)]
 pub struct SparseBlock {
     pub header: BlockHeader,
-    pub doc_ids_data: Vec<u8>,
-    pub ordinals_data: Vec<u8>,
-    pub weights_data: Vec<u8>,
+    /// Delta-encoded, bit-packed doc IDs (zero-copy from mmap when loaded lazily)
+    pub doc_ids_data: OwnedBytes,
+    /// Bit-packed ordinals (zero-copy from mmap when loaded lazily)
+    pub ordinals_data: OwnedBytes,
+    /// Quantized weights (zero-copy from mmap when loaded lazily)
+    pub weights_data: OwnedBytes,
 }
 
 impl SparseBlock {
@@ -91,25 +95,37 @@ impl SparseBlock {
         }
         deltas[0] = 0;
 
-        let doc_id_bits = find_optimal_bit_width(&deltas[1..]);
+        let doc_id_bits = simd::round_bit_width(find_optimal_bit_width(&deltas[1..]));
         let ordinals: Vec<u16> = postings.iter().map(|(_, o, _)| *o).collect();
         let max_ordinal = ordinals.iter().copied().max().unwrap_or(0);
         let ordinal_bits = if max_ordinal == 0 {
             0
         } else {
-            bits_needed_u16(max_ordinal)
+            simd::round_bit_width(bits_needed_u16(max_ordinal))
         };
 
         let weights: Vec<f32> = postings.iter().map(|(_, _, w)| *w).collect();
         let max_weight = weights.iter().copied().fold(0.0f32, f32::max);
 
-        let doc_ids_data = pack_bit_array(&deltas[1..], doc_id_bits);
-        let ordinals_data = if ordinal_bits > 0 {
-            pack_bit_array_u16(&ordinals, ordinal_bits)
+        let doc_ids_data = OwnedBytes::new({
+            let rounded = simd::RoundedBitWidth::from_u8(doc_id_bits);
+            let num_deltas = count - 1;
+            let byte_count = num_deltas * rounded.bytes_per_value();
+            let mut data = vec![0u8; byte_count];
+            simd::pack_rounded(&deltas[1..], rounded, &mut data);
+            data
+        });
+        let ordinals_data = OwnedBytes::new(if ordinal_bits > 0 {
+            let rounded = simd::RoundedBitWidth::from_u8(ordinal_bits);
+            let byte_count = count * rounded.bytes_per_value();
+            let mut data = vec![0u8; byte_count];
+            let ord_u32: Vec<u32> = ordinals.iter().map(|&o| o as u32).collect();
+            simd::pack_rounded(&ord_u32, rounded, &mut data);
+            data
         } else {
             Vec::new()
-        };
-        let weights_data = encode_weights(&weights, weight_quant)?;
+        });
+        let weights_data = OwnedBytes::new(encode_weights(&weights, weight_quant)?);
 
         Ok(Self {
             header: BlockHeader {
@@ -133,17 +149,31 @@ impl SparseBlock {
     }
 
     /// Decode doc IDs into an existing Vec (avoids allocation on reuse).
+    ///
+    /// Uses SIMD-accelerated unpacking for rounded bit widths (0, 8, 16, 32).
     pub fn decode_doc_ids_into(&self, out: &mut Vec<DocId>) {
         let count = self.header.count as usize;
         out.clear();
-        out.push(self.header.first_doc_id);
+        out.resize(count, 0);
+        out[0] = self.header.first_doc_id;
 
         if count > 1 {
-            let deltas = unpack_bit_array(&self.doc_ids_data, self.header.doc_id_bits, count - 1);
-            let mut prev = self.header.first_doc_id;
-            for delta in deltas {
-                prev += delta;
-                out.push(prev);
+            let bits = self.header.doc_id_bits;
+            if bits == 0 {
+                // All deltas are 0 (multi-value same doc_id repeats)
+                out[1..].fill(self.header.first_doc_id);
+            } else {
+                // SIMD-accelerated unpack (bits is always 8, 16, or 32)
+                simd::unpack_rounded(
+                    &self.doc_ids_data,
+                    simd::RoundedBitWidth::from_u8(bits),
+                    &mut out[1..],
+                    count - 1,
+                );
+                // In-place prefix sum (pure delta, NOT gap-1)
+                for i in 1..count {
+                    out[i] += out[i - 1];
+                }
             }
         }
     }
@@ -155,13 +185,26 @@ impl SparseBlock {
     }
 
     /// Decode ordinals into an existing Vec (avoids allocation on reuse).
+    ///
+    /// Uses SIMD-accelerated unpacking for rounded bit widths (0, 8, 16, 32).
     pub fn decode_ordinals_into(&self, out: &mut Vec<u16>) {
         let count = self.header.count as usize;
         out.clear();
         if self.header.ordinal_bits == 0 {
             out.resize(count, 0u16);
         } else {
-            unpack_bit_array_u16_into(&self.ordinals_data, self.header.ordinal_bits, count, out);
+            // SIMD-accelerated unpack (bits is always 8, 16, or 32)
+            let mut temp = [0u32; BLOCK_SIZE];
+            simd::unpack_rounded(
+                &self.ordinals_data,
+                simd::RoundedBitWidth::from_u8(self.header.ordinal_bits),
+                &mut temp[..count],
+                count,
+            );
+            out.reserve(count);
+            for &v in &temp[..count] {
+                out.push(v as u16);
+            }
         }
     }
 
@@ -180,6 +223,47 @@ impl SparseBlock {
             self.header.count as usize,
             out,
         );
+    }
+
+    /// Decode weights pre-multiplied by `query_weight` directly from quantized data.
+    ///
+    /// For UInt8: computes `(qw * scale) * q + (qw * min)` via SIMD — avoids
+    /// allocating an intermediate f32 dequantized buffer. The effective_scale and
+    /// effective_bias are computed once per block (not per element).
+    ///
+    /// For F32/F16/UInt4: falls back to decode + scalar multiply.
+    pub fn decode_scored_weights_into(&self, query_weight: f32, out: &mut Vec<f32>) {
+        out.clear();
+        let count = self.header.count as usize;
+        match self.header.weight_quant {
+            WeightQuantization::UInt8 if self.weights_data.len() >= 8 => {
+                // UInt8 layout: [scale: f32][min: f32][q0, q1, ..., q_{n-1}]
+                let scale = f32::from_le_bytes([
+                    self.weights_data[0],
+                    self.weights_data[1],
+                    self.weights_data[2],
+                    self.weights_data[3],
+                ]);
+                let min_val = f32::from_le_bytes([
+                    self.weights_data[4],
+                    self.weights_data[5],
+                    self.weights_data[6],
+                    self.weights_data[7],
+                ]);
+                // Fused: qw * (q * scale + min) = q * (qw * scale) + (qw * min)
+                let eff_scale = query_weight * scale;
+                let eff_bias = query_weight * min_val;
+                out.resize(count, 0.0);
+                simd::dequantize_uint8(&self.weights_data[8..], out, eff_scale, eff_bias, count);
+            }
+            _ => {
+                // Fallback: decode to f32, then multiply
+                decode_weights_into(&self.weights_data, self.header.weight_quant, count, out);
+                for w in out.iter_mut() {
+                    *w *= query_weight;
+                }
+            }
+        }
     }
 
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
@@ -201,18 +285,18 @@ impl SparseBlock {
         let weights_len = r.read_u16::<LittleEndian>()? as usize;
         let _ = r.read_u16::<LittleEndian>()?;
 
-        let mut doc_ids_data = vec![0u8; doc_ids_len];
-        r.read_exact(&mut doc_ids_data)?;
-        let mut ordinals_data = vec![0u8; ordinals_len];
-        r.read_exact(&mut ordinals_data)?;
-        let mut weights_data = vec![0u8; weights_len];
-        r.read_exact(&mut weights_data)?;
+        let mut doc_ids_vec = vec![0u8; doc_ids_len];
+        r.read_exact(&mut doc_ids_vec)?;
+        let mut ordinals_vec = vec![0u8; ordinals_len];
+        r.read_exact(&mut ordinals_vec)?;
+        let mut weights_vec = vec![0u8; weights_len];
+        r.read_exact(&mut weights_vec)?;
 
         Ok(Self {
             header,
-            doc_ids_data,
-            ordinals_data,
-            weights_data,
+            doc_ids_data: OwnedBytes::new(doc_ids_vec),
+            ordinals_data: OwnedBytes::new(ordinals_vec),
+            weights_data: OwnedBytes::new(weights_vec),
         })
     }
 
@@ -220,8 +304,7 @@ impl SparseBlock {
     ///
     /// Parses the block header and sub-block length prefix, then slices the
     /// OwnedBytes into doc_ids/ordinals/weights without any heap allocation.
-    /// The returned Vecs share the underlying mmap Arc via `.to_vec()` on the
-    /// small sub-slices (typically < 1KB each).
+    /// Sub-slices share the underlying mmap Arc — no data is copied.
     pub fn from_owned_bytes(data: crate::directories::OwnedBytes) -> crate::Result<Self> {
         let b = data.as_slice();
         if b.len() < BlockHeader::SIZE + 8 {
@@ -245,9 +328,9 @@ impl SparseBlock {
 
         Ok(Self {
             header,
-            doc_ids_data: b[data_start..ord_start].to_vec(),
-            ordinals_data: b[ord_start..wt_start].to_vec(),
-            weights_data: b[wt_start..wt_start + weights_len].to_vec(),
+            doc_ids_data: data.slice(data_start..ord_start),
+            ordinals_data: data.slice(ord_start..wt_start),
+            weights_data: data.slice(wt_start..wt_start + weights_len),
         })
     }
 
@@ -737,102 +820,6 @@ fn bits_needed_u16(val: u16) -> u8 {
     }
 }
 
-fn pack_bit_array(values: &[u32], bits: u8) -> Vec<u8> {
-    if bits == 0 || values.is_empty() {
-        return Vec::new();
-    }
-    let total_bytes = (values.len() * bits as usize).div_ceil(8);
-    let mut result = vec![0u8; total_bytes];
-    let mut bit_pos = 0usize;
-    for &val in values {
-        pack_value(&mut result, bit_pos, val & ((1u32 << bits) - 1), bits);
-        bit_pos += bits as usize;
-    }
-    result
-}
-
-fn pack_bit_array_u16(values: &[u16], bits: u8) -> Vec<u8> {
-    if bits == 0 || values.is_empty() {
-        return Vec::new();
-    }
-    let total_bytes = (values.len() * bits as usize).div_ceil(8);
-    let mut result = vec![0u8; total_bytes];
-    let mut bit_pos = 0usize;
-    for &val in values {
-        pack_value(
-            &mut result,
-            bit_pos,
-            (val as u32) & ((1u32 << bits) - 1),
-            bits,
-        );
-        bit_pos += bits as usize;
-    }
-    result
-}
-
-#[inline]
-fn pack_value(data: &mut [u8], bit_pos: usize, val: u32, bits: u8) {
-    let mut remaining = bits as usize;
-    let mut val = val;
-    let mut byte = bit_pos / 8;
-    let mut offset = bit_pos % 8;
-    while remaining > 0 {
-        let space = 8 - offset;
-        let to_write = remaining.min(space);
-        let mask = (1u32 << to_write) - 1;
-        data[byte] |= ((val & mask) as u8) << offset;
-        val >>= to_write;
-        remaining -= to_write;
-        byte += 1;
-        offset = 0;
-    }
-}
-
-fn unpack_bit_array(data: &[u8], bits: u8, count: usize) -> Vec<u32> {
-    if bits == 0 || count == 0 {
-        return vec![0; count];
-    }
-    let mut result = Vec::with_capacity(count);
-    let mut bit_pos = 0usize;
-    for _ in 0..count {
-        result.push(unpack_value(data, bit_pos, bits));
-        bit_pos += bits as usize;
-    }
-    result
-}
-
-fn unpack_bit_array_u16_into(data: &[u8], bits: u8, count: usize, out: &mut Vec<u16>) {
-    if bits == 0 || count == 0 {
-        out.resize(count, 0u16);
-        return;
-    }
-    let mut bit_pos = 0usize;
-    for _ in 0..count {
-        out.push(unpack_value(data, bit_pos, bits) as u16);
-        bit_pos += bits as usize;
-    }
-}
-
-#[inline]
-fn unpack_value(data: &[u8], bit_pos: usize, bits: u8) -> u32 {
-    let mut val = 0u32;
-    let mut remaining = bits as usize;
-    let mut byte = bit_pos / 8;
-    let mut offset = bit_pos % 8;
-    let mut shift = 0;
-    while remaining > 0 {
-        let space = 8 - offset;
-        let to_read = remaining.min(space);
-        let mask = (1u8 << to_read) - 1;
-        val |= (((data.get(byte).copied().unwrap_or(0) >> offset) & mask) as u32) << shift;
-        remaining -= to_read;
-        shift += to_read;
-        byte += 1;
-        offset = 0;
-    }
-    val
-}
-
 // ============================================================================
 // Weight encoding/decoding
 // ============================================================================
@@ -910,11 +897,10 @@ fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out
         }
         WeightQuantization::UInt8 => {
             let scale = cursor.read_f32::<LittleEndian>().unwrap_or(1.0);
-            let min = cursor.read_f32::<LittleEndian>().unwrap_or(0.0);
-            for _ in 0..count {
-                let q = cursor.read_u8().unwrap_or(0);
-                out.push(q as f32 * scale + min);
-            }
+            let min_val = cursor.read_f32::<LittleEndian>().unwrap_or(0.0);
+            let offset = cursor.position() as usize;
+            out.resize(count, 0.0);
+            simd::dequantize_uint8(&data[offset..], out, scale, min_val, count);
         }
         WeightQuantization::UInt4 => {
             let scale = cursor.read_f32::<LittleEndian>().unwrap_or(1.0);

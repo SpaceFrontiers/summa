@@ -1,11 +1,19 @@
 //! L2 reranker: rerank L1 candidates by exact dense vector distance on stored vectors
+//!
+//! Optimized for throughput:
+//! - Candidates grouped by segment for batched I/O
+//! - Flat indexes sorted for sequential mmap access (OS readahead)
+//! - Single SIMD batch-score call per segment (not per candidate)
+//! - Reusable buffers across segments (no per-candidate heap allocation)
+//! - unit_norm fast path: skip per-vector norm when vectors are pre-normalized
+
+use rustc_hash::FxHashMap;
 
 use crate::dsl::Field;
 
 use super::{MultiValueCombiner, ScoredPosition, SearchResult};
 
-/// Batch SIMD cosine scoring — dispatches to native-precision scorer by quantization type.
-/// Scores all vectors in one pass without per-vector dequantization overhead.
+/// Batch SIMD scoring — dispatches to cosine or dot-product scorer by quantization + unit_norm.
 #[inline]
 fn score_batch(
     query: &[f32],
@@ -13,20 +21,34 @@ fn score_batch(
     quant: crate::dsl::DenseVectorQuantization,
     dim: usize,
     scores: &mut [f32],
+    unit_norm: bool,
 ) {
     use crate::dsl::DenseVectorQuantization;
-    match quant {
-        DenseVectorQuantization::F32 => {
+    use crate::structures::simd;
+    match (quant, unit_norm) {
+        (DenseVectorQuantization::F32, false) => {
             let num_floats = scores.len() * dim;
             let vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
-            crate::structures::simd::batch_cosine_scores(query, vectors, dim, scores);
+            simd::batch_cosine_scores(query, vectors, dim, scores);
         }
-        DenseVectorQuantization::F16 => {
-            crate::structures::simd::batch_cosine_scores_f16(query, raw, dim, scores);
+        (DenseVectorQuantization::F32, true) => {
+            let num_floats = scores.len() * dim;
+            let vectors: &[f32] =
+                unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
+            simd::batch_dot_scores(query, vectors, dim, scores);
         }
-        DenseVectorQuantization::UInt8 => {
-            crate::structures::simd::batch_cosine_scores_u8(query, raw, dim, scores);
+        (DenseVectorQuantization::F16, false) => {
+            simd::batch_cosine_scores_f16(query, raw, dim, scores);
+        }
+        (DenseVectorQuantization::F16, true) => {
+            simd::batch_dot_scores_f16(query, raw, dim, scores);
+        }
+        (DenseVectorQuantization::UInt8, false) => {
+            simd::batch_cosine_scores_u8(query, raw, dim, scores);
+        }
+        (DenseVectorQuantization::UInt8, true) => {
+            simd::batch_dot_scores_u8(query, raw, dim, scores);
         }
     }
 }
@@ -40,6 +62,9 @@ pub struct RerankerConfig {
     pub vector: Vec<f32>,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
+    /// Whether stored vectors are pre-normalized to unit L2 norm.
+    /// When true, scoring uses dot-product only (skips per-vector norm — ~40% faster).
+    pub unit_norm: bool,
 }
 
 /// Score a single document against the query vector (used by tests).
@@ -82,15 +107,13 @@ fn score_document(
 
 /// Rerank L1 candidates by exact dense vector distance.
 ///
-/// Reads vectors directly from flat vector data (mmap) instead of loading
-/// full documents from the store. This avoids store block decompression
-/// and document deserialization — typically 10-50× faster.
+/// Groups candidates by segment for batched I/O, sorts flat indexes for
+/// sequential mmap access, and scores all vectors in a single SIMD batch
+/// per segment. Reuses buffers across segments to avoid per-candidate
+/// heap allocation.
 ///
-/// For each candidate, resolves the segment and flat vector index via
-/// binary search, reads the raw vector, dequantizes to f32, and scores
-/// with SIMD cosine similarity.
-///
-/// Documents missing the vector field are skipped.
+/// When `unit_norm` is set in the config, scoring uses dot-product only
+/// (skips per-vector norm computation — ~40% less work).
 pub async fn rerank<D: crate::directories::Directory + 'static>(
     searcher: &crate::index::Searcher<D>,
     candidates: &[SearchResult],
@@ -108,55 +131,113 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     let segments = searcher.segment_readers();
     let seg_by_id = searcher.segment_map();
 
-    // For each candidate, batch-read all its ordinals in one mmap call
-    // (vectors for the same doc are contiguous in the flat store)
-    let mut ordinal_scores: Vec<Vec<(u32, f32)>> = vec![Vec::new(); candidates.len()];
+    // ── Phase 1: Group candidates by segment ──────────────────────────────
+    let mut segment_groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     let mut skipped = 0u32;
-    let mut total_vectors = 0usize;
 
     for (ci, candidate) in candidates.iter().enumerate() {
-        let Some(&si) = seg_by_id.get(&candidate.segment_id) else {
+        if let Some(&si) = seg_by_id.get(&candidate.segment_id) {
+            segment_groups.entry(si).or_default().push(ci);
+        } else {
             skipped += 1;
+        }
+    }
+
+    // ── Phase 2: Per-segment batched resolve + read + score ───────────────
+    // Flat buffer: (candidate_idx, ordinal, score) — one allocation for all candidates.
+    // Multi-value docs produce multiple entries per candidate_idx.
+    let mut all_scores: Vec<(usize, u32, f32)> = Vec::new();
+    let mut total_vectors = 0usize;
+    // Reusable buffers across segments (avoids per-candidate allocation)
+    let mut raw_buf: Vec<u8> = Vec::new();
+    let mut scores_buf: Vec<f32> = Vec::new();
+
+    for (si, candidate_indices) in &segment_groups {
+        let Some(lazy_flat) = segments[*si].flat_vectors().get(&field_id) else {
+            skipped += candidate_indices.len() as u32;
             continue;
         };
-
-        let local_doc_id = candidate.doc_id - segments[si].doc_id_offset();
-        let Some(lazy_flat) = segments[si].flat_vectors().get(&field_id) else {
-            skipped += 1;
-            continue;
-        };
-
         if lazy_flat.dim != query_dim {
-            skipped += 1;
+            skipped += candidate_indices.len() as u32;
             continue;
         }
 
-        let (start, entries) = lazy_flat.flat_indexes_for_doc(local_doc_id);
-        if entries.is_empty() {
-            skipped += 1;
-            continue;
-        }
+        let vbs = lazy_flat.vector_byte_size();
+        let quant = lazy_flat.quantization;
 
-        let count = entries.len();
-        total_vectors += count;
-
-        // One batch read for all ordinals of this doc (contiguous in flat store)
-        let batch = match lazy_flat.read_vectors_batch(start, count).await {
-            Ok(b) => b,
-            Err(_) => {
+        // Resolve flat indexes for all candidates in this segment
+        // Each entry: (candidate_idx, flat_vector_idx, ordinal)
+        let mut resolved: Vec<(usize, usize, u32)> = Vec::new();
+        for &ci in candidate_indices {
+            let local_doc_id = candidates[ci].doc_id - segments[*si].doc_id_offset();
+            let (start, count) = lazy_flat.flat_indexes_for_doc_range(local_doc_id);
+            if count == 0 {
                 skipped += 1;
                 continue;
             }
-        };
+            for j in 0..count {
+                let (_, ordinal) = lazy_flat.get_doc_id(start + j);
+                resolved.push((ci, start + j, ordinal as u32));
+            }
+        }
 
-        let raw = batch.as_slice();
+        if resolved.is_empty() {
+            continue;
+        }
 
-        // Batch SIMD scoring: scores all vectors in one pass without per-vector dequantization
-        let mut scores = vec![0f32; count];
-        score_batch(query, raw, lazy_flat.quantization, query_dim, &mut scores);
+        let n = resolved.len();
+        total_vectors += n;
 
-        for (j, &(_doc_id, ordinal)) in entries.iter().enumerate() {
-            ordinal_scores[ci].push((ordinal as u32, scores[j]));
+        // Sort by flat_idx for sequential mmap access (better page locality)
+        resolved.sort_unstable_by_key(|&(_, flat_idx, _)| flat_idx);
+
+        // Coalesced range read: single mmap read covering [min_idx..max_idx+1],
+        // then selectively copy needed vectors. One page fault instead of N.
+        let first_idx = resolved[0].1;
+        let last_idx = resolved[n - 1].1;
+        let span = last_idx - first_idx + 1;
+
+        raw_buf.resize(n * vbs, 0);
+
+        // Use coalesced read if span waste is reasonable (< 4× the needed count),
+        // otherwise fall back to individual reads for very sparse patterns
+        if span <= n * 4 {
+            let range_bytes = match lazy_flat.read_vectors_batch(first_idx, span).await {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let rb = range_bytes.as_slice();
+            for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
+                let rel = flat_idx - first_idx;
+                let src = &rb[rel * vbs..(rel + 1) * vbs];
+                raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs].copy_from_slice(src);
+            }
+        } else {
+            for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
+                let _ = lazy_flat
+                    .read_vector_raw_into(
+                        flat_idx,
+                        &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
+                    )
+                    .await;
+            }
+        }
+
+        // Single batch SIMD scoring for all vectors in this segment
+        scores_buf.resize(n, 0.0);
+        score_batch(
+            query,
+            &raw_buf[..n * vbs],
+            quant,
+            query_dim,
+            &mut scores_buf[..n],
+            config.unit_norm,
+        );
+
+        // Append (candidate_idx, ordinal, score) to flat buffer
+        all_scores.reserve(n);
+        for (buf_idx, &(ci, _, ordinal)) in resolved.iter().enumerate() {
+            all_scores.push((ci, ordinal, scores_buf[buf_idx]));
         }
     }
 
@@ -171,22 +252,31 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         return Ok(Vec::new());
     }
 
-    // Combine per-candidate ordinal scores and build results
-    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len());
-    for (ci, ordinals) in ordinal_scores.into_iter().enumerate() {
-        if ordinals.is_empty() {
-            continue;
+    // ── Phase 3: Combine scores and build results ─────────────────────────
+    // Sort flat buffer by candidate_idx so contiguous runs belong to the same doc
+    all_scores.sort_unstable_by_key(|&(ci, _, _)| ci);
+
+    let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len().min(final_limit * 2));
+    let mut i = 0;
+    while i < all_scores.len() {
+        let ci = all_scores[i].0;
+        let run_start = i;
+        while i < all_scores.len() && all_scores[i].0 == ci {
+            i += 1;
         }
-        let combined = config.combiner.combine(&ordinals);
-        let mut positions: Vec<ScoredPosition> = ordinals
-            .into_iter()
-            .map(|(ord, score)| ScoredPosition::new(ord, score))
+        let run = &mut all_scores[run_start..i];
+
+        // Build (ordinal, score) slice for combiner
+        let ordinal_pairs: Vec<(u32, f32)> = run.iter().map(|&(_, ord, s)| (ord, s)).collect();
+        let combined = config.combiner.combine(&ordinal_pairs);
+
+        // Sort positions by score descending (best chunk first)
+        run.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let positions: Vec<ScoredPosition> = run
+            .iter()
+            .map(|&(_, ord, score)| ScoredPosition::new(ord, score))
             .collect();
-        positions.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+
         scored.push(SearchResult {
             doc_id: candidates[ci].doc_id,
             score: combined,
@@ -203,12 +293,13 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     scored.truncate(final_limit);
 
     log::debug!(
-        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors): read+score={:.1}ms total={:.1}ms",
+        "[reranker] field {}: {} candidates -> {} results (skipped {}, {} vectors, unit_norm={}): read+score={:.1}ms total={:.1}ms",
         field_id,
         candidates.len(),
         scored.len(),
         skipped,
         total_vectors,
+        config.unit_norm,
         read_score_elapsed.as_secs_f64() * 1000.0,
         t0.elapsed().as_secs_f64() * 1000.0,
     );
@@ -226,6 +317,7 @@ mod tests {
             field: Field(0),
             vector,
             combiner,
+            unit_norm: false,
         }
     }
 

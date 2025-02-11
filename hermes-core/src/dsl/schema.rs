@@ -178,10 +178,20 @@ pub struct DenseVectorConfig {
     /// Default: 1000 for RaBitQ, 10000 for IVF-RaBitQ/ScaNN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_threshold: Option<usize>,
+    /// Whether stored vectors are pre-normalized to unit L2 norm.
+    /// When true, scoring skips per-vector norm computation (cosine = dot / ||q||),
+    /// reducing compute by ~40%. Common for embedding models (e.g. OpenAI, Cohere).
+    /// Default: true (most embedding models produce L2-normalized vectors).
+    #[serde(default = "default_unit_norm")]
+    pub unit_norm: bool,
 }
 
 fn default_nprobe() -> usize {
     32
+}
+
+fn default_unit_norm() -> bool {
+    true
 }
 
 impl DenseVectorConfig {
@@ -193,6 +203,7 @@ impl DenseVectorConfig {
             num_clusters: None,
             nprobe: 32,
             build_threshold: None,
+            unit_norm: true,
         }
     }
 
@@ -205,6 +216,7 @@ impl DenseVectorConfig {
             num_clusters,
             nprobe,
             build_threshold: None,
+            unit_norm: true,
         }
     }
 
@@ -217,6 +229,7 @@ impl DenseVectorConfig {
             num_clusters,
             nprobe,
             build_threshold: None,
+            unit_norm: true,
         }
     }
 
@@ -229,6 +242,7 @@ impl DenseVectorConfig {
             num_clusters: None,
             nprobe: 0,
             build_threshold: None,
+            unit_norm: true,
         }
     }
 
@@ -241,6 +255,12 @@ impl DenseVectorConfig {
     /// Set build threshold for auto-building ANN index
     pub fn with_build_threshold(mut self, threshold: usize) -> Self {
         self.build_threshold = Some(threshold);
+        self
+    }
+
+    /// Mark vectors as pre-normalized to unit L2 norm
+    pub fn with_unit_norm(mut self) -> Self {
+        self.unit_norm = true;
         self
     }
 

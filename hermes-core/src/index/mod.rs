@@ -902,6 +902,7 @@ mod tests {
                 num_clusters: Some(4), // Small for test
                 nprobe: 2,
                 build_threshold: Some(50), // Build when we have 50+ vectors
+                unit_norm: false,
             },
         );
         let schema = schema_builder.build();
@@ -2095,6 +2096,7 @@ mod tests {
                 num_clusters: None,
                 nprobe: 0,
                 build_threshold: None,
+                unit_norm: false,
             },
         );
         let schema = sb.build();
@@ -2173,6 +2175,7 @@ mod tests {
                 num_clusters: None,
                 nprobe: 0,
                 build_threshold: None,
+                unit_norm: false,
             },
         );
         let schema = sb.build();

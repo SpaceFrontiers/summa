@@ -35,8 +35,6 @@ impl SegmentMemoryStats {
     }
 }
 
-use crate::structures::BlockSparsePostingList;
-
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -471,9 +469,12 @@ impl AsyncSegmentReader {
         quant: crate::dsl::DenseVectorQuantization,
         dim: usize,
         scores: &mut [f32],
+        unit_norm: bool,
     ) {
-        match quant {
-            crate::dsl::DenseVectorQuantization::F32 => {
+        use crate::dsl::DenseVectorQuantization;
+        use crate::structures::simd;
+        match (quant, unit_norm) {
+            (DenseVectorQuantization::F32, false) => {
                 let num_floats = scores.len() * dim;
                 debug_assert!(
                     (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
@@ -481,13 +482,29 @@ impl AsyncSegmentReader {
                 );
                 let vectors: &[f32] =
                     unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
-                crate::structures::simd::batch_cosine_scores(query, vectors, dim, scores);
+                simd::batch_cosine_scores(query, vectors, dim, scores);
             }
-            crate::dsl::DenseVectorQuantization::F16 => {
-                crate::structures::simd::batch_cosine_scores_f16(query, raw, dim, scores);
+            (DenseVectorQuantization::F32, true) => {
+                let num_floats = scores.len() * dim;
+                debug_assert!(
+                    (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                    "f32 vector data not 4-byte aligned"
+                );
+                let vectors: &[f32] =
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
+                simd::batch_dot_scores(query, vectors, dim, scores);
             }
-            crate::dsl::DenseVectorQuantization::UInt8 => {
-                crate::structures::simd::batch_cosine_scores_u8(query, raw, dim, scores);
+            (DenseVectorQuantization::F16, false) => {
+                simd::batch_cosine_scores_f16(query, raw, dim, scores);
+            }
+            (DenseVectorQuantization::F16, true) => {
+                simd::batch_dot_scores_f16(query, raw, dim, scores);
+            }
+            (DenseVectorQuantization::UInt8, false) => {
+                simd::batch_cosine_scores_u8(query, raw, dim, scores);
+            }
+            (DenseVectorQuantization::UInt8, true) => {
+                simd::batch_dot_scores_u8(query, raw, dim, scores);
             }
         }
     }
@@ -513,6 +530,13 @@ impl AsyncSegmentReader {
         if ann_index.is_none() && lazy_flat.is_none() {
             return Ok(Vec::new());
         }
+
+        // Check if vectors are pre-normalized (skip per-vector norm in scoring)
+        let unit_norm = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|e| e.dense_vector_config.as_ref())
+            .is_some_and(|c| c.unit_norm);
 
         /// Batch size for brute-force scoring (4096 vectors × 768 dims × 4 bytes ≈ 12MB)
         const BRUTE_FORCE_BATCH: usize = 4096;
@@ -595,7 +619,14 @@ impl AsyncSegmentReader {
                     .map_err(crate::Error::Io)?;
                 let raw = batch_bytes.as_slice();
 
-                Self::score_quantized_batch(query, raw, quant, dim, &mut scores[..batch_count]);
+                Self::score_quantized_batch(
+                    query,
+                    raw,
+                    quant,
+                    dim,
+                    &mut scores[..batch_count],
+                    unit_norm,
+                );
 
                 for (i, &score) in scores.iter().enumerate().take(batch_count) {
                     let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
@@ -664,7 +695,7 @@ impl AsyncSegmentReader {
                 // Native-precision batch SIMD cosine scoring
                 let t_score = std::time::Instant::now();
                 let mut scores = vec![0f32; resolved.len()];
-                Self::score_quantized_batch(query, &raw_buf, quant, dim, &mut scores);
+                Self::score_quantized_batch(query, &raw_buf, quant, dim, &mut scores, unit_norm);
                 let score_elapsed = t_score.elapsed();
 
                 // Write scores back to results
@@ -790,7 +821,7 @@ impl AsyncSegmentReader {
         combiner: crate::query::MultiValueCombiner,
         heap_factor: f32,
     ) -> Result<Vec<VectorSearchResult>> {
-        use crate::query::{BlockMaxScoreExecutor, BmpExecutor, SparseTermScorer};
+        use crate::query::BmpExecutor;
 
         let query_tokens = vector.len();
 
@@ -835,7 +866,7 @@ impl AsyncSegmentReader {
 
         // Select executor based on number of query terms:
         // - 12+ terms: BMP (block-at-a-time, lazy block loading, best for SPLADE)
-        // - 1-11 terms: BlockMaxScoreExecutor (unified MaxScore + block-max + conjunction)
+        // - 1-11 terms: LazyBlockMaxScoreExecutor (cursor-based traversal + lazy block loading)
         let num_terms = matched_terms.len();
         let over_fetch = limit * 2; // Over-fetch for multi-value combining
         let raw_results = if num_terms > 12 {
@@ -844,22 +875,16 @@ impl AsyncSegmentReader {
                 .execute()
                 .await?
         } else {
-            // Load posting lists only for the few terms (1-11) used by BlockMaxScore
-            let mut posting_lists: Vec<(u32, f32, Arc<BlockSparsePostingList>)> =
-                Vec::with_capacity(num_terms);
-            for &(dim_id, query_weight) in &matched_terms {
-                if let Some(pl) = sparse_index.get_posting(dim_id).await? {
-                    posting_lists.push((dim_id, query_weight, pl));
-                }
-            }
-            let scorers: Vec<SparseTermScorer> = posting_lists
-                .iter()
-                .map(|(_, query_weight, pl)| SparseTermScorer::from_arc(pl, *query_weight))
-                .collect();
-            if scorers.is_empty() {
-                return Ok(Vec::new());
-            }
-            BlockMaxScoreExecutor::with_heap_factor(scorers, over_fetch, heap_factor).execute()
+            // Lazy BlockMaxScore: skip entries drive navigation, blocks loaded on-demand.
+            // No upfront get_posting() — blocks only loaded when cursor actually visits them.
+            crate::query::LazyBlockMaxScoreExecutor::new(
+                sparse_index,
+                matched_terms,
+                over_fetch,
+                heap_factor,
+            )
+            .execute()
+            .await?
         };
 
         log::trace!(

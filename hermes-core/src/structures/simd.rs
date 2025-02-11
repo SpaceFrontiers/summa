@@ -2096,6 +2096,88 @@ mod neon_quant {
 
         (dot, norm)
     }
+
+    /// Dot product only for f16 vectors on NEON (no norm — for unit_norm vectors).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_product_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
+        let chunks8 = dim / 8;
+        let remainder = dim % 8;
+
+        let mut acc = vdupq_n_f32(0.0);
+
+        for c in 0..chunks8 {
+            let base = c * 8;
+            let v_raw = vld1q_u16(vec_f16.as_ptr().add(base));
+            let v_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(v_raw)));
+            let v_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(v_raw)));
+            let q_raw = vld1q_u16(query_f16.as_ptr().add(base));
+            let q_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(q_raw)));
+            let q_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(q_raw)));
+            acc = vfmaq_f32(acc, q_lo, v_lo);
+            acc = vfmaq_f32(acc, q_hi, v_hi);
+        }
+
+        let mut dot = vaddvq_f32(acc);
+        let base = chunks8 * 8;
+        for i in 0..remainder {
+            let v = super::f16_to_f32(*vec_f16.get_unchecked(base + i));
+            let q = super::f16_to_f32(*query_f16.get_unchecked(base + i));
+            dot += q * v;
+        }
+        dot
+    }
+
+    /// Dot product only for u8 vectors on NEON (no norm — for unit_norm vectors).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_product_u8(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
+        let scale = vdupq_n_f32(super::U8_INV_SCALE);
+        let offset = vdupq_n_f32(-1.0);
+        let chunks16 = dim / 16;
+        let remainder = dim % 16;
+
+        let mut acc = vdupq_n_f32(0.0);
+
+        for c in 0..chunks16 {
+            let base = c * 16;
+            let bytes = vld1q_u8(vec_u8.as_ptr().add(base));
+            let lo8 = vget_low_u8(bytes);
+            let hi8 = vget_high_u8(bytes);
+            let lo16 = vmovl_u8(lo8);
+            let hi16 = vmovl_u8(hi8);
+            let f0 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16))), scale),
+                offset,
+            );
+            let f1 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo16))), scale),
+                offset,
+            );
+            let f2 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16))), scale),
+                offset,
+            );
+            let f3 = vaddq_f32(
+                vmulq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi16))), scale),
+                offset,
+            );
+            let q0 = vld1q_f32(query.as_ptr().add(base));
+            let q1 = vld1q_f32(query.as_ptr().add(base + 4));
+            let q2 = vld1q_f32(query.as_ptr().add(base + 8));
+            let q3 = vld1q_f32(query.as_ptr().add(base + 12));
+            acc = vfmaq_f32(acc, q0, f0);
+            acc = vfmaq_f32(acc, q1, f1);
+            acc = vfmaq_f32(acc, q2, f2);
+            acc = vfmaq_f32(acc, q3, f3);
+        }
+
+        let mut dot = vaddvq_f32(acc);
+        let base = chunks16 * 16;
+        for i in 0..remainder {
+            let v = super::u8_to_f32(*vec_u8.get_unchecked(base + i));
+            dot += *query.get_unchecked(base + i) * v;
+        }
+        dot
+    }
 }
 
 // ============================================================================
@@ -2125,6 +2207,24 @@ fn fused_dot_norm_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f
         norm += v * v;
     }
     (dot, norm)
+}
+
+#[allow(dead_code)]
+fn dot_product_f16_scalar(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
+    let mut dot = 0.0f32;
+    for i in 0..dim {
+        dot += f16_to_f32(query_f16[i]) * f16_to_f32(vec_f16[i]);
+    }
+    dot
+}
+
+#[allow(dead_code)]
+fn dot_product_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
+    let mut dot = 0.0f32;
+    for i in 0..dim {
+        dot += query[i] * u8_to_f32(vec_u8[i]);
+    }
+    dot
 }
 
 // ============================================================================
@@ -2238,6 +2338,133 @@ unsafe fn fused_dot_norm_u8_sse(query: &[f32], vec_u8: &[u8], dim: usize) -> (f3
 }
 
 // ============================================================================
+// x86_64 F16C + AVX + FMA accelerated f16 scoring
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx", enable = "f16c", enable = "fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn fused_dot_norm_f16_f16c(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+    use std::arch::x86_64::*;
+
+    let chunks = dim / 8;
+    let remainder = dim % 8;
+
+    let mut acc_dot = _mm256_setzero_ps();
+    let mut acc_norm = _mm256_setzero_ps();
+
+    for chunk in 0..chunks {
+        let base = chunk * 8;
+        // Hardware f16→f32: 8 values at once via F16C
+        let v_raw = _mm_loadu_si128(vec_f16.as_ptr().add(base) as *const __m128i);
+        let vb = _mm256_cvtph_ps(v_raw);
+        let q_raw = _mm_loadu_si128(query_f16.as_ptr().add(base) as *const __m128i);
+        let qa = _mm256_cvtph_ps(q_raw);
+        acc_dot = _mm256_fmadd_ps(qa, vb, acc_dot);
+        acc_norm = _mm256_fmadd_ps(vb, vb, acc_norm);
+    }
+
+    // Horizontal sum 256→128→scalar
+    let hi_d = _mm256_extractf128_ps(acc_dot, 1);
+    let lo_d = _mm256_castps256_ps128(acc_dot);
+    let sum_d = _mm_add_ps(lo_d, hi_d);
+    let shuf_d = _mm_shuffle_ps(sum_d, sum_d, 0b10_11_00_01);
+    let sums_d = _mm_add_ps(sum_d, shuf_d);
+    let shuf2_d = _mm_movehl_ps(sums_d, sums_d);
+    let mut dot = _mm_cvtss_f32(_mm_add_ss(sums_d, shuf2_d));
+
+    let hi_n = _mm256_extractf128_ps(acc_norm, 1);
+    let lo_n = _mm256_castps256_ps128(acc_norm);
+    let sum_n = _mm_add_ps(lo_n, hi_n);
+    let shuf_n = _mm_shuffle_ps(sum_n, sum_n, 0b10_11_00_01);
+    let sums_n = _mm_add_ps(sum_n, shuf_n);
+    let shuf2_n = _mm_movehl_ps(sums_n, sums_n);
+    let mut norm = _mm_cvtss_f32(_mm_add_ss(sums_n, shuf2_n));
+
+    let base = chunks * 8;
+    for i in 0..remainder {
+        let v = f16_to_f32(*vec_f16.get_unchecked(base + i));
+        let q = f16_to_f32(*query_f16.get_unchecked(base + i));
+        dot += q * v;
+        norm += v * v;
+    }
+
+    (dot, norm)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx", enable = "f16c", enable = "fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_product_f16_f16c(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let chunks = dim / 8;
+    let remainder = dim % 8;
+    let mut acc = _mm256_setzero_ps();
+
+    for chunk in 0..chunks {
+        let base = chunk * 8;
+        let v_raw = _mm_loadu_si128(vec_f16.as_ptr().add(base) as *const __m128i);
+        let vb = _mm256_cvtph_ps(v_raw);
+        let q_raw = _mm_loadu_si128(query_f16.as_ptr().add(base) as *const __m128i);
+        let qa = _mm256_cvtph_ps(q_raw);
+        acc = _mm256_fmadd_ps(qa, vb, acc);
+    }
+
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let sum = _mm_add_ps(lo, hi);
+    let shuf = _mm_shuffle_ps(sum, sum, 0b10_11_00_01);
+    let sums = _mm_add_ps(sum, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let mut dot = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+
+    let base = chunks * 8;
+    for i in 0..remainder {
+        let v = f16_to_f32(*vec_f16.get_unchecked(base + i));
+        let q = f16_to_f32(*query_f16.get_unchecked(base + i));
+        dot += q * v;
+    }
+    dot
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2", enable = "sse4.1")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_product_u8_sse(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let scale = _mm_set1_ps(U8_INV_SCALE);
+    let offset = _mm_set1_ps(-1.0);
+    let chunks = dim / 4;
+    let remainder = dim % 4;
+    let mut acc = _mm_setzero_ps();
+
+    for chunk in 0..chunks {
+        let base = chunk * 4;
+        let bytes = _mm_cvtsi32_si128(std::ptr::read_unaligned(
+            vec_u8.as_ptr().add(base) as *const i32
+        ));
+        let ints = _mm_cvtepu8_epi32(bytes);
+        let floats = _mm_cvtepi32_ps(ints);
+        let vb = _mm_add_ps(_mm_mul_ps(floats, scale), offset);
+        let va = _mm_loadu_ps(query.as_ptr().add(base));
+        acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+    }
+
+    let shuf = _mm_shuffle_ps(acc, acc, 0b10_11_00_01);
+    let sums = _mm_add_ps(acc, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let mut dot = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+
+    let base = chunks * 4;
+    for i in 0..remainder {
+        dot += *query.get_unchecked(base + i) * u8_to_f32(*vec_u8.get_unchecked(base + i));
+    }
+    dot
+}
+
+// ============================================================================
 // Platform dispatch
 // ============================================================================
 
@@ -2250,6 +2477,9 @@ fn fused_dot_norm_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+            return unsafe { fused_dot_norm_f16_f16c(query_f16, vec_f16, dim) };
+        }
         if sse::is_available() {
             return unsafe { fused_dot_norm_f16_sse(query_f16, vec_f16, dim) };
         }
@@ -2275,6 +2505,44 @@ fn fused_dot_norm_u8(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
 
     #[allow(unreachable_code)]
     fused_dot_norm_u8_scalar(query, vec_u8, dim)
+}
+
+// ── Dot-product-only dispatch (for unit_norm vectors) ─────────────────────
+
+#[inline]
+fn dot_product_f16_quant(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { neon_quant::dot_product_f16(query_f16, vec_f16, dim) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+            return unsafe { dot_product_f16_f16c(query_f16, vec_f16, dim) };
+        }
+    }
+
+    #[allow(unreachable_code)]
+    dot_product_f16_scalar(query_f16, vec_f16, dim)
+}
+
+#[inline]
+fn dot_product_u8_quant(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { neon_quant::dot_product_u8(query, vec_u8, dim) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if sse::is_available() {
+            return unsafe { dot_product_u8_sse(query, vec_u8, dim) };
+        }
+    }
+
+    #[allow(unreachable_code)]
+    dot_product_u8_scalar(query, vec_u8, dim)
 }
 
 // ============================================================================
@@ -2362,6 +2630,105 @@ pub fn batch_cosine_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, sco
         } else {
             dot * inv_norm_q * fast_inv_sqrt(norm_v_sq)
         };
+    }
+}
+
+// ============================================================================
+// Batch dot-product scoring for unit-norm vectors
+// ============================================================================
+
+/// Batch dot-product scoring: f32 query vs N contiguous f32 unit-norm vectors.
+///
+/// For pre-normalized vectors (||v|| = 1), cosine = dot(q, v) / ||q||.
+/// Skips per-vector norm computation — ~40% less work than `batch_cosine_scores`.
+#[inline]
+pub fn batch_dot_scores(query: &[f32], vectors: &[f32], dim: usize, scores: &mut [f32]) {
+    let n = scores.len();
+    debug_assert!(vectors.len() >= n * dim);
+    debug_assert_eq!(query.len(), dim);
+
+    if dim == 0 || n == 0 {
+        return;
+    }
+
+    let norm_q_sq = dot_product_f32(query, query, dim);
+    if norm_q_sq < f32::EPSILON {
+        for s in scores.iter_mut() {
+            *s = 0.0;
+        }
+        return;
+    }
+    let inv_norm_q = fast_inv_sqrt(norm_q_sq);
+
+    for i in 0..n {
+        let vec = &vectors[i * dim..(i + 1) * dim];
+        let dot = dot_product_f32(query, vec, dim);
+        scores[i] = dot * inv_norm_q;
+    }
+}
+
+/// Batch dot-product scoring: f32 query vs N contiguous f16 unit-norm vectors.
+///
+/// For pre-normalized vectors (||v|| = 1), cosine = dot(q, v) / ||q||.
+/// Uses F16C/NEON hardware conversion + dot-only kernel.
+#[inline]
+pub fn batch_dot_scores_f16(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
+    let n = scores.len();
+    if dim == 0 || n == 0 {
+        return;
+    }
+
+    let norm_q_sq = dot_product_f32(query, query, dim);
+    if norm_q_sq < f32::EPSILON {
+        for s in scores.iter_mut() {
+            *s = 0.0;
+        }
+        return;
+    }
+    let inv_norm_q = fast_inv_sqrt(norm_q_sq);
+
+    let query_f16: Vec<u16> = query.iter().map(|&v| f32_to_f16(v)).collect();
+    let vec_bytes = dim * 2;
+    debug_assert!(vectors_raw.len() >= n * vec_bytes);
+    debug_assert!(
+        (vectors_raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()),
+        "f16 vector data not 2-byte aligned"
+    );
+
+    for i in 0..n {
+        let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
+        let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
+        let dot = dot_product_f16_quant(&query_f16, f16_slice, dim);
+        scores[i] = dot * inv_norm_q;
+    }
+}
+
+/// Batch dot-product scoring: f32 query vs N contiguous u8 unit-norm vectors.
+///
+/// For pre-normalized vectors (||v|| = 1), cosine = dot(q, v) / ||q||.
+/// Uses NEON/SSE widening chain for u8→f32 conversion + dot-only kernel.
+#[inline]
+pub fn batch_dot_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, scores: &mut [f32]) {
+    let n = scores.len();
+    if dim == 0 || n == 0 {
+        return;
+    }
+
+    let norm_q_sq = dot_product_f32(query, query, dim);
+    if norm_q_sq < f32::EPSILON {
+        for s in scores.iter_mut() {
+            *s = 0.0;
+        }
+        return;
+    }
+    let inv_norm_q = fast_inv_sqrt(norm_q_sq);
+
+    debug_assert!(vectors_raw.len() >= n * dim);
+
+    for i in 0..n {
+        let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
+        let dot = dot_product_u8_quant(query, u8_slice, dim);
+        scores[i] = dot * inv_norm_q;
     }
 }
 
