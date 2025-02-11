@@ -510,7 +510,7 @@ impl AsyncStoreReader {
                 .await?;
             let idx_start = dict_start + 4 + dict_len;
             (
-                Some(CompressionDict::from_bytes(dict_bytes.to_vec())),
+                Some(CompressionDict::from_owned_bytes(dict_bytes)),
                 idx_start,
             )
         } else {

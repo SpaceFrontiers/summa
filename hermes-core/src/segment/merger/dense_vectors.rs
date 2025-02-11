@@ -477,9 +477,10 @@ impl SegmentMerger {
                 for (seg_idx, segment) in segments.iter().enumerate() {
                     if let Some(lazy_flat) = segment.flat_vectors().get(&entry.field_id) {
                         let offset = doc_offs[seg_idx];
-                        let count = lazy_flat.doc_ids.len();
+                        let count = lazy_flat.num_vectors;
                         let mut buf = Vec::with_capacity(count * 6);
-                        for &(doc_id, ordinal) in &lazy_flat.doc_ids {
+                        for i in 0..count {
+                            let (doc_id, ordinal) = lazy_flat.get_doc_id(i);
                             buf.extend_from_slice(&(offset + doc_id).to_le_bytes());
                             buf.extend_from_slice(&ordinal.to_le_bytes());
                         }

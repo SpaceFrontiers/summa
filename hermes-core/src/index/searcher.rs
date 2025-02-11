@@ -232,18 +232,34 @@ impl<D: Directory + 'static> Searcher<D> {
             segments.push(Arc::new(reader));
         }
 
-        // Log searcher loading summary
+        // Log searcher loading summary with per-segment memory breakdown
         let total_docs: u32 = segments.iter().map(|s| s.meta().num_docs).sum();
-        let total_sparse_mem: usize = segments
-            .iter()
-            .flat_map(|s| s.sparse_indexes().values())
-            .map(|idx| idx.num_dimensions() * 12)
-            .sum();
+        let mut total_mem = 0usize;
+        for seg in &segments {
+            let stats = seg.memory_stats();
+            let seg_total = stats.total_bytes();
+            total_mem += seg_total;
+            log::info!(
+                "[searcher] segment {:016x}: docs={}, mem={:.2} MB \
+                 (term_dict={:.2} MB, store={:.2} MB, sparse={:.2} MB, dense={:.2} MB, bloom={:.2} MB)",
+                stats.segment_id,
+                stats.num_docs,
+                seg_total as f64 / (1024.0 * 1024.0),
+                stats.term_dict_cache_bytes as f64 / (1024.0 * 1024.0),
+                stats.store_cache_bytes as f64 / (1024.0 * 1024.0),
+                stats.sparse_index_bytes as f64 / (1024.0 * 1024.0),
+                stats.dense_index_bytes as f64 / (1024.0 * 1024.0),
+                stats.bloom_filter_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+        // Log process RSS if available (helps diagnose OOM)
+        let rss_mb = process_rss_mb();
         log::info!(
-            "[searcher] loaded {} segments: total_docs={}, sparse_index_mem={:.2} MB",
+            "[searcher] loaded {} segments: total_docs={}, estimated_mem={:.2} MB, process_rss={:.1} MB",
             segments.len(),
             total_docs,
-            total_sparse_mem as f64 / (1024.0 * 1024.0)
+            total_mem as f64 / (1024.0 * 1024.0),
+            rss_mb,
         );
 
         segments
@@ -609,5 +625,66 @@ impl<D: Directory + 'static> Searcher<D> {
         }
 
         Ok(None)
+    }
+}
+
+/// Get current process RSS in MB (best-effort, returns 0.0 on failure)
+fn process_rss_mb() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        // Read from /proc/self/status — VmRSS line
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let kb: f64 = rest
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0.0);
+                    return kb / 1024.0;
+                }
+            }
+        }
+        0.0
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Use mach_task_self / task_info via raw syscall
+        use std::mem;
+        #[repr(C)]
+        struct TaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        unsafe extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(task: u32, flavor: u32, info: *mut TaskBasicInfo, count: *mut u32) -> i32;
+        }
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        let mut info: TaskBasicInfo = unsafe { mem::zeroed() };
+        let mut count = (mem::size_of::<TaskBasicInfo>() / mem::size_of::<u32>()) as u32;
+        let ret = unsafe {
+            task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                &mut info,
+                &mut count,
+            )
+        };
+        if ret == 0 {
+            info.resident_size as f64 / (1024.0 * 1024.0)
+        } else {
+            0.0
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0.0
     }
 }

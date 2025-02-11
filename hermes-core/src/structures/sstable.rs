@@ -51,9 +51,63 @@ pub const BLOOM_HASH_COUNT: usize = 7;
 /// Simple bloom filter for key existence checks
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
-    bits: Vec<u64>,
+    bits: BloomBits,
     num_bits: usize,
     num_hashes: usize,
+}
+
+/// Bloom filter storage — Vec for write path, OwnedBytes for zero-copy read path.
+#[derive(Debug, Clone)]
+enum BloomBits {
+    /// Mutable storage for building (SSTable writer)
+    Vec(Vec<u64>),
+    /// Zero-copy mmap reference for reading (raw LE u64 words, no header)
+    Bytes(OwnedBytes),
+}
+
+impl BloomBits {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            BloomBits::Vec(v) => v.len(),
+            BloomBits::Bytes(b) => b.len() / 8,
+        }
+    }
+
+    #[inline]
+    fn get(&self, word_idx: usize) -> u64 {
+        match self {
+            BloomBits::Vec(v) => v[word_idx],
+            BloomBits::Bytes(b) => {
+                let off = word_idx * 8;
+                u64::from_le_bytes([
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                    b[off + 4],
+                    b[off + 5],
+                    b[off + 6],
+                    b[off + 7],
+                ])
+            }
+        }
+    }
+
+    #[inline]
+    fn set_bit(&mut self, word_idx: usize, bit_idx: usize) {
+        match self {
+            BloomBits::Vec(v) => v[word_idx] |= 1u64 << bit_idx,
+            BloomBits::Bytes(_) => panic!("cannot mutate read-only bloom filter"),
+        }
+    }
+
+    fn size_bytes(&self) -> usize {
+        match self {
+            BloomBits::Vec(v) => v.len() * 8,
+            BloomBits::Bytes(b) => b.len(),
+        }
+    }
 }
 
 impl BloomFilter {
@@ -62,39 +116,37 @@ impl BloomFilter {
         let num_bits = (expected_keys * bits_per_key).max(64);
         let num_words = num_bits.div_ceil(64);
         Self {
-            bits: vec![0u64; num_words],
+            bits: BloomBits::Vec(vec![0u64; num_words]),
             num_bits,
             num_hashes: BLOOM_HASH_COUNT,
         }
     }
 
-    /// Create from serialized bytes
-    pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
+    /// Create from serialized OwnedBytes (zero-copy for mmap)
+    pub fn from_owned_bytes(data: OwnedBytes) -> io::Result<Self> {
         if data.len() < 12 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Bloom filter data too short",
             ));
         }
-        let mut reader = data;
-        let num_bits = reader.read_u32::<LittleEndian>()? as usize;
-        let num_hashes = reader.read_u32::<LittleEndian>()? as usize;
-        let num_words = reader.read_u32::<LittleEndian>()? as usize;
+        let d = data.as_slice();
+        let num_bits = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize;
+        let num_hashes = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
+        let num_words = u32::from_le_bytes([d[8], d[9], d[10], d[11]]) as usize;
 
-        if reader.len() < num_words * 8 {
+        if d.len() < 12 + num_words * 8 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Bloom filter data truncated",
             ));
         }
 
-        let mut bits = Vec::with_capacity(num_words);
-        for _ in 0..num_words {
-            bits.push(reader.read_u64::<LittleEndian>()?);
-        }
+        // Slice past the 12-byte header to get raw u64 LE words (zero-copy)
+        let bits_bytes = data.slice(12..12 + num_words * 8);
 
         Ok(Self {
-            bits,
+            bits: BloomBits::Bytes(bits_bytes),
             num_bits,
             num_hashes,
         })
@@ -102,15 +154,15 @@ impl BloomFilter {
 
     /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(12 + self.bits.len() * 8);
+        let num_words = self.bits.len();
+        let mut data = Vec::with_capacity(12 + num_words * 8);
         data.write_u32::<LittleEndian>(self.num_bits as u32)
             .unwrap();
         data.write_u32::<LittleEndian>(self.num_hashes as u32)
             .unwrap();
-        data.write_u32::<LittleEndian>(self.bits.len() as u32)
-            .unwrap();
-        for &word in &self.bits {
-            data.write_u64::<LittleEndian>(word).unwrap();
+        data.write_u32::<LittleEndian>(num_words as u32).unwrap();
+        for i in 0..num_words {
+            data.write_u64::<LittleEndian>(self.bits.get(i)).unwrap();
         }
         data
     }
@@ -123,7 +175,7 @@ impl BloomFilter {
             let word_idx = bit_pos / 64;
             let bit_idx = bit_pos % 64;
             if word_idx < self.bits.len() {
-                self.bits[word_idx] |= 1u64 << bit_idx;
+                self.bits.set_bit(word_idx, bit_idx);
             }
         }
     }
@@ -136,7 +188,7 @@ impl BloomFilter {
             let bit_pos = self.get_bit_pos(h1, h2, i);
             let word_idx = bit_pos / 64;
             let bit_idx = bit_pos % 64;
-            if word_idx >= self.bits.len() || (self.bits[word_idx] & (1u64 << bit_idx)) == 0 {
+            if word_idx >= self.bits.len() || (self.bits.get(word_idx) & (1u64 << bit_idx)) == 0 {
                 return false;
             }
         }
@@ -145,7 +197,7 @@ impl BloomFilter {
 
     /// Size in bytes
     pub fn size_bytes(&self) -> usize {
-        12 + self.bits.len() * 8
+        12 + self.bits.size_bytes()
     }
 
     /// Insert a pre-computed hash pair into the filter
@@ -155,7 +207,7 @@ impl BloomFilter {
             let word_idx = bit_pos / 64;
             let bit_idx = bit_pos % 64;
             if word_idx < self.bits.len() {
-                self.bits[word_idx] |= 1u64 << bit_idx;
+                self.bits.set_bit(word_idx, bit_idx);
             }
         }
     }
@@ -1014,7 +1066,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             ));
         }
 
-        let index_data = OwnedBytes::new(idx_reader[..index_len].to_vec());
+        let index_data = index_bytes.slice(4..4 + index_len);
 
         // Try FST first (native), fall back to mmap
         #[cfg(feature = "native")]
@@ -1042,7 +1094,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             let bloom_data = file_handle
                 .read_bytes_range(bloom_start..bloom_start + bloom_size)
                 .await?;
-            Some(BloomFilter::from_bytes(&bloom_data)?)
+            Some(BloomFilter::from_owned_bytes(bloom_data)?)
         } else {
             None
         };
@@ -1063,7 +1115,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             let dict_data = file_handle
                 .read_bytes_range(dict_start + 4..dict_start + 4 + dict_len)
                 .await?;
-            Some(CompressionDict::from_bytes(dict_data.to_vec()))
+            Some(CompressionDict::from_owned_bytes(dict_data))
         } else {
             None
         };
@@ -1471,7 +1523,7 @@ mod tests {
         bloom.insert(b"key2");
 
         let bytes = bloom.to_bytes();
-        let restored = BloomFilter::from_bytes(&bytes).unwrap();
+        let restored = BloomFilter::from_owned_bytes(OwnedBytes::new(bytes)).unwrap();
 
         assert!(restored.may_contain(b"key1"));
         assert!(restored.may_contain(b"key2"));

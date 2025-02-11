@@ -1,15 +1,16 @@
-//! Sparse vector merge via byte-level block stacking.
+//! Sparse vector merge via byte-level block stacking (V3 format).
 //!
-//! File format (footer-based, data-first):
+//! V3 file layout (footer-based, data-first):
 //! ```text
-//! [posting data for all dims across all fields]
-//! [TOC: per-field header + per-dim entries]
-//! [footer: toc_offset(u64) + num_fields(u32) + magic(u32)]
+//! [block data for all dims across all fields]
+//! [skip section: SparseSkipEntry × total (20B each), contiguous]
+//! [TOC: per-field header(9B) + per-dim entries(24B each)]
+//! [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24B]
 //! ```
 //!
 //! Each dimension is merged by stacking raw block bytes from source segments.
 //! No deserialization or re-serialization of block data — only the small
-//! header and skip entries (20 bytes per block) are written fresh.
+//! skip entries (20 bytes per block) are written fresh in a separate section.
 //! The raw block bytes are copied directly from mmap.
 
 use std::io::Write;
@@ -21,30 +22,25 @@ use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::FieldType;
 use crate::segment::SparseIndex;
-use crate::segment::format::{SparseFieldToc, write_sparse_toc_and_footer};
+use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::structures::SparseSkipEntry;
 
 impl SegmentMerger {
-    /// Merge sparse vector indexes via byte-level block stacking.
+    /// Merge sparse vector indexes via byte-level block stacking (V3 format).
     ///
-    /// For each dimension, reads raw block data bytes from each source segment
-    /// (single mmap read per segment, zero deserialization) and writes:
-    ///   1. A new header (doc_count + global_max_weight + num_blocks)
-    ///   2. Adjusted skip entries (first_doc/last_doc += doc_offset, block offsets remapped)
-    ///   3. Raw block bytes copied directly from source segments
-    ///
-    /// Memory per dimension: only skip entries (~20 bytes × num_blocks) + mmap views.
-    /// TOC (~16 bytes per dim) is the only thing accumulated across dimensions.
+    /// V3 separates block data from skip entries:
+    ///   Phase 1: Write raw block data for all dims (copied from mmap)
+    ///   Phase 2: Write skip section (all skip entries contiguous)
+    ///   Phase 3: Write TOC (per-field header + per-dim entries with embedded metadata)
+    ///   Phase 4: Write 24-byte footer
     pub(super) async fn merge_sparse_vectors<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
         segments: &[SegmentReader],
         files: &SegmentFiles,
     ) -> Result<usize> {
-        use byteorder::{LittleEndian, WriteBytesExt};
-
         let doc_offs = doc_offsets(segments);
 
         // Collect all sparse vector fields from schema
@@ -61,7 +57,10 @@ impl SegmentMerger {
 
         let mut writer = OffsetWriter::new(dir.streaming_writer(&files.sparse).await?);
 
+        // Accumulated per-field data for TOC
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
+        // Accumulated skip entries (written in Phase 2)
+        let mut all_skip_entries: Vec<SparseSkipEntry> = Vec::new();
 
         for (field, sparse_config) in &sparse_fields {
             let quantization = sparse_config
@@ -100,7 +99,7 @@ impl SegmentMerger {
                 segments.len()
             );
 
-            let mut dim_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(all_dims.len());
+            let mut dim_toc_entries: Vec<SparseDimTocEntry> = Vec::with_capacity(all_dims.len());
 
             for &dim_id in &all_dims {
                 // Collect raw data from each segment (skip entries + raw block bytes)
@@ -117,7 +116,7 @@ impl SegmentMerger {
                     continue;
                 }
 
-                // Compute merged header values
+                // Compute merged metadata
                 let total_docs: u32 = sources.iter().map(|(r, _)| r.doc_count).sum();
                 let global_max: f32 = sources
                     .iter()
@@ -128,46 +127,39 @@ impl SegmentMerger {
                     .map(|(r, _)| r.skip_entries.len() as u32)
                     .sum();
 
-                let data_offset = writer.offset();
+                // Phase 1: Write block data only (no header, no skip entries)
+                let block_data_offset = writer.offset() as u32;
 
-                // Write posting list header: doc_count(4) + global_max_weight(4) + num_blocks(4)
-                writer.write_u32::<LittleEndian>(total_docs)?;
-                writer.write_f32::<LittleEndian>(global_max)?;
-                writer.write_u32::<LittleEndian>(total_blocks)?;
+                // Accumulate adjusted skip entries for Phase 2
+                let skip_start = all_skip_entries.len() as u32;
+                let mut cumulative_block_offset = 0u32;
 
-                // Write adjusted skip entries (block offsets remapped to merged layout)
-                let mut block_data_offset = 0u32;
+                // Block header layout: count(2) + doc_id_bits(1) + ordinal_bits(1)
+                //   + weight_quant(1) + pad(1) + pad(2) + first_doc_id(4, LE) + max_weight(4)
+                const FIRST_DOC_ID_OFFSET: usize = 8;
+                const BLOCK_HEADER_SIZE: usize = 16;
+
                 for (raw, doc_offset) in &sources {
-                    for entry in raw.skip_entries {
-                        let adjusted = SparseSkipEntry::new(
+                    // Adjust skip entries (doc offsets + block data offsets)
+                    for entry in &raw.skip_entries {
+                        all_skip_entries.push(SparseSkipEntry::new(
                             entry.first_doc + doc_offset,
                             entry.last_doc + doc_offset,
-                            block_data_offset + entry.offset,
+                            cumulative_block_offset + entry.offset,
                             entry.length,
                             entry.max_weight,
-                        );
-                        adjusted.write(&mut writer).map_err(crate::Error::Io)?;
+                        ));
                     }
                     // Advance cumulative offset by this source's total block data size
                     if let Some(last) = raw.skip_entries.last() {
-                        block_data_offset += last.offset + last.length;
+                        cumulative_block_offset += last.offset + last.length;
                     }
-                }
 
-                // Copy raw block data from each source, patching first_doc_id in each
-                // block header when doc_offset > 0.
-                // Block header layout: count(2) + doc_id_bits(1) + ordinal_bits(1)
-                //   + weight_quant(1) + pad(1) + pad(2) + first_doc_id(4, LE) + max_weight(4)
-                // So first_doc_id is at byte offset 8 within each block.
-                const FIRST_DOC_ID_OFFSET: usize = 8;
-                const BLOCK_HEADER_SIZE: usize = 16;
-                for (raw, doc_offset) in &sources {
+                    // Write raw block data, patching first_doc_id when doc_offset > 0
                     let data = raw.raw_block_data.as_slice();
                     if *doc_offset == 0 {
                         writer.write_all(data)?;
                     } else {
-                        // Write block-by-block, patching 4-byte first_doc_id inline.
-                        // Avoids cloning the entire raw_block_data buffer.
                         for (i, entry) in raw.skip_entries.iter().enumerate() {
                             let start = entry.offset as usize;
                             let end = if i + 1 < raw.skip_entries.len() {
@@ -177,16 +169,13 @@ impl SegmentMerger {
                             };
                             let block = &data[start..end];
                             if block.len() >= BLOCK_HEADER_SIZE {
-                                // Write header prefix (before first_doc_id)
                                 writer.write_all(&block[..FIRST_DOC_ID_OFFSET])?;
-                                // Write patched first_doc_id
                                 let old = u32::from_le_bytes(
                                     block[FIRST_DOC_ID_OFFSET..FIRST_DOC_ID_OFFSET + 4]
                                         .try_into()
                                         .unwrap(),
                                 );
                                 writer.write_all(&(old + doc_offset).to_le_bytes())?;
-                                // Write remainder of block
                                 writer.write_all(&block[FIRST_DOC_ID_OFFSET + 4..])?;
                             } else {
                                 writer.write_all(block)?;
@@ -195,16 +184,21 @@ impl SegmentMerger {
                     }
                 }
 
-                let posting_len = (writer.offset() - data_offset) as u32;
-                dim_entries.push((dim_id, data_offset, posting_len));
-                // sources (mmap views + skip entry refs) dropped here
+                dim_toc_entries.push(SparseDimTocEntry {
+                    dim_id,
+                    block_data_offset,
+                    skip_start,
+                    num_blocks: total_blocks,
+                    doc_count: total_docs,
+                    max_weight: global_max,
+                });
             }
 
-            if !dim_entries.is_empty() {
+            if !dim_toc_entries.is_empty() {
                 field_tocs.push(SparseFieldToc {
                     field_id: field.0,
                     quantization: quantization as u8,
-                    dims: dim_entries,
+                    dims: dim_toc_entries,
                 });
             }
         }
@@ -215,19 +209,27 @@ impl SegmentMerger {
             return Ok(0);
         }
 
+        // Phase 2: Write skip section (all skip entries contiguous)
+        let skip_offset = writer.offset();
+        for entry in &all_skip_entries {
+            entry.write(&mut writer).map_err(crate::Error::Io)?;
+        }
+
+        // Phase 3 + 4: Write TOC + footer
         let toc_offset = writer.offset();
-        write_sparse_toc_and_footer(&mut writer, toc_offset, &field_tocs)
+        write_sparse_toc_and_footer(&mut writer, skip_offset, toc_offset, &field_tocs)
             .map_err(crate::Error::Io)?;
 
         let output_size = writer.offset() as usize;
-        writer.finish()?;
+        writer.finish().map_err(crate::Error::Io)?;
 
         let total_dims: usize = field_tocs.iter().map(|f| f.dims.len()).sum();
         log::info!(
-            "[merge] sparse done: {} fields, {} dims, {}",
+            "[merge_sparse] file written: {:.2} MB ({} fields, {} dims, {} skip entries)",
+            output_size as f64 / (1024.0 * 1024.0),
             field_tocs.len(),
             total_dims,
-            super::format_bytes(output_size),
+            all_skip_entries.len(),
         );
 
         Ok(output_size)

@@ -6,14 +6,12 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use rustc_hash::FxHashMap;
 use std::io::Cursor;
 
-use crate::Result;
-use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
-use crate::dsl::Schema;
-use crate::structures::RaBitQIndex;
-
 use super::super::types::SegmentFiles;
 use super::super::vector_data::LazyFlatVectorData;
 use super::{SparseIndex, VectorIndex};
+use crate::Result;
+use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
+use crate::dsl::Schema;
 
 /// Vectors file loading result
 pub struct VectorsFileData {
@@ -145,11 +143,13 @@ pub async fn load_vectors_file<D: Directory>(
                 );
             }
             ann_build::RABITQ_TYPE => {
-                // RaBitQ (standalone)
+                // RaBitQ — lazy: OwnedBytes stored (zero-copy mmap ref),
+                // deserialized on first search. No heap copy during segment load.
                 let data = handle.read_bytes_range(offset..offset + length).await?;
-                if let Ok(rabitq_index) = serde_json::from_slice::<RaBitQIndex>(data.as_slice()) {
-                    indexes.insert(field_id, VectorIndex::RaBitQ(Arc::new(rabitq_index)));
-                }
+                indexes.insert(
+                    field_id,
+                    VectorIndex::RaBitQ(Arc::new(super::types::LazyRaBitQ::new(data))),
+                );
             }
             _ => {
                 log::warn!(
@@ -184,7 +184,7 @@ pub async fn load_sparse_file<D: Directory>(
     total_docs: u32,
     schema: &Schema,
 ) -> Result<FxHashMap<u32, SparseIndex>> {
-    use crate::segment::format::{FOOTER_SIZE, SPARSE_FOOTER_MAGIC};
+    use crate::segment::format::{SPARSE_FOOTER_MAGIC, SPARSE_FOOTER_SIZE};
 
     let mut indexes = FxHashMap::default();
 
@@ -206,13 +206,13 @@ pub async fn load_sparse_file<D: Directory>(
     };
 
     let file_size = handle.len();
-    if file_size < FOOTER_SIZE {
+    if file_size < SPARSE_FOOTER_SIZE {
         return Ok(indexes);
     }
 
-    // Read only footer (16 bytes) — not the entire file
+    // Read V3 footer (24 bytes): skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)
     let footer_bytes = match handle
-        .read_bytes_range(file_size - FOOTER_SIZE..file_size)
+        .read_bytes_range(file_size - SPARSE_FOOTER_SIZE..file_size)
         .await
     {
         Ok(d) => d,
@@ -220,10 +220,10 @@ pub async fn load_sparse_file<D: Directory>(
     };
     let fb = footer_bytes.as_slice();
 
-    // Parse footer: toc_offset(8) + num_fields(4) + magic(4)
-    let toc_offset = u64::from_le_bytes(fb[0..8].try_into().unwrap());
-    let num_fields = u32::from_le_bytes(fb[8..12].try_into().unwrap());
-    let magic = u32::from_le_bytes(fb[12..16].try_into().unwrap());
+    let skip_offset = u64::from_le_bytes(fb[0..8].try_into().unwrap());
+    let toc_offset = u64::from_le_bytes(fb[8..16].try_into().unwrap());
+    let num_fields = u32::from_le_bytes(fb[16..20].try_into().unwrap());
+    let magic = u32::from_le_bytes(fb[20..24].try_into().unwrap());
 
     if magic != SPARSE_FOOTER_MAGIC {
         return Err(crate::Error::Corruption(format!(
@@ -233,9 +233,10 @@ pub async fn load_sparse_file<D: Directory>(
     }
 
     log::debug!(
-        "Loading sparse file (lazy): size={} bytes, num_fields={}, toc_offset={}",
+        "Loading sparse V3: size={} bytes, num_fields={}, skip_offset={}, toc_offset={}",
         file_size,
         num_fields,
+        skip_offset,
         toc_offset,
     );
 
@@ -243,180 +244,68 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Read only the TOC section (toc_offset .. footer_start) — skip all posting block data
-    let toc_end = file_size - FOOTER_SIZE;
-    let toc_bytes = handle.read_bytes_range(toc_offset..toc_end).await?;
-    let toc_data = toc_bytes.as_slice();
+    // Single tail read: skip section + TOC (skip_offset .. footer_start)
+    // For mmap this is zero-copy. Block data at the front is never touched.
+    let tail_bytes = handle
+        .read_bytes_range(skip_offset..file_size - SPARSE_FOOTER_SIZE)
+        .await?;
+    let tail = tail_bytes.as_slice();
+
+    // skip section is at tail[0 .. toc_offset - skip_offset]
+    let skip_section_len = (toc_offset - skip_offset) as usize;
+    let skip_section = tail_bytes.slice(0..skip_section_len);
+    let toc_data = &tail[skip_section_len..];
+
+    // Parse TOC: per-field header(9B) + per-dim entries(24B each)
     let mut pos = 0usize;
 
-    // First pass: parse TOC to collect dimension metadata (dim_id, data_offset, posting_length)
-    // without reading any posting data yet.
-    struct DimTocEntry {
-        dim_id: u32,
-        data_offset: u64,
-        posting_length: u32,
-    }
-    struct FieldToc {
-        field_id: u32,
-        dims: Vec<DimTocEntry>,
-    }
-    let mut field_tocs = Vec::with_capacity(num_fields as usize);
     for _ in 0..num_fields {
         // Field header: field_id(4) + quant(1) + num_dims(4) = 9 bytes
-        let field_id = u32::from_le_bytes([
-            toc_data[pos],
-            toc_data[pos + 1],
-            toc_data[pos + 2],
-            toc_data[pos + 3],
-        ]);
+        let field_id = u32::from_le_bytes(toc_data[pos..pos + 4].try_into().unwrap());
         let _quantization = toc_data[pos + 4];
-        let ndims = u32::from_le_bytes([
-            toc_data[pos + 5],
-            toc_data[pos + 6],
-            toc_data[pos + 7],
-            toc_data[pos + 8],
-        ]);
+        let ndims = u32::from_le_bytes(toc_data[pos + 5..pos + 9].try_into().unwrap()) as usize;
         pos += 9;
 
-        let mut dims = Vec::with_capacity(ndims as usize);
+        // Parse V3 per-dim entries directly into SoA DimensionTable
+        let mut dims = super::types::DimensionTable::with_capacity(ndims);
         for _ in 0..ndims {
-            let dim_id = u32::from_le_bytes([
-                toc_data[pos],
-                toc_data[pos + 1],
-                toc_data[pos + 2],
-                toc_data[pos + 3],
-            ]);
-            let data_offset = u64::from_le_bytes([
-                toc_data[pos + 4],
-                toc_data[pos + 5],
-                toc_data[pos + 6],
-                toc_data[pos + 7],
-                toc_data[pos + 8],
-                toc_data[pos + 9],
-                toc_data[pos + 10],
-                toc_data[pos + 11],
-            ]);
-            let posting_length = u32::from_le_bytes([
-                toc_data[pos + 12],
-                toc_data[pos + 13],
-                toc_data[pos + 14],
-                toc_data[pos + 15],
-            ]);
-            pos += 16;
-            dims.push(DimTocEntry {
+            let d = &toc_data[pos..pos + 24];
+            let dim_id = u32::from_le_bytes(d[0..4].try_into().unwrap());
+            let block_data_offset = u32::from_le_bytes(d[4..8].try_into().unwrap());
+            let skip_start = u32::from_le_bytes(d[8..12].try_into().unwrap());
+            let num_blocks = u32::from_le_bytes(d[12..16].try_into().unwrap());
+            let doc_count = u32::from_le_bytes(d[16..20].try_into().unwrap());
+            let max_weight = f32::from_le_bytes(d[20..24].try_into().unwrap());
+            dims.push(
                 dim_id,
-                data_offset,
-                posting_length,
-            });
-        }
-        field_tocs.push(FieldToc { field_id, dims });
-    }
-
-    // Second pass: for each field, compute the contiguous header+skip region and
-    // read it in a single I/O call (avoids per-dimension reads).
-    for ftoc in &field_tocs {
-        if ftoc.dims.is_empty() {
-            continue;
-        }
-
-        // Posting data for dimensions within a field is written sequentially, so
-        // the headers+skip entries form a prefix of each posting, laid out one
-        // after another. We read the entire posting region and parse only the
-        // header+skip portion of each dimension, ignoring block data bytes.
-        let region_start = ftoc.dims.first().unwrap().data_offset;
-        let last = ftoc.dims.last().unwrap();
-        let region_end = last.data_offset + last.posting_length as u64;
-        let region_bytes = handle.read_bytes_range(region_start..region_end).await?;
-        let region = region_bytes.as_slice();
-
-        let mut dimensions: Vec<super::types::DimensionEntry> = Vec::with_capacity(ftoc.dims.len());
-        let mut all_skip_entries: Vec<crate::structures::SparseSkipEntry> = Vec::new();
-
-        for dim_entry in &ftoc.dims {
-            // Offset within region
-            let local = (dim_entry.data_offset - region_start) as usize;
-            let pl_data = &region[local..local + dim_entry.posting_length as usize];
-
-            // Parse posting header: doc_count(4) + global_max_weight(4) + num_blocks(4)
-            let doc_count = u32::from_le_bytes([pl_data[0], pl_data[1], pl_data[2], pl_data[3]]);
-            let global_max_weight =
-                f32::from_le_bytes([pl_data[4], pl_data[5], pl_data[6], pl_data[7]]);
-            let num_blocks =
-                u32::from_le_bytes([pl_data[8], pl_data[9], pl_data[10], pl_data[11]]) as usize;
-
-            // Parse skip entries (20 bytes each)
-            let skip_start = all_skip_entries.len() as u32;
-            let mut skip_pos = 12;
-            for _ in 0..num_blocks {
-                let first_doc = u32::from_le_bytes([
-                    pl_data[skip_pos],
-                    pl_data[skip_pos + 1],
-                    pl_data[skip_pos + 2],
-                    pl_data[skip_pos + 3],
-                ]);
-                let last_doc = u32::from_le_bytes([
-                    pl_data[skip_pos + 4],
-                    pl_data[skip_pos + 5],
-                    pl_data[skip_pos + 6],
-                    pl_data[skip_pos + 7],
-                ]);
-                let offset = u32::from_le_bytes([
-                    pl_data[skip_pos + 8],
-                    pl_data[skip_pos + 9],
-                    pl_data[skip_pos + 10],
-                    pl_data[skip_pos + 11],
-                ]);
-                let length = u32::from_le_bytes([
-                    pl_data[skip_pos + 12],
-                    pl_data[skip_pos + 13],
-                    pl_data[skip_pos + 14],
-                    pl_data[skip_pos + 15],
-                ]);
-                let max_weight = f32::from_le_bytes([
-                    pl_data[skip_pos + 16],
-                    pl_data[skip_pos + 17],
-                    pl_data[skip_pos + 18],
-                    pl_data[skip_pos + 19],
-                ]);
-                all_skip_entries.push(crate::structures::SparseSkipEntry::new(
-                    first_doc, last_doc, offset, length, max_weight,
-                ));
-                skip_pos += 20;
-            }
-
-            // data_offset points to posting start; block data starts after header + skip list
-            let header_size = 12 + num_blocks * 20;
-            dimensions.push(super::types::DimensionEntry {
-                dim_id: dim_entry.dim_id,
-                data_offset: dim_entry.data_offset + header_size as u64,
-                doc_count,
-                global_max_weight,
+                block_data_offset,
                 skip_start,
-                skip_count: num_blocks as u32,
-            });
+                num_blocks,
+                doc_count,
+                max_weight,
+            );
+            pos += 24;
         }
         // Ensure sorted by dim_id for binary search
-        dimensions.sort_by_key(|d| d.dim_id);
+        dims.sort_by_dim_id();
 
-        // total_vectors equals total_docs because doc_count per dimension
-        // already counts unique documents (not ordinals). The max(total_vectors,
-        // total_docs) in IDF computation is just a safety invariant.
+        // total_vectors equals total_docs (doc_count per dimension counts unique docs)
         let total_vectors = total_docs;
 
         log::debug!(
-            "Loaded sparse index for field {} (lazy): num_dims={}, total_docs={}, skip_entries={}",
-            ftoc.field_id,
-            ftoc.dims.len(),
+            "Loaded sparse V3 index for field {}: num_dims={}, total_docs={}, skip_bytes={}",
+            field_id,
+            dims.len(),
             total_docs,
-            all_skip_entries.len()
+            skip_section.len(),
         );
 
         indexes.insert(
-            ftoc.field_id,
+            field_id,
             SparseIndex::new(
                 handle.clone(),
-                dimensions,
-                all_skip_entries,
+                dims,
+                skip_section.clone(),
                 total_docs,
                 total_vectors,
             ),
@@ -424,7 +313,7 @@ pub async fn load_sparse_file<D: Directory>(
     }
 
     log::debug!(
-        "Sparse file loaded (lazy): fields={:?}",
+        "Sparse V3 file loaded: fields={:?}",
         indexes.keys().collect::<Vec<_>>()
     );
 

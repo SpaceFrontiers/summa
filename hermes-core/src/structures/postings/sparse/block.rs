@@ -216,6 +216,41 @@ impl SparseBlock {
         })
     }
 
+    /// Zero-copy constructor from OwnedBytes (mmap-backed).
+    ///
+    /// Parses the block header and sub-block length prefix, then slices the
+    /// OwnedBytes into doc_ids/ordinals/weights without any heap allocation.
+    /// The returned Vecs share the underlying mmap Arc via `.to_vec()` on the
+    /// small sub-slices (typically < 1KB each).
+    pub fn from_owned_bytes(data: crate::directories::OwnedBytes) -> crate::Result<Self> {
+        let b = data.as_slice();
+        if b.len() < BlockHeader::SIZE + 8 {
+            return Err(crate::Error::Corruption(
+                "sparse block too small".to_string(),
+            ));
+        }
+        let mut cursor = Cursor::new(&b[..BlockHeader::SIZE]);
+        let header =
+            BlockHeader::read(&mut cursor).map_err(|e| crate::Error::Corruption(e.to_string()))?;
+
+        let p = BlockHeader::SIZE;
+        let doc_ids_len = u16::from_le_bytes([b[p], b[p + 1]]) as usize;
+        let ordinals_len = u16::from_le_bytes([b[p + 2], b[p + 3]]) as usize;
+        let weights_len = u16::from_le_bytes([b[p + 4], b[p + 5]]) as usize;
+        // p+6..p+8 is padding
+
+        let data_start = p + 8;
+        let ord_start = data_start + doc_ids_len;
+        let wt_start = ord_start + ordinals_len;
+
+        Ok(Self {
+            header,
+            doc_ids_data: b[data_start..ord_start].to_vec(),
+            ordinals_data: b[ord_start..wt_start].to_vec(),
+            weights_data: b[wt_start..wt_start + weights_len].to_vec(),
+        })
+    }
+
     /// Create a copy of this block with first_doc_id adjusted by offset.
     ///
     /// This is used during merge to remap doc_ids from different segments.
@@ -330,7 +365,7 @@ impl BlockSparsePostingList {
         BlockSparsePostingIterator::new(self)
     }
 
-    /// Serialize with skip list header for lazy loading
+    /// Serialize with skip list header for lazy loading (V2 format, used by tests)
     ///
     /// Format:
     /// - doc_count: u32
@@ -373,6 +408,41 @@ impl BlockSparsePostingList {
         }
 
         Ok(())
+    }
+
+    /// V3 serialization: returns (block_data, skip_entries) separately.
+    ///
+    /// Block data and skip entries are written to different file sections.
+    /// The caller writes block data first, accumulates skip entries, then
+    /// writes all skip entries in a contiguous section at the file tail.
+    pub fn serialize_v3(&self) -> io::Result<(Vec<u8>, Vec<super::SparseSkipEntry>)> {
+        // Serialize all blocks to get their sizes
+        let mut block_data = Vec::new();
+        let mut skip_entries = Vec::with_capacity(self.blocks.len());
+        let mut offset = 0u32;
+
+        for block in &self.blocks {
+            let mut buf = Vec::new();
+            block.write(&mut buf)?;
+            let length = buf.len() as u32;
+
+            let first_doc = block.header.first_doc_id;
+            let doc_ids = block.decode_doc_ids();
+            let last_doc = doc_ids.last().copied().unwrap_or(first_doc);
+
+            skip_entries.push(super::SparseSkipEntry::new(
+                first_doc,
+                last_doc,
+                offset,
+                length,
+                block.header.max_weight,
+            ));
+
+            block_data.extend_from_slice(&buf);
+            offset += length;
+        }
+
+        Ok((block_data, skip_entries))
     }
 
     /// Deserialize fully (loads all blocks into memory)

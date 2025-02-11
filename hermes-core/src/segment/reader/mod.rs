@@ -215,12 +215,11 @@ impl AsyncSegmentReader {
         // Store cache: similar estimate
         let store_cache_bytes = self.store.cached_blocks() * 4096;
 
-        // Sparse index: each dimension has a posting list in memory
-        // Estimate: ~24 bytes per active dimension (HashMap entry overhead)
+        // Sparse index: SoA dim table + OwnedBytes skip section
         let sparse_index_bytes: usize = self
             .sparse_indexes
             .values()
-            .map(|s| s.num_dimensions() * 24)
+            .map(|s| s.estimated_memory_bytes())
             .sum();
 
         // Dense index: vectors are memory-mapped, but we track index structures
@@ -523,7 +522,10 @@ impl AsyncSegmentReader {
         let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
             // ANN search (RaBitQ, IVF, ScaNN)
             match index {
-                VectorIndex::RaBitQ(rabitq) => {
+                VectorIndex::RaBitQ(lazy) => {
+                    let rabitq = lazy.get().ok_or_else(|| {
+                        Error::Schema("RaBitQ index deserialization failed".to_string())
+                    })?;
                     let fetch_k = k * rerank_factor.max(1);
                     rabitq
                         .search(query, fetch_k, rerank_factor)
@@ -729,7 +731,7 @@ impl AsyncSegmentReader {
     /// Get the dense vector index for a field (if available)
     pub fn get_dense_vector_index(&self, field: Field) -> Option<Arc<RaBitQIndex>> {
         match self.vector_indexes.get(&field.0) {
-            Some(VectorIndex::RaBitQ(idx)) => Some(idx.clone()),
+            Some(VectorIndex::RaBitQ(lazy)) => lazy.get().cloned(),
             _ => None,
         }
     }

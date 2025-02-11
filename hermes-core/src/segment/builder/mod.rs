@@ -974,8 +974,10 @@ impl SegmentBuilder {
         schema: &Schema,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        use crate::segment::format::{SparseFieldToc, write_sparse_toc_and_footer};
-        use crate::structures::{BlockSparsePostingList, WeightQuantization};
+        use crate::segment::format::{
+            SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer,
+        };
+        use crate::structures::{BlockSparsePostingList, SparseSkipEntry, WeightQuantization};
 
         if sparse_vectors.is_empty() {
             return Ok(());
@@ -986,6 +988,7 @@ impl SegmentBuilder {
         field_ids.sort_unstable();
 
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
+        let mut all_skip_entries: Vec<SparseSkipEntry> = Vec::new();
         let mut current_offset = 0u64;
 
         for &field_id in &field_ids {
@@ -1006,13 +1009,11 @@ impl SegmentBuilder {
             let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
             let pruning_fraction = sparse_config.and_then(|c| c.posting_list_pruning);
 
-            // Parallel: sort + prune + serialize each dimension independently,
-            // then write sequentially. Each dimension's pipeline is CPU-bound
-            // and fully independent.
+            // Parallel: sort + prune + serialize_v3 each dimension independently
             let mut dims: Vec<_> = std::mem::take(&mut builder.postings).into_iter().collect();
             dims.sort_unstable_by_key(|(id, _)| *id);
 
-            let serialized_dims: Vec<(u32, Vec<u8>)> = dims
+            let serialized_dims: Vec<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> = dims
                 .into_par_iter()
                 .map(|(dim_id, mut postings)| {
                     postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
@@ -1039,25 +1040,45 @@ impl SegmentBuilder {
                     )
                     .map_err(crate::Error::Io)?;
 
-                    let mut buf = Vec::new();
-                    block_list.serialize(&mut buf).map_err(crate::Error::Io)?;
-                    Ok((dim_id, buf))
+                    let doc_count = block_list.doc_count;
+                    let (block_data, skip_entries) =
+                        block_list.serialize_v3().map_err(crate::Error::Io)?;
+                    Ok((dim_id, doc_count, block_data, skip_entries))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // Sequential write (preserves deterministic offset tracking)
-            let mut dim_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(serialized_dims.len());
-            for (dim_id, buf) in &serialized_dims {
-                writer.write_all(buf)?;
-                dim_entries.push((*dim_id, current_offset, buf.len() as u32));
-                current_offset += buf.len() as u64;
+            // Phase 1: Write block data sequentially, accumulate skip entries
+            let mut dim_toc_entries: Vec<SparseDimTocEntry> =
+                Vec::with_capacity(serialized_dims.len());
+            for (dim_id, doc_count, block_data, skip_entries) in &serialized_dims {
+                let block_data_offset = current_offset as u32;
+                let skip_start = all_skip_entries.len() as u32;
+                let num_blocks = skip_entries.len() as u32;
+                let max_weight = skip_entries
+                    .iter()
+                    .map(|e| e.max_weight)
+                    .fold(0.0f32, f32::max);
+
+                writer.write_all(block_data)?;
+                current_offset += block_data.len() as u64;
+
+                all_skip_entries.extend_from_slice(skip_entries);
+
+                dim_toc_entries.push(SparseDimTocEntry {
+                    dim_id: *dim_id,
+                    block_data_offset,
+                    skip_start,
+                    num_blocks,
+                    doc_count: *doc_count,
+                    max_weight,
+                });
             }
 
-            if !dim_entries.is_empty() {
+            if !dim_toc_entries.is_empty() {
                 field_tocs.push(SparseFieldToc {
                     field_id,
                     quantization: quantization as u8,
-                    dims: dim_entries,
+                    dims: dim_toc_entries,
                 });
             }
         }
@@ -1066,8 +1087,17 @@ impl SegmentBuilder {
             return Ok(());
         }
 
+        // Phase 2: Write skip section
+        let skip_offset = current_offset;
+        for entry in &all_skip_entries {
+            entry.write(writer).map_err(crate::Error::Io)?;
+        }
+        current_offset += (all_skip_entries.len() * SparseSkipEntry::SIZE) as u64;
+
+        // Phase 3+4: Write TOC + footer
         let toc_offset = current_offset;
-        write_sparse_toc_and_footer(writer, toc_offset, &field_tocs).map_err(crate::Error::Io)?;
+        write_sparse_toc_and_footer(writer, skip_offset, toc_offset, &field_tocs)
+            .map_err(crate::Error::Io)?;
 
         Ok(())
     }

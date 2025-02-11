@@ -1,6 +1,5 @@
 //! Types for segment reader
 
-use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
 
 use crate::DocId;
@@ -15,18 +14,57 @@ use crate::structures::{
 /// Raw flat vectors are stored separately in [`LazyFlatVectorData`] and accessed
 /// via mmap for reranking and merge. This enum only holds ANN indexes.
 ///
-/// IVF and ScaNN variants are **lazy**: `OwnedBytes` (zero-copy mmap ref) are
-/// stored on construction, bincode deserialization is deferred to first search
-/// access via `OnceLock`. No heap copies during segment load.
+/// All variants are **lazy**: `OwnedBytes` (zero-copy mmap ref) are stored on
+/// construction, deserialization is deferred to first search access via `OnceLock`.
+/// No heap copies during segment load.
 #[derive(Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum VectorIndex {
-    /// RaBitQ - binary quantization, good for small datasets
-    RaBitQ(Arc<RaBitQIndex>),
+    /// RaBitQ - lazy JSON deserialization on first access
+    RaBitQ(Arc<LazyRaBitQ>),
     /// IVF-RaBitQ - lazy deserialization on first access
     IVF(Arc<LazyIVF>),
     /// ScaNN (IVF-PQ) - lazy deserialization on first access
     ScaNN(Arc<LazyScaNN>),
+}
+
+/// Lazy RaBitQ index — defers serde_json deserialization to first access
+///
+/// Stores `OwnedBytes` which for mmap directories is a zero-copy reference.
+/// The mmap pages are only paged into physical RAM when deserialization happens.
+pub struct LazyRaBitQ {
+    raw: OwnedBytes,
+    resolved: OnceLock<Option<Arc<RaBitQIndex>>>,
+}
+
+impl LazyRaBitQ {
+    pub fn new(raw: OwnedBytes) -> Self {
+        Self {
+            raw,
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> Option<&Arc<RaBitQIndex>> {
+        self.resolved
+            .get_or_init(
+                || match serde_json::from_slice::<RaBitQIndex>(self.raw.as_slice()) {
+                    Ok(idx) => Some(Arc::new(idx)),
+                    Err(e) => {
+                        log::warn!("[lazy_rabitq] deserialization failed: {}", e);
+                        None
+                    }
+                },
+            )
+            .as_ref()
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        match self.resolved.get() {
+            Some(Some(idx)) => idx.estimated_memory_bytes(),
+            _ => self.raw.len(),
+        }
+    }
 }
 
 /// Lazy IVF-RaBitQ index — defers bincode deserialization to first access
@@ -117,7 +155,7 @@ impl VectorIndex {
     /// Estimate memory usage of this vector index
     pub fn estimated_memory_bytes(&self) -> usize {
         match self {
-            VectorIndex::RaBitQ(idx) => idx.estimated_memory_bytes(),
+            VectorIndex::RaBitQ(lazy) => lazy.estimated_memory_bytes(),
             VectorIndex::IVF(lazy) => lazy.estimated_memory_bytes(),
             VectorIndex::ScaNN(lazy) => lazy.estimated_memory_bytes(),
         }
@@ -126,11 +164,11 @@ impl VectorIndex {
 
 /// Raw dimension data for zero-copy merge (no block deserialization).
 ///
-/// Contains the skip entries (already in memory from segment open),
+/// Contains skip entries parsed on-demand from the mmap-backed skip section,
 /// metadata, and raw block data bytes read directly from mmap.
-pub struct DimRawData<'a> {
-    /// Skip entries for this dimension (borrowed from SparseIndex)
-    pub skip_entries: &'a [SparseSkipEntry],
+pub struct DimRawData {
+    /// Skip entries for this dimension (parsed from skip section)
+    pub skip_entries: Vec<SparseSkipEntry>,
     /// Total document count in this dimension's posting list
     pub doc_count: u32,
     /// Global max weight across all blocks
@@ -139,94 +177,178 @@ pub struct DimRawData<'a> {
     pub raw_block_data: crate::directories::OwnedBytes,
 }
 
-/// Sparse vector index for a field: lazy block loading via mmap
+/// SoA (Struct-of-Arrays) dimension table for cache-friendly access.
 ///
-/// Stores skip list per dimension (block metadata). Blocks loaded on-demand.
-/// Memory: only skip list headers in RAM, block data via mmap (OS page cache).
+/// Binary search only touches `dim_ids` (352KB for 88K dims, fits L2 cache).
+/// IDF computation only touches `doc_counts`. Scoring only touches `max_weights`.
+/// All arrays are parallel — same index accesses the same dimension.
+#[derive(Clone)]
+pub struct DimensionTable {
+    /// Dimension IDs, sorted for binary search
+    pub dim_ids: Vec<u32>,
+    /// Byte offset in file where block data starts (relative to file start)
+    pub block_offsets: Vec<u32>,
+    /// Index into the skip section (entry index, multiply by 20 for byte offset)
+    pub skip_starts: Vec<u32>,
+    /// Number of skip entries (= number of blocks) per dimension
+    pub skip_counts: Vec<u32>,
+    /// Total documents per dimension's posting list
+    pub doc_counts: Vec<u32>,
+    /// Global max weight per dimension
+    pub max_weights: Vec<f32>,
+}
+
+impl DimensionTable {
+    /// Create an empty table
+    pub fn new() -> Self {
+        Self {
+            dim_ids: Vec::new(),
+            block_offsets: Vec::new(),
+            skip_starts: Vec::new(),
+            skip_counts: Vec::new(),
+            doc_counts: Vec::new(),
+            max_weights: Vec::new(),
+        }
+    }
+
+    /// Create with pre-allocated capacity
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            dim_ids: Vec::with_capacity(cap),
+            block_offsets: Vec::with_capacity(cap),
+            skip_starts: Vec::with_capacity(cap),
+            skip_counts: Vec::with_capacity(cap),
+            doc_counts: Vec::with_capacity(cap),
+            max_weights: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Push a dimension entry
+    pub fn push(
+        &mut self,
+        dim_id: u32,
+        block_offset: u32,
+        skip_start: u32,
+        skip_count: u32,
+        doc_count: u32,
+        max_weight: f32,
+    ) {
+        self.dim_ids.push(dim_id);
+        self.block_offsets.push(block_offset);
+        self.skip_starts.push(skip_start);
+        self.skip_counts.push(skip_count);
+        self.doc_counts.push(doc_count);
+        self.max_weights.push(max_weight);
+    }
+
+    /// Sort all arrays by dim_id (for binary search)
+    pub fn sort_by_dim_id(&mut self) {
+        let mut indices: Vec<usize> = (0..self.dim_ids.len()).collect();
+        indices.sort_unstable_by_key(|&i| self.dim_ids[i]);
+        self.dim_ids = indices.iter().map(|&i| self.dim_ids[i]).collect();
+        self.block_offsets = indices.iter().map(|&i| self.block_offsets[i]).collect();
+        self.skip_starts = indices.iter().map(|&i| self.skip_starts[i]).collect();
+        self.skip_counts = indices.iter().map(|&i| self.skip_counts[i]).collect();
+        self.doc_counts = indices.iter().map(|&i| self.doc_counts[i]).collect();
+        self.max_weights = indices.iter().map(|&i| self.max_weights[i]).collect();
+    }
+
+    /// Number of dimensions
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.dim_ids.len()
+    }
+
+    /// Binary search for dim_id, returns index
+    #[inline]
+    pub fn find(&self, dim_id: u32) -> Option<usize> {
+        self.dim_ids.binary_search(&dim_id).ok()
+    }
+
+    /// Estimated heap memory in bytes (6 Vecs × capacity × element_size)
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let n = self.dim_ids.capacity();
+        n * (4 + 4 + 4 + 4 + 4 + 4) // u32×4 + f32×1 + u32×1 = 24 bytes per entry
+    }
+}
+
+/// Sparse vector index for a field: lazy block loading via mmap.
 ///
-/// Skip entries are stored in a single flat array shared across all dimensions
-/// (eliminates per-dimension heap allocations — one alloc instead of 73K+).
+/// V3 layout optimizations:
+/// - **SoA dimension table**: binary search only touches `dim_ids` array (352KB
+///   for 88K dims, fits L2 cache) instead of 2.8MB AoS.
+/// - **OwnedBytes skip section**: zero-copy mmap reference to the contiguous
+///   skip-entry region at the tail of the file. No heap allocation or parsing
+///   during segment load.
+/// - **Single tail read**: only footer + TOC + skip section are read during
+///   load; block data at the front of the file is never touched.
 #[derive(Clone)]
 pub struct SparseIndex {
-    /// Mmap file handle for sparse data
+    /// Mmap file handle for block data reads
     handle: LazyFileHandle,
-    /// Per-dimension data, sorted by dim_id for binary search
-    dimensions: Arc<Vec<DimensionEntry>>,
-    /// All skip entries in a single flat array (dimensions reference slices via skip_start/skip_count)
-    skip_entries: Arc<Vec<SparseSkipEntry>>,
+    /// SoA dimension table (sorted by dim_id)
+    dims: Arc<DimensionTable>,
+    /// Zero-copy skip section: all SparseSkipEntry structs contiguous (20B each)
+    skip_bytes: Arc<OwnedBytes>,
     /// Total document count in this segment (for IDF computation)
     pub total_docs: u32,
     /// Total sparse vectors in this segment (for multi-valued IDF)
     pub total_vectors: u32,
 }
 
-/// Per-dimension skip list data
-#[derive(Clone)]
-pub struct DimensionEntry {
-    pub dim_id: u32,
-    /// Base offset in file where block data starts for this dimension
-    pub data_offset: u64,
-    /// Total documents in this dimension's posting list
-    pub doc_count: u32,
-    /// Global max weight across all blocks
-    pub global_max_weight: f32,
-    /// Start index into the shared skip_entries flat array
-    pub skip_start: u32,
-    /// Number of skip entries for this dimension
-    pub skip_count: u32,
-}
-
 impl SparseIndex {
-    /// Create a new sparse index with lazy block loading
+    /// Create a new V3 sparse index with SoA dimension table and zero-copy skip section
     pub fn new(
         handle: LazyFileHandle,
-        dimensions: Vec<DimensionEntry>,
-        skip_entries: Vec<SparseSkipEntry>,
+        dims: DimensionTable,
+        skip_bytes: OwnedBytes,
         total_docs: u32,
         total_vectors: u32,
     ) -> Self {
         Self {
             handle,
-            dimensions: Arc::new(dimensions),
-            skip_entries: Arc::new(skip_entries),
+            dims: Arc::new(dims),
+            skip_bytes: Arc::new(skip_bytes),
             total_docs,
             total_vectors,
         }
     }
 
-    /// Find dimension entry via binary search
+    /// Parse a single skip entry from the zero-copy skip section
     #[inline]
-    fn get_dimension(&self, dim_id: u32) -> Option<&DimensionEntry> {
-        self.dimensions
-            .binary_search_by_key(&dim_id, |d| d.dim_id)
-            .ok()
-            .map(|idx| &self.dimensions[idx])
+    fn read_skip_entry(&self, entry_idx: usize) -> SparseSkipEntry {
+        let off = entry_idx * SparseSkipEntry::SIZE;
+        let d = &self.skip_bytes[off..off + SparseSkipEntry::SIZE];
+        SparseSkipEntry {
+            first_doc: u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+            last_doc: u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
+            offset: u32::from_le_bytes([d[8], d[9], d[10], d[11]]),
+            length: u32::from_le_bytes([d[12], d[13], d[14], d[15]]),
+            max_weight: f32::from_le_bytes([d[16], d[17], d[18], d[19]]),
+        }
     }
 
-    /// Get the skip entries slice for a dimension
-    #[inline]
-    fn dim_skip_entries(&self, dim: &DimensionEntry) -> &[SparseSkipEntry] {
-        let start = dim.skip_start as usize;
-        let end = start + dim.skip_count as usize;
-        &self.skip_entries[start..end]
+    /// Get skip entries for a dimension as a Vec (parsed from skip section)
+    fn dim_skip_entries_vec(&self, idx: usize) -> Vec<SparseSkipEntry> {
+        let start = self.dims.skip_starts[idx] as usize;
+        let count = self.dims.skip_counts[idx] as usize;
+        (0..count)
+            .map(|i| self.read_skip_entry(start + i))
+            .collect()
     }
 
     /// Load a single block via mmap (OS page cache handles caching)
-    async fn load_block(
-        &self,
-        dim: &DimensionEntry,
-        block_idx: usize,
-    ) -> crate::Result<SparseBlock> {
-        let skip = self.dim_skip_entries(dim);
-        let entry = &skip[block_idx];
-        let abs_offset = dim.data_offset + entry.offset as u64;
+    async fn load_block_at(&self, dim_idx: usize, block_idx: usize) -> crate::Result<SparseBlock> {
+        let entry = self.read_skip_entry(self.dims.skip_starts[dim_idx] as usize + block_idx);
+        let base = self.dims.block_offsets[dim_idx] as u64;
+        let abs_offset = base + entry.offset as u64;
         let data = self
             .handle
             .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
             .await
             .map_err(crate::Error::Io)?;
 
-        Ok(SparseBlock::read(&mut Cursor::new(data.as_slice()))?)
+        SparseBlock::from_owned_bytes(data)
     }
 
     /// Get posting list for a dimension (loads all blocks via mmap)
@@ -234,29 +356,28 @@ impl SparseIndex {
         &self,
         dim_id: u32,
     ) -> crate::Result<Option<Arc<BlockSparsePostingList>>> {
-        let dim = match self.get_dimension(dim_id) {
-            Some(d) => d,
+        let idx = match self.dims.find(dim_id) {
+            Some(i) => i,
             None => return Ok(None),
         };
 
-        // Load all blocks
-        let skip = self.dim_skip_entries(dim);
-        let mut blocks = Vec::with_capacity(skip.len());
-        for i in 0..skip.len() {
-            let block = self.load_block(dim, i).await?;
-            blocks.push(block);
+        let count = self.dims.skip_counts[idx] as usize;
+        let mut blocks = Vec::with_capacity(count);
+        for i in 0..count {
+            blocks.push(self.load_block_at(idx, i).await?);
         }
 
         Ok(Some(Arc::new(BlockSparsePostingList {
-            doc_count: dim.doc_count,
+            doc_count: self.dims.doc_counts[idx],
             blocks,
         })))
     }
 
-    /// Get skip list for a dimension (for block-max iteration without loading blocks)
-    pub fn get_skip_list(&self, dim_id: u32) -> Option<(&[SparseSkipEntry], f32)> {
-        self.get_dimension(dim_id)
-            .map(|d| (self.dim_skip_entries(d), d.global_max_weight))
+    /// Get skip list for a dimension (for block-max iteration without loading blocks).
+    /// Returns owned Vec since entries are parsed from zero-copy mmap bytes.
+    pub fn get_skip_list(&self, dim_id: u32) -> Option<(Vec<SparseSkipEntry>, f32)> {
+        let idx = self.dims.find(dim_id)?;
+        Some((self.dim_skip_entries_vec(idx), self.dims.max_weights[idx]))
     }
 
     /// Load specific block for a dimension
@@ -265,44 +386,42 @@ impl SparseIndex {
         dim_id: u32,
         block_idx: usize,
     ) -> crate::Result<Option<SparseBlock>> {
-        let dim = match self.get_dimension(dim_id) {
-            Some(d) => d,
+        let idx = match self.dims.find(dim_id) {
+            Some(i) => i,
             None => return Ok(None),
         };
-        let skip = self.dim_skip_entries(dim);
-        if block_idx >= skip.len() {
+        if block_idx >= self.dims.skip_counts[idx] as usize {
             return Ok(None);
         }
-        Ok(Some(self.load_block(dim, block_idx).await?))
+        Ok(Some(self.load_block_at(idx, block_idx).await?))
     }
 
     /// Check if dimension exists
     #[inline]
     pub fn has_dimension(&self, dim_id: u32) -> bool {
-        self.get_dimension(dim_id).is_some()
+        self.dims.find(dim_id).is_some()
     }
 
     /// Get the number of dimensions in the index
     #[inline]
     pub fn num_dimensions(&self) -> usize {
-        self.dimensions.len()
+        self.dims.len()
     }
 
     /// Iterate over all active dimension IDs
     pub fn active_dimensions(&self) -> impl Iterator<Item = u32> + '_ {
-        self.dimensions.iter().map(|d| d.dim_id)
+        self.dims.dim_ids.iter().copied()
     }
 
-    /// Get doc count for dimension (from skip list, no I/O)
+    /// Get doc count for dimension (from SoA table, no I/O)
     pub fn doc_count(&self, dim_id: u32) -> u32 {
-        self.get_dimension(dim_id).map(|d| d.doc_count).unwrap_or(0)
+        self.dims
+            .find(dim_id)
+            .map(|i| self.dims.doc_counts[i])
+            .unwrap_or(0)
     }
 
-    /// Compute IDF using doc_count from skip list
-    ///
-    /// doc_count tracks unique documents per dimension (not ordinals),
-    /// so df <= total_docs is always true. max(total_vectors, total_docs)
-    /// is a safety invariant.
+    /// Compute IDF using doc_count from SoA table
     #[inline]
     pub fn idf(&self, dim_id: u32) -> f32 {
         let df = self.doc_count(dim_id) as f32;
@@ -319,33 +438,42 @@ impl SparseIndex {
         dim_ids.iter().map(|&d| self.idf(d)).collect()
     }
 
+    /// Estimated memory usage in bytes
+    ///
+    /// - DimensionTable: SoA arrays (6 × ndims × 4 bytes)
+    /// - Skip section: OwnedBytes (Arc overhead only; data is mmap-backed)
+    /// - Handle: LazyFileHandle overhead
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let dim_table = self.dims.estimated_memory_bytes();
+        // OwnedBytes: just Arc + range (no heap copy for mmap)
+        let skip_overhead = std::mem::size_of::<OwnedBytes>() + self.skip_bytes.len();
+        dim_table + skip_overhead
+    }
+
     /// Get merge-level info for a dimension: skip entries, doc_count, global_max_weight,
     /// and raw block data bytes (single mmap read, zero deserialization).
-    ///
-    /// Used by sparse merge for O(blocks) byte-level block stacking: the caller
-    /// writes a new header + adjusted skip entries + copies raw bytes directly,
-    /// avoiding deserialize → clone → re-serialize overhead entirely.
-    pub async fn read_dim_raw(&self, dim_id: u32) -> crate::Result<Option<DimRawData<'_>>> {
-        let dim = match self.get_dimension(dim_id) {
-            Some(d) => d,
+    pub async fn read_dim_raw(&self, dim_id: u32) -> crate::Result<Option<DimRawData>> {
+        let idx = match self.dims.find(dim_id) {
+            Some(i) => i,
             None => return Ok(None),
         };
-        let skip = self.dim_skip_entries(dim);
+        let skip = self.dim_skip_entries_vec(idx);
         if skip.is_empty() {
             return Ok(None);
         }
         // Total block data size: last entry's (offset + length)
         let last = &skip[skip.len() - 1];
         let total_bytes = last.offset as u64 + last.length as u64;
+        let base = self.dims.block_offsets[idx] as u64;
         let raw = self
             .handle
-            .read_bytes_range(dim.data_offset..dim.data_offset + total_bytes)
+            .read_bytes_range(base..base + total_bytes)
             .await
             .map_err(crate::Error::Io)?;
         Ok(Some(DimRawData {
             skip_entries: skip,
-            doc_count: dim.doc_count,
-            global_max_weight: dim.global_max_weight,
+            doc_count: self.dims.doc_counts[idx],
+            global_max_weight: self.dims.max_weights[idx],
             raw_block_data: raw,
         }))
     }

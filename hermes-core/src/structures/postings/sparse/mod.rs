@@ -96,7 +96,7 @@ impl SparseSkipEntry {
     }
 
     /// Write skip entry to writer
-    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    pub fn write<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u32::<LittleEndian>(self.first_doc)?;
         writer.write_u32::<LittleEndian>(self.last_doc)?;
         writer.write_u32::<LittleEndian>(self.offset)?;

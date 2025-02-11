@@ -33,7 +33,7 @@ impl Default for CompressionLevel {
 /// Trained Zstd dictionary for improved compression
 #[derive(Clone)]
 pub struct CompressionDict {
-    raw_dict: Vec<u8>,
+    raw_dict: crate::directories::OwnedBytes,
 }
 
 impl CompressionDict {
@@ -43,17 +43,26 @@ impl CompressionDict {
     /// The dictionary size should typically be 16KB-112KB
     pub fn train(samples: &[&[u8]], dict_size: usize) -> io::Result<Self> {
         let raw_dict = zstd::dict::from_samples(samples, dict_size).map_err(io::Error::other)?;
-        Ok(Self { raw_dict })
+        Ok(Self {
+            raw_dict: crate::directories::OwnedBytes::new(raw_dict),
+        })
     }
 
     /// Create dictionary from raw bytes (for loading saved dictionaries)
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            raw_dict: crate::directories::OwnedBytes::new(bytes),
+        }
+    }
+
+    /// Create dictionary from OwnedBytes (zero-copy for mmap)
+    pub fn from_owned_bytes(bytes: crate::directories::OwnedBytes) -> Self {
         Self { raw_dict: bytes }
     }
 
     /// Get raw dictionary bytes (for saving)
     pub fn as_bytes(&self) -> &[u8] {
-        &self.raw_dict
+        self.raw_dict.as_slice()
     }
 
     /// Dictionary size in bytes
@@ -78,7 +87,7 @@ pub fn compress_with_dict(
     level: CompressionLevel,
     dict: &CompressionDict,
 ) -> io::Result<Vec<u8>> {
-    let mut encoder = zstd::Encoder::with_dictionary(Vec::new(), level.0, &dict.raw_dict)
+    let mut encoder = zstd::Encoder::with_dictionary(Vec::new(), level.0, dict.raw_dict.as_slice())
         .map_err(io::Error::other)?;
     encoder.write_all(data)?;
     encoder.finish().map_err(io::Error::other)
@@ -110,8 +119,8 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
 /// each store/sstable may use a different dictionary. The caller (block
 /// cache) ensures this is called only on cache misses.
 pub fn decompress_with_dict(data: &[u8], dict: &CompressionDict) -> io::Result<Vec<u8>> {
-    let mut decompressor =
-        zstd::bulk::Decompressor::with_dictionary(&dict.raw_dict).map_err(io::Error::other)?;
+    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict.raw_dict.as_slice())
+        .map_err(io::Error::other)?;
     decompressor
         .decompress(data, DECOMPRESS_CAPACITY)
         .map_err(io::Error::other)

@@ -153,9 +153,9 @@ impl FlatVectorData {
     }
 }
 
-/// Lazy flat vector data — doc_ids in memory, vectors accessed via range reads.
+/// Lazy flat vector data — zero-copy doc_id index, vectors via range reads.
 ///
-/// Only the doc_id index (~6 bytes/vector) is loaded into memory.
+/// The doc_id index is kept as `OwnedBytes` (mmap-backed, zero heap copy).
 /// Vector data stays on disk and is accessed via mmap-backed range reads.
 /// Element size depends on quantization: f32=4, f16=2, uint8=1 bytes/dim.
 ///
@@ -172,8 +172,8 @@ pub struct LazyFlatVectorData {
     pub num_vectors: usize,
     /// Storage quantization type
     pub quantization: DenseVectorQuantization,
-    /// In-memory doc_id index: (doc_id, ordinal) per vector
-    pub doc_ids: Vec<(u32, u16)>,
+    /// Zero-copy doc_id index: packed [u32_le doc_id + u16_le ordinal] × num_vectors
+    doc_ids_bytes: OwnedBytes,
     /// Lazy handle to this field's flat data region in the .vectors file
     handle: LazyFileSlice,
     /// Byte offset within handle where raw vector data starts (after header)
@@ -212,7 +212,7 @@ impl LazyFlatVectorData {
         })?;
         let element_size = quantization.element_size();
 
-        // Read doc_ids section (small: 6 bytes per vector)
+        // Read doc_ids section as zero-copy OwnedBytes (6 bytes per vector)
         let vectors_byte_len = num_vectors * dim * element_size;
         let doc_ids_start = (FLAT_BINARY_HEADER_SIZE + vectors_byte_len) as u64;
         let doc_ids_byte_len = (num_vectors * DOC_ID_ENTRY_SIZE) as u64;
@@ -220,21 +220,12 @@ impl LazyFlatVectorData {
         let doc_ids_bytes = handle
             .read_bytes_range(doc_ids_start..doc_ids_start + doc_ids_byte_len)
             .await?;
-        let d = doc_ids_bytes.as_slice();
-
-        let mut doc_ids = Vec::with_capacity(num_vectors);
-        for i in 0..num_vectors {
-            let off = i * DOC_ID_ENTRY_SIZE;
-            let doc_id = u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]]);
-            let ordinal = u16::from_le_bytes([d[off + 4], d[off + 5]]);
-            doc_ids.push((doc_id, ordinal));
-        }
 
         Ok(Self {
             dim,
             num_vectors,
             quantization,
-            doc_ids,
+            doc_ids_bytes,
             handle,
             vectors_offset: FLAT_BINARY_HEADER_SIZE as u64,
             element_size,
@@ -304,20 +295,55 @@ impl LazyFlatVectorData {
     /// Find flat indexes for a given doc_id via binary search on sorted doc_ids.
     ///
     /// doc_ids are sorted by (doc_id, ordinal) — segment builder adds docs
-    /// sequentially. Returns a slice of (doc_id, ordinal) entries; the position
-    /// of each entry in `self.doc_ids` is its flat vector index.
+    /// sequentially. Binary search runs directly on zero-copy mmap bytes.
     ///
-    /// Returns `(start_index, slice)` where start_index is the position in doc_ids.
-    pub fn flat_indexes_for_doc(&self, doc_id: u32) -> (usize, &[(u32, u16)]) {
-        let start = self.doc_ids.partition_point(|&(id, _)| id < doc_id);
-        let end = start + self.doc_ids[start..].partition_point(|&(id, _)| id == doc_id);
-        (start, &self.doc_ids[start..end])
+    /// Returns `(start_index, entries)` where start_index is the flat vector index.
+    pub fn flat_indexes_for_doc(&self, doc_id: u32) -> (usize, Vec<(u32, u16)>) {
+        let n = self.num_vectors;
+        // Binary search: find first entry where doc_id >= target
+        let start = {
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.doc_id_at(mid) < doc_id {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        // Collect entries with matching doc_id
+        let mut entries = Vec::new();
+        let mut i = start;
+        while i < n {
+            let (did, ord) = self.get_doc_id(i);
+            if did != doc_id {
+                break;
+            }
+            entries.push((did, ord));
+            i += 1;
+        }
+        (start, entries)
     }
 
-    /// Get doc_id and ordinal at index (from in-memory index).
+    /// Read doc_id at index from raw bytes (no ordinal).
+    #[inline]
+    fn doc_id_at(&self, idx: usize) -> u32 {
+        let off = idx * DOC_ID_ENTRY_SIZE;
+        let d = &self.doc_ids_bytes[off..];
+        u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+    }
+
+    /// Get doc_id and ordinal at index (parsed from zero-copy mmap bytes).
     #[inline]
     pub fn get_doc_id(&self, idx: usize) -> (u32, u16) {
-        self.doc_ids[idx]
+        let off = idx * DOC_ID_ENTRY_SIZE;
+        let d = &self.doc_ids_bytes[off..];
+        let doc_id = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+        let ordinal = u16::from_le_bytes([d[4], d[5]]);
+        (doc_id, ordinal)
     }
 
     /// Bytes per vector in storage.
@@ -341,9 +367,9 @@ impl LazyFlatVectorData {
         &self.handle
     }
 
-    /// Estimated memory usage (only doc_ids are in memory).
+    /// Estimated memory usage — doc_ids are mmap-backed (only Arc overhead).
     pub fn estimated_memory_bytes(&self) -> usize {
-        self.doc_ids.capacity() * size_of::<(u32, u16)>() + size_of::<Self>()
+        size_of::<Self>() + size_of::<OwnedBytes>()
     }
 }
 
