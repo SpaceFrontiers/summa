@@ -99,7 +99,7 @@ pub const SPARSE_FOOTER_SIZE: u64 = 24;
 pub struct SparseDimTocEntry {
     pub dim_id: u32,
     /// Absolute byte offset in file where block data starts for this dim
-    pub block_data_offset: u32,
+    pub block_data_offset: u64,
     /// Index into the global skip-entry array (entry index, not byte offset)
     pub skip_start: u32,
     /// Number of skip entries (= number of blocks)
@@ -142,7 +142,7 @@ pub fn write_sparse_toc_and_footer(
         writer.write_u32::<LittleEndian>(ftoc.dims.len() as u32)?;
         for d in &ftoc.dims {
             writer.write_u32::<LittleEndian>(d.dim_id)?;
-            writer.write_u32::<LittleEndian>(d.block_data_offset)?;
+            writer.write_u64::<LittleEndian>(d.block_data_offset)?;
             writer.write_u32::<LittleEndian>(d.skip_start)?;
             writer.write_u32::<LittleEndian>(d.num_blocks)?;
             writer.write_u32::<LittleEndian>(d.doc_count)?;

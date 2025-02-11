@@ -84,7 +84,7 @@ pub struct PostingWithPositions {
 pub struct PositionPostingList {
     /// Skip list: (base_doc_id, last_doc_id, byte_offset)
     /// Enables binary search to find the right block
-    skip_list: Vec<(DocId, DocId, u32)>,
+    skip_list: Vec<(DocId, DocId, u64)>,
     /// Compressed block data
     data: Vec<u8>,
     /// Total document count
@@ -125,7 +125,7 @@ impl PositionPostingList {
         let mut i = 0;
 
         while i < postings.len() {
-            let block_start = data.len() as u32;
+            let block_start = data.len() as u64;
             let block_end = (i + POSITION_BLOCK_SIZE).min(postings.len());
             let block = &postings[i..block_end];
 
@@ -174,7 +174,7 @@ impl PositionPostingList {
         };
 
         // Serialize this posting to data buffer
-        let block_start = self.data.len() as u32;
+        let block_start = self.data.len() as u64;
 
         // If this is first posting or we need a new block
         let need_new_block =
@@ -290,8 +290,8 @@ impl PositionPostingList {
     /// Format:
     /// ```text
     /// [block data: data_len bytes]
-    /// [skip entries: N × 12 bytes (base_doc, last_doc, offset)]
-    /// [footer: data_len(4) + skip_count(4) + doc_count(4) = 12 bytes]
+    /// [skip entries: N × 16 bytes (base_doc, last_doc, offset_u64)]
+    /// [footer: data_len(8) + skip_count(4) + doc_count(4) = 16 bytes]
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Data first
@@ -301,11 +301,11 @@ impl PositionPostingList {
         for (base_doc_id, last_doc_id, offset) in &self.skip_list {
             writer.write_u32::<LittleEndian>(*base_doc_id)?;
             writer.write_u32::<LittleEndian>(*last_doc_id)?;
-            writer.write_u32::<LittleEndian>(*offset)?;
+            writer.write_u64::<LittleEndian>(*offset)?;
         }
 
         // Footer
-        writer.write_u32::<LittleEndian>(self.data.len() as u32)?;
+        writer.write_u64::<LittleEndian>(self.data.len() as u64)?;
         writer.write_u32::<LittleEndian>(self.skip_list.len() as u32)?;
         writer.write_u32::<LittleEndian>(self.doc_count)?;
 
@@ -314,18 +314,18 @@ impl PositionPostingList {
 
     /// Deserialize from a byte slice (footer-based format).
     pub fn deserialize(raw: &[u8]) -> io::Result<Self> {
-        if raw.len() < 12 {
+        if raw.len() < 16 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "position data too short",
             ));
         }
 
-        // Parse footer (last 12 bytes)
-        let f = raw.len() - 12;
-        let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
-        let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
-        let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
+        // Parse footer (last 16 bytes)
+        let f = raw.len() - 16;
+        let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+        let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
 
         // Parse skip list (between data and footer)
         let mut skip_list = Vec::with_capacity(skip_count);
@@ -333,9 +333,9 @@ impl PositionPostingList {
         for _ in 0..skip_count {
             let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
             let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-            let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
+            let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
             skip_list.push((base, last, offset));
-            pos += 12;
+            pos += 16;
         }
 
         let data = raw[..data_len].to_vec();
@@ -364,7 +364,7 @@ impl PositionPostingList {
 
                 let new_base = base + doc_offset;
                 let new_last = last + doc_offset;
-                let new_offset = data.len() as u32;
+                let new_offset = data.len() as u64;
 
                 // Copy and adjust block data
                 let block_bytes = &source.data[src_offset as usize..next_offset];
@@ -404,7 +404,7 @@ impl PositionPostingList {
         writer: &mut W,
     ) -> io::Result<(u32, usize)> {
         struct RawSource<'a> {
-            skip_list: Vec<(u32, u32, u32)>,
+            skip_list: Vec<(u32, u32, u64)>,
             data: &'a [u8],
             doc_count: u32,
             doc_offset: u32,
@@ -412,22 +412,22 @@ impl PositionPostingList {
 
         let mut parsed: Vec<RawSource<'_>> = Vec::with_capacity(sources.len());
         for (raw, doc_offset) in sources {
-            if raw.len() < 12 {
+            if raw.len() < 16 {
                 continue;
             }
-            let f = raw.len() - 12;
-            let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
-            let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
-            let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
+            let f = raw.len() - 16;
+            let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+            let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+            let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
 
             let mut skip_list = Vec::with_capacity(skip_count);
             let mut pos = data_len;
             for _ in 0..skip_count {
                 let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
                 let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-                let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
+                let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
                 skip_list.push((base, last, offset));
-                pos += 12;
+                pos += 16;
             }
             parsed.push(RawSource {
                 skip_list,
@@ -440,8 +440,8 @@ impl PositionPostingList {
         let total_docs: u32 = parsed.iter().map(|s| s.doc_count).sum();
 
         // Phase 1: Stream block data with patched first_doc
-        let mut merged_skip: Vec<(u32, u32, u32)> = Vec::new();
-        let mut data_written = 0u32;
+        let mut merged_skip: Vec<(u32, u32, u64)> = Vec::new();
+        let mut data_written = 0u64;
         let mut patch_buf = [0u8; 8];
 
         for src in &parsed {
@@ -462,7 +462,7 @@ impl PositionPostingList {
                 writer.write_all(&patch_buf)?;
                 writer.write_all(&block[8..])?;
 
-                data_written += block.len() as u32;
+                data_written += block.len() as u64;
             }
         }
 
@@ -470,14 +470,14 @@ impl PositionPostingList {
         for (base, last, offset) in &merged_skip {
             writer.write_u32::<LittleEndian>(*base)?;
             writer.write_u32::<LittleEndian>(*last)?;
-            writer.write_u32::<LittleEndian>(*offset)?;
+            writer.write_u64::<LittleEndian>(*offset)?;
         }
 
-        writer.write_u32::<LittleEndian>(data_written)?;
+        writer.write_u64::<LittleEndian>(data_written)?;
         writer.write_u32::<LittleEndian>(merged_skip.len() as u32)?;
         writer.write_u32::<LittleEndian>(total_docs)?;
 
-        let total_bytes = data_written as usize + merged_skip.len() * 12 + 12;
+        let total_bytes = data_written as usize + merged_skip.len() * 16 + 16;
         Ok((total_docs, total_bytes))
     }
 

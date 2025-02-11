@@ -1,20 +1,111 @@
 //! Postings and positions streaming build.
 //!
-//! Parallel serialization of posting lists, then sequential streaming of
-//! term dict and postings data directly to writers.
+//! Includes in-memory posting builder types (TermKey, CompactPosting,
+//! PostingListBuilder, PositionPostingListBuilder) and the streaming
+//! serialization functions that flush them to disk.
 
 use std::io::Write;
 use std::mem::size_of;
 
 use hashbrown::HashMap;
-use lasso::Rodeo;
+use lasso::{Rodeo, Spur};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::Result;
 use crate::structures::{PostingList, SSTableWriter, TermInfo};
+use crate::{DocId, Result};
 
-use super::posting::{PositionPostingListBuilder, PostingListBuilder, SerializedPosting, TermKey};
+// ============================================================================
+// In-memory posting builder types
+// ============================================================================
+
+/// Interned term key combining field and term
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct TermKey {
+    pub field: u32,
+    pub term: Spur,
+}
+
+/// Compact posting entry for in-memory storage
+#[derive(Clone, Copy)]
+pub(super) struct CompactPosting {
+    pub doc_id: DocId,
+    pub term_freq: u16,
+}
+
+/// In-memory posting list for a term
+pub(super) struct PostingListBuilder {
+    /// In-memory postings
+    pub postings: Vec<CompactPosting>,
+}
+
+impl PostingListBuilder {
+    pub fn new() -> Self {
+        Self {
+            postings: Vec::with_capacity(4),
+        }
+    }
+
+    /// Add a posting, merging if same doc_id as last
+    #[inline]
+    pub fn add(&mut self, doc_id: DocId, term_freq: u32) {
+        // Check if we can merge with the last posting
+        if let Some(last) = self.postings.last_mut()
+            && last.doc_id == doc_id
+        {
+            last.term_freq = last.term_freq.saturating_add(term_freq as u16);
+            return;
+        }
+        self.postings.push(CompactPosting {
+            doc_id,
+            term_freq: term_freq.min(u16::MAX as u32) as u16,
+        });
+    }
+
+    pub fn len(&self) -> usize {
+        self.postings.len()
+    }
+}
+
+/// In-memory position posting list for a term (for fields with record_positions=true)
+pub(super) struct PositionPostingListBuilder {
+    /// Doc ID -> list of positions (encoded as element_ordinal << 20 | token_position)
+    pub postings: Vec<(DocId, Vec<u32>)>,
+}
+
+impl PositionPostingListBuilder {
+    pub fn new() -> Self {
+        Self {
+            postings: Vec::new(),
+        }
+    }
+
+    /// Add a position for a document
+    #[inline]
+    pub fn add_position(&mut self, doc_id: DocId, position: u32) {
+        if let Some((last_doc, positions)) = self.postings.last_mut()
+            && *last_doc == doc_id
+        {
+            positions.push(position);
+            return;
+        }
+        let mut positions = Vec::with_capacity(4);
+        positions.push(position);
+        self.postings.push((doc_id, positions));
+    }
+}
+
+/// Intermediate result for parallel posting serialization
+pub(super) enum SerializedPosting {
+    /// Inline posting (small enough to fit in TermInfo)
+    Inline(TermInfo),
+    /// External posting with serialized bytes
+    External { bytes: Vec<u8>, doc_count: u32 },
+}
+
+// ============================================================================
+// Streaming build functions
+// ============================================================================
 
 /// Stream postings directly to disk.
 ///
@@ -23,7 +114,7 @@ use super::posting::{PositionPostingListBuilder, PostingListBuilder, SerializedP
 pub(super) fn build_postings_streaming(
     inverted_index: HashMap<TermKey, PostingListBuilder>,
     term_interner: Rodeo,
-    position_offsets: &FxHashMap<Vec<u8>, (u64, u32)>,
+    position_offsets: &FxHashMap<Vec<u8>, (u64, u64)>,
     term_dict_writer: &mut dyn Write,
     postings_writer: &mut dyn Write,
 ) -> Result<()> {
@@ -92,7 +183,7 @@ pub(super) fn build_postings_streaming(
         let term_info = match serialized_posting {
             SerializedPosting::Inline(info) => info,
             SerializedPosting::External { bytes, doc_count } => {
-                let posting_len = bytes.len() as u32;
+                let posting_len = bytes.len() as u64;
                 postings_writer.write_all(&bytes)?;
 
                 let info = if let Some(&(pos_offset, pos_len)) = position_offsets.get(&key) {
@@ -106,7 +197,7 @@ pub(super) fn build_postings_streaming(
                 } else {
                     TermInfo::external(postings_offset, posting_len, doc_count)
                 };
-                postings_offset += posting_len as u64;
+                postings_offset += posting_len;
                 info
             }
         };
@@ -126,10 +217,10 @@ pub(super) fn build_positions_streaming(
     position_index: HashMap<TermKey, PositionPostingListBuilder>,
     term_interner: &Rodeo,
     writer: &mut dyn Write,
-) -> Result<FxHashMap<Vec<u8>, (u64, u32)>> {
+) -> Result<FxHashMap<Vec<u8>, (u64, u64)>> {
     use crate::structures::PositionPostingList;
 
-    let mut position_offsets: FxHashMap<Vec<u8>, (u64, u32)> = FxHashMap::default();
+    let mut position_offsets: FxHashMap<Vec<u8>, (u64, u64)> = FxHashMap::default();
 
     // Consume HashMap into Vec for sorting (owned, no borrowing)
     let mut entries: Vec<(Vec<u8>, PositionPostingListBuilder)> = position_index
@@ -159,7 +250,7 @@ pub(super) fn build_positions_streaming(
         pos_list.serialize(&mut buf).map_err(crate::Error::Io)?;
         writer.write_all(&buf)?;
 
-        position_offsets.insert(key, (current_offset, buf.len() as u32));
+        position_offsets.insert(key, (current_offset, buf.len() as u64));
         current_offset += buf.len() as u64;
     }
 

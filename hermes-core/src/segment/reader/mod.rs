@@ -3,6 +3,8 @@
 mod loader;
 mod types;
 
+#[cfg(feature = "diagnostics")]
+pub use types::DimRawData;
 pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
 
 /// Memory statistics for a single segment
@@ -288,7 +290,7 @@ impl AsyncSegmentReader {
         })?;
 
         let start = posting_offset;
-        let end = start + posting_len as u64;
+        let end = start + posting_len;
 
         if end > self.postings_handle.len() {
             return Err(Error::Corruption(
@@ -448,21 +450,21 @@ impl AsyncSegmentReader {
     }
 
     /// Read raw posting bytes at offset
-    pub async fn read_postings(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
+    pub async fn read_postings(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let start = offset;
-        let end = start + len as u64;
+        let end = start + len;
         let bytes = self.postings_handle.read_bytes_range(start..end).await?;
         Ok(bytes.to_vec())
     }
 
     /// Read raw position bytes at offset (for merge)
-    pub async fn read_position_bytes(&self, offset: u64, len: u32) -> Result<Option<Vec<u8>>> {
+    pub async fn read_position_bytes(&self, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
         let handle = match &self.positions_handle {
             Some(h) => h,
             None => return Ok(None),
         };
         let start = offset;
-        let end = start + len as u64;
+        let end = start + len;
         let bytes = handle.read_bytes_range(start..end).await?;
         Ok(Some(bytes.to_vec()))
     }
@@ -981,7 +983,7 @@ impl AsyncSegmentReader {
         };
 
         // Read the position data
-        let slice = handle.slice(offset..offset + length as u64);
+        let slice = handle.slice(offset..offset + length);
         let data = slice.read_bytes().await?;
 
         // Deserialize

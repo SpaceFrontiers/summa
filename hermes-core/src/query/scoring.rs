@@ -977,7 +977,7 @@ struct LazyTermCursor {
     /// Number of skip entries (blocks) for this dimension
     skip_count: usize,
     /// Base byte offset for block data (pre-resolved, avoids dim_id lookup per load)
-    block_data_offset: u32,
+    block_data_offset: u64,
     /// Current block index (0-based relative to this dimension's blocks)
     block_idx: usize,
     /// Decoded block data (loaded on demand, reused across seeks)
@@ -997,7 +997,7 @@ impl LazyTermCursor {
         skip_start: usize,
         skip_count: usize,
         global_max_weight: f32,
-        block_data_offset: u32,
+        block_data_offset: u64,
     ) -> Self {
         let exhausted = skip_count == 0;
         let abs_qw = query_weight.abs();

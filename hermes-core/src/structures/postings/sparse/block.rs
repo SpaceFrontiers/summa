@@ -105,7 +105,10 @@ impl SparseBlock {
         };
 
         let weights: Vec<f32> = postings.iter().map(|(_, _, w)| *w).collect();
-        let max_weight = weights.iter().copied().fold(0.0f32, f32::max);
+        let max_weight = weights
+            .iter()
+            .copied()
+            .fold(0.0f32, |acc, w| acc.max(w.abs()));
 
         let doc_ids_data = OwnedBytes::new({
             let rounded = simd::RoundedBitWidth::from_u8(doc_id_bits);
@@ -482,61 +485,16 @@ impl BlockSparsePostingList {
         BlockSparsePostingIterator::new(self)
     }
 
-    /// Serialize with skip list header for lazy loading (V2 format, used by tests)
-    ///
-    /// Format:
-    /// - doc_count: u32
-    /// - global_max_weight: f32
-    /// - num_blocks: u32
-    /// - skip_list: [SparseSkipEntry] × num_blocks (first_doc, last_doc, offset, length, max_weight)
-    /// - block_data: concatenated SparseBlock data
-    pub fn serialize<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        use super::SparseSkipEntry;
-
-        w.write_u32::<LittleEndian>(self.doc_count)?;
-        w.write_f32::<LittleEndian>(self.global_max_weight())?;
-        w.write_u32::<LittleEndian>(self.blocks.len() as u32)?;
-
-        // First pass: serialize blocks to get their sizes
-        let mut block_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
-            let mut buf = Vec::new();
-            block.write(&mut buf)?;
-            block_bytes.push(buf);
-        }
-
-        // Write skip list entries
-        let mut offset = 0u32;
-        for (block, bytes) in self.blocks.iter().zip(block_bytes.iter()) {
-            let first_doc = block.header.first_doc_id;
-            let doc_ids = block.decode_doc_ids();
-            let last_doc = doc_ids.last().copied().unwrap_or(first_doc);
-            let length = bytes.len() as u32;
-
-            let entry =
-                SparseSkipEntry::new(first_doc, last_doc, offset, length, block.header.max_weight);
-            entry.write(w)?;
-            offset += length;
-        }
-
-        // Write block data
-        for bytes in block_bytes {
-            w.write_all(&bytes)?;
-        }
-
-        Ok(())
-    }
-
-    /// V3 serialization: returns (block_data, skip_entries) separately.
+    /// Serialize: returns (block_data, skip_entries) separately.
     ///
     /// Block data and skip entries are written to different file sections.
     /// The caller writes block data first, accumulates skip entries, then
     /// writes all skip entries in a contiguous section at the file tail.
-    pub fn serialize_v3(&self) -> io::Result<(Vec<u8>, Vec<super::SparseSkipEntry>)> {
+    pub fn serialize(&self) -> io::Result<(Vec<u8>, Vec<super::SparseSkipEntry>)> {
         // Serialize all blocks to get their sizes
         let mut block_data = Vec::new();
         let mut skip_entries = Vec::with_capacity(self.blocks.len());
-        let mut offset = 0u32;
+        let mut offset = 0u64;
 
         for block in &self.blocks {
             let mut buf = Vec::new();
@@ -556,54 +514,31 @@ impl BlockSparsePostingList {
             ));
 
             block_data.extend_from_slice(&buf);
-            offset += length;
+            offset += length as u64;
         }
 
         Ok((block_data, skip_entries))
     }
 
-    /// Deserialize fully (loads all blocks into memory)
-    /// For lazy loading, use deserialize_header() + load_block()
-    pub fn deserialize<R: Read>(r: &mut R) -> io::Result<Self> {
-        use super::SparseSkipEntry;
-
-        let doc_count = r.read_u32::<LittleEndian>()?;
-        let _global_max_weight = r.read_f32::<LittleEndian>()?;
-        let num_blocks = r.read_u32::<LittleEndian>()? as usize;
-
-        // Skip the skip list entries
-        for _ in 0..num_blocks {
-            let _ = SparseSkipEntry::read(r)?;
-        }
-
-        // Read all blocks
-        let mut blocks = Vec::with_capacity(num_blocks);
-        for _ in 0..num_blocks {
-            blocks.push(SparseBlock::read(r)?);
+    /// Reconstruct from V3 serialized parts (block_data + skip_entries).
+    ///
+    /// Parses each block from the raw data using skip entry offsets.
+    /// Used for testing roundtrips; production uses lazy block loading.
+    #[cfg(test)]
+    pub fn from_parts(
+        doc_count: u32,
+        block_data: &[u8],
+        skip_entries: &[super::SparseSkipEntry],
+    ) -> io::Result<Self> {
+        let mut blocks = Vec::with_capacity(skip_entries.len());
+        for entry in skip_entries {
+            let start = entry.offset as usize;
+            let end = start + entry.length as usize;
+            blocks.push(SparseBlock::read(&mut std::io::Cursor::new(
+                &block_data[start..end],
+            ))?);
         }
         Ok(Self { doc_count, blocks })
-    }
-
-    /// Deserialize only the skip list header (for lazy loading)
-    /// Returns (doc_count, global_max_weight, skip_entries, header_size)
-    pub fn deserialize_header<R: Read>(
-        r: &mut R,
-    ) -> io::Result<(u32, f32, Vec<super::SparseSkipEntry>, usize)> {
-        use super::SparseSkipEntry;
-
-        let doc_count = r.read_u32::<LittleEndian>()?;
-        let global_max_weight = r.read_f32::<LittleEndian>()?;
-        let num_blocks = r.read_u32::<LittleEndian>()? as usize;
-
-        let mut entries = Vec::with_capacity(num_blocks);
-        for _ in 0..num_blocks {
-            entries.push(SparseSkipEntry::read(r)?);
-        }
-
-        // Header size: 4 + 4 + 4 + num_blocks * SparseSkipEntry::SIZE
-        let header_size = 4 + 4 + 4 + num_blocks * SparseSkipEntry::SIZE;
-
-        Ok((doc_count, global_max_weight, entries, header_size))
     }
 
     pub fn decode_all(&self) -> Vec<(DocId, u16, f32)> {
@@ -1013,9 +948,10 @@ mod tests {
         let list =
             BlockSparsePostingList::from_postings(&postings, WeightQuantization::UInt8).unwrap();
 
-        let mut buf = Vec::new();
-        list.serialize(&mut buf).unwrap();
-        let list2 = BlockSparsePostingList::deserialize(&mut Cursor::new(&buf)).unwrap();
+        let (block_data, skip_entries) = list.serialize().unwrap();
+        let list2 =
+            BlockSparsePostingList::from_parts(list.doc_count(), &block_data, &skip_entries)
+                .unwrap();
 
         assert_eq!(list.doc_count(), list2.doc_count());
     }
@@ -1119,13 +1055,11 @@ mod tests {
         // Merge with offset 100 for segment 2
         let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
 
-        // Serialize
-        let mut bytes = Vec::new();
-        merged.serialize(&mut bytes).unwrap();
-
-        // Deserialize
-        let mut cursor = std::io::Cursor::new(&bytes);
-        let loaded = BlockSparsePostingList::deserialize(&mut cursor).unwrap();
+        // Serialize + reconstruct
+        let (block_data, skip_entries) = merged.serialize().unwrap();
+        let loaded =
+            BlockSparsePostingList::from_parts(merged.doc_count(), &block_data, &skip_entries)
+                .unwrap();
 
         // Verify doc_ids are preserved after round-trip
         let decoded = loaded.decode_all();
@@ -1170,11 +1104,11 @@ mod tests {
         // Merge with offset 1000 for segment 2
         let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 1000)]);
 
-        // Serialize and deserialize (simulating what happens after merge file is written)
-        let mut bytes = Vec::new();
-        merged.serialize(&mut bytes).unwrap();
+        // Serialize + reconstruct
+        let (block_data, skip_entries) = merged.serialize().unwrap();
         let loaded =
-            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+            BlockSparsePostingList::from_parts(merged.doc_count(), &block_data, &skip_entries)
+                .unwrap();
 
         // Test seeking to various positions
         let mut iter = loaded.iterator();
@@ -1250,8 +1184,8 @@ mod tests {
     }
 
     /// Test the zero-copy merge path used by the actual sparse merger:
-    /// serialize → parse raw skip entries + block data → patch first_doc_id → reassemble.
-    /// This is the exact code path in `segment/merger/sparse_vectors.rs`.
+    /// serialize → get raw skip entries + block data → patch first_doc_id → reassemble.
+    /// This mirrors the code path in `segment/merger/sparse.rs`.
     #[test]
     fn test_zero_copy_merge_patches_first_doc_id() {
         use crate::structures::SparseSkipEntry;
@@ -1266,76 +1200,42 @@ mod tests {
         let list2 =
             BlockSparsePostingList::from_postings(&postings2, WeightQuantization::Float32).unwrap();
 
-        // Serialize both (this is what the builder writes to disk)
-        let mut bytes1 = Vec::new();
-        list1.serialize(&mut bytes1).unwrap();
-        let mut bytes2 = Vec::new();
-        list2.serialize(&mut bytes2).unwrap();
-
-        // --- Simulate read_dim_raw: parse header + skip entries, extract raw block data ---
-        fn parse_raw(data: &[u8]) -> (u32, f32, Vec<SparseSkipEntry>, &[u8]) {
-            let doc_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
-            let global_max = f32::from_le_bytes(data[4..8].try_into().unwrap());
-            let num_blocks = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
-            let mut pos = 12;
-            let mut skip = Vec::new();
-            for _ in 0..num_blocks {
-                let first_doc = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-                let last_doc = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-                let offset = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap());
-                let length = u32::from_le_bytes(data[pos + 12..pos + 16].try_into().unwrap());
-                let max_w = f32::from_le_bytes(data[pos + 16..pos + 20].try_into().unwrap());
-                skip.push(SparseSkipEntry::new(
-                    first_doc, last_doc, offset, length, max_w,
-                ));
-                pos += 20;
-            }
-            (doc_count, global_max, skip, &data[pos..])
-        }
-
-        let (dc1, gm1, skip1, raw1) = parse_raw(&bytes1);
-        let (dc2, gm2, skip2, raw2) = parse_raw(&bytes2);
+        // Serialize both using V3 format (block_data + skip_entries)
+        let (raw1, skip1) = list1.serialize().unwrap();
+        let (raw2, skip2) = list2.serialize().unwrap();
 
         // --- Simulate the merger's zero-copy reassembly ---
         let doc_offset: u32 = 1000; // segment 2 starts at doc 1000
-        let total_docs = dc1 + dc2;
-        let global_max = gm1.max(gm2);
-        let total_blocks = (skip1.len() + skip2.len()) as u32;
+        let total_docs = list1.doc_count() + list2.doc_count();
 
-        let mut output = Vec::new();
-        // Write header
-        output.extend_from_slice(&total_docs.to_le_bytes());
-        output.extend_from_slice(&global_max.to_le_bytes());
-        output.extend_from_slice(&total_blocks.to_le_bytes());
-
-        // Write adjusted skip entries
-        let mut block_data_offset = 0u32;
+        // Accumulate adjusted skip entries
+        let mut merged_skip = Vec::new();
+        let mut cumulative_offset = 0u64;
         for entry in &skip1 {
-            let adjusted = SparseSkipEntry::new(
+            merged_skip.push(SparseSkipEntry::new(
                 entry.first_doc,
                 entry.last_doc,
-                block_data_offset + entry.offset,
+                cumulative_offset + entry.offset,
                 entry.length,
                 entry.max_weight,
-            );
-            adjusted.write(&mut output).unwrap();
+            ));
         }
         if let Some(last) = skip1.last() {
-            block_data_offset += last.offset + last.length;
+            cumulative_offset += last.offset + last.length as u64;
         }
         for entry in &skip2 {
-            let adjusted = SparseSkipEntry::new(
+            merged_skip.push(SparseSkipEntry::new(
                 entry.first_doc + doc_offset,
                 entry.last_doc + doc_offset,
-                block_data_offset + entry.offset,
+                cumulative_offset + entry.offset,
                 entry.length,
                 entry.max_weight,
-            );
-            adjusted.write(&mut output).unwrap();
+            ));
         }
 
-        // Write raw block data: source 1 verbatim, source 2 with first_doc_id patched
-        output.extend_from_slice(raw1);
+        // Concatenate raw block data: source 1 verbatim, source 2 with first_doc_id patched
+        let mut merged_block_data = Vec::new();
+        merged_block_data.extend_from_slice(&raw1);
 
         const FIRST_DOC_ID_OFFSET: usize = 8;
         let mut buf2 = raw2.to_vec();
@@ -1347,10 +1247,12 @@ mod tests {
                 buf2[off..off + 4].copy_from_slice(&patched);
             }
         }
-        output.extend_from_slice(&buf2);
+        merged_block_data.extend_from_slice(&buf2);
 
-        // --- Deserialize the reassembled posting list and verify ---
-        let loaded = BlockSparsePostingList::deserialize(&mut Cursor::new(&output)).unwrap();
+        // --- Reconstruct and verify ---
+        let loaded =
+            BlockSparsePostingList::from_parts(total_docs, &merged_block_data, &merged_skip)
+                .unwrap();
         assert_eq!(loaded.doc_count(), 350);
 
         let mut iter = loaded.iterator();
@@ -1418,9 +1320,10 @@ mod tests {
             BlockSparsePostingList::from_postings(&postings, WeightQuantization::Float32).unwrap();
         assert_eq!(list.doc_count(), 2);
 
-        let mut buf = Vec::new();
-        list.serialize(&mut buf).unwrap();
-        let loaded = BlockSparsePostingList::deserialize(&mut Cursor::new(&buf)).unwrap();
+        let (block_data, skip_entries) = list.serialize().unwrap();
+        let loaded =
+            BlockSparsePostingList::from_parts(list.doc_count(), &block_data, &skip_entries)
+                .unwrap();
         assert_eq!(loaded.doc_count(), 2);
     }
 
@@ -1438,11 +1341,11 @@ mod tests {
         // Merge with offset 100 for segment 2
         let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
 
-        // Serialize and deserialize
-        let mut bytes = Vec::new();
-        merged.serialize(&mut bytes).unwrap();
+        // Serialize + reconstruct
+        let (block_data, skip_entries) = merged.serialize().unwrap();
         let loaded =
-            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+            BlockSparsePostingList::from_parts(merged.doc_count(), &block_data, &skip_entries)
+                .unwrap();
 
         // Verify all postings via iterator
         let mut iter = loaded.iterator();
@@ -1541,10 +1444,10 @@ mod tests {
         );
 
         // Roundtrip
-        let mut bytes = Vec::new();
-        merged.serialize(&mut bytes).unwrap();
+        let (block_data, skip_entries) = merged.serialize().unwrap();
         let loaded =
-            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+            BlockSparsePostingList::from_parts(merged.doc_count(), &block_data, &skip_entries)
+                .unwrap();
 
         assert!(
             (loaded.global_max_weight() - 7.0).abs() < 0.01,
@@ -1574,10 +1477,10 @@ mod tests {
         let merged = BlockSparsePostingList::merge_with_offsets(&[(&list1, 0), (&list2, 100)]);
 
         // Roundtrip
-        let mut bytes = Vec::new();
-        merged.serialize(&mut bytes).unwrap();
+        let (block_data, skip_entries) = merged.serialize().unwrap();
         let loaded =
-            BlockSparsePostingList::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+            BlockSparsePostingList::from_parts(merged.doc_count(), &block_data, &skip_entries)
+                .unwrap();
 
         // Simulate scoring with query_weight = 2.0
         let query_weight = 2.0f32;

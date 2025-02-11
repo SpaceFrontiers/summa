@@ -9,12 +9,12 @@
 //! - **Inline posting fast path**: Small terms skip PostingList/BlockPostingList entirely
 
 mod config;
-mod dense_build;
-mod posting;
-mod postings_build;
-mod sparse_build;
-mod store_build;
-mod vectors;
+mod dense;
+#[cfg(feature = "diagnostics")]
+mod diagnostics;
+mod postings;
+mod sparse;
+mod store;
 
 pub use config::{MemoryBreakdown, SegmentBuilderConfig, SegmentBuilderStats};
 
@@ -35,8 +35,9 @@ use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::tokenizer::BoxedTokenizer;
 use crate::{DocId, Result};
 
-use posting::{CompactPosting, PositionPostingListBuilder, PostingListBuilder, TermKey};
-use vectors::{DenseVectorBuilder, SparseVectorBuilder};
+use dense::DenseVectorBuilder;
+use postings::{CompactPosting, PositionPostingListBuilder, PostingListBuilder, TermKey};
+use sparse::SparseVectorBuilder;
 
 /// Size of the document store buffer before writing to disk
 const STORE_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB
@@ -682,7 +683,7 @@ impl SegmentBuilder {
         let position_index = std::mem::take(&mut self.position_index);
         let position_offsets = if !position_index.is_empty() {
             let mut pos_writer = dir.streaming_writer(&files.positions).await?;
-            let offsets = postings_build::build_positions_streaming(
+            let offsets = postings::build_positions_streaming(
                 position_index,
                 &self.term_interner,
                 &mut *pos_writer,
@@ -723,7 +724,7 @@ impl SegmentBuilder {
             || {
                 rayon::join(
                     || {
-                        postings_build::build_postings_streaming(
+                        postings::build_postings_streaming(
                             inverted_index,
                             term_interner,
                             &position_offsets,
@@ -732,7 +733,7 @@ impl SegmentBuilder {
                         )
                     },
                     || {
-                        store_build::build_store_streaming(
+                        store::build_store_streaming(
                             &store_path,
                             num_compression_threads,
                             compression_level,
@@ -745,7 +746,7 @@ impl SegmentBuilder {
                 rayon::join(
                     || -> Result<()> {
                         if let Some(ref mut w) = vectors_writer {
-                            dense_build::build_vectors_streaming(
+                            dense::build_vectors_streaming(
                                 dense_vectors,
                                 schema,
                                 trained,
@@ -756,11 +757,7 @@ impl SegmentBuilder {
                     },
                     || -> Result<()> {
                         if let Some(ref mut w) = sparse_writer {
-                            sparse_build::build_sparse_streaming(
-                                &mut sparse_vectors,
-                                schema,
-                                &mut **w,
-                            )?;
+                            sparse::build_sparse_streaming(&mut sparse_vectors, schema, &mut **w)?;
                         }
                         Ok(())
                     },

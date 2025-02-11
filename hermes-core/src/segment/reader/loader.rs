@@ -256,7 +256,7 @@ pub async fn load_sparse_file<D: Directory>(
     let skip_section = tail_bytes.slice(0..skip_section_len);
     let toc_data = &tail[skip_section_len..];
 
-    // Parse TOC: per-field header(9B) + per-dim entries(24B each)
+    // Parse TOC: per-field header(9B) + per-dim entries(28B each)
     let mut pos = 0usize;
 
     for _ in 0..num_fields {
@@ -269,13 +269,13 @@ pub async fn load_sparse_file<D: Directory>(
         // Parse V3 per-dim entries directly into SoA DimensionTable
         let mut dims = super::types::DimensionTable::with_capacity(ndims);
         for _ in 0..ndims {
-            let d = &toc_data[pos..pos + 24];
+            let d = &toc_data[pos..pos + 28];
             let dim_id = u32::from_le_bytes(d[0..4].try_into().unwrap());
-            let block_data_offset = u32::from_le_bytes(d[4..8].try_into().unwrap());
-            let skip_start = u32::from_le_bytes(d[8..12].try_into().unwrap());
-            let num_blocks = u32::from_le_bytes(d[12..16].try_into().unwrap());
-            let doc_count = u32::from_le_bytes(d[16..20].try_into().unwrap());
-            let max_weight = f32::from_le_bytes(d[20..24].try_into().unwrap());
+            let block_data_offset = u64::from_le_bytes(d[4..12].try_into().unwrap());
+            let skip_start = u32::from_le_bytes(d[12..16].try_into().unwrap());
+            let num_blocks = u32::from_le_bytes(d[16..20].try_into().unwrap());
+            let doc_count = u32::from_le_bytes(d[20..24].try_into().unwrap());
+            let max_weight = f32::from_le_bytes(d[24..28].try_into().unwrap());
             dims.push(
                 dim_id,
                 block_data_offset,
@@ -284,7 +284,7 @@ pub async fn load_sparse_file<D: Directory>(
                 doc_count,
                 max_weight,
             );
-            pos += 24;
+            pos += 28;
         }
         // Ensure sorted by dim_id for binary search
         dims.sort_by_dim_id();

@@ -169,7 +169,7 @@ pub struct BlockPostingList {
     /// Skip list: (base_doc_id, last_doc_id_in_block, byte_offset, block_max_tf)
     /// base_doc_id is the first doc_id in the block (absolute, not delta)
     /// block_max_tf enables Block-Max WAND optimization
-    skip_list: Vec<(DocId, DocId, u32, u32)>,
+    skip_list: Vec<(DocId, DocId, u64, u32)>,
     /// Compressed posting data (OwnedBytes for zero-copy mmap support)
     data: OwnedBytes,
     /// Total number of postings
@@ -189,7 +189,7 @@ impl BlockPostingList {
         let mut i = 0;
 
         while i < postings.len() {
-            let block_start = data.len() as u32;
+            let block_start = data.len() as u64;
             let block_end = (i + BLOCK_SIZE).min(postings.len());
             let block = &postings[i..block_end];
 
@@ -235,8 +235,8 @@ impl BlockPostingList {
     /// Format:
     /// ```text
     /// [block data: data_len bytes]
-    /// [skip entries: N × 16 bytes (base_doc, last_doc, offset, block_max_tf)]
-    /// [footer: data_len(4) + skip_count(4) + doc_count(4) + max_tf(4) = 16 bytes]
+    /// [skip entries: N × 20 bytes (base_doc, last_doc, offset_u64, block_max_tf)]
+    /// [footer: data_len(8) + skip_count(4) + doc_count(4) + max_tf(4) = 20 bytes]
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Data first (enables streaming writes during merge)
@@ -246,12 +246,12 @@ impl BlockPostingList {
         for (base_doc_id, last_doc_id, offset, block_max_tf) in &self.skip_list {
             writer.write_u32::<LittleEndian>(*base_doc_id)?;
             writer.write_u32::<LittleEndian>(*last_doc_id)?;
-            writer.write_u32::<LittleEndian>(*offset)?;
+            writer.write_u64::<LittleEndian>(*offset)?;
             writer.write_u32::<LittleEndian>(*block_max_tf)?;
         }
 
         // Footer
-        writer.write_u32::<LittleEndian>(self.data.len() as u32)?;
+        writer.write_u64::<LittleEndian>(self.data.len() as u64)?;
         writer.write_u32::<LittleEndian>(self.skip_list.len() as u32)?;
         writer.write_u32::<LittleEndian>(self.doc_count)?;
         writer.write_u32::<LittleEndian>(self.max_tf)?;
@@ -261,19 +261,19 @@ impl BlockPostingList {
 
     /// Deserialize from a byte slice (footer-based format).
     pub fn deserialize(raw: &[u8]) -> io::Result<Self> {
-        if raw.len() < 16 {
+        if raw.len() < 20 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "posting data too short",
             ));
         }
 
-        // Parse footer (last 16 bytes)
-        let f = raw.len() - 16;
-        let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
-        let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
-        let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
-        let max_tf = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
+        // Parse footer (last 20 bytes)
+        let f = raw.len() - 20;
+        let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+        let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
+        let max_tf = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
 
         // Parse skip list (between data and footer)
         let mut skip_list = Vec::with_capacity(skip_count);
@@ -281,10 +281,10 @@ impl BlockPostingList {
         for _ in 0..skip_count {
             let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
             let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-            let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
-            let block_max_tf = u32::from_le_bytes(raw[pos + 12..pos + 16].try_into().unwrap());
+            let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
+            let block_max_tf = u32::from_le_bytes(raw[pos + 16..pos + 20].try_into().unwrap());
             skip_list.push((base, last, offset, block_max_tf));
-            pos += 16;
+            pos += 20;
         }
 
         let data = OwnedBytes::new(raw[..data_len].to_vec());
@@ -300,28 +300,28 @@ impl BlockPostingList {
     /// Zero-copy deserialization from OwnedBytes.
     /// The data section is sliced from the source without copying.
     pub fn deserialize_zero_copy(raw: OwnedBytes) -> io::Result<Self> {
-        if raw.len() < 16 {
+        if raw.len() < 20 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "posting data too short",
             ));
         }
 
-        let f = raw.len() - 16;
-        let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
-        let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
-        let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
-        let max_tf = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
+        let f = raw.len() - 20;
+        let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+        let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
+        let max_tf = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
 
         let mut skip_list = Vec::with_capacity(skip_count);
         let mut pos = data_len;
         for _ in 0..skip_count {
             let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
             let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-            let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
-            let block_max_tf = u32::from_le_bytes(raw[pos + 12..pos + 16].try_into().unwrap());
+            let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
+            let block_max_tf = u32::from_le_bytes(raw[pos + 16..pos + 20].try_into().unwrap());
             skip_list.push((base, last, offset, block_max_tf));
-            pos += 16;
+            pos += 20;
         }
 
         // Zero-copy: slice references the source OwnedBytes (backed by mmap or Arc<Vec>)
@@ -398,7 +398,7 @@ impl BlockPostingList {
                 {
                     let new_base = base + doc_offset;
                     let new_last = last + doc_offset;
-                    let new_offset = data.len() as u32;
+                    let new_offset = data.len() as u64;
 
                     // Copy block data, but we need to adjust the first doc_id in the block
                     let block_bytes = &source.data[src_offset..src_offset + len];
@@ -442,7 +442,7 @@ impl BlockPostingList {
     ) -> io::Result<(u32, usize)> {
         // Parse footer + skip_list from each source (no data copy)
         struct RawSource<'a> {
-            skip_list: Vec<(u32, u32, u32, u32)>, // (base, last, offset, block_max_tf)
+            skip_list: Vec<(u32, u32, u64, u32)>, // (base, last, offset, block_max_tf)
             data: &'a [u8],                       // slice of block data section
             max_tf: u32,
             doc_count: u32,
@@ -451,24 +451,24 @@ impl BlockPostingList {
 
         let mut parsed: Vec<RawSource<'_>> = Vec::with_capacity(sources.len());
         for (raw, doc_offset) in sources {
-            if raw.len() < 16 {
+            if raw.len() < 20 {
                 continue;
             }
-            let f = raw.len() - 16;
-            let data_len = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
-            let skip_count = u32::from_le_bytes(raw[f + 4..f + 8].try_into().unwrap()) as usize;
-            let doc_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap());
-            let max_tf = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
+            let f = raw.len() - 20;
+            let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+            let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+            let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
+            let max_tf = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
 
             let mut skip_list = Vec::with_capacity(skip_count);
             let mut pos = data_len;
             for _ in 0..skip_count {
                 let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
                 let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-                let offset = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap());
-                let block_max_tf = u32::from_le_bytes(raw[pos + 12..pos + 16].try_into().unwrap());
+                let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
+                let block_max_tf = u32::from_le_bytes(raw[pos + 16..pos + 20].try_into().unwrap());
                 skip_list.push((base, last, offset, block_max_tf));
-                pos += 16;
+                pos += 20;
             }
             parsed.push(RawSource {
                 skip_list,
@@ -483,9 +483,9 @@ impl BlockPostingList {
         let merged_max_tf: u32 = parsed.iter().map(|s| s.max_tf).max().unwrap_or(0);
 
         // Phase 1: Stream block data with patched first_doc directly to writer.
-        // Accumulate merged skip entries (16 bytes each — bounded).
-        let mut merged_skip: Vec<(u32, u32, u32, u32)> = Vec::new();
-        let mut data_written = 0u32;
+        // Accumulate merged skip entries (20 bytes each — bounded).
+        let mut merged_skip: Vec<(u32, u32, u64, u32)> = Vec::new();
+        let mut data_written = 0u64;
         let mut patch_buf = [0u8; 8]; // reusable 8-byte prefix buffer
 
         for src in &parsed {
@@ -512,7 +512,7 @@ impl BlockPostingList {
                 writer.write_all(&patch_buf)?;
                 writer.write_all(&block[8..])?;
 
-                data_written += block.len() as u32;
+                data_written += block.len() as u64;
             }
         }
 
@@ -520,16 +520,16 @@ impl BlockPostingList {
         for (base, last, offset, block_max_tf) in &merged_skip {
             writer.write_u32::<LittleEndian>(*base)?;
             writer.write_u32::<LittleEndian>(*last)?;
-            writer.write_u32::<LittleEndian>(*offset)?;
+            writer.write_u64::<LittleEndian>(*offset)?;
             writer.write_u32::<LittleEndian>(*block_max_tf)?;
         }
 
-        writer.write_u32::<LittleEndian>(data_written)?;
+        writer.write_u64::<LittleEndian>(data_written)?;
         writer.write_u32::<LittleEndian>(merged_skip.len() as u32)?;
         writer.write_u32::<LittleEndian>(total_docs)?;
         writer.write_u32::<LittleEndian>(merged_max_tf)?;
 
-        let total_bytes = data_written as usize + merged_skip.len() * 16 + 16;
+        let total_bytes = data_written as usize + merged_skip.len() * 20 + 20;
         Ok((total_docs, total_bytes))
     }
 

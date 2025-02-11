@@ -59,7 +59,7 @@ pub struct SparseSkipEntry {
     /// Last doc_id in the block
     pub last_doc: DocId,
     /// Byte offset to block data (relative to data section start)
-    pub offset: u32,
+    pub offset: u64,
     /// Byte length of block data
     pub length: u32,
     /// Maximum weight in this block (for Block-Max optimization)
@@ -68,12 +68,12 @@ pub struct SparseSkipEntry {
 
 impl SparseSkipEntry {
     /// Size in bytes when serialized
-    pub const SIZE: usize = 20; // 4 + 4 + 4 + 4 + 4
+    pub const SIZE: usize = 24; // 4 + 4 + 8 + 4 + 4
 
     pub fn new(
         first_doc: DocId,
         last_doc: DocId,
-        offset: u32,
+        offset: u64,
         length: u32,
         max_weight: f32,
     ) -> Self {
@@ -99,7 +99,7 @@ impl SparseSkipEntry {
     pub fn write<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u32::<LittleEndian>(self.first_doc)?;
         writer.write_u32::<LittleEndian>(self.last_doc)?;
-        writer.write_u32::<LittleEndian>(self.offset)?;
+        writer.write_u64::<LittleEndian>(self.offset)?;
         writer.write_u32::<LittleEndian>(self.length)?;
         writer.write_f32::<LittleEndian>(self.max_weight)?;
         Ok(())
@@ -109,7 +109,7 @@ impl SparseSkipEntry {
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let first_doc = reader.read_u32::<LittleEndian>()?;
         let last_doc = reader.read_u32::<LittleEndian>()?;
-        let offset = reader.read_u32::<LittleEndian>()?;
+        let offset = reader.read_u64::<LittleEndian>()?;
         let length = reader.read_u32::<LittleEndian>()?;
         let max_weight = reader.read_f32::<LittleEndian>()?;
         Ok(Self {
@@ -140,7 +140,7 @@ impl SparseSkipList {
         &mut self,
         first_doc: DocId,
         last_doc: DocId,
-        offset: u32,
+        offset: u64,
         length: u32,
         max_weight: f32,
     ) {
@@ -650,10 +650,10 @@ mod tests {
         ] {
             let pl = BlockSparsePostingList::from_postings(&postings, quant).unwrap();
 
-            let mut buffer = Vec::new();
-            pl.serialize(&mut buffer).unwrap();
-
-            let pl2 = BlockSparsePostingList::deserialize(&mut &buffer[..]).unwrap();
+            let (block_data, skip_entries) = pl.serialize().unwrap();
+            let pl2 =
+                BlockSparsePostingList::from_parts(pl.doc_count(), &block_data, &skip_entries)
+                    .unwrap();
 
             assert_eq!(pl.doc_count(), pl2.doc_count());
 

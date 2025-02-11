@@ -13,7 +13,37 @@ use crate::dsl::{Field, Schema};
 use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer};
 use crate::structures::{BlockSparsePostingList, SparseSkipEntry, WeightQuantization};
 
-use super::vectors::SparseVectorBuilder;
+use crate::DocId;
+
+/// Builder for sparse vector index using BlockSparsePostingList
+///
+/// Collects (doc_id, ordinal, weight) postings per dimension, then builds
+/// BlockSparsePostingList with proper quantization during commit.
+pub(super) struct SparseVectorBuilder {
+    /// Postings per dimension: dim_id -> Vec<(doc_id, ordinal, weight)>
+    pub postings: FxHashMap<u32, Vec<(DocId, u16, f32)>>,
+}
+
+impl SparseVectorBuilder {
+    pub fn new() -> Self {
+        Self {
+            postings: FxHashMap::default(),
+        }
+    }
+
+    /// Add a sparse vector entry with ordinal tracking
+    #[inline]
+    pub fn add(&mut self, dim_id: u32, doc_id: DocId, ordinal: u16, weight: f32) {
+        self.postings
+            .entry(dim_id)
+            .or_default()
+            .push((doc_id, ordinal, weight));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.postings.is_empty()
+    }
+}
 
 /// Stream sparse vectors directly to disk (footer-based format).
 ///
@@ -87,10 +117,10 @@ pub(super) fn build_sparse_streaming(
 
                 let doc_count = block_list.doc_count;
                 let (block_data, skip_entries) =
-                    block_list.serialize_v3().map_err(crate::Error::Io)?;
+                    block_list.serialize().map_err(crate::Error::Io)?;
 
-                // Validate serialized blocks: count>0, contiguous offsets
-                validate_serialized_blocks(dim_id, &block_data, &skip_entries)?;
+                #[cfg(feature = "diagnostics")]
+                super::diagnostics::validate_serialized_blocks(dim_id, &block_data, &skip_entries)?;
 
                 Ok((dim_id, doc_count, block_data, skip_entries))
             })
@@ -99,7 +129,7 @@ pub(super) fn build_sparse_streaming(
         // Phase 1: Write block data sequentially, accumulate skip entries
         let mut dim_toc_entries: Vec<SparseDimTocEntry> = Vec::with_capacity(serialized_dims.len());
         for (dim_id, doc_count, block_data, skip_entries) in &serialized_dims {
-            let block_data_offset = current_offset as u32;
+            let block_data_offset = current_offset;
             let skip_start = all_skip_entries.len() as u32;
             let num_blocks = skip_entries.len() as u32;
             let max_weight = skip_entries
@@ -147,53 +177,5 @@ pub(super) fn build_sparse_streaming(
     write_sparse_toc_and_footer(writer, skip_offset, toc_offset, &field_tocs)
         .map_err(crate::Error::Io)?;
 
-    Ok(())
-}
-
-/// Validate serialized block data: count>0, contiguous offsets.
-fn validate_serialized_blocks(
-    dim_id: u32,
-    block_data: &[u8],
-    skip_entries: &[SparseSkipEntry],
-) -> Result<()> {
-    for (i, entry) in skip_entries.iter().enumerate() {
-        let off = entry.offset as usize;
-        if off + 2 > block_data.len() {
-            return Err(crate::Error::Corruption(format!(
-                "[build] dim_id={} block={}/{}: offset {} + 2 > data_len {}",
-                dim_id,
-                i,
-                skip_entries.len(),
-                off,
-                block_data.len()
-            )));
-        }
-        let cnt = u16::from_le_bytes([block_data[off], block_data[off + 1]]);
-        if cnt == 0 {
-            let hex: String = block_data[off..]
-                .iter()
-                .take(32)
-                .map(|x| format!("{x:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            return Err(crate::Error::Corruption(format!(
-                "[build] dim_id={} block={}/{}: count=0 (first_32=[{}])",
-                dim_id,
-                i,
-                skip_entries.len(),
-                hex
-            )));
-        }
-        if i + 1 < skip_entries.len() {
-            let expected = entry.offset + entry.length;
-            let actual = skip_entries[i + 1].offset;
-            if expected != actual {
-                return Err(crate::Error::Corruption(format!(
-                    "[build] dim_id={} block={}: non-contiguous: {} + {} = {} != {}",
-                    dim_id, i, entry.offset, entry.length, expected, actual
-                )));
-            }
-        }
-    }
     Ok(())
 }

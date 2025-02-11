@@ -13,7 +13,40 @@ use crate::dsl::{DenseVectorQuantization, Field, Schema, VectorIndexType};
 use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
 use crate::segment::vector_data::FlatVectorData;
 
-use super::vectors::DenseVectorBuilder;
+use crate::DocId;
+
+/// Builder for dense vector index
+///
+/// Collects vectors with ordinal tracking for multi-valued fields.
+pub(super) struct DenseVectorBuilder {
+    /// Dimension of vectors
+    pub dim: usize,
+    /// Document IDs with ordinals: (doc_id, ordinal)
+    pub doc_ids: Vec<(DocId, u16)>,
+    /// Flat vector storage (doc_ids.len() * dim floats)
+    pub vectors: Vec<f32>,
+}
+
+impl DenseVectorBuilder {
+    pub fn new(dim: usize) -> Self {
+        // Pre-allocate for ~16 vectors to avoid early reallocation chains
+        Self {
+            dim,
+            doc_ids: Vec::with_capacity(16),
+            vectors: Vec::with_capacity(16 * dim),
+        }
+    }
+
+    pub fn add(&mut self, doc_id: DocId, ordinal: u16, vector: &[f32]) {
+        debug_assert_eq!(vector.len(), self.dim, "Vector dimension mismatch");
+        self.doc_ids.push((doc_id, ordinal));
+        self.vectors.extend_from_slice(vector);
+    }
+
+    pub fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+}
 
 /// Stream dense vectors directly to disk (zero-buffer for vector data).
 ///

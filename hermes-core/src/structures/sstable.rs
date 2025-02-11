@@ -335,18 +335,18 @@ pub enum TermInfo {
     /// Reference to external posting list in .post file
     External {
         posting_offset: u64,
-        posting_len: u32,
+        posting_len: u64,
         doc_freq: u32,
         /// Position data offset (0 if no positions)
         position_offset: u64,
         /// Position data length (0 if no positions)
-        position_len: u32,
+        position_len: u64,
     },
 }
 
 impl TermInfo {
     /// Create an external reference
-    pub fn external(posting_offset: u64, posting_len: u32, doc_freq: u32) -> Self {
+    pub fn external(posting_offset: u64, posting_len: u64, doc_freq: u32) -> Self {
         TermInfo::External {
             posting_offset,
             posting_len,
@@ -359,10 +359,10 @@ impl TermInfo {
     /// Create an external reference with position info
     pub fn external_with_positions(
         posting_offset: u64,
-        posting_len: u32,
+        posting_len: u64,
         doc_freq: u32,
         position_offset: u64,
-        position_len: u32,
+        position_len: u64,
     ) -> Self {
         TermInfo::External {
             posting_offset,
@@ -453,7 +453,7 @@ impl TermInfo {
     }
 
     /// Get external posting info (offset, len) - returns None for inline
-    pub fn external_info(&self) -> Option<(u64, u32)> {
+    pub fn external_info(&self) -> Option<(u64, u64)> {
         match self {
             TermInfo::External {
                 posting_offset,
@@ -465,7 +465,7 @@ impl TermInfo {
     }
 
     /// Get position info (offset, len) - returns None for inline or if no positions
-    pub fn position_info(&self) -> Option<(u64, u32)> {
+    pub fn position_info(&self) -> Option<(u64, u64)> {
         match self {
             TermInfo::External {
                 position_offset,
@@ -533,14 +533,14 @@ impl SSTableValue for TermInfo {
                     writer.write_u8(0x01)?;
                     write_vint(writer, *doc_freq as u64)?;
                     write_vint(writer, *posting_offset)?;
-                    write_vint(writer, *posting_len as u64)?;
+                    write_vint(writer, *posting_len)?;
                     write_vint(writer, *position_offset)?;
-                    write_vint(writer, *position_len as u64)?;
+                    write_vint(writer, *position_len)?;
                 } else {
                     writer.write_u8(0x00)?;
                     write_vint(writer, *doc_freq as u64)?;
                     write_vint(writer, *posting_offset)?;
-                    write_vint(writer, *posting_len as u64)?;
+                    write_vint(writer, *posting_len)?;
                 }
             }
         }
@@ -565,7 +565,7 @@ impl SSTableValue for TermInfo {
             // External (no positions)
             let doc_freq = read_vint(reader)? as u32;
             let posting_offset = read_vint(reader)?;
-            let posting_len = read_vint(reader)? as u32;
+            let posting_len = read_vint(reader)?;
             Ok(TermInfo::External {
                 posting_offset,
                 posting_len,
@@ -577,9 +577,9 @@ impl SSTableValue for TermInfo {
             // External with positions
             let doc_freq = read_vint(reader)? as u32;
             let posting_offset = read_vint(reader)?;
-            let posting_len = read_vint(reader)? as u32;
+            let posting_len = read_vint(reader)?;
             let position_offset = read_vint(reader)?;
-            let position_len = read_vint(reader)? as u32;
+            let position_len = read_vint(reader)?;
             Ok(TermInfo::External {
                 posting_offset,
                 posting_len,

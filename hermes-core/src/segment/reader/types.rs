@@ -187,7 +187,7 @@ pub struct DimensionTable {
     /// Dimension IDs, sorted for binary search
     pub dim_ids: Vec<u32>,
     /// Byte offset in file where block data starts (relative to file start)
-    pub block_offsets: Vec<u32>,
+    pub block_offsets: Vec<u64>,
     /// Index into the skip section (entry index, multiply by 20 for byte offset)
     pub skip_starts: Vec<u32>,
     /// Number of skip entries (= number of blocks) per dimension
@@ -227,7 +227,7 @@ impl DimensionTable {
     pub fn push(
         &mut self,
         dim_id: u32,
-        block_offset: u32,
+        block_offset: u64,
         skip_start: u32,
         skip_count: u32,
         doc_count: u32,
@@ -268,7 +268,7 @@ impl DimensionTable {
     /// Estimated heap memory in bytes (6 Vecs × capacity × element_size)
     pub fn estimated_memory_bytes(&self) -> usize {
         let n = self.dim_ids.capacity();
-        n * (4 + 4 + 4 + 4 + 4 + 4) // u32×4 + f32×1 + u32×1 = 24 bytes per entry
+        n * (4 + 8 + 4 + 4 + 4 + 4) // u32×4 + u64×1 + f32×1 = 28 bytes per entry
     }
 }
 
@@ -328,9 +328,9 @@ impl SparseIndex {
         SparseSkipEntry {
             first_doc: u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
             last_doc: u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
-            offset: u32::from_le_bytes([d[8], d[9], d[10], d[11]]),
-            length: u32::from_le_bytes([d[12], d[13], d[14], d[15]]),
-            max_weight: f32::from_le_bytes([d[16], d[17], d[18], d[19]]),
+            offset: u64::from_le_bytes([d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]]),
+            length: u32::from_le_bytes([d[16], d[17], d[18], d[19]]),
+            max_weight: f32::from_le_bytes([d[20], d[21], d[22], d[23]]),
         }
     }
 
@@ -346,8 +346,8 @@ impl SparseIndex {
     /// Load a single block via mmap (OS page cache handles caching)
     async fn load_block_at(&self, dim_idx: usize, block_idx: usize) -> crate::Result<SparseBlock> {
         let entry = self.read_skip_entry(self.dims.skip_starts[dim_idx] as usize + block_idx);
-        let base = self.dims.block_offsets[dim_idx] as u64;
-        let abs_offset = base + entry.offset as u64;
+        let base = self.dims.block_offsets[dim_idx];
+        let abs_offset = base + entry.offset;
         let data = self
             .handle
             .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
@@ -410,7 +410,7 @@ impl SparseIndex {
     ///
     /// Returns `(skip_start, skip_count, max_weight, block_data_offset)`.
     #[inline]
-    pub fn get_skip_range_full(&self, dim_id: u32) -> Option<(usize, usize, f32, u32)> {
+    pub fn get_skip_range_full(&self, dim_id: u32) -> Option<(usize, usize, f32, u64)> {
         let idx = self.dims.find(dim_id)?;
         Some((
             self.dims.skip_starts[idx] as usize,
@@ -440,13 +440,13 @@ impl SparseIndex {
             return Ok(Vec::new());
         }
         let end = (block_start + block_count).min(total_blocks);
-        let base = self.dims.block_offsets[idx] as u64;
+        let base = self.dims.block_offsets[idx];
 
         // Compute the byte range covering all blocks [block_start..end)
         let first_entry = self.read_skip_entry(skip_start + block_start);
         let last_entry = self.read_skip_entry(skip_start + end - 1);
-        let range_start = base + first_entry.offset as u64;
-        let range_end = base + last_entry.offset as u64 + last_entry.length as u64;
+        let range_start = base + first_entry.offset;
+        let range_end = base + last_entry.offset + last_entry.length as u64;
 
         // Single coalesced mmap read
         let range_data = self
@@ -459,9 +459,9 @@ impl SparseIndex {
         let mut blocks = Vec::with_capacity(end - block_start);
         for bi in block_start..end {
             let entry = self.read_skip_entry(skip_start + bi);
-            let rel_offset = entry.offset as u64 - first_entry.offset as u64;
-            let block_bytes =
-                range_data.slice(rel_offset as usize..rel_offset as usize + entry.length as usize);
+            let rel_offset = entry.offset - first_entry.offset;
+            let block_bytes = range_data
+                .slice(rel_offset as usize..(rel_offset as usize + entry.length as usize));
             blocks.push(SparseBlock::from_owned_bytes(block_bytes).map_err(|e| {
                 crate::Error::Corruption(format!(
                     "dim_id={} block={}/{} skip_entry(offset={},length={}) base={}: {e}",
@@ -496,15 +496,15 @@ impl SparseIndex {
     pub async fn load_block_direct(
         &self,
         skip_start: usize,
-        block_data_offset: u32,
+        block_data_offset: u64,
         block_idx: usize,
     ) -> crate::Result<Option<SparseBlock>> {
         if skip_start + block_idx >= self.skip_entry_count() {
             return Ok(None);
         }
         let entry = self.read_skip_entry(skip_start + block_idx);
-        let base = block_data_offset as u64;
-        let abs_offset = base + entry.offset as u64;
+        let base = block_data_offset;
+        let abs_offset = base + entry.offset;
         let data = self
             .handle
             .read_bytes_range(abs_offset..abs_offset + entry.length as u64)
@@ -585,8 +585,8 @@ impl SparseIndex {
         }
         // Total block data size: last entry's (offset + length)
         let last = &skip[skip.len() - 1];
-        let total_bytes = last.offset as u64 + last.length as u64;
-        let base = self.dims.block_offsets[idx] as u64;
+        let total_bytes = last.offset + last.length as u64;
+        let base = self.dims.block_offsets[idx];
         let raw = self
             .handle
             .read_bytes_range(base..base + total_bytes)
