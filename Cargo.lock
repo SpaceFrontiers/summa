@@ -1799,7 +1799,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-core"
-version = "1.7.16"
+version = "1.7.17"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.7.16"
+version = "1.7.17"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.7.16"
+version = "1.7.17"
 dependencies = [
  "anyhow",
  "clap",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.7.16"
+version = "1.7.17"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.7.16"
+version = "1.7.17"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -5544,9 +5544,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.4.0"
+version = "7.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc12baa6db2b15a140161ce53d72209dacea594230798c24774139b54ecaa980"
+checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
 dependencies = [
  "crc32fast",
  "indexmap",
