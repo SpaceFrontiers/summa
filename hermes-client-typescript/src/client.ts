@@ -443,6 +443,9 @@ function buildQuery(options: SearchOptions): PbQuery {
         combinerTemperature: 0,
         combinerTopK: 0,
         combinerDecay: 0,
+        weightThreshold: 0,
+        maxQueryDims: 0,
+        pruning: 0,
       },
     };
   }
@@ -460,6 +463,9 @@ function buildQuery(options: SearchOptions): PbQuery {
         combinerTemperature: 0,
         combinerTopK: 0,
         combinerDecay: 0,
+        weightThreshold: 0,
+        maxQueryDims: 0,
+        pruning: 0,
       },
     };
   }

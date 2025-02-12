@@ -99,6 +99,12 @@ export interface SparseVectorQuery {
   combinerTopK: number;
   /** Decay for WeightedTopK (default: 0.7) */
   combinerDecay: number;
+  /** Min abs(weight) for query dims (0 = no filtering) */
+  weightThreshold: number;
+  /** Max query dimensions to process (0 = all) */
+  maxQueryDims: number;
+  /** Fraction of query dims to keep (0 = no pruning, 0.1 = top 10%) */
+  pruning: number;
 }
 
 /** Dense vector query for similarity search */
@@ -202,8 +208,16 @@ export interface SearchRequest {
   filters: Filter[];
 }
 
-export interface SearchHit {
+/** Unique document address: segment + local doc_id */
+export interface DocAddress {
+  /** Segment ID (hex, 32 chars) */
+  segmentId: string;
+  /** Segment-local document ID */
   docId: number;
+}
+
+export interface SearchHit {
+  address: DocAddress | undefined;
   score: number;
   fields: { [key: string]: FieldValue };
   /** Per-ordinal scores for multi-value fields */
@@ -270,7 +284,7 @@ export interface SearchTimings {
 /** Get document request/response */
 export interface GetDocumentRequest {
   indexName: string;
-  docId: number;
+  address: DocAddress | undefined;
 }
 
 export interface GetDocumentResponse {
@@ -294,7 +308,21 @@ export interface GetIndexInfoResponse {
   /** Schema in SDL format */
   schema: string;
   /** Memory usage breakdown (if available) */
-  memoryStats: MemoryStats | undefined;
+  memoryStats:
+    | MemoryStats
+    | undefined;
+  /** Per-field vector statistics */
+  vectorStats: VectorFieldStats[];
+}
+
+/** Per-field vector statistics (dense or sparse) */
+export interface VectorFieldStats {
+  fieldName: string;
+  /** "dense" or "sparse" */
+  vectorType: string;
+  totalVectors: number;
+  /** dim for dense, num_dimensions for sparse */
+  dimension: number;
 }
 
 /** Memory usage statistics */
@@ -616,6 +644,9 @@ function createBaseSparseVectorQuery(): SparseVectorQuery {
     combinerTemperature: 0,
     combinerTopK: 0,
     combinerDecay: 0,
+    weightThreshold: 0,
+    maxQueryDims: 0,
+    pruning: 0,
   };
 }
 
@@ -651,6 +682,15 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
     }
     if (message.combinerDecay !== 0) {
       writer.uint32(77).float(message.combinerDecay);
+    }
+    if (message.weightThreshold !== 0) {
+      writer.uint32(85).float(message.weightThreshold);
+    }
+    if (message.maxQueryDims !== 0) {
+      writer.uint32(88).uint32(message.maxQueryDims);
+    }
+    if (message.pruning !== 0) {
+      writer.uint32(101).float(message.pruning);
     }
     return writer;
   },
@@ -754,6 +794,30 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
           message.combinerDecay = reader.float();
           continue;
         }
+        case 10: {
+          if (tag !== 85) {
+            break;
+          }
+
+          message.weightThreshold = reader.float();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.maxQueryDims = reader.uint32();
+          continue;
+        }
+        case 12: {
+          if (tag !== 101) {
+            break;
+          }
+
+          message.pruning = reader.float();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -790,6 +854,17 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
         : isSet(object.combiner_decay)
         ? globalThis.Number(object.combiner_decay)
         : 0,
+      weightThreshold: isSet(object.weightThreshold)
+        ? globalThis.Number(object.weightThreshold)
+        : isSet(object.weight_threshold)
+        ? globalThis.Number(object.weight_threshold)
+        : 0,
+      maxQueryDims: isSet(object.maxQueryDims)
+        ? globalThis.Number(object.maxQueryDims)
+        : isSet(object.max_query_dims)
+        ? globalThis.Number(object.max_query_dims)
+        : 0,
+      pruning: isSet(object.pruning) ? globalThis.Number(object.pruning) : 0,
     };
   },
 
@@ -822,6 +897,15 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
     if (message.combinerDecay !== 0) {
       obj.combinerDecay = message.combinerDecay;
     }
+    if (message.weightThreshold !== 0) {
+      obj.weightThreshold = message.weightThreshold;
+    }
+    if (message.maxQueryDims !== 0) {
+      obj.maxQueryDims = Math.round(message.maxQueryDims);
+    }
+    if (message.pruning !== 0) {
+      obj.pruning = message.pruning;
+    }
     return obj;
   },
 
@@ -839,6 +923,9 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
     message.combinerTemperature = object.combinerTemperature ?? 0;
     message.combinerTopK = object.combinerTopK ?? 0;
     message.combinerDecay = object.combinerDecay ?? 0;
+    message.weightThreshold = object.weightThreshold ?? 0;
+    message.maxQueryDims = object.maxQueryDims ?? 0;
+    message.pruning = object.pruning ?? 0;
     return message;
   },
 };
@@ -2186,14 +2273,98 @@ export const SearchRequest: MessageFns<SearchRequest> = {
   },
 };
 
+function createBaseDocAddress(): DocAddress {
+  return { segmentId: "", docId: 0 };
+}
+
+export const DocAddress: MessageFns<DocAddress> = {
+  encode(message: DocAddress, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.segmentId !== "") {
+      writer.uint32(10).string(message.segmentId);
+    }
+    if (message.docId !== 0) {
+      writer.uint32(16).uint32(message.docId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): DocAddress {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseDocAddress();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.segmentId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.docId = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): DocAddress {
+    return {
+      segmentId: isSet(object.segmentId)
+        ? globalThis.String(object.segmentId)
+        : isSet(object.segment_id)
+        ? globalThis.String(object.segment_id)
+        : "",
+      docId: isSet(object.docId)
+        ? globalThis.Number(object.docId)
+        : isSet(object.doc_id)
+        ? globalThis.Number(object.doc_id)
+        : 0,
+    };
+  },
+
+  toJSON(message: DocAddress): unknown {
+    const obj: any = {};
+    if (message.segmentId !== "") {
+      obj.segmentId = message.segmentId;
+    }
+    if (message.docId !== 0) {
+      obj.docId = Math.round(message.docId);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<DocAddress>): DocAddress {
+    return DocAddress.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<DocAddress>): DocAddress {
+    const message = createBaseDocAddress();
+    message.segmentId = object.segmentId ?? "";
+    message.docId = object.docId ?? 0;
+    return message;
+  },
+};
+
 function createBaseSearchHit(): SearchHit {
-  return { docId: 0, score: 0, fields: {}, ordinalScores: [] };
+  return { address: undefined, score: 0, fields: {}, ordinalScores: [] };
 }
 
 export const SearchHit: MessageFns<SearchHit> = {
   encode(message: SearchHit, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.docId !== 0) {
-      writer.uint32(8).uint32(message.docId);
+    if (message.address !== undefined) {
+      DocAddress.encode(message.address, writer.uint32(10).fork()).join();
     }
     if (message.score !== 0) {
       writer.uint32(21).float(message.score);
@@ -2215,11 +2386,11 @@ export const SearchHit: MessageFns<SearchHit> = {
       const tag = reader.uint32();
       switch (tag >>> 3) {
         case 1: {
-          if (tag !== 8) {
+          if (tag !== 10) {
             break;
           }
 
-          message.docId = reader.uint32();
+          message.address = DocAddress.decode(reader, reader.uint32());
           continue;
         }
         case 2: {
@@ -2260,11 +2431,7 @@ export const SearchHit: MessageFns<SearchHit> = {
 
   fromJSON(object: any): SearchHit {
     return {
-      docId: isSet(object.docId)
-        ? globalThis.Number(object.docId)
-        : isSet(object.doc_id)
-        ? globalThis.Number(object.doc_id)
-        : 0,
+      address: isSet(object.address) ? DocAddress.fromJSON(object.address) : undefined,
       score: isSet(object.score) ? globalThis.Number(object.score) : 0,
       fields: isObject(object.fields)
         ? (globalThis.Object.entries(object.fields) as [string, any][]).reduce(
@@ -2285,8 +2452,8 @@ export const SearchHit: MessageFns<SearchHit> = {
 
   toJSON(message: SearchHit): unknown {
     const obj: any = {};
-    if (message.docId !== 0) {
-      obj.docId = Math.round(message.docId);
+    if (message.address !== undefined) {
+      obj.address = DocAddress.toJSON(message.address);
     }
     if (message.score !== 0) {
       obj.score = message.score;
@@ -2311,7 +2478,9 @@ export const SearchHit: MessageFns<SearchHit> = {
   },
   fromPartial(object: DeepPartial<SearchHit>): SearchHit {
     const message = createBaseSearchHit();
-    message.docId = object.docId ?? 0;
+    message.address = (object.address !== undefined && object.address !== null)
+      ? DocAddress.fromPartial(object.address)
+      : undefined;
     message.score = object.score ?? 0;
     message.fields = (globalThis.Object.entries(object.fields ?? {}) as [string, FieldValue][]).reduce(
       (acc: { [key: string]: FieldValue }, [key, value]: [string, FieldValue]) => {
@@ -3097,7 +3266,7 @@ export const SearchTimings: MessageFns<SearchTimings> = {
 };
 
 function createBaseGetDocumentRequest(): GetDocumentRequest {
-  return { indexName: "", docId: 0 };
+  return { indexName: "", address: undefined };
 }
 
 export const GetDocumentRequest: MessageFns<GetDocumentRequest> = {
@@ -3105,8 +3274,8 @@ export const GetDocumentRequest: MessageFns<GetDocumentRequest> = {
     if (message.indexName !== "") {
       writer.uint32(10).string(message.indexName);
     }
-    if (message.docId !== 0) {
-      writer.uint32(16).uint32(message.docId);
+    if (message.address !== undefined) {
+      DocAddress.encode(message.address, writer.uint32(18).fork()).join();
     }
     return writer;
   },
@@ -3127,11 +3296,11 @@ export const GetDocumentRequest: MessageFns<GetDocumentRequest> = {
           continue;
         }
         case 2: {
-          if (tag !== 16) {
+          if (tag !== 18) {
             break;
           }
 
-          message.docId = reader.uint32();
+          message.address = DocAddress.decode(reader, reader.uint32());
           continue;
         }
       }
@@ -3150,11 +3319,7 @@ export const GetDocumentRequest: MessageFns<GetDocumentRequest> = {
         : isSet(object.index_name)
         ? globalThis.String(object.index_name)
         : "",
-      docId: isSet(object.docId)
-        ? globalThis.Number(object.docId)
-        : isSet(object.doc_id)
-        ? globalThis.Number(object.doc_id)
-        : 0,
+      address: isSet(object.address) ? DocAddress.fromJSON(object.address) : undefined,
     };
   },
 
@@ -3163,8 +3328,8 @@ export const GetDocumentRequest: MessageFns<GetDocumentRequest> = {
     if (message.indexName !== "") {
       obj.indexName = message.indexName;
     }
-    if (message.docId !== 0) {
-      obj.docId = Math.round(message.docId);
+    if (message.address !== undefined) {
+      obj.address = DocAddress.toJSON(message.address);
     }
     return obj;
   },
@@ -3175,7 +3340,9 @@ export const GetDocumentRequest: MessageFns<GetDocumentRequest> = {
   fromPartial(object: DeepPartial<GetDocumentRequest>): GetDocumentRequest {
     const message = createBaseGetDocumentRequest();
     message.indexName = object.indexName ?? "";
-    message.docId = object.docId ?? 0;
+    message.address = (object.address !== undefined && object.address !== null)
+      ? DocAddress.fromPartial(object.address)
+      : undefined;
     return message;
   },
 };
@@ -3408,7 +3575,7 @@ export const GetIndexInfoRequest: MessageFns<GetIndexInfoRequest> = {
 };
 
 function createBaseGetIndexInfoResponse(): GetIndexInfoResponse {
-  return { indexName: "", numDocs: 0, numSegments: 0, schema: "", memoryStats: undefined };
+  return { indexName: "", numDocs: 0, numSegments: 0, schema: "", memoryStats: undefined, vectorStats: [] };
 }
 
 export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
@@ -3427,6 +3594,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     }
     if (message.memoryStats !== undefined) {
       MemoryStats.encode(message.memoryStats, writer.uint32(42).fork()).join();
+    }
+    for (const v of message.vectorStats) {
+      VectorFieldStats.encode(v!, writer.uint32(50).fork()).join();
     }
     return writer;
   },
@@ -3478,6 +3648,14 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
           message.memoryStats = MemoryStats.decode(reader, reader.uint32());
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.vectorStats.push(VectorFieldStats.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -3510,6 +3688,11 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
         : isSet(object.memory_stats)
         ? MemoryStats.fromJSON(object.memory_stats)
         : undefined,
+      vectorStats: globalThis.Array.isArray(object?.vectorStats)
+        ? object.vectorStats.map((e: any) => VectorFieldStats.fromJSON(e))
+        : globalThis.Array.isArray(object?.vector_stats)
+        ? object.vector_stats.map((e: any) => VectorFieldStats.fromJSON(e))
+        : [],
     };
   },
 
@@ -3530,6 +3713,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     if (message.memoryStats !== undefined) {
       obj.memoryStats = MemoryStats.toJSON(message.memoryStats);
     }
+    if (message.vectorStats?.length) {
+      obj.vectorStats = message.vectorStats.map((e) => VectorFieldStats.toJSON(e));
+    }
     return obj;
   },
 
@@ -3545,6 +3731,127 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     message.memoryStats = (object.memoryStats !== undefined && object.memoryStats !== null)
       ? MemoryStats.fromPartial(object.memoryStats)
       : undefined;
+    message.vectorStats = object.vectorStats?.map((e) => VectorFieldStats.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseVectorFieldStats(): VectorFieldStats {
+  return { fieldName: "", vectorType: "", totalVectors: 0, dimension: 0 };
+}
+
+export const VectorFieldStats: MessageFns<VectorFieldStats> = {
+  encode(message: VectorFieldStats, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.fieldName !== "") {
+      writer.uint32(10).string(message.fieldName);
+    }
+    if (message.vectorType !== "") {
+      writer.uint32(18).string(message.vectorType);
+    }
+    if (message.totalVectors !== 0) {
+      writer.uint32(24).uint64(message.totalVectors);
+    }
+    if (message.dimension !== 0) {
+      writer.uint32(32).uint32(message.dimension);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): VectorFieldStats {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseVectorFieldStats();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.fieldName = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.vectorType = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.totalVectors = longToNumber(reader.uint64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.dimension = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): VectorFieldStats {
+    return {
+      fieldName: isSet(object.fieldName)
+        ? globalThis.String(object.fieldName)
+        : isSet(object.field_name)
+        ? globalThis.String(object.field_name)
+        : "",
+      vectorType: isSet(object.vectorType)
+        ? globalThis.String(object.vectorType)
+        : isSet(object.vector_type)
+        ? globalThis.String(object.vector_type)
+        : "",
+      totalVectors: isSet(object.totalVectors)
+        ? globalThis.Number(object.totalVectors)
+        : isSet(object.total_vectors)
+        ? globalThis.Number(object.total_vectors)
+        : 0,
+      dimension: isSet(object.dimension) ? globalThis.Number(object.dimension) : 0,
+    };
+  },
+
+  toJSON(message: VectorFieldStats): unknown {
+    const obj: any = {};
+    if (message.fieldName !== "") {
+      obj.fieldName = message.fieldName;
+    }
+    if (message.vectorType !== "") {
+      obj.vectorType = message.vectorType;
+    }
+    if (message.totalVectors !== 0) {
+      obj.totalVectors = Math.round(message.totalVectors);
+    }
+    if (message.dimension !== 0) {
+      obj.dimension = Math.round(message.dimension);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<VectorFieldStats>): VectorFieldStats {
+    return VectorFieldStats.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<VectorFieldStats>): VectorFieldStats {
+    const message = createBaseVectorFieldStats();
+    message.fieldName = object.fieldName ?? "";
+    message.vectorType = object.vectorType ?? "";
+    message.totalVectors = object.totalVectors ?? 0;
+    message.dimension = object.dimension ?? 0;
     return message;
   },
 };
