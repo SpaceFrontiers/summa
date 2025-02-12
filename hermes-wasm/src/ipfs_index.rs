@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use hermes_core::directories::{
-    Directory, FileSlice, LazyFileHandle, OwnedBytes, SliceCachingDirectory,
-};
+use hermes_core::directories::{Directory, FileHandle, OwnedBytes, SliceCachingDirectory};
 use hermes_core::{IndexMetadata, SLICE_CACHE_FILENAME, Searcher};
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -194,10 +192,10 @@ impl Directory for JsFetchDirectory {
         Ok(size)
     }
 
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle> {
         let full_path = self.path_for(path);
         let data = self.call_fetch(&full_path).await?;
-        Ok(FileSlice::new(OwnedBytes::new(data)))
+        Ok(FileHandle::from_bytes(OwnedBytes::new(data)))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -213,10 +211,10 @@ impl Directory for JsFetchDirectory {
         ))
     }
 
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
         // JsFetchDirectory doesn't support lazy loading directly because
         // js_sys::Function is not Send+Sync. Instead, we load the full file
-        // and wrap it in a LazyFileHandle that serves from memory.
+        // and wrap it in a FileHandle that serves from memory.
         let full_path = self.path_for(path);
         let data = self.call_fetch(&full_path).await?;
         let file_size = data.len() as u64;
@@ -237,7 +235,7 @@ impl Directory for JsFetchDirectory {
             })
         });
 
-        Ok(LazyFileHandle::new(file_size, read_fn))
+        Ok(FileHandle::lazy(file_size, read_fn))
     }
 }
 
