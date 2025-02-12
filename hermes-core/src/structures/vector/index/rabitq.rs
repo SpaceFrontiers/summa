@@ -110,7 +110,7 @@ impl RaBitQIndex {
     }
 
     /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
-    pub fn search(&self, query: &[f32], k: usize, _fetch_k: usize) -> Vec<(u32, u16, f32)> {
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u32, u16, f32)> {
         let prepared = self.prepare_query(query);
 
         // Phase 1: Estimate distances for all vectors
@@ -220,13 +220,13 @@ mod tests {
         let index = RaBitQIndex::build(config, &vectors);
 
         let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
-        let results = index.search(&query, k, 10);
+        let results = index.search(&query, k);
 
         assert_eq!(results.len(), k);
 
         // Verify results are sorted by distance
         for i in 1..results.len() {
-            assert!(results[i].1 >= results[i - 1].1);
+            assert!(results[i].2 >= results[i - 1].2);
         }
     }
 }

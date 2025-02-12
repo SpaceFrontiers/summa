@@ -566,6 +566,8 @@ impl AsyncSegmentReader {
         /// Batch size for brute-force scoring (4096 vectors × 768 dims × 4 bytes ≈ 12MB)
         const BRUTE_FORCE_BATCH: usize = 4096;
 
+        let fetch_k = (k as f32 * rerank_factor.max(1.0)).ceil() as usize;
+
         // Results are (doc_id, ordinal, score) where score = similarity (higher = better)
         let t0 = std::time::Instant::now();
         let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
@@ -575,9 +577,8 @@ impl AsyncSegmentReader {
                     let rabitq = lazy.get().ok_or_else(|| {
                         Error::Schema("RaBitQ index deserialization failed".to_string())
                     })?;
-                    let fetch_k = (k as f32 * rerank_factor.max(1.0)).ceil() as usize;
                     rabitq
-                        .search(query, fetch_k, fetch_k)
+                        .search(query, fetch_k)
                         .into_iter()
                         .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
                         .collect()
@@ -593,7 +594,6 @@ impl AsyncSegmentReader {
                         ))
                     })?;
                     let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
-                    let fetch_k = (k as f32 * rerank_factor.max(1.0)).ceil() as usize;
                     index
                         .search(centroids, codebook, query, fetch_k, Some(effective_nprobe))
                         .into_iter()
@@ -611,7 +611,6 @@ impl AsyncSegmentReader {
                         ))
                     })?;
                     let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
-                    let fetch_k = (k as f32 * rerank_factor.max(1.0)).ceil() as usize;
                     index
                         .search(centroids, codebook, query, fetch_k, Some(effective_nprobe))
                         .into_iter()
@@ -632,7 +631,6 @@ impl AsyncSegmentReader {
             let dim = lazy_flat.dim;
             let n = lazy_flat.num_vectors;
             let quant = lazy_flat.quantization;
-            let fetch_k = (k as f32 * rerank_factor.max(1.0)).ceil() as usize;
             let mut collector = crate::query::ScoreCollector::new(fetch_k);
             let mut scores = vec![0f32; BRUTE_FORCE_BATCH];
 
@@ -742,7 +740,7 @@ impl AsyncSegmentReader {
             }
 
             results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-            results.truncate((k as f32 * rerank_factor.max(1.0)).ceil() as usize);
+            results.truncate(fetch_k);
             log::debug!(
                 "[search_dense] field {}: rerank total={:.1}ms",
                 field.0,
