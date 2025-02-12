@@ -16,6 +16,7 @@ import {
 } from "./generated/hermes";
 
 import {
+  DocAddress,
   Document,
   SearchHit,
   SearchResponse,
@@ -96,6 +97,12 @@ export class HermesClient {
       numDocs: response.numDocs,
       numSegments: response.numSegments,
       schema: response.schema,
+      vectorStats: (response.vectorStats || []).map((vs) => ({
+        fieldName: vs.fieldName,
+        vectorType: vs.vectorType,
+        totalVectors: vs.totalVectors,
+        dimension: vs.dimension,
+      })),
     };
   }
 
@@ -191,8 +198,22 @@ export class HermesClient {
         combinerTemperature: 0,
         combinerTopK: 0,
         combinerDecay: 0,
+        matryoshkaDims: options.matryoshkaDims ?? 0,
       };
     }
+
+    const filters = (options.filters ?? []).map((f) => {
+      const filter: any = { field: f.field };
+      if (f.eq_u64 !== undefined) filter.eqU64 = f.eq_u64;
+      else if (f.eq_i64 !== undefined) filter.eqI64 = f.eq_i64;
+      else if (f.eq_f64 !== undefined) filter.eqF64 = f.eq_f64;
+      else if (f.eq_text !== undefined) filter.eqText = f.eq_text;
+      else if (f.range !== undefined) filter.range = { min: f.range.min, max: f.range.max };
+      else if (f.in_text !== undefined) filter.inValues = { textValues: f.in_text, u64Values: [], i64Values: [] };
+      else if (f.in_u64 !== undefined) filter.inValues = { textValues: [], u64Values: f.in_u64, i64Values: [] };
+      else if (f.in_i64 !== undefined) filter.inValues = { textValues: [], u64Values: [], i64Values: f.in_i64 };
+      return filter;
+    });
 
     const response = await this.searchClient!.search({
       indexName,
@@ -201,10 +222,14 @@ export class HermesClient {
       offset: options.offset ?? 0,
       fieldsToLoad: options.fieldsToLoad ?? [],
       reranker,
+      filters,
     });
 
     const hits: SearchHit[] = response.hits.map((hit) => ({
-      docId: hit.docId,
+      address: {
+        segmentId: hit.address?.segmentId ?? "",
+        docId: hit.address?.docId ?? 0,
+      },
       score: hit.score,
       fields: Object.fromEntries(
         Object.entries(hit.fields).map(([k, v]) => [k, fromFieldValue(v)])
@@ -228,13 +253,16 @@ export class HermesClient {
     };
   }
 
-  /** Get a document by ID. Returns null if not found. */
-  async getDocument(indexName: string, docId: number): Promise<Document | null> {
+  /** Get a document by address. Returns null if not found. */
+  async getDocument(indexName: string, address: DocAddress): Promise<Document | null> {
     this.ensureConnected();
     try {
       const response = await this.searchClient!.getDocument({
         indexName,
-        docId,
+        address: {
+          segmentId: address.segmentId,
+          docId: address.docId,
+        },
       });
       const fields = Object.fromEntries(
         Object.entries(response.fields).map(([k, v]) => [k, fromFieldValue(v)])

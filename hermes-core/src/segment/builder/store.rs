@@ -15,11 +15,17 @@ use crate::compression::CompressionLevel;
 /// Reads pre-serialized document bytes from temp file and passes them
 /// directly to the store writer via `store_raw`, avoiding the
 /// deserialize→Document→reserialize roundtrip entirely.
+///
+/// `expected_docs` is the number of documents the builder added. The store
+/// writer's final doc count is verified against this — a mismatch means the
+/// temp file was truncated or a compression block was lost, which would
+/// silently corrupt the segment (postings/store doc_id desync).
 pub(super) fn build_store_streaming(
     store_path: &PathBuf,
     num_compression_threads: usize,
     compression_level: CompressionLevel,
     writer: &mut dyn Write,
+    expected_docs: u32,
 ) -> Result<()> {
     use crate::segment::store::EagerParallelStoreWriter;
 
@@ -53,6 +59,15 @@ pub(super) fn build_store_streaming(
         offset += doc_len;
     }
 
-    store_writer.finish()?;
+    let store_docs = store_writer.finish()?;
+    if store_docs != expected_docs {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Store doc count mismatch: store wrote {} docs but builder expected {}",
+                store_docs, expected_docs
+            ),
+        )));
+    }
     Ok(())
 }

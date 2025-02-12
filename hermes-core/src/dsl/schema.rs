@@ -57,6 +57,10 @@ pub struct FieldEntry {
     /// Configuration for dense vector fields (dimension, quantization)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dense_vector_config: Option<DenseVectorConfig>,
+    /// Whether this field has columnar fast-field storage for O(1) doc→value access.
+    /// Valid for u64, i64, f64, and text fields.
+    #[serde(default)]
+    pub fast: bool,
 }
 
 /// Position tracking mode for text fields
@@ -465,6 +469,7 @@ impl SchemaBuilder {
             positions: None,
             sparse_vector_config: Some(config),
             dense_vector_config: None,
+            fast: false,
         });
         field
     }
@@ -513,6 +518,7 @@ impl SchemaBuilder {
             positions: None,
             sparse_vector_config: None,
             dense_vector_config: Some(config),
+            fast: false,
         });
         field
     }
@@ -558,6 +564,7 @@ impl SchemaBuilder {
             positions: None,
             sparse_vector_config: None,
             dense_vector_config: None,
+            fast: false,
         });
         field
     }
@@ -566,6 +573,14 @@ impl SchemaBuilder {
     pub fn set_multi(&mut self, field: Field, multi: bool) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.multi = multi;
+        }
+    }
+
+    /// Set fast-field columnar storage for O(1) doc→value access.
+    /// Valid for u64, i64, f64, and text fields.
+    pub fn set_fast(&mut self, field: Field, fast: bool) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.fast = fast;
         }
     }
 

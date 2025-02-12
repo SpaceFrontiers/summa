@@ -105,7 +105,7 @@ tokenizer_spec = { "<" ~ identifier ~ ">" }
 // indexed can have optional index config: indexed<positions> or indexed<rabitq, centroids: "path">
 // stored can have optional multi config: stored<multi> for array fields
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" }
+attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" }
 
 // Stored attribute with optional multi flag
 // Examples:
@@ -153,11 +153,14 @@ path_chars = @{ (!("\"" ) ~ ANY)* }
 // Example: query<tokenizer: "model/name", weighting: idf>
 query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
 query_config_params = { query_config_param ~ ("," ~ query_config_param)* }
-query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg }
+query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg | query_weight_threshold_kwarg | query_max_dims_kwarg | query_pruning_kwarg }
 query_tokenizer_kwarg = { "tokenizer" ~ ":" ~ tokenizer_path }
 query_weighting_kwarg = { "weighting" ~ ":" ~ weighting_spec }
 tokenizer_path = { "\"" ~ path_chars ~ "\"" }
 weighting_spec = { "one" | "idf_file" | "idf" }
+query_weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
+query_max_dims_kwarg = { "max_dims" ~ ":" ~ nprobe_spec }
+query_pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
 
 // Identifier (field names, index names, tokenizer names)
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

@@ -159,6 +159,32 @@ export interface Reranker {
   combinerTemperature: number;
   combinerTopK: number;
   combinerDecay: number;
+  /** Matryoshka pre-filter dims (0 = disabled) */
+  matryoshkaDims: number;
+}
+
+/** Fast-field filter for efficient document filtering */
+export interface Filter {
+  field: string;
+  eqU64?: number | undefined;
+  eqI64?: number | undefined;
+  eqF64?: number | undefined;
+  eqText?: string | undefined;
+  range?: RangeFilter | undefined;
+  inValues?: InFilter | undefined;
+}
+
+/** Numeric range filter (inclusive bounds) */
+export interface RangeFilter {
+  min?: number | undefined;
+  max?: number | undefined;
+}
+
+/** Set membership filter */
+export interface InFilter {
+  textValues: string[];
+  u64Values: number[];
+  i64Values: number[];
 }
 
 /** Search request/response */
@@ -169,7 +195,11 @@ export interface SearchRequest {
   offset: number;
   fieldsToLoad: string[];
   /** Optional L2 reranker */
-  reranker: Reranker | undefined;
+  reranker:
+    | Reranker
+    | undefined;
+  /** Fast-field filters */
+  filters: Filter[];
 }
 
 export interface SearchHit {
@@ -222,6 +252,19 @@ export interface SearchResponse {
   hits: SearchHit[];
   totalHits: number;
   tookMs: number;
+  timings: SearchTimings | undefined;
+}
+
+/** Detailed timing breakdown for search phases (all values in microseconds) */
+export interface SearchTimings {
+  /** L1 retrieval (query scoring across segments) */
+  searchUs: number;
+  /** L2 reranking (dense vector rescoring) */
+  rerankUs: number;
+  /** Document field loading from store */
+  loadUs: number;
+  /** Wall-clock total (includes overhead) */
+  totalUs: number;
 }
 
 /** Get document request/response */
@@ -1377,7 +1420,16 @@ export const MatchQuery: MessageFns<MatchQuery> = {
 };
 
 function createBaseReranker(): Reranker {
-  return { field: "", vector: [], limit: 0, combiner: 0, combinerTemperature: 0, combinerTopK: 0, combinerDecay: 0 };
+  return {
+    field: "",
+    vector: [],
+    limit: 0,
+    combiner: 0,
+    combinerTemperature: 0,
+    combinerTopK: 0,
+    combinerDecay: 0,
+    matryoshkaDims: 0,
+  };
 }
 
 export const Reranker: MessageFns<Reranker> = {
@@ -1404,6 +1456,9 @@ export const Reranker: MessageFns<Reranker> = {
     }
     if (message.combinerDecay !== 0) {
       writer.uint32(61).float(message.combinerDecay);
+    }
+    if (message.matryoshkaDims !== 0) {
+      writer.uint32(64).uint32(message.matryoshkaDims);
     }
     return writer;
   },
@@ -1481,6 +1536,14 @@ export const Reranker: MessageFns<Reranker> = {
           message.combinerDecay = reader.float();
           continue;
         }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.matryoshkaDims = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1511,6 +1574,11 @@ export const Reranker: MessageFns<Reranker> = {
         : isSet(object.combiner_decay)
         ? globalThis.Number(object.combiner_decay)
         : 0,
+      matryoshkaDims: isSet(object.matryoshkaDims)
+        ? globalThis.Number(object.matryoshkaDims)
+        : isSet(object.matryoshka_dims)
+        ? globalThis.Number(object.matryoshka_dims)
+        : 0,
     };
   },
 
@@ -1537,6 +1605,9 @@ export const Reranker: MessageFns<Reranker> = {
     if (message.combinerDecay !== 0) {
       obj.combinerDecay = message.combinerDecay;
     }
+    if (message.matryoshkaDims !== 0) {
+      obj.matryoshkaDims = Math.round(message.matryoshkaDims);
+    }
     return obj;
   },
 
@@ -1552,12 +1623,405 @@ export const Reranker: MessageFns<Reranker> = {
     message.combinerTemperature = object.combinerTemperature ?? 0;
     message.combinerTopK = object.combinerTopK ?? 0;
     message.combinerDecay = object.combinerDecay ?? 0;
+    message.matryoshkaDims = object.matryoshkaDims ?? 0;
+    return message;
+  },
+};
+
+function createBaseFilter(): Filter {
+  return {
+    field: "",
+    eqU64: undefined,
+    eqI64: undefined,
+    eqF64: undefined,
+    eqText: undefined,
+    range: undefined,
+    inValues: undefined,
+  };
+}
+
+export const Filter: MessageFns<Filter> = {
+  encode(message: Filter, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.field !== "") {
+      writer.uint32(10).string(message.field);
+    }
+    if (message.eqU64 !== undefined) {
+      writer.uint32(16).uint64(message.eqU64);
+    }
+    if (message.eqI64 !== undefined) {
+      writer.uint32(24).int64(message.eqI64);
+    }
+    if (message.eqF64 !== undefined) {
+      writer.uint32(33).double(message.eqF64);
+    }
+    if (message.eqText !== undefined) {
+      writer.uint32(42).string(message.eqText);
+    }
+    if (message.range !== undefined) {
+      RangeFilter.encode(message.range, writer.uint32(50).fork()).join();
+    }
+    if (message.inValues !== undefined) {
+      InFilter.encode(message.inValues, writer.uint32(58).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Filter {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFilter();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.field = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.eqU64 = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.eqI64 = longToNumber(reader.int64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 33) {
+            break;
+          }
+
+          message.eqF64 = reader.double();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.eqText = reader.string();
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.range = RangeFilter.decode(reader, reader.uint32());
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.inValues = InFilter.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Filter {
+    return {
+      field: isSet(object.field) ? globalThis.String(object.field) : "",
+      eqU64: isSet(object.eqU64)
+        ? globalThis.Number(object.eqU64)
+        : isSet(object.eq_u64)
+        ? globalThis.Number(object.eq_u64)
+        : undefined,
+      eqI64: isSet(object.eqI64)
+        ? globalThis.Number(object.eqI64)
+        : isSet(object.eq_i64)
+        ? globalThis.Number(object.eq_i64)
+        : undefined,
+      eqF64: isSet(object.eqF64)
+        ? globalThis.Number(object.eqF64)
+        : isSet(object.eq_f64)
+        ? globalThis.Number(object.eq_f64)
+        : undefined,
+      eqText: isSet(object.eqText)
+        ? globalThis.String(object.eqText)
+        : isSet(object.eq_text)
+        ? globalThis.String(object.eq_text)
+        : undefined,
+      range: isSet(object.range) ? RangeFilter.fromJSON(object.range) : undefined,
+      inValues: isSet(object.inValues)
+        ? InFilter.fromJSON(object.inValues)
+        : isSet(object.in_values)
+        ? InFilter.fromJSON(object.in_values)
+        : undefined,
+    };
+  },
+
+  toJSON(message: Filter): unknown {
+    const obj: any = {};
+    if (message.field !== "") {
+      obj.field = message.field;
+    }
+    if (message.eqU64 !== undefined) {
+      obj.eqU64 = Math.round(message.eqU64);
+    }
+    if (message.eqI64 !== undefined) {
+      obj.eqI64 = Math.round(message.eqI64);
+    }
+    if (message.eqF64 !== undefined) {
+      obj.eqF64 = message.eqF64;
+    }
+    if (message.eqText !== undefined) {
+      obj.eqText = message.eqText;
+    }
+    if (message.range !== undefined) {
+      obj.range = RangeFilter.toJSON(message.range);
+    }
+    if (message.inValues !== undefined) {
+      obj.inValues = InFilter.toJSON(message.inValues);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Filter>): Filter {
+    return Filter.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Filter>): Filter {
+    const message = createBaseFilter();
+    message.field = object.field ?? "";
+    message.eqU64 = object.eqU64 ?? undefined;
+    message.eqI64 = object.eqI64 ?? undefined;
+    message.eqF64 = object.eqF64 ?? undefined;
+    message.eqText = object.eqText ?? undefined;
+    message.range = (object.range !== undefined && object.range !== null)
+      ? RangeFilter.fromPartial(object.range)
+      : undefined;
+    message.inValues = (object.inValues !== undefined && object.inValues !== null)
+      ? InFilter.fromPartial(object.inValues)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseRangeFilter(): RangeFilter {
+  return { min: undefined, max: undefined };
+}
+
+export const RangeFilter: MessageFns<RangeFilter> = {
+  encode(message: RangeFilter, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.min !== undefined) {
+      writer.uint32(9).double(message.min);
+    }
+    if (message.max !== undefined) {
+      writer.uint32(17).double(message.max);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RangeFilter {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRangeFilter();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 9) {
+            break;
+          }
+
+          message.min = reader.double();
+          continue;
+        }
+        case 2: {
+          if (tag !== 17) {
+            break;
+          }
+
+          message.max = reader.double();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RangeFilter {
+    return {
+      min: isSet(object.min) ? globalThis.Number(object.min) : undefined,
+      max: isSet(object.max) ? globalThis.Number(object.max) : undefined,
+    };
+  },
+
+  toJSON(message: RangeFilter): unknown {
+    const obj: any = {};
+    if (message.min !== undefined) {
+      obj.min = message.min;
+    }
+    if (message.max !== undefined) {
+      obj.max = message.max;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RangeFilter>): RangeFilter {
+    return RangeFilter.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RangeFilter>): RangeFilter {
+    const message = createBaseRangeFilter();
+    message.min = object.min ?? undefined;
+    message.max = object.max ?? undefined;
+    return message;
+  },
+};
+
+function createBaseInFilter(): InFilter {
+  return { textValues: [], u64Values: [], i64Values: [] };
+}
+
+export const InFilter: MessageFns<InFilter> = {
+  encode(message: InFilter, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.textValues) {
+      writer.uint32(10).string(v!);
+    }
+    writer.uint32(18).fork();
+    for (const v of message.u64Values) {
+      writer.uint64(v);
+    }
+    writer.join();
+    writer.uint32(26).fork();
+    for (const v of message.i64Values) {
+      writer.int64(v);
+    }
+    writer.join();
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): InFilter {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseInFilter();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.textValues.push(reader.string());
+          continue;
+        }
+        case 2: {
+          if (tag === 16) {
+            message.u64Values.push(longToNumber(reader.uint64()));
+
+            continue;
+          }
+
+          if (tag === 18) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.u64Values.push(longToNumber(reader.uint64()));
+            }
+
+            continue;
+          }
+
+          break;
+        }
+        case 3: {
+          if (tag === 24) {
+            message.i64Values.push(longToNumber(reader.int64()));
+
+            continue;
+          }
+
+          if (tag === 26) {
+            const end2 = reader.uint32() + reader.pos;
+            while (reader.pos < end2) {
+              message.i64Values.push(longToNumber(reader.int64()));
+            }
+
+            continue;
+          }
+
+          break;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): InFilter {
+    return {
+      textValues: globalThis.Array.isArray(object?.textValues)
+        ? object.textValues.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.text_values)
+        ? object.text_values.map((e: any) => globalThis.String(e))
+        : [],
+      u64Values: globalThis.Array.isArray(object?.u64Values)
+        ? object.u64Values.map((e: any) => globalThis.Number(e))
+        : globalThis.Array.isArray(object?.u64_values)
+        ? object.u64_values.map((e: any) => globalThis.Number(e))
+        : [],
+      i64Values: globalThis.Array.isArray(object?.i64Values)
+        ? object.i64Values.map((e: any) => globalThis.Number(e))
+        : globalThis.Array.isArray(object?.i64_values)
+        ? object.i64_values.map((e: any) => globalThis.Number(e))
+        : [],
+    };
+  },
+
+  toJSON(message: InFilter): unknown {
+    const obj: any = {};
+    if (message.textValues?.length) {
+      obj.textValues = message.textValues;
+    }
+    if (message.u64Values?.length) {
+      obj.u64Values = message.u64Values.map((e) => Math.round(e));
+    }
+    if (message.i64Values?.length) {
+      obj.i64Values = message.i64Values.map((e) => Math.round(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<InFilter>): InFilter {
+    return InFilter.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<InFilter>): InFilter {
+    const message = createBaseInFilter();
+    message.textValues = object.textValues?.map((e) => e) || [];
+    message.u64Values = object.u64Values?.map((e) => e) || [];
+    message.i64Values = object.i64Values?.map((e) => e) || [];
     return message;
   },
 };
 
 function createBaseSearchRequest(): SearchRequest {
-  return { indexName: "", query: undefined, limit: 0, offset: 0, fieldsToLoad: [], reranker: undefined };
+  return { indexName: "", query: undefined, limit: 0, offset: 0, fieldsToLoad: [], reranker: undefined, filters: [] };
 }
 
 export const SearchRequest: MessageFns<SearchRequest> = {
@@ -1579,6 +2043,9 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     }
     if (message.reranker !== undefined) {
       Reranker.encode(message.reranker, writer.uint32(50).fork()).join();
+    }
+    for (const v of message.filters) {
+      Filter.encode(v!, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -1638,6 +2105,14 @@ export const SearchRequest: MessageFns<SearchRequest> = {
           message.reranker = Reranker.decode(reader, reader.uint32());
           continue;
         }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.filters.push(Filter.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1663,6 +2138,7 @@ export const SearchRequest: MessageFns<SearchRequest> = {
         ? object.fields_to_load.map((e: any) => globalThis.String(e))
         : [],
       reranker: isSet(object.reranker) ? Reranker.fromJSON(object.reranker) : undefined,
+      filters: globalThis.Array.isArray(object?.filters) ? object.filters.map((e: any) => Filter.fromJSON(e)) : [],
     };
   },
 
@@ -1686,6 +2162,9 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     if (message.reranker !== undefined) {
       obj.reranker = Reranker.toJSON(message.reranker);
     }
+    if (message.filters?.length) {
+      obj.filters = message.filters.map((e) => Filter.toJSON(e));
+    }
     return obj;
   },
 
@@ -1702,6 +2181,7 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     message.reranker = (object.reranker !== undefined && object.reranker !== null)
       ? Reranker.fromPartial(object.reranker)
       : undefined;
+    message.filters = object.filters?.map((e) => Filter.fromPartial(e)) || [];
     return message;
   },
 };
@@ -2375,7 +2855,7 @@ export const DenseVector: MessageFns<DenseVector> = {
 };
 
 function createBaseSearchResponse(): SearchResponse {
-  return { hits: [], totalHits: 0, tookMs: 0 };
+  return { hits: [], totalHits: 0, tookMs: 0, timings: undefined };
 }
 
 export const SearchResponse: MessageFns<SearchResponse> = {
@@ -2388,6 +2868,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     }
     if (message.tookMs !== 0) {
       writer.uint32(24).uint64(message.tookMs);
+    }
+    if (message.timings !== undefined) {
+      SearchTimings.encode(message.timings, writer.uint32(34).fork()).join();
     }
     return writer;
   },
@@ -2423,6 +2906,14 @@ export const SearchResponse: MessageFns<SearchResponse> = {
           message.tookMs = longToNumber(reader.uint64());
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.timings = SearchTimings.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2445,6 +2936,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
         : isSet(object.took_ms)
         ? globalThis.Number(object.took_ms)
         : 0,
+      timings: isSet(object.timings) ? SearchTimings.fromJSON(object.timings) : undefined,
     };
   },
 
@@ -2459,6 +2951,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     if (message.tookMs !== 0) {
       obj.tookMs = Math.round(message.tookMs);
     }
+    if (message.timings !== undefined) {
+      obj.timings = SearchTimings.toJSON(message.timings);
+    }
     return obj;
   },
 
@@ -2470,6 +2965,133 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     message.hits = object.hits?.map((e) => SearchHit.fromPartial(e)) || [];
     message.totalHits = object.totalHits ?? 0;
     message.tookMs = object.tookMs ?? 0;
+    message.timings = (object.timings !== undefined && object.timings !== null)
+      ? SearchTimings.fromPartial(object.timings)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseSearchTimings(): SearchTimings {
+  return { searchUs: 0, rerankUs: 0, loadUs: 0, totalUs: 0 };
+}
+
+export const SearchTimings: MessageFns<SearchTimings> = {
+  encode(message: SearchTimings, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.searchUs !== 0) {
+      writer.uint32(8).uint64(message.searchUs);
+    }
+    if (message.rerankUs !== 0) {
+      writer.uint32(16).uint64(message.rerankUs);
+    }
+    if (message.loadUs !== 0) {
+      writer.uint32(24).uint64(message.loadUs);
+    }
+    if (message.totalUs !== 0) {
+      writer.uint32(32).uint64(message.totalUs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SearchTimings {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSearchTimings();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.searchUs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.rerankUs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.loadUs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.totalUs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SearchTimings {
+    return {
+      searchUs: isSet(object.searchUs)
+        ? globalThis.Number(object.searchUs)
+        : isSet(object.search_us)
+        ? globalThis.Number(object.search_us)
+        : 0,
+      rerankUs: isSet(object.rerankUs)
+        ? globalThis.Number(object.rerankUs)
+        : isSet(object.rerank_us)
+        ? globalThis.Number(object.rerank_us)
+        : 0,
+      loadUs: isSet(object.loadUs)
+        ? globalThis.Number(object.loadUs)
+        : isSet(object.load_us)
+        ? globalThis.Number(object.load_us)
+        : 0,
+      totalUs: isSet(object.totalUs)
+        ? globalThis.Number(object.totalUs)
+        : isSet(object.total_us)
+        ? globalThis.Number(object.total_us)
+        : 0,
+    };
+  },
+
+  toJSON(message: SearchTimings): unknown {
+    const obj: any = {};
+    if (message.searchUs !== 0) {
+      obj.searchUs = Math.round(message.searchUs);
+    }
+    if (message.rerankUs !== 0) {
+      obj.rerankUs = Math.round(message.rerankUs);
+    }
+    if (message.loadUs !== 0) {
+      obj.loadUs = Math.round(message.loadUs);
+    }
+    if (message.totalUs !== 0) {
+      obj.totalUs = Math.round(message.totalUs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SearchTimings>): SearchTimings {
+    return SearchTimings.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SearchTimings>): SearchTimings {
+    const message = createBaseSearchTimings();
+    message.searchUs = object.searchUs ?? 0;
+    message.rerankUs = object.rerankUs ?? 0;
+    message.loadUs = object.loadUs ?? 0;
+    message.totalUs = object.totalUs ?? 0;
     return message;
   },
 };

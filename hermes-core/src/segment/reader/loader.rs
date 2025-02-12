@@ -338,3 +338,49 @@ pub async fn open_positions_file<D: Directory>(
         Err(_) => Ok(None),
     }
 }
+
+/// Load fast-field columns from `.fast` file.
+/// Returns a map of field_id → FastFieldReader.
+pub async fn load_fast_fields_file<D: Directory>(
+    dir: &D,
+    files: &SegmentFiles,
+    schema: &Schema,
+) -> Result<FxHashMap<u32, crate::structures::fast_field::FastFieldReader>> {
+    use crate::structures::fast_field::{
+        FastFieldReader, read_fast_field_footer, read_fast_field_toc,
+    };
+
+    // Skip if no fast fields in schema
+    let has_fast = schema.fields().any(|(_, entry)| entry.fast);
+    if !has_fast {
+        return Ok(FxHashMap::default());
+    }
+
+    // Try to open the .fast file (may not exist for old segments)
+    let handle = match dir.open_read(&files.fast).await {
+        Ok(h) => h,
+        Err(_) => return Ok(FxHashMap::default()),
+    };
+
+    let file_data = handle.read_bytes().await?;
+    if file_data.is_empty() {
+        return Ok(FxHashMap::default());
+    }
+
+    let (toc_offset, num_columns) = read_fast_field_footer(&file_data).map_err(crate::Error::Io)?;
+    let toc_entries =
+        read_fast_field_toc(&file_data, toc_offset, num_columns).map_err(crate::Error::Io)?;
+
+    let mut readers = FxHashMap::default();
+    for toc in &toc_entries {
+        let reader = FastFieldReader::open(&file_data, toc).map_err(crate::Error::Io)?;
+        readers.insert(toc.field_id, reader);
+    }
+
+    log::debug!(
+        "[fast-fields] loaded {} columns from .fast file",
+        readers.len()
+    );
+
+    Ok(readers)
+}

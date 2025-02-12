@@ -97,7 +97,7 @@ impl IndexMetadata {
         }
     }
 
-    /// Get segment IDs as a sorted Vec (deterministic ordering for doc_id_offset assignment)
+    /// Get segment IDs as a sorted Vec (deterministic ordering)
     pub fn segment_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.segment_metas.keys().cloned().collect();
         ids.sort();

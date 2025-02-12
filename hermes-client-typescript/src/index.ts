@@ -1,9 +1,11 @@
 export { HermesClient } from "./client";
 export {
+  DocAddress,
   Document,
   SearchHit,
   SearchResponse,
   IndexInfo,
+  VectorFieldStats,
   SearchOptions,
   TermQuery,
   BooleanQueryDef,
@@ -36,6 +38,7 @@ export {
   SparseVector,
   DenseVector,
   GetDocumentRequest,
+  DocAddress as PbDocAddress,
   GetDocumentResponse,
   GetIndexInfoRequest,
   GetIndexInfoResponse,

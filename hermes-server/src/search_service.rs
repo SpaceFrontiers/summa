@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use tonic::{Request, Response, Status};
 
-use crate::converters::{convert_field_value, convert_query, convert_reranker, schema_to_sdl};
+use crate::converters::{
+    convert_field_value, convert_filters, convert_query, convert_reranker, schema_to_sdl,
+};
 use crate::proto::search_service_server::SearchService;
 use crate::proto::*;
 use crate::registry::IndexRegistry;
@@ -38,8 +40,18 @@ impl SearchService for SearchServiceImpl {
             .query
             .ok_or_else(|| Status::invalid_argument("Query is required"))?;
 
-        let core_query = convert_query(&query, reader.schema(), Some(searcher.global_stats()))
+        let mut core_query = convert_query(&query, reader.schema(), Some(searcher.global_stats()))
             .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
+
+        // Apply fast-field filters if present
+        if !req.filters.is_empty() {
+            let filters = convert_filters(&req.filters, reader.schema())
+                .map_err(|e| Status::invalid_argument(format!("Invalid filter: {}", e)))?;
+            core_query = Box::new(hermes_core::query::FastFieldFilterQuery::new(
+                std::sync::Arc::from(core_query),
+                filters,
+            ));
+        }
 
         let limit = if req.limit == 0 {
             10
@@ -106,19 +118,22 @@ impl SearchService for SearchServiceImpl {
         for result in results {
             let mut fields = HashMap::new();
 
-            if !req.fields_to_load.is_empty()
-                && let Ok(Some(doc)) = searcher
+            if !req.fields_to_load.is_empty() {
+                let doc = searcher
                     .get_document_with_fields(
                         &hermes_core::query::DocAddress::new(result.segment_id, result.doc_id),
                         requested_field_ids.as_ref(),
                     )
                     .await
-            {
-                for field_name in &req.fields_to_load {
-                    if let Some(field) = searcher.schema().get_field(field_name)
-                        && let Some(value) = doc.get_first(field)
-                    {
-                        fields.insert(field_name.clone(), convert_field_value(value));
+                    .map_err(|e| Status::internal(format!("Failed to load doc fields: {}", e)))?;
+
+                if let Some(doc) = doc {
+                    for field_name in &req.fields_to_load {
+                        if let Some(field) = searcher.schema().get_field(field_name)
+                            && let Some(value) = doc.get_first(field)
+                        {
+                            fields.insert(field_name.clone(), convert_field_value(value));
+                        }
                     }
                 }
             }
@@ -136,7 +151,10 @@ impl SearchService for SearchServiceImpl {
                 .collect();
 
             hits.push(SearchHit {
-                doc_id: result.doc_id,
+                address: Some(DocAddress {
+                    segment_id: format!("{:032x}", result.segment_id),
+                    doc_id: result.doc_id,
+                }),
                 score: result.score,
                 fields,
                 ordinal_scores,
@@ -176,8 +194,14 @@ impl SearchService for SearchServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
+        let addr = req
+            .address
+            .ok_or_else(|| Status::invalid_argument("address is required"))?;
+        let segment_id = u128::from_str_radix(&addr.segment_id, 16).map_err(|_| {
+            Status::invalid_argument(format!("Invalid segment_id: {}", addr.segment_id))
+        })?;
         let doc = searcher
-            .doc(req.doc_id)
+            .doc(segment_id, addr.doc_id)
             .await
             .map_err(|e| Status::internal(format!("Failed to get document: {}", e)))?
             .ok_or_else(|| Status::not_found("Document not found"))?;
@@ -242,12 +266,60 @@ impl SearchService for SearchServiceImpl {
             segment_reader: Some(segment_reader_stats),
         };
 
+        // Collect per-field vector statistics across all segments
+        let schema = index.schema();
+        let mut dense_totals: HashMap<u32, u64> = HashMap::new();
+        let mut sparse_totals: HashMap<u32, u64> = HashMap::new();
+        let mut dense_dims: HashMap<u32, u32> = HashMap::new();
+        let mut sparse_dims: HashMap<u32, u32> = HashMap::new();
+
+        for segment in searcher.segment_readers() {
+            for (&field_id, flat) in segment.flat_vectors() {
+                *dense_totals.entry(field_id).or_default() += flat.num_vectors as u64;
+                dense_dims.entry(field_id).or_insert(flat.dim as u32);
+            }
+            for (&field_id, sparse_idx) in segment.sparse_indexes() {
+                *sparse_totals.entry(field_id).or_default() += sparse_idx.total_vectors as u64;
+                sparse_dims
+                    .entry(field_id)
+                    .or_insert(sparse_idx.num_dimensions() as u32);
+            }
+        }
+
+        let mut vector_stats = Vec::new();
+        for (field_id, total) in &dense_totals {
+            let name = schema
+                .get_field_name(hermes_core::dsl::Field(*field_id))
+                .unwrap_or("unknown")
+                .to_string();
+            vector_stats.push(VectorFieldStats {
+                field_name: name,
+                vector_type: "dense".to_string(),
+                total_vectors: *total,
+                dimension: dense_dims.get(field_id).copied().unwrap_or(0),
+            });
+        }
+        for (field_id, total) in &sparse_totals {
+            let name = schema
+                .get_field_name(hermes_core::dsl::Field(*field_id))
+                .unwrap_or("unknown")
+                .to_string();
+            vector_stats.push(VectorFieldStats {
+                field_name: name,
+                vector_type: "sparse".to_string(),
+                total_vectors: *total,
+                dimension: sparse_dims.get(field_id).copied().unwrap_or(0),
+            });
+        }
+        vector_stats.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+
         Ok(Response::new(GetIndexInfoResponse {
             index_name: req.index_name,
             num_docs: searcher.num_docs(),
             num_segments: searcher.segment_readers().len() as u32,
             schema: schema_str,
             memory_stats: Some(memory_stats),
+            vector_stats,
         }))
     }
 }

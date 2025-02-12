@@ -3,9 +3,15 @@ export interface Document {
   fields: Record<string, any>;
 }
 
+/** Unique document address: segment + local doc_id. */
+export interface DocAddress {
+  segmentId: string;
+  docId: number;
+}
+
 /** A single search result. */
 export interface SearchHit {
-  docId: number;
+  address: DocAddress;
   score: number;
   fields: Record<string, any>;
 }
@@ -26,12 +32,21 @@ export interface SearchResponse {
   timings?: SearchTimings;
 }
 
+/** Per-field vector statistics. */
+export interface VectorFieldStats {
+  fieldName: string;
+  vectorType: string; // "dense" or "sparse"
+  totalVectors: number;
+  dimension: number;
+}
+
 /** Information about an index. */
 export interface IndexInfo {
   indexName: string;
   numDocs: number;
   numSegments: number;
   schema: string;
+  vectorStats: VectorFieldStats[];
 }
 
 /** Term query: (field, term) */
@@ -67,6 +82,19 @@ export type RerankerCombiner =
   | "sum"
   | "weighted_top_k";
 
+/** Fast-field filter condition */
+export interface FilterDef {
+  field: string;
+  eq_u64?: number;
+  eq_i64?: number;
+  eq_f64?: number;
+  eq_text?: string;
+  range?: { min?: number; max?: number };
+  in_text?: string[];
+  in_u64?: number[];
+  in_i64?: number[];
+}
+
 /** Search options */
 export interface SearchOptions {
   term?: TermQuery;
@@ -83,4 +111,9 @@ export interface SearchOptions {
   fieldsToLoad?: string[];
   reranker?: RerankerDef;
   rerankerCombiner?: RerankerCombiner;
+  /** Matryoshka pre-filter: number of leading dimensions for cheap approximate
+   *  scoring before full-dimension exact reranking (0 or undefined = disabled). */
+  matryoshkaDims?: number;
+  /** Fast-field filters for efficient document filtering. */
+  filters?: FilterDef[];
 }

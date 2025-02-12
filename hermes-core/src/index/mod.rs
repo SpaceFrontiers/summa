@@ -447,7 +447,8 @@ mod tests {
         // Retrieve document via searcher snapshot
         let reader = index.reader().await.unwrap();
         let searcher = reader.searcher().await.unwrap();
-        let doc = searcher.doc(0).await.unwrap().unwrap();
+        let seg_id = searcher.segment_readers()[0].meta().id;
+        let doc = searcher.doc(seg_id, 0).await.unwrap().unwrap();
         assert_eq!(doc.get_first(title).unwrap().as_text(), Some("Hello World"));
     }
 
@@ -534,9 +535,10 @@ mod tests {
         // Verify all documents accessible (order may vary with queue-based indexing)
         let reader = index.reader().await.unwrap();
         let searcher = reader.searcher().await.unwrap();
+        let seg_id = searcher.segment_readers()[0].meta().id;
         let mut found_docs = 0;
         for i in 0..9 {
-            if searcher.doc(i).await.unwrap().is_some() {
+            if searcher.doc(seg_id, i).await.unwrap().is_some() {
                 found_docs += 1;
             }
         }
@@ -593,7 +595,8 @@ mod tests {
         // Also verify doc retrieval via searcher snapshot
         let reader = index.reader().await.unwrap();
         let searcher = reader.searcher().await.unwrap();
-        let doc = searcher.doc(0).await.unwrap().unwrap();
+        let seg_id = searcher.segment_readers()[0].meta().id;
+        let doc = searcher.doc(seg_id, 0).await.unwrap().unwrap();
         assert!(
             !doc.field_values().is_empty(),
             "Doc should have field values"
@@ -674,7 +677,8 @@ mod tests {
         // Verify document retrieval preserves all values
         let reader = index.reader().await.unwrap();
         let searcher = reader.searcher().await.unwrap();
-        let doc = searcher.doc(0).await.unwrap().unwrap();
+        let seg_id = searcher.segment_readers()[0].meta().id;
+        let doc = searcher.doc(seg_id, 0).await.unwrap().unwrap();
         let all_uris: Vec<_> = doc.get_all(uris).collect();
         assert_eq!(all_uris.len(), 2, "Should have 2 uris values");
         assert_eq!(all_uris[0].as_text(), Some("one"));
@@ -1065,11 +1069,12 @@ mod tests {
             "all 50 docs should match 'fox' after merge 1"
         );
 
-        // Verify all docs retrievable
+        // Verify all docs retrievable (single merged segment)
         let reader1 = index.reader().await.unwrap();
         let searcher1 = reader1.searcher().await.unwrap();
+        let seg_id1 = searcher1.segment_readers()[0].meta().id;
         for i in 0..50 {
-            let doc = searcher1.doc(i).await.unwrap();
+            let doc = searcher1.doc(seg_id1, i).await.unwrap();
             assert!(doc.is_some(), "doc {} should exist after merge 1", i);
         }
 
@@ -1130,11 +1135,12 @@ mod tests {
         let results = index.query("delta", 100).await.unwrap();
         assert_eq!(results.hits.len(), 30, "round 2 docs after merge 2");
 
-        // Verify all 80 docs retrievable
+        // Verify all 80 docs retrievable (single merged segment)
         let reader2 = index.reader().await.unwrap();
         let searcher2 = reader2.searcher().await.unwrap();
+        let seg_id2 = searcher2.segment_readers()[0].meta().id;
         for i in 0..80 {
-            let doc = searcher2.doc(i).await.unwrap();
+            let doc = searcher2.doc(seg_id2, i).await.unwrap();
             assert!(doc.is_some(), "doc {} should exist after merge 2", i);
         }
     }
@@ -1213,8 +1219,9 @@ mod tests {
         // Verify doc retrieval for every doc
         let reader = index.reader().await.unwrap();
         let searcher = reader.searcher().await.unwrap();
+        let seg_id = searcher.segment_readers()[0].meta().id;
         for i in 0..total_docs {
-            let doc = searcher.doc(i).await.unwrap();
+            let doc = searcher.doc(seg_id, i).await.unwrap();
             assert!(doc.is_some(), "doc {} missing after merge", i);
         }
     }
@@ -1886,7 +1893,11 @@ mod tests {
         assert_eq!(results.len(), 1, "TermQuery should also find the needle");
 
         // Verify content
-        let doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         let text = doc.get_first(content).unwrap().as_text().unwrap();
         assert!(
             text.contains("quetzalcoatl"),
@@ -1961,7 +1972,11 @@ mod tests {
         assert!(results[0].score > 0.0, "Needle score should be positive");
 
         // Verify it's the right document
-        let doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         let title_val = doc.get_first(title).unwrap().as_text().unwrap();
         assert_eq!(title_val, "Needle sparse document");
 
@@ -2031,7 +2046,11 @@ mod tests {
         let query = SparseVectorQuery::new(sparse, vec![(500, 1.0), (501, 1.0)]);
         let results = searcher.search(&query, 10).await.unwrap();
         assert_eq!(results.len(), 1, "Pre-merge: needle should be found");
-        let doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             doc.get_first(title).unwrap().as_text().unwrap(),
             "seg2 needle"
@@ -2053,7 +2072,11 @@ mod tests {
         let query = SparseVectorQuery::new(sparse, vec![(500, 1.0), (501, 1.0)]);
         let results = searcher.search(&query, 10).await.unwrap();
         assert_eq!(results.len(), 1, "Post-merge: needle should still be found");
-        let doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             doc.get_first(title).unwrap().as_text().unwrap(),
             "seg2 needle"
@@ -2123,7 +2146,11 @@ mod tests {
         assert!(!results.is_empty(), "Should find at least 1 result");
 
         // The needle (exact match) should be the top result with highest score
-        let top_doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let top_doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         let top_title = top_doc.get_first(title).unwrap().as_text().unwrap();
         assert_eq!(
             top_title, "Needle dense document",
@@ -2138,10 +2165,14 @@ mod tests {
 
     /// Combined: full-text + sparse + dense in the same index.
     /// Verifies all three retrieval paths work independently on the same dataset.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_needle_combined_all_modalities() {
+        use crate::directories::MmapDirectory;
         use crate::dsl::{DenseVectorConfig, VectorIndexType};
         use crate::query::{DenseVectorQuery, SparseVectorQuery, TermQuery};
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
 
         let dim = 8;
         let mut sb = SchemaBuilder::default();
@@ -2164,7 +2195,6 @@ mod tests {
         );
         let schema = sb.build();
 
-        let dir = RamDirectory::new();
         let config = IndexConfig::default();
         let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
             .await
@@ -2211,7 +2241,11 @@ mod tests {
             1,
             "Full-text: should find exactly the needle"
         );
-        let doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             doc.get_first(title)
                 .unwrap()
@@ -2224,7 +2258,11 @@ mod tests {
         let sq = SparseVectorQuery::new(sparse, vec![(9999, 1.0), (9998, 1.0)]);
         let results = searcher.search(&sq, 10).await.unwrap();
         assert_eq!(results.len(), 1, "Sparse: should find exactly the needle");
-        let doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             doc.get_first(title)
                 .unwrap()
@@ -2237,7 +2275,11 @@ mod tests {
         let dq = DenseVectorQuery::new(embedding, needle_vec);
         let results = searcher.search(&dq, 1).await.unwrap();
         assert!(!results.is_empty(), "Dense: should find at least 1 result");
-        let doc = searcher.doc(results[0].doc_id).await.unwrap().unwrap();
+        let doc = searcher
+            .doc(results[0].segment_id, results[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             doc.get_first(title).unwrap().as_text().unwrap(),
             "The extraordinary rhinoceros",
@@ -2336,6 +2378,335 @@ mod tests {
             hay_per_batch * 4,
             "Common term should match all {} hay docs",
             hay_per_batch * 4
+        );
+    }
+
+    /// Verify that every document's FIELDS (not just existence) survive multiple
+    /// merge rounds. Uses documents large enough to create multiple store blocks
+    /// per segment. This catches store merger bugs that silently lose blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_store_fields_survive_multiple_merges() {
+        use crate::directories::MmapDirectory;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let body = schema_builder.add_text_field("body", false, true);
+        let schema = schema_builder.build();
+
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 1024 * 64,
+            num_indexing_threads: 2,
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        };
+
+        let make_doc = |round: usize, idx: usize| -> Document {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("doc_r{}_i{} searchterm", round, idx));
+            let body_text = format!("round={} idx={} {}", round, idx, "abcdefghij ".repeat(90));
+            doc.add_text(body, body_text);
+            doc
+        };
+
+        let mut total_docs = 0usize;
+
+        // === Round 1: 200 docs across multiple segments ===
+        {
+            let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+                .await
+                .unwrap();
+            for batch in 0..4 {
+                for i in 0..50 {
+                    writer.add_document(make_doc(1, batch * 50 + i)).unwrap();
+                }
+                writer.commit().await.unwrap();
+            }
+            total_docs += 200;
+        }
+
+        // Force merge round 1
+        {
+            let mut writer = IndexWriter::open(dir.clone(), config.clone())
+                .await
+                .unwrap();
+            writer.force_merge().await.unwrap();
+        }
+
+        // Verify every doc's fields after merge 1
+        {
+            let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+            assert_eq!(index.num_docs().await.unwrap(), total_docs as u32);
+
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            assert_eq!(
+                searcher.num_segments(),
+                1,
+                "should be 1 segment after merge 1"
+            );
+            let seg = &searcher.segment_readers()[0];
+            let seg_id = seg.meta().id;
+
+            assert_eq!(
+                seg.store().num_docs(),
+                seg.num_docs(),
+                "store.num_docs != meta.num_docs after merge 1"
+            );
+
+            for i in 0..total_docs as u32 {
+                let doc = searcher
+                    .doc(seg_id, i)
+                    .await
+                    .unwrap_or_else(|e| panic!("doc {} error: {}", i, e));
+                assert!(doc.is_some(), "doc {} missing after merge 1", i);
+                let doc = doc.unwrap();
+                let t = doc
+                    .get_first(title)
+                    .unwrap_or_else(|| panic!("doc {} missing title", i));
+                assert!(
+                    t.as_text().unwrap().contains("searchterm"),
+                    "doc {} title corrupt after merge 1",
+                    i
+                );
+            }
+        }
+
+        // === Round 2: add 150 more docs, merge again ===
+        {
+            let mut writer = IndexWriter::open(dir.clone(), config.clone())
+                .await
+                .unwrap();
+            for batch in 0..3 {
+                for i in 0..50 {
+                    writer.add_document(make_doc(2, batch * 50 + i)).unwrap();
+                }
+                writer.commit().await.unwrap();
+            }
+            total_docs += 150;
+            writer.force_merge().await.unwrap();
+        }
+
+        // Verify every doc's fields after merge 2
+        {
+            let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+            assert_eq!(index.num_docs().await.unwrap(), total_docs as u32);
+
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            assert_eq!(
+                searcher.num_segments(),
+                1,
+                "should be 1 segment after merge 2"
+            );
+            let seg = &searcher.segment_readers()[0];
+            let seg_id = seg.meta().id;
+
+            assert_eq!(
+                seg.store().num_docs(),
+                seg.num_docs(),
+                "store.num_docs != meta.num_docs after merge 2"
+            );
+
+            for i in 0..total_docs as u32 {
+                let doc = searcher
+                    .doc(seg_id, i)
+                    .await
+                    .unwrap_or_else(|e| panic!("doc {} error: {}", i, e));
+                assert!(doc.is_some(), "doc {} missing after merge 2", i);
+                let doc = doc.unwrap();
+                let t = doc
+                    .get_first(title)
+                    .unwrap_or_else(|| panic!("doc {} missing title", i));
+                assert!(
+                    t.as_text().unwrap().contains("searchterm"),
+                    "doc {} title corrupt after merge 2",
+                    i
+                );
+            }
+        }
+
+        // === Round 3: add 100 more, merge a third time ===
+        {
+            let mut writer = IndexWriter::open(dir.clone(), config.clone())
+                .await
+                .unwrap();
+            for batch in 0..2 {
+                for i in 0..50 {
+                    writer.add_document(make_doc(3, batch * 50 + i)).unwrap();
+                }
+                writer.commit().await.unwrap();
+            }
+            total_docs += 100;
+            writer.force_merge().await.unwrap();
+        }
+
+        // Verify every doc's fields after merge 3
+        {
+            let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+            assert_eq!(index.num_docs().await.unwrap(), total_docs as u32);
+
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            assert_eq!(
+                searcher.num_segments(),
+                1,
+                "should be 1 segment after merge 3"
+            );
+            let seg = &searcher.segment_readers()[0];
+            let seg_id = seg.meta().id;
+
+            assert_eq!(
+                seg.store().num_docs(),
+                seg.num_docs(),
+                "store.num_docs != meta.num_docs after merge 3"
+            );
+
+            let mut missing = 0;
+            let mut corrupt = 0;
+            for i in 0..total_docs as u32 {
+                match searcher.doc(seg_id, i).await {
+                    Ok(Some(doc)) => {
+                        if let Some(t) = doc.get_first(title) {
+                            if !t.as_text().unwrap_or("").contains("searchterm") {
+                                corrupt += 1;
+                            }
+                        } else {
+                            corrupt += 1;
+                        }
+                    }
+                    Ok(None) => missing += 1,
+                    Err(e) => panic!("doc {} error after merge 3: {}", i, e),
+                }
+            }
+            assert_eq!(
+                missing, 0,
+                "merge 3: {} of {} docs missing from store",
+                missing, total_docs
+            );
+            assert_eq!(
+                corrupt, 0,
+                "merge 3: {} of {} docs have corrupt fields",
+                corrupt, total_docs
+            );
+        }
+
+        eprintln!("All {} docs verified across 3 merge rounds", total_docs);
+    }
+
+    /// Large-scale store test: ~3000 docs with ~1KB each → many store blocks per segment.
+    /// Verifies every doc's fields survive 4 merge rounds with MmapDirectory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_store_large_scale_multi_merge() {
+        use crate::directories::MmapDirectory;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp_dir.path());
+
+        let mut schema_builder = SchemaBuilder::default();
+        let title = schema_builder.add_text_field("title", true, true);
+        let body = schema_builder.add_text_field("body", false, true);
+        let schema = schema_builder.build();
+
+        let config = IndexConfig {
+            max_indexing_memory_bytes: 1024 * 256,
+            num_indexing_threads: 2,
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        };
+
+        // ~1KB per doc → ~256 docs per 256KB store block → 800 docs ≈ 3 blocks
+        let make_doc = |round: usize, idx: usize| -> Document {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("r{}_i{}_needle", round, idx));
+            doc.add_text(body, format!("r{}i{} {}", round, idx, "x".repeat(950)));
+            doc
+        };
+
+        let mut total_docs = 0u32;
+
+        for round in 0..4 {
+            let docs_this_round = 800u32;
+
+            // Add docs across multiple segments
+            {
+                let mut writer = if round == 0 {
+                    IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+                        .await
+                        .unwrap()
+                } else {
+                    IndexWriter::open(dir.clone(), config.clone())
+                        .await
+                        .unwrap()
+                };
+                for batch in 0..4 {
+                    for i in 0..docs_this_round / 4 {
+                        writer
+                            .add_document(make_doc(
+                                round,
+                                (batch * (docs_this_round / 4) + i) as usize,
+                            ))
+                            .unwrap();
+                    }
+                    writer.commit().await.unwrap();
+                }
+                total_docs += docs_this_round;
+                writer.force_merge().await.unwrap();
+            }
+
+            // Verify every doc's fields in the merged segment
+            {
+                let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+                assert_eq!(index.num_docs().await.unwrap(), total_docs);
+                let reader = index.reader().await.unwrap();
+                let searcher = reader.searcher().await.unwrap();
+                assert_eq!(
+                    searcher.num_segments(),
+                    1,
+                    "round {}: expected 1 segment",
+                    round
+                );
+                let seg = &searcher.segment_readers()[0];
+                let seg_id = seg.meta().id;
+                assert_eq!(
+                    seg.store().num_docs(),
+                    seg.num_docs(),
+                    "round {}: store/meta mismatch",
+                    round
+                );
+                let mut missing = 0u32;
+                for i in 0..total_docs {
+                    match searcher.doc(seg_id, i).await {
+                        Ok(Some(doc)) => {
+                            let t = doc.get_first(title);
+                            assert!(
+                                t.is_some() && t.unwrap().as_text().unwrap().contains("needle"),
+                                "round {}: doc {} corrupt",
+                                round,
+                                i
+                            );
+                        }
+                        Ok(None) => missing += 1,
+                        Err(e) => panic!("round {}: doc {} error: {}", round, i, e),
+                    }
+                }
+                assert_eq!(
+                    missing, 0,
+                    "round {}: {} of {} docs missing",
+                    round, missing, total_docs
+                );
+            }
+
+            eprintln!(
+                "Round {}: {} docs verified ({} total)",
+                round, docs_this_round, total_docs
+            );
+        }
+        eprintln!(
+            "All {} docs verified across 4 large-scale merge rounds",
+            total_docs
         );
     }
 }

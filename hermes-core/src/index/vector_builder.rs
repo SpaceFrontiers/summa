@@ -166,7 +166,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         const MAX_TRAINING_VECTORS: usize = 100_000;
 
         let mut all_vectors: FxHashMap<u32, Vec<Vec<f32>>> = FxHashMap::default();
-        let mut doc_offset = 0u32;
         let mut total_skipped = 0usize;
 
         for id_str in segment_ids {
@@ -176,7 +175,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 self.directory.as_ref(),
                 segment_id,
                 Arc::clone(&self.schema),
-                doc_offset,
                 self.config.term_cache_blocks,
             )
             .await?;
@@ -244,8 +242,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     }
                 }
             }
-
-            doc_offset += reader.meta().num_docs;
         }
 
         if total_skipped > 0 {

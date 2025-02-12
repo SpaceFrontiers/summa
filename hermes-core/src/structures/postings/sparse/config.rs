@@ -100,6 +100,8 @@ pub enum QueryWeighting {
 /// Query-time configuration for sparse vectors
 ///
 /// Research-validated query optimization strategies:
+/// - **weight_threshold (0.01-0.05)**: Drop query dimensions with weight below threshold
+///   - Filters low-IDF tokens that add latency without improving relevance
 /// - **max_query_dims (10-20)**: Process only top-k dimensions by weight
 ///   - 30-50% latency reduction with <2% nDCG loss (Qiao et al., 2023)
 /// - **heap_factor (0.8)**: Skip blocks with low max score contribution
@@ -122,6 +124,14 @@ pub struct SparseQueryConfig {
     /// - 0.5 = very approximate, much faster but higher recall loss
     #[serde(default = "default_heap_factor")]
     pub heap_factor: f32,
+    /// Minimum weight for query dimensions (query-time pruning)
+    /// Dimensions with abs(weight) below this threshold are dropped before search.
+    /// Useful for filtering low-IDF tokens that add latency without improving relevance.
+    ///
+    /// - 0.0 = no filtering (default)
+    /// - 0.01-0.05 = recommended for SPLADE/learned sparse models
+    #[serde(default)]
+    pub weight_threshold: f32,
     /// Maximum number of query dimensions to process (query pruning)
     /// Processes only the top-k dimensions by weight
     ///
@@ -132,6 +142,11 @@ pub struct SparseQueryConfig {
     ///   - <2% nDCG@10 loss
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_query_dims: Option<usize>,
+    /// Fraction of query dimensions to keep (0.0-1.0), same semantics as
+    /// indexing-time `pruning`: sort by abs(weight) descending,
+    /// keep top fraction. None or 1.0 = no pruning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruning: Option<f32>,
 }
 
 fn default_heap_factor() -> f32 {
@@ -144,7 +159,9 @@ impl Default for SparseQueryConfig {
             tokenizer: None,
             weighting: QueryWeighting::One,
             heap_factor: 1.0,
+            weight_threshold: 0.0,
             max_query_dims: None,
+            pruning: None,
         }
     }
 }
@@ -186,7 +203,7 @@ pub struct SparseVectorConfig {
     ///
     /// Applied only during initial segment build, not during merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub posting_list_pruning: Option<f32>,
+    pub pruning: Option<f32>,
     /// Query-time configuration (tokenizer, weighting)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_config: Option<SparseQueryConfig>,
@@ -203,7 +220,7 @@ impl Default for SparseVectorConfig {
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
             block_size: 128,
-            posting_list_pruning: None,
+            pruning: None,
             query_config: None,
         }
     }
@@ -231,12 +248,14 @@ impl SparseVectorConfig {
             weight_quantization: WeightQuantization::UInt8,
             weight_threshold: 0.01, // Remove ~30-50% of low-weight postings
             block_size: 128,
-            posting_list_pruning: Some(0.1), // Keep top 10% per dimension
+            pruning: Some(0.1), // Keep top 10% per dimension
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
                 weighting: QueryWeighting::One,
                 heap_factor: 0.8,         // 20% faster approximate search
+                weight_threshold: 0.01,   // Drop low-IDF query tokens
                 max_query_dims: Some(20), // Process top 20 query dimensions
+                pruning: Some(0.1),       // Keep top 10% of query dims
             }),
         }
     }
@@ -255,12 +274,14 @@ impl SparseVectorConfig {
             weight_quantization: WeightQuantization::UInt4,
             weight_threshold: 0.02, // Slightly higher threshold for UInt4
             block_size: 128,
-            posting_list_pruning: Some(0.15), // Keep top 15% per dimension
+            pruning: Some(0.15), // Keep top 15% per dimension
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
                 weighting: QueryWeighting::One,
                 heap_factor: 0.7,         // More aggressive approximate search
+                weight_threshold: 0.02,   // Drop low-IDF query tokens
                 max_query_dims: Some(15), // Fewer query dimensions
+                pruning: Some(0.15),      // Keep top 15% of query dims
             }),
         }
     }
@@ -274,7 +295,7 @@ impl SparseVectorConfig {
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
             block_size: 128,
-            posting_list_pruning: None,
+            pruning: None,
             query_config: None,
         }
     }
@@ -294,12 +315,14 @@ impl SparseVectorConfig {
             weight_quantization: WeightQuantization::Float16,
             weight_threshold: 0.005, // Minimal pruning
             block_size: 128,
-            posting_list_pruning: None, // No posting list pruning
+            pruning: None, // No posting list pruning
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
                 weighting: QueryWeighting::One,
                 heap_factor: 0.9,         // Nearly exact search
+                weight_threshold: 0.005,  // Minimal query pruning
                 max_query_dims: Some(50), // Process more dimensions
+                pruning: None,            // No fraction-based pruning
             }),
         }
     }
@@ -313,7 +336,7 @@ impl SparseVectorConfig {
     /// Set posting list pruning fraction (builder pattern)
     /// e.g., 0.1 = keep top 10% of postings per dimension
     pub fn with_pruning(mut self, fraction: f32) -> Self {
-        self.posting_list_pruning = Some(fraction.clamp(0.0, 1.0));
+        self.pruning = Some(fraction.clamp(0.0, 1.0));
         self
     }
 
@@ -337,7 +360,7 @@ impl SparseVectorConfig {
             weight_quantization,
             weight_threshold: 0.0,
             block_size: 128,
-            posting_list_pruning: None,
+            pruning: None,
             query_config: None,
         })
     }

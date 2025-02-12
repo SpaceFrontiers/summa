@@ -266,6 +266,16 @@ pub struct SparseVectorQuery {
     /// Approximate search factor (1.0 = exact, lower values = faster but approximate)
     /// Controls MaxScore pruning aggressiveness in block-max scoring
     pub heap_factor: f32,
+    /// Minimum abs(weight) for query dimensions (0.0 = no filtering)
+    /// Dimensions below this threshold are dropped before search.
+    pub weight_threshold: f32,
+    /// Maximum number of query dimensions to process (None = all)
+    /// Keeps only the top-k dimensions by abs(weight).
+    pub max_query_dims: Option<usize>,
+    /// Fraction of query dimensions to keep (0.0-1.0), same semantics as
+    /// indexing-time `pruning`: sort by abs(weight) descending,
+    /// keep top fraction. None or 1.0 = no pruning.
+    pub pruning: Option<f32>,
 }
 
 impl SparseVectorQuery {
@@ -281,6 +291,9 @@ impl SparseVectorQuery {
             vector,
             combiner: MultiValueCombiner::LogSumExp { temperature: 0.7 },
             heap_factor: 1.0,
+            weight_threshold: 0.0,
+            max_query_dims: None,
+            pruning: None,
         }
     }
 
@@ -299,6 +312,94 @@ impl SparseVectorQuery {
     pub fn with_heap_factor(mut self, heap_factor: f32) -> Self {
         self.heap_factor = heap_factor.clamp(0.0, 1.0);
         self
+    }
+
+    /// Set minimum weight threshold for query dimensions
+    /// Dimensions with abs(weight) below this are dropped before search.
+    pub fn with_weight_threshold(mut self, threshold: f32) -> Self {
+        self.weight_threshold = threshold;
+        self
+    }
+
+    /// Set maximum number of query dimensions (top-k by weight)
+    pub fn with_max_query_dims(mut self, max_dims: usize) -> Self {
+        self.max_query_dims = Some(max_dims);
+        self
+    }
+
+    /// Set pruning fraction (0.0-1.0): keep top fraction of query dims by weight.
+    /// Same semantics as indexing-time `pruning`.
+    pub fn with_pruning(mut self, fraction: f32) -> Self {
+        self.pruning = Some(fraction.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Apply weight_threshold, pruning, and max_query_dims, returning the pruned vector.
+    fn pruned_vector(&self) -> Vec<(u32, f32)> {
+        let original_len = self.vector.len();
+
+        // Step 1: weight_threshold — drop dimensions below minimum weight
+        let mut v: Vec<(u32, f32)> = if self.weight_threshold > 0.0 {
+            self.vector
+                .iter()
+                .copied()
+                .filter(|(_, w)| w.abs() >= self.weight_threshold)
+                .collect()
+        } else {
+            self.vector.clone()
+        };
+        let after_threshold = v.len();
+
+        // Step 2: pruning — keep top fraction by abs(weight), same as indexing
+        if let Some(fraction) = self.pruning
+            && fraction < 1.0
+            && v.len() > 1
+        {
+            v.sort_unstable_by(|a, b| {
+                b.1.abs()
+                    .partial_cmp(&a.1.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let keep = ((v.len() as f64 * fraction as f64).ceil() as usize).max(1);
+            v.truncate(keep);
+        }
+        let after_pruning = v.len();
+
+        // Step 3: max_query_dims — absolute cap on dimensions
+        if let Some(max_dims) = self.max_query_dims
+            && v.len() > max_dims
+        {
+            // Sort by descending abs(weight), keep top-k
+            v.sort_unstable_by(|a, b| {
+                b.1.abs()
+                    .partial_cmp(&a.1.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            v.truncate(max_dims);
+        }
+
+        if v.len() < original_len {
+            log::debug!(
+                "[sparse query] field={}: pruned {}->{} dims \
+                 (threshold: {}->{}, pruning: {}->{}, max_dims: {}->{})",
+                self.field.0,
+                original_len,
+                v.len(),
+                original_len,
+                after_threshold,
+                after_threshold,
+                after_pruning,
+                after_pruning,
+                v.len(),
+            );
+            if log::log_enabled!(log::Level::Trace) {
+                for (dim, w) in &v {
+                    log::trace!("  dim={}, weight={:.4}", dim, w);
+                }
+            }
+        }
+
+        v
     }
 
     /// Create from separate indices and weights vectors
@@ -457,7 +558,7 @@ impl SparseVectorQuery {
 impl Query for SparseVectorQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
-        let vector = self.vector.clone();
+        let vector = self.pruned_vector();
         let combiner = self.combiner;
         let heap_factor = self.heap_factor;
         Box::pin(async move {

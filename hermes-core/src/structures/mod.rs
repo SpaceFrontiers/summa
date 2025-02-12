@@ -6,6 +6,7 @@
 //! - `simd` - SIMD utilities
 //! - `sstable` - SSTable for term dictionary
 
+pub mod fast_field;
 pub mod postings;
 pub mod simd;
 mod sstable;

@@ -21,10 +21,18 @@ class Document:
 
 
 @dataclass
+class DocAddress:
+    """Unique document address: segment + local doc_id."""
+
+    segment_id: str
+    doc_id: int
+
+
+@dataclass
 class SearchHit:
     """A single search result."""
 
-    doc_id: int
+    address: DocAddress
     score: float
     fields: dict[str, Any] = field(default_factory=dict)
 
@@ -50,6 +58,16 @@ class SearchResponse:
 
 
 @dataclass
+class VectorFieldStats:
+    """Per-field vector statistics."""
+
+    field_name: str
+    vector_type: str  # "dense" or "sparse"
+    total_vectors: int
+    dimension: int
+
+
+@dataclass
 class IndexInfo:
     """Information about an index."""
 
@@ -57,3 +75,4 @@ class IndexInfo:
     num_docs: int
     num_segments: int
     schema: str
+    vector_stats: list[VectorFieldStats] = field(default_factory=list)

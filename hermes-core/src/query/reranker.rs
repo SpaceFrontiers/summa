@@ -202,7 +202,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         // Each entry: (candidate_idx, flat_vector_idx, ordinal)
         let mut resolved: Vec<(usize, usize, u32)> = Vec::new();
         for &ci in candidate_indices {
-            let local_doc_id = candidates[ci].doc_id - segments[*si].doc_id_offset();
+            let local_doc_id = candidates[ci].doc_id;
             let (start, count) = lazy_flat.flat_indexes_for_doc_range(local_doc_id);
             if count == 0 {
                 skipped += 1;
@@ -235,10 +235,10 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         // Use coalesced read if span waste is reasonable (< 4× the needed count),
         // otherwise fall back to individual reads for very sparse patterns
         if span <= n * 4 {
-            let range_bytes = match lazy_flat.read_vectors_batch(first_idx, span).await {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            let range_bytes = lazy_flat
+                .read_vectors_batch(first_idx, span)
+                .await
+                .expect("reranker: failed to read vector batch from flat storage");
             let rb = range_bytes.as_slice();
             for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
                 let rel = flat_idx - first_idx;
@@ -247,12 +247,13 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
             }
         } else {
             for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
-                let _ = lazy_flat
+                lazy_flat
                     .read_vector_raw_into(
                         flat_idx,
                         &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
                     )
-                    .await;
+                    .await
+                    .expect("reranker: failed to read individual vector from flat storage");
             }
         }
 

@@ -322,8 +322,9 @@ impl<'a> EagerParallelStoreWriter<'a> {
         let mut remaining = Vec::new();
         for handle in self.pending_handles.drain(..) {
             if handle.is_finished() {
-                if let Ok(block) = handle.join() {
-                    self.compressed_blocks.push(block);
+                match handle.join() {
+                    Ok(block) => self.compressed_blocks.push(block),
+                    Err(payload) => std::panic::resume_unwind(payload),
                 }
             } else {
                 remaining.push(handle);
@@ -341,8 +342,9 @@ impl<'a> EagerParallelStoreWriter<'a> {
 
         // Wait for all remaining compression tasks
         for handle in self.pending_handles.drain(..) {
-            if let Ok(block) = handle.join() {
-                self.compressed_blocks.push(block);
+            match handle.join() {
+                Ok(block) => self.compressed_blocks.push(block),
+                Err(payload) => std::panic::resume_unwind(payload),
             }
         }
 

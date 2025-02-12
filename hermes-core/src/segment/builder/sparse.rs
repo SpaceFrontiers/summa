@@ -83,7 +83,7 @@ pub(super) fn build_sparse_streaming(
             .map(|c| c.weight_quantization)
             .unwrap_or(WeightQuantization::Float32);
 
-        let pruning_fraction = sparse_config.and_then(|c| c.posting_list_pruning);
+        let pruning_fraction = sparse_config.and_then(|c| c.pruning);
 
         // Parallel: sort + prune + serialize_v3 each dimension independently
         let mut dims: Vec<_> = std::mem::take(&mut builder.postings).into_iter().collect();

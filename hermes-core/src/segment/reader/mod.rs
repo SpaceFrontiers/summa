@@ -67,8 +67,6 @@ pub struct AsyncSegmentReader {
     /// Document store with lazy block loading
     store: Arc<AsyncStoreReader>,
     schema: Arc<Schema>,
-    /// Base doc_id offset for this segment
-    doc_id_offset: DocId,
     /// Dense vector indexes per field (RaBitQ or IVF-RaBitQ) — for search
     vector_indexes: FxHashMap<u32, VectorIndex>,
     /// Lazy flat vectors per field — for reranking and merge (doc_ids in memory, vectors via mmap)
@@ -79,6 +77,8 @@ pub struct AsyncSegmentReader {
     sparse_indexes: FxHashMap<u32, SparseIndex>,
     /// Position file handle for phrase queries (lazy loading)
     positions_handle: Option<FileHandle>,
+    /// Fast-field columnar readers per field_id
+    fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
 }
 
 impl AsyncSegmentReader {
@@ -87,7 +87,6 @@ impl AsyncSegmentReader {
         dir: &D,
         segment_id: SegmentId,
         schema: Arc<Schema>,
-        doc_id_offset: DocId,
         cache_blocks: usize,
     ) -> Result<Self> {
         let files = SegmentFiles::new(segment_id.0);
@@ -120,6 +119,9 @@ impl AsyncSegmentReader {
         // Open positions file handle (if exists) - offsets are now in TermInfo
         let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
 
+        // Load fast-field columns from .fast file
+        let fast_fields = loader::load_fast_fields_file(dir, &files, &schema).await?;
+
         // Log segment loading stats
         {
             let mut parts = vec![format!(
@@ -141,6 +143,9 @@ impl AsyncSegmentReader {
                     idx.num_dimensions() as f64 * 24.0 / 1024.0
                 ));
             }
+            if !fast_fields.is_empty() {
+                parts.push(format!("fast: {} fields", fast_fields.len()));
+            }
             log::debug!("{}", parts.join(", "));
         }
 
@@ -150,12 +155,12 @@ impl AsyncSegmentReader {
             postings_handle,
             store: Arc::new(store),
             schema,
-            doc_id_offset,
             vector_indexes,
             flat_vectors,
             coarse_centroids: FxHashMap::default(),
             sparse_indexes,
             positions_handle,
+            fast_fields,
         })
     }
 
@@ -170,15 +175,6 @@ impl AsyncSegmentReader {
     /// Get average field length for BM25F scoring
     pub fn avg_field_len(&self, field: Field) -> f32 {
         self.meta.avg_field_len(field)
-    }
-
-    pub fn doc_id_offset(&self) -> DocId {
-        self.doc_id_offset
-    }
-
-    /// Set the doc_id_offset (used for parallel segment loading)
-    pub fn set_doc_id_offset(&mut self, offset: DocId) {
-        self.doc_id_offset = offset;
     }
 
     pub fn schema(&self) -> &Schema {
@@ -198,6 +194,19 @@ impl AsyncSegmentReader {
     /// Get lazy flat vectors for all fields (for reranking and merge)
     pub fn flat_vectors(&self) -> &FxHashMap<u32, LazyFlatVectorData> {
         &self.flat_vectors
+    }
+
+    /// Get a fast-field reader for a specific field.
+    pub fn fast_field(
+        &self,
+        field_id: u32,
+    ) -> Option<&crate::structures::fast_field::FastFieldReader> {
+        self.fast_fields.get(&field_id)
+    }
+
+    /// Get all fast-field readers.
+    pub fn fast_fields(&self) -> &FxHashMap<u32, crate::structures::fast_field::FastFieldReader> {
+        &self.fast_fields
     }
 
     /// Get term dictionary stats for debugging
@@ -528,7 +537,7 @@ impl AsyncSegmentReader {
     /// Search dense vectors using RaBitQ
     ///
     /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
-    /// The doc_ids are adjusted by doc_id_offset for this segment.
+    /// Doc IDs are segment-local.
     /// For multi-valued documents, scores are combined using the specified combiner.
     pub async fn search_dense_vector(
         &self,
@@ -742,7 +751,6 @@ impl AsyncSegmentReader {
         }
 
         // Track ordinals with individual scores for each doc_id
-        // Note: doc_id_offset is NOT applied here - the collector applies it uniformly
         let mut doc_ordinals: rustc_hash::FxHashMap<DocId, Vec<(u32, f32)>> =
             rustc_hash::FxHashMap::default();
         for (doc_id, ordinal, score) in results {
@@ -904,16 +912,15 @@ impl AsyncSegmentReader {
         };
 
         log::trace!(
-            "Sparse search returned {} raw results for segment (doc_id_offset={})",
+            "Sparse search returned {} raw results for segment {:016x}",
             raw_results.len(),
-            self.doc_id_offset
+            self.meta.id
         );
         if log::log_enabled!(log::Level::Trace) && !raw_results.is_empty() {
             for r in raw_results.iter().take(5) {
                 log::trace!(
-                    "  Raw result: doc_id={} (global={}), score={:.4}, ordinal={}",
+                    "  Raw result: doc_id={}, score={:.4}, ordinal={}",
                     r.doc_id,
-                    r.doc_id + self.doc_id_offset,
                     r.score,
                     r.ordinal
                 );
@@ -930,7 +937,6 @@ impl AsyncSegmentReader {
         }
 
         // Combine scores and build results with ordinal tracking
-        // Note: doc_id_offset is NOT applied here - the collector applies it uniformly
         let mut results: Vec<VectorSearchResult> = doc_ordinals
             .into_iter()
             .map(|(doc_id, ordinals)| {

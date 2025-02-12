@@ -76,6 +76,8 @@ pub struct FieldDef {
     pub sparse_vector_config: Option<SparseVectorConfig>,
     /// Configuration for dense vector fields
     pub dense_vector_config: Option<DenseVectorConfig>,
+    /// Whether this field has columnar fast-field storage
+    pub fast: bool,
 }
 
 /// Parsed index definition
@@ -137,6 +139,9 @@ impl IndexDef {
             };
             if field.multi {
                 builder.set_multi(f, true);
+            }
+            if field.fast {
+                builder.set_fast(f, true);
             }
             // Set positions: explicit > auto (ordinal for multi vectors)
             let positions = field.positions.or({
@@ -211,27 +216,33 @@ struct IndexConfig {
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
-    posting_list_pruning: Option<f32>,
+    pruning: Option<f32>,
     // Sparse vector query-time config
     query_tokenizer: Option<String>,
     query_weighting: Option<QueryWeighting>,
+    query_weight_threshold: Option<f32>,
+    query_max_dims: Option<usize>,
+    query_pruning: Option<f32>,
     // Position tracking mode for phrase queries
     positions: Option<super::schema::PositionMode>,
 }
 
 /// Parse attributes from pest pair
-/// Returns (indexed, stored, multi, index_config)
+/// Returns (indexed, stored, multi, fast, index_config)
 /// positions is now inside index_config (via indexed<positions> or indexed<ordinal> etc.)
 /// multi is now inside stored<multi>
-fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> (bool, bool, bool, Option<IndexConfig>) {
+fn parse_attributes(
+    pair: pest::iterators::Pair<Rule>,
+) -> (bool, bool, bool, bool, Option<IndexConfig>) {
     let mut indexed = false;
     let mut stored = false;
     let mut multi = false;
+    let mut fast = false;
     let mut index_config = None;
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::attribute {
-            // attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" }
+            // attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" }
             let mut found_config = false;
             for inner in attr.clone().into_inner() {
                 match inner.as_rule() {
@@ -255,13 +266,14 @@ fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> (bool, bool, bool, Opt
                 match attr.as_str() {
                     "indexed" => indexed = true,
                     "stored" => stored = true,
+                    "fast" => fast = true,
                     _ => {}
                 }
             }
         }
     }
 
-    (indexed, stored, multi, index_config)
+    (indexed, stored, multi, fast, index_config)
 }
 
 /// Parse index configuration from indexed<...> attribute
@@ -358,7 +370,7 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
         Rule::pruning_kwarg => {
             // pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
             if let Some(f) = p.into_inner().next() {
-                config.posting_list_pruning = Some(f.as_str().parse().unwrap_or(1.0));
+                config.pruning = Some(f.as_str().parse().unwrap_or(1.0));
             }
         }
         Rule::query_config_block => {
@@ -405,6 +417,22 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                                     });
                                 }
                             }
+                            Rule::query_weight_threshold_kwarg => {
+                                if let Some(t) = p.into_inner().next() {
+                                    config.query_weight_threshold =
+                                        Some(t.as_str().parse().unwrap_or(0.0));
+                                }
+                            }
+                            Rule::query_max_dims_kwarg => {
+                                if let Some(t) = p.into_inner().next() {
+                                    config.query_max_dims = Some(t.as_str().parse().unwrap_or(0));
+                                }
+                            }
+                            Rule::query_pruning_kwarg => {
+                                if let Some(t) = p.into_inner().next() {
+                                    config.query_pruning = Some(t.as_str().parse().unwrap_or(1.0));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -438,6 +466,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut indexed = true;
     let mut stored = true;
     let mut multi = false;
+    let mut fast = false;
     let mut index_config: Option<IndexConfig> = None;
 
     for item in inner {
@@ -457,10 +486,11 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 dense_vector_config = Some(parse_dense_vector_config(item));
             }
             Rule::attributes => {
-                let (idx, sto, mul, idx_cfg) = parse_attributes(item);
+                let (idx, sto, mul, fst, idx_cfg) = parse_attributes(item);
                 indexed = idx;
                 stored = sto;
                 multi = mul;
+                fast = fst;
                 index_config = idx_cfg;
             }
             _ => {}
@@ -490,6 +520,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         positions,
         sparse_vector_config,
         dense_vector_config,
+        fast,
     })
 }
 
@@ -537,7 +568,7 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
         weight_quantization: WeightQuantization::default(),
         weight_threshold: 0.0,
         block_size: 128,
-        posting_list_pruning: None,
+        pruning: None,
         query_config: None,
     }
 }
@@ -561,7 +592,7 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         config.block_size = adjusted;
     }
-    if let Some(p) = idx_cfg.posting_list_pruning {
+    if let Some(p) = idx_cfg.pruning {
         let clamped = p.clamp(0.0, 1.0);
         if (clamped - p).abs() > f32::EPSILON {
             log::warn!(
@@ -570,10 +601,15 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
                 clamped
             );
         }
-        config.posting_list_pruning = Some(clamped);
+        config.pruning = Some(clamped);
     }
     // Apply query-time configuration if present
-    if idx_cfg.query_tokenizer.is_some() || idx_cfg.query_weighting.is_some() {
+    if idx_cfg.query_tokenizer.is_some()
+        || idx_cfg.query_weighting.is_some()
+        || idx_cfg.query_weight_threshold.is_some()
+        || idx_cfg.query_max_dims.is_some()
+        || idx_cfg.query_pruning.is_some()
+    {
         let query_config = config
             .query_config
             .get_or_insert(SparseQueryConfig::default());
@@ -582,6 +618,15 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         if let Some(weighting) = idx_cfg.query_weighting {
             query_config.weighting = weighting;
+        }
+        if let Some(t) = idx_cfg.query_weight_threshold {
+            query_config.weight_threshold = t;
+        }
+        if let Some(d) = idx_cfg.query_max_dims {
+            query_config.max_query_dims = Some(d);
+        }
+        if let Some(p) = idx_cfg.query_pruning {
+            query_config.pruning = Some(p);
         }
     }
 }
@@ -1221,7 +1266,7 @@ mod tests {
         assert_eq!(f.name, "embedding");
         let config = f.sparse_vector_config.as_ref().unwrap();
         assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
-        assert_eq!(config.posting_list_pruning, Some(0.1));
+        assert_eq!(config.pruning, Some(0.1));
     }
 
     #[test]
@@ -1649,5 +1694,77 @@ mod tests {
         let sc = entry.sparse_vector_config.as_ref().unwrap();
         let qc = sc.query_config.as_ref().unwrap();
         assert_eq!(qc.weighting, QueryWeighting::IdfFile);
+    }
+
+    #[test]
+    fn test_sparse_vector_query_config_pruning_params() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16> [indexed<quantization: uint8, query<weighting: idf, weight_threshold: 0.03, max_dims: 25, pruning: 0.2>>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+
+        let qc = config.query_config.as_ref().unwrap();
+        assert_eq!(qc.weighting, QueryWeighting::Idf);
+        assert!((qc.weight_threshold - 0.03).abs() < 0.001);
+        assert_eq!(qc.max_query_dims, Some(25));
+        assert!((qc.pruning.unwrap() - 0.2).abs() < 0.001);
+
+        // Verify schema roundtrip
+        let schema = indexes[0].to_schema();
+        let field = schema.get_field("embedding").unwrap();
+        let entry = schema.get_field_entry(field).unwrap();
+        let sc = entry.sparse_vector_config.as_ref().unwrap();
+        let rqc = sc.query_config.as_ref().unwrap();
+        assert!((rqc.weight_threshold - 0.03).abs() < 0.001);
+        assert_eq!(rqc.max_query_dims, Some(25));
+        assert!((rqc.pruning.unwrap() - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_fast_attribute() {
+        let sdl = r#"
+            index products {
+                field name: text [indexed, stored]
+                field price: f64 [indexed, fast]
+                field category: text [indexed, stored, fast]
+                field count: u64 [fast]
+                field score: i64 [indexed, stored, fast]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 1);
+        let index = &indexes[0];
+        assert_eq!(index.fields.len(), 5);
+
+        // name: no fast
+        assert!(!index.fields[0].fast);
+        // price: fast
+        assert!(index.fields[1].fast);
+        assert!(matches!(index.fields[1].field_type, FieldType::F64));
+        // category: fast text
+        assert!(index.fields[2].fast);
+        assert!(matches!(index.fields[2].field_type, FieldType::Text));
+        // count: fast only
+        assert!(index.fields[3].fast);
+        assert!(matches!(index.fields[3].field_type, FieldType::U64));
+        // score: fast i64
+        assert!(index.fields[4].fast);
+        assert!(matches!(index.fields[4].field_type, FieldType::I64));
+
+        // Verify schema roundtrip preserves fast flag
+        let schema = index.to_schema();
+        let price_field = schema.get_field("price").unwrap();
+        assert!(schema.get_field_entry(price_field).unwrap().fast);
+
+        let category_field = schema.get_field("category").unwrap();
+        assert!(schema.get_field_entry(category_field).unwrap().fast);
+
+        let name_field = schema.get_field("name").unwrap();
+        assert!(!schema.get_field_entry(name_field).unwrap().fast);
     }
 }

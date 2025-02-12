@@ -124,6 +124,9 @@ pub struct SegmentBuilder {
 
     /// Reusable buffer for document serialization (avoids per-document allocation)
     doc_serialize_buffer: Vec<u8>,
+
+    /// Fast-field columnar writers per field_id (only for fields with fast=true)
+    fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldWriter>,
 }
 
 impl SegmentBuilder {
@@ -158,6 +161,22 @@ impl SegmentBuilder {
             }
         }
 
+        // Initialize fast-field writers for fields with fast=true
+        use crate::structures::fast_field::{FastFieldColumnType, FastFieldWriter};
+        let mut fast_fields = FxHashMap::default();
+        for (field, entry) in schema.fields() {
+            if entry.fast {
+                let writer = match entry.field_type {
+                    FieldType::U64 => FastFieldWriter::new_numeric(FastFieldColumnType::U64),
+                    FieldType::I64 => FastFieldWriter::new_numeric(FastFieldColumnType::I64),
+                    FieldType::F64 => FastFieldWriter::new_numeric(FastFieldColumnType::F64),
+                    FieldType::Text => FastFieldWriter::new_text(),
+                    _ => continue, // fast not supported for other types
+                };
+                fast_fields.insert(field.0, writer);
+            }
+        }
+
         Ok(Self {
             schema,
             tokenizers: FxHashMap::default(),
@@ -182,6 +201,7 @@ impl SegmentBuilder {
             current_element_ordinal: FxHashMap::default(),
             estimated_memory: 0,
             doc_serialize_buffer: Vec::with_capacity(256),
+            fast_fields,
         })
     }
 
@@ -372,15 +392,29 @@ impl SegmentBuilder {
                     if let Some(&slot) = self.field_to_slot.get(&field.0) {
                         self.doc_field_lengths[base_idx + slot] = token_count;
                     }
+
+                    // Fast-field: store raw text for text ordinal column
+                    if let Some(ff) = self.fast_fields.get_mut(&field.0) {
+                        ff.add_text(doc_id, text);
+                    }
                 }
                 (FieldType::U64, FieldValue::U64(v)) => {
                     self.index_numeric_field(*field, doc_id, *v)?;
+                    if let Some(ff) = self.fast_fields.get_mut(&field.0) {
+                        ff.add_u64(doc_id, *v);
+                    }
                 }
                 (FieldType::I64, FieldValue::I64(v)) => {
                     self.index_numeric_field(*field, doc_id, *v as u64)?;
+                    if let Some(ff) = self.fast_fields.get_mut(&field.0) {
+                        ff.add_i64(doc_id, *v);
+                    }
                 }
                 (FieldType::F64, FieldValue::F64(v)) => {
                     self.index_numeric_field(*field, doc_id, v.to_bits())?;
+                    if let Some(ff) = self.fast_fields.get_mut(&field.0) {
+                        ff.add_f64(doc_id, *v);
+                    }
                 }
                 (FieldType::DenseVector, FieldValue::DenseVector(vec))
                     if entry.indexed || entry.stored =>
@@ -719,55 +753,79 @@ impl SegmentBuilder {
         } else {
             None
         };
+        let mut fast_fields = std::mem::take(&mut self.fast_fields);
+        let num_docs = self.next_doc_id;
+        let mut fast_writer = if !fast_fields.is_empty() {
+            Some(dir.streaming_writer(&files.fast).await?)
+        } else {
+            None
+        };
 
-        let ((postings_result, store_result), (vectors_result, sparse_result)) = rayon::join(
-            || {
-                rayon::join(
-                    || {
-                        postings::build_postings_streaming(
-                            inverted_index,
-                            term_interner,
-                            &position_offsets,
-                            &mut *term_dict_writer,
-                            &mut *postings_writer,
-                        )
-                    },
-                    || {
-                        store::build_store_streaming(
-                            &store_path,
-                            num_compression_threads,
-                            compression_level,
-                            &mut *store_writer,
-                        )
-                    },
-                )
-            },
-            || {
-                rayon::join(
-                    || -> Result<()> {
-                        if let Some(ref mut w) = vectors_writer {
-                            dense::build_vectors_streaming(
-                                dense_vectors,
-                                schema,
-                                trained,
-                                &mut **w,
-                            )?;
-                        }
-                        Ok(())
-                    },
-                    || -> Result<()> {
-                        if let Some(ref mut w) = sparse_writer {
-                            sparse::build_sparse_streaming(&mut sparse_vectors, schema, &mut **w)?;
-                        }
-                        Ok(())
-                    },
-                )
-            },
-        );
+        let ((postings_result, store_result), ((vectors_result, sparse_result), fast_result)) =
+            rayon::join(
+                || {
+                    rayon::join(
+                        || {
+                            postings::build_postings_streaming(
+                                inverted_index,
+                                term_interner,
+                                &position_offsets,
+                                &mut *term_dict_writer,
+                                &mut *postings_writer,
+                            )
+                        },
+                        || {
+                            store::build_store_streaming(
+                                &store_path,
+                                num_compression_threads,
+                                compression_level,
+                                &mut *store_writer,
+                                num_docs,
+                            )
+                        },
+                    )
+                },
+                || {
+                    rayon::join(
+                        || {
+                            rayon::join(
+                                || -> Result<()> {
+                                    if let Some(ref mut w) = vectors_writer {
+                                        dense::build_vectors_streaming(
+                                            dense_vectors,
+                                            schema,
+                                            trained,
+                                            &mut **w,
+                                        )?;
+                                    }
+                                    Ok(())
+                                },
+                                || -> Result<()> {
+                                    if let Some(ref mut w) = sparse_writer {
+                                        sparse::build_sparse_streaming(
+                                            &mut sparse_vectors,
+                                            schema,
+                                            &mut **w,
+                                        )?;
+                                    }
+                                    Ok(())
+                                },
+                            )
+                        },
+                        || -> Result<()> {
+                            if let Some(ref mut w) = fast_writer {
+                                build_fast_fields_streaming(&mut fast_fields, num_docs, &mut **w)?;
+                            }
+                            Ok(())
+                        },
+                    )
+                },
+            );
         postings_result?;
         store_result?;
         vectors_result?;
         sparse_result?;
+        fast_result?;
         term_dict_writer.finish()?;
         postings_writer.finish()?;
         store_writer.finish()?;
@@ -775,6 +833,9 @@ impl SegmentBuilder {
             w.finish()?;
         }
         if let Some(w) = sparse_writer {
+            w.finish()?;
+        }
+        if let Some(w) = fast_writer {
             w.finish()?;
         }
         drop(position_offsets);
@@ -793,6 +854,49 @@ impl SegmentBuilder {
 
         Ok(meta)
     }
+}
+
+/// Serialize all fast-field columns to a `.fast` file.
+fn build_fast_fields_streaming(
+    fast_fields: &mut FxHashMap<u32, crate::structures::fast_field::FastFieldWriter>,
+    num_docs: u32,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use crate::structures::fast_field::{FastFieldTocEntry, write_fast_field_toc_and_footer};
+
+    if fast_fields.is_empty() {
+        return Ok(());
+    }
+
+    // Sort fields by id for deterministic output
+    let mut field_ids: Vec<u32> = fast_fields.keys().copied().collect();
+    field_ids.sort_unstable();
+
+    let mut toc_entries: Vec<FastFieldTocEntry> = Vec::with_capacity(field_ids.len());
+    let mut current_offset = 0u64;
+
+    for &field_id in &field_ids {
+        let ff = fast_fields.get_mut(&field_id).unwrap();
+        ff.pad_to(num_docs);
+
+        let (mut toc, bytes_written) = ff.serialize(writer, current_offset)?;
+        toc.field_id = field_id;
+        current_offset += bytes_written;
+        toc_entries.push(toc);
+    }
+
+    // Write TOC + footer
+    let toc_offset = current_offset;
+    write_fast_field_toc_and_footer(writer, toc_offset, &toc_entries)?;
+
+    log::debug!(
+        "[fast-fields] wrote {} columns, {} docs, toc at offset {}",
+        toc_entries.len(),
+        num_docs,
+        toc_offset
+    );
+
+    Ok(())
 }
 
 impl Drop for SegmentBuilder {

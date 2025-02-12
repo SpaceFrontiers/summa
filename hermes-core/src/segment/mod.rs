@@ -56,7 +56,7 @@ mod tests {
         builder.build(&dir, segment_id, None).await.unwrap();
 
         // Open with async reader
-        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
+        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 16)
             .await
             .unwrap();
 
@@ -109,7 +109,7 @@ mod tests {
 
         builder.build(&dir, segment_id, None).await.unwrap();
 
-        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
+        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 16)
             .await
             .unwrap();
 
@@ -170,7 +170,7 @@ mod tests {
 
         builder.build(&dir, segment_id, None).await.unwrap();
 
-        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 0, 16)
+        let reader = AsyncSegmentReader::open(&dir, segment_id, schema.clone(), 16)
             .await
             .unwrap();
 

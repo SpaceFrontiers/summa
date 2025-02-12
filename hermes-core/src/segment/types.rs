@@ -168,6 +168,8 @@ pub struct SegmentFiles {
     pub sparse: PathBuf,
     /// Token positions for phrase queries (fields with record_positions=true)
     pub positions: PathBuf,
+    /// Fast-field columnar storage for O(1) doc→value access
+    pub fast: PathBuf,
 }
 
 impl SegmentFiles {
@@ -181,6 +183,7 @@ impl SegmentFiles {
             vectors: PathBuf::from(format!("{}.vectors", prefix)),
             sparse: PathBuf::from(format!("{}.sparse", prefix)),
             positions: PathBuf::from(format!("{}.pos", prefix)),
+            fast: PathBuf::from(format!("{}.fast", prefix)),
         }
     }
 }

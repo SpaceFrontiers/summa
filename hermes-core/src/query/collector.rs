@@ -138,7 +138,7 @@ pub struct SearchResponse {
 
 impl PartialEq for SearchResult {
     fn eq(&self, other: &Self) -> bool {
-        self.doc_id == other.doc_id
+        self.segment_id == other.segment_id && self.doc_id == other.doc_id
     }
 }
 
@@ -156,6 +156,7 @@ impl Ord for SearchResult {
             .score
             .partial_cmp(&self.score)
             .unwrap_or(Ordering::Equal)
+            .then_with(|| self.segment_id.cmp(&other.segment_id))
             .then_with(|| self.doc_id.cmp(&other.doc_id))
     }
 }
@@ -397,8 +398,8 @@ pub async fn collect_segment<C: Collector>(
 /// that support it (e.g., sparse vector search). This significantly improves
 /// performance when only the top-k results are needed.
 ///
-/// Doc IDs are automatically adjusted by the segment's doc_id_offset to produce
-/// global doc IDs that can be used across all segments.
+/// Doc IDs in the collector are segment-local. The searcher stamps each result
+/// with its segment_id, making (segment_id, doc_id) the unique document key.
 pub async fn collect_segment_with_limit<C: Collector>(
     reader: &SegmentReader,
     query: &dyn Query,
@@ -406,17 +407,15 @@ pub async fn collect_segment_with_limit<C: Collector>(
     limit: usize,
 ) -> Result<()> {
     let needs_positions = collector.needs_positions();
-    let doc_id_offset = reader.doc_id_offset();
     let mut scorer = query.scorer(reader, limit).await?;
 
     let mut doc = scorer.doc();
     while doc != TERMINATED {
-        // Add doc_id_offset to convert segment-local ID to global ID
         if needs_positions {
             let positions = scorer.matched_positions().unwrap_or_default();
-            collector.collect(doc + doc_id_offset, scorer.score(), &positions);
+            collector.collect(doc, scorer.score(), &positions);
         } else {
-            collector.collect(doc + doc_id_offset, scorer.score(), &[]);
+            collector.collect(doc, scorer.score(), &[]);
         }
         doc = scorer.advance();
     }

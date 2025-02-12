@@ -75,6 +75,9 @@ message SparseVectorQuery {
   float combiner_temperature = 7;   // Temperature for LogSumExp (default: 1.5)
   uint32 combiner_top_k = 8;        // K for WeightedTopK (default: 5)
   float combiner_decay = 9;         // Decay for WeightedTopK (default: 0.7)
+  float weight_threshold = 10;      // Min abs(weight) for query dims (0 = no filtering)
+  uint32 max_query_dims = 11;       // Max query dimensions to process (0 = all)
+  float pruning = 12;               // Fraction of query dims to keep (0 = no pruning, 0.1 = top 10%)
 }
 
 // Dense vector query for similarity search
@@ -126,6 +129,32 @@ message Reranker {
   uint32 matryoshka_dims = 8;          // Matryoshka pre-filter dims (0 = disabled)
 }
 
+// Fast-field filter for efficient document filtering
+message Filter {
+  string field = 1;
+  oneof condition {
+    uint64 eq_u64 = 2;
+    int64 eq_i64 = 3;
+    double eq_f64 = 4;
+    string eq_text = 5;
+    RangeFilter range = 6;
+    InFilter in_values = 7;
+  }
+}
+
+// Numeric range filter (inclusive bounds)
+message RangeFilter {
+  optional double min = 1;
+  optional double max = 2;
+}
+
+// Set membership filter
+message InFilter {
+  repeated string text_values = 1;
+  repeated uint64 u64_values = 2;
+  repeated int64 i64_values = 3;
+}
+
 // Search request/response
 message SearchRequest {
   string index_name = 1;
@@ -134,10 +163,17 @@ message SearchRequest {
   uint32 offset = 4;
   repeated string fields_to_load = 5;
   Reranker reranker = 6;               // Optional L2 reranker
+  repeated Filter filters = 7;         // Fast-field filters
+}
+
+// Unique document address: segment + local doc_id
+message DocAddress {
+  string segment_id = 1;          // Segment ID (hex, 32 chars)
+  uint32 doc_id = 2;              // Segment-local document ID
 }
 
 message SearchHit {
-  uint32 doc_id = 1;
+  DocAddress address = 1;
   float score = 2;
   map<string, FieldValue> fields = 3;
   repeated OrdinalScore ordinal_scores = 4;  // Per-ordinal scores for multi-value fields
@@ -191,7 +227,7 @@ message SearchTimings {
 // Get document request/response
 message GetDocumentRequest {
   string index_name = 1;
-  uint32 doc_id = 2;
+  DocAddress address = 2;
 }
 
 message GetDocumentResponse {
@@ -211,6 +247,16 @@ message GetIndexInfoResponse {
   string schema = 4;
   // Memory usage breakdown (if available)
   MemoryStats memory_stats = 5;
+  // Per-field vector statistics
+  repeated VectorFieldStats vector_stats = 6;
+}
+
+// Per-field vector statistics (dense or sparse)
+message VectorFieldStats {
+  string field_name = 1;
+  string vector_type = 2;  // "dense" or "sparse"
+  uint64 total_vectors = 3;
+  uint32 dimension = 4;    // dim for dense, num_dimensions for sparse
 }
 
 // Memory usage statistics

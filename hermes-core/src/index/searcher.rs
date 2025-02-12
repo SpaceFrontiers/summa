@@ -40,8 +40,8 @@ pub struct Searcher<D: Directory + 'static> {
     global_stats: Arc<LazyGlobalStats>,
     /// O(1) segment lookup by segment_id
     segment_map: FxHashMap<u128, usize>,
-    /// Cumulative doc counts for binary-search in doc(global_id)
-    doc_id_cumulative: Vec<u32>,
+    /// Total document count across all segments
+    total_docs: u32,
 }
 
 impl<D: Directory + 'static> Searcher<D> {
@@ -74,15 +74,14 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        let (segments, default_fields, global_stats, segment_map, doc_id_cumulative) =
-            Self::load_common(
-                &directory,
-                &schema,
-                snapshot.segment_ids(),
-                &trained_centroids,
-                term_cache_blocks,
-            )
-            .await;
+        let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
+            &directory,
+            &schema,
+            snapshot.segment_ids(),
+            &trained_centroids,
+            term_cache_blocks,
+        )
+        .await;
 
         Ok(Self {
             _snapshot: snapshot,
@@ -94,7 +93,7 @@ impl<D: Directory + 'static> Searcher<D> {
             trained_centroids,
             global_stats,
             segment_map,
-            doc_id_cumulative,
+            total_docs,
         })
     }
 
@@ -106,15 +105,14 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
-        let (segments, default_fields, global_stats, segment_map, doc_id_cumulative) =
-            Self::load_common(
-                &directory,
-                &schema,
-                segment_ids,
-                &trained_centroids,
-                term_cache_blocks,
-            )
-            .await;
+        let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
+            &directory,
+            &schema,
+            segment_ids,
+            &trained_centroids,
+            term_cache_blocks,
+        )
+        .await;
 
         #[cfg(feature = "native")]
         let _snapshot = {
@@ -134,7 +132,7 @@ impl<D: Directory + 'static> Searcher<D> {
             trained_centroids,
             global_stats,
             segment_map,
-            doc_id_cumulative,
+            total_docs,
         })
     }
 
@@ -150,7 +148,7 @@ impl<D: Directory + 'static> Searcher<D> {
         Vec<crate::Field>,
         Arc<LazyGlobalStats>,
         FxHashMap<u128, usize>,
-        Vec<u32>,
+        u32,
     ) {
         let segments = Self::load_segments(
             directory,
@@ -162,13 +160,13 @@ impl<D: Directory + 'static> Searcher<D> {
         .await;
         let default_fields = Self::build_default_fields(schema);
         let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
-        let (segment_map, doc_id_cumulative) = Self::build_lookup_tables(&segments);
+        let (segment_map, total_docs) = Self::build_lookup_tables(&segments);
         (
             segments,
             default_fields,
             global_stats,
             segment_map,
-            doc_id_cumulative,
+            total_docs,
         )
     }
 
@@ -187,44 +185,39 @@ impl<D: Directory + 'static> Searcher<D> {
             .filter_map(|(idx, id_str)| SegmentId::from_hex(id_str).map(|sid| (idx, sid)))
             .collect();
 
-        // Load all segments in parallel with offset=0
-        let futures: Vec<_> =
-            valid_segments
-                .iter()
-                .map(|(_, segment_id)| {
-                    let dir = Arc::clone(directory);
-                    let sch = Arc::clone(schema);
-                    let sid = *segment_id;
-                    async move {
-                        SegmentReader::open(dir.as_ref(), sid, sch, 0, term_cache_blocks).await
-                    }
-                })
-                .collect();
+        // Load all segments in parallel
+        let futures: Vec<_> = valid_segments
+            .iter()
+            .map(|(_, segment_id)| {
+                let dir = Arc::clone(directory);
+                let sch = Arc::clone(schema);
+                let sid = *segment_id;
+                async move { SegmentReader::open(dir.as_ref(), sid, sch, term_cache_blocks).await }
+            })
+            .collect();
 
         let results = futures::future::join_all(futures).await;
 
-        // Collect successful results with their original index for ordering
-        let mut loaded: Vec<(usize, SegmentReader)> = valid_segments
-            .into_iter()
-            .zip(results)
-            .filter_map(|((idx, _), result)| match result {
-                Ok(reader) => Some((idx, reader)),
+        // Collect results — fail fast if any segment fails to open
+        let mut loaded: Vec<(usize, SegmentReader)> = Vec::with_capacity(valid_segments.len());
+        for ((idx, sid), result) in valid_segments.into_iter().zip(results) {
+            match result {
+                Ok(reader) => loaded.push((idx, reader)),
                 Err(e) => {
-                    log::warn!("Failed to open segment: {:?}", e);
-                    None
+                    panic!(
+                        "Failed to open segment {:016x}: {:?}. \
+                         Refusing to serve with incomplete data.",
+                        sid.0, e
+                    );
                 }
-            })
-            .collect();
+            }
+        }
 
         // Sort by original index to maintain deterministic ordering
         loaded.sort_by_key(|(idx, _)| *idx);
 
-        // Calculate and assign doc_id_offsets sequentially
-        let mut doc_id_offset = 0u32;
         let mut segments = Vec::with_capacity(loaded.len());
         for (_, mut reader) in loaded {
-            reader.set_doc_id_offset(doc_id_offset);
-            doc_id_offset += reader.meta().num_docs;
             // Inject per-field centroids into reader for IVF/ScaNN search
             if !trained_centroids.is_empty() {
                 reader.set_coarse_centroids(trained_centroids.clone());
@@ -311,21 +304,19 @@ impl<D: Directory + 'static> Searcher<D> {
     }
 
     /// Build O(1) lookup tables from loaded segments
-    fn build_lookup_tables(segments: &[Arc<SegmentReader>]) -> (FxHashMap<u128, usize>, Vec<u32>) {
+    fn build_lookup_tables(segments: &[Arc<SegmentReader>]) -> (FxHashMap<u128, usize>, u32) {
         let mut segment_map = FxHashMap::default();
-        let mut cumulative = Vec::with_capacity(segments.len());
-        let mut acc = 0u32;
+        let mut total = 0u32;
         for (i, seg) in segments.iter().enumerate() {
             segment_map.insert(seg.meta().id, i);
-            acc += seg.meta().num_docs;
-            cumulative.push(acc);
+            total = total.saturating_add(seg.meta().num_docs);
         }
-        (segment_map, cumulative)
+        (segment_map, total)
     }
 
     /// Get total document count across all segments
     pub fn num_docs(&self) -> u32 {
-        self.doc_id_cumulative.last().copied().unwrap_or(0)
+        self.total_docs
     }
 
     /// Get O(1) segment_id → index map (used by reranker)
@@ -338,18 +329,12 @@ impl<D: Directory + 'static> Searcher<D> {
         self.segments.len()
     }
 
-    /// Get a document by global doc_id (binary search on cumulative offsets)
-    pub async fn doc(&self, doc_id: u32) -> Result<Option<crate::dsl::Document>> {
-        let idx = self.doc_id_cumulative.partition_point(|&cum| cum <= doc_id);
-        if idx >= self.segments.len() {
-            return Ok(None);
+    /// Get a document by (segment_id, local_doc_id)
+    pub async fn doc(&self, segment_id: u128, doc_id: u32) -> Result<Option<crate::dsl::Document>> {
+        if let Some(&idx) = self.segment_map.get(&segment_id) {
+            return self.segments[idx].doc(doc_id).await;
         }
-        let base = if idx == 0 {
-            0
-        } else {
-            self.doc_id_cumulative[idx - 1]
-        };
-        self.segments[idx].doc(doc_id - base).await
+        Ok(None)
     }
 
     /// Search across all segments and return aggregated results
@@ -593,10 +578,7 @@ impl<D: Directory + 'static> Searcher<D> {
         )
     }
 
-    /// Get a document by address (segment_id + global doc_id)
-    ///
-    /// The doc_id in the address is a global doc_id (with doc_id_offset applied).
-    /// This method converts it back to a segment-local doc_id for the store lookup.
+    /// Get a document by address (segment_id + local doc_id)
     pub async fn get_document(
         &self,
         address: &crate::query::DocAddress,
@@ -619,9 +601,9 @@ impl<D: Directory + 'static> Searcher<D> {
         })?;
 
         if let Some(&idx) = self.segment_map.get(&segment_id) {
-            let segment = &self.segments[idx];
-            let local_doc_id = address.doc_id.wrapping_sub(segment.doc_id_offset());
-            return segment.doc_with_fields(local_doc_id, fields).await;
+            return self.segments[idx]
+                .doc_with_fields(address.doc_id, fields)
+                .await;
         }
 
         Ok(None)

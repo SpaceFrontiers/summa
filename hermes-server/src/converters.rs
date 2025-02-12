@@ -234,9 +234,38 @@ pub fn convert_query(
             );
             let mut query = SparseVectorQuery::new(field, vector).with_combiner(combiner);
 
-            // Set heap_factor if provided (defaults to 1.0 for exact search)
+            // Apply SDL query_config defaults, then override with per-request values
+            let schema_qc = schema
+                .get_field_entry(field)
+                .and_then(|e| e.sparse_vector_config.as_ref())
+                .and_then(|c| c.query_config.as_ref());
+
+            // heap_factor: per-request > schema default > 1.0
             if sv_query.heap_factor > 0.0 {
                 query = query.with_heap_factor(sv_query.heap_factor);
+            } else if let Some(qc) = schema_qc {
+                query = query.with_heap_factor(qc.heap_factor);
+            }
+
+            // weight_threshold: per-request > schema default > 0.0
+            if sv_query.weight_threshold > 0.0 {
+                query = query.with_weight_threshold(sv_query.weight_threshold);
+            } else if let Some(qc) = schema_qc {
+                query = query.with_weight_threshold(qc.weight_threshold);
+            }
+
+            // max_query_dims: per-request > schema default > None
+            if sv_query.max_query_dims > 0 {
+                query = query.with_max_query_dims(sv_query.max_query_dims as usize);
+            } else if let Some(Some(max_dims)) = schema_qc.map(|qc| qc.max_query_dims) {
+                query = query.with_max_query_dims(max_dims);
+            }
+
+            // pruning: per-request > schema default > None
+            if sv_query.pruning > 0.0 {
+                query = query.with_pruning(sv_query.pruning);
+            } else if let Some(Some(p)) = schema_qc.map(|qc| qc.pruning) {
+                query = query.with_pruning(p);
             }
 
             Ok(Box::new(query))
@@ -391,6 +420,79 @@ pub fn convert_reranker(
         unit_norm,
         matryoshka_dims,
     })
+}
+
+/// Convert proto filters to core FastFieldFilter conditions.
+pub fn convert_filters(
+    filters: &[proto::Filter],
+    schema: &Schema,
+) -> Result<Vec<hermes_core::query::FastFieldFilter>, String> {
+    use hermes_core::query::fast_filter::{FastFieldCondition, FastFieldFilter};
+
+    let mut result = Vec::with_capacity(filters.len());
+
+    for filter in filters {
+        let field = schema
+            .get_field(&filter.field)
+            .ok_or_else(|| format!("Filter field '{}' not found in schema", filter.field))?;
+
+        let entry = schema
+            .get_field_entry(field)
+            .ok_or_else(|| format!("Filter field '{}' has no entry", filter.field))?;
+
+        if !entry.fast {
+            return Err(format!(
+                "Filter field '{}' does not have fast=true in schema",
+                filter.field
+            ));
+        }
+
+        let condition = match &filter.condition {
+            Some(proto::filter::Condition::EqU64(v)) => FastFieldCondition::EqU64(*v),
+            Some(proto::filter::Condition::EqI64(v)) => FastFieldCondition::EqI64(*v),
+            Some(proto::filter::Condition::EqF64(v)) => FastFieldCondition::EqF64(*v),
+            Some(proto::filter::Condition::EqText(v)) => FastFieldCondition::EqText(v.clone()),
+            Some(proto::filter::Condition::Range(r)) => {
+                // Determine range type from field type
+                match entry.field_type {
+                    hermes_core::dsl::FieldType::U64 => FastFieldCondition::RangeU64 {
+                        min: r.min.map(|v| v as u64),
+                        max: r.max.map(|v| v as u64),
+                    },
+                    hermes_core::dsl::FieldType::I64 => FastFieldCondition::RangeI64 {
+                        min: r.min.map(|v| v as i64),
+                        max: r.max.map(|v| v as i64),
+                    },
+                    hermes_core::dsl::FieldType::F64 => FastFieldCondition::RangeF64 {
+                        min: r.min,
+                        max: r.max,
+                    },
+                    _ => {
+                        return Err(format!(
+                            "Range filter not supported for field type {:?}",
+                            entry.field_type
+                        ));
+                    }
+                }
+            }
+            Some(proto::filter::Condition::InValues(inv)) => {
+                if !inv.text_values.is_empty() {
+                    FastFieldCondition::InText(inv.text_values.clone())
+                } else if !inv.u64_values.is_empty() {
+                    FastFieldCondition::InU64(inv.u64_values.clone())
+                } else if !inv.i64_values.is_empty() {
+                    FastFieldCondition::InI64(inv.i64_values.clone())
+                } else {
+                    return Err("InFilter has no values".to_string());
+                }
+            }
+            None => FastFieldCondition::Exists,
+        };
+
+        result.push(FastFieldFilter { field, condition });
+    }
+
+    Ok(result)
 }
 
 pub fn convert_proto_to_document(

@@ -496,7 +496,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .iter()
             .map(|&sid| {
                 let sch = Arc::clone(&schema_arc);
-                async move { SegmentReader::open(directory, sid, sch, 0, term_cache_blocks).await }
+                async move { SegmentReader::open(directory, sid, sch, term_cache_blocks).await }
             })
             .collect();
 

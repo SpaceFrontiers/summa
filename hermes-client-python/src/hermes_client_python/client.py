@@ -11,7 +11,15 @@ from grpc import aio
 
 from . import hermes_pb2 as pb
 from . import hermes_pb2_grpc as pb_grpc
-from .types import Document, IndexInfo, SearchHit, SearchResponse, SearchTimings
+from .types import (
+    DocAddress,
+    Document,
+    IndexInfo,
+    SearchHit,
+    SearchResponse,
+    SearchTimings,
+    VectorFieldStats,
+)
 
 
 class HermesClient:
@@ -158,11 +166,21 @@ class HermesClient:
         self._ensure_connected()
         request = pb.GetIndexInfoRequest(index_name=index_name)
         response = await self._search_stub.GetIndexInfo(request)
+        vector_stats = [
+            VectorFieldStats(
+                field_name=vs.field_name,
+                vector_type=vs.vector_type,
+                total_vectors=vs.total_vectors,
+                dimension=vs.dimension,
+            )
+            for vs in response.vector_stats
+        ]
         return IndexInfo(
             index_name=response.index_name,
             num_docs=response.num_docs,
             num_segments=response.num_segments,
             schema=response.schema,
+            vector_stats=vector_stats,
         )
 
     # =========================================================================
@@ -294,6 +312,8 @@ class HermesClient:
         fields_to_load: list[str] | None = None,
         reranker: tuple[str, list[float], int] | None = None,
         reranker_combiner: str = "weighted_top_k",
+        matryoshka_dims: int = 0,
+        filters: list[dict[str, Any]] | None = None,
     ) -> SearchResponse:
         """Search for documents.
 
@@ -318,6 +338,16 @@ class HermesClient:
                 l1_limit=0 defaults to 10x the final limit.
             reranker_combiner: Score combiner for reranker multi-value fields:
                 "log_sum_exp" (default), "max", "avg", "sum"
+            matryoshka_dims: Matryoshka pre-filter dimensions for reranker.
+                When > 0, scores candidates on leading N dimensions first,
+                keeps top survivors, then does full-dimension exact scoring.
+                0 = disabled (default).
+            filters: Fast-field filters. Each dict has "field" and one condition key:
+                - {"field": "status", "eq_text": "active"}
+                - {"field": "price", "eq_u64": 100}
+                - {"field": "price", "range": {"min": 10.0, "max": 100.0}}
+                - {"field": "category", "in_text": ["books", "movies"]}
+                - {"field": "count", "in_u64": [1, 2, 3]}
 
         Returns:
             SearchResponse with hits
@@ -377,7 +407,10 @@ class HermesClient:
                 vector=query_vector,
                 limit=l1_limit,
                 combiner=reranker_combiner_value,
+                matryoshka_dims=matryoshka_dims,
             )
+
+        pb_filters = _build_filters(filters) if filters else []
 
         request = pb.SearchRequest(
             index_name=index_name,
@@ -386,13 +419,17 @@ class HermesClient:
             offset=offset,
             fields_to_load=fields_to_load or [],
             reranker=pb_reranker,
+            filters=pb_filters,
         )
 
         response = await self._search_stub.Search(request)
 
         hits = [
             SearchHit(
-                doc_id=hit.doc_id,
+                address=DocAddress(
+                    segment_id=hit.address.segment_id,
+                    doc_id=hit.address.doc_id,
+                ),
                 score=hit.score,
                 fields={k: _from_field_value(v) for k, v in hit.fields.items()},
             )
@@ -416,18 +453,23 @@ class HermesClient:
             timings=timings,
         )
 
-    async def get_document(self, index_name: str, doc_id: int) -> Document | None:
-        """Get a document by ID.
+    async def get_document(
+        self, index_name: str, address: DocAddress
+    ) -> Document | None:
+        """Get a document by address.
 
         Args:
             index_name: Name of the index
-            doc_id: Document ID
+            address: DocAddress from a SearchHit
 
         Returns:
             Document or None if not found
         """
         self._ensure_connected()
-        request = pb.GetDocumentRequest(index_name=index_name, doc_id=doc_id)
+        request = pb.GetDocumentRequest(
+            index_name=index_name,
+            address=pb.DocAddress(segment_id=address.segment_id, doc_id=address.doc_id),
+        )
         try:
             response = await self._search_stub.GetDocument(request)
             fields = {k: _from_field_value(v) for k, v in response.fields.items()}
@@ -597,6 +639,38 @@ def _reranker_combiner_to_proto(combiner: str) -> int:
         "sum": 3,
         "weighted_top_k": 4,
     }.get(combiner.lower(), 0)
+
+
+def _build_filters(filters: list[dict[str, Any]]) -> list[pb.Filter]:
+    """Convert filter dicts to protobuf Filter messages."""
+    result = []
+    for f in filters:
+        field = f["field"]
+        kwargs: dict[str, Any] = {"field": field}
+        if "eq_u64" in f:
+            kwargs["eq_u64"] = int(f["eq_u64"])
+        elif "eq_i64" in f:
+            kwargs["eq_i64"] = int(f["eq_i64"])
+        elif "eq_f64" in f:
+            kwargs["eq_f64"] = float(f["eq_f64"])
+        elif "eq_text" in f:
+            kwargs["eq_text"] = str(f["eq_text"])
+        elif "range" in f:
+            r = f["range"]
+            range_kwargs = {}
+            if "min" in r:
+                range_kwargs["min"] = float(r["min"])
+            if "max" in r:
+                range_kwargs["max"] = float(r["max"])
+            kwargs["range"] = pb.RangeFilter(**range_kwargs)
+        elif "in_text" in f:
+            kwargs["in_values"] = pb.InFilter(text_values=list(f["in_text"]))
+        elif "in_u64" in f:
+            kwargs["in_values"] = pb.InFilter(u64_values=[int(v) for v in f["in_u64"]])
+        elif "in_i64" in f:
+            kwargs["in_values"] = pb.InFilter(i64_values=[int(v) for v in f["in_i64"]])
+        result.append(pb.Filter(**kwargs))
+    return result
 
 
 def _build_query(

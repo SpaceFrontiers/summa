@@ -14,7 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Num docs: {}", searcher.num_docs());
 
-    if let Some(doc) = searcher.doc(0).await? {
+    let seg_id = searcher.segment_readers()[0].meta().id;
+    if let Some(doc) = searcher.doc(seg_id, 0).await? {
         println!("Doc 0 field_values count: {}", doc.field_values().len());
         for (field, value) in doc.field_values() {
             println!("  Field {:?}: {:?}", field, value);

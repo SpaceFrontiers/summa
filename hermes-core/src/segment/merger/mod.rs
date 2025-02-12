@@ -3,6 +3,7 @@
 mod dense;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
+mod fast_fields;
 mod postings;
 mod sparse;
 mod store;
@@ -94,6 +95,24 @@ pub struct MergeStats {
     pub vectors_bytes: usize,
     /// Sparse vector index output size
     pub sparse_bytes: usize,
+    /// Fast-field output size
+    pub fast_bytes: usize,
+}
+
+impl std::fmt::Display for MergeStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "terms={}, term_dict={}, postings={}, store={}, vectors={}, sparse={}, fast={}",
+            self.terms_processed,
+            format_bytes(self.term_dict_bytes),
+            format_bytes(self.postings_bytes),
+            format_bytes(self.store_bytes),
+            format_bytes(self.vectors_bytes),
+            format_bytes(self.sparse_bytes),
+            format_bytes(self.fast_bytes),
+        )
+    }
 }
 
 // TrainedVectorStructures is defined in super::types (available on all platforms)
@@ -180,10 +199,10 @@ impl SegmentMerger {
 
         let store_fut = async {
             let mut store_writer = OffsetWriter::new(dir.streaming_writer(&files.store).await?);
-            self.merge_store(segments, &mut store_writer).await?;
+            let store_num_docs = self.merge_store(segments, &mut store_writer).await?;
             let bytes = store_writer.offset() as usize;
             store_writer.finish()?;
-            Ok::<usize, crate::Error>(bytes)
+            Ok::<(usize, u32), crate::Error>((bytes, store_num_docs))
         };
 
         let dense_fut = async {
@@ -193,20 +212,24 @@ impl SegmentMerger {
 
         let sparse_fut = async { self.merge_sparse_vectors(dir, segments, &files).await };
 
-        let (postings_result, store_bytes, vectors_bytes, sparse_bytes) =
-            tokio::try_join!(postings_fut, store_fut, dense_fut, sparse_fut)?;
+        let fast_fut = async { self.merge_fast_fields(dir, segments, &files).await };
+
+        let (postings_result, store_result, vectors_bytes, (sparse_bytes, fast_bytes)) =
+            tokio::try_join!(postings_fut, store_fut, dense_fut, async {
+                tokio::try_join!(sparse_fut, fast_fut)
+            })?;
+        let (store_bytes, store_num_docs) = store_result;
         stats.terms_processed = postings_result.0;
         stats.term_dict_bytes = postings_result.1;
         stats.postings_bytes = postings_result.2;
         stats.store_bytes = store_bytes;
         stats.vectors_bytes = vectors_bytes;
         stats.sparse_bytes = sparse_bytes;
+        stats.fast_bytes = fast_bytes;
         log::info!(
-            "[merge] all phases done: store={}, dense={}, sparse={} in {:.1}s",
-            format_bytes(stats.store_bytes),
-            format_bytes(stats.vectors_bytes),
-            format_bytes(stats.sparse_bytes),
-            merge_start.elapsed().as_secs_f64()
+            "[merge] all phases done in {:.1}s: {}",
+            merge_start.elapsed().as_secs_f64(),
+            stats
         );
 
         // === Mandatory: merge field stats + write meta ===
@@ -220,6 +243,34 @@ impl SegmentMerger {
         }
 
         let total_docs: u32 = segments.iter().map(|s| s.num_docs()).sum();
+
+        // Verify store doc count matches metadata — a mismatch here means
+        // some store blocks were lost (e.g., compression thread panic) or
+        // source segment metadata disagrees with its store.
+        if store_num_docs != total_docs {
+            log::error!(
+                "[merge] STORE/META MISMATCH: store has {} docs but metadata expects {}. \
+                 Per-segment: {:?}",
+                store_num_docs,
+                total_docs,
+                segments
+                    .iter()
+                    .map(|s| (
+                        format!("{:016x}", s.meta().id),
+                        s.num_docs(),
+                        s.store().num_docs()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            return Err(crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Store/meta doc count mismatch: store={}, meta={}",
+                    store_num_docs, total_docs
+                ),
+            )));
+        }
+
         let meta = SegmentMeta {
             id: new_segment_id.0,
             num_docs: total_docs,
@@ -233,34 +284,27 @@ impl SegmentMerger {
         } else {
             "Merge"
         };
-        log::info!(
-            "{} complete: {} docs, {} terms, term_dict={}, postings={}, store={}, vectors={}, sparse={}",
-            label,
-            total_docs,
-            stats.terms_processed,
-            format_bytes(stats.term_dict_bytes),
-            format_bytes(stats.postings_bytes),
-            format_bytes(stats.store_bytes),
-            format_bytes(stats.vectors_bytes),
-            format_bytes(stats.sparse_bytes),
-        );
+        log::info!("{} complete: {} docs, {}", label, total_docs, stats);
 
         Ok((meta, stats))
     }
 }
 
-/// Delete segment files from directory
+/// Delete segment files from directory (all deletions run concurrently).
 pub async fn delete_segment<D: Directory + DirectoryWriter>(
     dir: &D,
     segment_id: SegmentId,
 ) -> Result<()> {
     let files = SegmentFiles::new(segment_id.0);
-    let _ = dir.delete(&files.term_dict).await;
-    let _ = dir.delete(&files.postings).await;
-    let _ = dir.delete(&files.store).await;
-    let _ = dir.delete(&files.meta).await;
-    let _ = dir.delete(&files.vectors).await;
-    let _ = dir.delete(&files.sparse).await;
-    let _ = dir.delete(&files.positions).await;
+    let _ = tokio::join!(
+        dir.delete(&files.term_dict),
+        dir.delete(&files.postings),
+        dir.delete(&files.store),
+        dir.delete(&files.meta),
+        dir.delete(&files.vectors),
+        dir.delete(&files.sparse),
+        dir.delete(&files.positions),
+        dir.delete(&files.fast),
+    );
     Ok(())
 }
