@@ -88,8 +88,9 @@ pub fn read_dense_toc(
 
 // ── Sparse vectors (.sparse) ────────────────────────────────────────────────
 
-/// Magic number for `.sparse` V3 file footer ("SPR3" in LE)
-pub const SPARSE_FOOTER_MAGIC: u32 = 0x33525053;
+/// Magic number for `.sparse` file footer ("SPR4" in LE)
+/// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
+pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;
@@ -115,6 +116,9 @@ pub struct SparseDimTocEntry {
 pub struct SparseFieldToc {
     pub field_id: u32,
     pub quantization: u8,
+    /// Total number of documents that have at least one sparse vector in this field.
+    /// Not the same as segment total_docs when some docs lack the field.
+    pub total_vectors: u32,
     pub dims: Vec<SparseDimTocEntry>,
 }
 
@@ -124,7 +128,7 @@ pub struct SparseFieldToc {
 /// ```text
 /// [block data ...]
 /// [skip section: SparseSkipEntry × total_skips (20B each)]
-/// [TOC: per-field header(9B) + per-dim entries(24B each)]
+/// [TOC: per-field header(13B) + per-dim entries(28B each)]
 /// [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)]
 /// ```
 #[cfg(feature = "native")]
@@ -140,6 +144,7 @@ pub fn write_sparse_toc_and_footer(
         writer.write_u32::<LittleEndian>(ftoc.field_id)?;
         writer.write_u8(ftoc.quantization)?;
         writer.write_u32::<LittleEndian>(ftoc.dims.len() as u32)?;
+        writer.write_u32::<LittleEndian>(ftoc.total_vectors)?;
         for d in &ftoc.dims {
             writer.write_u32::<LittleEndian>(d.dim_id)?;
             writer.write_u64::<LittleEndian>(d.block_data_offset)?;

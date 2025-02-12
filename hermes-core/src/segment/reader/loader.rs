@@ -210,7 +210,7 @@ pub async fn load_sparse_file<D: Directory>(
         return Ok(indexes);
     }
 
-    // Read V3 footer (24 bytes): skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)
+    // Read footer (24 bytes): skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)
     let footer_bytes = match handle
         .read_bytes_range(file_size - SPARSE_FOOTER_SIZE..file_size)
         .await
@@ -233,7 +233,7 @@ pub async fn load_sparse_file<D: Directory>(
     }
 
     log::debug!(
-        "Loading sparse V3: size={} bytes, num_fields={}, skip_offset={}, toc_offset={}",
+        "Loading sparse: size={} bytes, num_fields={}, skip_offset={}, toc_offset={}",
         file_size,
         num_fields,
         skip_offset,
@@ -256,17 +256,18 @@ pub async fn load_sparse_file<D: Directory>(
     let skip_section = tail_bytes.slice(0..skip_section_len);
     let toc_data = &tail[skip_section_len..];
 
-    // Parse TOC: per-field header(9B) + per-dim entries(28B each)
+    // Parse TOC: per-field header(13B) + per-dim entries(28B each)
     let mut pos = 0usize;
 
     for _ in 0..num_fields {
-        // Field header: field_id(4) + quant(1) + num_dims(4) = 9 bytes
+        // Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13 bytes
         let field_id = u32::from_le_bytes(toc_data[pos..pos + 4].try_into().unwrap());
         let _quantization = toc_data[pos + 4];
         let ndims = u32::from_le_bytes(toc_data[pos + 5..pos + 9].try_into().unwrap()) as usize;
-        pos += 9;
+        let total_vectors = u32::from_le_bytes(toc_data[pos + 9..pos + 13].try_into().unwrap());
+        pos += 13;
 
-        // Parse V3 per-dim entries directly into SoA DimensionTable
+        // Parse per-dim entries directly into SoA DimensionTable
         let mut dims = super::types::DimensionTable::with_capacity(ndims);
         for _ in 0..ndims {
             let d = &toc_data[pos..pos + 28];
@@ -289,14 +290,11 @@ pub async fn load_sparse_file<D: Directory>(
         // Ensure sorted by dim_id for binary search
         dims.sort_by_dim_id();
 
-        // total_vectors equals total_docs (doc_count per dimension counts unique docs)
-        let total_vectors = total_docs;
-
         log::debug!(
-            "Loaded sparse V3 index for field {}: num_dims={}, total_docs={}, skip_bytes={}",
+            "Loaded sparse index for field {}: num_dims={}, total_vectors={}, skip_bytes={}",
             field_id,
             dims.len(),
-            total_docs,
+            total_vectors,
             skip_section.len(),
         );
 
@@ -313,7 +311,7 @@ pub async fn load_sparse_file<D: Directory>(
     }
 
     log::debug!(
-        "Sparse V3 file loaded: fields={:?}",
+        "Sparse file loaded: fields={:?}",
         indexes.keys().collect::<Vec<_>>()
     );
 

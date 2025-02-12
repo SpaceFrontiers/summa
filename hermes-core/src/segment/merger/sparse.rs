@@ -92,11 +92,18 @@ impl SegmentMerger {
                 .map(|seg| seg.sparse_indexes().get(&field.0))
                 .collect();
 
+            // Sum total_vectors across segments for this field
+            let total_vectors: u32 = sparse_indexes
+                .iter()
+                .filter_map(|si| si.map(|idx| idx.total_vectors))
+                .sum();
+
             log::debug!(
-                "[merge] sparse field {}: {} unique dims across {} segments",
+                "[merge] sparse field {}: {} unique dims across {} segments, total_vectors={}",
                 field.0,
                 all_dims.len(),
-                segments.len()
+                segments.len(),
+                total_vectors,
             );
 
             let mut dim_toc_entries: Vec<SparseDimTocEntry> = Vec::with_capacity(all_dims.len());
@@ -197,6 +204,7 @@ impl SegmentMerger {
                 field_tocs.push(SparseFieldToc {
                     field_id: field.0,
                     quantization: quantization as u8,
+                    total_vectors,
                     dims: dim_toc_entries,
                 });
             }
