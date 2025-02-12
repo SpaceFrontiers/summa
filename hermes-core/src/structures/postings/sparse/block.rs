@@ -15,6 +15,7 @@ use crate::structures::postings::TERMINATED;
 use crate::structures::simd;
 
 pub const BLOCK_SIZE: usize = 128;
+pub const MAX_BLOCK_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BlockHeader {
@@ -81,7 +82,7 @@ impl SparseBlock {
         postings: &[(DocId, u16, f32)],
         weight_quant: WeightQuantization,
     ) -> io::Result<Self> {
-        assert!(!postings.is_empty() && postings.len() <= BLOCK_SIZE);
+        assert!(!postings.is_empty() && postings.len() <= MAX_BLOCK_SIZE);
 
         let count = postings.len();
         let first_doc_id = postings[0].0;
@@ -269,6 +270,78 @@ impl SparseBlock {
         }
     }
 
+    /// Fused decode + multiply + scatter-accumulate into flat_scores array.
+    ///
+    /// Equivalent to:
+    ///   decode_scored_weights_into(qw, &mut weights_buf);
+    ///   for i in 0..count { flat_scores[doc_ids[i] - base] += weights_buf[i]; }
+    ///
+    /// But avoids allocating/filling weights_buf — decodes directly into flat_scores.
+    /// Tracks dirty entries (first touch) for efficient collection.
+    ///
+    /// `doc_ids` must already be decoded via `decode_doc_ids_into`.
+    /// Returns the number of postings accumulated.
+    #[inline]
+    pub fn accumulate_scored_weights(
+        &self,
+        query_weight: f32,
+        doc_ids: &[u32],
+        flat_scores: &mut [f32],
+        base_doc: u32,
+        dirty: &mut Vec<u32>,
+    ) -> usize {
+        let count = self.header.count as usize;
+        match self.header.weight_quant {
+            WeightQuantization::UInt8 if self.weights_data.len() >= 8 => {
+                // UInt8 layout: [scale: f32][min: f32][q0, q1, ..., q_{n-1}]
+                let scale = f32::from_le_bytes([
+                    self.weights_data[0],
+                    self.weights_data[1],
+                    self.weights_data[2],
+                    self.weights_data[3],
+                ]);
+                let min_val = f32::from_le_bytes([
+                    self.weights_data[4],
+                    self.weights_data[5],
+                    self.weights_data[6],
+                    self.weights_data[7],
+                ]);
+                let eff_scale = query_weight * scale;
+                let eff_bias = query_weight * min_val;
+                let quant_data = &self.weights_data[8..];
+
+                for i in 0..count.min(quant_data.len()) {
+                    let w = quant_data[i] as f32 * eff_scale + eff_bias;
+                    let off = (doc_ids[i] - base_doc) as usize;
+                    if flat_scores[off] == 0.0 {
+                        dirty.push(doc_ids[i]);
+                    }
+                    flat_scores[off] += w;
+                }
+                count
+            }
+            _ => {
+                // Fallback: decode to temp buffer, then scatter
+                let mut weights_buf = Vec::with_capacity(count);
+                decode_weights_into(
+                    &self.weights_data,
+                    self.header.weight_quant,
+                    count,
+                    &mut weights_buf,
+                );
+                for i in 0..count {
+                    let w = weights_buf[i] * query_weight;
+                    let off = (doc_ids[i] - base_doc) as usize;
+                    if flat_scores[off] == 0.0 {
+                        dirty.push(doc_ids[i]);
+                    }
+                    flat_scores[off] += w;
+                }
+                count
+            }
+        }
+    }
+
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
         self.header.write(w)?;
         w.write_u16::<LittleEndian>(self.doc_ids_data.len() as u16)?;
@@ -442,6 +515,47 @@ impl BlockSparsePostingList {
         weight_quant: WeightQuantization,
     ) -> io::Result<Self> {
         Self::from_postings_with_block_size(postings, weight_quant, BLOCK_SIZE)
+    }
+
+    /// Create from postings using a pre-computed variable-size partition plan.
+    ///
+    /// `partition` is a slice of block sizes (e.g., [64, 128, 32, ...]) whose
+    /// sum must equal `postings.len()`. Each block size must be ≤ MAX_BLOCK_SIZE.
+    /// Produced by `optimal_partition()`.
+    pub fn from_postings_with_partition(
+        postings: &[(DocId, u16, f32)],
+        weight_quant: WeightQuantization,
+        partition: &[usize],
+    ) -> io::Result<Self> {
+        if postings.is_empty() {
+            return Ok(Self {
+                doc_count: 0,
+                blocks: Vec::new(),
+            });
+        }
+
+        let mut blocks = Vec::with_capacity(partition.len());
+        let mut offset = 0;
+        for &block_size in partition {
+            let end = (offset + block_size).min(postings.len());
+            blocks.push(SparseBlock::from_postings(
+                &postings[offset..end],
+                weight_quant,
+            )?);
+            offset = end;
+        }
+
+        let mut unique_docs = 1u32;
+        for i in 1..postings.len() {
+            if postings[i].0 != postings[i - 1].0 {
+                unique_docs += 1;
+            }
+        }
+
+        Ok(Self {
+            doc_count: unique_docs,
+            blocks,
+        })
     }
 
     pub fn doc_count(&self) -> u32 {
@@ -756,7 +870,7 @@ impl<'a> BlockSparsePostingIterator<'a> {
     }
 
     /// Skip to the start of the next block, returning its first doc_id.
-    /// Used by block-max WAND to skip entire blocks that can't beat threshold.
+    /// Used by block-max pruning to skip entire blocks that can't beat threshold.
     pub fn skip_to_next_block(&mut self) -> DocId {
         if self.exhausted {
             return TERMINATED;

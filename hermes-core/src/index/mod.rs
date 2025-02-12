@@ -707,14 +707,14 @@ mod tests {
         assert_eq!(results.hits.len(), 0, "Should not find non-existent value");
     }
 
-    /// Comprehensive test for WAND optimization in BooleanQuery OR queries
+    /// Comprehensive test for MaxScore optimization in BooleanQuery OR queries
     ///
     /// This test verifies that:
-    /// 1. BooleanQuery with multiple SHOULD term queries uses WAND automatically
-    /// 2. Search results are correct regardless of WAND optimization
+    /// 1. BooleanQuery with multiple SHOULD term queries uses MaxScore automatically
+    /// 2. Search results are correct regardless of MaxScore optimization
     /// 3. Scores are reasonable for matching documents
     #[tokio::test]
-    async fn test_wand_optimization_for_or_queries() {
+    async fn test_maxscore_optimization_for_or_queries() {
         use crate::query::{BooleanQuery, TermQuery};
 
         let mut schema_builder = SchemaBuilder::default();
@@ -759,7 +759,7 @@ mod tests {
         // Open for reading
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
 
-        // Test 1: Pure OR query with multiple terms (should use WAND automatically)
+        // Test 1: Pure OR query with multiple terms (should use MaxScore automatically)
         let or_query = BooleanQuery::new()
             .should(TermQuery::text(content, "rust"))
             .should(TermQuery::text(content, "programming"));
@@ -779,13 +779,13 @@ mod tests {
             "Should NOT find doc 3 (only has 'python')"
         );
 
-        // Test 2: Single term query (should NOT use WAND, but still work)
+        // Test 2: Single term query (should NOT use MaxScore, but still work)
         let single_query = BooleanQuery::new().should(TermQuery::text(content, "rust"));
 
         let results = index.search(&single_query, 10).await.unwrap();
         assert_eq!(results.hits.len(), 3, "Should find 3 documents with 'rust'");
 
-        // Test 3: Query with MUST (should NOT use WAND)
+        // Test 3: Query with MUST (should NOT use MaxScore)
         let must_query = BooleanQuery::new()
             .must(TermQuery::text(content, "rust"))
             .should(TermQuery::text(content, "programming"));
@@ -794,7 +794,7 @@ mod tests {
         // Must have "rust", optionally "programming"
         assert_eq!(results.hits.len(), 3, "Should find 3 documents with 'rust'");
 
-        // Test 4: Query with MUST_NOT (should NOT use WAND)
+        // Test 4: Query with MUST_NOT (should NOT use MaxScore)
         let must_not_query = BooleanQuery::new()
             .should(TermQuery::text(content, "rust"))
             .should(TermQuery::text(content, "programming"))
@@ -812,7 +812,7 @@ mod tests {
             "Should NOT find doc 4 (has 'systems')"
         );
 
-        // Test 5: Verify top-k limit works correctly with WAND
+        // Test 5: Verify top-k limit works correctly with MaxScore
         let or_query = BooleanQuery::new()
             .should(TermQuery::text(content, "rust"))
             .should(TermQuery::text(content, "programming"));
@@ -824,10 +824,10 @@ mod tests {
         // Doc 0 and 4 contain both "rust" and "programming"
     }
 
-    /// Test that WAND optimization produces same results as non-WAND for correctness
+    /// Test that BooleanQuery with pure SHOULD clauses uses MaxScore and returns correct results
     #[tokio::test]
-    async fn test_wand_results_match_standard_boolean() {
-        use crate::query::{BooleanQuery, TermQuery, WandOrQuery};
+    async fn test_boolean_or_maxscore_optimization() {
+        use crate::query::{BooleanQuery, TermQuery};
 
         let mut schema_builder = SchemaBuilder::default();
         let content = schema_builder.add_text_field("content", true, true);
@@ -856,32 +856,16 @@ mod tests {
         writer.commit().await.unwrap();
         let index = Index::open(dir.clone(), config.clone()).await.unwrap();
 
-        // Compare explicit WandOrQuery with auto-optimized BooleanQuery
-        let wand_query = WandOrQuery::new(content).term("apple").term("banana");
-
-        let bool_query = BooleanQuery::new()
+        // Pure SHOULD query — triggers MaxScore fast path
+        let query = BooleanQuery::new()
             .should(TermQuery::text(content, "apple"))
             .should(TermQuery::text(content, "banana"));
 
-        let wand_results = index.search(&wand_query, 10).await.unwrap();
-        let bool_results = index.search(&bool_query, 10).await.unwrap();
+        let results = index.search(&query, 10).await.unwrap();
 
-        // Both should find the same documents
-        assert_eq!(
-            wand_results.hits.len(),
-            bool_results.hits.len(),
-            "WAND and Boolean should find same number of docs"
-        );
-
-        let wand_docs: std::collections::HashSet<u32> =
-            wand_results.hits.iter().map(|h| h.address.doc_id).collect();
-        let bool_docs: std::collections::HashSet<u32> =
-            bool_results.hits.iter().map(|h| h.address.doc_id).collect();
-
-        assert_eq!(
-            wand_docs, bool_docs,
-            "WAND and Boolean should find same documents"
-        );
+        // "apple" matches docs 0,1,4,5,8,9 and "banana" matches docs 0,2,4,6,8
+        // Union = {0,1,2,4,5,6,8,9} = 8 docs
+        assert_eq!(results.hits.len(), 8, "Should find all matching docs");
     }
 
     #[tokio::test]

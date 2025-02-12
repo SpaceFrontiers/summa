@@ -42,7 +42,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use super::vector_data::LazyFlatVectorData;
-use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
+use crate::directories::{Directory, FileHandle};
 use crate::dsl::{Document, Field, Schema};
 use crate::structures::{
     AsyncSSTableReader, BlockPostingList, CoarseCentroids, IVFPQIndex, IVFRaBitQIndex, PQCodebook,
@@ -63,7 +63,7 @@ pub struct AsyncSegmentReader {
     /// Term dictionary with lazy block loading
     term_dict: Arc<AsyncSSTableReader<TermInfo>>,
     /// Postings file handle - fetches ranges on demand
-    postings_handle: LazyFileHandle,
+    postings_handle: FileHandle,
     /// Document store with lazy block loading
     store: Arc<AsyncStoreReader>,
     schema: Arc<Schema>,
@@ -78,7 +78,7 @@ pub struct AsyncSegmentReader {
     /// Sparse vector indexes per field
     sparse_indexes: FxHashMap<u32, SparseIndex>,
     /// Position file handle for phrase queries (lazy loading)
-    positions_handle: Option<LazyFileHandle>,
+    positions_handle: Option<FileHandle>,
 }
 
 impl AsyncSegmentReader {
@@ -403,7 +403,7 @@ impl AsyncSegmentReader {
     }
 
     /// Get store data slice for raw block access
-    pub fn store_data_slice(&self) -> &LazyFileSlice {
+    pub fn store_data_slice(&self) -> &FileHandle {
         self.store.data_slice()
     }
 
@@ -822,10 +822,10 @@ impl AsyncSegmentReader {
 
     /// Search for similar sparse vectors using dedicated sparse posting lists
     ///
-    /// Uses shared `WandExecutor` with `SparseTermScorer` for efficient top-k retrieval.
-    /// Optimizations (via WandExecutor):
+    /// Uses `BmpExecutor` or `SparseMaxScoreExecutor` for efficient top-k retrieval.
+    /// Optimizations:
     /// 1. **MaxScore pruning**: Dimensions sorted by max contribution
-    /// 2. **Block-Max WAND**: Skips blocks where max contribution < threshold
+    /// 2. **Block-max pruning**: Skips blocks where max contribution < threshold
     /// 3. **Top-K heap**: Efficient score collection
     ///
     /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
@@ -882,7 +882,7 @@ impl AsyncSegmentReader {
 
         // Select executor based on number of query terms:
         // - 12+ terms: BMP (block-at-a-time, lazy block loading, best for SPLADE)
-        // - 1-11 terms: LazyBlockMaxScoreExecutor (cursor-based traversal + lazy block loading)
+        // - 1-11 terms: SparseMaxScoreExecutor (cursor-based traversal + lazy block loading)
         let num_terms = matched_terms.len();
         let over_fetch = limit * 2; // Over-fetch for multi-value combining
         let raw_results = if num_terms > 12 {
@@ -893,7 +893,7 @@ impl AsyncSegmentReader {
         } else {
             // Lazy BlockMaxScore: skip entries drive navigation, blocks loaded on-demand.
             // No upfront get_posting() — blocks only loaded when cursor actually visits them.
-            crate::query::LazyBlockMaxScoreExecutor::new(
+            crate::query::SparseMaxScoreExecutor::new(
                 sparse_index,
                 matched_terms,
                 over_fetch,
@@ -904,7 +904,7 @@ impl AsyncSegmentReader {
         };
 
         log::trace!(
-            "Sparse WAND returned {} raw results for segment (doc_id_offset={})",
+            "Sparse search returned {} raw results for segment (doc_id_offset={})",
             raw_results.len(),
             self.doc_id_offset
         );

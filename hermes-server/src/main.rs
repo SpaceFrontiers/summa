@@ -41,7 +41,7 @@ struct Args {
     cache_dir: Option<PathBuf>,
 
     /// Max indexing memory (MB) before auto-flush (global across all builders)
-    #[arg(long, default_value = "4096")]
+    #[arg(long, default_value = "16384")]
     max_indexing_memory_mb: usize,
 
     /// Number of parallel indexing threads (defaults to CPU count)
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
 
     let num_indexing_threads = args
         .indexing_threads
-        .unwrap_or_else(|| (num_cpus::get() / 2).max(1));
+        .unwrap_or_else(|| (num_cpus::get() / 4).max(1));
 
     let config = IndexConfig {
         max_indexing_memory_bytes: args.max_indexing_memory_mb * 1024 * 1024,

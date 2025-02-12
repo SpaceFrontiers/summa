@@ -168,13 +168,13 @@ pub const BLOCK_SIZE: usize = 128;
 pub struct BlockPostingList {
     /// Skip list: (base_doc_id, last_doc_id_in_block, byte_offset, block_max_tf)
     /// base_doc_id is the first doc_id in the block (absolute, not delta)
-    /// block_max_tf enables Block-Max WAND optimization
+    /// block_max_tf enables block-max pruning optimization
     skip_list: Vec<(DocId, DocId, u64, u32)>,
     /// Compressed posting data (OwnedBytes for zero-copy mmap support)
     data: OwnedBytes,
     /// Total number of postings
     doc_count: u32,
-    /// Maximum term frequency across all postings (for WAND upper bound)
+    /// Maximum term frequency across all postings (for MaxScore upper bound)
     max_tf: u32,
 }
 
@@ -193,7 +193,7 @@ impl BlockPostingList {
             let block_end = (i + BLOCK_SIZE).min(postings.len());
             let block = &postings[i..block_end];
 
-            // Compute block's max term frequency for Block-Max WAND
+            // Compute block's max term frequency for block-max pruning
             let block_max_tf = block.iter().map(|p| p.term_freq).max().unwrap_or(0);
             max_tf = max_tf.max(block_max_tf);
 
@@ -339,7 +339,7 @@ impl BlockPostingList {
         self.doc_count
     }
 
-    /// Get maximum term frequency (for WAND upper bound computation)
+    /// Get maximum term frequency (for MaxScore upper bound computation)
     pub fn max_tf(&self) -> u32 {
         self.max_tf
     }
@@ -369,7 +369,7 @@ impl BlockPostingList {
         ))
     }
 
-    /// Get block's max term frequency for Block-Max WAND
+    /// Get block's max term frequency for block-max pruning
     pub fn block_max_tf(&self, block_idx: usize) -> Option<u32> {
         self.skip_list
             .get(block_idx)
@@ -696,7 +696,7 @@ impl<'a> BlockPostingIterator<'a> {
     }
 
     /// Skip to the next block, returning the first doc_id in the new block
-    /// This is used for block-max WAND optimization when the current block's
+    /// This is used for block-max pruning when the current block's
     /// max score can't beat the threshold.
     pub fn skip_to_next_block(&mut self) -> DocId {
         if self.exhausted {
@@ -718,7 +718,7 @@ impl<'a> BlockPostingIterator<'a> {
         self.block_list.skip_list.len()
     }
 
-    /// Get the current block's max term frequency for Block-Max WAND
+    /// Get the current block's max term frequency for block-max pruning
     #[inline]
     pub fn current_block_max_tf(&self) -> u32 {
         if self.exhausted || self.current_block >= self.block_list.skip_list.len() {

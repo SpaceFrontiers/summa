@@ -1,4 +1,4 @@
-//! Comprehensive tests for WAND scoring and document retrieval
+//! Comprehensive tests for MaxScore scoring and document retrieval
 //!
 //! Tests cover:
 //! - Document retrievability (all matching docs found)

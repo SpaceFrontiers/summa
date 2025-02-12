@@ -17,7 +17,7 @@ use std::io::{self, Read, Write};
 /// Block size for rounded bitpacking (128 integers per block for SIMD alignment)
 pub const ROUNDED_BP128_BLOCK_SIZE: usize = 128;
 
-/// Rounded bitpacked block with skip info for BlockWAND
+/// Rounded bitpacked block with skip info for block-max pruning
 #[derive(Debug, Clone)]
 pub struct RoundedBP128Block {
     /// Delta-encoded doc_ids (rounded bitpacked: 8/16/32 bits)
@@ -36,7 +36,7 @@ pub struct RoundedBP128Block {
     pub num_docs: u16,
     /// Maximum term frequency in this block
     pub max_tf: u32,
-    /// Maximum impact score in this block (for MaxScore/WAND)
+    /// Maximum impact score in this block (for MaxScore pruning)
     pub max_block_score: f32,
 }
 
@@ -443,7 +443,7 @@ impl<'a> RoundedBP128Iterator<'a> {
         self.doc()
     }
 
-    /// Get block max score for current block (for WAND/MaxScore)
+    /// Get block max score for current block (for MaxScore pruning)
     #[inline]
     pub fn block_max_score(&self) -> f32 {
         if self.current_block < self.posting_list.blocks.len() {

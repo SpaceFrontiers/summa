@@ -28,7 +28,7 @@ use std::sync::Arc;
 use super::sstable_index::FstBlockIndex;
 use super::sstable_index::{BlockAddr, BlockIndex, MmapBlockIndex};
 use crate::compression::{CompressionDict, CompressionLevel};
-use crate::directories::{AsyncFileRead, LazyFileHandle, LazyFileSlice, OwnedBytes};
+use crate::directories::{FileHandle, OwnedBytes};
 
 /// SSTable magic number - version 4 with memory-efficient index
 /// Uses FST-based or mmap'd block index to avoid heap allocation
@@ -855,7 +855,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
 
         let data_end_offset = self.current_offset;
 
-        // Build memory-efficient block index (v4 format)
+        // Build memory-efficient block index
         // Convert to (key, BlockAddr) pairs for the new index format
         let entries: Vec<(Vec<u8>, BlockAddr)> = self
             .index
@@ -907,7 +907,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             0
         };
 
-        // Write extended footer (v4 format)
+        // Write extended footer
         self.writer.write_u64::<LittleEndian>(data_end_offset)?;
         self.writer.write_u64::<LittleEndian>(self.num_entries)?;
         self.writer.write_u64::<LittleEndian>(bloom_offset)?; // 0 if no bloom
@@ -928,16 +928,16 @@ struct BlockIndexEntry {
     length: u32,
 }
 
-/// Async SSTable reader - loads blocks on demand via LazyFileSlice
+/// Async SSTable reader - loads blocks on demand via FileHandle
 ///
-/// Memory-efficient design (v4 format):
+/// Memory-efficient design:
 /// - Block index uses FST (native) or mmap'd raw bytes - no heap allocation for keys
 /// - Block addresses stored in bitpacked format
 /// - Bloom filter and dictionary optional
 pub struct AsyncSSTableReader<V: SSTableValue> {
-    /// LazyFileSlice for the data portion (blocks only) - fetches ranges on demand
-    data_slice: LazyFileSlice,
-    /// Memory-efficient block index (v4: FST or mmap, v3: legacy Vec)
+    /// FileHandle for the data portion (blocks only) - fetches ranges on demand
+    data_slice: FileHandle,
+    /// Memory-efficient block index (FST or mmap)
     block_index: BlockIndex,
     num_entries: u64,
     /// Hot cache for decompressed blocks
@@ -1008,13 +1008,11 @@ impl BlockCache {
 }
 
 impl<V: SSTableValue> AsyncSSTableReader<V> {
-    /// Open an SSTable from a LazyFileHandle
+    /// Open an SSTable from a FileHandle
     /// Only loads the footer and index into memory, data blocks fetched on-demand
     ///
-    /// Supports both v3 (legacy) and v4 (memory-efficient) formats:
-    /// - v4: FST-based or mmap'd block index (no heap allocation for keys)
-    /// - v3: Prefix-compressed block index loaded into Vec (legacy fallback)
-    pub async fn open(file_handle: LazyFileHandle, cache_blocks: usize) -> io::Result<Self> {
+    /// Uses FST-based (native) or mmap'd block index (no heap allocation for keys)
+    pub async fn open(file_handle: FileHandle, cache_blocks: usize) -> io::Result<Self> {
         let file_len = file_handle.len();
         if file_len < 37 {
             return Err(io::Error::new(

@@ -24,7 +24,7 @@ name = "test-doc-retrieval"
 path = "src/bin/test_doc_retrieval.rs"
 
 [dependencies]
-hermes-core = { workspace = true, features = ["native"] }
+hermes-core = { workspace = true, features = ["native", "sync"] }
 tokio = { workspace = true, features = ["macros", "signal"] }
 tonic = { workspace = true, features = ["gzip"] }
 tonic-prost = "0.14"

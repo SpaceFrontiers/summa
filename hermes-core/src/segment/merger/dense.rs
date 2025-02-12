@@ -15,7 +15,7 @@ use super::SegmentMerger;
 use super::TrainedVectorStructures;
 use super::doc_offsets;
 use crate::Result;
-use crate::directories::{AsyncFileRead, Directory, DirectoryWriter};
+use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{DenseVectorQuantization, FieldType, VectorIndexType};
 use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
 use crate::segment::reader::SegmentReader;

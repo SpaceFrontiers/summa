@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::DocId;
-use crate::directories::{AsyncFileRead, LazyFileHandle, OwnedBytes};
+use crate::directories::{FileHandle, OwnedBytes};
 use crate::structures::{
     BlockSparsePostingList, IVFPQIndex, IVFRaBitQIndex, PQCodebook, RaBitQCodebook, RaBitQIndex,
     SparseBlock, SparseSkipEntry,
@@ -284,8 +284,8 @@ impl DimensionTable {
 ///   load; block data at the front of the file is never touched.
 #[derive(Clone)]
 pub struct SparseIndex {
-    /// Mmap file handle for block data reads
-    handle: LazyFileHandle,
+    /// File handle for block data reads (Inline for mmap, Lazy for HTTP)
+    handle: FileHandle,
     /// SoA dimension table (sorted by dim_id)
     dims: Arc<DimensionTable>,
     /// Zero-copy skip section: all SparseSkipEntry structs contiguous (20B each)
@@ -299,7 +299,7 @@ pub struct SparseIndex {
 impl SparseIndex {
     /// Create a new V3 sparse index with SoA dimension table and zero-copy skip section
     pub fn new(
-        handle: LazyFileHandle,
+        handle: FileHandle,
         dims: DimensionTable,
         skip_bytes: OwnedBytes,
         total_docs: u32,
@@ -570,6 +570,90 @@ impl SparseIndex {
         // OwnedBytes: just Arc + range (no heap copy for mmap)
         let skip_overhead = std::mem::size_of::<OwnedBytes>() + self.skip_bytes.len();
         dim_table + skip_overhead
+    }
+
+    /// Whether the handle supports synchronous reads (mmap/RAM-backed).
+    #[inline]
+    pub fn is_sync(&self) -> bool {
+        self.handle.is_sync()
+    }
+
+    /// Synchronous block load using pre-resolved skip_start and block_data_offset.
+    ///
+    /// Only works when the handle is Inline (mmap/RAM). Panics or errors on Lazy handles.
+    /// This bypasses all async overhead for mmap-backed sparse indexes.
+    #[inline]
+    pub fn load_block_direct_sync(
+        &self,
+        skip_start: usize,
+        block_data_offset: u64,
+        block_idx: usize,
+    ) -> crate::Result<Option<SparseBlock>> {
+        if skip_start + block_idx >= self.skip_entry_count() {
+            return Ok(None);
+        }
+        let entry = self.read_skip_entry(skip_start + block_idx);
+        let base = block_data_offset;
+        let abs_offset = base + entry.offset;
+        let data = self
+            .handle
+            .read_bytes_range_sync(abs_offset..abs_offset + entry.length as u64)
+            .map_err(crate::Error::Io)?;
+        Ok(Some(SparseBlock::from_owned_bytes(data).map_err(|e| {
+            crate::Error::Corruption(format!(
+                "sync direct block load skip_start={} block_idx={} offset={} length={} base={}: {e}",
+                skip_start, block_idx, entry.offset, entry.length, base
+            ))
+        })?))
+    }
+
+    /// Synchronous contiguous range block load.
+    ///
+    /// Only works when the handle is Inline (mmap/RAM). Single zero-copy slice
+    /// into the mmap, then split into individual blocks.
+    pub fn get_blocks_range_sync(
+        &self,
+        dim_id: u32,
+        block_start: usize,
+        block_count: usize,
+    ) -> crate::Result<Vec<SparseBlock>> {
+        let idx = match self.dims.find(dim_id) {
+            Some(i) => i,
+            None => return Ok(Vec::new()),
+        };
+        let skip_start = self.dims.skip_starts[idx] as usize;
+        let total_blocks = self.dims.skip_counts[idx] as usize;
+        if block_start >= total_blocks || block_count == 0 {
+            return Ok(Vec::new());
+        }
+        let end = (block_start + block_count).min(total_blocks);
+        let base = self.dims.block_offsets[idx];
+
+        let first_entry = self.read_skip_entry(skip_start + block_start);
+        let last_entry = self.read_skip_entry(skip_start + end - 1);
+        let range_start = base + first_entry.offset;
+        let range_end = base + last_entry.offset + last_entry.length as u64;
+
+        let range_data = self
+            .handle
+            .read_bytes_range_sync(range_start..range_end)
+            .map_err(crate::Error::Io)?;
+
+        let mut blocks = Vec::with_capacity(end - block_start);
+        for bi in block_start..end {
+            let entry = self.read_skip_entry(skip_start + bi);
+            let rel_offset = entry.offset - first_entry.offset;
+            let block_bytes = range_data
+                .slice(rel_offset as usize..(rel_offset as usize + entry.length as usize));
+            blocks.push(SparseBlock::from_owned_bytes(block_bytes).map_err(|e| {
+                crate::Error::Corruption(format!(
+                    "sync dim_id={} block={}/{} skip_entry(offset={},length={}) base={}: {e}",
+                    dim_id, bi, total_blocks, entry.offset, entry.length, base
+                ))
+            })?);
+        }
+
+        Ok(blocks)
     }
 
     /// Get merge-level info for a dimension: skip entries, doc_count, global_max_weight,

@@ -367,8 +367,8 @@ impl<A: Collector, B: Collector, C: Collector> Collector for (&mut A, &mut B, &m
 
 /// Execute a query with one or more collectors (async)
 ///
-/// Uses a large limit for the scorer to disable WAND pruning.
-/// For queries that benefit from WAND pruning (e.g., sparse vector search),
+/// Uses a large limit for the scorer to disable MaxScore pruning.
+/// For queries that benefit from MaxScore pruning (e.g., sparse vector search),
 /// use `collect_segment_with_limit` instead.
 ///
 /// # Examples
@@ -387,13 +387,13 @@ pub async fn collect_segment<C: Collector>(
     query: &dyn Query,
     collector: &mut C,
 ) -> Result<()> {
-    // Use large limit to disable WAND skipping for exhaustive collection
+    // Use large limit to disable MaxScore skipping for exhaustive collection
     collect_segment_with_limit(reader, query, collector, usize::MAX / 2).await
 }
 
 /// Execute a query with one or more collectors and a specific limit (async)
 ///
-/// The limit is passed to the scorer to enable WAND pruning for queries
+/// The limit is passed to the scorer to enable MaxScore pruning for queries
 /// that support it (e.g., sparse vector search). This significantly improves
 /// performance when only the top-k results are needed.
 ///

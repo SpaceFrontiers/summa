@@ -369,7 +369,7 @@ impl<'a> ExactSizeIterator for EliasFanoIterator<'a> {}
 /// Block size for Elias-Fano BlockMax (matches bitpacking for consistency)
 pub const EF_BLOCK_SIZE: usize = 128;
 
-/// Block metadata for BlockMax WAND optimization
+/// Block metadata for block-max pruning optimization
 #[derive(Debug, Clone)]
 pub struct EFBlockInfo {
     /// First document ID in this block
@@ -424,7 +424,7 @@ pub struct EliasFanoPostingList {
     pub tf_bits: u8,
     /// Maximum term frequency (for BM25 upper bound)
     pub max_tf: u32,
-    /// Block metadata for BlockMax WAND
+    /// Block metadata for block-max pruning
     pub blocks: Vec<EFBlockInfo>,
     /// Global maximum score across all blocks
     pub max_score: f32,
@@ -485,7 +485,7 @@ impl EliasFanoPostingList {
             }
         }
 
-        // Build block metadata for BlockMax WAND
+        // Build block metadata for block-max pruning
         let mut blocks = Vec::new();
         let mut max_score = 0.0f32;
         let mut i = 0;
@@ -711,7 +711,7 @@ impl<'a> EliasFanoPostingIterator<'a> {
         self.pos >= self.list.len()
     }
 
-    /// Get current block's max score (for BlockMax WAND)
+    /// Get current block's max score (for block-max pruning)
     pub fn current_block_max_score(&self) -> f32 {
         if self.is_exhausted() || self.list.blocks.is_empty() {
             return 0.0;
@@ -746,7 +746,7 @@ impl<'a> EliasFanoPostingIterator<'a> {
             .fold(0.0f32, |a, b| a.max(b))
     }
 
-    /// Skip to next block containing doc >= target (for BlockWAND)
+    /// Skip to next block containing doc >= target (for block-max pruning)
     /// Returns (first_doc_in_block, block_max_score) or None if exhausted
     pub fn skip_to_block_with_doc(&mut self, target: u32) -> Option<(u32, f32)> {
         if self.list.blocks.is_empty() {

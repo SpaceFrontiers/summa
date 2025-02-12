@@ -103,6 +103,7 @@ pub use postings::{
     decode_element_ordinal,
     decode_token_position,
     encode_position,
+    optimal_partition,
     pack_block,
     pack_deltas_fixed,
     pack_vertical,

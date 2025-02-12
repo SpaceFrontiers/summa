@@ -35,7 +35,7 @@ pub type CountFuture<'a> = Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>
 #[cfg(target_arch = "wasm32")]
 pub type CountFuture<'a> = Pin<Box<dyn Future<Output = Result<u32>> + 'a>>;
 
-/// Info for WAND-optimizable term queries
+/// Info for MaxScore-optimizable term queries
 #[derive(Debug, Clone)]
 pub struct TermQueryInfo {
     /// Field being searched
@@ -68,7 +68,7 @@ macro_rules! define_query_traits {
             /// Estimated number of matching documents in a segment (async)
             fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a>;
 
-            /// Return term info if this is a simple term query eligible for WAND optimization
+            /// Return term info if this is a simple term query eligible for MaxScore optimization
             ///
             /// Returns None for complex queries (boolean, phrase, etc.)
             fn as_term_query_info(&self) -> Option<TermQueryInfo> {

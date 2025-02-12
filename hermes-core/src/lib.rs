@@ -8,7 +8,7 @@
 //! - Multiple segments with merge support
 //! - Text and numeric field support
 //! - Term, boolean, and boost queries
-//! - BlockWAND / MaxScore query optimizations
+//! - MaxScore / block-max pruning query optimizations
 
 pub mod compression;
 pub mod directories;
@@ -41,8 +41,8 @@ pub use directories::HttpDirectory;
 #[cfg(feature = "native")]
 pub use directories::MmapDirectory;
 pub use directories::{
-    AsyncFileRead, CachingDirectory, Directory, DirectoryWriter, FileSlice, LazyFileHandle,
-    LazyFileSlice, OwnedBytes, RamDirectory, SliceCacheStats, SliceCachingDirectory,
+    CachingDirectory, Directory, DirectoryWriter, FileHandle, OwnedBytes, RamDirectory,
+    SliceCacheStats, SliceCachingDirectory,
 };
 
 /// Default directory type for native builds - uses memory-mapped files for efficient access
@@ -58,9 +58,8 @@ pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 
 // Re-exports from query
 pub use query::{
-    BlockMaxScoreExecutor, Bm25Params, BooleanQuery, BoostQuery, Query, ScoredDoc, Scorer,
-    SearchHit, SearchResponse, SearchResult, TermQuery, TopKCollector, WandExecutor, WandOrQuery,
-    search_segment,
+    Bm25Params, BooleanQuery, BoostQuery, MaxScoreExecutor, Query, ScoredDoc, Scorer, SearchHit,
+    SearchResponse, SearchResult, SparseMaxScoreExecutor, TermQuery, TopKCollector, search_segment,
 };
 
 // Re-exports from tokenizer
@@ -91,11 +90,11 @@ pub type DocId = u32;
 pub type TermFreq = u32;
 pub type Score = f32;
 
-/// Default number of indexing threads (cpu / 2, minimum 1).
+/// Default number of indexing threads (cpu / 4, minimum 1).
 /// Centralized so all configs share one definition.
 #[cfg(feature = "native")]
 pub fn default_indexing_threads() -> usize {
-    (num_cpus::get() / 2).max(1)
+    (num_cpus::get() / 4).max(1)
 }
 
 /// Default number of compression threads (cpu / 4, minimum 1).

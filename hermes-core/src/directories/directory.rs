@@ -11,130 +11,6 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A slice of bytes that can be read asynchronously
-#[derive(Debug, Clone)]
-pub struct FileSlice {
-    data: OwnedBytes,
-    range: Range<u64>,
-}
-
-impl FileSlice {
-    pub fn new(data: OwnedBytes) -> Self {
-        let len = data.len() as u64;
-        Self {
-            data,
-            range: 0..len,
-        }
-    }
-
-    pub fn empty() -> Self {
-        Self {
-            data: OwnedBytes::empty(),
-            range: 0..0,
-        }
-    }
-
-    pub fn slice(&self, range: Range<u64>) -> Self {
-        let start = self.range.start + range.start;
-        let end = self.range.start + range.end;
-        Self {
-            data: self.data.clone(),
-            range: start..end,
-        }
-    }
-
-    pub fn len(&self) -> u64 {
-        self.range.end - self.range.start
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.range.start == self.range.end
-    }
-
-    /// Read the entire slice (async for network compatibility)
-    pub async fn read_bytes(&self) -> io::Result<OwnedBytes> {
-        Ok(self
-            .data
-            .slice(self.range.start as usize..self.range.end as usize))
-    }
-
-    /// Read a specific range within this slice
-    pub async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
-        let start = self.range.start + range.start;
-        let end = self.range.start + range.end;
-        if end > self.range.end {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Range out of bounds",
-            ));
-        }
-        Ok(self.data.slice(start as usize..end as usize))
-    }
-}
-
-/// Trait for async range reading - implemented by both FileSlice and LazyFileHandle
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg(not(target_arch = "wasm32"))]
-pub trait AsyncFileRead: Send + Sync {
-    /// Get the total length of the file/slice (u64 to support >4GB files on 32-bit platforms)
-    fn len(&self) -> u64;
-
-    /// Check if empty
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Read a specific byte range
-    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes>;
-
-    /// Read all bytes
-    async fn read_bytes(&self) -> io::Result<OwnedBytes> {
-        self.read_bytes_range(0..self.len()).await
-    }
-}
-
-/// Trait for async range reading - implemented by both FileSlice and LazyFileHandle (WASM version)
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg(target_arch = "wasm32")]
-pub trait AsyncFileRead {
-    /// Get the total length of the file/slice (u64 to support >4GB files on 32-bit platforms)
-    fn len(&self) -> u64;
-
-    /// Check if empty
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Read a specific byte range
-    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes>;
-
-    /// Read all bytes
-    async fn read_bytes(&self) -> io::Result<OwnedBytes> {
-        self.read_bytes_range(0..self.len()).await
-    }
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl AsyncFileRead for FileSlice {
-    fn len(&self) -> u64 {
-        self.range.end - self.range.start
-    }
-
-    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
-        let start = self.range.start + range.start;
-        let end = self.range.start + range.end;
-        if end > self.range.end {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Range out of bounds",
-            ));
-        }
-        Ok(self.data.slice(start as usize..end as usize))
-    }
-}
-
 /// Callback type for lazy range reading
 #[cfg(not(target_arch = "wasm32"))]
 pub type RangeReadFn = Arc<
@@ -153,128 +29,215 @@ pub type RangeReadFn = Arc<
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<OwnedBytes>>>>,
 >;
 
-/// Lazy file handle that fetches ranges on demand via HTTP range requests
-/// Does NOT load the entire file into memory
-pub struct LazyFileHandle {
-    /// Total file size (u64 to support >4GB files on 32-bit platforms like WASM)
-    file_size: u64,
-    /// Callback to read a range from the underlying directory
-    read_fn: RangeReadFn,
-}
-
-impl std::fmt::Debug for LazyFileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LazyFileHandle")
-            .field("file_size", &self.file_size)
-            .finish()
-    }
-}
-
-impl Clone for LazyFileHandle {
-    fn clone(&self) -> Self {
-        Self {
-            file_size: self.file_size,
-            read_fn: Arc::clone(&self.read_fn),
-        }
-    }
-}
-
-impl LazyFileHandle {
-    /// Create a new lazy file handle
-    pub fn new(file_size: u64, read_fn: RangeReadFn) -> Self {
-        Self { file_size, read_fn }
-    }
-
-    /// Get file size
-    pub fn file_size(&self) -> u64 {
-        self.file_size
-    }
-
-    /// Create a sub-slice view (still lazy)
-    pub fn slice(&self, range: Range<u64>) -> LazyFileSlice {
-        LazyFileSlice {
-            handle: self.clone(),
-            offset: range.start,
-            len: range.end - range.start,
-        }
-    }
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl AsyncFileRead for LazyFileHandle {
-    fn len(&self) -> u64 {
-        self.file_size
-    }
-
-    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
-        if range.end > self.file_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Range {:?} out of bounds (file size: {})",
-                    range, self.file_size
-                ),
-            ));
-        }
-        (self.read_fn)(range).await
-    }
-}
-
-/// A slice view into a LazyFileHandle
+/// Unified file handle for both inline (mmap/RAM) and lazy (HTTP/filesystem) access.
+///
+/// Replaces the previous `FileSlice`, `LazyFileHandle`, and `LazyFileSlice` types.
+/// - **Inline**: data is available synchronously (mmap, RAM). Sync reads via `read_bytes_range_sync`.
+/// - **Lazy**: data is fetched on-demand via async callback (HTTP, filesystem).
+///
+/// Use `.slice()` to create sub-range views (zero-copy for Inline, offset-adjusted for Lazy).
 #[derive(Clone)]
-pub struct LazyFileSlice {
-    handle: LazyFileHandle,
-    offset: u64,
-    len: u64,
+pub struct FileHandle {
+    inner: FileHandleInner,
 }
 
-impl std::fmt::Debug for LazyFileSlice {
+#[derive(Clone)]
+enum FileHandleInner {
+    /// Data available inline — sync reads possible (mmap, RAM)
+    Inline {
+        data: OwnedBytes,
+        offset: u64,
+        len: u64,
+    },
+    /// Data fetched on-demand via async callback (HTTP, filesystem)
+    Lazy {
+        read_fn: RangeReadFn,
+        offset: u64,
+        len: u64,
+    },
+}
+
+impl std::fmt::Debug for FileHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LazyFileSlice")
-            .field("offset", &self.offset)
-            .field("len", &self.len)
-            .finish()
+        match &self.inner {
+            FileHandleInner::Inline { len, offset, .. } => f
+                .debug_struct("FileHandle::Inline")
+                .field("offset", offset)
+                .field("len", len)
+                .finish(),
+            FileHandleInner::Lazy { len, offset, .. } => f
+                .debug_struct("FileHandle::Lazy")
+                .field("offset", offset)
+                .field("len", len)
+                .finish(),
+        }
     }
 }
 
-impl LazyFileSlice {
-    /// Create a slice from a handle with absolute offset and length
-    pub fn from_handle_range(handle: &LazyFileHandle, offset: u64, len: u64) -> Self {
+impl FileHandle {
+    /// Create an inline file handle from owned bytes (mmap, RAM).
+    /// Sync reads are available.
+    pub fn from_bytes(data: OwnedBytes) -> Self {
+        let len = data.len() as u64;
         Self {
-            handle: handle.clone(),
-            offset,
-            len,
+            inner: FileHandleInner::Inline {
+                data,
+                offset: 0,
+                len,
+            },
         }
     }
 
-    /// Create a sub-slice
+    /// Create an empty file handle.
+    pub fn empty() -> Self {
+        Self::from_bytes(OwnedBytes::empty())
+    }
+
+    /// Create a lazy file handle from an async range-read callback.
+    /// Only async reads are available.
+    pub fn lazy(len: u64, read_fn: RangeReadFn) -> Self {
+        Self {
+            inner: FileHandleInner::Lazy {
+                read_fn,
+                offset: 0,
+                len,
+            },
+        }
+    }
+
+    /// Total length in bytes.
+    #[inline]
+    pub fn len(&self) -> u64 {
+        match &self.inner {
+            FileHandleInner::Inline { len, .. } => *len,
+            FileHandleInner::Lazy { len, .. } => *len,
+        }
+    }
+
+    /// Check if empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether synchronous reads are available (inline/mmap data).
+    #[inline]
+    pub fn is_sync(&self) -> bool {
+        matches!(&self.inner, FileHandleInner::Inline { .. })
+    }
+
+    /// Create a sub-range view. Zero-copy for Inline, offset-adjusted for Lazy.
     pub fn slice(&self, range: Range<u64>) -> Self {
-        Self {
-            handle: self.handle.clone(),
-            offset: self.offset + range.start,
-            len: range.end - range.start,
+        match &self.inner {
+            FileHandleInner::Inline { data, offset, len } => {
+                let new_offset = offset + range.start;
+                let new_len = range.end - range.start;
+                debug_assert!(
+                    new_offset + new_len <= offset + len,
+                    "slice out of bounds: {}+{} > {}+{}",
+                    new_offset,
+                    new_len,
+                    offset,
+                    len
+                );
+                Self {
+                    inner: FileHandleInner::Inline {
+                        data: data.clone(),
+                        offset: new_offset,
+                        len: new_len,
+                    },
+                }
+            }
+            FileHandleInner::Lazy {
+                read_fn,
+                offset,
+                len,
+            } => {
+                let new_offset = offset + range.start;
+                let new_len = range.end - range.start;
+                debug_assert!(
+                    new_offset + new_len <= offset + len,
+                    "slice out of bounds: {}+{} > {}+{}",
+                    new_offset,
+                    new_len,
+                    offset,
+                    len
+                );
+                Self {
+                    inner: FileHandleInner::Lazy {
+                        read_fn: Arc::clone(read_fn),
+                        offset: new_offset,
+                        len: new_len,
+                    },
+                }
+            }
         }
     }
-}
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl AsyncFileRead for LazyFileSlice {
-    fn len(&self) -> u64 {
-        self.len
+    /// Async range read — works for both Inline and Lazy.
+    pub async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
+        match &self.inner {
+            FileHandleInner::Inline { data, offset, len } => {
+                if range.end > *len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Range {:?} out of bounds (len: {})", range, len),
+                    ));
+                }
+                let start = (*offset + range.start) as usize;
+                let end = (*offset + range.end) as usize;
+                Ok(data.slice(start..end))
+            }
+            FileHandleInner::Lazy {
+                read_fn,
+                offset,
+                len,
+            } => {
+                if range.end > *len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Range {:?} out of bounds (len: {})", range, len),
+                    ));
+                }
+                let abs_start = offset + range.start;
+                let abs_end = offset + range.end;
+                (read_fn)(abs_start..abs_end).await
+            }
+        }
     }
 
-    async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
-        if range.end > self.len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Range {:?} out of bounds (slice len: {})", range, self.len),
-            ));
+    /// Read all bytes.
+    pub async fn read_bytes(&self) -> io::Result<OwnedBytes> {
+        self.read_bytes_range(0..self.len()).await
+    }
+
+    /// Synchronous range read — only works for Inline handles.
+    /// Returns `Err` if the handle is Lazy.
+    #[inline]
+    pub fn read_bytes_range_sync(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
+        match &self.inner {
+            FileHandleInner::Inline { data, offset, len } => {
+                if range.end > *len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Range {:?} out of bounds (len: {})", range, len),
+                    ));
+                }
+                let start = (*offset + range.start) as usize;
+                let end = (*offset + range.end) as usize;
+                Ok(data.slice(start..end))
+            }
+            FileHandleInner::Lazy { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Synchronous read not available on lazy file handle",
+            )),
         }
-        let abs_start = self.offset + range.start;
-        let abs_end = self.offset + range.end;
-        self.handle.read_bytes_range(abs_start..abs_end).await
+    }
+
+    /// Synchronous read of all bytes — only works for Inline handles.
+    #[inline]
+    pub fn read_bytes_sync(&self) -> io::Result<OwnedBytes> {
+        self.read_bytes_range_sync(0..self.len())
     }
 }
 
@@ -412,8 +375,8 @@ pub trait Directory: Send + Sync + 'static {
     /// Get file size
     async fn file_size(&self, path: &Path) -> io::Result<u64>;
 
-    /// Open a file for reading, returns a FileSlice (loads entire file)
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice>;
+    /// Open a file for reading (loads entire file into an inline FileHandle)
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle>;
 
     /// Read a specific byte range from a file (optimized for network)
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes>;
@@ -421,9 +384,10 @@ pub trait Directory: Send + Sync + 'static {
     /// List files in directory
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>>;
 
-    /// Open a lazy file handle that fetches ranges on demand
-    /// This is more efficient for large files over network
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle>;
+    /// Open a file handle that fetches ranges on demand.
+    /// For mmap directories this returns an Inline handle (sync-capable).
+    /// For HTTP/filesystem directories this returns a Lazy handle.
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle>;
 }
 
 /// Async directory trait for reading index files (WASM version - no Send requirement)
@@ -436,8 +400,8 @@ pub trait Directory: 'static {
     /// Get file size
     async fn file_size(&self, path: &Path) -> io::Result<u64>;
 
-    /// Open a file for reading, returns a FileSlice (loads entire file)
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice>;
+    /// Open a file for reading (loads entire file into an inline FileHandle)
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle>;
 
     /// Read a specific byte range from a file (optimized for network)
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes>;
@@ -445,9 +409,8 @@ pub trait Directory: 'static {
     /// List files in directory
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>>;
 
-    /// Open a lazy file handle that fetches ranges on demand
-    /// This is more efficient for large files over network
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle>;
+    /// Open a file handle that fetches ranges on demand.
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle>;
 }
 
 /// A writer for incrementally writing data to a directory file.
@@ -599,13 +562,13 @@ impl Directory for RamDirectory {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))
     }
 
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle> {
         let files = self.files.read();
         let data = files
             .get(path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
 
-        Ok(FileSlice::new(OwnedBytes::from_arc_vec(
+        Ok(FileHandle::from_bytes(OwnedBytes::from_arc_vec(
             Arc::clone(data),
             0..data.len(),
         )))
@@ -639,40 +602,9 @@ impl Directory for RamDirectory {
             .collect())
     }
 
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
-        let files = Arc::clone(&self.files);
-        let path = path.to_path_buf();
-
-        let file_size = {
-            let files_guard = files.read();
-            files_guard
-                .get(&path)
-                .map(|data| data.len() as u64)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?
-        };
-
-        let read_fn: RangeReadFn = Arc::new(move |range: Range<u64>| {
-            let files = Arc::clone(&files);
-            let path = path.clone();
-            Box::pin(async move {
-                let files_guard = files.read();
-                let data = files_guard
-                    .get(&path)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
-
-                let start = range.start as usize;
-                let end = range.end as usize;
-                if end > data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Range out of bounds",
-                    ));
-                }
-                Ok(OwnedBytes::from_arc_vec(Arc::clone(data), start..end))
-            })
-        });
-
-        Ok(LazyFileHandle::new(file_size, read_fn))
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
+        // RAM data is always available synchronously — return Inline handle
+        self.open_read(path).await
     }
 }
 
@@ -746,10 +678,10 @@ impl Directory for FsDirectory {
         Ok(metadata.len())
     }
 
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle> {
         let full_path = self.resolve(path);
         let data = tokio::fs::read(&full_path).await?;
-        Ok(FileSlice::new(OwnedBytes::new(data)))
+        Ok(FileHandle::from_bytes(OwnedBytes::new(data)))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -781,7 +713,7 @@ impl Directory for FsDirectory {
         Ok(files)
     }
 
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
         let full_path = self.resolve(path);
         let metadata = tokio::fs::metadata(&full_path).await?;
         let file_size = metadata.len();
@@ -802,7 +734,7 @@ impl Directory for FsDirectory {
             })
         });
 
-        Ok(LazyFileHandle::new(file_size, read_fn))
+        Ok(FileHandle::lazy(file_size, read_fn))
     }
 }
 
@@ -894,22 +826,22 @@ impl<D: Directory> Directory for CachingDirectory<D> {
         self.inner.file_size(path).await
     }
 
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle> {
         // Check cache first
         if let Some(data) = self.cache.read().get(path) {
-            return Ok(FileSlice::new(OwnedBytes::from_arc_vec(
+            return Ok(FileHandle::from_bytes(OwnedBytes::from_arc_vec(
                 Arc::clone(data),
                 0..data.len(),
             )));
         }
 
         // Read from inner and potentially cache
-        let slice = self.inner.open_read(path).await?;
-        let bytes = slice.read_bytes().await?;
+        let handle = self.inner.open_read(path).await?;
+        let bytes = handle.read_bytes().await?;
 
         self.try_cache(path, bytes.as_slice());
 
-        Ok(FileSlice::new(bytes))
+        Ok(FileHandle::from_bytes(bytes))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -927,7 +859,7 @@ impl<D: Directory> Directory for CachingDirectory<D> {
         self.inner.list_files(prefix).await
     }
 
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
         // For caching directory, delegate to inner - caching happens at read_range level
         self.inner.open_lazy(path).await
     }
@@ -965,19 +897,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_slice() {
+    async fn test_file_handle() {
         let data = OwnedBytes::new(b"hello world".to_vec());
-        let slice = FileSlice::new(data);
+        let handle = FileHandle::from_bytes(data);
 
-        assert_eq!(slice.len(), 11);
+        assert_eq!(handle.len(), 11);
+        assert!(handle.is_sync());
 
-        let sub_slice = slice.slice(0..5);
-        let bytes = sub_slice.read_bytes().await.unwrap();
+        let sub = handle.slice(0..5);
+        let bytes = sub.read_bytes().await.unwrap();
         assert_eq!(bytes.as_slice(), b"hello");
 
-        let sub_slice2 = slice.slice(6..11);
-        let bytes2 = sub_slice2.read_bytes().await.unwrap();
+        let sub2 = handle.slice(6..11);
+        let bytes2 = sub2.read_bytes().await.unwrap();
         assert_eq!(bytes2.as_slice(), b"world");
+
+        // Sync reads work on inline handles
+        let sync_bytes = handle.read_bytes_range_sync(0..5).unwrap();
+        assert_eq!(sync_bytes.as_slice(), b"hello");
     }
 
     #[tokio::test]

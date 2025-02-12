@@ -13,7 +13,6 @@ mod scoring_tests;
 mod term;
 mod traits;
 mod vector;
-mod wand_or;
 
 pub use bm25::*;
 pub use boolean::*;
@@ -26,4 +25,3 @@ pub use scoring::*;
 pub use term::*;
 pub use traits::*;
 pub use vector::*;
-pub use wand_or::*;

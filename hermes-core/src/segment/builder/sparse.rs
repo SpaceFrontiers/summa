@@ -11,7 +11,9 @@ use rustc_hash::FxHashMap;
 use crate::Result;
 use crate::dsl::{Field, Schema};
 use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer};
-use crate::structures::{BlockSparsePostingList, SparseSkipEntry, WeightQuantization};
+use crate::structures::{
+    BlockSparsePostingList, SparseSkipEntry, WeightQuantization, optimal_partition,
+};
 
 use crate::DocId;
 
@@ -81,7 +83,6 @@ pub(super) fn build_sparse_streaming(
             .map(|c| c.weight_quantization)
             .unwrap_or(WeightQuantization::Float32);
 
-        let block_size = sparse_config.map(|c| c.block_size).unwrap_or(128);
         let pruning_fraction = sparse_config.and_then(|c| c.posting_list_pruning);
 
         // Parallel: sort + prune + serialize_v3 each dimension independently
@@ -108,10 +109,12 @@ pub(super) fn build_sparse_streaming(
                     postings.sort_unstable_by_key(|(d, o, _)| (*d, *o));
                 }
 
-                let block_list = BlockSparsePostingList::from_postings_with_block_size(
+                let weights: Vec<f32> = postings.iter().map(|(_, _, w)| w.abs()).collect();
+                let partition = optimal_partition(&weights);
+                let block_list = BlockSparsePostingList::from_postings_with_partition(
                     &postings,
                     quantization,
-                    block_size,
+                    &partition,
                 )
                 .map_err(crate::Error::Io)?;
 

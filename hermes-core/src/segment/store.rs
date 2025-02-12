@@ -19,7 +19,7 @@ use crate::DocId;
 use crate::compression::CompressionDict;
 #[cfg(feature = "native")]
 use crate::compression::CompressionLevel;
-use crate::directories::{AsyncFileRead, LazyFileHandle, LazyFileSlice};
+use crate::directories::FileHandle;
 use crate::dsl::{Document, Schema};
 
 const STORE_MAGIC: u32 = 0x53544F52; // "STOR"
@@ -409,8 +409,8 @@ pub(crate) struct StoreBlockIndex {
 
 /// Async document store reader - loads blocks on demand
 pub struct AsyncStoreReader {
-    /// LazyFileSlice for the data portion - fetches ranges on demand
-    data_slice: LazyFileSlice,
+    /// FileHandle for the data portion - fetches ranges on demand
+    data_slice: FileHandle,
     /// Block index
     index: Vec<StoreBlockIndex>,
     num_docs: u32,
@@ -540,9 +540,9 @@ impl StoreBlockCache {
 }
 
 impl AsyncStoreReader {
-    /// Open a document store from LazyFileHandle
+    /// Open a document store from FileHandle
     /// Only loads footer and index into memory, data blocks are fetched on-demand
-    pub async fn open(file_handle: LazyFileHandle, cache_blocks: usize) -> io::Result<Self> {
+    pub async fn open(file_handle: FileHandle, cache_blocks: usize) -> io::Result<Self> {
         let file_len = file_handle.len();
         // Footer: data_end(8) + dict_offset(8) + num_docs(4) + has_dict(4) + version(4) + magic(4) = 32 bytes
         if file_len < 32 {
@@ -926,9 +926,9 @@ impl<'a, W: Write> StoreMerger<'a, W> {
     ///
     /// `data_slice` should be the data portion of the store (before index/footer)
     /// `blocks` contains the block metadata from the source store
-    pub async fn append_store<F: AsyncFileRead>(
+    pub async fn append_store(
         &mut self,
-        data_slice: &F,
+        data_slice: &FileHandle,
         blocks: &[RawStoreBlock],
     ) -> io::Result<()> {
         for block in blocks {
@@ -1036,7 +1036,7 @@ impl AsyncStoreReader {
     }
 
     /// Get the data slice for raw block access
-    pub fn data_slice(&self) -> &LazyFileSlice {
+    pub fn data_slice(&self) -> &FileHandle {
         &self.data_slice
     }
 

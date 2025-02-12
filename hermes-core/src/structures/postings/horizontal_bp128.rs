@@ -164,7 +164,7 @@ fn prefix_sum_8(deltas: &mut [u32; 8]) {
     }
 }
 
-/// Bitpacked block with skip info for BlockWAND
+/// Bitpacked block with skip info for block-max pruning
 #[derive(Debug, Clone)]
 pub struct HorizontalBP128Block {
     /// Delta-encoded doc_ids (bitpacked)
@@ -183,7 +183,7 @@ pub struct HorizontalBP128Block {
     pub num_docs: u16,
     /// Maximum term frequency in this block (for BM25F upper bound calculation)
     pub max_tf: u32,
-    /// Maximum impact score in this block (for MaxScore/WAND)
+    /// Maximum impact score in this block (for MaxScore pruning)
     /// This is computed using BM25F with conservative length normalization
     pub max_block_score: f32,
 }
@@ -582,7 +582,7 @@ impl<'a> HorizontalBP128Iterator<'a> {
             .fold(0.0f32, |a, b| a.max(b))
     }
 
-    /// Skip to next block (for BlockWAND)
+    /// Skip to next block (for block-max pruning)
     pub fn skip_to_block_with_doc(&mut self, target: u32) -> Option<(u32, f32)> {
         while self.current_block < self.posting_list.blocks.len() {
             let block = &self.posting_list.blocks[self.current_block];

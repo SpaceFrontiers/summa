@@ -25,12 +25,14 @@
 
 mod block;
 mod config;
+mod partitioner;
 
 pub use block::{BlockSparsePostingIterator, BlockSparsePostingList, SparseBlock};
 pub use config::{
     IndexSize, QueryWeighting, SparseEntry, SparseQueryConfig, SparseVector, SparseVectorConfig,
     WeightQuantization,
 };
+pub use partitioner::optimal_partition;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
@@ -50,7 +52,7 @@ pub const SPARSE_BLOCK_SIZE: usize = 128;
 
 /// Skip entry for sparse posting lists with block-max support
 ///
-/// Extends the basic skip entry with `max_weight` for Block-Max WAND optimization.
+/// Extends the basic skip entry with `max_weight` for block-max pruning optimization.
 /// Used for lazy block loading - only skip list is loaded, blocks loaded on-demand.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SparseSkipEntry {

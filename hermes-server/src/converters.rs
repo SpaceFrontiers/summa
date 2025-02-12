@@ -9,7 +9,7 @@ use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
 use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, Query, Schema, TermQuery,
-    TokenizerRegistry, WandOrQuery,
+    TokenizerRegistry,
 };
 use tracing::{debug, warn};
 
@@ -82,8 +82,11 @@ pub fn convert_query(
                 return Ok(Box::new(TermQuery::text(field, &tokens[0])));
             }
 
-            // Multiple tokens - use WandOrQuery for efficient OR search
-            let query = WandOrQuery::new(field).terms(tokens);
+            // Multiple tokens - use BooleanQuery with SHOULD clauses (MaxScore fast path)
+            let mut query = BooleanQuery::new();
+            for token in tokens {
+                query = query.should(TermQuery::text(field, &token));
+            }
             Ok(Box::new(query))
         }
         Some(ProtoQueryType::Boolean(bool_query)) => {
@@ -375,11 +378,18 @@ pub fn convert_reranker(
         .as_ref()
         .is_some_and(|c| c.unit_norm);
 
+    let matryoshka_dims = if reranker.matryoshka_dims > 0 {
+        Some(reranker.matryoshka_dims as usize)
+    } else {
+        None
+    };
+
     Ok(RerankerConfig {
         field,
         vector: reranker.vector.clone(),
         combiner,
         unit_norm,
+        matryoshka_dims,
     })
 }
 

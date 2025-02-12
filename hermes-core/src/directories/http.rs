@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Directory, FileSlice, LazyFileHandle, OwnedBytes, RangeReadFn};
+use super::{Directory, FileHandle, OwnedBytes, RangeReadFn};
 
 /// A single network operation record
 #[derive(Debug, Clone, serde::Serialize)]
@@ -243,10 +243,12 @@ impl Directory for HttpDirectory {
         self.head_content_length(&url).await
     }
 
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle> {
         // Check cache first
         if let Some(data) = self.cache.read().get(path) {
-            return Ok(FileSlice::new(OwnedBytes::new(data.as_ref().clone())));
+            return Ok(FileHandle::from_bytes(OwnedBytes::new(
+                data.as_ref().clone(),
+            )));
         }
 
         // Fetch entire file
@@ -259,7 +261,9 @@ impl Directory for HttpDirectory {
             .write()
             .insert(path.to_path_buf(), Arc::clone(&data));
 
-        Ok(FileSlice::new(OwnedBytes::new(data.as_ref().clone())))
+        Ok(FileHandle::from_bytes(OwnedBytes::new(
+            data.as_ref().clone(),
+        )))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -286,7 +290,7 @@ impl Directory for HttpDirectory {
         ))
     }
 
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
         // Get file size via HEAD request
         let file_size = self.file_size(path).await?;
 
@@ -336,7 +340,7 @@ impl Directory for HttpDirectory {
             })
         });
 
-        Ok(LazyFileHandle::new(file_size, read_fn))
+        Ok(FileHandle::lazy(file_size, read_fn))
     }
 }
 

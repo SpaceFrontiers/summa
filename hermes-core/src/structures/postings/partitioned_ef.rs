@@ -720,7 +720,7 @@ impl<'a> Iterator for PartitionedEFIterator<'a> {
     }
 }
 
-/// Block metadata for BlockMax WAND
+/// Block metadata for block-max pruning
 #[derive(Debug, Clone)]
 pub struct PEFBlockInfo {
     /// First document ID in block
@@ -778,7 +778,7 @@ pub struct PartitionedEFPostingList {
     pub tf_bits: u8,
     /// Maximum term frequency
     pub max_tf: u32,
-    /// Block metadata for BlockMax WAND
+    /// Block metadata for block-max pruning
     pub blocks: Vec<PEFBlockInfo>,
     /// Global maximum score
     pub max_score: f32,
@@ -1132,7 +1132,7 @@ impl<'a> PartitionedEFPostingIterator<'a> {
             .fold(0.0f32, |a, b| a.max(b))
     }
 
-    /// Skip to next block containing doc >= target (for BlockWAND)
+    /// Skip to next block containing doc >= target (for block-max pruning)
     /// Returns (first_doc_in_block, block_max_score) or None if exhausted
     pub fn skip_to_block_with_doc(&mut self, target: u32) -> Option<(u32, f32)> {
         if self.list.blocks.is_empty() {

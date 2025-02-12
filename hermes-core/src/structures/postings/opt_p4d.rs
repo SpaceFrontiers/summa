@@ -355,7 +355,7 @@ pub struct OptP4DBlock {
     pub tf_bit_width: u8,
     /// Maximum term frequency in this block
     pub max_tf: u32,
-    /// Maximum block score for WAND/MaxScore
+    /// Maximum block score for MaxScore pruning
     pub max_block_score: f32,
     /// Packed doc deltas
     pub doc_deltas: Vec<u8>,

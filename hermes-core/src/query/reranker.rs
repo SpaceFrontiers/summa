@@ -76,6 +76,13 @@ pub struct RerankerConfig {
     /// Whether stored vectors are pre-normalized to unit L2 norm.
     /// When true, scoring uses dot-product only (skips per-vector norm — ~40% faster).
     pub unit_norm: bool,
+    /// Matryoshka pre-filter: number of leading dimensions to use for cheap
+    /// approximate scoring before full-dimension exact reranking.
+    /// When set, scores all candidates on the first `matryoshka_dims` dimensions,
+    /// keeps the top `final_limit × 2` candidates, then does full-dimension
+    /// exact scoring on survivors only. Skips ~50-70% of full cosine computations.
+    /// Set to `None` to disable (default: score all candidates at full dimension).
+    pub matryoshka_dims: Option<usize>,
 }
 
 /// Score a single document against the query vector (used by tests).
@@ -251,19 +258,94 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
 
         // Single batch SIMD scoring for all vectors in this segment
         scores_buf.resize(n, 0.0);
-        score_batch_precomp(
-            &pq,
-            &raw_buf[..n * vbs],
-            quant,
-            query_dim,
-            &mut scores_buf[..n],
-            config.unit_norm,
-        );
 
-        // Append (candidate_idx, ordinal, score) to flat buffer
-        all_scores.reserve(n);
-        for (buf_idx, &(ci, _, ordinal)) in resolved.iter().enumerate() {
-            all_scores.push((ci, ordinal, scores_buf[buf_idx]));
+        // Matryoshka pre-filter: score on truncated dimensions first, then
+        // full-dimension scoring only on survivors.
+        if let Some(mdims) = config.matryoshka_dims
+            && mdims < query_dim
+            && n > final_limit * 2
+        {
+            // Phase 2a: truncated-dimension approximate SIMD scoring.
+            // Score directly from raw_buf — no intermediate buffer copy needed.
+            // Each vector's first trunc_vbs bytes are the leading dimensions
+            // (storage is dimension-contiguous within each vector).
+            let trunc_dim = mdims;
+            let trunc_pq = PrecompQuery {
+                query: &query[..trunc_dim],
+                inv_norm_q: {
+                    let nq =
+                        simd::dot_product_f32(&query[..trunc_dim], &query[..trunc_dim], trunc_dim);
+                    if nq < f32::EPSILON {
+                        0.0
+                    } else {
+                        simd::fast_inv_sqrt(nq)
+                    }
+                },
+                query_f16: &query_f16[..trunc_dim],
+            };
+            let trunc_vbs = trunc_dim * quant.element_size();
+            for i in 0..n {
+                let vec_start = i * vbs;
+                score_batch_precomp(
+                    &trunc_pq,
+                    &raw_buf[vec_start..vec_start + trunc_vbs],
+                    quant,
+                    trunc_dim,
+                    &mut scores_buf[i..i + 1],
+                    config.unit_norm,
+                );
+            }
+
+            // Phase 2b: keep top final_limit*2 by truncated score
+            let keep = (final_limit * 2).min(n);
+            let mut ranked: Vec<(usize, f32)> = (0..n).map(|i| (i, scores_buf[i])).collect();
+            ranked.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ranked.truncate(keep);
+
+            // Phase 2c: full-dimension exact SIMD scoring on survivors only.
+            // Score directly from raw_buf at original offsets — zero-copy.
+            all_scores.reserve(ranked.len());
+            for &(orig_idx, _) in &ranked {
+                let vec_start = orig_idx * vbs;
+                let mut score = 0.0f32;
+                score_batch_precomp(
+                    &pq,
+                    &raw_buf[vec_start..vec_start + vbs],
+                    quant,
+                    query_dim,
+                    std::slice::from_mut(&mut score),
+                    config.unit_norm,
+                );
+                let (ci, _, ordinal) = resolved[orig_idx];
+                all_scores.push((ci, ordinal, score));
+            }
+
+            let filtered = n - ranked.len();
+            log::debug!(
+                "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived (filtered {})",
+                trunc_dim,
+                query_dim,
+                ranked.len(),
+                n,
+                filtered
+            );
+        } else {
+            // No pre-filter: full-dimension SIMD scoring on all candidates
+            score_batch_precomp(
+                &pq,
+                &raw_buf[..n * vbs],
+                quant,
+                query_dim,
+                &mut scores_buf[..n],
+                config.unit_norm,
+            );
+
+            all_scores.reserve(n);
+            for (buf_idx, &(ci, _, ordinal)) in resolved.iter().enumerate() {
+                all_scores.push((ci, ordinal, scores_buf[buf_idx]));
+            }
         }
     }
 
@@ -344,6 +426,7 @@ mod tests {
             vector,
             combiner,
             unit_norm: false,
+            matryoshka_dims: None,
         }
     }
 

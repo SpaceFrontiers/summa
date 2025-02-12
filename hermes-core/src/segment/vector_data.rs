@@ -5,7 +5,7 @@ use std::mem::size_of;
 
 use serde::{Deserialize, Serialize};
 
-use crate::directories::{AsyncFileRead, LazyFileSlice, OwnedBytes};
+use crate::directories::{FileHandle, OwnedBytes};
 use crate::dsl::DenseVectorQuantization;
 use crate::segment::format::{DOC_ID_ENTRY_SIZE, FLAT_BINARY_HEADER_SIZE, FLAT_BINARY_MAGIC};
 use crate::structures::simd::{batch_f32_to_f16, batch_f32_to_u8, f16_to_f32, u8_to_f32};
@@ -174,8 +174,8 @@ pub struct LazyFlatVectorData {
     pub quantization: DenseVectorQuantization,
     /// Zero-copy doc_id index: packed [u32_le doc_id + u16_le ordinal] × num_vectors
     doc_ids_bytes: OwnedBytes,
-    /// Lazy handle to this field's flat data region in the .vectors file
-    handle: LazyFileSlice,
+    /// File handle for this field's flat data region in the .vectors file
+    handle: FileHandle,
     /// Byte offset within handle where raw vector data starts (after header)
     vectors_offset: u64,
     /// Bytes per vector element (cached from quantization.element_size())
@@ -187,7 +187,7 @@ impl LazyFlatVectorData {
     ///
     /// Reads header (16 bytes) + doc_ids (~6 bytes/vector) into memory.
     /// Vector data stays lazy on disk.
-    pub async fn open(handle: LazyFileSlice) -> io::Result<Self> {
+    pub async fn open(handle: FileHandle) -> io::Result<Self> {
         // Read header: magic(4) + dim(4) + num_vectors(4) + quant_type(1) + pad(3) = 16 bytes
         let header = handle
             .read_bytes_range(0..FLAT_BINARY_HEADER_SIZE as u64)
@@ -391,8 +391,8 @@ impl LazyFlatVectorData {
         self.vectors_offset
     }
 
-    /// Access the underlying lazy file handle (for chunked byte-range reads in merger).
-    pub fn handle(&self) -> &LazyFileSlice {
+    /// Access the underlying file handle (for chunked byte-range reads in merger).
+    pub fn handle(&self) -> &FileHandle {
         &self.handle
     }
 

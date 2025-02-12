@@ -264,7 +264,7 @@ pub struct SparseVectorQuery {
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
     /// Approximate search factor (1.0 = exact, lower values = faster but approximate)
-    /// Controls WAND pruning aggressiveness in block-max scoring
+    /// Controls MaxScore pruning aggressiveness in block-max scoring
     pub heap_factor: f32,
 }
 

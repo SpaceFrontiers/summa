@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::{Directory, FileSlice, LazyFileHandle, OwnedBytes, RangeReadFn};
+use super::{Directory, FileHandle, OwnedBytes, RangeReadFn};
 
 /// File extension for slice cache files
 pub const SLICE_CACHE_EXTENSION: &str = "slicecache";
@@ -615,24 +615,24 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
         Ok(size)
     }
 
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle> {
         // Check if we have the full file cached (use our caching file_size)
         let file_size = self.file_size(path).await?;
         let full_range = 0..file_size;
 
         // Try cache first for full file
         if let Some(data) = self.try_cache_read(path, full_range.clone()) {
-            return Ok(FileSlice::new(OwnedBytes::new(data)));
+            return Ok(FileHandle::from_bytes(OwnedBytes::new(data)));
         }
 
         // Read from inner
-        let slice = self.inner.open_read(path).await?;
-        let bytes = slice.read_bytes().await?;
+        let handle = self.inner.open_read(path).await?;
+        let bytes = handle.read_bytes().await?;
 
         // Cache the full file
         self.cache_insert(path, full_range, bytes.as_slice().to_vec());
 
-        Ok(FileSlice::new(bytes))
+        Ok(FileHandle::from_bytes(bytes))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -654,7 +654,7 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
         self.inner.list_files(prefix).await
     }
 
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
         // Get file size (uses cache to avoid HEAD requests)
         let file_size = self.file_size(path).await?;
 
@@ -721,7 +721,7 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
             })
         });
 
-        Ok(LazyFileHandle::new(file_size, read_fn))
+        Ok(FileHandle::lazy(file_size, read_fn))
     }
 }
 

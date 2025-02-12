@@ -716,7 +716,7 @@ impl<'a> RoaringIterator<'a> {
 /// Block size for Roaring BlockMax (matches container size = 65536 doc_ids)
 pub const ROARING_BLOCK_SIZE: usize = 65536;
 
-/// Block metadata for BlockMax WAND optimization in Roaring
+/// Block metadata for block-max pruning optimization in Roaring
 #[derive(Debug, Clone)]
 pub struct RoaringBlockInfo {
     /// High 16 bits (container key)
@@ -770,7 +770,7 @@ pub struct RoaringPostingList {
     pub default_tf: u32,
     /// Maximum term frequency
     pub max_tf: u32,
-    /// Block metadata for BlockMax WAND (one per container)
+    /// Block metadata for block-max pruning (one per container)
     pub blocks: Vec<RoaringBlockInfo>,
     /// Global maximum score across all blocks
     pub max_score: f32,
@@ -1051,7 +1051,7 @@ impl<'a> RoaringPostingIterator<'a> {
         self.current_doc.is_none()
     }
 
-    /// Get current block's max score (for BlockMax WAND)
+    /// Get current block's max score (for block-max pruning)
     pub fn current_block_max_score(&self) -> f32 {
         if self.current_doc.is_none() || self.list.blocks.is_empty() {
             return 0.0;
@@ -1086,7 +1086,7 @@ impl<'a> RoaringPostingIterator<'a> {
             .fold(0.0f32, |a, b| a.max(b))
     }
 
-    /// Skip to next block containing doc >= target (for BlockWAND)
+    /// Skip to next block containing doc >= target (for block-max pruning)
     /// Returns (first_doc_in_block, block_max_score) or None if exhausted
     pub fn skip_to_block_with_doc(&mut self, target: u32) -> Option<(u32, f32)> {
         if self.list.blocks.is_empty() {

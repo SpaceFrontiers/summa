@@ -10,7 +10,7 @@ use super::super::types::SegmentFiles;
 use super::super::vector_data::LazyFlatVectorData;
 use super::{SparseIndex, VectorIndex};
 use crate::Result;
-use crate::directories::{AsyncFileRead, Directory, LazyFileHandle, LazyFileSlice};
+use crate::directories::{Directory, FileHandle};
 use crate::dsl::Schema;
 
 /// Vectors file loading result
@@ -110,7 +110,7 @@ pub async fn load_vectors_file<D: Directory>(
         match index_type {
             ann_build::FLAT_TYPE => {
                 // Flat binary — load lazily (only doc_ids in memory, vectors via mmap)
-                let slice = LazyFileSlice::from_handle_range(&handle, offset, length);
+                let slice = handle.slice(offset..offset + length);
                 match LazyFlatVectorData::open(slice).await {
                     Ok(lazy_flat) => {
                         flat_vectors.insert(field_id, lazy_flat);
@@ -325,7 +325,7 @@ pub async fn open_positions_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
     schema: &Schema,
-) -> Result<Option<LazyFileHandle>> {
+) -> Result<Option<FileHandle>> {
     // Skip loading positions file if schema has no fields with position tracking
     let has_positions = schema.fields().any(|(_, entry)| entry.positions.is_some());
     if !has_positions {

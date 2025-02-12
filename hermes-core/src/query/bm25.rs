@@ -1,7 +1,7 @@
 //! BM25/BM25F scoring constants and utilities
 //!
 //! Shared BM25 parameters used across full-text scoring implementations.
-//! All posting list formats and WAND executors should use these functions.
+//! All posting list formats and scoring executors should use these functions.
 
 /// BM25 k1 parameter - controls term frequency saturation
 /// Higher values give more weight to term frequency
@@ -40,7 +40,7 @@ pub fn bm25f_score(tf: f32, idf: f32, doc_len: f32, avg_doc_len: f32, field_boos
     idf * tf_norm
 }
 
-/// Compute BM25 upper bound score for WAND pruning
+/// Compute BM25 upper bound score for MaxScore pruning
 ///
 /// Uses conservative assumptions for maximum possible score:
 /// - Maximum TF from posting list
@@ -52,7 +52,7 @@ pub fn bm25_upper_bound(max_tf: f32, idf: f32) -> f32 {
     idf * tf_norm
 }
 
-/// Compute BM25F upper bound score for WAND pruning with field boost
+/// Compute BM25F upper bound score for MaxScore pruning with field boost
 ///
 /// Uses conservative assumptions for maximum possible score:
 /// - Maximum TF from posting list

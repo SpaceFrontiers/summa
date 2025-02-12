@@ -3,7 +3,7 @@
 //! Provides common traits and utilities for efficient top-k retrieval:
 //! - `ScoringIterator`: Common interface for posting list iteration with scoring
 //! - `TopKCollector`: Efficient min-heap for maintaining top-k results
-//! - `BlockMaxScoreExecutor`: Unified Block-Max MaxScore with conjunction optimization
+//! - `MaxScoreExecutor`: Unified Block-Max MaxScore with conjunction optimization
 //! - `BmpExecutor`: Block-at-a-time executor for learned sparse retrieval (12+ terms)
 //! - `SparseTermScorer`: ScoringIterator implementation for sparse vectors
 
@@ -18,7 +18,7 @@ use crate::structures::BlockSparsePostingList;
 
 /// Common interface for scoring iterators (text terms or sparse dimensions)
 ///
-/// Abstracts the common operations needed for WAND-style top-k retrieval.
+/// Abstracts the common operations needed for MaxScore top-k retrieval.
 pub trait ScoringIterator {
     /// Current document ID (u32::MAX if exhausted)
     fn doc(&self) -> DocId;
@@ -49,7 +49,7 @@ pub trait ScoringIterator {
     fn current_block_max_score(&self) -> f32;
 
     /// Skip to the next block, returning the first doc_id in the new block.
-    /// Used for block-max WAND optimization when current block can't beat threshold.
+    /// Used for block-max pruning when current block can't beat threshold.
     /// Default implementation just advances (no block-level skipping).
     fn skip_to_next_block(&mut self) -> DocId {
         self.advance()
@@ -201,7 +201,7 @@ impl ScoreCollector {
     }
 }
 
-/// Search result from WAND execution
+/// Search result from MaxScore execution
 #[derive(Debug, Clone, Copy)]
 pub struct ScoredDoc {
     pub doc_id: DocId,
@@ -221,9 +221,8 @@ pub struct ScoredDoc {
 ///    essential terms as threshold rises, skipping docs that lack enough terms
 ///
 /// Works with any type implementing `ScoringIterator` (text or sparse).
-/// Replaces separate WAND and MaxScore executors with better performance
-/// across all query lengths.
-pub struct BlockMaxScoreExecutor<S: ScoringIterator> {
+/// Unified executor with better performance across all query lengths.
+pub struct MaxScoreExecutor<S: ScoringIterator> {
     /// Scorers sorted by max_score ascending (non-essential first)
     scorers: Vec<S>,
     /// Cumulative max_score prefix sums: prefix_sums[i] = sum(max_score[0..=i])
@@ -236,10 +235,7 @@ pub struct BlockMaxScoreExecutor<S: ScoringIterator> {
     heap_factor: f32,
 }
 
-/// Backwards-compatible alias for `BlockMaxScoreExecutor`
-pub type WandExecutor<S> = BlockMaxScoreExecutor<S>;
-
-impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
+impl<S: ScoringIterator> MaxScoreExecutor<S> {
     /// Create a new executor with exact search (heap_factor = 1.0)
     pub fn new(scorers: Vec<S>, k: usize) -> Self {
         Self::with_heap_factor(scorers, k, 1.0)
@@ -268,7 +264,7 @@ impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
         }
 
         debug!(
-            "Creating BlockMaxScoreExecutor: num_scorers={}, k={}, total_upper={:.4}, heap_factor={:.2}",
+            "Creating MaxScoreExecutor: num_scorers={}, k={}, total_upper={:.4}, heap_factor={:.2}",
             scorers.len(),
             k,
             cumsum,
@@ -303,7 +299,7 @@ impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
     /// 6. Score non-essential scorers, group by ordinal, insert results
     pub fn execute(mut self) -> Vec<ScoredDoc> {
         if self.scorers.is_empty() {
-            debug!("BlockMaxScoreExecutor: no scorers, returning empty results");
+            debug!("MaxScoreExecutor: no scorers, returning empty results");
             return Vec::new();
         }
 
@@ -456,7 +452,7 @@ impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
             .collect();
 
         debug!(
-            "BlockMaxScoreExecutor completed: scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
+            "MaxScoreExecutor completed: scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
             docs_scored,
             docs_skipped,
             blocks_skipped,
@@ -469,7 +465,7 @@ impl<S: ScoringIterator> BlockMaxScoreExecutor<S> {
     }
 }
 
-/// Scorer for full-text terms using WAND optimization
+/// Scorer for full-text terms using MaxScore optimization
 ///
 /// Wraps a `BlockPostingList` with BM25 parameters to implement `ScoringIterator`.
 /// Enables MaxScore pruning for efficient top-k retrieval in OR queries.
@@ -540,7 +536,7 @@ impl ScoringIterator for TextTermScorer {
 
     #[inline]
     fn current_block_max_score(&self) -> f32 {
-        // Use per-block max_tf for tighter Block-Max WAND bounds
+        // Use per-block max_tf for tighter block-max bounds
         let block_max_tf = self.iter.current_block_max_tf() as f32;
         super::bm25_upper_bound(block_max_tf.max(1.0), self.idf)
     }
@@ -568,7 +564,7 @@ pub struct SparseTermScorer<'a> {
 impl<'a> SparseTermScorer<'a> {
     /// Create a new sparse term scorer
     ///
-    /// Note: Assumes positive weights for WAND upper bound calculation.
+    /// Note: Assumes positive weights for MaxScore upper bound calculation.
     /// For negative query weights, uses absolute value to ensure valid upper bound.
     pub fn new(posting_list: &'a BlockSparsePostingList, query_weight: f32) -> Self {
         // Upper bound must account for sign: |query_weight| * max_weight
@@ -659,27 +655,42 @@ pub struct BmpExecutor<'a> {
 /// Reduces heap operations by S× (e.g. 8× fewer push/pop for S=8).
 const BMP_SUPERBLOCK_SIZE: usize = 8;
 
-/// Entry in the BMP priority queue: represents a superblock (group of up to S blocks)
-struct BmpBlockEntry {
+/// Megablock size: group M superblocks into one outer priority queue entry.
+/// Two-level pruning: megablock-level (coarse) → superblock-level (fine).
+/// Reduces outer heap operations by M× compared to single-level superblocks.
+const BMP_MEGABLOCK_SIZE: usize = 16;
+
+/// Superblock entry (stored per-term, not in the heap directly)
+struct BmpSuperBlock {
     /// Upper bound contribution of this superblock (sum of constituent blocks)
     contribution: f32,
-    /// Index into query_terms
-    term_idx: usize,
     /// First block index in this superblock
     block_start: usize,
     /// Number of blocks in this superblock (1..=BMP_SUPERBLOCK_SIZE)
     block_count: usize,
 }
 
-impl PartialEq for BmpBlockEntry {
+/// Entry in the BMP outer priority queue: represents a megablock (group of superblocks)
+struct BmpMegaBlockEntry {
+    /// Upper bound contribution of this megablock (sum of constituent superblocks)
+    contribution: f32,
+    /// Index into query_terms
+    term_idx: usize,
+    /// First superblock index within term_superblocks[term_idx]
+    sb_start: usize,
+    /// Number of superblocks in this megablock (1..=BMP_MEGABLOCK_SIZE)
+    sb_count: usize,
+}
+
+impl PartialEq for BmpMegaBlockEntry {
     fn eq(&self, other: &Self) -> bool {
         self.contribution == other.contribution
     }
 }
 
-impl Eq for BmpBlockEntry {}
+impl Eq for BmpMegaBlockEntry {}
 
-impl Ord for BmpBlockEntry {
+impl Ord for BmpMegaBlockEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Max-heap: higher contributions come first
         self.contribution
@@ -688,7 +699,7 @@ impl Ord for BmpBlockEntry {
     }
 }
 
-impl PartialOrd for BmpBlockEntry {
+impl PartialOrd for BmpMegaBlockEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -730,22 +741,23 @@ impl<'a> BmpExecutor<'a> {
         let num_terms = self.query_terms.len();
         let si = self.sparse_index;
 
-        // Build priority queue from skip entries, grouped into superblocks
-        let mut block_queue: BinaryHeap<BmpBlockEntry> = BinaryHeap::new();
-        let mut remaining_max: Vec<f32> = Vec::with_capacity(num_terms);
-        // Pre-resolved skip_start per term (avoids repeated dim_id binary search)
+        // Two-level queue construction:
+        // 1. Build superblocks per term (flat Vecs)
+        // 2. Group superblocks into megablocks, push to outer BinaryHeap
+        let mut term_superblocks: Vec<Vec<BmpSuperBlock>> = Vec::with_capacity(num_terms);
         let mut term_skip_starts: Vec<usize> = Vec::with_capacity(num_terms);
         let mut global_min_doc = u32::MAX;
         let mut global_max_doc = 0u32;
+        let mut total_remaining = 0.0f32;
 
-        for (term_idx, &(dim_id, qw)) in self.query_terms.iter().enumerate() {
-            let mut term_remaining = 0.0f32;
+        for &(dim_id, qw) in &self.query_terms {
             let mut term_skip_start = 0usize;
+            let mut superblocks = Vec::new();
 
             let abs_qw = qw.abs();
             if let Some((skip_start, skip_count, _global_max)) = si.get_skip_range(dim_id) {
                 term_skip_start = skip_start;
-                // Group blocks into superblocks of BMP_SUPERBLOCK_SIZE
+                // Step 1: Build superblock entries
                 let mut sb_start = 0;
                 while sb_start < skip_count {
                     let sb_count = (skip_count - sb_start).min(BMP_SUPERBLOCK_SIZE);
@@ -756,18 +768,37 @@ impl<'a> BmpExecutor<'a> {
                         global_min_doc = global_min_doc.min(skip.first_doc);
                         global_max_doc = global_max_doc.max(skip.last_doc);
                     }
-                    term_remaining += sb_contribution;
-                    block_queue.push(BmpBlockEntry {
+                    total_remaining += sb_contribution;
+                    superblocks.push(BmpSuperBlock {
                         contribution: sb_contribution,
-                        term_idx,
                         block_start: sb_start,
                         block_count: sb_count,
                     });
                     sb_start += sb_count;
                 }
             }
-            remaining_max.push(term_remaining);
             term_skip_starts.push(term_skip_start);
+            term_superblocks.push(superblocks);
+        }
+
+        // Step 2: Group superblocks into megablocks and build outer priority queue
+        let mut mega_queue: BinaryHeap<BmpMegaBlockEntry> = BinaryHeap::new();
+        for (term_idx, superblocks) in term_superblocks.iter().enumerate() {
+            let mut mb_start = 0;
+            while mb_start < superblocks.len() {
+                let mb_count = (superblocks.len() - mb_start).min(BMP_MEGABLOCK_SIZE);
+                let mb_contribution: f32 = superblocks[mb_start..mb_start + mb_count]
+                    .iter()
+                    .map(|sb| sb.contribution)
+                    .sum();
+                mega_queue.push(BmpMegaBlockEntry {
+                    contribution: mb_contribution,
+                    term_idx,
+                    sb_start: mb_start,
+                    sb_count: mb_count,
+                });
+                mb_start += mb_count;
+            }
         }
 
         // Hybrid accumulator: flat array for ordinal=0, FxHashMap for multi-ordinal
@@ -792,7 +823,6 @@ impl<'a> BmpExecutor<'a> {
         // FxHashMap fallback for multi-ordinal entries or when flat array is too large
         let mut multi_ord_accumulators: FxHashMap<u64, f32> = FxHashMap::default();
 
-        let mut total_remaining: f32 = remaining_max.iter().sum();
         let mut blocks_processed = 0u64;
         let mut blocks_skipped = 0u64;
 
@@ -800,99 +830,146 @@ impl<'a> BmpExecutor<'a> {
         let mut top_k = ScoreCollector::new(self.k);
 
         // Reusable decode buffers
-        let mut doc_ids_buf: Vec<u32> = Vec::with_capacity(128);
-        let mut weights_buf: Vec<f32> = Vec::with_capacity(128);
-        let mut ordinals_buf: Vec<u16> = Vec::with_capacity(128);
+        let mut doc_ids_buf: Vec<u32> = Vec::with_capacity(256);
+        let mut weights_buf: Vec<f32> = Vec::with_capacity(256);
+        let mut ordinals_buf: Vec<u16> = Vec::with_capacity(256);
 
-        // Process blocks in contribution-descending order, loading each on-demand
-        while let Some(entry) = block_queue.pop() {
-            remaining_max[entry.term_idx] -= entry.contribution;
-            total_remaining -= entry.contribution;
+        // Warm-start: ensure at least one megablock per term is processed before
+        // enabling early termination. This diversifies initial scores across terms,
+        // giving the top-k heap a better starting threshold for pruning.
+        let mut terms_warmed = vec![false; num_terms];
+        let mut warmup_remaining = self.k.min(num_terms);
 
-            let adjusted_threshold = top_k.threshold() * self.heap_factor;
-            if top_k.len() >= self.k && total_remaining <= adjusted_threshold {
-                blocks_skipped += block_queue.len() as u64;
-                debug!(
-                    "BMP early termination after {} blocks: remaining={:.4} <= threshold={:.4}",
-                    blocks_processed, total_remaining, adjusted_threshold
-                );
-                break;
+        // Two-level processing: outer loop pops megablocks, inner loop iterates superblocks
+        while let Some(mega) = mega_queue.pop() {
+            total_remaining -= mega.contribution;
+
+            // Track warm-start progress: count unique terms seen
+            if !terms_warmed[mega.term_idx] {
+                terms_warmed[mega.term_idx] = true;
+                warmup_remaining = warmup_remaining.saturating_sub(1);
             }
 
-            // Coalesced superblock loading: single mmap read for all blocks in superblock
-            let dim_id = self.query_terms[entry.term_idx].0;
-            let qw = self.query_terms[entry.term_idx].1;
+            // Megablock-level early termination (coarse)
+            if warmup_remaining == 0 {
+                let adjusted_threshold = top_k.threshold() * self.heap_factor;
+                if top_k.len() >= self.k && total_remaining <= adjusted_threshold {
+                    // Count remaining blocks across all unprocessed megablocks
+                    let remaining_blocks: u64 = mega_queue
+                        .iter()
+                        .map(|m| {
+                            let sbs =
+                                &term_superblocks[m.term_idx][m.sb_start..m.sb_start + m.sb_count];
+                            sbs.iter().map(|sb| sb.block_count as u64).sum::<u64>()
+                        })
+                        .sum();
+                    blocks_skipped += remaining_blocks;
+                    debug!(
+                        "BMP early termination after {} blocks: remaining={:.4} <= threshold={:.4}",
+                        blocks_processed, total_remaining, adjusted_threshold
+                    );
+                    break;
+                }
+            }
+
+            let dim_id = self.query_terms[mega.term_idx].0;
+            let qw = self.query_terms[mega.term_idx].1;
             let abs_qw = qw.abs();
+            let skip_start = term_skip_starts[mega.term_idx];
 
-            let sb_blocks = si
-                .get_blocks_range(dim_id, entry.block_start, entry.block_count)
-                .await?;
-
-            let skip_start = term_skip_starts[entry.term_idx];
-            let adjusted_threshold2 = top_k.threshold() * self.heap_factor;
-
-            for (blk_offset, block) in sb_blocks.into_iter().enumerate() {
-                let blk_idx = entry.block_start + blk_offset;
-
-                // Per-block pruning within superblock
+            // Inner loop: iterate superblocks within this megablock
+            for sb in term_superblocks[mega.term_idx]
+                .iter()
+                .skip(mega.sb_start)
+                .take(mega.sb_count)
+            {
+                // Superblock-level pruning (fine-grained)
                 if top_k.len() >= self.k {
-                    let skip = si.read_skip_entry(skip_start + blk_idx);
-                    let blk_contrib = abs_qw * skip.max_weight;
-                    if blk_contrib + total_remaining <= adjusted_threshold2 {
-                        blocks_skipped += 1;
+                    let adjusted_threshold = top_k.threshold() * self.heap_factor;
+                    if sb.contribution + total_remaining <= adjusted_threshold {
+                        blocks_skipped += sb.block_count as u64;
                         continue;
                     }
                 }
 
-                block.decode_doc_ids_into(&mut doc_ids_buf);
-                block.decode_scored_weights_into(qw, &mut weights_buf);
-                let count = block.header.count as usize;
+                // Coalesced superblock loading: single mmap read for all blocks
+                let sb_blocks = si
+                    .get_blocks_range(dim_id, sb.block_start, sb.block_count)
+                    .await?;
 
-                // Fast path: skip ordinals decode when all ordinals are 0
-                // (ordinal_bits == 0 in header). This is the common single-value case.
-                if block.header.ordinal_bits == 0 && use_flat {
-                    for i in 0..count {
-                        let doc_id = doc_ids_buf[i];
-                        let off = (doc_id - global_min_doc) as usize;
-                        if flat_scores[off] == 0.0 {
-                            dirty.push(doc_id);
+                let adjusted_threshold2 = top_k.threshold() * self.heap_factor;
+
+                // Track dirty start for deferred top_k insertion at superblock boundary
+                let dirty_start = dirty.len();
+
+                for (blk_offset, block) in sb_blocks.into_iter().enumerate() {
+                    let blk_idx = sb.block_start + blk_offset;
+
+                    // Per-block pruning within superblock
+                    if top_k.len() >= self.k {
+                        let skip = si.read_skip_entry(skip_start + blk_idx);
+                        let blk_contrib = abs_qw * skip.max_weight;
+                        if blk_contrib + total_remaining <= adjusted_threshold2 {
+                            blocks_skipped += 1;
+                            continue;
                         }
-                        flat_scores[off] += weights_buf[i];
-                        top_k.insert_with_ordinal(doc_id, flat_scores[off], 0);
                     }
-                } else {
-                    block.decode_ordinals_into(&mut ordinals_buf);
-                    if use_flat {
-                        for i in 0..count {
-                            let doc_id = doc_ids_buf[i];
-                            let ordinal = ordinals_buf[i];
-                            let score_contribution = weights_buf[i];
 
-                            if ordinal == 0 {
-                                let off = (doc_id - global_min_doc) as usize;
-                                if flat_scores[off] == 0.0 {
-                                    dirty.push(doc_id);
+                    block.decode_doc_ids_into(&mut doc_ids_buf);
+
+                    // Fast path: ordinal=0 + flat accumulator → fused decode+scatter
+                    if block.header.ordinal_bits == 0 && use_flat {
+                        block.accumulate_scored_weights(
+                            qw,
+                            &doc_ids_buf,
+                            &mut flat_scores,
+                            global_min_doc,
+                            &mut dirty,
+                        );
+                    } else {
+                        block.decode_scored_weights_into(qw, &mut weights_buf);
+                        let count = block.header.count as usize;
+
+                        block.decode_ordinals_into(&mut ordinals_buf);
+                        if use_flat {
+                            for i in 0..count {
+                                let doc_id = doc_ids_buf[i];
+                                let ordinal = ordinals_buf[i];
+                                let score_contribution = weights_buf[i];
+
+                                if ordinal == 0 {
+                                    let off = (doc_id - global_min_doc) as usize;
+                                    if flat_scores[off] == 0.0 {
+                                        dirty.push(doc_id);
+                                    }
+                                    flat_scores[off] += score_contribution;
+                                } else {
+                                    let key = (doc_id as u64) << 16 | ordinal as u64;
+                                    let acc = multi_ord_accumulators.entry(key).or_insert(0.0);
+                                    *acc += score_contribution;
+                                    top_k.insert_with_ordinal(doc_id, *acc, ordinal);
                                 }
-                                flat_scores[off] += score_contribution;
-                                top_k.insert_with_ordinal(doc_id, flat_scores[off], 0);
-                            } else {
-                                let key = (doc_id as u64) << 16 | ordinal as u64;
+                            }
+                        } else {
+                            for i in 0..count {
+                                let key = (doc_ids_buf[i] as u64) << 16 | ordinals_buf[i] as u64;
                                 let acc = multi_ord_accumulators.entry(key).or_insert(0.0);
-                                *acc += score_contribution;
-                                top_k.insert_with_ordinal(doc_id, *acc, ordinal);
+                                *acc += weights_buf[i];
+                                top_k.insert_with_ordinal(doc_ids_buf[i], *acc, ordinals_buf[i]);
                             }
                         }
-                    } else {
-                        for i in 0..count {
-                            let key = (doc_ids_buf[i] as u64) << 16 | ordinals_buf[i] as u64;
-                            let acc = multi_ord_accumulators.entry(key).or_insert(0.0);
-                            *acc += weights_buf[i];
-                            top_k.insert_with_ordinal(doc_ids_buf[i], *acc, ordinals_buf[i]);
-                        }
                     }
+
+                    blocks_processed += 1;
                 }
 
-                blocks_processed += 1;
+                // Deferred top_k insertion at superblock boundary:
+                // Scan only newly-dirty entries (first-touch docs from this superblock).
+                // Eliminates ~90% of per-posting heap operations.
+                for &doc_id in &dirty[dirty_start..] {
+                    let off = (doc_id - global_min_doc) as usize;
+                    top_k.insert_with_ordinal(doc_id, flat_scores[off], 0);
+                }
             }
         }
 
@@ -958,7 +1035,7 @@ impl<'a> BmpExecutor<'a> {
 /// skipped entirely — lazy loading avoids the I/O and decode cost for those
 /// blocks. This hybrid achieves BMP's memory efficiency with BlockMaxScore's
 /// superior pruning for few-term queries.
-pub struct LazyBlockMaxScoreExecutor<'a> {
+pub struct SparseMaxScoreExecutor<'a> {
     sparse_index: &'a crate::segment::SparseIndex,
     cursors: Vec<LazyTermCursor>,
     prefix_sums: Vec<f32>,
@@ -1009,33 +1086,36 @@ impl LazyTermCursor {
             skip_count,
             block_data_offset,
             block_idx: 0,
-            doc_ids: Vec::with_capacity(128),
-            ordinals: Vec::with_capacity(128),
-            weights: Vec::with_capacity(128),
+            doc_ids: Vec::with_capacity(256),
+            ordinals: Vec::with_capacity(256),
+            weights: Vec::with_capacity(256),
             pos: 0,
             block_loaded: false,
             exhausted,
         }
     }
 
-    /// Ensure current block is loaded and decoded
-    async fn ensure_block_loaded(
+    // --- Shared non-I/O helpers ---
+
+    /// Decode a loaded block into the cursor's buffers
+    #[inline]
+    fn decode_block(&mut self, block: crate::structures::SparseBlock) {
+        block.decode_doc_ids_into(&mut self.doc_ids);
+        block.decode_ordinals_into(&mut self.ordinals);
+        block.decode_scored_weights_into(self.query_weight, &mut self.weights);
+        self.pos = 0;
+        self.block_loaded = true;
+    }
+
+    /// Handle a loaded block result (Some/None). Returns Ok(true) if block was loaded.
+    #[inline]
+    fn handle_block_result(
         &mut self,
-        sparse_index: &crate::segment::SparseIndex,
+        block: Option<crate::structures::SparseBlock>,
     ) -> crate::Result<bool> {
-        if self.exhausted || self.block_loaded {
-            return Ok(!self.exhausted);
-        }
-        match sparse_index
-            .load_block_direct(self.skip_start, self.block_data_offset, self.block_idx)
-            .await?
-        {
-            Some(block) => {
-                block.decode_doc_ids_into(&mut self.doc_ids);
-                block.decode_ordinals_into(&mut self.ordinals);
-                block.decode_scored_weights_into(self.query_weight, &mut self.weights);
-                self.pos = 0;
-                self.block_loaded = true;
+        match block {
+            Some(b) => {
+                self.decode_block(b);
                 Ok(true)
             }
             None => {
@@ -1045,14 +1125,189 @@ impl LazyTermCursor {
         }
     }
 
+    /// Advance position within current block, moving to next block if needed.
+    /// Does NOT load the next block (lazy). Returns current doc.
+    #[inline]
+    fn advance_pos(&mut self) -> DocId {
+        self.pos += 1;
+        if self.pos >= self.doc_ids.len() {
+            self.block_idx += 1;
+            self.block_loaded = false;
+            if self.block_idx >= self.skip_count {
+                self.exhausted = true;
+                return u32::MAX;
+            }
+        }
+        self.doc()
+    }
+
+    /// Seek preparation: handle in-block seek and binary search on skip entries.
+    /// Returns `Ok(Some(doc))` if seek resolved without needing a block load,
+    /// or `Ok(None)` if a block load is needed (block_idx updated, block_loaded = false).
+    fn seek_prepare(
+        &mut self,
+        si: &crate::segment::SparseIndex,
+        target: DocId,
+    ) -> crate::Result<Option<DocId>> {
+        if self.exhausted {
+            return Ok(Some(u32::MAX));
+        }
+
+        // If block is loaded and target is within current block range
+        if self.block_loaded
+            && let Some(&last) = self.doc_ids.last()
+        {
+            if last >= target && self.doc_ids[self.pos] < target {
+                let remaining = &self.doc_ids[self.pos..];
+                let offset = crate::structures::simd::find_first_ge_u32(remaining, target);
+                self.pos += offset;
+                if self.pos >= self.doc_ids.len() {
+                    self.block_idx += 1;
+                    self.block_loaded = false;
+                    if self.block_idx >= self.skip_count {
+                        self.exhausted = true;
+                        return Ok(Some(u32::MAX));
+                    }
+                }
+                return Ok(Some(self.doc()));
+            }
+            if self.doc_ids[self.pos] >= target {
+                return Ok(Some(self.doc()));
+            }
+        }
+
+        // Binary search on skip entries: find first block where last_doc >= target.
+        let mut lo = self.block_idx;
+        let mut hi = self.skip_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if si.read_skip_entry(self.skip_start + mid).last_doc < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= self.skip_count {
+            self.exhausted = true;
+            return Ok(Some(u32::MAX));
+        }
+        if lo != self.block_idx || !self.block_loaded {
+            self.block_idx = lo;
+            self.block_loaded = false;
+        }
+        // Need a block load — caller handles sync/async
+        Ok(None)
+    }
+
+    /// Finish seek after block load: position within the loaded block.
+    /// Returns `true` if a second block load is needed.
+    #[inline]
+    fn seek_finish(&mut self, target: DocId) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        self.pos = crate::structures::simd::find_first_ge_u32(&self.doc_ids, target);
+        if self.pos >= self.doc_ids.len() {
+            self.block_idx += 1;
+            self.block_loaded = false;
+            if self.block_idx >= self.skip_count {
+                self.exhausted = true;
+                return false;
+            }
+            return true; // need second block load
+        }
+        false
+    }
+
+    // --- Async methods (delegate to shared helpers) ---
+
+    async fn ensure_block_loaded(
+        &mut self,
+        si: &crate::segment::SparseIndex,
+    ) -> crate::Result<bool> {
+        if self.exhausted || self.block_loaded {
+            return Ok(!self.exhausted);
+        }
+        let block = si
+            .load_block_direct(self.skip_start, self.block_data_offset, self.block_idx)
+            .await?;
+        self.handle_block_result(block)
+    }
+
+    async fn advance(&mut self, si: &crate::segment::SparseIndex) -> crate::Result<DocId> {
+        if self.exhausted {
+            return Ok(u32::MAX);
+        }
+        self.ensure_block_loaded(si).await?;
+        if self.exhausted {
+            return Ok(u32::MAX);
+        }
+        Ok(self.advance_pos())
+    }
+
+    async fn seek(
+        &mut self,
+        si: &crate::segment::SparseIndex,
+        target: DocId,
+    ) -> crate::Result<DocId> {
+        if let Some(doc) = self.seek_prepare(si, target)? {
+            return Ok(doc);
+        }
+        self.ensure_block_loaded(si).await?;
+        if self.seek_finish(target) {
+            self.ensure_block_loaded(si).await?;
+        }
+        Ok(self.doc())
+    }
+
+    // --- Sync methods (delegate to same shared helpers) ---
+
+    fn ensure_block_loaded_sync(
+        &mut self,
+        si: &crate::segment::SparseIndex,
+    ) -> crate::Result<bool> {
+        if self.exhausted || self.block_loaded {
+            return Ok(!self.exhausted);
+        }
+        let block =
+            si.load_block_direct_sync(self.skip_start, self.block_data_offset, self.block_idx)?;
+        self.handle_block_result(block)
+    }
+
+    fn advance_sync(&mut self, si: &crate::segment::SparseIndex) -> crate::Result<DocId> {
+        if self.exhausted {
+            return Ok(u32::MAX);
+        }
+        self.ensure_block_loaded_sync(si)?;
+        if self.exhausted {
+            return Ok(u32::MAX);
+        }
+        Ok(self.advance_pos())
+    }
+
+    fn seek_sync(
+        &mut self,
+        si: &crate::segment::SparseIndex,
+        target: DocId,
+    ) -> crate::Result<DocId> {
+        if let Some(doc) = self.seek_prepare(si, target)? {
+            return Ok(doc);
+        }
+        self.ensure_block_loaded_sync(si)?;
+        if self.seek_finish(target) {
+            self.ensure_block_loaded_sync(si)?;
+        }
+        Ok(self.doc())
+    }
+
+    // --- Read-only accessors (shared) ---
+
     #[inline]
     fn doc_with_si(&self, si: &crate::segment::SparseIndex) -> DocId {
         if self.exhausted {
             return u32::MAX;
         }
         if !self.block_loaded {
-            // Block not yet loaded — return first_doc of current skip entry
-            // as a lower bound (actual doc may be higher after decode)
             return si
                 .read_skip_entry(self.skip_start + self.block_idx)
                 .first_doc;
@@ -1068,7 +1323,6 @@ impl LazyTermCursor {
         if self.block_loaded {
             return self.doc_ids.get(self.pos).copied().unwrap_or(u32::MAX);
         }
-        // Fallback: should only be called when block is loaded
         u32::MAX
     }
 
@@ -1098,102 +1352,6 @@ impl LazyTermCursor {
                 .max_weight
     }
 
-    /// Advance to next posting within current block, or move to next block
-    async fn advance(
-        &mut self,
-        sparse_index: &crate::segment::SparseIndex,
-    ) -> crate::Result<DocId> {
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        self.ensure_block_loaded(sparse_index).await?;
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        self.pos += 1;
-        if self.pos >= self.doc_ids.len() {
-            self.block_idx += 1;
-            self.block_loaded = false;
-            if self.block_idx >= self.skip_count {
-                self.exhausted = true;
-                return Ok(u32::MAX);
-            }
-            // Don't load next block yet — lazy
-        }
-        Ok(self.doc())
-    }
-
-    /// Seek to first doc >= target using skip entries for block navigation
-    async fn seek(
-        &mut self,
-        sparse_index: &crate::segment::SparseIndex,
-        target: DocId,
-    ) -> crate::Result<DocId> {
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-
-        // If block is loaded and target is within current block range
-        if self.block_loaded
-            && let Some(&last) = self.doc_ids.last()
-        {
-            if last >= target && self.doc_ids[self.pos] < target {
-                // Binary search within current block
-                let remaining = &self.doc_ids[self.pos..];
-                let offset = crate::structures::simd::find_first_ge_u32(remaining, target);
-                self.pos += offset;
-                if self.pos >= self.doc_ids.len() {
-                    self.block_idx += 1;
-                    self.block_loaded = false;
-                    if self.block_idx >= self.skip_count {
-                        self.exhausted = true;
-                        return Ok(u32::MAX);
-                    }
-                }
-                return Ok(self.doc());
-            }
-            if self.doc_ids[self.pos] >= target {
-                return Ok(self.doc());
-            }
-        }
-
-        // Binary search on skip entries: find first block where last_doc >= target.
-        // Start from block_idx (earlier blocks already exhausted).
-        let mut lo = self.block_idx;
-        let mut hi = self.skip_count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if sparse_index.read_skip_entry(self.skip_start + mid).last_doc < target {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo >= self.skip_count {
-            self.exhausted = true;
-            return Ok(u32::MAX);
-        }
-        if lo != self.block_idx || !self.block_loaded {
-            self.block_idx = lo;
-            self.block_loaded = false;
-        }
-        self.ensure_block_loaded(sparse_index).await?;
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        self.pos = crate::structures::simd::find_first_ge_u32(&self.doc_ids, target);
-        if self.pos >= self.doc_ids.len() {
-            self.block_idx += 1;
-            self.block_loaded = false;
-            if self.block_idx >= self.skip_count {
-                self.exhausted = true;
-                return Ok(u32::MAX);
-            }
-            self.ensure_block_loaded(sparse_index).await?;
-        }
-        Ok(self.doc())
-    }
-
     /// Skip to next block without loading it (for block-max pruning)
     fn skip_to_next_block(&mut self, si: &crate::segment::SparseIndex) -> DocId {
         if self.exhausted {
@@ -1205,13 +1363,185 @@ impl LazyTermCursor {
             self.exhausted = true;
             return u32::MAX;
         }
-        // Return first_doc of next block as lower bound
         si.read_skip_entry(self.skip_start + self.block_idx)
             .first_doc
     }
 }
 
-impl<'a> LazyBlockMaxScoreExecutor<'a> {
+/// Macro to stamp out the Block-Max MaxScore loop for both async and sync paths.
+///
+/// `$ensure`, `$advance`, `$seek` are cursor method idents (async or _sync variants).
+/// `$($aw:tt)*` captures `.await` for async or nothing for sync.
+macro_rules! bms_execute_loop {
+    ($self:ident, $ensure:ident, $advance:ident, $seek:ident, $($aw:tt)*) => {{
+        let n = $self.cursors.len();
+        let si = $self.sparse_index;
+
+        // Load first block for each cursor (ensures doc() returns real values)
+        for cursor in &mut $self.cursors {
+            cursor.$ensure(si) $($aw)* ?;
+        }
+
+        let mut docs_scored = 0u64;
+        let mut docs_skipped = 0u64;
+        let mut blocks_skipped = 0u64;
+        let mut blocks_loaded = 0u64;
+        let mut conjunction_skipped = 0u64;
+        let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
+
+        loop {
+            let partition = $self.find_partition();
+            if partition >= n {
+                break;
+            }
+
+            // Find minimum doc_id across essential cursors
+            let mut min_doc = u32::MAX;
+            for i in partition..n {
+                let doc = $self.cursors[i].doc_with_si(si);
+                if doc < min_doc {
+                    min_doc = doc;
+                }
+            }
+            if min_doc == u32::MAX {
+                break;
+            }
+
+            let non_essential_upper = if partition > 0 {
+                $self.prefix_sums[partition - 1]
+            } else {
+                0.0
+            };
+            let adjusted_threshold = $self.collector.threshold() * $self.heap_factor;
+
+            // --- Conjunction optimization ---
+            if $self.collector.len() >= $self.collector.k {
+                let present_upper: f32 = (partition..n)
+                    .filter(|&i| $self.cursors[i].doc_with_si(si) == min_doc)
+                    .map(|i| $self.cursors[i].max_score)
+                    .sum();
+
+                if present_upper + non_essential_upper <= adjusted_threshold {
+                    for i in partition..n {
+                        if $self.cursors[i].doc_with_si(si) == min_doc {
+                            $self.cursors[i].$ensure(si) $($aw)* ?;
+                            $self.cursors[i].$advance(si) $($aw)* ?;
+                            blocks_loaded += u64::from($self.cursors[i].block_loaded);
+                        }
+                    }
+                    conjunction_skipped += 1;
+                    continue;
+                }
+            }
+
+            // --- Block-max pruning ---
+            if $self.collector.len() >= $self.collector.k {
+                let block_max_sum: f32 = (partition..n)
+                    .filter(|&i| $self.cursors[i].doc_with_si(si) == min_doc)
+                    .map(|i| $self.cursors[i].current_block_max_score(si))
+                    .sum();
+
+                if block_max_sum + non_essential_upper <= adjusted_threshold {
+                    for i in partition..n {
+                        if $self.cursors[i].doc_with_si(si) == min_doc {
+                            $self.cursors[i].skip_to_next_block(si);
+                            $self.cursors[i].$ensure(si) $($aw)* ?;
+                            blocks_loaded += 1;
+                        }
+                    }
+                    blocks_skipped += 1;
+                    continue;
+                }
+            }
+
+            // --- Score essential cursors ---
+            ordinal_scores.clear();
+            for i in partition..n {
+                if $self.cursors[i].doc_with_si(si) == min_doc {
+                    $self.cursors[i].$ensure(si) $($aw)* ?;
+                    while $self.cursors[i].doc_with_si(si) == min_doc {
+                        ordinal_scores.push(($self.cursors[i].ordinal(), $self.cursors[i].score()));
+                        $self.cursors[i].$advance(si) $($aw)* ?;
+                    }
+                }
+            }
+
+            let essential_total: f32 = ordinal_scores.iter().map(|(_, s)| *s).sum();
+            if $self.collector.len() >= $self.collector.k
+                && essential_total + non_essential_upper <= adjusted_threshold
+            {
+                docs_skipped += 1;
+                continue;
+            }
+
+            // --- Score non-essential cursors (highest max_score first for early exit) ---
+            let mut running_total = essential_total;
+            for i in (0..partition).rev() {
+                if $self.collector.len() >= $self.collector.k
+                    && running_total + $self.prefix_sums[i] <= adjusted_threshold
+                {
+                    break;
+                }
+
+                let doc = $self.cursors[i].$seek(si, min_doc) $($aw)* ?;
+                if doc == min_doc {
+                    while $self.cursors[i].doc_with_si(si) == min_doc {
+                        let s = $self.cursors[i].score();
+                        running_total += s;
+                        ordinal_scores.push(($self.cursors[i].ordinal(), s));
+                        $self.cursors[i].$advance(si) $($aw)* ?;
+                    }
+                }
+            }
+
+            // --- Group by ordinal and insert ---
+            ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
+            let mut j = 0;
+            while j < ordinal_scores.len() {
+                let current_ord = ordinal_scores[j].0;
+                let mut score = 0.0f32;
+                while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
+                    score += ordinal_scores[j].1;
+                    j += 1;
+                }
+                if $self
+                    .collector
+                    .insert_with_ordinal(min_doc, score, current_ord)
+                {
+                    docs_scored += 1;
+                } else {
+                    docs_skipped += 1;
+                }
+            }
+        }
+
+        let results: Vec<ScoredDoc> = $self
+            .collector
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| ScoredDoc {
+                doc_id,
+                score,
+                ordinal,
+            })
+            .collect();
+
+        debug!(
+            "SparseMaxScoreExecutor: scored={}, skipped={}, blocks_skipped={}, blocks_loaded={}, conjunction_skipped={}, returned={}, top_score={:.4}",
+            docs_scored,
+            docs_skipped,
+            blocks_skipped,
+            blocks_loaded,
+            conjunction_skipped,
+            results.len(),
+            results.first().map(|r| r.score).unwrap_or(0.0)
+        );
+
+        Ok(results)
+    }};
+}
+
+impl<'a> SparseMaxScoreExecutor<'a> {
     /// Create a new lazy executor
     ///
     /// `query_terms` should contain only dimensions present in the index.
@@ -1252,7 +1582,7 @@ impl<'a> LazyBlockMaxScoreExecutor<'a> {
         }
 
         debug!(
-            "Creating LazyBlockMaxScoreExecutor: num_terms={}, k={}, total_upper={:.4}, heap_factor={:.2}",
+            "Creating SparseMaxScoreExecutor: num_terms={}, k={}, total_upper={:.4}, heap_factor={:.2}",
             cursors.len(),
             k,
             cumsum,
@@ -1280,177 +1610,16 @@ impl<'a> LazyBlockMaxScoreExecutor<'a> {
         if self.cursors.is_empty() {
             return Ok(Vec::new());
         }
+        bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await)
+    }
 
-        let n = self.cursors.len();
-        let si = self.sparse_index;
-
-        // Load first block for each cursor (ensures doc() returns real values)
-        for cursor in &mut self.cursors {
-            cursor.ensure_block_loaded(si).await?;
+    /// Synchronous execution — only works when the sparse index has an Inline (mmap/RAM) handle.
+    /// Bypasses all async overhead for mmap-backed indexes.
+    pub fn execute_sync(mut self) -> crate::Result<Vec<ScoredDoc>> {
+        if self.cursors.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let mut docs_scored = 0u64;
-        let mut docs_skipped = 0u64;
-        let mut blocks_skipped = 0u64;
-        let mut blocks_loaded = 0u64;
-        let mut conjunction_skipped = 0u64;
-        let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
-
-        loop {
-            let partition = self.find_partition();
-            if partition >= n {
-                break;
-            }
-
-            // Find minimum doc_id across essential cursors
-            let mut min_doc = u32::MAX;
-            for i in partition..n {
-                let doc = self.cursors[i].doc_with_si(si);
-                if doc < min_doc {
-                    min_doc = doc;
-                }
-            }
-            if min_doc == u32::MAX {
-                break;
-            }
-
-            let non_essential_upper = if partition > 0 {
-                self.prefix_sums[partition - 1]
-            } else {
-                0.0
-            };
-            let adjusted_threshold = self.collector.threshold() * self.heap_factor;
-
-            // --- Conjunction optimization ---
-            if self.collector.len() >= self.collector.k {
-                let present_upper: f32 = (partition..n)
-                    .filter(|&i| self.cursors[i].doc_with_si(si) == min_doc)
-                    .map(|i| self.cursors[i].max_score)
-                    .sum();
-
-                if present_upper + non_essential_upper <= adjusted_threshold {
-                    for i in partition..n {
-                        if self.cursors[i].doc_with_si(si) == min_doc {
-                            self.cursors[i].ensure_block_loaded(si).await?;
-                            self.cursors[i].advance(si).await?;
-                            blocks_loaded += u64::from(self.cursors[i].block_loaded);
-                        }
-                    }
-                    conjunction_skipped += 1;
-                    continue;
-                }
-            }
-
-            // --- Block-max pruning ---
-            if self.collector.len() >= self.collector.k {
-                let block_max_sum: f32 = (partition..n)
-                    .filter(|&i| self.cursors[i].doc_with_si(si) == min_doc)
-                    .map(|i| self.cursors[i].current_block_max_score(si))
-                    .sum();
-
-                if block_max_sum + non_essential_upper <= adjusted_threshold {
-                    for i in partition..n {
-                        if self.cursors[i].doc_with_si(si) == min_doc {
-                            self.cursors[i].skip_to_next_block(si);
-                            // Ensure next block is loaded for doc() to return real value
-                            self.cursors[i].ensure_block_loaded(si).await?;
-                            blocks_loaded += 1;
-                        }
-                    }
-                    blocks_skipped += 1;
-                    continue;
-                }
-            }
-
-            // --- Score essential cursors ---
-            ordinal_scores.clear();
-            for i in partition..n {
-                if self.cursors[i].doc_with_si(si) == min_doc {
-                    self.cursors[i].ensure_block_loaded(si).await?;
-                    while self.cursors[i].doc_with_si(si) == min_doc {
-                        ordinal_scores.push((self.cursors[i].ordinal(), self.cursors[i].score()));
-                        self.cursors[i].advance(si).await?;
-                    }
-                }
-            }
-
-            let essential_total: f32 = ordinal_scores.iter().map(|(_, s)| *s).sum();
-            if self.collector.len() >= self.collector.k
-                && essential_total + non_essential_upper <= adjusted_threshold
-            {
-                docs_skipped += 1;
-                continue;
-            }
-
-            // --- Score non-essential cursors (highest max_score first for early exit) ---
-            // Cursors are sorted by max_score ascending, so iterate in reverse to
-            // score highest-impact cursors first and exit early when remaining
-            // non-essential upper bound can't change the outcome.
-            let mut running_total = essential_total;
-            for i in (0..partition).rev() {
-                // prefix_sums[i] = sum of max_scores for cursors 0..=i
-                // If running total + all remaining (including cursor i) can't beat threshold, stop
-                if self.collector.len() >= self.collector.k
-                    && running_total + self.prefix_sums[i] <= adjusted_threshold
-                {
-                    break;
-                }
-
-                let doc = self.cursors[i].seek(si, min_doc).await?;
-                if doc == min_doc {
-                    while self.cursors[i].doc_with_si(si) == min_doc {
-                        let s = self.cursors[i].score();
-                        running_total += s;
-                        ordinal_scores.push((self.cursors[i].ordinal(), s));
-                        self.cursors[i].advance(si).await?;
-                    }
-                }
-            }
-
-            // --- Group by ordinal and insert ---
-            ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
-            let mut j = 0;
-            while j < ordinal_scores.len() {
-                let current_ord = ordinal_scores[j].0;
-                let mut score = 0.0f32;
-                while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
-                    score += ordinal_scores[j].1;
-                    j += 1;
-                }
-                if self
-                    .collector
-                    .insert_with_ordinal(min_doc, score, current_ord)
-                {
-                    docs_scored += 1;
-                } else {
-                    docs_skipped += 1;
-                }
-            }
-        }
-
-        let results: Vec<ScoredDoc> = self
-            .collector
-            .into_sorted_results()
-            .into_iter()
-            .map(|(doc_id, score, ordinal)| ScoredDoc {
-                doc_id,
-                score,
-                ordinal,
-            })
-            .collect();
-
-        debug!(
-            "LazyBlockMaxScoreExecutor completed: scored={}, skipped={}, blocks_skipped={}, blocks_loaded={}, conjunction_skipped={}, returned={}, top_score={:.4}",
-            docs_scored,
-            docs_skipped,
-            blocks_skipped,
-            blocks_loaded,
-            conjunction_skipped,
-            results.len(),
-            results.first().map(|r| r.score).unwrap_or(0.0)
-        );
-
-        Ok(results)
+        bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
     }
 }
 

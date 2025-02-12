@@ -11,8 +11,7 @@ use async_trait::async_trait;
 use memmap2::Mmap;
 
 use super::{
-    Directory, DirectoryWriter, FileSlice, FileStreamingWriter, LazyFileHandle, OwnedBytes,
-    RangeReadFn, StreamingWriter,
+    Directory, DirectoryWriter, FileHandle, FileStreamingWriter, OwnedBytes, StreamingWriter,
 };
 
 /// Memory-mapped directory for efficient access to large index files
@@ -74,10 +73,10 @@ impl Directory for MmapDirectory {
         Ok(metadata.len())
     }
 
-    async fn open_read(&self, path: &Path) -> io::Result<FileSlice> {
+    async fn open_read(&self, path: &Path) -> io::Result<FileHandle> {
         let mmap = self.mmap_file(path)?;
         // Zero-copy: OwnedBytes references the mmap directly
-        Ok(FileSlice::new(OwnedBytes::from_mmap(mmap)))
+        Ok(FileHandle::from_bytes(OwnedBytes::from_mmap(mmap)))
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
@@ -110,29 +109,10 @@ impl Directory for MmapDirectory {
         Ok(files)
     }
 
-    async fn open_lazy(&self, path: &Path) -> io::Result<LazyFileHandle> {
-        let mmap = self.mmap_file(path)?;
-        let file_size = mmap.len() as u64;
-
-        let read_fn: RangeReadFn = Arc::new(move |range: Range<u64>| {
-            let mmap = Arc::clone(&mmap);
-            Box::pin(async move {
-                let start = range.start as usize;
-                let end = range.end as usize;
-
-                if end > mmap.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Range {}..{} exceeds file size {}", start, end, mmap.len()),
-                    ));
-                }
-
-                // Zero-copy: slice references the mmap directly
-                Ok(OwnedBytes::from_mmap_range(mmap, start..end))
-            })
-        });
-
-        Ok(LazyFileHandle::new(file_size, read_fn))
+    async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
+        // Mmap data is always available synchronously — return Inline handle
+        // This eliminates the async callback overhead entirely for mmap paths
+        self.open_read(path).await
     }
 }
 
@@ -213,8 +193,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_mmap_directory_lazy_handle() {
-        use crate::directories::AsyncFileRead;
-
         let temp_dir = TempDir::new().unwrap();
         let dir = MmapDirectory::new(temp_dir.path());
 
@@ -222,16 +200,18 @@ mod tests {
         let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         dir.write(Path::new("large.bin"), &data).await.unwrap();
 
-        // Open lazy handle
+        // Open lazy handle — should be Inline (sync-capable) for mmap
         let handle = dir.open_lazy(Path::new("large.bin")).await.unwrap();
         assert_eq!(handle.len(), 1000);
+        assert!(handle.is_sync());
 
-        // Read ranges
+        // Async reads
         let range1 = handle.read_bytes_range(0..100).await.unwrap();
         assert_eq!(range1.len(), 100);
         assert_eq!(range1.as_slice(), &data[0..100]);
 
-        let range2 = handle.read_bytes_range(500..600).await.unwrap();
+        // Sync reads
+        let range2 = handle.read_bytes_range_sync(500..600).unwrap();
         assert_eq!(range2.as_slice(), &data[500..600]);
     }
 }

@@ -123,6 +123,7 @@ message Reranker {
   float combiner_temperature = 5;
   uint32 combiner_top_k = 6;
   float combiner_decay = 7;
+  uint32 matryoshka_dims = 8;          // Matryoshka pre-filter dims (0 = disabled)
 }
 
 // Search request/response

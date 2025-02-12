@@ -68,7 +68,7 @@ pub use sparse::{
     BlockSparsePostingIterator, BlockSparsePostingList, IndexSize, QueryWeighting,
     SPARSE_BLOCK_SIZE, SparseBlock, SparseEntry, SparsePosting, SparsePostingIterator,
     SparsePostingList, SparseQueryConfig, SparseSkipEntry, SparseSkipList, SparseVector,
-    SparseVectorConfig, WeightQuantization,
+    SparseVectorConfig, WeightQuantization, optimal_partition,
 };
 pub use vertical_bp128::{
     VERTICAL_BP128_BLOCK_SIZE, VerticalBP128Block, VerticalBP128Iterator, VerticalBP128PostingList,

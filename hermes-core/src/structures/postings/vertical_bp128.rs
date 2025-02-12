@@ -8,7 +8,7 @@
 //! - **Integrated delta decoding**: Fused unpack + prefix sum in single pass
 //! - **128-integer blocks**: 32 groups of 4 integers each
 //! - **NEON intrinsics on ARM**: Uses vld1q_u32, vaddq_u32, etc.
-//! - **Block-level metadata**: Skip info for BlockMax WAND
+//! - **Block-level metadata**: Skip info for block-max pruning
 
 use crate::structures::simd;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -785,7 +785,7 @@ pub struct VerticalBP128Block {
     pub num_docs: u16,
     /// Maximum term frequency in block
     pub max_tf: u32,
-    /// Maximum BM25 score upper bound for BlockMax WAND
+    /// Maximum BM25 score upper bound for block-max pruning
     pub max_block_score: f32,
 }
 
@@ -1225,7 +1225,7 @@ impl<'a> VerticalBP128Iterator<'a> {
         }
     }
 
-    /// Skip to next block containing doc >= target (for BlockWAND)
+    /// Skip to next block containing doc >= target (for block-max pruning)
     /// Returns (first_doc_in_block, block_max_score) or None if exhausted
     pub fn skip_to_block_with_doc(&mut self, target: u32) -> Option<(u32, f32)> {
         while self.current_block < self.list.blocks.len() {
