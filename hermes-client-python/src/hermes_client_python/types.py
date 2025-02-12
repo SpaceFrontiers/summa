@@ -1,7 +1,114 @@
-"""Type definitions for Hermes client."""
+"""Type definitions for Hermes client.
+
+All search-related types mirror the proto API structure exactly.
+Query is a dict with exactly one key matching the proto Query oneof variant.
+"""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, TypedDict
+
+# =============================================================================
+# Multi-value score combiner (mirrors proto MultiValueCombiner)
+# =============================================================================
+
+Combiner = Literal["log_sum_exp", "max", "avg", "sum", "weighted_top_k"]
+
+# =============================================================================
+# Query types (mirrors proto Query oneof)
+# =============================================================================
+
+
+class TermQuery(TypedDict):
+    field: str
+    term: str
+
+
+class MatchQuery(TypedDict):
+    field: str
+    text: str
+
+
+class BooleanQuery(TypedDict, total=False):
+    must: list["Query"]
+    should: list["Query"]
+    must_not: list["Query"]
+
+
+class BoostQuery(TypedDict):
+    query: "Query"
+    boost: float
+
+
+class AllQuery(TypedDict):
+    pass
+
+
+class SparseVectorQuery(TypedDict, total=False):
+    field: str  # required but total=False for optional fields
+    indices: list[int]
+    values: list[float]
+    text: str
+    combiner: Combiner
+    heap_factor: float
+    combiner_temperature: float
+    combiner_top_k: int
+    combiner_decay: float
+    weight_threshold: float
+    max_query_dims: int
+    pruning: float
+
+
+class DenseVectorQuery(TypedDict, total=False):
+    field: str  # required but total=False for optional fields
+    vector: list[float]
+    nprobe: int
+    rerank_factor: int
+    combiner: Combiner
+    combiner_temperature: float
+    combiner_top_k: int
+    combiner_decay: float
+
+
+# Query is a dict with exactly one key: "term", "match", "boolean",
+# "sparse_vector", "dense_vector", "boost", or "all".
+Query = dict[str, Any]
+
+# =============================================================================
+# Reranker (mirrors proto Reranker)
+# =============================================================================
+
+
+class Reranker(TypedDict, total=False):
+    field: str
+    vector: list[float]
+    limit: int
+    combiner: Combiner
+    combiner_temperature: float
+    combiner_top_k: int
+    combiner_decay: float
+    matryoshka_dims: int
+
+
+# =============================================================================
+# Filter (mirrors proto Filter)
+# =============================================================================
+
+
+class Filter(TypedDict, total=False):
+    field: str
+    eq_u64: int
+    eq_i64: int
+    eq_f64: float
+    eq_text: str
+    range: dict[str, float]  # {"min": ..., "max": ...}
+    in_values: dict[
+        str, list
+    ]  # {"text_values": [...], "u64_values": [...], "i64_values": [...]}
+
+
+# =============================================================================
+# Response types
+# =============================================================================
 
 
 @dataclass

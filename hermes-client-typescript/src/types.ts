@@ -1,3 +1,7 @@
+// =============================================================================
+// Response types
+// =============================================================================
+
 /** A document with field values. */
 export interface Document {
   fields: Record<string, any>;
@@ -35,7 +39,7 @@ export interface SearchResponse {
 /** Per-field vector statistics. */
 export interface VectorFieldStats {
   fieldName: string;
-  vectorType: string; // "dense" or "sparse"
+  vectorType: string;
   totalVectors: number;
   dimension: number;
 }
@@ -49,71 +53,130 @@ export interface IndexInfo {
   vectorStats: VectorFieldStats[];
 }
 
-/** Term query: (field, term) */
-export type TermQuery = [string, string];
+// =============================================================================
+// Multi-value score combiner (mirrors proto MultiValueCombiner)
+// =============================================================================
 
-/** Boolean query with must/should/mustNot clauses */
-export interface BooleanQueryDef {
-  must?: TermQuery[];
-  should?: TermQuery[];
-  mustNot?: TermQuery[];
-}
+export type Combiner = "log_sum_exp" | "max" | "avg" | "sum" | "weighted_top_k";
 
-/** Sparse vector query: (field, indices, values) */
-export type SparseVectorQueryDef = [string, number[], number[]];
+// =============================================================================
+// Query types (mirrors proto Query oneof)
+// =============================================================================
 
-/** Sparse text query: (field, text) */
-export type SparseTextQueryDef = [string, string];
-
-/** Dense vector query: (field, vector) */
-export type DenseVectorQueryDef = [string, number[]];
-
-/** Reranker: (field, queryVector, l1Limit) */
-export type RerankerDef = [string, number[], number];
-
-/** Score combiner for multi-value fields */
-export type Combiner = "sum" | "max" | "avg";
-
-/** Reranker combiner */
-export type RerankerCombiner =
-  | "log_sum_exp"
-  | "max"
-  | "avg"
-  | "sum"
-  | "weighted_top_k";
-
-/** Fast-field filter condition */
-export interface FilterDef {
+export interface TermQuery {
   field: string;
-  eq_u64?: number;
-  eq_i64?: number;
-  eq_f64?: number;
-  eq_text?: string;
-  range?: { min?: number; max?: number };
-  in_text?: string[];
-  in_u64?: number[];
-  in_i64?: number[];
+  term: string;
 }
 
-/** Search options */
-export interface SearchOptions {
-  term?: TermQuery;
-  boolean?: BooleanQueryDef;
-  sparseVector?: SparseVectorQueryDef;
-  sparseText?: SparseTextQueryDef;
-  denseVector?: DenseVectorQueryDef;
-  nprobe?: number;
-  rerankFactor?: number;
-  heapFactor?: number;
+export interface MatchQuery {
+  field: string;
+  text: string;
+}
+
+export interface BooleanQuery {
+  must?: Query[];
+  should?: Query[];
+  mustNot?: Query[];
+}
+
+export interface BoostQuery {
+  query: Query;
+  boost: number;
+}
+
+export interface AllQuery {}
+
+export interface SparseVectorQuery {
+  field: string;
+  /** Pre-computed token indices */
+  indices?: number[];
+  /** Pre-computed token values */
+  values?: number[];
+  /** Raw text (tokenized server-side if tokenizer configured) */
+  text?: string;
   combiner?: Combiner;
+  /** Approximate search factor (1.0 = exact, 0.8 = ~20% faster) */
+  heapFactor?: number;
+  /** Temperature for LogSumExp combiner (default: 1.5) */
+  combinerTemperature?: number;
+  /** K for WeightedTopK combiner (default: 5) */
+  combinerTopK?: number;
+  /** Decay for WeightedTopK combiner (default: 0.7) */
+  combinerDecay?: number;
+  /** Min abs(weight) for query dims (0 = no filtering) */
+  weightThreshold?: number;
+  /** Max query dimensions to process (0 = all) */
+  maxQueryDims?: number;
+  /** Fraction of query dims to keep (0-1, e.g. 0.1 = top 10%) */
+  pruning?: number;
+}
+
+export interface DenseVectorQuery {
+  field: string;
+  vector: number[];
+  /** Number of clusters to probe (for IVF indexes) */
+  nprobe?: number;
+  /** Re-ranking factor (multiplied by k) */
+  rerankFactor?: number;
+  combiner?: Combiner;
+  /** Temperature for LogSumExp combiner (default: 1.5) */
+  combinerTemperature?: number;
+  /** K for WeightedTopK combiner (default: 5) */
+  combinerTopK?: number;
+  /** Decay for WeightedTopK combiner (default: 0.7) */
+  combinerDecay?: number;
+}
+
+/** Discriminated union matching proto Query oneof. Exactly one key must be set. */
+export type Query =
+  | { term: TermQuery }
+  | { match: MatchQuery }
+  | { boolean: BooleanQuery }
+  | { sparseVector: SparseVectorQuery }
+  | { denseVector: DenseVectorQuery }
+  | { boost: BoostQuery }
+  | { all: AllQuery };
+
+// =============================================================================
+// Reranker (mirrors proto Reranker)
+// =============================================================================
+
+export interface Reranker {
+  field: string;
+  vector: number[];
+  /** L1 candidate count (0 = 10x final limit) */
+  limit?: number;
+  combiner?: Combiner;
+  combinerTemperature?: number;
+  combinerTopK?: number;
+  combinerDecay?: number;
+  /** Matryoshka pre-filter dims (0 = disabled) */
+  matryoshkaDims?: number;
+}
+
+// =============================================================================
+// Filter (mirrors proto Filter)
+// =============================================================================
+
+export interface Filter {
+  field: string;
+  eqU64?: number;
+  eqI64?: number;
+  eqF64?: number;
+  eqText?: string;
+  range?: { min?: number; max?: number };
+  inValues?: { textValues?: string[]; u64Values?: number[]; i64Values?: number[] };
+}
+
+// =============================================================================
+// SearchRequest (mirrors proto SearchRequest, minus index_name)
+// =============================================================================
+
+export interface SearchRequest {
+  query: Query;
   limit?: number;
   offset?: number;
   fieldsToLoad?: string[];
-  reranker?: RerankerDef;
-  rerankerCombiner?: RerankerCombiner;
-  /** Matryoshka pre-filter: number of leading dimensions for cheap approximate
-   *  scoring before full-dimension exact reranking (0 or undefined = disabled). */
-  matryoshkaDims?: number;
-  /** Fast-field filters for efficient document filtering. */
-  filters?: FilterDef[];
+  reranker?: Reranker;
+  filters?: Filter[];
 }

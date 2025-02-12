@@ -1,4 +1,8 @@
-"""Async Hermes client implementation."""
+"""Async Hermes client implementation.
+
+All search types mirror the proto API structure exactly.
+See types.py for Query, Reranker, Filter definitions.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +29,8 @@ from .types import (
 class HermesClient:
     """Async client for Hermes search server.
 
+    All search types mirror the proto API structure exactly.
+
     Example:
         async with HermesClient("localhost:50051") as client:
             # Create index
@@ -43,9 +49,10 @@ class HermesClient:
             await client.commit("articles")
 
             # Search
-            results = await client.search("articles", term=("title", "hello"))
+            results = await client.search("articles",
+                query={"match": {"field": "title", "text": "hello"}})
             for hit in results.hits:
-                print(hit.doc_id, hit.score)
+                print(hit.address, hit.score)
     """
 
     def __init__(self, address: str = "localhost:50051"):
@@ -297,124 +304,95 @@ class HermesClient:
         self,
         index_name: str,
         *,
-        term: tuple[str, str] | None = None,
-        match: tuple[str, str] | None = None,
-        boolean: dict[str, list[tuple[str, str]]] | None = None,
-        sparse_vector: tuple[str, list[int], list[float]] | None = None,
-        sparse_text: tuple[str, str] | None = None,
-        dense_vector: tuple[str, list[float]] | None = None,
-        nprobe: int = 0,
-        rerank_factor: int = 0,
-        heap_factor: float = 1.0,
-        combiner: str = "sum",
+        query: dict[str, Any],
         limit: int = 10,
         offset: int = 0,
         fields_to_load: list[str] | None = None,
-        reranker: tuple[str, list[float], int] | None = None,
-        reranker_combiner: str = "weighted_top_k",
-        matryoshka_dims: int = 0,
+        reranker: dict[str, Any] | None = None,
         filters: list[dict[str, Any]] | None = None,
     ) -> SearchResponse:
         """Search for documents.
 
+        All parameters mirror the proto SearchRequest structure exactly.
+        ``query`` is a dict with exactly one key matching the proto Query oneof.
+
         Args:
             index_name: Name of the index
-            term: Term query as (field, term) tuple - exact single-term match
-            match: Match query as (field, text) tuple - tokenizes text server-side
-                and searches as OR of individual tokens (use for natural language)
-            boolean: Boolean query with "must", "should", "must_not" keys
-            sparse_vector: Sparse vector query as (field, indices, values) tuple
-            sparse_text: Sparse vector query with server-side tokenization as (field, text) tuple
-            dense_vector: Dense vector query as (field, vector) tuple
-            nprobe: Number of clusters to probe for dense vector (IVF indexes)
-            rerank_factor: Re-ranking factor for dense vector search
-            heap_factor: Approximate search factor for sparse vectors (1.0=exact, 0.8=faster)
-            combiner: Score combiner for multi-value fields: "sum", "max", or "avg"
+            query: Query dict with one key: "term", "match", "boolean",
+                "sparse_vector", "dense_vector", "boost", or "all".
             limit: Maximum number of results
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
-            reranker: L2 reranker as (field, query_vector, l1_limit) tuple.
-                Reranks L1 candidates by exact dense vector distance.
-                l1_limit=0 defaults to 10x the final limit.
-            reranker_combiner: Score combiner for reranker multi-value fields:
-                "log_sum_exp" (default), "max", "avg", "sum"
-            matryoshka_dims: Matryoshka pre-filter dimensions for reranker.
-                When > 0, scores candidates on leading N dimensions first,
-                keeps top survivors, then does full-dimension exact scoring.
-                0 = disabled (default).
-            filters: Fast-field filters. Each dict has "field" and one condition key:
-                - {"field": "status", "eq_text": "active"}
-                - {"field": "price", "eq_u64": 100}
-                - {"field": "price", "range": {"min": 10.0, "max": 100.0}}
-                - {"field": "category", "in_text": ["books", "movies"]}
-                - {"field": "count", "in_u64": [1, 2, 3]}
+            reranker: Reranker dict matching proto Reranker message
+            filters: List of filter dicts matching proto Filter message
 
         Returns:
             SearchResponse with hits
 
         Examples:
             # Term query (exact single token)
-            results = await client.search("articles", term=("title", "hello"))
+            results = await client.search("articles",
+                query={"term": {"field": "title", "term": "hello"}})
 
             # Match query (full-text, tokenized server-side)
-            results = await client.search("articles", match=("title", "what is hemoglobin"))
+            results = await client.search("articles",
+                query={"match": {"field": "title", "text": "what is hemoglobin"}})
 
             # Boolean query
-            results = await client.search("articles", boolean={
-                "must": [("title", "hello")],
-                "should": [("body", "world")],
-            })
+            results = await client.search("articles",
+                query={"boolean": {
+                    "must": [{"match": {"field": "title", "text": "hello"}}],
+                    "should": [{"match": {"field": "body", "text": "world"}}],
+                }})
 
-            # Sparse vector query (pre-tokenized)
+            # Sparse text query (server-side tokenization) with pruning
             results = await client.search("docs",
-                sparse_vector=("embedding", [1, 5, 10], [0.5, 0.3, 0.2]),
-                fields_to_load=["title", "body"]
-            )
+                query={"sparse_vector": {
+                    "field": "embedding",
+                    "text": "machine learning",
+                    "pruning": 0.5,
+                }},
+                fields_to_load=["title", "body"])
 
-            # Sparse text query (server-side tokenization)
+            # Sparse vector query (pre-computed)
             results = await client.search("docs",
-                sparse_text=("embedding", "what is machine learning?"),
-                fields_to_load=["title", "body"]
-            )
+                query={"sparse_vector": {
+                    "field": "embedding",
+                    "indices": [1, 5, 10],
+                    "values": [0.5, 0.3, 0.2],
+                }})
 
-            # Dense vector query
+            # Dense vector query with reranker
             results = await client.search("docs",
-                dense_vector=("embedding", [0.1, 0.2, 0.3, ...]),
-                fields_to_load=["title"]
-            )
+                query={"dense_vector": {
+                    "field": "embedding",
+                    "vector": [0.1, 0.2, 0.3],
+                    "nprobe": 10,
+                }},
+                reranker={
+                    "field": "embedding",
+                    "vector": [0.1, 0.2, 0.3],
+                    "limit": 100,
+                },
+                fields_to_load=["title"])
+
+            # Filters
+            results = await client.search("docs",
+                query={"match": {"field": "title", "text": "hello"}},
+                filters=[
+                    {"field": "status", "eq_text": "active"},
+                    {"field": "price", "range": {"min": 10.0, "max": 100.0}},
+                ])
         """
         self._ensure_connected()
 
-        query = _build_query(
-            term=term,
-            match=match,
-            boolean=boolean,
-            sparse_vector=sparse_vector,
-            sparse_text=sparse_text,
-            dense_vector=dense_vector,
-            nprobe=nprobe,
-            rerank_factor=rerank_factor,
-            heap_factor=heap_factor,
-            combiner=combiner,
-        )
-
-        pb_reranker = None
-        if reranker is not None:
-            field_name, query_vector, l1_limit = reranker
-            reranker_combiner_value = _reranker_combiner_to_proto(reranker_combiner)
-            pb_reranker = pb.Reranker(
-                field=field_name,
-                vector=query_vector,
-                limit=l1_limit,
-                combiner=reranker_combiner_value,
-                matryoshka_dims=matryoshka_dims,
-            )
-
-        pb_filters = _build_filters(filters) if filters else []
+        pb_query = _build_query(query)
+        pb_reranker = _build_reranker(reranker) if reranker else None
+        pb_filters = [_build_filter(f) for f in filters] if filters else []
 
         request = pb.SearchRequest(
             index_name=index_name,
-            query=query,
+            query=pb_query,
             limit=limit,
             offset=offset,
             fields_to_load=fields_to_load or [],
@@ -625,129 +603,134 @@ def _from_field_value(fv: pb.FieldValue) -> Any:
     return None
 
 
-def _combiner_to_proto(combiner: str) -> int:
-    """Convert combiner string to proto enum value."""
-    return {"sum": 0, "max": 1, "avg": 2}.get(combiner.lower(), 0)
+_COMBINER_MAP: dict[str, int] = {
+    "log_sum_exp": 0,
+    "max": 1,
+    "avg": 2,
+    "sum": 3,
+    "weighted_top_k": 4,
+}
 
 
-def _reranker_combiner_to_proto(combiner: str) -> int:
-    """Convert reranker combiner string to proto MultiValueCombiner enum."""
-    return {
-        "log_sum_exp": 0,
-        "max": 1,
-        "avg": 2,
-        "sum": 3,
-        "weighted_top_k": 4,
-    }.get(combiner.lower(), 0)
+def _combiner_to_proto(combiner: str | None) -> int:
+    """Convert combiner string to proto MultiValueCombiner enum value."""
+    if combiner is None:
+        return 0  # LOG_SUM_EXP default
+    return _COMBINER_MAP.get(combiner.lower(), 0)
 
 
-def _build_filters(filters: list[dict[str, Any]]) -> list[pb.Filter]:
-    """Convert filter dicts to protobuf Filter messages."""
-    result = []
-    for f in filters:
-        field = f["field"]
-        kwargs: dict[str, Any] = {"field": field}
-        if "eq_u64" in f:
-            kwargs["eq_u64"] = int(f["eq_u64"])
-        elif "eq_i64" in f:
-            kwargs["eq_i64"] = int(f["eq_i64"])
-        elif "eq_f64" in f:
-            kwargs["eq_f64"] = float(f["eq_f64"])
-        elif "eq_text" in f:
-            kwargs["eq_text"] = str(f["eq_text"])
-        elif "range" in f:
-            r = f["range"]
-            range_kwargs = {}
-            if "min" in r:
-                range_kwargs["min"] = float(r["min"])
-            if "max" in r:
-                range_kwargs["max"] = float(r["max"])
-            kwargs["range"] = pb.RangeFilter(**range_kwargs)
-        elif "in_text" in f:
-            kwargs["in_values"] = pb.InFilter(text_values=list(f["in_text"]))
-        elif "in_u64" in f:
-            kwargs["in_values"] = pb.InFilter(u64_values=[int(v) for v in f["in_u64"]])
-        elif "in_i64" in f:
-            kwargs["in_values"] = pb.InFilter(i64_values=[int(v) for v in f["in_i64"]])
-        result.append(pb.Filter(**kwargs))
-    return result
+def _build_query(q: dict[str, Any]) -> pb.Query:
+    """Recursively convert a Query dict to protobuf Query.
 
+    The dict must have exactly one key matching the proto Query oneof:
+    "term", "match", "boolean", "sparse_vector", "dense_vector", "boost", "all".
+    """
+    if "term" in q:
+        t = q["term"]
+        return pb.Query(term=pb.TermQuery(field=t["field"], term=t["term"]))
 
-def _build_query(
-    *,
-    term: tuple[str, str] | None = None,
-    match: tuple[str, str] | None = None,
-    boolean: dict[str, list[tuple[str, str]]] | None = None,
-    sparse_vector: tuple[str, list[int], list[float]] | None = None,
-    sparse_text: tuple[str, str] | None = None,
-    dense_vector: tuple[str, list[float]] | None = None,
-    nprobe: int = 0,
-    rerank_factor: int = 0,
-    heap_factor: float = 1.0,
-    combiner: str = "sum",
-) -> pb.Query:
-    """Build a protobuf Query from parameters."""
-    if term is not None:
-        field, value = term
-        return pb.Query(term=pb.TermQuery(field=field, term=value))
+    if "match" in q:
+        m = q["match"]
+        return pb.Query(match=pb.MatchQuery(field=m["field"], text=m["text"]))
 
-    if match is not None:
-        field, text = match
-        return pb.Query(match=pb.MatchQuery(field=field, text=text))
-
-    if boolean is not None:
-        must = [
-            pb.Query(match=pb.MatchQuery(field=f, text=t))
-            for f, t in boolean.get("must", [])
-        ]
-        should = [
-            pb.Query(match=pb.MatchQuery(field=f, text=t))
-            for f, t in boolean.get("should", [])
-        ]
-        must_not = [
-            pb.Query(match=pb.MatchQuery(field=f, text=t))
-            for f, t in boolean.get("must_not", [])
-        ]
+    if "boolean" in q:
+        b = q["boolean"]
         return pb.Query(
-            boolean=pb.BooleanQuery(must=must, should=should, must_not=must_not)
-        )
-
-    combiner_value = _combiner_to_proto(combiner)
-
-    if sparse_vector is not None:
-        field, indices, values = sparse_vector
-        return pb.Query(
-            sparse_vector=pb.SparseVectorQuery(
-                field=field,
-                indices=indices,
-                values=values,
-                combiner=combiner_value,
-                heap_factor=heap_factor,
+            boolean=pb.BooleanQuery(
+                must=[_build_query(sq) for sq in b.get("must", [])],
+                should=[_build_query(sq) for sq in b.get("should", [])],
+                must_not=[_build_query(sq) for sq in b.get("must_not", [])],
             )
         )
 
-    if sparse_text is not None:
-        field, text = sparse_text
+    if "sparse_vector" in q:
+        sv = q["sparse_vector"]
         return pb.Query(
             sparse_vector=pb.SparseVectorQuery(
-                field=field,
-                text=text,
-                combiner=combiner_value,
-                heap_factor=heap_factor,
+                field=sv["field"],
+                indices=sv.get("indices", []),
+                values=sv.get("values", []),
+                text=sv.get("text", ""),
+                combiner=_combiner_to_proto(sv.get("combiner")),
+                heap_factor=sv.get("heap_factor", 0),
+                combiner_temperature=sv.get("combiner_temperature", 0),
+                combiner_top_k=sv.get("combiner_top_k", 0),
+                combiner_decay=sv.get("combiner_decay", 0),
+                weight_threshold=sv.get("weight_threshold", 0),
+                max_query_dims=sv.get("max_query_dims", 0),
+                pruning=sv.get("pruning", 0),
             )
         )
 
-    if dense_vector is not None:
-        field, vector = dense_vector
+    if "dense_vector" in q:
+        dv = q["dense_vector"]
         return pb.Query(
             dense_vector=pb.DenseVectorQuery(
-                field=field,
-                vector=vector,
-                nprobe=nprobe,
-                rerank_factor=rerank_factor,
-                combiner=combiner_value,
+                field=dv["field"],
+                vector=dv["vector"],
+                nprobe=dv.get("nprobe", 0),
+                rerank_factor=dv.get("rerank_factor", 0),
+                combiner=_combiner_to_proto(dv.get("combiner")),
+                combiner_temperature=dv.get("combiner_temperature", 0),
+                combiner_top_k=dv.get("combiner_top_k", 0),
+                combiner_decay=dv.get("combiner_decay", 0),
             )
         )
 
-    # Default: match all (empty boolean query)
+    if "boost" in q:
+        bq = q["boost"]
+        return pb.Query(
+            boost=pb.BoostQuery(
+                query=_build_query(bq["query"]),
+                boost=bq["boost"],
+            )
+        )
+
+    if "all" in q:
+        return pb.Query(all=pb.AllQuery())
+
+    # Default: match all
     return pb.Query(boolean=pb.BooleanQuery())
+
+
+def _build_reranker(r: dict[str, Any]) -> pb.Reranker:
+    """Convert a Reranker dict to protobuf Reranker."""
+    return pb.Reranker(
+        field=r["field"],
+        vector=r["vector"],
+        limit=r.get("limit", 0),
+        combiner=_combiner_to_proto(r.get("combiner")),
+        combiner_temperature=r.get("combiner_temperature", 0),
+        combiner_top_k=r.get("combiner_top_k", 0),
+        combiner_decay=r.get("combiner_decay", 0),
+        matryoshka_dims=r.get("matryoshka_dims", 0),
+    )
+
+
+def _build_filter(f: dict[str, Any]) -> pb.Filter:
+    """Convert a Filter dict to protobuf Filter."""
+    kwargs: dict[str, Any] = {"field": f["field"]}
+    if "eq_u64" in f:
+        kwargs["eq_u64"] = int(f["eq_u64"])
+    elif "eq_i64" in f:
+        kwargs["eq_i64"] = int(f["eq_i64"])
+    elif "eq_f64" in f:
+        kwargs["eq_f64"] = float(f["eq_f64"])
+    elif "eq_text" in f:
+        kwargs["eq_text"] = str(f["eq_text"])
+    elif "range" in f:
+        r = f["range"]
+        range_kwargs = {}
+        if "min" in r:
+            range_kwargs["min"] = float(r["min"])
+        if "max" in r:
+            range_kwargs["max"] = float(r["max"])
+        kwargs["range"] = pb.RangeFilter(**range_kwargs)
+    elif "in_values" in f:
+        iv = f["in_values"]
+        kwargs["in_values"] = pb.InFilter(
+            text_values=iv.get("text_values", []),
+            u64_values=[int(v) for v in iv.get("u64_values", [])],
+            i64_values=[int(v) for v in iv.get("i64_values", [])],
+        )
+    return pb.Filter(**kwargs)

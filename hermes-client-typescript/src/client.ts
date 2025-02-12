@@ -1,5 +1,8 @@
 /**
  * Async Hermes client implementation.
+ *
+ * All search types mirror the proto API structure exactly.
+ * See types.ts for Query, Reranker, Filter, SearchRequest definitions.
  */
 
 import { ChannelCredentials } from "@grpc/grpc-js";
@@ -11,20 +14,21 @@ import {
   FieldValue as PbFieldValue,
   FieldEntry as PbFieldEntry,
   Query as PbQuery,
-  Reranker as PbReranker,
   MultiValueCombiner,
 } from "./generated/hermes";
 
-import {
+import type {
   DocAddress,
   Document,
   SearchHit,
   SearchResponse,
   SearchTimings,
   IndexInfo,
-  SearchOptions,
+  SearchRequest,
+  Query,
   Combiner,
-  RerankerCombiner,
+  Reranker,
+  Filter,
 } from "./types";
 
 type SearchClient = Client<typeof SearchServiceDefinition>;
@@ -181,46 +185,53 @@ export class HermesClient {
   // Search
   // =========================================================================
 
-  /** Search for documents. */
-  async search(indexName: string, options: SearchOptions = {}): Promise<SearchResponse> {
+  /**
+   * Search for documents.
+   *
+   * @example
+   * // Term query
+   * await client.search("articles", {
+   *   query: { term: { field: "title", term: "hello" } },
+   * });
+   *
+   * // Match query (full-text, tokenized server-side)
+   * await client.search("articles", {
+   *   query: { match: { field: "title", text: "what is hemoglobin" } },
+   * });
+   *
+   * // Sparse vector query with server-side tokenization + pruning
+   * await client.search("docs", {
+   *   query: { sparseVector: { field: "embedding", text: "machine learning", pruning: 0.5 } },
+   *   fieldsToLoad: ["title"],
+   * });
+   *
+   * // Dense vector query
+   * await client.search("docs", {
+   *   query: { denseVector: { field: "embedding", vector: [0.1, 0.2, ...], nprobe: 10 } },
+   *   reranker: { field: "embedding", vector: [0.1, 0.2, ...], limit: 100 },
+   * });
+   *
+   * // Boolean query
+   * await client.search("articles", {
+   *   query: { boolean: {
+   *     must: [{ match: { field: "title", text: "hello" } }],
+   *     should: [{ match: { field: "body", text: "world" } }],
+   *   }},
+   * });
+   */
+  async search(indexName: string, request: SearchRequest): Promise<SearchResponse> {
     this.ensureConnected();
 
-    const query = buildQuery(options);
-
-    let reranker: PbReranker | undefined;
-    if (options.reranker) {
-      const [field, vector, limit] = options.reranker;
-      reranker = {
-        field,
-        vector,
-        limit,
-        combiner: rerankerCombinerToProto(options.rerankerCombiner ?? "weighted_top_k"),
-        combinerTemperature: 0,
-        combinerTopK: 0,
-        combinerDecay: 0,
-        matryoshkaDims: options.matryoshkaDims ?? 0,
-      };
-    }
-
-    const filters = (options.filters ?? []).map((f) => {
-      const filter: any = { field: f.field };
-      if (f.eq_u64 !== undefined) filter.eqU64 = f.eq_u64;
-      else if (f.eq_i64 !== undefined) filter.eqI64 = f.eq_i64;
-      else if (f.eq_f64 !== undefined) filter.eqF64 = f.eq_f64;
-      else if (f.eq_text !== undefined) filter.eqText = f.eq_text;
-      else if (f.range !== undefined) filter.range = { min: f.range.min, max: f.range.max };
-      else if (f.in_text !== undefined) filter.inValues = { textValues: f.in_text, u64Values: [], i64Values: [] };
-      else if (f.in_u64 !== undefined) filter.inValues = { textValues: [], u64Values: f.in_u64, i64Values: [] };
-      else if (f.in_i64 !== undefined) filter.inValues = { textValues: [], u64Values: [], i64Values: f.in_i64 };
-      return filter;
-    });
+    const query = buildQuery(request.query);
+    const reranker = request.reranker ? buildReranker(request.reranker) : undefined;
+    const filters = (request.filters ?? []).map(buildFilter);
 
     const response = await this.searchClient!.search({
       indexName,
       query,
-      limit: options.limit ?? 10,
-      offset: options.offset ?? 0,
-      fieldsToLoad: options.fieldsToLoad ?? [],
+      limit: request.limit ?? 10,
+      offset: request.offset ?? 0,
+      fieldsToLoad: request.fieldsToLoad ?? [],
       reranker,
       filters,
     });
@@ -270,7 +281,6 @@ export class HermesClient {
       return { fields };
     } catch (err: any) {
       if (err?.code === 5) {
-        // NOT_FOUND
         return null;
       }
       throw err;
@@ -279,7 +289,112 @@ export class HermesClient {
 }
 
 // =============================================================================
-// Helper functions
+// Proto conversion helpers
+// =============================================================================
+
+const COMBINER_MAP: Record<string, MultiValueCombiner> = {
+  log_sum_exp: MultiValueCombiner.COMBINER_LOG_SUM_EXP,
+  max: MultiValueCombiner.COMBINER_MAX,
+  avg: MultiValueCombiner.COMBINER_AVG,
+  sum: MultiValueCombiner.COMBINER_SUM,
+  weighted_top_k: MultiValueCombiner.COMBINER_WEIGHTED_TOP_K,
+};
+
+function combinerToProto(combiner?: Combiner): MultiValueCombiner {
+  return combiner ? (COMBINER_MAP[combiner] ?? MultiValueCombiner.COMBINER_LOG_SUM_EXP) : MultiValueCombiner.COMBINER_LOG_SUM_EXP;
+}
+
+function buildQuery(q: Query): PbQuery {
+  if ("term" in q) {
+    return { term: { field: q.term.field, term: q.term.term } };
+  }
+  if ("match" in q) {
+    return { match: { field: q.match.field, text: q.match.text } };
+  }
+  if ("boolean" in q) {
+    return {
+      boolean: {
+        must: (q.boolean.must ?? []).map(buildQuery),
+        should: (q.boolean.should ?? []).map(buildQuery),
+        mustNot: (q.boolean.mustNot ?? []).map(buildQuery),
+      },
+    };
+  }
+  if ("sparseVector" in q) {
+    const sv = q.sparseVector;
+    return {
+      sparseVector: {
+        field: sv.field,
+        indices: sv.indices ?? [],
+        values: sv.values ?? [],
+        text: sv.text ?? "",
+        combiner: combinerToProto(sv.combiner),
+        heapFactor: sv.heapFactor ?? 0,
+        combinerTemperature: sv.combinerTemperature ?? 0,
+        combinerTopK: sv.combinerTopK ?? 0,
+        combinerDecay: sv.combinerDecay ?? 0,
+        weightThreshold: sv.weightThreshold ?? 0,
+        maxQueryDims: sv.maxQueryDims ?? 0,
+        pruning: sv.pruning ?? 0,
+      },
+    };
+  }
+  if ("denseVector" in q) {
+    const dv = q.denseVector;
+    return {
+      denseVector: {
+        field: dv.field,
+        vector: dv.vector,
+        nprobe: dv.nprobe ?? 0,
+        rerankFactor: dv.rerankFactor ?? 0,
+        combiner: combinerToProto(dv.combiner),
+        combinerTemperature: dv.combinerTemperature ?? 0,
+        combinerTopK: dv.combinerTopK ?? 0,
+        combinerDecay: dv.combinerDecay ?? 0,
+      },
+    };
+  }
+  if ("boost" in q) {
+    return { boost: { query: buildQuery(q.boost.query), boost: q.boost.boost } };
+  }
+  if ("all" in q) {
+    return { all: {} };
+  }
+  return { all: {} };
+}
+
+function buildReranker(r: Reranker): any {
+  return {
+    field: r.field,
+    vector: r.vector,
+    limit: r.limit ?? 0,
+    combiner: combinerToProto(r.combiner),
+    combinerTemperature: r.combinerTemperature ?? 0,
+    combinerTopK: r.combinerTopK ?? 0,
+    combinerDecay: r.combinerDecay ?? 0,
+    matryoshkaDims: r.matryoshkaDims ?? 0,
+  };
+}
+
+function buildFilter(f: Filter): any {
+  const filter: any = { field: f.field };
+  if (f.eqU64 !== undefined) filter.eqU64 = f.eqU64;
+  else if (f.eqI64 !== undefined) filter.eqI64 = f.eqI64;
+  else if (f.eqF64 !== undefined) filter.eqF64 = f.eqF64;
+  else if (f.eqText !== undefined) filter.eqText = f.eqText;
+  else if (f.range !== undefined) filter.range = f.range;
+  else if (f.inValues !== undefined) {
+    filter.inValues = {
+      textValues: f.inValues.textValues ?? [],
+      u64Values: f.inValues.u64Values ?? [],
+      i64Values: f.inValues.i64Values ?? [],
+    };
+  }
+  return filter;
+}
+
+// =============================================================================
+// Document field helpers
 // =============================================================================
 
 function isSparseVector(value: any[]): boolean {
@@ -391,101 +506,4 @@ function fromFieldValue(fv: PbFieldValue): any {
     return Array.from(fv.denseVector.values);
   }
   return null;
-}
-
-function combinerToProto(combiner: Combiner): number {
-  const map: Record<string, number> = { sum: 0, max: 1, avg: 2 };
-  return map[combiner] ?? 0;
-}
-
-function rerankerCombinerToProto(combiner: RerankerCombiner): MultiValueCombiner {
-  const map: Record<string, MultiValueCombiner> = {
-    log_sum_exp: MultiValueCombiner.COMBINER_LOG_SUM_EXP,
-    max: MultiValueCombiner.COMBINER_MAX,
-    avg: MultiValueCombiner.COMBINER_AVG,
-    sum: MultiValueCombiner.COMBINER_SUM,
-    weighted_top_k: MultiValueCombiner.COMBINER_WEIGHTED_TOP_K,
-  };
-  return map[combiner] ?? MultiValueCombiner.COMBINER_LOG_SUM_EXP;
-}
-
-function buildQuery(options: SearchOptions): PbQuery {
-  if (options.term) {
-    const [field, term] = options.term;
-    return { term: { field, term } };
-  }
-
-  if (options.boolean) {
-    const must = (options.boolean.must ?? []).map(([f, t]) => ({
-      term: { field: f, term: t },
-    }));
-    const should = (options.boolean.should ?? []).map(([f, t]) => ({
-      term: { field: f, term: t },
-    }));
-    const mustNot = (options.boolean.mustNot ?? []).map(([f, t]) => ({
-      term: { field: f, term: t },
-    }));
-    return { boolean: { must, should, mustNot } };
-  }
-
-  const combiner = combinerToProto(options.combiner ?? "sum");
-
-  if (options.sparseVector) {
-    const [field, indices, values] = options.sparseVector;
-    return {
-      sparseVector: {
-        field,
-        indices,
-        values,
-        text: "",
-        combiner,
-        heapFactor: options.heapFactor ?? 1.0,
-        combinerTemperature: 0,
-        combinerTopK: 0,
-        combinerDecay: 0,
-        weightThreshold: 0,
-        maxQueryDims: 0,
-        pruning: 0,
-      },
-    };
-  }
-
-  if (options.sparseText) {
-    const [field, text] = options.sparseText;
-    return {
-      sparseVector: {
-        field,
-        indices: [],
-        values: [],
-        text,
-        combiner,
-        heapFactor: options.heapFactor ?? 1.0,
-        combinerTemperature: 0,
-        combinerTopK: 0,
-        combinerDecay: 0,
-        weightThreshold: 0,
-        maxQueryDims: 0,
-        pruning: 0,
-      },
-    };
-  }
-
-  if (options.denseVector) {
-    const [field, vector] = options.denseVector;
-    return {
-      denseVector: {
-        field,
-        vector,
-        nprobe: options.nprobe ?? 0,
-        rerankFactor: options.rerankFactor ?? 0,
-        combiner,
-        combinerTemperature: 0,
-        combinerTopK: 0,
-        combinerDecay: 0,
-      },
-    };
-  }
-
-  // Default: match all (empty boolean query)
-  return { boolean: { must: [], should: [], mustNot: [] } };
 }

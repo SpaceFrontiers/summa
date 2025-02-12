@@ -2,21 +2,43 @@
 
 from .client import HermesClient
 from .types import (
+    AllQuery,
+    BooleanQuery,
+    BoostQuery,
+    Combiner,
+    DenseVectorQuery,
     DocAddress,
     Document,
+    Filter,
     IndexInfo,
+    MatchQuery,
+    Reranker,
     SearchHit,
     SearchResponse,
+    SearchTimings,
+    SparseVectorQuery,
+    TermQuery,
     VectorFieldStats,
 )
 
 __all__ = [
     "HermesClient",
+    "AllQuery",
+    "BooleanQuery",
+    "BoostQuery",
+    "Combiner",
+    "DenseVectorQuery",
     "DocAddress",
     "Document",
+    "Filter",
+    "IndexInfo",
+    "MatchQuery",
+    "Reranker",
     "SearchHit",
     "SearchResponse",
-    "IndexInfo",
+    "SearchTimings",
+    "SparseVectorQuery",
+    "TermQuery",
     "VectorFieldStats",
 ]
 
