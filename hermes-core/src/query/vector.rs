@@ -351,6 +351,7 @@ impl SparseVectorQuery {
         let after_threshold = v.len();
 
         // Step 2: pruning — keep top fraction by abs(weight), same as indexing
+        let mut sorted_by_weight = false;
         if let Some(fraction) = self.pruning
             && fraction < 1.0
             && v.len() > 1
@@ -360,6 +361,7 @@ impl SparseVectorQuery {
                     .partial_cmp(&a.1.abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            sorted_by_weight = true;
             let keep = ((v.len() as f64 * fraction as f64).ceil() as usize).max(1);
             v.truncate(keep);
         }
@@ -369,12 +371,13 @@ impl SparseVectorQuery {
         if let Some(max_dims) = self.max_query_dims
             && v.len() > max_dims
         {
-            // Sort by descending abs(weight), keep top-k
-            v.sort_unstable_by(|a, b| {
-                b.1.abs()
-                    .partial_cmp(&a.1.abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            if !sorted_by_weight {
+                v.sort_unstable_by(|a, b| {
+                    b.1.abs()
+                        .partial_cmp(&a.1.abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
             v.truncate(max_dims);
         }
 

@@ -666,6 +666,8 @@ impl SegmentBuilder {
             .entry(field.0)
             .or_insert_with(SparseVectorBuilder::new);
 
+        builder.inc_vector_count();
+
         for &(dim_id, weight) in entries {
             // Skip weights below threshold
             if weight.abs() < weight_threshold {
