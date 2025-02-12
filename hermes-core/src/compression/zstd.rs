@@ -93,14 +93,14 @@ pub fn compress_with_dict(
     encoder.finish().map_err(io::Error::other)
 }
 
-/// Upper bound for decompressed output (512KB covers 256KB store blocks).
+/// Capacity hint for bulk decompressor (covers typical 256KB store blocks).
+/// Blocks that decompress larger than this fall back to streaming decode.
 const DECOMPRESS_CAPACITY: usize = 512 * 1024;
 
 /// Decompress data using Zstd
 ///
-/// Reuses a thread-local `Decompressor` to avoid re-initializing the
-/// zstd context on every call. The bulk API reads the content-size
-/// field from the frame header and allocates the exact output buffer.
+/// Fast path: reuses a thread-local bulk `Decompressor` with a 512KB
+/// capacity hint. Falls back to streaming decode for oversized blocks.
 pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     thread_local! {
         static DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> =
@@ -109,7 +109,7 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     DECOMPRESSOR.with(|dc| {
         dc.borrow_mut()
             .decompress(data, DECOMPRESS_CAPACITY)
-            .map_err(io::Error::other)
+            .or_else(|_| zstd::decode_all(data))
     })
 }
 
@@ -140,7 +140,12 @@ pub fn decompress_with_dict(data: &[u8], dict: &CompressionDict) -> io::Result<V
             .unwrap()
             .1
             .decompress(data, DECOMPRESS_CAPACITY)
-            .map_err(io::Error::other)
+            .or_else(|_| {
+                let mut decoder = zstd::Decoder::with_dictionary(data, dict.as_bytes())?;
+                let mut output = Vec::new();
+                io::Read::read_to_end(&mut decoder, &mut output)?;
+                Ok(output)
+            })
     })
 }
 
