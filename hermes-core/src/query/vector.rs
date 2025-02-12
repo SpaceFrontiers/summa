@@ -132,8 +132,8 @@ pub struct DenseVectorQuery {
     pub vector: Vec<f32>,
     /// Number of clusters to probe (for IVF indexes)
     pub nprobe: usize,
-    /// Re-ranking factor (multiplied by k for candidate selection)
-    pub rerank_factor: usize,
+    /// Re-ranking factor (multiplied by k for candidate selection, e.g. 3.0)
+    pub rerank_factor: f32,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
 }
@@ -145,7 +145,7 @@ impl DenseVectorQuery {
             field,
             vector,
             nprobe: 32,
-            rerank_factor: 3,
+            rerank_factor: 3.0,
             combiner: MultiValueCombiner::Max,
         }
     }
@@ -156,8 +156,8 @@ impl DenseVectorQuery {
         self
     }
 
-    /// Set the re-ranking factor
-    pub fn with_rerank_factor(mut self, factor: usize) -> Self {
+    /// Set the re-ranking factor (e.g. 3.0 = fetch 3x candidates for reranking)
+    pub fn with_rerank_factor(mut self, factor: f32) -> Self {
         self.rerank_factor = factor;
         self
     }
@@ -648,12 +648,12 @@ mod tests {
     fn test_dense_vector_query_builder() {
         let query = DenseVectorQuery::new(Field(0), vec![1.0, 2.0, 3.0])
             .with_nprobe(64)
-            .with_rerank_factor(5);
+            .with_rerank_factor(5.0);
 
         assert_eq!(query.field, Field(0));
         assert_eq!(query.vector.len(), 3);
         assert_eq!(query.nprobe, 64);
-        assert_eq!(query.rerank_factor, 5);
+        assert_eq!(query.rerank_factor, 5.0);
     }
 
     #[test]

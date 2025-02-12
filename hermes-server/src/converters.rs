@@ -278,8 +278,8 @@ pub fn convert_query(
             if dv_query.nprobe > 0 {
                 query = query.with_nprobe(dv_query.nprobe as usize);
             }
-            if dv_query.rerank_factor > 0 {
-                query = query.with_rerank_factor(dv_query.rerank_factor as usize);
+            if dv_query.rerank_factor > 0.0 {
+                query = query.with_rerank_factor(dv_query.rerank_factor);
             }
             let combiner = convert_combiner(
                 dv_query.combiner,

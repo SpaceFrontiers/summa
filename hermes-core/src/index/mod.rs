@@ -932,7 +932,7 @@ mod tests {
                 &query_vec,
                 5,
                 0,
-                1,
+                1.0,
                 crate::query::MultiValueCombiner::Max,
             )
             .await
@@ -972,7 +972,7 @@ mod tests {
                 &query_vec,
                 5,
                 0,
-                1,
+                1.0,
                 crate::query::MultiValueCombiner::Max,
             )
             .await

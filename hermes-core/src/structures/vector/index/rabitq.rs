@@ -110,7 +110,7 @@ impl RaBitQIndex {
     }
 
     /// Search for k nearest neighbors, returns (doc_id, ordinal, distance)
-    pub fn search(&self, query: &[f32], k: usize, _rerank_factor: usize) -> Vec<(u32, u16, f32)> {
+    pub fn search(&self, query: &[f32], k: usize, _fetch_k: usize) -> Vec<(u32, u16, f32)> {
         let prepared = self.prepare_query(query);
 
         // Phase 1: Estimate distances for all vectors

@@ -85,7 +85,7 @@ message DenseVectorQuery {
   string field = 1;
   repeated float vector = 2;
   uint32 nprobe = 3;           // Number of clusters to probe (for IVF indexes)
-  uint32 rerank_factor = 4;    // Re-ranking factor (multiplied by k)
+  float rerank_factor = 4;     // Re-ranking factor (multiplied by k, e.g. 3.0)
   MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
   float combiner_temperature = 6;   // Temperature for LogSumExp (default: 1.5)
   uint32 combiner_top_k = 7;        // K for WeightedTopK (default: 5)

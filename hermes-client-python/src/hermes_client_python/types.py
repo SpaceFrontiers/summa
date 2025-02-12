@@ -62,7 +62,7 @@ class DenseVectorQuery(TypedDict, total=False):
     field: str  # required but total=False for optional fields
     vector: list[float]
     nprobe: int
-    rerank_factor: int
+    rerank_factor: float
     combiner: Combiner
     combiner_temperature: float
     combiner_top_k: int

@@ -113,7 +113,7 @@ export interface DenseVectorQuery {
   vector: number[];
   /** Number of clusters to probe (for IVF indexes) */
   nprobe: number;
-  /** Re-ranking factor (multiplied by k) */
+  /** Re-ranking factor (multiplied by k, e.g. 3.0) */
   rerankFactor: number;
   /** How to combine scores for multi-value fields */
   combiner: MultiValueCombiner;
@@ -957,7 +957,7 @@ export const DenseVectorQuery: MessageFns<DenseVectorQuery> = {
       writer.uint32(24).uint32(message.nprobe);
     }
     if (message.rerankFactor !== 0) {
-      writer.uint32(32).uint32(message.rerankFactor);
+      writer.uint32(37).float(message.rerankFactor);
     }
     if (message.combiner !== 0) {
       writer.uint32(40).int32(message.combiner);
@@ -1016,11 +1016,11 @@ export const DenseVectorQuery: MessageFns<DenseVectorQuery> = {
           continue;
         }
         case 4: {
-          if (tag !== 32) {
+          if (tag !== 37) {
             break;
           }
 
-          message.rerankFactor = reader.uint32();
+          message.rerankFactor = reader.float();
           continue;
         }
         case 5: {
@@ -1105,7 +1105,7 @@ export const DenseVectorQuery: MessageFns<DenseVectorQuery> = {
       obj.nprobe = Math.round(message.nprobe);
     }
     if (message.rerankFactor !== 0) {
-      obj.rerankFactor = Math.round(message.rerankFactor);
+      obj.rerankFactor = message.rerankFactor;
     }
     if (message.combiner !== 0) {
       obj.combiner = multiValueCombinerToJSON(message.combiner);

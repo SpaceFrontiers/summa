@@ -36,7 +36,7 @@ pub enum ParsedQuery {
         field: String,
         vector: Vec<f32>,
         nprobe: usize,
-        rerank: usize,
+        rerank: f32,
     },
     /// Sparse vector query
     Sparse {
@@ -329,7 +329,7 @@ impl QueryLanguageParser {
         let mut field = String::new();
         let mut vector = Vec::new();
         let mut nprobe = 32usize;
-        let mut rerank = 3usize;
+        let mut rerank = 3.0f32;
 
         for inner in pair.into_inner() {
             match inner.as_rule() {
@@ -353,10 +353,9 @@ impl QueryLanguageParser {
                             if let Some(eq_pos) = param_str.find('=') {
                                 let name = &param_str[..eq_pos];
                                 let value = &param_str[eq_pos + 1..];
-                                let val: usize = value.parse().unwrap_or(0);
                                 match name {
-                                    "nprobe" => nprobe = val,
-                                    "rerank" => rerank = val,
+                                    "nprobe" => nprobe = value.parse().unwrap_or(0),
+                                    "rerank" => rerank = value.parse().unwrap_or(0.0),
                                     _ => {}
                                 }
                             }
@@ -787,7 +786,7 @@ mod tests {
             assert_eq!(field, "embedding");
             assert_eq!(vector, vec![1.0, 2.0, 3.0]);
             assert_eq!(nprobe, 32);
-            assert_eq!(rerank, 3); // default
+            assert_eq!(rerank, 3.0); // default
         } else {
             panic!("Expected Ann query, got: {:?}", result);
         }
