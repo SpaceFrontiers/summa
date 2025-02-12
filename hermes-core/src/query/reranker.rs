@@ -297,18 +297,48 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                 );
             }
 
-            // Phase 2b: keep top final_limit*2 by truncated score
-            let keep = (final_limit * 2).min(n);
+            // Phase 2b: diversity-aware selection — ensure at least final_limit
+            // unique documents survive the pre-filter. For saturating combiners
+            // (Max, WeightedTopK), cap per-doc vectors to avoid one multi-valued
+            // doc crowding out others.
+            let per_doc_cap: usize = match &config.combiner {
+                super::MultiValueCombiner::Max => 1,
+                super::MultiValueCombiner::WeightedTopK { k, .. } => *k,
+                _ => usize::MAX,
+            };
+
             let mut ranked: Vec<(usize, f32)> = (0..n).map(|i| (i, scores_buf[i])).collect();
             ranked.sort_unstable_by(|a, b| {
                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             });
-            ranked.truncate(keep);
+
+            let mut survivors: Vec<(usize, f32)> = Vec::with_capacity(n.min(final_limit * 4));
+            let mut doc_vector_counts: FxHashMap<usize, usize> = FxHashMap::default();
+            let mut unique_docs = 0usize;
+
+            for &(orig_idx, score) in &ranked {
+                let ci = resolved[orig_idx].0;
+                let count = doc_vector_counts.entry(ci).or_insert(0);
+
+                if *count >= per_doc_cap {
+                    continue;
+                }
+                if *count == 0 {
+                    unique_docs += 1;
+                }
+                *count += 1;
+                survivors.push((orig_idx, score));
+
+                // Stop once we have enough unique docs AND enough entries
+                if unique_docs >= final_limit && survivors.len() >= final_limit * 2 {
+                    break;
+                }
+            }
 
             // Phase 2c: full-dimension exact SIMD scoring on survivors only.
             // Score directly from raw_buf at original offsets — zero-copy.
-            all_scores.reserve(ranked.len());
-            for &(orig_idx, _) in &ranked {
+            all_scores.reserve(survivors.len());
+            for &(orig_idx, _) in &survivors {
                 let vec_start = orig_idx * vbs;
                 let mut score = 0.0f32;
                 score_batch_precomp(
@@ -323,14 +353,16 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                 all_scores.push((ci, ordinal, score));
             }
 
-            let filtered = n - ranked.len();
+            let filtered = n - survivors.len();
             log::debug!(
-                "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived (filtered {})",
+                "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived, {} unique docs (filtered {}, per_doc_cap={})",
                 trunc_dim,
                 query_dim,
-                ranked.len(),
+                survivors.len(),
+                unique_docs,
                 n,
-                filtered
+                filtered,
+                per_doc_cap
             );
         } else {
             // No pre-filter: full-dimension SIMD scoring on all candidates

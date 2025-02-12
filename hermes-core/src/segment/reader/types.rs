@@ -241,8 +241,12 @@ impl DimensionTable {
         self.max_weights.push(max_weight);
     }
 
-    /// Sort all arrays by dim_id (for binary search)
+    /// Sort all arrays by dim_id (for binary search).
+    /// Skips allocation when already sorted (the common case from builder/merger).
     pub fn sort_by_dim_id(&mut self) {
+        if self.dim_ids.windows(2).all(|w| w[0] <= w[1]) {
+            return;
+        }
         let mut indices: Vec<usize> = (0..self.dim_ids.len()).collect();
         indices.sort_unstable_by_key(|&i| self.dim_ids[i]);
         self.dim_ids = indices.iter().map(|&i| self.dim_ids[i]).collect();

@@ -103,7 +103,7 @@ pub(super) fn build_sparse_streaming(
         let serialized_dims: Vec<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> = dims
             .into_par_iter()
             .map(|(dim_id, mut postings)| {
-                if let Some(fraction) = pruning_fraction
+                let pruned = if let Some(fraction) = pruning_fraction
                     && postings.len() > 1
                     && fraction < 1.0
                 {
@@ -115,8 +115,15 @@ pub(super) fn build_sparse_streaming(
                     });
                     let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
                     postings.truncate(keep);
+                    true
+                } else {
+                    false
+                };
+                // Postings arrive in (doc_id, ordinal) order from sequential indexing;
+                // only re-sort if pruning destroyed that order.
+                if pruned {
+                    postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
                 }
-                postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
 
                 let weights: Vec<f32> = postings.iter().map(|(_, _, w)| w.abs()).collect();
                 let partition = optimal_partition(&weights);

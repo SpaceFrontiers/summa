@@ -414,28 +414,46 @@ impl<S: ScoringIterator> MaxScoreExecutor<S> {
             }
 
             // --- Group by ordinal and insert ---
-            ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
-            let mut j = 0;
-            while j < ordinal_scores.len() {
-                let current_ord = ordinal_scores[j].0;
-                let mut score = 0.0f32;
-                while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
-                    score += ordinal_scores[j].1;
-                    j += 1;
-                }
-
+            // Fast path: single entry (common for single-valued fields) — skip sort + grouping
+            if ordinal_scores.len() == 1 {
+                let (ord, score) = ordinal_scores[0];
                 trace!(
                     "Doc {}: ordinal={}, score={:.4}, threshold={:.4}",
-                    min_doc, current_ord, score, adjusted_threshold
+                    min_doc, ord, score, adjusted_threshold
                 );
-
-                if self
-                    .collector
-                    .insert_with_ordinal(min_doc, score, current_ord)
-                {
+                if self.collector.insert_with_ordinal(min_doc, score, ord) {
                     docs_scored += 1;
                 } else {
                     docs_skipped += 1;
+                }
+            } else if !ordinal_scores.is_empty() {
+                if ordinal_scores.len() > 2 {
+                    ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
+                } else if ordinal_scores[0].0 > ordinal_scores[1].0 {
+                    ordinal_scores.swap(0, 1);
+                }
+                let mut j = 0;
+                while j < ordinal_scores.len() {
+                    let current_ord = ordinal_scores[j].0;
+                    let mut score = 0.0f32;
+                    while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
+                        score += ordinal_scores[j].1;
+                        j += 1;
+                    }
+
+                    trace!(
+                        "Doc {}: ordinal={}, score={:.4}, threshold={:.4}",
+                        min_doc, current_ord, score, adjusted_threshold
+                    );
+
+                    if self
+                        .collector
+                        .insert_with_ordinal(min_doc, score, current_ord)
+                    {
+                        docs_scored += 1;
+                    } else {
+                        docs_skipped += 1;
+                    }
                 }
             }
         }
@@ -1495,22 +1513,36 @@ macro_rules! bms_execute_loop {
             }
 
             // --- Group by ordinal and insert ---
-            ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
-            let mut j = 0;
-            while j < ordinal_scores.len() {
-                let current_ord = ordinal_scores[j].0;
-                let mut score = 0.0f32;
-                while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
-                    score += ordinal_scores[j].1;
-                    j += 1;
-                }
-                if $self
-                    .collector
-                    .insert_with_ordinal(min_doc, score, current_ord)
-                {
+            // Fast path: single entry (common for single-valued fields) — skip sort + grouping
+            if ordinal_scores.len() == 1 {
+                let (ord, score) = ordinal_scores[0];
+                if $self.collector.insert_with_ordinal(min_doc, score, ord) {
                     docs_scored += 1;
                 } else {
                     docs_skipped += 1;
+                }
+            } else if !ordinal_scores.is_empty() {
+                if ordinal_scores.len() > 2 {
+                    ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
+                } else if ordinal_scores[0].0 > ordinal_scores[1].0 {
+                    ordinal_scores.swap(0, 1);
+                }
+                let mut j = 0;
+                while j < ordinal_scores.len() {
+                    let current_ord = ordinal_scores[j].0;
+                    let mut score = 0.0f32;
+                    while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
+                        score += ordinal_scores[j].1;
+                        j += 1;
+                    }
+                    if $self
+                        .collector
+                        .insert_with_ordinal(min_doc, score, current_ord)
+                    {
+                        docs_scored += 1;
+                    } else {
+                        docs_skipped += 1;
+                    }
                 }
             }
         }
