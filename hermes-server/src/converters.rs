@@ -67,11 +67,11 @@ pub fn convert_query(
             let tokenizer_name = schema
                 .get_field_entry(field)
                 .and_then(|entry| entry.tokenizer.as_deref())
-                .unwrap_or("lowercase");
+                .unwrap_or("simple");
 
             let tokenizer = TOKENIZER_REGISTRY
                 .get(tokenizer_name)
-                .unwrap_or_else(|| Box::new(hermes_core::LowercaseTokenizer));
+                .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
 
             let tokens: Vec<String> = tokenizer
                 .tokenize(&match_query.text)

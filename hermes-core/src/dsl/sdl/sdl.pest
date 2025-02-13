@@ -46,7 +46,7 @@ string_inner = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 // Examples:
 //   field title: text [indexed, stored]
 //   field body: text<en_stem> [indexed]
-//   field name: text<lowercase> [indexed, stored]
+//   field name: text<simple> [indexed, stored]
 //   field embedding: dense_vector<768> [indexed<rabitq>]
 //   field embedding: dense_vector<768> [indexed<ivf_rabitq, num_clusters: 256, nprobe: 32>]
 //   field embedding: dense_vector<768> [indexed<flat>]  # brute-force, no ANN index

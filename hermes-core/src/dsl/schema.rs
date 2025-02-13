@@ -390,7 +390,7 @@ impl SchemaBuilder {
             FieldType::Text,
             indexed,
             stored,
-            Some("lowercase".to_string()),
+            Some("simple".to_string()),
         )
     }
 

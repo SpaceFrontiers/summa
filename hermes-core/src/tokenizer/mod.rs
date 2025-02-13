@@ -53,30 +53,15 @@ pub trait Tokenizer: Send + Sync + Clone + 'static {
     fn tokenize(&self, text: &str) -> Vec<Token>;
 }
 
-/// Simple tokenizer — splits on whitespace and lowercases.
+/// Simple tokenizer — splits on whitespace, strips non-alphanumeric, and lowercases.
 ///
-/// Does NOT strip punctuation. "Hello, World!" → ["hello,", "world!"]
+/// "Hello, World!" → ["hello", "world"]
 #[derive(Debug, Clone, Default)]
 pub struct SimpleTokenizer;
 
 impl Tokenizer for SimpleTokenizer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
-        let mut tokens = Vec::with_capacity(text.len() / 5);
-        let mut position = 0u32;
-
-        for (offset, word) in split_whitespace_with_offsets(text) {
-            if !word.is_empty() {
-                tokens.push(Token::new(
-                    lowercase_word(word),
-                    position,
-                    offset,
-                    offset + word.len(),
-                ));
-                position += 1;
-            }
-        }
-
-        tokens
+        tokenize_and_clean(text, std::convert::identity)
     }
 }
 
@@ -126,25 +111,12 @@ impl Tokenizer for RawCiTokenizer {
     }
 }
 
-/// Lowercase tokenizer — splits on whitespace, strips non-alphanumeric, and lowercases.
-///
-/// "Hello, World!" → ["hello", "world"]
-#[derive(Debug, Clone, Default)]
-pub struct LowercaseTokenizer;
-
-impl Tokenizer for LowercaseTokenizer {
-    fn tokenize(&self, text: &str) -> Vec<Token> {
-        tokenize_and_clean(text, std::convert::identity)
-    }
-}
-
 /// Lowercase a word, preserving all characters (no stripping).
 ///
 /// ASCII fast-path avoids char decoding.
 #[inline]
 fn lowercase_word(word: &str) -> String {
     if word.is_ascii() {
-        // Fast check: already lowercase?
         if word.bytes().all(|b| !b.is_ascii_uppercase()) {
             return word.to_string();
         }
@@ -191,8 +163,8 @@ fn clean_word(word: &str) -> String {
 /// Shared tokenization logic: split on whitespace, clean (remove punctuation + lowercase),
 /// then apply a transform function to produce the final token text.
 ///
-/// The transform receives an owned `String` (the cleaned word) so that identity
-/// transforms (`LowercaseTokenizer`) avoid an extra allocation per token.
+/// Used by `SimpleTokenizer` (identity transform) and `StemmerTokenizer` (stem transform).
+/// The transform receives an owned `String` so identity transforms avoid extra allocations.
 fn tokenize_and_clean(text: &str, transform: impl Fn(String) -> String) -> Vec<Token> {
     let mut tokens = Vec::with_capacity(text.len() / 5);
     let mut position = 0u32;
@@ -530,7 +502,7 @@ impl Clone for BoxedTokenizer {
 /// Registry for named tokenizers
 ///
 /// Allows registering tokenizers by name and retrieving them for use during indexing.
-/// Pre-registers common tokenizers: "simple", "lowercase", "en_stem", etc.
+/// Pre-registers common tokenizers: "simple", "raw", "raw_ci", "en_stem", etc.
 #[derive(Clone)]
 pub struct TokenizerRegistry {
     tokenizers: Arc<RwLock<HashMap<String, BoxedTokenizer>>>,
@@ -550,7 +522,6 @@ impl TokenizerRegistry {
     fn register_defaults(&self) {
         // Basic tokenizers
         self.register("simple", SimpleTokenizer);
-        self.register("lowercase", LowercaseTokenizer);
         self.register("raw", RawTokenizer);
         self.register("raw_ci", RawCiTokenizer);
 
@@ -597,23 +568,23 @@ impl TokenizerRegistry {
         // Stop word filtered tokenizers (lowercase + stop words)
         self.register(
             "en_stop",
-            StopWordTokenizer::new(LowercaseTokenizer, Language::English),
+            StopWordTokenizer::new(SimpleTokenizer, Language::English),
         );
         self.register(
             "de_stop",
-            StopWordTokenizer::new(LowercaseTokenizer, Language::German),
+            StopWordTokenizer::new(SimpleTokenizer, Language::German),
         );
         self.register(
             "fr_stop",
-            StopWordTokenizer::new(LowercaseTokenizer, Language::French),
+            StopWordTokenizer::new(SimpleTokenizer, Language::French),
         );
         self.register(
             "ru_stop",
-            StopWordTokenizer::new(LowercaseTokenizer, Language::Russian),
+            StopWordTokenizer::new(SimpleTokenizer, Language::Russian),
         );
         self.register(
             "es_stop",
-            StopWordTokenizer::new(LowercaseTokenizer, Language::Spanish),
+            StopWordTokenizer::new(SimpleTokenizer, Language::Spanish),
         );
 
         // Stop word + stemming tokenizers
@@ -677,24 +648,13 @@ mod tests {
     #[test]
     fn test_simple_tokenizer() {
         let tokenizer = SimpleTokenizer;
-        // SimpleTokenizer: whitespace split + lowercase, preserves punctuation
-        let tokens = Tokenizer::tokenize(&tokenizer, "Hello, World!");
+        let tokens = Tokenizer::tokenize(&tokenizer, "Hello World");
 
         assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].text, "hello,");
+        assert_eq!(tokens[0].text, "hello");
         assert_eq!(tokens[0].position, 0);
-        assert_eq!(tokens[1].text, "world!");
+        assert_eq!(tokens[1].text, "world");
         assert_eq!(tokens[1].position, 1);
-    }
-
-    #[test]
-    fn test_simple_tokenizer_preserves_punctuation() {
-        let tokenizer = SimpleTokenizer;
-        let tokens = Tokenizer::tokenize(&tokenizer, "https://example.com/page");
-
-        // Single token — no whitespace to split on
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].text, "https://example.com/page");
     }
 
     #[test]
@@ -742,9 +702,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lowercase_tokenizer() {
-        let tokenizer = LowercaseTokenizer;
-        // LowercaseTokenizer: whitespace split + strip non-alnum + lowercase
+    fn test_simple_tokenizer_strips_punctuation() {
+        let tokenizer = SimpleTokenizer;
         let tokens = Tokenizer::tokenize(&tokenizer, "Hello, World!");
 
         assert_eq!(tokens.len(), 2);
@@ -865,7 +824,8 @@ mod tests {
 
         // Check default tokenizers are registered
         assert!(registry.contains("simple"));
-        assert!(registry.contains("lowercase"));
+        assert!(registry.contains("raw"));
+        assert!(registry.contains("raw_ci"));
         assert!(registry.contains("raw"));
         assert!(registry.contains("raw_ci"));
         assert!(registry.contains("en_stem"));
@@ -895,7 +855,7 @@ mod tests {
         let registry = TokenizerRegistry::new();
 
         // Register a custom tokenizer
-        registry.register("my_tokenizer", LowercaseTokenizer);
+        registry.register("my_tokenizer", SimpleTokenizer);
 
         assert!(registry.contains("my_tokenizer"));
         let tokenizer = registry.get("my_tokenizer").unwrap();
@@ -912,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_stop_word_tokenizer_english() {
-        let tokenizer = StopWordTokenizer::english(LowercaseTokenizer);
+        let tokenizer = StopWordTokenizer::english(SimpleTokenizer);
         let tokens = Tokenizer::tokenize(&tokenizer, "The quick brown fox jumps over the lazy dog");
 
         // "the", "over" are stop words and should be filtered
@@ -944,7 +904,7 @@ mod tests {
 
     #[test]
     fn test_stop_word_tokenizer_german() {
-        let tokenizer = StopWordTokenizer::new(LowercaseTokenizer, Language::German);
+        let tokenizer = StopWordTokenizer::new(SimpleTokenizer, Language::German);
         let tokens = Tokenizer::tokenize(&tokenizer, "Der Hund und die Katze");
 
         // "der", "und", "die" are German stop words
@@ -959,7 +919,7 @@ mod tests {
     #[test]
     fn test_stop_word_tokenizer_custom() {
         let custom_stops: HashSet<String> = ["foo", "bar"].iter().map(|s| s.to_string()).collect();
-        let tokenizer = StopWordTokenizer::with_custom_stop_words(LowercaseTokenizer, custom_stops);
+        let tokenizer = StopWordTokenizer::with_custom_stop_words(SimpleTokenizer, custom_stops);
         let tokens = Tokenizer::tokenize(&tokenizer, "foo baz bar qux");
 
         let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
@@ -971,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_stop_word_tokenizer_is_stop_word() {
-        let tokenizer = StopWordTokenizer::english(LowercaseTokenizer);
+        let tokenizer = StopWordTokenizer::english(SimpleTokenizer);
         assert!(tokenizer.is_stop_word("the"));
         assert!(tokenizer.is_stop_word("and"));
         assert!(tokenizer.is_stop_word("is"));

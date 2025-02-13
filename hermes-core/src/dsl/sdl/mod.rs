@@ -66,7 +66,7 @@ pub struct FieldDef {
     pub field_type: FieldType,
     pub indexed: bool,
     pub stored: bool,
-    /// Tokenizer name for text fields (e.g., "lowercase", "en_stem", "german")
+    /// Tokenizer name for text fields (e.g., "simple", "en_stem", "german")
     pub tokenizer: Option<String>,
     /// Whether this field can have multiple values (serialized as array in JSON)
     pub multi: bool,
@@ -98,7 +98,7 @@ impl IndexDef {
         for field in &self.fields {
             let f = match field.field_type {
                 FieldType::Text => {
-                    let tokenizer = field.tokenizer.as_deref().unwrap_or("lowercase");
+                    let tokenizer = field.tokenizer.as_deref().unwrap_or("simple");
                     builder.add_text_field_with_tokenizer(
                         &field.name,
                         field.indexed,
@@ -1008,7 +1008,7 @@ mod tests {
         let sdl = r#"
             index articles {
                 field title: text<en_stem> [indexed, stored]
-                field body: text<lowercase> [indexed]
+                field body: text<simple> [indexed]
                 field author: text [indexed, stored]
             }
         "#;
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(index.fields[0].tokenizer, Some("en_stem".to_string()));
 
         assert_eq!(index.fields[1].name, "body");
-        assert_eq!(index.fields[1].tokenizer, Some("lowercase".to_string()));
+        assert_eq!(index.fields[1].tokenizer, Some("simple".to_string()));
 
         assert_eq!(index.fields[2].name, "author");
         assert_eq!(index.fields[2].tokenizer, None); // No tokenizer specified

@@ -584,16 +584,16 @@ impl QueryLanguageParser {
     }
 
     fn get_tokenizer(&self, field: Field) -> BoxedTokenizer {
-        // Get tokenizer name from schema field entry, fallback to "lowercase"
+        // Get tokenizer name from schema field entry, fallback to "simple"
         let tokenizer_name = self
             .schema
             .get_field_entry(field)
             .and_then(|entry| entry.tokenizer.as_deref())
-            .unwrap_or("lowercase");
+            .unwrap_or("simple");
 
         self.tokenizers
             .get(tokenizer_name)
-            .unwrap_or_else(|| Box::new(crate::tokenizer::LowercaseTokenizer))
+            .unwrap_or_else(|| Box::new(crate::tokenizer::SimpleTokenizer))
     }
 }
 

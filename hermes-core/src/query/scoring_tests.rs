@@ -1288,8 +1288,8 @@ mod tests {
         // "httpsgithubcomrust". Each add_text() call for the same field adds
         // another value — all values get independently tokenized and indexed.
         let mut schema_builder = SchemaBuilder::default();
-        let uris = schema_builder.add_text_field_with_tokenizer("uris", true, true, "lowercase");
-        let title = schema_builder.add_text_field_with_tokenizer("title", true, true, "lowercase");
+        let uris = schema_builder.add_text_field_with_tokenizer("uris", true, true, "simple");
+        let title = schema_builder.add_text_field_with_tokenizer("title", true, true, "simple");
         schema_builder.set_default_fields(vec!["uris".to_string(), "title".to_string()]);
         let schema = schema_builder.build();
 
