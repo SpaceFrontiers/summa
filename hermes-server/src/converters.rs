@@ -67,7 +67,7 @@ pub fn convert_query(
             let tokenizer_name = schema
                 .get_field_entry(field)
                 .and_then(|entry| entry.tokenizer.as_deref())
-                .unwrap_or("default");
+                .unwrap_or("lowercase");
 
             let tokenizer = TOKENIZER_REGISTRY
                 .get(tokenizer_name)

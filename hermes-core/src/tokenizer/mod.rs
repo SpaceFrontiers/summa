@@ -59,7 +59,7 @@ pub struct SimpleTokenizer;
 
 impl Tokenizer for SimpleTokenizer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
-        let mut tokens = Vec::new();
+        let mut tokens = Vec::with_capacity(text.len() / 5);
         let mut position = 0u32;
 
         for (offset, word) in split_whitespace_with_offsets(text) {
@@ -84,7 +84,7 @@ pub struct LowercaseTokenizer;
 
 impl Tokenizer for LowercaseTokenizer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
-        tokenize_and_clean(text, |s| s.to_string())
+        tokenize_and_clean(text, std::convert::identity)
     }
 }
 
@@ -95,9 +95,17 @@ impl Tokenizer for LowercaseTokenizer {
 #[inline]
 fn clean_word(word: &str) -> String {
     if word.is_ascii() {
-        // ASCII fast path – byte iteration, no char decoding
-        let mut result = String::with_capacity(word.len());
-        for &b in word.as_bytes() {
+        let bytes = word.as_bytes();
+        // Super-fast path: word is already lowercase alphanumeric → single memcpy
+        if bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        {
+            return word.to_string();
+        }
+        // ASCII path – byte iteration, no char decoding
+        let mut result = String::with_capacity(bytes.len());
+        for &b in bytes {
             if b.is_ascii_alphanumeric() {
                 result.push(b.to_ascii_lowercase() as char);
             }
@@ -114,15 +122,18 @@ fn clean_word(word: &str) -> String {
 
 /// Shared tokenization logic: split on whitespace, clean (remove punctuation + lowercase),
 /// then apply a transform function to produce the final token text.
-fn tokenize_and_clean(text: &str, transform: impl Fn(&str) -> String) -> Vec<Token> {
-    let mut tokens = Vec::new();
+///
+/// The transform receives an owned `String` (the cleaned word) so that identity
+/// transforms (`LowercaseTokenizer`) avoid an extra allocation per token.
+fn tokenize_and_clean(text: &str, transform: impl Fn(String) -> String) -> Vec<Token> {
+    let mut tokens = Vec::with_capacity(text.len() / 5);
     let mut position = 0u32;
     for (offset, word) in split_whitespace_with_offsets(text) {
         if !word.is_empty() {
             let cleaned = clean_word(word);
             if !cleaned.is_empty() {
                 tokens.push(Token::new(
-                    transform(&cleaned),
+                    transform(cleaned),
                     position,
                     offset,
                     offset + word.len(),
@@ -260,7 +271,7 @@ impl<T: Tokenizer> Tokenizer for StopWordTokenizer<T> {
         self.inner
             .tokenize(text)
             .into_iter()
-            .filter(|token| !self.stop_words.contains(&token.text))
+            .filter(|token| !self.stop_words.contains(token.text.as_str()))
             .collect()
     }
 }
@@ -295,7 +306,7 @@ impl Default for StemmerTokenizer {
 impl Tokenizer for StemmerTokenizer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
         let stemmer = rust_stemmers::Stemmer::create(self.language.to_algorithm());
-        tokenize_and_clean(text, |s| stemmer.stem(s).into_owned())
+        tokenize_and_clean(text, |s| stemmer.stem(&s).into_owned())
     }
 }
 
@@ -317,7 +328,7 @@ impl MultiLanguageStemmer {
     /// Tokenize text using a specific language
     pub fn tokenize_with_language(&self, text: &str, language: Language) -> Vec<Token> {
         let stemmer = rust_stemmers::Stemmer::create(language.to_algorithm());
-        tokenize_and_clean(text, |s| stemmer.stem(s).into_owned())
+        tokenize_and_clean(text, |s| stemmer.stem(&s).into_owned())
     }
 
     /// Get the default language
@@ -451,7 +462,7 @@ impl Clone for BoxedTokenizer {
 /// Registry for named tokenizers
 ///
 /// Allows registering tokenizers by name and retrieving them for use during indexing.
-/// Pre-registers common tokenizers: "default", "simple", "lowercase", "en_stem", etc.
+/// Pre-registers common tokenizers: "simple", "lowercase", "en_stem", etc.
 #[derive(Clone)]
 pub struct TokenizerRegistry {
     tokenizers: Arc<RwLock<HashMap<String, BoxedTokenizer>>>,
@@ -470,7 +481,6 @@ impl TokenizerRegistry {
     /// Register default tokenizers
     fn register_defaults(&self) {
         // Basic tokenizers
-        self.register("default", LowercaseTokenizer);
         self.register("simple", SimpleTokenizer);
         self.register("lowercase", LowercaseTokenizer);
         self.register("raw", SimpleTokenizer);
@@ -729,7 +739,6 @@ mod tests {
         let registry = TokenizerRegistry::new();
 
         // Check default tokenizers are registered
-        assert!(registry.contains("default"));
         assert!(registry.contains("simple"));
         assert!(registry.contains("lowercase"));
         assert!(registry.contains("en_stem"));

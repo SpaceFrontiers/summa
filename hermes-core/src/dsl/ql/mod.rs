@@ -584,12 +584,12 @@ impl QueryLanguageParser {
     }
 
     fn get_tokenizer(&self, field: Field) -> BoxedTokenizer {
-        // Get tokenizer name from schema field entry, fallback to "default"
+        // Get tokenizer name from schema field entry, fallback to "lowercase"
         let tokenizer_name = self
             .schema
             .get_field_entry(field)
             .and_then(|entry| entry.tokenizer.as_deref())
-            .unwrap_or("default");
+            .unwrap_or("lowercase");
 
         self.tokenizers
             .get(tokenizer_name)
