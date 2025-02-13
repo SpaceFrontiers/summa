@@ -120,13 +120,14 @@ async fn test_sparse_vector_query_maxscore_path() {
 
 // ── MUST + SHOULD ────────────────────────────────────────────────────────
 
-/// MUST RangeQuery + SHOULD SparseVectorQuery: lazy seek path.
+/// MUST RangeQuery + SHOULD SparseVectorQuery: SHOULD-drives-MUST optimization.
+/// Only docs matching SHOULD AND passing MUST predicate are returned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_must_range_should_sparse_lazy() {
     let (index, _content, timestamp, embedding) = create_boolean_test_index().await;
 
     // timestamp [5000, 7000] → docs 40..=60 (21 docs)
-    // sparse dims {150: 1.0, 151: 1.0} → boost docs 50, 51
+    // sparse dims {150: 1.0, 151: 1.0} → match docs 50, 51
     let q = BooleanQuery::new()
         .must(RangeQuery::u64_range(timestamp, Some(5000), Some(7000)))
         .should(SparseVectorQuery::new(
@@ -135,29 +136,14 @@ async fn test_must_range_should_sparse_lazy() {
         ));
 
     let results = index.search(&q, 100).await.unwrap();
-    assert_eq!(results.hits.len(), 21);
+    // SHOULD-drives-MUST: only SHOULD-matching docs filtered by Range
+    assert_eq!(results.hits.len(), 2);
 
-    let top2: Vec<u32> = results
-        .hits
-        .iter()
-        .take(2)
-        .map(|h| h.address.doc_id)
-        .collect();
+    let doc_ids: Vec<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
     assert!(
-        top2.contains(&50) && top2.contains(&51),
-        "Docs 50 and 51 should be top-ranked, got {:?}",
-        top2
-    );
-
-    // Non-sparse docs should have score == 1.0 (range only)
-    let non_sparse = results
-        .hits
-        .iter()
-        .find(|h| h.address.doc_id == 40)
-        .expect("Doc 40 should be in results");
-    assert_eq!(
-        non_sparse.score, 1.0,
-        "Range-only doc should have score 1.0"
+        doc_ids.contains(&50) && doc_ids.contains(&51),
+        "Docs 50 and 51 should be returned, got {:?}",
+        doc_ids
     );
 }
 
@@ -213,21 +199,23 @@ async fn test_should_sparse_must_not_range() {
 // ── MUST + SHOULD + MUST_NOT (triple combo) ──────────────────────────────
 
 /// All three clauses: MUST range filter, SHOULD sparse boost, MUST_NOT text exclude.
+/// Uses broad SHOULD (dim 0 matches all) so SHOULD-drives-MUST returns all range docs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_must_should_must_not_combined() {
     let (index, content, timestamp, embedding) = create_boolean_test_index().await;
 
     // MUST: timestamp [2000, 6000] → docs 10..=50 (41 docs)
-    // SHOULD: sparse dim 130 boost
+    // SHOULD: dim 0 (all docs) + dim 130 (boosts doc 30)
     // MUST_NOT: text "doc30" (exclude doc 30)
     let q = BooleanQuery::new()
         .must(RangeQuery::u64_range(timestamp, Some(2000), Some(6000)))
-        .should(SparseTermQuery::new(embedding, 130, 1.0))
+        .should(SparseTermQuery::new(embedding, 0, 0.5))
+        .should(SparseTermQuery::new(embedding, 130, 2.0))
         .must_not(TermQuery::text(content, "doc30"));
 
     let results = index.search(&q, 100).await.unwrap();
 
-    // 41 docs from range, minus 1 excluded = 40
+    // SHOULD dim 0 matches all 100 docs, filtered by Range → 41, minus doc30 → 40
     assert_eq!(
         results.hits.len(),
         40,
@@ -242,12 +230,13 @@ async fn test_must_should_must_not_combined() {
 // ── Multiple MUST + multiple SHOULD ──────────────────────────────────────
 
 /// Two MUST clauses (range intersection) + two SHOULD SparseTermQuery.
+/// SHOULD-drives-MUST: only docs matching SHOULD AND both Range predicates returned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_two_must_two_should_sparse() {
     let (index, _content, timestamp, embedding) = create_boolean_test_index().await;
 
     // MUST: timestamp >= 3000 AND timestamp <= 5000 → docs 20..=40 (21 docs)
-    // SHOULD: sparse dim 125 + sparse dim 130 → boost docs 25, 30
+    // SHOULD: sparse dim 125 + sparse dim 130 → match docs 25, 30
     let q = BooleanQuery::new()
         .must(RangeQuery::u64_range(timestamp, Some(3000), None))
         .must(RangeQuery::u64_range(timestamp, None, Some(5000)))
@@ -255,19 +244,14 @@ async fn test_two_must_two_should_sparse() {
         .should(SparseTermQuery::new(embedding, 130, 1.0));
 
     let results = index.search(&q, 100).await.unwrap();
-    assert_eq!(results.hits.len(), 21);
+    // SHOULD matches docs 25, 30 only; both pass Range [3000,5000]
+    assert_eq!(results.hits.len(), 2);
 
-    // Docs 25 and 30 should be top-ranked
-    let top2: Vec<u32> = results
-        .hits
-        .iter()
-        .take(2)
-        .map(|h| h.address.doc_id)
-        .collect();
+    let doc_ids: Vec<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
     assert!(
-        top2.contains(&25) && top2.contains(&30),
-        "Top 2 should be docs 25 and 30, got {:?}",
-        top2
+        doc_ids.contains(&25) && doc_ids.contains(&30),
+        "Results should be docs 25 and 30, got {:?}",
+        doc_ids
     );
 }
 

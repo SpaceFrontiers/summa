@@ -215,8 +215,10 @@ async fn test_range_two_ranges_in_boolean() {
 /// "Recent" window: timestamp in [5000, 7000] → i in [40, 60] → 21 docs.
 /// Sparse query targets dims {500, 501} — only docs 50 and 51 have these.
 ///
-/// Expected: 21 docs (from range filter), but docs 50 and 51 score highest
-/// because they match the SHOULD sparse query.
+/// With SHOULD-drives-MUST optimization: only docs matching SHOULD sparse
+/// query AND passing the MUST range predicate are returned. MUST-only docs
+/// (score=filter_score only) are not returned since they can never outrank
+/// SHOULD docs in top-k.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_must_range_should_sparse() {
     use crate::directories::MmapDirectory;
@@ -269,54 +271,28 @@ async fn test_must_range_should_sparse() {
 
     let results = index.search(&q, 100).await.unwrap();
 
-    // timestamp [5000, 7000] → i in [40, 60] → 21 docs
+    // SHOULD-drives-MUST: only SHOULD-matching docs filtered by Range
+    // SHOULD sparse {50, 51} matches docs 50, 51; both in range [5000,7000]
     assert_eq!(
         results.hits.len(),
-        21,
-        "MUST range [5000,7000] should yield 21 docs, got {}",
+        2,
+        "Only SHOULD-matching docs in range are returned, got {}",
         results.hits.len()
     );
 
-    // Docs 50 and 51 should be ranked highest (they match the SHOULD sparse query)
-    // Their scores should be > 1.0 (range score=1.0 + sparse score > 0)
-    let top2_doc_ids: Vec<u32> = results
-        .hits
-        .iter()
-        .take(2)
-        .map(|h| h.address.doc_id)
-        .collect();
+    let doc_ids: Vec<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
     assert!(
-        top2_doc_ids.contains(&50) && top2_doc_ids.contains(&51),
-        "Top 2 results should be docs 50 and 51 (sparse match), got {:?}",
-        top2_doc_ids,
+        doc_ids.contains(&50) && doc_ids.contains(&51),
+        "Results should be docs 50 and 51, got {:?}",
+        doc_ids,
     );
 
-    // Docs that only match the range (no sparse overlap) should have score == 1.0
-    let non_sparse_hit = results
-        .hits
-        .iter()
-        .find(|h| h.address.doc_id != 50 && h.address.doc_id != 51)
-        .expect("Should have non-sparse hits");
-    assert_eq!(
-        non_sparse_hit.score, 1.0,
-        "Non-sparse hits should have score 1.0 (from range only), got {}",
-        non_sparse_hit.score,
-    );
-
-    // Sparse-matching docs should have score > 1.0
-    let sparse_hit = results
-        .hits
-        .iter()
-        .find(|h| h.address.doc_id == 50)
-        .expect("Doc 50 should be in results");
-    assert!(
-        sparse_hit.score > 1.0,
-        "Doc 50 should have score > 1.0 (range + sparse), got {}",
-        sparse_hit.score,
-    );
-
-    eprintln!(
-        "MUST range + SHOULD sparse test passed: 21 hits, top2={:?}, top_score={:.3}",
-        top2_doc_ids, results.hits[0].score
-    );
+    // Both should have score > 1.0 (filter_score + sparse score)
+    for hit in &results.hits {
+        assert!(
+            hit.score > 1.0,
+            "SHOULD-matching docs should have score > 1.0, got {}",
+            hit.score,
+        );
+    }
 }

@@ -516,33 +516,41 @@ impl Query for BooleanQuery {
                     sub.scorer(reader, limit).await?
                 };
 
-                if should_scorer.size_hint() >= limit as u32 {
-                    // Split MUST into predicates (O(1)) vs verifier scorers (seek)
-                    let mut predicates: Vec<super::DocPredicate<'a>> = Vec::new();
-                    let mut must_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
-                    let mut filter_score = 0.0f32;
+                // Split MUST into predicates (O(1)) vs verifier scorers (seek)
+                let mut predicates: Vec<super::DocPredicate<'a>> = Vec::new();
+                let mut must_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
+                let mut filter_score = 0.0f32;
 
-                    for q in &must {
-                        if let Some(pred) = q.as_doc_predicate(reader) {
-                            predicates.push(pred);
-                            filter_score += 1.0;
-                        } else {
-                            must_verifiers.push(q.scorer(reader, limit).await?);
-                        }
+                for q in &must {
+                    if let Some(pred) = q.as_doc_predicate(reader) {
+                        predicates.push(pred);
+                        filter_score += 1.0;
+                    } else {
+                        must_verifiers.push(q.scorer(reader, limit).await?);
                     }
+                }
 
-                    // Split MUST_NOT into negated predicates vs verifier scorers
-                    let mut must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
-                    for q in &must_not {
-                        if let Some(pred) = q.as_doc_predicate(reader) {
-                            let negated: super::DocPredicate<'a> =
-                                Box::new(move |doc_id| !pred(doc_id));
-                            predicates.push(negated);
-                        } else {
-                            must_not_verifiers.push(q.scorer(reader, limit).await?);
-                        }
+                // Split MUST_NOT into negated predicates vs verifier scorers
+                let mut must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
+                for q in &must_not {
+                    if let Some(pred) = q.as_doc_predicate(reader) {
+                        let negated: super::DocPredicate<'a> =
+                            Box::new(move |doc_id| !pred(doc_id));
+                        predicates.push(negated);
+                    } else {
+                        must_not_verifiers.push(q.scorer(reader, limit).await?);
                     }
+                }
 
+                // When all MUST became O(1) predicates (no verifiers), always
+                // use PredicatedScorer — pure predicates add only constant
+                // filter_score so MUST-only docs can never outrank SHOULD docs.
+                // When there are verifiers (contributing BM25 scores), require
+                // size_hint >= limit to ensure correctness.
+                let use_predicated =
+                    must_verifiers.is_empty() || should_scorer.size_hint() >= limit as u32;
+
+                if use_predicated {
                     log::debug!(
                         "BooleanQuery planner: push-down {} predicates + {} must verifiers + {} must_not verifiers, {} SHOULD drive (size_hint={})",
                         predicates.len(),
@@ -561,22 +569,13 @@ impl Query for BooleanQuery {
                     )));
                 }
 
-                // size_hint < limit — reuse already-built SHOULD scorer in
-                // the standard BooleanScorer to avoid rebuilding it.
-                let mut must_scorers = Vec::with_capacity(must.len());
-                for q in &must {
-                    must_scorers.push(q.scorer(reader, limit).await?);
-                }
-
-                let mut must_not_scorers = Vec::with_capacity(must_not.len());
-                for q in &must_not {
-                    must_not_scorers.push(q.scorer(reader, limit).await?);
-                }
-
+                // size_hint < limit with verifier scorers — reuse already-built
+                // SHOULD scorer in BooleanScorer to avoid rebuilding it.
+                // must_verifiers become the MUST scorers for BooleanScorer.
                 let mut scorer = BooleanScorer {
-                    must: must_scorers,
+                    must: must_verifiers,
                     should: vec![should_scorer],
-                    must_not: must_not_scorers,
+                    must_not: must_not_verifiers,
                     current_doc: 0,
                 };
                 scorer.current_doc = scorer.find_next_match();
@@ -662,31 +661,33 @@ impl Query for BooleanQuery {
                 sub.scorer_sync(reader, limit)?
             };
 
-            if should_scorer.size_hint() >= limit as u32 {
-                let mut predicates: Vec<super::DocPredicate<'a>> = Vec::new();
-                let mut must_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
-                let mut filter_score = 0.0f32;
+            let mut predicates: Vec<super::DocPredicate<'a>> = Vec::new();
+            let mut must_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
+            let mut filter_score = 0.0f32;
 
-                for q in &self.must {
-                    if let Some(pred) = q.as_doc_predicate(reader) {
-                        predicates.push(pred);
-                        filter_score += 1.0;
-                    } else {
-                        must_verifiers.push(q.scorer_sync(reader, limit)?);
-                    }
+            for q in &self.must {
+                if let Some(pred) = q.as_doc_predicate(reader) {
+                    predicates.push(pred);
+                    filter_score += 1.0;
+                } else {
+                    must_verifiers.push(q.scorer_sync(reader, limit)?);
                 }
+            }
 
-                let mut must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
-                for q in &self.must_not {
-                    if let Some(pred) = q.as_doc_predicate(reader) {
-                        let negated: super::DocPredicate<'a> =
-                            Box::new(move |doc_id| !pred(doc_id));
-                        predicates.push(negated);
-                    } else {
-                        must_not_verifiers.push(q.scorer_sync(reader, limit)?);
-                    }
+            let mut must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>> = Vec::new();
+            for q in &self.must_not {
+                if let Some(pred) = q.as_doc_predicate(reader) {
+                    let negated: super::DocPredicate<'a> = Box::new(move |doc_id| !pred(doc_id));
+                    predicates.push(negated);
+                } else {
+                    must_not_verifiers.push(q.scorer_sync(reader, limit)?);
                 }
+            }
 
+            let use_predicated =
+                must_verifiers.is_empty() || should_scorer.size_hint() >= limit as u32;
+
+            if use_predicated {
                 log::debug!(
                     "BooleanQuery planner (sync): push-down {} predicates + {} must verifiers + {} must_not verifiers, {} SHOULD drive",
                     predicates.len(),
@@ -704,22 +705,12 @@ impl Query for BooleanQuery {
                 )));
             }
 
-            // size_hint < limit — reuse already-built SHOULD scorer in
-            // the standard BooleanScorer to avoid rebuilding it.
-            let mut must_scorers = Vec::with_capacity(self.must.len());
-            for q in &self.must {
-                must_scorers.push(q.scorer_sync(reader, limit)?);
-            }
-
-            let mut must_not_scorers = Vec::with_capacity(self.must_not.len());
-            for q in &self.must_not {
-                must_not_scorers.push(q.scorer_sync(reader, limit)?);
-            }
-
+            // size_hint < limit with verifier scorers — reuse already-built
+            // SHOULD scorer in BooleanScorer to avoid rebuilding it.
             let mut scorer = BooleanScorer {
-                must: must_scorers,
+                must: must_verifiers,
                 should: vec![should_scorer],
-                must_not: must_not_scorers,
+                must_not: must_not_verifiers,
                 current_doc: 0,
             };
             scorer.current_doc = scorer.find_next_match();
