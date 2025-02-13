@@ -68,9 +68,19 @@ impl MergeInventory {
         // Check for overlap with any active merge
         for id in &segment_ids {
             if inner.contains(id) {
+                log::debug!(
+                    "[merge_inventory] rejected: {} overlaps with active merge ({} active IDs)",
+                    id,
+                    inner.len()
+                );
                 return None;
             }
         }
+        log::debug!(
+            "[merge_inventory] registered {} IDs (total active: {})",
+            segment_ids.len(),
+            inner.len() + segment_ids.len()
+        );
         for id in &segment_ids {
             inner.insert(id.clone());
         }
@@ -301,10 +311,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Evaluate merge policy and spawn background merges for all eligible candidates.
     ///
-    /// Single lock scope: builds segment list AND calls find_merges atomically
-    /// to prevent stale-list races with concurrent replace_segments.
-    /// Segments already involved in active merges are excluded from policy evaluation
-    /// so the policy only sees truly available segments.
+    /// **Atomicity**: The entire filter → find_merges → spawn_merge sequence runs
+    /// under the `state` lock to prevent a TOCTOU race where concurrent callers
+    /// both see segments as eligible before either registers them in the inventory.
+    /// `spawn_merge` is non-blocking (just `try_register` + `tokio::spawn`), so
+    /// holding the state lock through it is safe and sub-microsecond.
     ///
     /// Note: `max_concurrent_merges` is a soft limit — concurrent auto-triggers
     /// may briefly exceed it by one or two due to TOCTOU between slot counting
@@ -322,13 +333,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             return;
         }
 
-        let candidates = {
+        // Hold state lock through spawn_merge to make filter + register atomic.
+        // This closes the TOCTOU window where concurrent maybe_merge calls could
+        // both see the same segments as eligible before either registers them.
+        let new_handles = {
             let st = self.state.lock().await;
 
             // Exclude segments that are pending deletion OR already in an active merge.
-            // Without the in-merge filter, the policy would generate candidates that
-            // overlap with running merges (rejected by try_register) and miss valid
-            // merges of the remaining free segments.
             let segments: Vec<SegmentInfo> = st
                 .metadata
                 .segment_metas
@@ -344,28 +355,31 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             log::debug!("[maybe_merge] {} eligible segments", segments.len());
 
-            st.merge_policy.find_merges(&segments)
+            let candidates = st.merge_policy.find_merges(&segments);
+
+            if candidates.is_empty() {
+                return;
+            }
+
+            log::debug!(
+                "[maybe_merge] {} merge candidates, {} slots available",
+                candidates.len(),
+                slots_available
+            );
+
+            let mut handles = Vec::new();
+            for c in candidates {
+                if handles.len() >= slots_available {
+                    break;
+                }
+                if let Some(h) = self.spawn_merge(c.segment_ids) {
+                    handles.push(h);
+                }
+            }
+            handles
+            // state lock released here — after spawn_merge registered IDs in inventory
         };
 
-        if candidates.is_empty() {
-            return;
-        }
-
-        log::debug!(
-            "[maybe_merge] {} merge candidates, {} slots available",
-            candidates.len(),
-            slots_available
-        );
-
-        let mut new_handles = Vec::new();
-        for c in candidates {
-            if new_handles.len() >= slots_available {
-                break;
-            }
-            if let Some(h) = self.spawn_merge(c.segment_ids) {
-                new_handles.push(h);
-            }
-        }
         if !new_handles.is_empty() {
             self.merge_handles.lock().await.extend(new_handles);
         }
