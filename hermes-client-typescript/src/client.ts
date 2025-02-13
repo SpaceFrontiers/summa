@@ -12,6 +12,7 @@ import {
   SearchServiceDefinition,
   IndexServiceDefinition,
   FieldValue as PbFieldValue,
+  FieldValueList as PbFieldValueList,
   FieldEntry as PbFieldEntry,
   Query as PbQuery,
   MultiValueCombiner,
@@ -240,7 +241,7 @@ export class HermesClient {
       },
       score: hit.score,
       fields: Object.fromEntries(
-        Object.entries(hit.fields).map(([k, v]) => [k, fromFieldValue(v)])
+        Object.entries(hit.fields).map(([k, v]) => [k, fromFieldValueList(v)])
       ),
     }));
 
@@ -273,7 +274,7 @@ export class HermesClient {
         },
       });
       const fields = Object.fromEntries(
-        Object.entries(response.fields).map(([k, v]) => [k, fromFieldValue(v)])
+        Object.entries(response.fields).map(([k, v]) => [k, fromFieldValueList(v)])
       );
       return { fields };
     } catch (err: any) {
@@ -500,4 +501,10 @@ function fromFieldValue(fv: PbFieldValue): any {
     return Array.from(fv.denseVector.values);
   }
   return null;
+}
+
+function fromFieldValueList(fvl: PbFieldValueList): any {
+  const values = fvl.values.map(fromFieldValue);
+  if (values.length === 1) return values[0];
+  return values;
 }

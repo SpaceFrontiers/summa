@@ -398,7 +398,7 @@ class HermesClient:
                     doc_id=hit.address.doc_id,
                 ),
                 score=hit.score,
-                fields={k: _from_field_value(v) for k, v in hit.fields.items()},
+                fields={k: _from_field_value_list(v) for k, v in hit.fields.items()},
             )
             for hit in response.hits
         ]
@@ -439,7 +439,7 @@ class HermesClient:
         )
         try:
             response = await self._search_stub.GetDocument(request)
-            fields = {k: _from_field_value(v) for k, v in response.fields.items()}
+            fields = {k: _from_field_value_list(v) for k, v in response.fields.items()}
             return Document(fields=fields)
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.NOT_FOUND:
@@ -590,6 +590,18 @@ def _from_field_value(fv: pb.FieldValue) -> Any:
     elif which == "dense_vector":
         return list(fv.dense_vector.values)
     return None
+
+
+def _from_field_value_list(fvl: pb.FieldValueList) -> Any:
+    """Convert protobuf FieldValueList to Python value.
+
+    Single-value fields are unwrapped to a scalar.
+    Multi-value fields are returned as a list.
+    """
+    values = [_from_field_value(v) for v in fvl.values]
+    if len(values) == 1:
+        return values[0]
+    return values
 
 
 _COMBINER_MAP: dict[str, int] = {

@@ -110,7 +110,7 @@ impl SearchService for SearchServiceImpl {
         // Convert to response with optional field loading
         let mut hits = Vec::new();
         for result in results {
-            let mut fields = HashMap::new();
+            let mut fields: HashMap<String, FieldValueList> = HashMap::new();
 
             if !req.fields_to_load.is_empty() {
                 let doc = searcher
@@ -123,10 +123,12 @@ impl SearchService for SearchServiceImpl {
 
                 if let Some(doc) = doc {
                     for field_name in &req.fields_to_load {
-                        if let Some(field) = searcher.schema().get_field(field_name)
-                            && let Some(value) = doc.get_first(field)
-                        {
-                            fields.insert(field_name.clone(), convert_field_value(value));
+                        if let Some(field) = searcher.schema().get_field(field_name) {
+                            let values: Vec<_> =
+                                doc.get_all(field).map(convert_field_value).collect();
+                            if !values.is_empty() {
+                                fields.insert(field_name.clone(), FieldValueList { values });
+                            }
                         }
                     }
                 }
@@ -200,10 +202,14 @@ impl SearchService for SearchServiceImpl {
             .map_err(|e| Status::internal(format!("Failed to get document: {}", e)))?
             .ok_or_else(|| Status::not_found("Document not found"))?;
 
-        let mut fields = HashMap::new();
+        let mut fields: HashMap<String, FieldValueList> = HashMap::new();
         for (field, value) in doc.field_values() {
             if let Some(entry) = index.schema().get_field_entry(*field) {
-                fields.insert(entry.name.clone(), convert_field_value(value));
+                fields
+                    .entry(entry.name.clone())
+                    .or_insert_with(|| FieldValueList { values: Vec::new() })
+                    .values
+                    .push(convert_field_value(value));
             }
         }
 

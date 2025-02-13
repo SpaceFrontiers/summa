@@ -161,8 +161,13 @@ message DocAddress {
 message SearchHit {
   DocAddress address = 1;
   float score = 2;
-  map<string, FieldValue> fields = 3;
+  map<string, FieldValueList> fields = 3;
   repeated OrdinalScore ordinal_scores = 4;  // Per-ordinal scores for multi-value fields
+}
+
+// List of field values — supports multi-value fields (e.g. multiple URIs per document)
+message FieldValueList {
+  repeated FieldValue values = 1;
 }
 
 // Score contribution from a specific ordinal in a multi-valued field
@@ -217,7 +222,7 @@ message GetDocumentRequest {
 }
 
 message GetDocumentResponse {
-  map<string, FieldValue> fields = 1;
+  map<string, FieldValueList> fields = 1;
 }
 
 // Index info request/response
