@@ -406,7 +406,7 @@ pub async fn collect_segment_with_limit<C: Collector>(
     collector: &mut C,
     limit: usize,
 ) -> Result<()> {
-    let mut scorer = query.scorer(reader, limit, None).await?;
+    let mut scorer = query.scorer(reader, limit).await?;
     drive_scorer(scorer.as_mut(), collector);
     Ok(())
 }
@@ -472,7 +472,7 @@ pub fn collect_segment_with_limit_sync<C: Collector>(
     collector: &mut C,
     limit: usize,
 ) -> Result<()> {
-    let mut scorer = query.scorer_sync(reader, limit, None)?;
+    let mut scorer = query.scorer_sync(reader, limit)?;
     drive_scorer(scorer.as_mut(), collector);
     Ok(())
 }

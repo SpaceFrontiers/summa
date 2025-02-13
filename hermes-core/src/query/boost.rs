@@ -32,16 +32,11 @@ impl BoostQuery {
 }
 
 impl Query for BoostQuery {
-    fn scorer<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        limit: usize,
-        predicate: Option<super::DocPredicate<'a>>,
-    ) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let inner = self.inner.clone();
         let boost = self.boost;
         Box::pin(async move {
-            let inner_scorer = inner.scorer(reader, limit, predicate).await?;
+            let inner_scorer = inner.scorer(reader, limit).await?;
             Ok(Box::new(BoostScorer {
                 inner: inner_scorer,
                 boost,
@@ -54,9 +49,8 @@ impl Query for BoostQuery {
         &self,
         reader: &'a SegmentReader,
         limit: usize,
-        predicate: Option<super::DocPredicate<'a>>,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        let inner_scorer = self.inner.scorer_sync(reader, limit, predicate)?;
+        let inner_scorer = self.inner.scorer_sync(reader, limit)?;
         Ok(Box::new(BoostScorer {
             inner: inner_scorer,
             boost: self.boost,
@@ -74,13 +68,9 @@ struct BoostScorer<'a> {
     boost: f32,
 }
 
-impl Scorer for BoostScorer<'_> {
+impl super::docset::DocSet for BoostScorer<'_> {
     fn doc(&self) -> DocId {
         self.inner.doc()
-    }
-
-    fn score(&self) -> Score {
-        self.inner.score() * self.boost
     }
 
     fn advance(&mut self) -> DocId {
@@ -93,5 +83,11 @@ impl Scorer for BoostScorer<'_> {
 
     fn size_hint(&self) -> u32 {
         self.inner.size_hint()
+    }
+}
+
+impl Scorer for BoostScorer<'_> {
+    fn score(&self) -> Score {
+        self.inner.score() * self.boost
     }
 }

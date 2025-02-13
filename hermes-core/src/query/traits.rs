@@ -8,16 +8,6 @@ use std::pin::Pin;
 use crate::segment::SegmentReader;
 use crate::{DocId, Result, Score};
 
-/// Filter predicate checked per-doc during scoring.
-///
-/// Fast-field lookups are O(1) per doc — no bitset needed.
-/// Passed through the query tree so executors (MaxScore, BMP) can reject
-/// filtered documents *inside* the scoring loop, before they enter the heap.
-#[cfg(not(target_arch = "wasm32"))]
-pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + Send + Sync + 'a>;
-#[cfg(target_arch = "wasm32")]
-pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + 'a>;
-
 /// BM25 parameters
 #[derive(Debug, Clone, Copy)]
 pub struct Bm25Params {
@@ -54,6 +44,24 @@ pub struct TermQueryInfo {
     pub term: Vec<u8>,
 }
 
+/// Info for MaxScore-optimizable sparse term queries
+#[derive(Debug, Clone, Copy)]
+pub struct SparseTermQueryInfo {
+    /// Sparse vector field
+    pub field: crate::dsl::Field,
+    /// Dimension ID in the sparse vector
+    pub dim_id: u32,
+    /// Query weight for this dimension
+    pub weight: f32,
+    /// MaxScore heap factor (1.0 = exact, lower = approximate)
+    pub heap_factor: f32,
+    /// Multi-value combiner for ordinal deduplication
+    pub combiner: super::MultiValueCombiner,
+    /// Multiplier on executor limit to compensate for ordinal deduplication
+    /// (1.0 = exact, 2.0 = fetch 2x then combine down)
+    pub over_fetch_factor: f32,
+}
+
 /// Matched positions for a field (field_id, list of scored positions)
 /// Each position includes its individual score contribution
 pub type MatchedPositions = Vec<(u32, Vec<super::ScoredPosition>)>;
@@ -77,7 +85,6 @@ macro_rules! define_query_traits {
                 &self,
                 reader: &'a SegmentReader,
                 limit: usize,
-                predicate: Option<DocPredicate<'a>>,
             ) -> ScorerFuture<'a>;
 
             /// Estimated number of matching documents in a segment (async)
@@ -92,9 +99,8 @@ macro_rules! define_query_traits {
                 &self,
                 reader: &'a SegmentReader,
                 limit: usize,
-                predicate: Option<DocPredicate<'a>>,
             ) -> Result<Box<dyn Scorer + 'a>> {
-                let _ = (reader, limit, predicate);
+                let _ = (reader, limit);
                 Err(crate::error::Error::Query(
                     "sync scorer not supported for this query type".into(),
                 ))
@@ -106,24 +112,18 @@ macro_rules! define_query_traits {
             fn as_term_query_info(&self) -> Option<TermQueryInfo> {
                 None
             }
+
+            /// Return sparse term info if this is a single-dimension sparse query
+            /// eligible for MaxScore optimization
+            fn as_sparse_term_query_info(&self) -> Option<SparseTermQueryInfo> {
+                None
+            }
         }
 
-        /// Scorer that iterates over matching documents and computes scores
-        pub trait Scorer: $($send_bounds)* {
-            /// Current document ID, or TERMINATED if exhausted
-            fn doc(&self) -> DocId;
-
+        /// Scored document stream: a DocSet that also provides scores.
+        pub trait Scorer: super::docset::DocSet + $($send_bounds)* {
             /// Score for current document
             fn score(&self) -> Score;
-
-            /// Advance to next document
-            fn advance(&mut self) -> DocId;
-
-            /// Seek to first doc >= target
-            fn seek(&mut self, target: DocId) -> DocId;
-
-            /// Size hint for remaining documents
-            fn size_hint(&self) -> u32;
 
             /// Get matched positions for the current document (if available)
             /// Returns (field_id, positions) pairs where positions are encoded as per PositionMode
@@ -141,13 +141,8 @@ define_query_traits!(Send + Sync);
 define_query_traits!();
 
 impl Query for Box<dyn Query> {
-    fn scorer<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        limit: usize,
-        predicate: Option<DocPredicate<'a>>,
-    ) -> ScorerFuture<'a> {
-        (**self).scorer(reader, limit, predicate)
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        (**self).scorer(reader, limit)
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
@@ -158,27 +153,26 @@ impl Query for Box<dyn Query> {
         (**self).as_term_query_info()
     }
 
+    fn as_sparse_term_query_info(&self) -> Option<SparseTermQueryInfo> {
+        (**self).as_sparse_term_query_info()
+    }
+
     #[cfg(feature = "sync")]
     fn scorer_sync<'a>(
         &self,
         reader: &'a SegmentReader,
         limit: usize,
-        predicate: Option<DocPredicate<'a>>,
     ) -> Result<Box<dyn Scorer + 'a>> {
-        (**self).scorer_sync(reader, limit, predicate)
+        (**self).scorer_sync(reader, limit)
     }
 }
 
 /// Empty scorer for terms that don't exist
 pub struct EmptyScorer;
 
-impl Scorer for EmptyScorer {
+impl super::docset::DocSet for EmptyScorer {
     fn doc(&self) -> DocId {
         crate::structures::TERMINATED
-    }
-
-    fn score(&self) -> Score {
-        0.0
     }
 
     fn advance(&mut self) -> DocId {
@@ -191,5 +185,11 @@ impl Scorer for EmptyScorer {
 
     fn size_hint(&self) -> u32 {
         0
+    }
+}
+
+impl Scorer for EmptyScorer {
+    fn score(&self) -> Score {
+        0.0
     }
 }

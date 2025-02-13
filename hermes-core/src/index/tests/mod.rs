@@ -1,5 +1,6 @@
 mod basic;
-mod filter;
+mod boolean;
 mod merge;
+mod range;
 mod search;
 mod vector;

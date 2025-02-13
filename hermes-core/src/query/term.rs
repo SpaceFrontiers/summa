@@ -61,12 +61,7 @@ impl TermQuery {
 }
 
 impl Query for TermQuery {
-    fn scorer<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        _limit: usize,
-        _predicate: Option<super::DocPredicate<'a>>,
-    ) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let term = self.term.clone();
         let global_stats = self.global_stats.clone();
@@ -136,7 +131,6 @@ impl Query for TermQuery {
         &self,
         reader: &'a SegmentReader,
         _limit: usize,
-        _predicate: Option<super::DocPredicate<'a>>,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         let postings = reader.get_postings_sync(self.field, &self.term)?;
 
@@ -229,16 +223,9 @@ impl TermScorer {
     }
 }
 
-impl Scorer for TermScorer {
+impl super::docset::DocSet for TermScorer {
     fn doc(&self) -> DocId {
         self.iterator.doc()
-    }
-
-    fn score(&self) -> Score {
-        let tf = self.iterator.term_freq() as f32;
-        // Note: Using tf as doc_len proxy since we don't store per-doc field lengths.
-        // This is a common approximation - longer docs tend to have higher TF.
-        super::bm25f_score(tf, self.idf, tf, self.avg_field_len, self.field_boost)
     }
 
     fn advance(&mut self) -> DocId {
@@ -251,6 +238,15 @@ impl Scorer for TermScorer {
 
     fn size_hint(&self) -> u32 {
         0
+    }
+}
+
+impl Scorer for TermScorer {
+    fn score(&self) -> Score {
+        let tf = self.iterator.term_freq() as f32;
+        // Note: Using tf as doc_len proxy since we don't store per-doc field lengths.
+        // This is a common approximation - longer docs tend to have higher TF.
+        super::bm25f_score(tf, self.idf, tf, self.avg_field_len, self.field_boost)
     }
 
     fn matched_positions(&self) -> Option<super::MatchedPositions> {

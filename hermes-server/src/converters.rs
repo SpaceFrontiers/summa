@@ -47,6 +47,15 @@ pub fn convert_query(
             let field = schema
                 .get_field(&term_query.field)
                 .ok_or_else(|| format!("Field '{}' not found", term_query.field))?;
+            let entry = schema.get_field_entry(field);
+            if let Some(e) = entry
+                && e.field_type != hermes_core::FieldType::Text
+            {
+                return Err(format!(
+                    "TermQuery requires a text field, but '{}' is {:?}. Use RangeQuery for numeric fields.",
+                    term_query.field, e.field_type
+                ));
+            }
             Ok(Box::new(TermQuery::text(field, &term_query.term)))
         }
         Some(ProtoQueryType::Match(match_query)) => {
@@ -90,20 +99,7 @@ pub fn convert_query(
             Ok(Box::new(query))
         }
         Some(ProtoQueryType::Boolean(bool_query)) => {
-            let mut bq = BooleanQuery::new();
-            for q in &bool_query.must {
-                let inner = convert_query(q, schema, global_stats)?;
-                bq.must.push(inner.into());
-            }
-            for q in &bool_query.should {
-                let inner = convert_query(q, schema, global_stats)?;
-                bq.should.push(inner.into());
-            }
-            for q in &bool_query.must_not {
-                let inner = convert_query(q, schema, global_stats)?;
-                bq.must_not.push(inner.into());
-            }
-            Ok(Box::new(bq))
+            convert_boolean_query(bool_query, schema, global_stats)
         }
         Some(ProtoQueryType::Boost(boost_query)) => {
             let inner = boost_query
@@ -162,18 +158,26 @@ pub fn convert_query(
                         // Use real IDF from global index statistics
                         if let Some(stats) = global_stats {
                             let idf_weights = stats.sparse_idf_weights(field, &token_ids);
-                            debug!(
-                                "Sparse IDF (global stats): field={}, total_docs={}, token_ids={:?}, idf={:?}",
-                                sv_query.field,
-                                stats.total_docs(),
-                                token_ids,
-                                idf_weights,
-                            );
-                            token_counts
+                            let final_weights: Vec<f32> = token_counts
                                 .iter()
                                 .zip(idf_weights.iter())
                                 .map(|((_, count), idf)| *count as f32 * idf)
-                                .collect()
+                                .collect();
+                            let paired: Vec<_> = token_ids
+                                .iter()
+                                .zip(final_weights.iter())
+                                .map(|(id, w)| {
+                                    let tok = tokenizer.id_to_token(*id).unwrap_or_default();
+                                    format!("({:?},{},{:.4})", tok, id, w)
+                                })
+                                .collect();
+                            debug!(
+                                "Sparse IDF (global stats): field={}, total_docs={}, tokens=[{}]",
+                                sv_query.field,
+                                stats.total_docs(),
+                                paired.join(", "),
+                            );
+                            final_weights
                         } else {
                             warn!(
                                 "Sparse IDF: no global_stats available for field={}, falling back to count",
@@ -194,9 +198,18 @@ pub fn convert_query(
                                 .iter()
                                 .map(|&(id, count)| count as f32 * idf_weights.get(id))
                                 .collect();
+                            let paired: Vec<_> = token_ids
+                                .iter()
+                                .zip(weights.iter())
+                                .map(|(id, w)| {
+                                    let tok = tokenizer.id_to_token(*id).unwrap_or_default();
+                                    format!("({:?},{},{:.4})", tok, id, w)
+                                })
+                                .collect();
                             debug!(
-                                "Sparse IDF (idf.json): tokenizer={}, tokens={:?}, weights={:?}",
-                                tokenizer_name, token_ids, weights,
+                                "Sparse IDF (idf.json): tokenizer={}, tokens=[{}]",
+                                tokenizer_name,
+                                paired.join(", "),
                             );
                             weights
                         } else {
@@ -290,8 +303,87 @@ pub fn convert_query(
             query = query.with_combiner(combiner);
             Ok(Box::new(query))
         }
+        Some(ProtoQueryType::Range(range_query)) => convert_range_query(range_query, schema),
         None => Err("Query type is required".to_string()),
     }
+}
+
+/// Convert a BooleanQuery. MUST/SHOULD/MUST_NOT clauses are mapped to
+/// the corresponding BooleanQuery fields. Intersection between MUST clauses
+/// (including term filters and vector queries) is handled by BooleanScorer's
+/// DocSet-based seek optimization.
+fn convert_boolean_query(
+    bool_query: &proto::BooleanQuery,
+    schema: &Schema,
+    global_stats: Option<&LazyGlobalStats>,
+) -> Result<Box<dyn Query>, String> {
+    let mut bq = BooleanQuery::new();
+    for q in &bool_query.must {
+        let inner = convert_query(q, schema, global_stats)?;
+        bq.must.push(inner.into());
+    }
+    for q in &bool_query.should {
+        let inner = convert_query(q, schema, global_stats)?;
+        bq.should.push(inner.into());
+    }
+    for q in &bool_query.must_not {
+        let inner = convert_query(q, schema, global_stats)?;
+        bq.must_not.push(inner.into());
+    }
+    Ok(Box::new(bq))
+}
+
+/// Convert a RangeQuery from proto to core.
+///
+/// Detects the type from which bounds are set:
+/// - min_u64/max_u64 → U64 range
+/// - min_i64/max_i64 → I64 range
+/// - min_f64/max_f64 → F64 range
+///   Field must have fast=true in the schema.
+fn convert_range_query(rq: &proto::RangeQuery, schema: &Schema) -> Result<Box<dyn Query>, String> {
+    use hermes_core::query::{RangeBound, RangeQuery};
+
+    let field = schema
+        .get_field(&rq.field)
+        .ok_or_else(|| format!("Range query field '{}' not found", rq.field))?;
+
+    let entry = schema
+        .get_field_entry(field)
+        .ok_or_else(|| format!("Field entry for '{}' not found", rq.field))?;
+
+    if !entry.fast {
+        return Err(format!(
+            "Range query field '{}' must have fast=true in schema",
+            rq.field
+        ));
+    }
+
+    // Detect which type of bounds are provided
+    let bound = if rq.min_u64.is_some() || rq.max_u64.is_some() {
+        RangeBound::U64 {
+            min: rq.min_u64,
+            max: rq.max_u64,
+        }
+    } else if rq.min_i64.is_some() || rq.max_i64.is_some() {
+        RangeBound::I64 {
+            min: rq.min_i64,
+            max: rq.max_i64,
+        }
+    } else if rq.min_f64.is_some() || rq.max_f64.is_some() {
+        RangeBound::F64 {
+            min: rq.min_f64,
+            max: rq.max_f64,
+        }
+    } else {
+        // No bounds specified — match all docs that have a value (exists check)
+        // Use full u64 range which excludes FAST_FIELD_MISSING
+        RangeBound::U64 {
+            min: None,
+            max: None,
+        }
+    };
+
+    Ok(Box::new(RangeQuery::new(field, bound)))
 }
 
 pub fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
@@ -420,79 +512,6 @@ pub fn convert_reranker(
         unit_norm,
         matryoshka_dims,
     })
-}
-
-/// Convert proto filters to core FastFieldFilter conditions.
-pub fn convert_filters(
-    filters: &[proto::Filter],
-    schema: &Schema,
-) -> Result<Vec<hermes_core::query::FastFieldFilter>, String> {
-    use hermes_core::query::fast_filter::{FastFieldCondition, FastFieldFilter};
-
-    let mut result = Vec::with_capacity(filters.len());
-
-    for filter in filters {
-        let field = schema
-            .get_field(&filter.field)
-            .ok_or_else(|| format!("Filter field '{}' not found in schema", filter.field))?;
-
-        let entry = schema
-            .get_field_entry(field)
-            .ok_or_else(|| format!("Filter field '{}' has no entry", filter.field))?;
-
-        if !entry.fast {
-            return Err(format!(
-                "Filter field '{}' does not have fast=true in schema",
-                filter.field
-            ));
-        }
-
-        let condition = match &filter.condition {
-            Some(proto::filter::Condition::EqU64(v)) => FastFieldCondition::EqU64(*v),
-            Some(proto::filter::Condition::EqI64(v)) => FastFieldCondition::EqI64(*v),
-            Some(proto::filter::Condition::EqF64(v)) => FastFieldCondition::EqF64(*v),
-            Some(proto::filter::Condition::EqText(v)) => FastFieldCondition::EqText(v.clone()),
-            Some(proto::filter::Condition::Range(r)) => {
-                // Determine range type from field type
-                match entry.field_type {
-                    hermes_core::dsl::FieldType::U64 => FastFieldCondition::RangeU64 {
-                        min: r.min.map(|v| v as u64),
-                        max: r.max.map(|v| v as u64),
-                    },
-                    hermes_core::dsl::FieldType::I64 => FastFieldCondition::RangeI64 {
-                        min: r.min.map(|v| v as i64),
-                        max: r.max.map(|v| v as i64),
-                    },
-                    hermes_core::dsl::FieldType::F64 => FastFieldCondition::RangeF64 {
-                        min: r.min,
-                        max: r.max,
-                    },
-                    _ => {
-                        return Err(format!(
-                            "Range filter not supported for field type {:?}",
-                            entry.field_type
-                        ));
-                    }
-                }
-            }
-            Some(proto::filter::Condition::InValues(inv)) => {
-                if !inv.text_values.is_empty() {
-                    FastFieldCondition::InText(inv.text_values.clone())
-                } else if !inv.u64_values.is_empty() {
-                    FastFieldCondition::InU64(inv.u64_values.clone())
-                } else if !inv.i64_values.is_empty() {
-                    FastFieldCondition::InI64(inv.i64_values.clone())
-                } else {
-                    return Err("InFilter has no values".to_string());
-                }
-            }
-            None => FastFieldCondition::Exists,
-        };
-
-        result.push(FastFieldFilter { field, condition });
-    }
-
-    Ok(result)
 }
 
 pub fn convert_proto_to_document(

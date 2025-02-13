@@ -170,12 +170,7 @@ impl DenseVectorQuery {
 }
 
 impl Query for DenseVectorQuery {
-    fn scorer<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        limit: usize,
-        _predicate: Option<super::DocPredicate<'a>>,
-    ) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let vector = self.vector.clone();
         let nprobe = self.nprobe;
@@ -195,7 +190,6 @@ impl Query for DenseVectorQuery {
         &self,
         reader: &'a SegmentReader,
         limit: usize,
-        _predicate: Option<super::DocPredicate<'a>>,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         let results = reader.search_dense_vector_sync(
             self.field,
@@ -221,7 +215,9 @@ struct DenseVectorScorer {
 }
 
 impl DenseVectorScorer {
-    fn new(results: Vec<VectorSearchResult>, field_id: u32) -> Self {
+    fn new(mut results: Vec<VectorSearchResult>, field_id: u32) -> Self {
+        // Sort by doc_id ascending — DocSet contract requires monotonic doc IDs
+        results.sort_unstable_by_key(|r| r.doc_id);
         Self {
             results,
             position: 0,
@@ -230,20 +226,12 @@ impl DenseVectorScorer {
     }
 }
 
-impl Scorer for DenseVectorScorer {
+impl super::docset::DocSet for DenseVectorScorer {
     fn doc(&self) -> DocId {
         if self.position < self.results.len() {
             self.results[self.position].doc_id
         } else {
             TERMINATED
-        }
-    }
-
-    fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
         }
     }
 
@@ -253,14 +241,25 @@ impl Scorer for DenseVectorScorer {
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
-        while self.doc() < target && self.doc() != TERMINATED {
-            self.advance();
-        }
+        // Binary search within remaining results for O(log k) seek
+        let remaining = &self.results[self.position..];
+        let offset = remaining.partition_point(|r| r.doc_id < target);
+        self.position += offset;
         self.doc()
     }
 
     fn size_hint(&self) -> u32 {
         (self.results.len() - self.position) as u32
+    }
+}
+
+impl Scorer for DenseVectorScorer {
+    fn score(&self) -> Score {
+        if self.position < self.results.len() {
+            self.results[self.position].score
+        } else {
+            0.0
+        }
     }
 
     fn matched_positions(&self) -> Option<MatchedPositions> {
@@ -299,6 +298,10 @@ pub struct SparseVectorQuery {
     /// indexing-time `pruning`: sort by abs(weight) descending,
     /// keep top fraction. None or 1.0 = no pruning.
     pub pruning: Option<f32>,
+    /// Multiplier on executor limit for ordinal deduplication (1.0 = no over-fetch)
+    pub over_fetch_factor: f32,
+    /// Cached pruned vector; None = use `vector` as-is (no pruning applied)
+    pruned: Option<Vec<(u32, f32)>>,
 }
 
 impl SparseVectorQuery {
@@ -317,12 +320,28 @@ impl SparseVectorQuery {
             weight_threshold: 0.0,
             max_query_dims: None,
             pruning: None,
+            over_fetch_factor: 2.0,
+            pruned: None,
         }
+    }
+
+    /// Effective query dimensions after pruning. Returns `vector` if no pruning is configured.
+    fn pruned_dims(&self) -> &[(u32, f32)] {
+        self.pruned.as_deref().unwrap_or(&self.vector)
     }
 
     /// Set the multi-value score combiner
     pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
         self.combiner = combiner;
+        self
+    }
+
+    /// Set executor over-fetch factor for multi-valued fields.
+    /// After MaxScore execution, ordinal combining may reduce result count;
+    /// this multiplier compensates by fetching more from the executor.
+    /// (1.0 = no over-fetch, 2.0 = fetch 2x then combine down)
+    pub fn with_over_fetch_factor(mut self, factor: f32) -> Self {
+        self.over_fetch_factor = factor.max(1.0);
         self
     }
 
@@ -341,12 +360,14 @@ impl SparseVectorQuery {
     /// Dimensions with abs(weight) below this are dropped before search.
     pub fn with_weight_threshold(mut self, threshold: f32) -> Self {
         self.weight_threshold = threshold;
+        self.pruned = Some(self.compute_pruned_vector());
         self
     }
 
     /// Set maximum number of query dimensions (top-k by weight)
     pub fn with_max_query_dims(mut self, max_dims: usize) -> Self {
         self.max_query_dims = Some(max_dims);
+        self.pruned = Some(self.compute_pruned_vector());
         self
     }
 
@@ -354,11 +375,12 @@ impl SparseVectorQuery {
     /// Same semantics as indexing-time `pruning`.
     pub fn with_pruning(mut self, fraction: f32) -> Self {
         self.pruning = Some(fraction.clamp(0.0, 1.0));
+        self.pruned = Some(self.compute_pruned_vector());
         self
     }
 
     /// Apply weight_threshold, pruning, and max_query_dims, returning the pruned vector.
-    fn pruned_vector(&self) -> Vec<(u32, f32)> {
+    fn compute_pruned_vector(&self) -> Vec<(u32, f32)> {
         let original_len = self.vector.len();
 
         // Step 1: weight_threshold — drop dimensions below minimum weight
@@ -405,9 +427,16 @@ impl SparseVectorQuery {
         }
 
         if v.len() < original_len {
+            let src: Vec<_> = self
+                .vector
+                .iter()
+                .map(|(d, w)| format!("({},{:.4})", d, w))
+                .collect();
+            let pruned_fmt: Vec<_> = v.iter().map(|(d, w)| format!("({},{:.4})", d, w)).collect();
             log::debug!(
                 "[sparse query] field={}: pruned {}->{} dims \
-                 (threshold: {}->{}, pruning: {}->{}, max_dims: {}->{})",
+                 (threshold: {}->{}, pruning: {}->{}, max_dims: {}->{}), \
+                 source=[{}], pruned=[{}]",
                 self.field.0,
                 original_len,
                 v.len(),
@@ -417,12 +446,9 @@ impl SparseVectorQuery {
                 after_pruning,
                 after_pruning,
                 v.len(),
+                src.join(", "),
+                pruned_fmt.join(", "),
             );
-            if log::log_enabled!(log::Level::Trace) {
-                for (dim, w) in &v {
-                    log::trace!("  dim={}, weight={:.4}", dim, w);
-                }
-            }
         }
 
         v
@@ -581,24 +607,49 @@ impl SparseVectorQuery {
     }
 }
 
-impl Query for SparseVectorQuery {
-    fn scorer<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        limit: usize,
-        _predicate: Option<super::DocPredicate<'a>>,
-    ) -> ScorerFuture<'a> {
-        let field = self.field;
-        let vector = self.pruned_vector();
-        let combiner = self.combiner;
-        let heap_factor = self.heap_factor;
-        Box::pin(async move {
-            let results = reader
-                .search_sparse_vector(field, &vector, limit, combiner, heap_factor)
-                .await?;
+impl SparseVectorQuery {
+    /// Build the inner query for this sparse vector search against a segment.
+    /// Filters pruned dims to those present in the segment, then returns:
+    /// - None if no dims match
+    /// - A single SparseTermQuery if one dim matches
+    /// - A BooleanQuery of SHOULD SparseTermQuery clauses otherwise
+    fn build_inner_query(&self, reader: &SegmentReader) -> Option<Box<dyn Query>> {
+        let si = reader.sparse_index(self.field)?;
+        let matched: Vec<(u32, f32)> = self
+            .pruned_dims()
+            .iter()
+            .filter(|(d, _)| si.has_dimension(*d))
+            .copied()
+            .collect();
+        if matched.is_empty() {
+            return None;
+        }
 
-            Ok(Box::new(SparseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)
-        })
+        let make_term = |(dim_id, weight)| {
+            SparseTermQuery::new(self.field, dim_id, weight)
+                .with_heap_factor(self.heap_factor)
+                .with_combiner(self.combiner)
+                .with_over_fetch_factor(self.over_fetch_factor)
+        };
+
+        if matched.len() == 1 {
+            return Some(Box::new(make_term(matched[0])));
+        }
+
+        let mut bool_q = super::BooleanQuery::new();
+        for dims in matched {
+            bool_q = bool_q.should(make_term(dims));
+        }
+        Some(Box::new(bool_q))
+    }
+}
+
+impl Query for SparseVectorQuery {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        match self.build_inner_query(reader) {
+            None => Box::pin(async { Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer>) }),
+            Some(q) => q.scorer(reader, limit),
+        }
     }
 
     #[cfg(feature = "sync")]
@@ -606,17 +657,11 @@ impl Query for SparseVectorQuery {
         &self,
         reader: &'a SegmentReader,
         limit: usize,
-        _predicate: Option<super::DocPredicate<'a>>,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        let vector = self.pruned_vector();
-        let results = reader.search_sparse_vector_sync(
-            self.field,
-            &vector,
-            limit,
-            self.combiner,
-            self.heap_factor,
-        )?;
-        Ok(Box::new(SparseVectorScorer::new(results, self.field.0)) as Box<dyn Scorer>)
+        match self.build_inner_query(reader) {
+            None => Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
+            Some(q) => q.scorer_sync(reader, limit),
+        }
     }
 
     fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
@@ -624,67 +669,188 @@ impl Query for SparseVectorQuery {
     }
 }
 
-/// Scorer for sparse vector search results with ordinal tracking
-struct SparseVectorScorer {
-    results: Vec<VectorSearchResult>,
-    position: usize,
+// ── SparseTermQuery: single sparse dimension query (like TermQuery for text) ──
+
+/// Query for a single sparse vector dimension.
+///
+/// Analogous to `TermQuery` for text: searches one dimension's posting list
+/// with a given weight. Multiple `SparseTermQuery` instances are combined as
+/// `BooleanQuery` SHOULD clauses to form a full sparse vector search.
+#[derive(Debug, Clone)]
+pub struct SparseTermQuery {
+    pub field: Field,
+    pub dim_id: u32,
+    pub weight: f32,
+    /// MaxScore heap factor (1.0 = exact, lower = approximate)
+    pub heap_factor: f32,
+    /// Multi-value combiner for ordinal deduplication
+    pub combiner: MultiValueCombiner,
+    /// Multiplier on executor limit to compensate for ordinal deduplication
+    pub over_fetch_factor: f32,
+}
+
+impl SparseTermQuery {
+    pub fn new(field: Field, dim_id: u32, weight: f32) -> Self {
+        Self {
+            field,
+            dim_id,
+            weight,
+            heap_factor: 1.0,
+            combiner: MultiValueCombiner::default(),
+            over_fetch_factor: 2.0,
+        }
+    }
+
+    pub fn with_heap_factor(mut self, heap_factor: f32) -> Self {
+        self.heap_factor = heap_factor;
+        self
+    }
+
+    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
+        self.combiner = combiner;
+        self
+    }
+
+    pub fn with_over_fetch_factor(mut self, factor: f32) -> Self {
+        self.over_fetch_factor = factor.max(1.0);
+        self
+    }
+
+    /// Create a SparseTermScorer from this query's config against a segment.
+    /// Returns EmptyScorer if the dimension doesn't exist.
+    fn make_scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+    ) -> crate::Result<Option<SparseTermScorer<'a>>> {
+        let si = match reader.sparse_index(self.field) {
+            Some(si) => si,
+            None => return Ok(None),
+        };
+        let (skip_start, skip_count, global_max, block_data_offset) =
+            match si.get_skip_range_full(self.dim_id) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+        let cursor = super::TermCursor::sparse(
+            si,
+            self.weight,
+            skip_start,
+            skip_count,
+            global_max,
+            block_data_offset,
+        );
+        Ok(Some(SparseTermScorer {
+            cursor,
+            field_id: self.field.0,
+        }))
+    }
+}
+
+impl Query for SparseTermQuery {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+        let query = self.clone();
+        Box::pin(async move {
+            let mut scorer = match query.make_scorer(reader)? {
+                Some(s) => s,
+                None => return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
+            };
+            scorer.cursor.ensure_block_loaded().await.ok();
+            Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
+        })
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        _limit: usize,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let mut scorer = match self.make_scorer(reader)? {
+            Some(s) => s,
+            None => return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
+        };
+        scorer.cursor.ensure_block_loaded_sync().ok();
+        Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
+    }
+
+    fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
+        let field = self.field;
+        let dim_id = self.dim_id;
+        Box::pin(async move {
+            let si = match reader.sparse_index(field) {
+                Some(si) => si,
+                None => return Ok(0),
+            };
+            match si.get_skip_range_full(dim_id) {
+                Some((_, skip_count, _, _)) => Ok((skip_count * 256) as u32),
+                None => Ok(0),
+            }
+        })
+    }
+
+    fn as_sparse_term_query_info(&self) -> Option<super::SparseTermQueryInfo> {
+        Some(super::SparseTermQueryInfo {
+            field: self.field,
+            dim_id: self.dim_id,
+            weight: self.weight,
+            heap_factor: self.heap_factor,
+            combiner: self.combiner,
+            over_fetch_factor: self.over_fetch_factor,
+        })
+    }
+}
+
+/// Lazy scorer for a single sparse dimension, backed by `TermCursor::Sparse`.
+///
+/// Iterates through the posting list block-by-block using sync I/O.
+/// Score for each doc = `query_weight * quantized_stored_weight`.
+struct SparseTermScorer<'a> {
+    cursor: super::TermCursor<'a>,
     field_id: u32,
 }
 
-impl SparseVectorScorer {
-    fn new(results: Vec<VectorSearchResult>, field_id: u32) -> Self {
-        Self {
-            results,
-            position: 0,
-            field_id,
-        }
-    }
-}
-
-impl Scorer for SparseVectorScorer {
+impl super::docset::DocSet for SparseTermScorer<'_> {
     fn doc(&self) -> DocId {
-        if self.position < self.results.len() {
-            self.results[self.position].doc_id
-        } else {
-            TERMINATED
-        }
-    }
-
-    fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
-        }
+        let d = self.cursor.doc();
+        if d == u32::MAX { TERMINATED } else { d }
     }
 
     fn advance(&mut self) -> DocId {
-        self.position += 1;
-        self.doc()
+        match self.cursor.advance_sync() {
+            Ok(d) if d == u32::MAX => TERMINATED,
+            Ok(d) => d,
+            Err(_) => TERMINATED,
+        }
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
-        while self.doc() < target && self.doc() != TERMINATED {
-            self.advance();
+        match self.cursor.seek_sync(target) {
+            Ok(d) if d == u32::MAX => TERMINATED,
+            Ok(d) => d,
+            Err(_) => TERMINATED,
         }
-        self.doc()
     }
 
     fn size_hint(&self) -> u32 {
-        (self.results.len() - self.position) as u32
+        0
+    }
+}
+
+impl Scorer for SparseTermScorer<'_> {
+    fn score(&self) -> Score {
+        self.cursor.score()
     }
 
     fn matched_positions(&self) -> Option<MatchedPositions> {
-        if self.position >= self.results.len() {
+        let ordinal = self.cursor.ordinal();
+        let score = self.cursor.score();
+        if score == 0.0 {
             return None;
         }
-        let result = &self.results[self.position];
-        let scored_positions: Vec<ScoredPosition> = result
-            .ordinals
-            .iter()
-            .map(|(ordinal, score)| ScoredPosition::new(*ordinal, *score))
-            .collect();
-        Some(vec![(self.field_id, scored_positions)])
+        Some(vec![(
+            self.field_id,
+            vec![ScoredPosition::new(ordinal as u32, score)],
+        )])
     }
 }
 

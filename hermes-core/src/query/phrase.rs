@@ -78,12 +78,7 @@ impl PhraseQuery {
 }
 
 impl Query for PhraseQuery {
-    fn scorer<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        limit: usize,
-        predicate: Option<super::DocPredicate<'a>>,
-    ) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let terms = self.terms.clone();
         let slop = self.slop;
@@ -97,7 +92,7 @@ impl Query for PhraseQuery {
             // Single term - delegate to TermQuery
             if terms.len() == 1 {
                 let term_query = super::TermQuery::new(field, terms[0].clone());
-                return term_query.scorer(reader, limit, predicate).await;
+                return term_query.scorer(reader, limit).await;
             }
 
             // Check if positions are available
@@ -107,7 +102,7 @@ impl Query for PhraseQuery {
                 for term in &terms {
                     bool_query = bool_query.must(super::TermQuery::new(field, term.clone()));
                 }
-                return bool_query.scorer(reader, limit, predicate).await;
+                return bool_query.scorer(reader, limit).await;
             }
 
             // Load postings and positions for all terms (parallel per term)
@@ -160,7 +155,6 @@ impl Query for PhraseQuery {
         &self,
         reader: &'a SegmentReader,
         limit: usize,
-        predicate: Option<super::DocPredicate<'a>>,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         if self.terms.is_empty() {
             return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>);
@@ -168,7 +162,7 @@ impl Query for PhraseQuery {
 
         if self.terms.len() == 1 {
             let term_query = super::TermQuery::new(self.field, self.terms[0].clone());
-            return term_query.scorer_sync(reader, limit, predicate);
+            return term_query.scorer_sync(reader, limit);
         }
 
         if !reader.has_positions(self.field) {
@@ -176,7 +170,7 @@ impl Query for PhraseQuery {
             for term in &self.terms {
                 bool_query = bool_query.must(super::TermQuery::new(self.field, term.clone()));
             }
-            return bool_query.scorer_sync(reader, limit, predicate);
+            return bool_query.scorer_sync(reader, limit);
         }
 
         let mut term_postings: Vec<BlockPostingList> = Vec::with_capacity(self.terms.len());
@@ -397,25 +391,9 @@ impl PhraseScorer {
     }
 }
 
-impl Scorer for PhraseScorer {
+impl super::docset::DocSet for PhraseScorer {
     fn doc(&self) -> DocId {
         self.current_doc
-    }
-
-    fn score(&self) -> Score {
-        if self.current_doc == TERMINATED {
-            return 0.0;
-        }
-
-        // Sum term frequencies for BM25 scoring
-        let tf: f32 = self
-            .posting_iters
-            .iter()
-            .map(|it| it.term_freq() as f32)
-            .sum();
-
-        // Phrase matches get a boost since they're more precise
-        super::bm25_score(tf, self.idf, tf, self.avg_field_len) * 1.5
     }
 
     fn advance(&mut self) -> DocId {
@@ -441,5 +419,23 @@ impl Scorer for PhraseScorer {
 
     fn size_hint(&self) -> u32 {
         0
+    }
+}
+
+impl Scorer for PhraseScorer {
+    fn score(&self) -> Score {
+        if self.current_doc == TERMINATED {
+            return 0.0;
+        }
+
+        // Sum term frequencies for BM25 scoring
+        let tf: f32 = self
+            .posting_iters
+            .iter()
+            .map(|it| it.term_freq() as f32)
+            .sum();
+
+        // Phrase matches get a boost since they're more precise
+        super::bm25_score(tf, self.idf, tf, self.avg_field_len) * 1.5
     }
 }

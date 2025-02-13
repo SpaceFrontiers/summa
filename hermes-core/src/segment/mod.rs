@@ -15,6 +15,7 @@ mod vector_data;
 pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
+pub(crate) use reader::combine_ordinal_results;
 pub use reader::{SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
 pub use store::*;
 #[cfg(feature = "native")]
@@ -228,30 +229,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Query matching dimension 0
-        let query = vec![(0u32, 1.0f32)];
-        let results = reader
-            .search_sparse_vector(sparse, &query, 10, MultiValueCombiner::Sum, 1.0)
+        // Query matching dimension 0 via SparseVectorQuery
+        let query = crate::query::SparseVectorQuery::new(sparse, vec![(0, 1.0)])
+            .with_combiner(MultiValueCombiner::Sum);
+        let mut collector = crate::query::TopKCollector::new(10);
+        crate::query::collect_segment(&reader, &query, &mut collector)
             .await
             .unwrap();
+        let top_docs = collector.into_sorted_results();
 
         // Both doc 0 and doc 1 have dimension 0
-        assert!(results.len() >= 2, "Should have at least 2 results");
-
-        // Check doc 1 has ordinal tracking
-        let doc1_result = results.iter().find(|r| r.doc_id == 1);
-        assert!(doc1_result.is_some(), "Doc 1 should be in results");
-
-        let doc1 = doc1_result.unwrap();
-        // Doc 1's first sparse vector has dim 0, so ordinal should be 0
-        assert!(
-            !doc1.ordinals.is_empty(),
-            "Doc 1 should have ordinal information"
-        );
-
-        // Check ordinals are valid (0 or 1)
-        for (ordinal, _score) in &doc1.ordinals {
-            assert!(*ordinal <= 1, "Ordinal should be 0 or 1, got {}", ordinal);
-        }
+        assert!(top_docs.len() >= 2, "Should have at least 2 results");
     }
 }

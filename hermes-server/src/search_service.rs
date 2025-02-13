@@ -6,9 +6,7 @@ use std::time::Instant;
 
 use tonic::{Request, Response, Status};
 
-use crate::converters::{
-    convert_field_value, convert_filters, convert_query, convert_reranker, schema_to_sdl,
-};
+use crate::converters::{convert_field_value, convert_query, convert_reranker, schema_to_sdl};
 use crate::proto::search_service_server::SearchService;
 use crate::proto::*;
 use crate::registry::IndexRegistry;
@@ -40,18 +38,8 @@ impl SearchService for SearchServiceImpl {
             .query
             .ok_or_else(|| Status::invalid_argument("Query is required"))?;
 
-        let mut core_query = convert_query(&query, reader.schema(), Some(searcher.global_stats()))
+        let core_query = convert_query(&query, reader.schema(), Some(searcher.global_stats()))
             .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
-
-        // Apply fast-field filters if present
-        if !req.filters.is_empty() {
-            let filters = convert_filters(&req.filters, reader.schema())
-                .map_err(|e| Status::invalid_argument(format!("Invalid filter: {}", e)))?;
-            core_query = Box::new(hermes_core::query::FastFieldFilterQuery::new(
-                std::sync::Arc::from(core_query),
-                filters,
-            ));
-        }
 
         let limit = if req.limit == 0 {
             10

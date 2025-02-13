@@ -1,7 +1,7 @@
 """Async Hermes client implementation.
 
 All search types mirror the proto API structure exactly.
-See types.py for Query, Reranker, Filter definitions.
+See types.py for Query, Reranker definitions.
 """
 
 from __future__ import annotations
@@ -309,7 +309,6 @@ class HermesClient:
         offset: int = 0,
         fields_to_load: list[str] | None = None,
         reranker: dict[str, Any] | None = None,
-        filters: list[dict[str, Any]] | None = None,
     ) -> SearchResponse:
         """Search for documents.
 
@@ -324,7 +323,6 @@ class HermesClient:
             offset: Offset for pagination
             fields_to_load: List of fields to include in results
             reranker: Reranker dict matching proto Reranker message
-            filters: List of filter dicts matching proto Filter message
 
         Returns:
             SearchResponse with hits
@@ -376,19 +374,11 @@ class HermesClient:
                 },
                 fields_to_load=["title"])
 
-            # Filters
-            results = await client.search("docs",
-                query={"match": {"field": "title", "text": "hello"}},
-                filters=[
-                    {"field": "status", "eq_text": "active"},
-                    {"field": "price", "range": {"min": 10.0, "max": 100.0}},
-                ])
         """
         self._ensure_connected()
 
         pb_query = _build_query(query)
         pb_reranker = _build_reranker(reranker) if reranker else None
-        pb_filters = [_build_filter(f) for f in filters] if filters else []
 
         request = pb.SearchRequest(
             index_name=index_name,
@@ -397,7 +387,6 @@ class HermesClient:
             offset=offset,
             fields_to_load=fields_to_load or [],
             reranker=pb_reranker,
-            filters=pb_filters,
         )
 
         response = await self._search_stub.Search(request)
@@ -686,6 +675,23 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
             )
         )
 
+    if "range" in q:
+        rq = q["range"]
+        kwargs: dict[str, Any] = {"field": rq["field"]}
+        if "min_u64" in rq:
+            kwargs["min_u64"] = int(rq["min_u64"])
+        if "max_u64" in rq:
+            kwargs["max_u64"] = int(rq["max_u64"])
+        if "min_i64" in rq:
+            kwargs["min_i64"] = int(rq["min_i64"])
+        if "max_i64" in rq:
+            kwargs["max_i64"] = int(rq["max_i64"])
+        if "min_f64" in rq:
+            kwargs["min_f64"] = float(rq["min_f64"])
+        if "max_f64" in rq:
+            kwargs["max_f64"] = float(rq["max_f64"])
+        return pb.Query(range=pb.RangeQuery(**kwargs))
+
     if "all" in q:
         return pb.Query(all=pb.AllQuery())
 
@@ -705,32 +711,3 @@ def _build_reranker(r: dict[str, Any]) -> pb.Reranker:
         combiner_decay=r.get("combiner_decay", 0),
         matryoshka_dims=r.get("matryoshka_dims", 0),
     )
-
-
-def _build_filter(f: dict[str, Any]) -> pb.Filter:
-    """Convert a Filter dict to protobuf Filter."""
-    kwargs: dict[str, Any] = {"field": f["field"]}
-    if "eq_u64" in f:
-        kwargs["eq_u64"] = int(f["eq_u64"])
-    elif "eq_i64" in f:
-        kwargs["eq_i64"] = int(f["eq_i64"])
-    elif "eq_f64" in f:
-        kwargs["eq_f64"] = float(f["eq_f64"])
-    elif "eq_text" in f:
-        kwargs["eq_text"] = str(f["eq_text"])
-    elif "range" in f:
-        r = f["range"]
-        range_kwargs = {}
-        if "min" in r:
-            range_kwargs["min"] = float(r["min"])
-        if "max" in r:
-            range_kwargs["max"] = float(r["max"])
-        kwargs["range"] = pb.RangeFilter(**range_kwargs)
-    elif "in_values" in f:
-        iv = f["in_values"]
-        kwargs["in_values"] = pb.InFilter(
-            text_values=iv.get("text_values", []),
-            u64_values=[int(v) for v in iv.get("u64_values", [])],
-            i64_values=[int(v) for v in iv.get("i64_values", [])],
-        )
-    return pb.Filter(**kwargs)

@@ -55,14 +55,36 @@ use super::types::{SegmentFiles, SegmentId, SegmentMeta};
 
 /// Combine per-ordinal (doc_id, ordinal, score) triples into VectorSearchResults,
 /// applying the multi-value combiner, sorting by score desc, and truncating to `limit`.
-fn combine_ordinal_results(
+///
+/// Fast path: when all ordinals are 0 (single-valued field), skips the HashMap
+/// grouping entirely and just sorts + truncates the raw results.
+pub(crate) fn combine_ordinal_results(
     raw: impl IntoIterator<Item = (u32, u16, f32)>,
     combiner: crate::query::MultiValueCombiner,
     limit: usize,
 ) -> Vec<VectorSearchResult> {
+    let collected: Vec<(u32, u16, f32)> = raw.into_iter().collect();
+
+    // Fast path: all ordinals are 0 → no grouping needed, skip HashMap
+    let all_single = collected.iter().all(|&(_, ord, _)| ord == 0);
+    if all_single {
+        let mut results: Vec<VectorSearchResult> = collected
+            .into_iter()
+            .map(|(doc_id, _, score)| VectorSearchResult::new(doc_id, score, vec![(0, score)]))
+            .collect();
+        results.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+        return results;
+    }
+
+    // Slow path: multi-valued field — group by doc_id, apply combiner
     let mut doc_ordinals: rustc_hash::FxHashMap<DocId, Vec<(u32, f32)>> =
         rustc_hash::FxHashMap::default();
-    for (doc_id, ordinal, score) in raw {
+    for (doc_id, ordinal, score) in collected {
         doc_ordinals
             .entry(doc_id as DocId)
             .or_default()
@@ -75,7 +97,7 @@ fn combine_ordinal_results(
             VectorSearchResult::new(doc_id, combined_score, ordinals)
         })
         .collect();
-    results.sort_by(|a, b| {
+    results.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -215,6 +237,11 @@ impl SegmentReader {
     /// Get sparse indexes for all fields
     pub fn sparse_indexes(&self) -> &FxHashMap<u32, SparseIndex> {
         &self.sparse_indexes
+    }
+
+    /// Get sparse index for a specific field
+    pub fn sparse_index(&self, field: Field) -> Option<&SparseIndex> {
+        self.sparse_indexes.get(&field.0)
     }
 
     /// Get vector indexes for all fields
@@ -832,113 +859,6 @@ impl SegmentReader {
         self.vector_indexes.get(&field.0)
     }
 
-    /// Search for similar sparse vectors using dedicated sparse posting lists
-    ///
-    /// Uses `BmpExecutor` or `MaxScoreExecutor` for efficient top-k retrieval.
-    /// Optimizations:
-    /// 1. **MaxScore pruning**: Dimensions sorted by max contribution
-    /// 2. **Block-max pruning**: Skips blocks where max contribution < threshold
-    /// 3. **Top-K heap**: Efficient score collection
-    ///
-    /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
-    pub async fn search_sparse_vector(
-        &self,
-        field: Field,
-        vector: &[(u32, f32)],
-        limit: usize,
-        combiner: crate::query::MultiValueCombiner,
-        heap_factor: f32,
-    ) -> Result<Vec<VectorSearchResult>> {
-        use crate::query::BmpExecutor;
-
-        let query_tokens = vector.len();
-
-        // Get sparse index for this field
-        let sparse_index = match self.sparse_indexes.get(&field.0) {
-            Some(idx) => idx,
-            None => {
-                log::debug!(
-                    "Sparse vector search: no index for field {}, returning empty",
-                    field.0
-                );
-                return Ok(Vec::new());
-            }
-        };
-
-        let index_dimensions = sparse_index.num_dimensions();
-
-        // Filter query terms to only those present in the index
-        let mut matched_terms: Vec<(u32, f32)> = Vec::with_capacity(vector.len());
-        let mut missing_count = 0usize;
-
-        for &(dim_id, query_weight) in vector {
-            if sparse_index.has_dimension(dim_id) {
-                matched_terms.push((dim_id, query_weight));
-            } else {
-                missing_count += 1;
-            }
-        }
-
-        log::debug!(
-            "Sparse vector search: query_tokens={}, matched={}, missing={}, index_dimensions={}",
-            query_tokens,
-            matched_terms.len(),
-            missing_count,
-            index_dimensions
-        );
-
-        if matched_terms.is_empty() {
-            log::debug!("Sparse vector search: no matching tokens, returning empty");
-            return Ok(Vec::new());
-        }
-
-        // Select executor based on number of query terms:
-        // - 12+ terms: BMP (block-at-a-time, lazy block loading, best for SPLADE)
-        // - 1-11 terms: MaxScoreExecutor (cursor-based DAAT + lazy block loading)
-        let num_terms = matched_terms.len();
-        let over_fetch = limit * 2; // Over-fetch for multi-value combining
-        let raw_results = if num_terms > 12 {
-            // BMP: lazy block loading — only skip entries in memory, blocks loaded on-demand
-            BmpExecutor::new(sparse_index, matched_terms, over_fetch, heap_factor)
-                .execute()
-                .await?
-        } else {
-            // Block-Max MaxScore: skip entries drive navigation, blocks loaded on-demand.
-            crate::query::MaxScoreExecutor::sparse(
-                sparse_index,
-                matched_terms,
-                over_fetch,
-                heap_factor,
-            )
-            .execute()
-            .await?
-        };
-
-        log::trace!(
-            "Sparse search returned {} raw results for segment {:016x}",
-            raw_results.len(),
-            self.meta.id
-        );
-        if log::log_enabled!(log::Level::Trace) && !raw_results.is_empty() {
-            for r in raw_results.iter().take(5) {
-                log::trace!(
-                    "  Raw result: doc_id={}, score={:.4}, ordinal={}",
-                    r.doc_id,
-                    r.score,
-                    r.ordinal
-                );
-            }
-        }
-
-        Ok(combine_ordinal_results(
-            raw_results
-                .into_iter()
-                .map(|r| (r.doc_id, r.ordinal, r.score)),
-            combiner,
-            limit,
-        ))
-    }
-
     /// Get positions for a term (for phrase queries)
     ///
     /// Position offsets are now embedded in TermInfo, so we first look up
@@ -1229,51 +1149,5 @@ impl SegmentReader {
         }
 
         Ok(combine_ordinal_results(results, combiner, k))
-    }
-
-    /// Synchronous sparse vector search.
-    pub fn search_sparse_vector_sync(
-        &self,
-        field: Field,
-        vector: &[(u32, f32)],
-        limit: usize,
-        combiner: crate::query::MultiValueCombiner,
-        heap_factor: f32,
-    ) -> Result<Vec<VectorSearchResult>> {
-        use crate::query::MaxScoreExecutor;
-
-        let sparse_index = match self.sparse_indexes.get(&field.0) {
-            Some(idx) => idx,
-            None => return Ok(Vec::new()),
-        };
-
-        let mut matched_terms: Vec<(u32, f32)> = Vec::with_capacity(vector.len());
-        for &(dim_id, query_weight) in vector {
-            if sparse_index.has_dimension(dim_id) {
-                matched_terms.push((dim_id, query_weight));
-            }
-        }
-
-        if matched_terms.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let num_terms = matched_terms.len();
-        let over_fetch = limit * 2;
-        let raw_results = if num_terms > 12 {
-            crate::query::BmpExecutor::new(sparse_index, matched_terms, over_fetch, heap_factor)
-                .execute_sync()?
-        } else {
-            MaxScoreExecutor::sparse(sparse_index, matched_terms, over_fetch, heap_factor)
-                .execute_sync()?
-        };
-
-        Ok(combine_ordinal_results(
-            raw_results
-                .into_iter()
-                .map(|r| (r.doc_id, r.ordinal, r.score)),
-            combiner,
-            limit,
-        ))
     }
 }

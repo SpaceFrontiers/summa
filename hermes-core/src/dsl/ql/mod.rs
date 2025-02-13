@@ -466,6 +466,16 @@ impl QueryLanguageParser {
                 .schema
                 .get_field(field_name)
                 .ok_or_else(|| format!("Unknown field: {}", field_name))?;
+            // Validate field type — TermQuery only works on text fields
+            if let Some(entry) = self.schema.get_field_entry(field_id) {
+                use crate::dsl::FieldType;
+                if entry.field_type != FieldType::Text {
+                    return Err(format!(
+                        "Term query requires a text field, but '{}' is {:?}. Use range query for numeric fields.",
+                        field_name, entry.field_type
+                    ));
+                }
+            }
             let tokenizer = self.get_tokenizer(field_id);
             let tokens: Vec<String> = tokenizer
                 .tokenize(term)

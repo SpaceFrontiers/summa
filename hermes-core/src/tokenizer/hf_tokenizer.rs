@@ -136,6 +136,11 @@ impl HfTokenizer {
         }
     }
 
+    /// Resolve a token ID back to its text representation
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.tokenizer.id_to_token(id)
+    }
+
     /// Tokenize text and return token IDs
     ///
     /// Returns a vector of (token_id, count) pairs where count is the
@@ -153,11 +158,16 @@ impl HfTokenizer {
         }
 
         let result: Vec<(u32, u32)> = counts.into_iter().collect();
+        let paired: Vec<_> = encoding
+            .get_tokens()
+            .iter()
+            .zip(encoding.get_ids())
+            .map(|(tok, id)| format!("({:?},{})", tok, id))
+            .collect();
         debug!(
-            "Tokenized query: text={:?} tokens={:?} token_ids={:?} unique_count={}",
+            "Tokenized query: text={:?} tokens=[{}] unique_count={}",
             text,
-            encoding.get_tokens(),
-            encoding.get_ids(),
+            paired.join(", "),
             result.len()
         );
 
@@ -176,11 +186,16 @@ impl HfTokenizer {
         ids.sort_unstable();
         ids.dedup();
 
+        let paired: Vec<_> = encoding
+            .get_tokens()
+            .iter()
+            .zip(encoding.get_ids())
+            .map(|(tok, id)| format!("({:?},{})", tok, id))
+            .collect();
         debug!(
-            "Tokenized query (unique): text={:?} tokens={:?} token_ids={:?} unique_count={}",
+            "Tokenized query (unique): text={:?} tokens=[{}] unique_count={}",
             text,
-            encoding.get_tokens(),
-            encoding.get_ids(),
+            paired.join(", "),
             ids.len()
         );
 

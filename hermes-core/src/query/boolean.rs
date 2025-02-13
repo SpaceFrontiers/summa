@@ -6,7 +6,10 @@ use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
-use super::{CountFuture, GlobalStats, MaxScoreExecutor, Query, ScoredDoc, Scorer, ScorerFuture};
+use super::{
+    CountFuture, GlobalStats, MaxScoreExecutor, Query, ScoredDoc, Scorer, ScorerFuture,
+    SparseTermQueryInfo,
+};
 
 /// Boolean query with MUST, SHOULD, and MUST_NOT clauses
 ///
@@ -59,25 +62,6 @@ impl BooleanQuery {
     }
 }
 
-/// Check if SHOULD clauses are eligible for MaxScore optimization.
-/// Returns (term_infos, field) if all are single-field term queries, None otherwise.
-fn maxscore_eligible(
-    should: &[Arc<dyn Query>],
-) -> Option<(Vec<super::TermQueryInfo>, crate::Field)> {
-    let term_infos: Vec<_> = should
-        .iter()
-        .filter_map(|q| q.as_term_query_info())
-        .collect();
-    if term_infos.len() != should.len() {
-        return None;
-    }
-    let first_field = term_infos[0].field;
-    if !term_infos.iter().all(|t| t.field == first_field) {
-        return None;
-    }
-    Some((term_infos, first_field))
-}
-
 /// Compute IDF for a posting list, preferring global stats.
 fn compute_idf(
     posting_list: &crate::structures::BlockPostingList,
@@ -96,100 +80,193 @@ fn compute_idf(
     super::bm25_idf(doc_freq, num_docs)
 }
 
-/// Build MaxScore scorer from pre-fetched posting lists.
-fn maxscore_scorer_from_postings<'a>(
+/// Shared pre-check for text MaxScore: extract term infos, field, avg_field_len, num_docs.
+/// Returns None if not all SHOULD clauses are single-field term queries.
+fn prepare_text_maxscore(
+    should: &[Arc<dyn Query>],
+    reader: &SegmentReader,
+    global_stats: Option<&Arc<GlobalStats>>,
+) -> Option<(Vec<super::TermQueryInfo>, crate::Field, f32, f32)> {
+    let infos: Vec<_> = should
+        .iter()
+        .filter_map(|q| q.as_term_query_info())
+        .collect();
+    if infos.len() != should.len() {
+        return None;
+    }
+    let field = infos[0].field;
+    if !infos.iter().all(|t| t.field == field) {
+        return None;
+    }
+    let avg_field_len = global_stats
+        .map(|s| s.avg_field_len(field))
+        .unwrap_or_else(|| reader.avg_field_len(field));
+    let num_docs = reader.num_docs() as f32;
+    Some((infos, field, avg_field_len, num_docs))
+}
+
+/// Build a TopK scorer from fetched posting lists via text MaxScore.
+fn finish_text_maxscore<'a>(
     posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
     avg_field_len: f32,
     limit: usize,
-    predicate: Option<super::DocPredicate<'a>>,
 ) -> crate::Result<Box<dyn Scorer + 'a>> {
     if posting_lists.is_empty() {
         return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
     }
-    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit);
-    executor.set_predicate(predicate);
-    let results = executor.execute_sync()?;
+    let results = MaxScoreExecutor::text(posting_lists, avg_field_len, limit).execute_sync()?;
     Ok(Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>)
 }
 
-/// Try to create a MaxScore-optimized scorer for pure OR queries (async)
+/// Try text MaxScore for pure OR queries (async).
 async fn try_maxscore_scorer<'a>(
     should: &[Arc<dyn Query>],
     reader: &'a SegmentReader,
     limit: usize,
     global_stats: Option<&Arc<GlobalStats>>,
-    predicate: Option<super::DocPredicate<'a>>,
 ) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
-    let (mut term_infos, field) = match maxscore_eligible(should) {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-
-    let avg_field_len = global_stats
-        .map(|s| s.avg_field_len(field))
-        .unwrap_or_else(|| reader.avg_field_len(field));
-    let num_docs = reader.num_docs() as f32;
-
-    let mut posting_lists: Vec<(crate::structures::BlockPostingList, f32)> =
-        Vec::with_capacity(term_infos.len());
-    for info in term_infos.drain(..) {
+    let (mut infos, _field, avg_field_len, num_docs) =
+        match prepare_text_maxscore(should, reader, global_stats) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+    let mut posting_lists = Vec::with_capacity(infos.len());
+    for info in infos.drain(..) {
         if let Some(pl) = reader.get_postings(info.field, &info.term).await? {
             let idf = compute_idf(&pl, info.field, &info.term, num_docs, global_stats);
             posting_lists.push((pl, idf));
         }
     }
-
-    Ok(Some(maxscore_scorer_from_postings(
+    Ok(Some(finish_text_maxscore(
         posting_lists,
         avg_field_len,
         limit,
-        predicate,
     )?))
 }
 
-/// Try to create a MaxScore-optimized scorer for pure OR queries (sync)
+/// Try text MaxScore for pure OR queries (sync).
 #[cfg(feature = "sync")]
 fn try_maxscore_scorer_sync<'a>(
     should: &[Arc<dyn Query>],
     reader: &'a SegmentReader,
     limit: usize,
     global_stats: Option<&Arc<GlobalStats>>,
-    predicate: Option<super::DocPredicate<'a>>,
 ) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
-    let (mut term_infos, field) = match maxscore_eligible(should) {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-
-    let avg_field_len = global_stats
-        .map(|s| s.avg_field_len(field))
-        .unwrap_or_else(|| reader.avg_field_len(field));
-    let num_docs = reader.num_docs() as f32;
-
-    let mut posting_lists: Vec<(crate::structures::BlockPostingList, f32)> =
-        Vec::with_capacity(term_infos.len());
-    for info in term_infos.drain(..) {
+    let (mut infos, _field, avg_field_len, num_docs) =
+        match prepare_text_maxscore(should, reader, global_stats) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+    let mut posting_lists = Vec::with_capacity(infos.len());
+    for info in infos.drain(..) {
         if let Some(pl) = reader.get_postings_sync(info.field, &info.term)? {
             let idf = compute_idf(&pl, info.field, &info.term, num_docs, global_stats);
             posting_lists.push((pl, idf));
         }
     }
-
-    Ok(Some(maxscore_scorer_from_postings(
+    Ok(Some(finish_text_maxscore(
         posting_lists,
         avg_field_len,
         limit,
-        predicate,
     )?))
 }
 
+/// Try to build a sparse MaxScoreExecutor from SHOULD clauses.
+/// Returns None if not eligible, Some(Err) for empty segment, Some(Ok) otherwise.
+fn prepare_sparse_maxscore<'a>(
+    should: &[Arc<dyn Query>],
+    reader: &'a SegmentReader,
+    limit: usize,
+) -> Option<Result<MaxScoreExecutor<'a>, Box<dyn Scorer + 'a>>> {
+    let infos: Vec<SparseTermQueryInfo> = should
+        .iter()
+        .filter_map(|q| q.as_sparse_term_query_info())
+        .collect();
+    if infos.len() != should.len() {
+        return None;
+    }
+    let field = infos[0].field;
+    if !infos.iter().all(|t| t.field == field) {
+        return None;
+    }
+    let si = match reader.sparse_index(field) {
+        Some(si) => si,
+        None => return Some(Err(Box::new(EmptyScorer))),
+    };
+    let query_terms: Vec<(u32, f32)> = infos
+        .iter()
+        .filter(|info| si.has_dimension(info.dim_id))
+        .map(|info| (info.dim_id, info.weight))
+        .collect();
+    if query_terms.is_empty() {
+        return Some(Err(Box::new(EmptyScorer)));
+    }
+    let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
+    Some(Ok(MaxScoreExecutor::sparse(
+        si,
+        query_terms,
+        executor_limit,
+        infos[0].heap_factor,
+    )))
+}
+
+/// Combine raw MaxScore results with ordinal deduplication into a scorer.
+fn combine_sparse_results<'a>(
+    raw: Vec<ScoredDoc>,
+    combiner: super::MultiValueCombiner,
+    limit: usize,
+) -> Box<dyn Scorer + 'a> {
+    let combined = crate::segment::combine_ordinal_results(
+        raw.into_iter().map(|r| (r.doc_id, r.ordinal, r.score)),
+        combiner,
+        limit,
+    );
+    let scored: Vec<ScoredDoc> = combined
+        .into_iter()
+        .map(|r| ScoredDoc {
+            doc_id: r.doc_id,
+            score: r.score,
+            ordinal: 0,
+        })
+        .collect();
+    Box::new(TopKResultScorer::new(scored))
+}
+
+/// Build MaxScore scorer from sparse term infos (async).
+async fn try_sparse_maxscore_scorer<'a>(
+    should: &[Arc<dyn Query>],
+    reader: &'a SegmentReader,
+    limit: usize,
+) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
+    let executor = match prepare_sparse_maxscore(should, reader, limit) {
+        None => return Ok(None),
+        Some(Err(empty)) => return Ok(Some(empty)),
+        Some(Ok(e)) => e,
+    };
+    let combiner = should[0].as_sparse_term_query_info().unwrap().combiner;
+    let raw = executor.execute().await?;
+    Ok(Some(combine_sparse_results(raw, combiner, limit)))
+}
+
+/// Build MaxScore scorer from sparse term infos (sync).
+#[cfg(feature = "sync")]
+fn try_sparse_maxscore_scorer_sync<'a>(
+    should: &[Arc<dyn Query>],
+    reader: &'a SegmentReader,
+    limit: usize,
+) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
+    let executor = match prepare_sparse_maxscore(should, reader, limit) {
+        None => return Ok(None),
+        Some(Err(empty)) => return Ok(Some(empty)),
+        Some(Ok(e)) => e,
+    };
+    let combiner = should[0].as_sparse_term_query_info().unwrap().combiner;
+    let raw = executor.execute_sync()?;
+    Ok(Some(combine_sparse_results(raw, combiner, limit)))
+}
+
 impl Query for BooleanQuery {
-    fn scorer<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        limit: usize,
-        predicate: Option<super::DocPredicate<'a>>,
-    ) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         // Clone Arc vectors - cheap reference counting
         let must = self.must.clone();
         let should = self.should.clone();
@@ -197,33 +274,45 @@ impl Query for BooleanQuery {
         let global_stats = self.global_stats.clone();
 
         Box::pin(async move {
+            // Single-clause optimization: unwrap to inner scorer directly
+            if must_not.is_empty() {
+                if must.len() == 1 && should.is_empty() {
+                    return must[0].scorer(reader, limit).await;
+                }
+                if should.len() == 1 && must.is_empty() {
+                    return should[0].scorer(reader, limit).await;
+                }
+            }
+
             // Check if this is a pure OR query eligible for MaxScore optimization
             // Conditions: no MUST, no MUST_NOT, multiple SHOULD clauses, all same field
-            if must.is_empty()
-                && must_not.is_empty()
-                && should.len() >= 2
-                && let Some(scorer) =
-                    try_maxscore_scorer(&should, reader, limit, global_stats.as_ref(), predicate)
-                        .await?
-            {
-                return Ok(scorer);
+            if must.is_empty() && must_not.is_empty() && should.len() >= 2 {
+                // Try text MaxScore first
+                if let Some(scorer) =
+                    try_maxscore_scorer(&should, reader, limit, global_stats.as_ref()).await?
+                {
+                    return Ok(scorer);
+                }
+                // Try sparse MaxScore
+                if let Some(scorer) = try_sparse_maxscore_scorer(&should, reader, limit).await? {
+                    return Ok(scorer);
+                }
             }
 
             // Fall back to standard boolean scoring
-            // Predicate not passed to sub-scorers — it's only useful for executors
             let mut must_scorers = Vec::with_capacity(must.len());
             for q in &must {
-                must_scorers.push(q.scorer(reader, limit, None).await?);
+                must_scorers.push(q.scorer(reader, limit).await?);
             }
 
             let mut should_scorers = Vec::with_capacity(should.len());
             for q in &should {
-                should_scorers.push(q.scorer(reader, limit, None).await?);
+                should_scorers.push(q.scorer(reader, limit).await?);
             }
 
             let mut must_not_scorers = Vec::with_capacity(must_not.len());
             for q in &must_not {
-                must_not_scorers.push(q.scorer(reader, limit, None).await?);
+                must_not_scorers.push(q.scorer(reader, limit).await?);
             }
 
             let mut scorer = BooleanScorer {
@@ -243,37 +332,43 @@ impl Query for BooleanQuery {
         &self,
         reader: &'a SegmentReader,
         limit: usize,
-        predicate: Option<super::DocPredicate<'a>>,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        // Single-clause optimization: unwrap to inner scorer directly
+        if self.must_not.is_empty() {
+            if self.must.len() == 1 && self.should.is_empty() {
+                return self.must[0].scorer_sync(reader, limit);
+            }
+            if self.should.len() == 1 && self.must.is_empty() {
+                return self.should[0].scorer_sync(reader, limit);
+            }
+        }
+
         // MaxScore optimization for pure OR queries
-        if self.must.is_empty()
-            && self.must_not.is_empty()
-            && self.should.len() >= 2
-            && let Some(scorer) = try_maxscore_scorer_sync(
-                &self.should,
-                reader,
-                limit,
-                self.global_stats.as_ref(),
-                predicate,
-            )?
-        {
-            return Ok(scorer);
+        if self.must.is_empty() && self.must_not.is_empty() && self.should.len() >= 2 {
+            if let Some(scorer) =
+                try_maxscore_scorer_sync(&self.should, reader, limit, self.global_stats.as_ref())?
+            {
+                return Ok(scorer);
+            }
+            if let Some(scorer) = try_sparse_maxscore_scorer_sync(&self.should, reader, limit)? {
+                return Ok(scorer);
+            }
         }
 
         // Fall back to standard boolean scoring
         let mut must_scorers = Vec::with_capacity(self.must.len());
         for q in &self.must {
-            must_scorers.push(q.scorer_sync(reader, limit, None)?);
+            must_scorers.push(q.scorer_sync(reader, limit)?);
         }
 
         let mut should_scorers = Vec::with_capacity(self.should.len());
         for q in &self.should {
-            should_scorers.push(q.scorer_sync(reader, limit, None)?);
+            should_scorers.push(q.scorer_sync(reader, limit)?);
         }
 
         let mut must_not_scorers = Vec::with_capacity(self.must_not.len());
         for q in &self.must_not {
-            must_not_scorers.push(q.scorer_sync(reader, limit, None)?);
+            must_not_scorers.push(q.scorer_sync(reader, limit)?);
         }
 
         let mut scorer = BooleanScorer {
@@ -303,7 +398,7 @@ impl Query for BooleanQuery {
             } else if !should.is_empty() {
                 let mut sum = 0u32;
                 for q in &should {
-                    sum += q.count_estimate(reader).await?;
+                    sum = sum.saturating_add(q.count_estimate(reader).await?);
                 }
                 Ok(sum)
             } else {
@@ -376,6 +471,10 @@ impl BooleanScorer<'_> {
             });
 
             if !excluded {
+                // Seek SHOULD scorers to candidate so score() can see their contributions
+                for scorer in &mut self.should {
+                    scorer.seek(candidate);
+                }
                 self.current_doc = candidate;
                 return candidate;
             }
@@ -397,27 +496,9 @@ impl BooleanScorer<'_> {
     }
 }
 
-impl Scorer for BooleanScorer<'_> {
+impl super::docset::DocSet for BooleanScorer<'_> {
     fn doc(&self) -> DocId {
         self.current_doc
-    }
-
-    fn score(&self) -> Score {
-        let mut total = 0.0;
-
-        for scorer in &self.must {
-            if scorer.doc() == self.current_doc {
-                total += scorer.score();
-            }
-        }
-
-        for scorer in &self.should {
-            if scorer.doc() == self.current_doc {
-                total += scorer.score();
-            }
-        }
-
-        total
     }
 
     fn advance(&mut self) -> DocId {
@@ -459,6 +540,26 @@ impl Scorer for BooleanScorer<'_> {
     }
 }
 
+impl Scorer for BooleanScorer<'_> {
+    fn score(&self) -> Score {
+        let mut total = 0.0;
+
+        for scorer in &self.must {
+            if scorer.doc() == self.current_doc {
+                total += scorer.score();
+            }
+        }
+
+        for scorer in &self.should {
+            if scorer.doc() == self.current_doc {
+                total += scorer.score();
+            }
+        }
+
+        total
+    }
+}
+
 /// Scorer that iterates over pre-computed top-k results
 struct TopKResultScorer {
     results: Vec<ScoredDoc>,
@@ -466,7 +567,9 @@ struct TopKResultScorer {
 }
 
 impl TopKResultScorer {
-    fn new(results: Vec<ScoredDoc>) -> Self {
+    fn new(mut results: Vec<ScoredDoc>) -> Self {
+        // Sort by doc_id ascending — required for DocSet seek() correctness
+        results.sort_unstable_by_key(|r| r.doc_id);
         Self {
             results,
             position: 0,
@@ -474,20 +577,12 @@ impl TopKResultScorer {
     }
 }
 
-impl Scorer for TopKResultScorer {
+impl super::docset::DocSet for TopKResultScorer {
     fn doc(&self) -> DocId {
         if self.position < self.results.len() {
             self.results[self.position].doc_id
         } else {
             TERMINATED
-        }
-    }
-
-    fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
         }
     }
 
@@ -497,27 +592,32 @@ impl Scorer for TopKResultScorer {
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
-        while self.position < self.results.len() && self.results[self.position].doc_id < target {
-            self.position += 1;
-        }
+        let remaining = &self.results[self.position..];
+        self.position += remaining.partition_point(|r| r.doc_id < target);
         self.doc()
     }
 
     fn size_hint(&self) -> u32 {
-        self.results.len() as u32
+        (self.results.len() - self.position) as u32
+    }
+}
+
+impl Scorer for TopKResultScorer {
+    fn score(&self) -> Score {
+        if self.position < self.results.len() {
+            self.results[self.position].score
+        } else {
+            0.0
+        }
     }
 }
 
 /// Empty scorer for when no terms match
 struct EmptyScorer;
 
-impl Scorer for EmptyScorer {
+impl super::docset::DocSet for EmptyScorer {
     fn doc(&self) -> DocId {
         TERMINATED
-    }
-
-    fn score(&self) -> Score {
-        0.0
     }
 
     fn advance(&mut self) -> DocId {
@@ -530,6 +630,12 @@ impl Scorer for EmptyScorer {
 
     fn size_hint(&self) -> u32 {
         0
+    }
+}
+
+impl Scorer for EmptyScorer {
+    fn score(&self) -> Score {
+        0.0
     }
 }
 

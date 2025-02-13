@@ -16,9 +16,9 @@ export type {
   AllQuery,
   SparseVectorQuery,
   DenseVectorQuery,
+  RangeQuery,
   Combiner,
   Reranker,
-  Filter,
 } from "./types";
 
 export {
@@ -65,5 +65,4 @@ export {
   IndexingBufferStats,
   SegmentReaderStats,
   OrdinalScore,
-  Filter as PbFilter,
 } from "./generated/hermes";

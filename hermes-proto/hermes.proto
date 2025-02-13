@@ -51,6 +51,7 @@ message Query {
     SparseVectorQuery sparse_vector = 5;
     DenseVectorQuery dense_vector = 6;
     MatchQuery match = 7;
+    RangeQuery range = 8;
   }
 }
 
@@ -110,6 +111,18 @@ message BoostQuery {
 
 message AllQuery {}
 
+// Range query on a fast field (inclusive bounds)
+// Exactly one pair of bounds should be set (u64, i64, or f64)
+message RangeQuery {
+  string field = 1;
+  optional uint64 min_u64 = 2;
+  optional uint64 max_u64 = 3;
+  optional int64 min_i64 = 4;
+  optional int64 max_i64 = 5;
+  optional double min_f64 = 6;
+  optional double max_f64 = 7;
+}
+
 // Full-text match query - tokenizes text server-side and searches as OR of tokens
 // Use this instead of TermQuery when searching with natural language text
 message MatchQuery {
@@ -129,32 +142,6 @@ message Reranker {
   uint32 matryoshka_dims = 8;          // Matryoshka pre-filter dims (0 = disabled)
 }
 
-// Fast-field filter for efficient document filtering
-message Filter {
-  string field = 1;
-  oneof condition {
-    uint64 eq_u64 = 2;
-    int64 eq_i64 = 3;
-    double eq_f64 = 4;
-    string eq_text = 5;
-    RangeFilter range = 6;
-    InFilter in_values = 7;
-  }
-}
-
-// Numeric range filter (inclusive bounds)
-message RangeFilter {
-  optional double min = 1;
-  optional double max = 2;
-}
-
-// Set membership filter
-message InFilter {
-  repeated string text_values = 1;
-  repeated uint64 u64_values = 2;
-  repeated int64 i64_values = 3;
-}
-
 // Search request/response
 message SearchRequest {
   string index_name = 1;
@@ -163,7 +150,6 @@ message SearchRequest {
   uint32 offset = 4;
   repeated string fields_to_load = 5;
   Reranker reranker = 6;               // Optional L2 reranker
-  repeated Filter filters = 7;         // Fast-field filters
 }
 
 // Unique document address: segment + local doc_id

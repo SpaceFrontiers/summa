@@ -127,6 +127,19 @@ export interface DenseVectorQuery {
   combinerDecay?: number;
 }
 
+export interface RangeQuery {
+  field: string;
+  /** u64 bounds (inclusive) */
+  minU64?: number;
+  maxU64?: number;
+  /** i64 bounds (inclusive) */
+  minI64?: number;
+  maxI64?: number;
+  /** f64 bounds (inclusive) */
+  minF64?: number;
+  maxF64?: number;
+}
+
 /** Discriminated union matching proto Query oneof. Exactly one key must be set. */
 export type Query =
   | { term: TermQuery }
@@ -135,7 +148,8 @@ export type Query =
   | { sparseVector: SparseVectorQuery }
   | { denseVector: DenseVectorQuery }
   | { boost: BoostQuery }
-  | { all: AllQuery };
+  | { all: AllQuery }
+  | { range: RangeQuery };
 
 // =============================================================================
 // Reranker (mirrors proto Reranker)
@@ -155,20 +169,6 @@ export interface Reranker {
 }
 
 // =============================================================================
-// Filter (mirrors proto Filter)
-// =============================================================================
-
-export interface Filter {
-  field: string;
-  eqU64?: number;
-  eqI64?: number;
-  eqF64?: number;
-  eqText?: string;
-  range?: { min?: number; max?: number };
-  inValues?: { textValues?: string[]; u64Values?: number[]; i64Values?: number[] };
-}
-
-// =============================================================================
 // SearchRequest (mirrors proto SearchRequest, minus index_name)
 // =============================================================================
 
@@ -178,5 +178,4 @@ export interface SearchRequest {
   offset?: number;
   fieldsToLoad?: string[];
   reranker?: Reranker;
-  filters?: Filter[];
 }

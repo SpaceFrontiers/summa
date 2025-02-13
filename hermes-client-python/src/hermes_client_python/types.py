@@ -69,8 +69,18 @@ class DenseVectorQuery(TypedDict, total=False):
     combiner_decay: float
 
 
+class RangeQuery(TypedDict, total=False):
+    field: str  # required but total=False for optional fields
+    min_u64: int
+    max_u64: int
+    min_i64: int
+    max_i64: int
+    min_f64: float
+    max_f64: float
+
+
 # Query is a dict with exactly one key: "term", "match", "boolean",
-# "sparse_vector", "dense_vector", "boost", or "all".
+# "sparse_vector", "dense_vector", "boost", "range", or "all".
 Query = dict[str, Any]
 
 # =============================================================================
@@ -87,23 +97,6 @@ class Reranker(TypedDict, total=False):
     combiner_top_k: int
     combiner_decay: float
     matryoshka_dims: int
-
-
-# =============================================================================
-# Filter (mirrors proto Filter)
-# =============================================================================
-
-
-class Filter(TypedDict, total=False):
-    field: str
-    eq_u64: int
-    eq_i64: int
-    eq_f64: float
-    eq_text: str
-    range: dict[str, float]  # {"min": ..., "max": ...}
-    in_values: dict[
-        str, list
-    ]  # {"text_values": [...], "u64_values": [...], "i64_values": [...]}
 
 
 # =============================================================================

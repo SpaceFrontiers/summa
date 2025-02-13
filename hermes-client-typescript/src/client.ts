@@ -2,7 +2,7 @@
  * Async Hermes client implementation.
  *
  * All search types mirror the proto API structure exactly.
- * See types.ts for Query, Reranker, Filter, SearchRequest definitions.
+ * See types.ts for Query, Reranker, SearchRequest definitions.
  */
 
 import { ChannelCredentials } from "@grpc/grpc-js";
@@ -28,7 +28,6 @@ import type {
   Query,
   Combiner,
   Reranker,
-  Filter,
 } from "./types";
 
 type SearchClient = Client<typeof SearchServiceDefinition>;
@@ -224,7 +223,6 @@ export class HermesClient {
 
     const query = buildQuery(request.query);
     const reranker = request.reranker ? buildReranker(request.reranker) : undefined;
-    const filters = (request.filters ?? []).map(buildFilter);
 
     const response = await this.searchClient!.search({
       indexName,
@@ -233,7 +231,6 @@ export class HermesClient {
       offset: request.offset ?? 0,
       fieldsToLoad: request.fieldsToLoad ?? [],
       reranker,
-      filters,
     });
 
     const hits: SearchHit[] = response.hits.map((hit) => ({
@@ -357,6 +354,20 @@ function buildQuery(q: Query): PbQuery {
   if ("boost" in q) {
     return { boost: { query: buildQuery(q.boost.query), boost: q.boost.boost } };
   }
+  if ("range" in q) {
+    const r = q.range;
+    return {
+      range: {
+        field: r.field,
+        minU64: r.minU64,
+        maxU64: r.maxU64,
+        minI64: r.minI64,
+        maxI64: r.maxI64,
+        minF64: r.minF64,
+        maxF64: r.maxF64,
+      },
+    };
+  }
   if ("all" in q) {
     return { all: {} };
   }
@@ -374,23 +385,6 @@ function buildReranker(r: Reranker): any {
     combinerDecay: r.combinerDecay ?? 0,
     matryoshkaDims: r.matryoshkaDims ?? 0,
   };
-}
-
-function buildFilter(f: Filter): any {
-  const filter: any = { field: f.field };
-  if (f.eqU64 !== undefined) filter.eqU64 = f.eqU64;
-  else if (f.eqI64 !== undefined) filter.eqI64 = f.eqI64;
-  else if (f.eqF64 !== undefined) filter.eqF64 = f.eqF64;
-  else if (f.eqText !== undefined) filter.eqText = f.eqText;
-  else if (f.range !== undefined) filter.range = f.range;
-  else if (f.inValues !== undefined) {
-    filter.inValues = {
-      textValues: f.inValues.textValues ?? [],
-      u64Values: f.inValues.u64Values ?? [],
-      i64Values: f.inValues.i64Values ?? [],
-    };
-  }
-  return filter;
 }
 
 // =============================================================================
