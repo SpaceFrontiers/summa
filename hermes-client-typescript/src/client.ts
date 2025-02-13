@@ -445,6 +445,11 @@ function toFieldEntries(doc: Record<string, any>): PbFieldEntry[] {
         }
         continue;
       }
+      // Multi-value plain field: ["val1", "val2", ...] -> separate entries
+      for (const item of value) {
+        entries.push({ name, value: toFieldValue(item) });
+      }
+      continue;
     }
     entries.push({ name, value: toFieldValue(value) });
   }

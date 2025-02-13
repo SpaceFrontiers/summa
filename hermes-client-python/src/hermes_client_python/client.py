@@ -501,7 +501,7 @@ def _to_field_entries(doc: dict[str, Any]) -> list[pb.FieldEntry]:
     entries = []
     for name, value in doc.items():
         if isinstance(value, list):
-            # Check for multi-value sparse vectors: [[( idx, val), ...], ...]
+            # Check for multi-value sparse vectors: [[(idx, val), ...], ...]
             if _is_multi_sparse_vector(value):
                 for sv in value:
                     indices = [int(item[0]) for item in sv]
@@ -519,6 +519,10 @@ def _to_field_entries(doc: dict[str, Any]) -> list[pb.FieldEntry]:
                     )
                     entries.append(pb.FieldEntry(name=name, value=fv))
                 continue
+            # Multi-value plain field: ["val1", "val2", ...] -> separate entries
+            for item in value:
+                entries.append(pb.FieldEntry(name=name, value=_to_field_value(item)))
+            continue
         # Single value - use standard conversion
         entries.append(pb.FieldEntry(name=name, value=_to_field_value(value)))
     return entries
