@@ -51,6 +51,76 @@ async fn create_boolean_test_index() -> (
     (index, content, timestamp, embedding)
 }
 
+// ── Predicate-aware MaxScore ─────────────────────────────────────────
+
+/// Predicate-aware MaxScore: Boolean(+Range Sparse(dim_0)) where dim 0 matches
+/// all 100 docs. With a selective Range predicate, we should get exactly `limit`
+/// results (or all matching docs if fewer than limit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_predicate_aware_maxscore_fills_topk() {
+    let (index, _content, timestamp, embedding) = create_boolean_test_index().await;
+
+    // Range [3000, 5000] matches docs 20..=40 (21 docs)
+    // Sparse dim 0 (weight 0.5) exists in all 100 docs
+    // Predicate-aware MaxScore should collect top-10 within the range
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(timestamp, Some(3000), Some(5000)))
+        .should(SparseTermQuery::new(embedding, 0, 1.0));
+
+    let results = index.search(&q, 10).await.unwrap();
+    assert_eq!(
+        results.hits.len(),
+        10,
+        "Predicate-aware MaxScore should return exactly limit results when enough docs match, got {}",
+        results.hits.len()
+    );
+
+    // All returned docs should be within [3000, 5000] range (docs 20..=40)
+    for hit in &results.hits {
+        let doc_id = hit.address.doc_id;
+        assert!(
+            (20..=40).contains(&doc_id),
+            "Doc {} should be in range [20, 40]",
+            doc_id
+        );
+        assert!(
+            hit.score > 0.0,
+            "Score should be positive, got {}",
+            hit.score
+        );
+    }
+}
+
+/// Predicate-aware MaxScore with SparseVectorQuery (multi-dim) as SHOULD.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_predicate_aware_maxscore_sparse_vector() {
+    let (index, _content, timestamp, embedding) = create_boolean_test_index().await;
+
+    // Range [2000, 8000] matches docs 10..=70 (61 docs)
+    // SparseVectorQuery with dims {0: 1.0, 1: 0.5} — all 100 docs have dims 0,1
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(timestamp, Some(2000), Some(8000)))
+        .should(SparseVectorQuery::new(embedding, vec![(0, 1.0), (1, 0.5)]));
+
+    let results = index.search(&q, 20).await.unwrap();
+    assert_eq!(
+        results.hits.len(),
+        20,
+        "Should return exactly 20 results from 61 matching docs, got {}",
+        results.hits.len()
+    );
+
+    // All returned docs within the range
+    for hit in &results.hits {
+        let doc_id = hit.address.doc_id;
+        assert!(
+            (10..=70).contains(&doc_id),
+            "Doc {} should be in range [10, 70]",
+            doc_id
+        );
+    }
+}
+
 // ── Standalone SparseTermQuery ──────────────────────────────────────────
 
 /// Single SparseTermQuery for one dimension should find only the matching doc.
@@ -129,7 +199,7 @@ async fn test_must_range_should_sparse_lazy() {
     // timestamp [5000, 7000] → docs 40..=60 (21 docs)
     // sparse dims {150: 1.0, 151: 1.0} → match docs 50, 51
     let q = BooleanQuery::new()
-        .must(RangeQuery::u64_range(timestamp, Some(5000), Some(7000)))
+        .must(RangeQuery::u64(timestamp, Some(5000), Some(7000)))
         .should(SparseVectorQuery::new(
             embedding,
             vec![(150, 1.0), (151, 1.0)],
@@ -177,7 +247,7 @@ async fn test_should_sparse_must_not_range() {
     // MUST_NOT: exclude timestamp >= 5000 (docs 40..99)
     let q = BooleanQuery::new()
         .should(SparseTermQuery::new(embedding, 0, 1.0))
-        .must_not(RangeQuery::u64_range(timestamp, Some(5000), None));
+        .must_not(RangeQuery::u64(timestamp, Some(5000), None));
 
     let results = index.search(&q, 200).await.unwrap();
 
@@ -208,7 +278,7 @@ async fn test_must_should_must_not_combined() {
     // SHOULD: dim 0 (all docs) + dim 130 (boosts doc 30)
     // MUST_NOT: text "doc30" (exclude doc 30)
     let q = BooleanQuery::new()
-        .must(RangeQuery::u64_range(timestamp, Some(2000), Some(6000)))
+        .must(RangeQuery::u64(timestamp, Some(2000), Some(6000)))
         .should(SparseTermQuery::new(embedding, 0, 0.5))
         .should(SparseTermQuery::new(embedding, 130, 2.0))
         .must_not(TermQuery::text(content, "doc30"));
@@ -238,8 +308,8 @@ async fn test_two_must_two_should_sparse() {
     // MUST: timestamp >= 3000 AND timestamp <= 5000 → docs 20..=40 (21 docs)
     // SHOULD: sparse dim 125 + sparse dim 130 → match docs 25, 30
     let q = BooleanQuery::new()
-        .must(RangeQuery::u64_range(timestamp, Some(3000), None))
-        .must(RangeQuery::u64_range(timestamp, None, Some(5000)))
+        .must(RangeQuery::u64(timestamp, Some(3000), None))
+        .must(RangeQuery::u64(timestamp, None, Some(5000)))
         .should(SparseTermQuery::new(embedding, 125, 1.0))
         .should(SparseTermQuery::new(embedding, 130, 1.0));
 

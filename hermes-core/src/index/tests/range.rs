@@ -73,7 +73,7 @@ async fn test_range_u64_exact() {
     let (index, _, price, _, _) = create_range_test_index().await;
 
     // price in [200, 300] → i in [10, 20] → 11 docs
-    let q = RangeQuery::u64_range(price, Some(200), Some(300));
+    let q = RangeQuery::u64(price, Some(200), Some(300));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -87,7 +87,7 @@ async fn test_range_u64_open_min() {
     let (index, _, price, _, _) = create_range_test_index().await;
 
     // price <= 150 → i in [0, 5] → 6 docs (100,110,120,130,140,150)
-    let q = RangeQuery::u64_range(price, None, Some(150));
+    let q = RangeQuery::u64(price, None, Some(150));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -101,7 +101,7 @@ async fn test_range_u64_open_max() {
     let (index, _, price, _, _) = create_range_test_index().await;
 
     // price >= 550 → i in [45, 49] → 5 docs (550,560,570,580,590)
-    let q = RangeQuery::u64_range(price, Some(550), None);
+    let q = RangeQuery::u64(price, Some(550), None);
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -115,7 +115,7 @@ async fn test_range_i64_crossing_zero() {
     let (index, _, _, temp, _) = create_range_test_index().await;
 
     // temp in [-20, 20] → i*10-50 in [-20,20] → i in [3,7] → 5 docs
-    let q = RangeQuery::i64_range(temp, Some(-20), Some(20));
+    let q = RangeQuery::i64(temp, Some(-20), Some(20));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -129,7 +129,7 @@ async fn test_range_i64_all_negative() {
     let (index, _, _, temp, _) = create_range_test_index().await;
 
     // temp in [-50, -10] → i*10-50 in [-50,-10] → i in [0,4] → 5 docs
-    let q = RangeQuery::i64_range(temp, Some(-50), Some(-10));
+    let q = RangeQuery::i64(temp, Some(-50), Some(-10));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -143,7 +143,7 @@ async fn test_range_f64() {
     let (index, _, _, _, weight) = create_range_test_index().await;
 
     // weight in [1.0, 3.0] → 0.5+i*0.25 in [1.0,3.0] → i in [2,10] → 9 docs
-    let q = RangeQuery::f64_range(weight, Some(1.0), Some(3.0));
+    let q = RangeQuery::f64(weight, Some(1.0), Some(3.0));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -157,7 +157,7 @@ async fn test_range_no_matches() {
     let (index, _, price, _, _) = create_range_test_index().await;
 
     // price in [9000, 9999] → no docs
-    let q = RangeQuery::u64_range(price, Some(9000), Some(9999));
+    let q = RangeQuery::u64(price, Some(9000), Some(9999));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(results.hits.len(), 0, "Out-of-range should match 0 docs");
 }
@@ -172,7 +172,7 @@ async fn test_range_in_boolean_must() {
     // price in [200, 300] → i in [10,20] → intersection: docs 10..20 = 11 docs
     let q = BooleanQuery::new()
         .must(TermQuery::new(title, b"electronics".to_vec()))
-        .must(RangeQuery::u64_range(price, Some(200), Some(300)));
+        .must(RangeQuery::u64(price, Some(200), Some(300)));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -196,8 +196,8 @@ async fn test_range_two_ranges_in_boolean() {
     // temp in [0, 100] → i*10-50 in [0,100] → i in [5, 15]
     // Intersection: i in [10, 15] → 6 docs
     let q = BooleanQuery::new()
-        .must(RangeQuery::u64_range(price, Some(200), Some(400)))
-        .must(RangeQuery::i64_range(temp, Some(0), Some(100)));
+        .must(RangeQuery::u64(price, Some(200), Some(400)))
+        .must(RangeQuery::i64(temp, Some(0), Some(100)));
     let results = index.search(&q, 100).await.unwrap();
     assert_eq!(
         results.hits.len(),
@@ -263,7 +263,7 @@ async fn test_must_range_should_sparse() {
 
     // ── Query: MUST timestamp in [5000, 7000], SHOULD sparse{50: 1.0, 51: 1.0} ──
     let q = BooleanQuery::new()
-        .must(RangeQuery::u64_range(timestamp, Some(5000), Some(7000)))
+        .must(RangeQuery::u64(timestamp, Some(5000), Some(7000)))
         .should(SparseVectorQuery::new(
             embedding,
             vec![(50, 1.0), (51, 1.0)],
@@ -287,11 +287,11 @@ async fn test_must_range_should_sparse() {
         doc_ids,
     );
 
-    // Both should have score > 1.0 (filter_score + sparse score)
+    // Scores are pure sparse scores (no filter_score bonus)
     for hit in &results.hits {
         assert!(
-            hit.score > 1.0,
-            "SHOULD-matching docs should have score > 1.0, got {}",
+            hit.score > 0.0,
+            "SHOULD-matching docs should have positive score, got {}",
             hit.score,
         );
     }

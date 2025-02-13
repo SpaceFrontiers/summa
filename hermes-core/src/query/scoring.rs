@@ -182,6 +182,7 @@ pub struct MaxScoreExecutor<'a> {
     prefix_sums: Vec<f32>,
     collector: ScoreCollector,
     heap_factor: f32,
+    predicate: Option<super::DocPredicate<'a>>,
 }
 
 /// Unified term cursor for Block-Max MaxScore execution.
@@ -703,6 +704,19 @@ macro_rules! bms_execute_loop {
                 }
             }
 
+            // --- Predicate filter (after block-max, before scoring) ---
+            if let Some(ref pred) = $self.predicate {
+                if !pred(min_doc) {
+                    for i in partition..n {
+                        if $self.cursors[i].doc() == min_doc {
+                            $self.cursors[i].$ensure() $($aw)* ?;
+                            $self.cursors[i].$advance() $($aw)* ?;
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // --- Score essential cursors ---
             ordinal_scores.clear();
             for i in partition..n {
@@ -836,6 +850,7 @@ impl<'a> MaxScoreExecutor<'a> {
             prefix_sums,
             collector: ScoreCollector::new(k),
             heap_factor: heap_factor.clamp(0.0, 1.0),
+            predicate: None,
         }
     }
 
@@ -885,6 +900,16 @@ impl<'a> MaxScoreExecutor<'a> {
     fn find_partition(&self) -> usize {
         let threshold = self.collector.threshold() * self.heap_factor;
         self.prefix_sums.partition_point(|&sum| sum <= threshold)
+    }
+
+    /// Attach a per-doc predicate filter to this executor.
+    ///
+    /// Docs failing the predicate are skipped after block-max pruning but
+    /// before scoring. The predicate does not affect thresholds or block-max
+    /// comparisons — the heap stores pure sparse/text scores.
+    pub fn with_predicate(mut self, predicate: super::DocPredicate<'a>) -> Self {
+        self.predicate = Some(predicate);
+        self
     }
 
     /// Execute Block-Max MaxScore and return top-k results (async).

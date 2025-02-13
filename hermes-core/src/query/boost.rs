@@ -75,6 +75,10 @@ impl Query for BoostQuery {
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
         self.inner.as_doc_predicate(reader)
     }
+
+    fn as_sparse_term_queries(&self) -> Option<Vec<super::SparseTermQueryInfo>> {
+        self.inner.as_sparse_term_queries()
+    }
 }
 
 struct BoostScorer<'a> {

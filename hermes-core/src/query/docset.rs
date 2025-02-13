@@ -391,7 +391,6 @@ impl super::Scorer for IntersectionScorer<'_> {
 /// - O(1) predicate closures (e.g., fast-field range checks)
 /// - seek()-based verifier scorers (e.g., TermQuery posting list lookups)
 ///
-/// `filter_score` is a constant added for predicate-converted filters.
 /// Verifier scorers contribute their actual per-doc score (e.g., BM25).
 pub struct PredicatedScorer<'a> {
     /// Driving scorer (typically SHOULD clauses)
@@ -402,8 +401,6 @@ pub struct PredicatedScorer<'a> {
     must_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
     /// MUST_NOT scorers — docs are excluded if these land on them
     must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
-    /// Constant score from predicate-converted filters (1.0 per filter)
-    filter_score: f32,
 }
 
 impl<'a> PredicatedScorer<'a> {
@@ -412,14 +409,12 @@ impl<'a> PredicatedScorer<'a> {
         predicates: Vec<super::DocPredicate<'a>>,
         must_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
         must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
-        filter_score: f32,
     ) -> Self {
         let mut s = Self {
             driver,
             predicates,
             must_verifiers,
             must_not_verifiers,
-            filter_score,
         };
         // Position on first matching doc
         s.skip_non_matching();
@@ -479,7 +474,7 @@ impl super::Scorer for PredicatedScorer<'_> {
         for v in &self.must_verifiers {
             total += v.score();
         }
-        total + self.filter_score
+        total
     }
 
     fn matched_positions(&self) -> Option<super::MatchedPositions> {

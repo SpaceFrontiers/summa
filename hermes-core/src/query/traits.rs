@@ -125,6 +125,15 @@ macro_rules! define_query_traits {
                 None
             }
 
+            /// Decompose into sparse term query infos for MaxScore optimization.
+            ///
+            /// Returns `Some(vec)` if this query can be represented as a set of
+            /// sparse term queries on the same field. Used by the BooleanQuery
+            /// planner to build a predicate-aware MaxScoreExecutor directly.
+            fn as_sparse_term_queries(&self) -> Option<Vec<SparseTermQueryInfo>> {
+                None
+            }
+
             /// True if this query is a pure filter (always scores 1.0, no positions).
             /// Used by the planner to convert non-selective MUST filters into predicates.
             fn is_filter(&self) -> bool {
@@ -176,6 +185,10 @@ impl Query for Box<dyn Query> {
 
     fn as_sparse_term_query_info(&self) -> Option<SparseTermQueryInfo> {
         (**self).as_sparse_term_query_info()
+    }
+
+    fn as_sparse_term_queries(&self) -> Option<Vec<SparseTermQueryInfo>> {
+        (**self).as_sparse_term_queries()
     }
 
     fn is_filter(&self) -> bool {

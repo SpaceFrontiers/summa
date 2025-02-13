@@ -72,79 +72,97 @@ impl TermQuery {
     }
 }
 
+/// Compute (idf, avg_field_len) from a posting list, using global stats when available.
+fn compute_term_idf(
+    posting_list: &BlockPostingList,
+    field: Field,
+    reader: &SegmentReader,
+    global_stats: Option<&Arc<GlobalStats>>,
+    term: &[u8],
+) -> (f32, f32) {
+    if let Some(stats) = global_stats {
+        let term_str = String::from_utf8_lossy(term);
+        let global_idf = stats.text_idf(field, &term_str);
+        if global_idf > 0.0 {
+            return (global_idf, stats.avg_field_len(field));
+        }
+    }
+    let num_docs = reader.num_docs() as f32;
+    let doc_freq = posting_list.doc_count() as f32;
+    (
+        super::bm25_idf(doc_freq, num_docs),
+        reader.avg_field_len(field),
+    )
+}
+
+// ── Unified term scorer macro ────────────────────────────────────────────
+//
+// Parameterised on:
+//   $get_postings_fn – get_postings | get_postings_sync
+//   $get_positions_fn – get_positions | get_positions_sync
+//   $($aw)*          – .await  (present for async, absent for sync)
+macro_rules! term_plan {
+    ($field:expr, $term:expr, $global_stats:expr, $reader:expr,
+     $get_postings_fn:ident, $get_positions_fn:ident
+     $(, $aw:tt)*) => {{
+        let field: Field = $field;
+        let term: &[u8] = $term;
+        let global_stats: Option<&Arc<GlobalStats>> = $global_stats;
+        let reader: &SegmentReader = $reader;
+
+        // Non-indexed fields → fast-field-only path
+        let is_indexed = reader.schema().get_field_entry(field).is_none_or(|e| e.indexed);
+        if !is_indexed {
+            let term_str = String::from_utf8_lossy(term);
+            if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
+                return Ok(Box::new(scorer) as Box<dyn Scorer + '_>);
+            }
+            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+        }
+
+        let postings = reader.$get_postings_fn(field, term) $(. $aw)* ?;
+
+        match postings {
+            Some(posting_list) => {
+                let (idf, avg_field_len) =
+                    compute_term_idf(&posting_list, field, reader, global_stats, term);
+
+                let positions = reader.$get_positions_fn(field, term)
+                    $(. $aw)* .ok().flatten();
+
+                let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0);
+                if let Some(pos) = positions {
+                    scorer = scorer.with_positions(field.0, pos);
+                }
+                Ok(Box::new(scorer) as Box<dyn Scorer + '_>)
+            }
+            None => {
+                let term_str = String::from_utf8_lossy(term);
+                if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
+                    Ok(Box::new(scorer) as Box<dyn Scorer + '_>)
+                } else {
+                    Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>)
+                }
+            }
+        }
+    }};
+}
+
 impl Query for TermQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let term = self.term.clone();
         let global_stats = self.global_stats.clone();
-        let is_indexed = reader
-            .schema()
-            .get_field_entry(field)
-            .is_none_or(|e| e.indexed);
         Box::pin(async move {
-            // For non-indexed fields (fast-field-only), skip SSTable entirely
-            if !is_indexed {
-                let term_str = String::from_utf8_lossy(&term);
-                if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
-                    return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
-                }
-                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
-            }
-
-            let postings = reader.get_postings(field, &term).await?;
-
-            match postings {
-                Some(posting_list) => {
-                    // Use global stats IDF if available, otherwise segment-local
-                    let (idf, avg_field_len) = if let Some(ref stats) = global_stats {
-                        let term_str = String::from_utf8_lossy(&term);
-                        let global_idf = stats.text_idf(field, &term_str);
-
-                        // If global stats has this term, use global IDF
-                        // Otherwise fall back to segment-local
-                        if global_idf > 0.0 {
-                            (global_idf, stats.avg_field_len(field))
-                        } else {
-                            // Fall back to segment-local IDF
-                            let num_docs = reader.num_docs() as f32;
-                            let doc_freq = posting_list.doc_count() as f32;
-                            let idf = super::bm25_idf(doc_freq, num_docs);
-                            (idf, reader.avg_field_len(field))
-                        }
-                    } else {
-                        // Compute IDF from segment statistics
-                        let num_docs = reader.num_docs() as f32;
-                        let doc_freq = posting_list.doc_count() as f32;
-                        let idf = super::bm25_idf(doc_freq, num_docs);
-                        (idf, reader.avg_field_len(field))
-                    };
-
-                    // Try to load positions if available
-                    let positions = reader.get_positions(field, &term).await.ok().flatten();
-
-                    let mut scorer = TermScorer::new(
-                        posting_list,
-                        idf,
-                        avg_field_len,
-                        1.0, // default field boost
-                    );
-
-                    if let Some(pos) = positions {
-                        scorer = scorer.with_positions(field.0, pos);
-                    }
-
-                    Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
-                }
-                None => {
-                    // Fall back to fast field scanning for fast-only text fields
-                    let term_str = String::from_utf8_lossy(&term);
-                    if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
-                        Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
-                    } else {
-                        Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>)
-                    }
-                }
-            }
+            term_plan!(
+                field,
+                &term,
+                global_stats.as_ref(),
+                reader,
+                get_postings,
+                get_positions,
+                await
+            )
         })
     }
 
@@ -165,66 +183,14 @@ impl Query for TermQuery {
         reader: &'a SegmentReader,
         _limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        // For non-indexed fields (fast-field-only), skip SSTable entirely
-        let is_indexed = reader
-            .schema()
-            .get_field_entry(self.field)
-            .is_none_or(|e| e.indexed);
-        if !is_indexed {
-            let term_str = String::from_utf8_lossy(&self.term);
-            if let Some(scorer) = FastFieldTextScorer::try_new(reader, self.field, &term_str) {
-                return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
-            }
-            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
-        }
-
-        let postings = reader.get_postings_sync(self.field, &self.term)?;
-
-        match postings {
-            Some(posting_list) => {
-                let (idf, avg_field_len) = if let Some(ref stats) = self.global_stats {
-                    let term_str = String::from_utf8_lossy(&self.term);
-                    let global_idf = stats.text_idf(self.field, &term_str);
-                    if global_idf > 0.0 {
-                        (global_idf, stats.avg_field_len(self.field))
-                    } else {
-                        let num_docs = reader.num_docs() as f32;
-                        let doc_freq = posting_list.doc_count() as f32;
-                        (
-                            super::bm25_idf(doc_freq, num_docs),
-                            reader.avg_field_len(self.field),
-                        )
-                    }
-                } else {
-                    let num_docs = reader.num_docs() as f32;
-                    let doc_freq = posting_list.doc_count() as f32;
-                    (
-                        super::bm25_idf(doc_freq, num_docs),
-                        reader.avg_field_len(self.field),
-                    )
-                };
-
-                let positions = reader
-                    .get_positions_sync(self.field, &self.term)
-                    .ok()
-                    .flatten();
-
-                let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0);
-                if let Some(pos) = positions {
-                    scorer = scorer.with_positions(self.field.0, pos);
-                }
-
-                Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
-            }
-            None => {
-                let term_str = String::from_utf8_lossy(&self.term);
-                if let Some(scorer) = FastFieldTextScorer::try_new(reader, self.field, &term_str) {
-                    Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
-                } else {
-                    Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>)
-                }
-            }
-        }
+        term_plan!(
+            self.field,
+            &self.term,
+            self.global_stats.as_ref(),
+            reader,
+            get_postings_sync,
+            get_positions_sync
+        )
     }
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {

@@ -694,6 +694,25 @@ impl Query for SparseVectorQuery {
     fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
         Box::pin(async move { Ok(u32::MAX) })
     }
+
+    fn as_sparse_term_queries(&self) -> Option<Vec<super::SparseTermQueryInfo>> {
+        let dims = self.pruned_dims();
+        if dims.is_empty() {
+            return None;
+        }
+        Some(
+            dims.iter()
+                .map(|&(dim_id, weight)| super::SparseTermQueryInfo {
+                    field: self.field,
+                    dim_id,
+                    weight,
+                    heap_factor: self.heap_factor,
+                    combiner: self.combiner,
+                    over_fetch_factor: self.over_fetch_factor,
+                })
+                .collect(),
+        )
+    }
 }
 
 // ── SparseTermQuery: single sparse dimension query (like TermQuery for text) ──
@@ -834,6 +853,10 @@ impl Query for SparseTermQuery {
             combiner: self.combiner,
             over_fetch_factor: self.over_fetch_factor,
         })
+    }
+
+    fn as_sparse_term_queries(&self) -> Option<Vec<super::SparseTermQueryInfo>> {
+        Some(vec![self.as_sparse_term_query_info()?])
     }
 }
 

@@ -92,76 +92,79 @@ impl PhraseQuery {
     }
 }
 
+/// Build a PhraseScorer from already-fetched term data.
+fn build_phrase_scorer<'a>(
+    term_data: Vec<(BlockPostingList, PositionPostingList)>,
+    slop: u32,
+    reader: &SegmentReader,
+    field: Field,
+) -> Box<dyn Scorer + 'a> {
+    let idf: f32 = term_data
+        .iter()
+        .map(|(p, _)| {
+            let num_docs = reader.num_docs() as f32;
+            let doc_freq = p.doc_count() as f32;
+            super::bm25_idf(doc_freq, num_docs)
+        })
+        .sum();
+    let avg_field_len = reader.avg_field_len(field);
+    let (postings, positions): (Vec<_>, Vec<_>) = term_data.into_iter().unzip();
+    Box::new(PhraseScorer::new(
+        postings,
+        positions,
+        slop,
+        idf,
+        avg_field_len,
+    ))
+}
+
+// ── Shared early-return checks for phrase scorer ─────────────────────────
+//
+// Handles: empty terms, single-term delegation, no-positions fallback.
+// Parameterised on $scorer_fn + $($aw)* for async/sync.
+macro_rules! phrase_early_returns {
+    ($field:expr, $terms:expr, $reader:expr, $limit:expr,
+     $scorer_fn:ident $(, $aw:tt)*) => {
+        if $terms.is_empty() {
+            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+        }
+        if $terms.len() == 1 {
+            let tq = super::TermQuery::new($field, $terms[0].clone());
+            return tq.$scorer_fn($reader, $limit) $(. $aw)* ;
+        }
+        if !$reader.has_positions($field) {
+            let mut bq = super::BooleanQuery::new();
+            for t in $terms.iter() {
+                bq = bq.must(super::TermQuery::new($field, t.clone()));
+            }
+            return bq.$scorer_fn($reader, $limit) $(. $aw)* ;
+        }
+    };
+}
+
 impl Query for PhraseQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let terms = self.terms.clone();
         let slop = self.slop;
-        let _global_stats = self.global_stats.clone();
 
         Box::pin(async move {
-            if terms.is_empty() {
-                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
-            }
+            phrase_early_returns!(field, terms, reader, limit, scorer, await);
 
-            // Single term - delegate to TermQuery
-            if terms.len() == 1 {
-                let term_query = super::TermQuery::new(field, terms[0].clone());
-                return term_query.scorer(reader, limit).await;
-            }
-
-            // Check if positions are available
-            if !reader.has_positions(field) {
-                // Fall back to AND query (BooleanQuery with MUST clauses)
-                let mut bool_query = super::BooleanQuery::new();
-                for term in &terms {
-                    bool_query = bool_query.must(super::TermQuery::new(field, term.clone()));
-                }
-                return bool_query.scorer(reader, limit).await;
-            }
-
-            // Load postings and positions for all terms (parallel per term)
-            let mut term_postings: Vec<BlockPostingList> = Vec::with_capacity(terms.len());
-            let mut term_positions: Vec<PositionPostingList> = Vec::with_capacity(terms.len());
-
+            // Fetch postings + positions in parallel per term via futures::join!
+            let mut term_data = Vec::with_capacity(terms.len());
             for term in &terms {
-                // Fetch postings and positions in parallel
                 let (postings, positions) = futures::join!(
                     reader.get_postings(field, term),
                     reader.get_positions(field, term)
                 );
-
                 match (postings?, positions?) {
-                    (Some(p), Some(pos)) => {
-                        term_postings.push(p);
-                        term_positions.push(pos);
-                    }
-                    _ => {
-                        // If any term is missing, no documents can match
-                        return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
-                    }
+                    (Some(p), Some(pos)) => term_data.push((p, pos)),
+                    _ => return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
                 }
             }
 
-            // Compute combined IDF (sum of individual IDFs)
-            let idf: f32 = term_postings
-                .iter()
-                .map(|p| {
-                    let num_docs = reader.num_docs() as f32;
-                    let doc_freq = p.doc_count() as f32;
-                    super::bm25_idf(doc_freq, num_docs)
-                })
-                .sum();
-
-            let avg_field_len = reader.avg_field_len(field);
-
-            Ok(Box::new(PhraseScorer::new(
-                term_postings,
-                term_positions,
-                slop,
-                idf,
-                avg_field_len,
-            )) as Box<dyn Scorer + 'a>)
+            Ok(build_phrase_scorer(term_data, slop, reader, field))
         })
     }
 
@@ -171,57 +174,33 @@ impl Query for PhraseQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        if self.terms.is_empty() {
-            return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>);
-        }
+        phrase_early_returns!(self.field, self.terms, reader, limit, scorer_sync);
 
-        if self.terms.len() == 1 {
-            let term_query = super::TermQuery::new(self.field, self.terms[0].clone());
-            return term_query.scorer_sync(reader, limit);
-        }
-
-        if !reader.has_positions(self.field) {
-            let mut bool_query = super::BooleanQuery::new();
-            for term in &self.terms {
-                bool_query = bool_query.must(super::TermQuery::new(self.field, term.clone()));
-            }
-            return bool_query.scorer_sync(reader, limit);
-        }
-
-        let mut term_postings: Vec<BlockPostingList> = Vec::with_capacity(self.terms.len());
-        let mut term_positions: Vec<PositionPostingList> = Vec::with_capacity(self.terms.len());
-
-        for term in &self.terms {
-            let postings = reader.get_postings_sync(self.field, term)?;
-            let positions = reader.get_positions_sync(self.field, term)?;
-
-            match (postings, positions) {
-                (Some(p), Some(pos)) => {
-                    term_postings.push(p);
-                    term_positions.push(pos);
-                }
-                _ => return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
-            }
-        }
-
-        let idf: f32 = term_postings
-            .iter()
-            .map(|p| {
-                let num_docs = reader.num_docs() as f32;
-                let doc_freq = p.doc_count() as f32;
-                super::bm25_idf(doc_freq, num_docs)
+        // Parallel fetch across all terms via rayon
+        use rayon::prelude::*;
+        let pairs: crate::Result<Vec<Option<(BlockPostingList, PositionPostingList)>>> = self
+            .terms
+            .par_iter()
+            .map(|term| {
+                let postings = reader.get_postings_sync(self.field, term)?;
+                let positions = reader.get_positions_sync(self.field, term)?;
+                Ok(match (postings, positions) {
+                    (Some(p), Some(pos)) => Some((p, pos)),
+                    _ => None,
+                })
             })
-            .sum();
+            .collect();
+        let mut term_data = Vec::with_capacity(self.terms.len());
+        for entry in pairs? {
+            match entry {
+                Some(pair) => term_data.push(pair),
+                None => return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
+            }
+        }
 
-        let avg_field_len = reader.avg_field_len(self.field);
-
-        Ok(Box::new(PhraseScorer::new(
-            term_postings,
-            term_positions,
-            self.slop,
-            idf,
-            avg_field_len,
-        )) as Box<dyn Scorer + 'a>)
+        Ok(build_phrase_scorer(
+            term_data, self.slop, reader, self.field,
+        ))
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {

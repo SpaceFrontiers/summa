@@ -126,17 +126,17 @@ impl RangeQuery {
     }
 
     /// Convenience: u64 range
-    pub fn u64_range(field: Field, min: Option<u64>, max: Option<u64>) -> Self {
+    pub fn u64(field: Field, min: Option<u64>, max: Option<u64>) -> Self {
         Self::new(field, RangeBound::U64 { min, max })
     }
 
     /// Convenience: i64 range
-    pub fn i64_range(field: Field, min: Option<i64>, max: Option<i64>) -> Self {
+    pub fn i64(field: Field, min: Option<i64>, max: Option<i64>) -> Self {
         Self::new(field, RangeBound::I64 { min, max })
     }
 
     /// Convenience: f64 range
-    pub fn f64_range(field: Field, min: Option<f64>, max: Option<f64>) -> Self {
+    pub fn f64(field: Field, min: Option<f64>, max: Option<f64>) -> Self {
         Self::new(field, RangeBound::F64 { min, max })
     }
 }
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_range_query_constructors() {
-        let q = RangeQuery::u64_range(Field(0), Some(10), Some(100));
+        let q = RangeQuery::u64(Field(0), Some(10), Some(100));
         assert_eq!(q.field, Field(0));
         assert!(matches!(
             q.bound,
@@ -397,7 +397,7 @@ mod tests {
             }
         ));
 
-        let q = RangeQuery::i64_range(Field(1), Some(-50), Some(50));
+        let q = RangeQuery::i64(Field(1), Some(-50), Some(50));
         assert!(matches!(
             q.bound,
             RangeBound::I64 {
@@ -406,7 +406,7 @@ mod tests {
             }
         ));
 
-        let q = RangeQuery::f64_range(Field(2), Some(0.5), Some(9.5));
+        let q = RangeQuery::f64(Field(2), Some(0.5), Some(9.5));
         assert!(matches!(q.bound, RangeBound::F64 { .. }));
     }
 }
