@@ -77,7 +77,20 @@ impl Query for TermQuery {
         let field = self.field;
         let term = self.term.clone();
         let global_stats = self.global_stats.clone();
+        let is_indexed = reader
+            .schema()
+            .get_field_entry(field)
+            .is_none_or(|e| e.indexed);
         Box::pin(async move {
+            // For non-indexed fields (fast-field-only), skip SSTable entirely
+            if !is_indexed {
+                let term_str = String::from_utf8_lossy(&term);
+                if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
+                    return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
+                }
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
+            }
+
             let postings = reader.get_postings(field, &term).await?;
 
             match postings {
@@ -152,6 +165,19 @@ impl Query for TermQuery {
         reader: &'a SegmentReader,
         _limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        // For non-indexed fields (fast-field-only), skip SSTable entirely
+        let is_indexed = reader
+            .schema()
+            .get_field_entry(self.field)
+            .is_none_or(|e| e.indexed);
+        if !is_indexed {
+            let term_str = String::from_utf8_lossy(&self.term);
+            if let Some(scorer) = FastFieldTextScorer::try_new(reader, self.field, &term_str) {
+                return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
+            }
+            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
+        }
+
         let postings = reader.get_postings_sync(self.field, &self.term)?;
 
         match postings {
