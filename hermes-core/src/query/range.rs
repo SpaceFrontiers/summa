@@ -170,6 +170,30 @@ impl Query for RangeQuery {
         // Rough estimate: half the segment (we don't know selectivity)
         Box::pin(async move { Ok(num_docs / 2) })
     }
+
+    fn is_filter(&self) -> bool {
+        true
+    }
+
+    fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
+        let fast_field = reader.fast_field(self.field.0)?;
+        let (raw_lo, raw_hi) = self.bound.compile();
+        let use_i64 = self.bound.is_i64();
+        let (i64_lo, i64_hi) = self.bound.i64_bounds();
+
+        Some(Box::new(move |doc_id: DocId| -> bool {
+            let raw = fast_field.get_u64(doc_id);
+            if raw == FAST_FIELD_MISSING {
+                return false;
+            }
+            if use_i64 {
+                let val = crate::structures::fast_field::zigzag_decode(raw);
+                val >= i64_lo && val <= i64_hi
+            } else {
+                raw >= raw_lo && raw <= raw_hi
+            }
+        }))
+    }
 }
 
 // ── RangeScorer ──────────────────────────────────────────────────────────

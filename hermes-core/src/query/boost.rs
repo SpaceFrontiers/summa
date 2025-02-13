@@ -67,6 +67,14 @@ impl Query for BoostQuery {
         let inner = self.inner.clone();
         Box::pin(async move { inner.count_estimate(reader).await })
     }
+
+    fn is_filter(&self) -> bool {
+        self.inner.is_filter()
+    }
+
+    fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
+        self.inner.as_doc_predicate(reader)
+    }
 }
 
 struct BoostScorer<'a> {

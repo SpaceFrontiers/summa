@@ -459,6 +459,58 @@ fn try_sparse_maxscore_scorer_sync<'a>(
     )))
 }
 
+/// Try to compile all MUST filter queries (and optionally MUST_NOT) into a
+/// single combined predicate. Returns `None` if:
+/// - any MUST clause is not a filter (`is_filter() == false`)
+/// - any MUST clause can't produce a `DocPredicate`
+/// - any MUST_NOT clause can't produce a `DocPredicate`
+///
+/// On success returns `(predicate, filter_score)`.
+fn compile_filter_predicates<'a>(
+    must: &[std::sync::Arc<dyn Query>],
+    must_not: &[std::sync::Arc<dyn Query>],
+    reader: &'a SegmentReader,
+) -> Option<(super::DocPredicate<'a>, f32)> {
+    if must.is_empty() || !must.iter().all(|q| q.is_filter()) {
+        return None;
+    }
+
+    let predicates: Vec<_> = must
+        .iter()
+        .filter_map(|q| q.as_doc_predicate(reader))
+        .collect();
+    if predicates.len() != must.len() {
+        return None;
+    }
+
+    let filter_score = must.len() as f32;
+
+    let combined: super::DocPredicate<'a> = if predicates.len() == 1 {
+        predicates.into_iter().next().unwrap()
+    } else {
+        Box::new(move |doc_id| predicates.iter().all(|p| p(doc_id)))
+    };
+
+    if must_not.is_empty() {
+        return Some((combined, filter_score));
+    }
+
+    // All MUST_NOT must also be convertible to predicates; otherwise
+    // we can't guarantee correctness and must fall back to BooleanScorer.
+    let not_predicates: Vec<_> = must_not
+        .iter()
+        .filter_map(|q| q.as_doc_predicate(reader))
+        .collect();
+    if not_predicates.len() != must_not.len() {
+        return None;
+    }
+
+    Some((
+        Box::new(move |doc_id| combined(doc_id) && not_predicates.iter().all(|p| !p(doc_id))),
+        filter_score,
+    ))
+}
+
 impl Query for BooleanQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         // Clone Arc vectors - cheap reference counting
@@ -496,6 +548,44 @@ impl Query for BooleanQuery {
                     try_per_field_maxscore(&should, reader, limit, global_stats.as_ref()).await?
                 {
                     return Ok(scorer);
+                }
+            }
+
+            // ── Planner: filter push-down for MUST filters + SHOULD scoring ──
+            // When ALL MUST clauses are pure filters (score=1.0) and there are
+            // scoring SHOULD clauses, flip the driver: SHOULD drives iteration,
+            // MUST filters become O(1) per-doc predicates.
+            if !should.is_empty()
+                && limit < usize::MAX / 4
+                && let Some((predicate, filter_score)) =
+                    compile_filter_predicates(&must, &must_not, reader)
+            {
+                let should_scorer = if should.len() == 1 {
+                    should[0].scorer(reader, limit).await?
+                } else {
+                    let sub = BooleanQuery {
+                        must: Vec::new(),
+                        should: should.clone(),
+                        must_not: Vec::new(),
+                        global_stats: global_stats.clone(),
+                    };
+                    sub.scorer(reader, limit).await?
+                };
+
+                // Only use push-down when SHOULD has enough results to
+                // fill top-k. Otherwise fall through to standard scoring.
+                if should_scorer.size_hint() >= limit as u32 {
+                    log::debug!(
+                        "BooleanQuery planner: filter push-down, {} MUST filters → predicate, {} SHOULD scorers drive (size_hint={})",
+                        must.len(),
+                        should.len(),
+                        should_scorer.size_hint()
+                    );
+                    return Ok(Box::new(super::PredicatedScorer::new(
+                        should_scorer,
+                        predicate,
+                        filter_score,
+                    )));
                 }
             }
 
@@ -561,6 +651,38 @@ impl Query for BooleanQuery {
                 self.global_stats.as_ref(),
             )? {
                 return Ok(scorer);
+            }
+        }
+
+        // ── Planner: filter push-down for MUST filters + SHOULD scoring ──
+        if !self.should.is_empty()
+            && limit < usize::MAX / 4
+            && let Some((predicate, filter_score)) =
+                compile_filter_predicates(&self.must, &self.must_not, reader)
+        {
+            let should_scorer = if self.should.len() == 1 {
+                self.should[0].scorer_sync(reader, limit)?
+            } else {
+                let sub = BooleanQuery {
+                    must: Vec::new(),
+                    should: self.should.clone(),
+                    must_not: Vec::new(),
+                    global_stats: self.global_stats.clone(),
+                };
+                sub.scorer_sync(reader, limit)?
+            };
+
+            if should_scorer.size_hint() >= limit as u32 {
+                log::debug!(
+                    "BooleanQuery planner (sync): filter push-down, {} MUST filters → predicate, {} SHOULD scorers drive",
+                    self.must.len(),
+                    self.should.len()
+                );
+                return Ok(Box::new(super::PredicatedScorer::new(
+                    should_scorer,
+                    predicate,
+                    filter_score,
+                )));
             }
         }
 

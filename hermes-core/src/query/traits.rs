@@ -35,6 +35,12 @@ pub type CountFuture<'a> = Pin<Box<dyn Future<Output = Result<u32>> + Send + 'a>
 #[cfg(target_arch = "wasm32")]
 pub type CountFuture<'a> = Pin<Box<dyn Future<Output = Result<u32>> + 'a>>;
 
+/// Per-document predicate closure type (platform-aware Send+Sync bounds)
+#[cfg(not(target_arch = "wasm32"))]
+pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + Send + Sync + 'a>;
+#[cfg(target_arch = "wasm32")]
+pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + 'a>;
+
 /// Info for MaxScore-optimizable term queries
 #[derive(Debug, Clone)]
 pub struct TermQueryInfo {
@@ -118,6 +124,21 @@ macro_rules! define_query_traits {
             fn as_sparse_term_query_info(&self) -> Option<SparseTermQueryInfo> {
                 None
             }
+
+            /// True if this query is a pure filter (always scores 1.0, no positions).
+            /// Used by the planner to convert non-selective MUST filters into predicates.
+            fn is_filter(&self) -> bool {
+                false
+            }
+
+            /// For filter queries: return a cheap per-doc predicate against a segment.
+            /// The predicate does O(1) work per doc (e.g., fast-field lookup).
+            fn as_doc_predicate<'a>(
+                &self,
+                _reader: &'a SegmentReader,
+            ) -> Option<DocPredicate<'a>> {
+                None
+            }
         }
 
         /// Scored document stream: a DocSet that also provides scores.
@@ -155,6 +176,14 @@ impl Query for Box<dyn Query> {
 
     fn as_sparse_term_query_info(&self) -> Option<SparseTermQueryInfo> {
         (**self).as_sparse_term_query_info()
+    }
+
+    fn is_filter(&self) -> bool {
+        (**self).is_filter()
+    }
+
+    fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<DocPredicate<'a>> {
+        (**self).as_doc_predicate(reader)
     }
 
     #[cfg(feature = "sync")]

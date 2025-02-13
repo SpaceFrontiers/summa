@@ -382,6 +382,77 @@ impl super::Scorer for IntersectionScorer<'_> {
     }
 }
 
+// ── PredicatedScorer ─────────────────────────────────────────────────────
+
+/// Wraps a Scorer with a predicate closure, skipping docs that fail the predicate.
+///
+/// Used by the query planner to convert non-selective MUST filters (e.g., Range)
+/// into O(1) per-doc checks instead of driving iteration from them.
+/// The `filter_score` is added to the inner score for each matching doc.
+pub struct PredicatedScorer<'a> {
+    inner: Box<dyn super::Scorer + 'a>,
+    predicate: super::DocPredicate<'a>,
+    filter_score: f32,
+}
+
+impl<'a> PredicatedScorer<'a> {
+    pub fn new(
+        mut inner: Box<dyn super::Scorer + 'a>,
+        predicate: super::DocPredicate<'a>,
+        filter_score: f32,
+    ) -> Self {
+        // Advance to the first doc that satisfies the predicate
+        let mut doc = inner.doc();
+        while doc != TERMINATED && !(predicate)(doc) {
+            doc = inner.advance();
+        }
+        Self {
+            inner,
+            predicate,
+            filter_score,
+        }
+    }
+
+    /// Advance inner past non-matching docs.
+    fn skip_non_matching(&mut self) -> DocId {
+        let mut doc = self.inner.doc();
+        while doc != TERMINATED && !(self.predicate)(doc) {
+            doc = self.inner.advance();
+        }
+        doc
+    }
+}
+
+impl DocSet for PredicatedScorer<'_> {
+    fn doc(&self) -> DocId {
+        self.inner.doc()
+    }
+
+    fn advance(&mut self) -> DocId {
+        self.inner.advance();
+        self.skip_non_matching()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.inner.seek(target);
+        self.skip_non_matching()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.inner.size_hint()
+    }
+}
+
+impl super::Scorer for PredicatedScorer<'_> {
+    fn score(&self) -> crate::Score {
+        self.inner.score() + self.filter_score
+    }
+
+    fn matched_positions(&self) -> Option<super::MatchedPositions> {
+        self.inner.matched_positions()
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
