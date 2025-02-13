@@ -560,6 +560,27 @@ impl Query for BooleanQuery {
                         filter_score,
                     )));
                 }
+
+                // size_hint < limit — reuse already-built SHOULD scorer in
+                // the standard BooleanScorer to avoid rebuilding it.
+                let mut must_scorers = Vec::with_capacity(must.len());
+                for q in &must {
+                    must_scorers.push(q.scorer(reader, limit).await?);
+                }
+
+                let mut must_not_scorers = Vec::with_capacity(must_not.len());
+                for q in &must_not {
+                    must_not_scorers.push(q.scorer(reader, limit).await?);
+                }
+
+                let mut scorer = BooleanScorer {
+                    must: must_scorers,
+                    should: vec![should_scorer],
+                    must_not: must_not_scorers,
+                    current_doc: 0,
+                };
+                scorer.current_doc = scorer.find_next_match();
+                return Ok(Box::new(scorer));
             }
 
             // Fall back to standard boolean scoring
@@ -682,6 +703,27 @@ impl Query for BooleanQuery {
                     filter_score,
                 )));
             }
+
+            // size_hint < limit — reuse already-built SHOULD scorer in
+            // the standard BooleanScorer to avoid rebuilding it.
+            let mut must_scorers = Vec::with_capacity(self.must.len());
+            for q in &self.must {
+                must_scorers.push(q.scorer_sync(reader, limit)?);
+            }
+
+            let mut must_not_scorers = Vec::with_capacity(self.must_not.len());
+            for q in &self.must_not {
+                must_not_scorers.push(q.scorer_sync(reader, limit)?);
+            }
+
+            let mut scorer = BooleanScorer {
+                must: must_scorers,
+                should: vec![should_scorer],
+                must_not: must_not_scorers,
+                current_doc: 0,
+            };
+            scorer.current_doc = scorer.find_next_match();
+            return Ok(Box::new(scorer));
         }
 
         // Fall back to standard boolean scoring

@@ -483,7 +483,16 @@ impl super::Scorer for PredicatedScorer<'_> {
     }
 
     fn matched_positions(&self) -> Option<super::MatchedPositions> {
-        self.driver.matched_positions()
+        let mut all: super::MatchedPositions = Vec::new();
+        if let Some(p) = self.driver.matched_positions() {
+            all.extend(p);
+        }
+        for v in &self.must_verifiers {
+            if let Some(p) = v.matched_positions() {
+                all.extend(p);
+            }
+        }
+        if all.is_empty() { None } else { Some(all) }
     }
 }
 
