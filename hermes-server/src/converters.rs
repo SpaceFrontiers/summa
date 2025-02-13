@@ -408,34 +408,166 @@ pub fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
 }
 
 /// Convert Schema to SDL string representation
+///
+/// Produces a faithful round-trippable SDL including tokenizer, multi, fast,
+/// positions, and full vector configuration (dense/sparse).
 pub fn schema_to_sdl(schema: &Schema) -> String {
-    use hermes_core::FieldType;
+    use hermes_core::dsl::{DenseVectorQuantization, FieldType, PositionMode, VectorIndexType};
+    use hermes_core::structures::{IndexSize, WeightQuantization};
 
     let mut lines = vec!["index _ {".to_string()];
     for (_, entry) in schema.fields() {
-        let type_str = match entry.field_type {
-            FieldType::Text => "text",
-            FieldType::U64 => "u64",
-            FieldType::I64 => "i64",
-            FieldType::F64 => "f64",
-            FieldType::Bytes => "bytes",
-            FieldType::SparseVector => "sparse_vector",
-            FieldType::DenseVector => "dense_vector",
-            FieldType::Json => "json",
+        // --- type name + optional type-level config ---
+        let mut type_part = match entry.field_type {
+            FieldType::Text => "text".to_string(),
+            FieldType::U64 => "u64".to_string(),
+            FieldType::I64 => "i64".to_string(),
+            FieldType::F64 => "f64".to_string(),
+            FieldType::Bytes => "bytes".to_string(),
+            FieldType::Json => "json".to_string(),
+            FieldType::SparseVector => "sparse_vector".to_string(),
+            FieldType::DenseVector => "dense_vector".to_string(),
         };
-        let mut flags = Vec::new();
+
+        // Text tokenizer: text<en_stem>
+        if entry.field_type == FieldType::Text
+            && let Some(ref tok) = entry.tokenizer
+        {
+            type_part.push_str(&format!("<{}>", tok));
+        }
+
+        // Sparse vector type config: sparse_vector<u16>
+        if let Some(ref cfg) = entry.sparse_vector_config {
+            let idx = match cfg.index_size {
+                IndexSize::U16 => "u16",
+                IndexSize::U32 => "u32",
+            };
+            type_part.push_str(&format!("<{}>", idx));
+        }
+
+        // Dense vector type config: dense_vector<768> or dense_vector<768, f16>
+        if let Some(ref cfg) = entry.dense_vector_config {
+            let quant_suffix = match cfg.quantization {
+                DenseVectorQuantization::F32 => String::new(),
+                DenseVectorQuantization::F16 => ", f16".to_string(),
+                DenseVectorQuantization::UInt8 => ", uint8".to_string(),
+            };
+            type_part.push_str(&format!("<{}{}>", cfg.dim, quant_suffix));
+        }
+
+        // --- attributes: [indexed<...>, stored<multi>, fast] ---
+        let mut attrs = Vec::new();
+
         if entry.indexed {
-            flags.push("indexed");
+            let mut idx_params = Vec::new();
+
+            // Positions (for text/sparse)
+            if let Some(pos) = entry.positions {
+                idx_params.push(match pos {
+                    PositionMode::Ordinal => "ordinal".to_string(),
+                    PositionMode::TokenPosition => "token_position".to_string(),
+                    PositionMode::Full => "positions".to_string(),
+                });
+            }
+
+            // Dense vector index params
+            if let Some(ref cfg) = entry.dense_vector_config {
+                let idx_name = match cfg.index_type {
+                    VectorIndexType::Flat => "flat",
+                    VectorIndexType::RaBitQ => "rabitq",
+                    VectorIndexType::IvfRaBitQ => "ivf_rabitq",
+                    VectorIndexType::ScaNN => "scann",
+                };
+                idx_params.push(idx_name.to_string());
+                if let Some(nc) = cfg.num_clusters {
+                    idx_params.push(format!("num_clusters: {}", nc));
+                }
+                if cfg.nprobe != 32 {
+                    idx_params.push(format!("nprobe: {}", cfg.nprobe));
+                }
+                if let Some(bt) = cfg.build_threshold {
+                    idx_params.push(format!("build_threshold: {}", bt));
+                }
+            }
+
+            // Sparse vector index params
+            if let Some(ref cfg) = entry.sparse_vector_config {
+                let quant = match cfg.weight_quantization {
+                    WeightQuantization::Float32 => None,
+                    WeightQuantization::Float16 => Some("float16"),
+                    WeightQuantization::UInt8 => Some("uint8"),
+                    WeightQuantization::UInt4 => Some("uint4"),
+                };
+                if let Some(q) = quant {
+                    idx_params.push(format!("quantization: {}", q));
+                }
+                if cfg.weight_threshold > 0.0 {
+                    idx_params.push(format!("weight_threshold: {}", cfg.weight_threshold));
+                }
+                if cfg.block_size != 128 {
+                    idx_params.push(format!("block_size: {}", cfg.block_size));
+                }
+                if let Some(p) = cfg.pruning {
+                    idx_params.push(format!("pruning: {}", p));
+                }
+                // Query config sub-block
+                if let Some(ref qc) = cfg.query_config {
+                    let mut qparams = Vec::new();
+                    if let Some(ref t) = qc.tokenizer {
+                        qparams.push(format!("tokenizer: \"{}\"", t));
+                    }
+                    if qc.weighting != hermes_core::structures::QueryWeighting::One {
+                        let w = match qc.weighting {
+                            hermes_core::structures::QueryWeighting::Idf => "idf",
+                            hermes_core::structures::QueryWeighting::IdfFile => "idf_file",
+                            _ => "one",
+                        };
+                        qparams.push(format!("weighting: {}", w));
+                    }
+                    if qc.weight_threshold > 0.0 {
+                        qparams.push(format!("weight_threshold: {}", qc.weight_threshold));
+                    }
+                    if let Some(md) = qc.max_query_dims {
+                        qparams.push(format!("max_dims: {}", md));
+                    }
+                    if let Some(p) = qc.pruning {
+                        qparams.push(format!("pruning: {}", p));
+                    }
+                    if !qparams.is_empty() {
+                        idx_params.push(format!("query<{}>", qparams.join(", ")));
+                    }
+                }
+            }
+
+            if idx_params.is_empty() {
+                attrs.push("indexed".to_string());
+            } else {
+                attrs.push(format!("indexed<{}>", idx_params.join(", ")));
+            }
         }
+
         if entry.stored {
-            flags.push("stored");
+            if entry.multi {
+                attrs.push("stored<multi>".to_string());
+            } else {
+                attrs.push("stored".to_string());
+            }
         }
-        lines.push(format!(
-            "    {}: {} {}",
-            entry.name,
-            type_str,
-            flags.join(" ")
-        ));
+
+        if entry.fast {
+            attrs.push("fast".to_string());
+        }
+
+        if attrs.is_empty() {
+            lines.push(format!("    field {}: {}", entry.name, type_part));
+        } else {
+            lines.push(format!(
+                "    field {}: {} [{}]",
+                entry.name,
+                type_part,
+                attrs.join(", ")
+            ));
+        }
     }
     lines.push("}".to_string());
     lines.join("\n")
@@ -617,4 +749,103 @@ pub fn convert_proto_to_document(
     }
 
     Ok(doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_to_sdl_roundtrip() {
+        let input_sdl = r#"
+            index documents {
+                field id: text<raw> [indexed, stored]
+                field title: text<en_stem> [indexed, stored]
+                field uris: text<default> [indexed, stored<multi>]
+                field price: f64 [indexed, fast]
+                field count: u64 [indexed, stored, fast]
+                field tags: text<raw_ci> [indexed, stored<multi>, fast]
+                field sparse_emb: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
+                field dense_emb: dense_vector<1024, f16> [indexed<ivf_rabitq, num_clusters: 256>, stored<multi>]
+                field meta: json [stored<multi>]
+            }
+        "#;
+
+        let indexes = hermes_core::dsl::sdl::parse_sdl(input_sdl).unwrap();
+        let schema = indexes[0].to_schema();
+        let sdl_output = schema_to_sdl(&schema);
+
+        // Verify the output is valid SDL that parses back
+        let reparsed = hermes_core::dsl::sdl::parse_sdl(&sdl_output)
+            .unwrap_or_else(|e| panic!("Failed to reparse SDL:\n{}\nError: {}", sdl_output, e));
+        assert_eq!(reparsed.len(), 1);
+        let reparsed_schema = reparsed[0].to_schema();
+
+        // Verify field count matches
+        assert_eq!(
+            schema.fields().count(),
+            reparsed_schema.fields().count(),
+            "SDL:\n{}",
+            sdl_output
+        );
+
+        // Verify each field entry round-trips
+        for ((_, orig), (_, reparsed)) in schema.fields().zip(reparsed_schema.fields()) {
+            assert_eq!(orig.name, reparsed.name, "field name mismatch");
+            assert_eq!(
+                orig.field_type, reparsed.field_type,
+                "field type mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.indexed, reparsed.indexed,
+                "indexed mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.stored, reparsed.stored,
+                "stored mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.multi, reparsed.multi,
+                "multi mismatch for {}",
+                orig.name
+            );
+            assert_eq!(orig.fast, reparsed.fast, "fast mismatch for {}", orig.name);
+            assert_eq!(
+                orig.tokenizer, reparsed.tokenizer,
+                "tokenizer mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.positions, reparsed.positions,
+                "positions mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.sparse_vector_config, reparsed.sparse_vector_config,
+                "sparse config mismatch for {}",
+                orig.name
+            );
+            if let (Some(a), Some(b)) = (&orig.dense_vector_config, &reparsed.dense_vector_config) {
+                assert_eq!(a.dim, b.dim, "dense dim mismatch for {}", orig.name);
+                assert_eq!(
+                    a.quantization, b.quantization,
+                    "dense quant mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    a.index_type, b.index_type,
+                    "dense index_type mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    a.num_clusters, b.num_clusters,
+                    "dense num_clusters mismatch for {}",
+                    orig.name
+                );
+            }
+        }
+    }
 }

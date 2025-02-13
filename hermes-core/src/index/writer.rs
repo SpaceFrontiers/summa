@@ -203,12 +203,24 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         builder_config: SegmentBuilderConfig,
         segment_manager: Arc<crate::merge::SegmentManager<D>>,
     ) -> Self {
+        // Auto-configure tokenizers from schema for all text fields
+        let registry = crate::tokenizer::TokenizerRegistry::new();
+        let mut tokenizers = FxHashMap::default();
+        for (field, entry) in schema.fields() {
+            if matches!(entry.field_type, crate::dsl::FieldType::Text)
+                && let Some(ref tok_name) = entry.tokenizer
+                && let Some(tok) = registry.get(tok_name)
+            {
+                tokenizers.insert(field, tok);
+            }
+        }
+
         let num_workers = config.num_indexing_threads.max(1);
         let worker_state = Arc::new(WorkerState {
             directory: Arc::clone(&directory),
             schema: Arc::clone(&schema),
             builder_config,
-            tokenizers: parking_lot::RwLock::new(FxHashMap::default()),
+            tokenizers: parking_lot::RwLock::new(tokenizers),
             memory_budget_per_worker: config.max_indexing_memory_bytes / num_workers,
             segment_manager: Arc::clone(&segment_manager),
             built_segments: parking_lot::Mutex::new(Vec::new()),
