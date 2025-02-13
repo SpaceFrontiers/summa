@@ -767,23 +767,32 @@ impl SegmentBuilder {
         let schema = &self.schema;
 
         // Pre-create all streaming writers (async) before entering sync rayon scope
-        let mut term_dict_writer = dir.streaming_writer(&files.term_dict).await?;
-        let mut postings_writer = dir.streaming_writer(&files.postings).await?;
-        let mut store_writer = dir.streaming_writer(&files.store).await?;
+        // Wrapped in OffsetWriter to track bytes written per phase.
+        let mut term_dict_writer =
+            super::OffsetWriter::new(dir.streaming_writer(&files.term_dict).await?);
+        let mut postings_writer =
+            super::OffsetWriter::new(dir.streaming_writer(&files.postings).await?);
+        let mut store_writer = super::OffsetWriter::new(dir.streaming_writer(&files.store).await?);
         let mut vectors_writer = if !dense_vectors.is_empty() {
-            Some(dir.streaming_writer(&files.vectors).await?)
+            Some(super::OffsetWriter::new(
+                dir.streaming_writer(&files.vectors).await?,
+            ))
         } else {
             None
         };
         let mut sparse_writer = if !sparse_vectors.is_empty() {
-            Some(dir.streaming_writer(&files.sparse).await?)
+            Some(super::OffsetWriter::new(
+                dir.streaming_writer(&files.sparse).await?,
+            ))
         } else {
             None
         };
         let mut fast_fields = std::mem::take(&mut self.fast_fields);
         let num_docs = self.next_doc_id;
         let mut fast_writer = if !fast_fields.is_empty() {
-            Some(dir.streaming_writer(&files.fast).await?)
+            Some(super::OffsetWriter::new(
+                dir.streaming_writer(&files.fast).await?,
+            ))
         } else {
             None
         };
@@ -797,8 +806,8 @@ impl SegmentBuilder {
                                 inverted_index,
                                 term_interner,
                                 &position_offsets,
-                                &mut *term_dict_writer,
-                                &mut *postings_writer,
+                                &mut term_dict_writer,
+                                &mut postings_writer,
                             )
                         },
                         || {
@@ -806,7 +815,7 @@ impl SegmentBuilder {
                                 &store_path,
                                 num_compression_threads,
                                 compression_level,
-                                &mut *store_writer,
+                                &mut store_writer,
                                 num_docs,
                             )
                         },
@@ -822,7 +831,7 @@ impl SegmentBuilder {
                                             dense_vectors,
                                             schema,
                                             trained,
-                                            &mut **w,
+                                            w,
                                         )?;
                                     }
                                     Ok(())
@@ -832,7 +841,7 @@ impl SegmentBuilder {
                                         sparse::build_sparse_streaming(
                                             &mut sparse_vectors,
                                             schema,
-                                            &mut **w,
+                                            w,
                                         )?;
                                     }
                                     Ok(())
@@ -841,7 +850,7 @@ impl SegmentBuilder {
                         },
                         || -> Result<()> {
                             if let Some(ref mut w) = fast_writer {
-                                build_fast_fields_streaming(&mut fast_fields, num_docs, &mut **w)?;
+                                build_fast_fields_streaming(&mut fast_fields, num_docs, w)?;
                             }
                             Ok(())
                         },
@@ -853,6 +862,14 @@ impl SegmentBuilder {
         vectors_result?;
         sparse_result?;
         fast_result?;
+
+        let term_dict_bytes = term_dict_writer.offset() as usize;
+        let postings_bytes = postings_writer.offset() as usize;
+        let store_bytes = store_writer.offset() as usize;
+        let vectors_bytes = vectors_writer.as_ref().map_or(0, |w| w.offset() as usize);
+        let sparse_bytes = sparse_writer.as_ref().map_or(0, |w| w.offset() as usize);
+        let fast_bytes = fast_writer.as_ref().map_or(0, |w| w.offset() as usize);
+
         term_dict_writer.finish()?;
         postings_writer.finish()?;
         store_writer.finish()?;
@@ -867,6 +884,17 @@ impl SegmentBuilder {
         }
         drop(position_offsets);
         drop(sparse_vectors);
+
+        log::info!(
+            "[segment_build] {} docs: term_dict={}, postings={}, store={}, vectors={}, sparse={}, fast={}",
+            num_docs,
+            super::format_bytes(term_dict_bytes),
+            super::format_bytes(postings_bytes),
+            super::format_bytes(store_bytes),
+            super::format_bytes(vectors_bytes),
+            super::format_bytes(sparse_bytes),
+            super::format_bytes(fast_bytes),
+        );
 
         let meta = SegmentMeta {
             id: segment_id.0,
@@ -915,13 +943,6 @@ fn build_fast_fields_streaming(
     // Write TOC + footer
     let toc_offset = current_offset;
     write_fast_field_toc_and_footer(writer, toc_offset, &toc_entries)?;
-
-    log::debug!(
-        "[fast-fields] wrote {} columns, {} docs, toc at offset {}",
-        toc_entries.len(),
-        num_docs,
-        toc_offset
-    );
 
     Ok(())
 }

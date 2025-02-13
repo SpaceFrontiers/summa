@@ -309,48 +309,34 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     ) -> Result<crate::query::SearchResponse> {
         let reader = self.reader().await?;
         let searcher = reader.searcher().await?;
-        let segments = searcher.segment_readers();
 
-        let fetch_limit = offset + limit;
+        #[cfg(feature = "sync")]
+        let (results, total_seen) = {
+            // Sync search: rayon handles segment parallelism internally.
+            // On multi-threaded tokio, use block_in_place to yield the worker;
+            // on single-threaded (tests), call directly.
+            let runtime_flavor = tokio::runtime::Handle::current().runtime_flavor();
+            if runtime_flavor == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    searcher.search_with_offset_and_count_sync(query, limit, offset)
+                })?
+            } else {
+                searcher.search_with_offset_and_count_sync(query, limit, offset)?
+            }
+        };
 
-        let futures: Vec<_> = segments
-            .iter()
-            .map(|segment| {
-                let sid = segment.meta().id;
-                async move {
-                    let results =
-                        crate::query::search_segment(segment.as_ref(), query, fetch_limit).await?;
-                    Ok::<_, crate::error::Error>(
-                        results
-                            .into_iter()
-                            .map(move |r| (sid, r))
-                            .collect::<Vec<_>>(),
-                    )
-                }
-            })
-            .collect();
+        #[cfg(not(feature = "sync"))]
+        let (results, total_seen) = {
+            searcher
+                .search_with_offset_and_count(query, limit, offset)
+                .await?
+        };
 
-        let batches = futures::future::try_join_all(futures).await?;
-        let mut all_results: Vec<(u128, crate::query::SearchResult)> =
-            Vec::with_capacity(batches.iter().map(|b| b.len()).sum());
-        for batch in batches {
-            all_results.extend(batch);
-        }
-
-        all_results.sort_by(|a, b| {
-            b.1.score
-                .partial_cmp(&a.1.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let total_hits = all_results.len() as u32;
-
-        let hits: Vec<crate::query::SearchHit> = all_results
+        let total_hits = total_seen;
+        let hits: Vec<crate::query::SearchHit> = results
             .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(segment_id, result)| crate::query::SearchHit {
-                address: crate::query::DocAddress::new(segment_id, result.doc_id),
+            .map(|result| crate::query::SearchHit {
+                address: crate::query::DocAddress::new(result.segment_id, result.doc_id),
                 score: result.score,
                 matched_fields: result.extract_ordinals(),
             })

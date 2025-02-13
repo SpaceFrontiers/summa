@@ -49,6 +49,20 @@ impl Query for BoostQuery {
         })
     }
 
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<super::DocPredicate<'a>>,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let inner_scorer = self.inner.scorer_sync(reader, limit, predicate)?;
+        Ok(Box::new(BoostScorer {
+            inner: inner_scorer,
+            boost: self.boost,
+        }) as Box<dyn Scorer + 'a>)
+    }
+
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         let inner = self.inner.clone();
         Box::pin(async move { inner.count_estimate(reader).await })

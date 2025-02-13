@@ -53,12 +53,43 @@ use crate::{DocId, Error, Result};
 use super::store::{AsyncStoreReader, RawStoreBlock};
 use super::types::{SegmentFiles, SegmentId, SegmentMeta};
 
+/// Combine per-ordinal (doc_id, ordinal, score) triples into VectorSearchResults,
+/// applying the multi-value combiner, sorting by score desc, and truncating to `limit`.
+fn combine_ordinal_results(
+    raw: impl IntoIterator<Item = (u32, u16, f32)>,
+    combiner: crate::query::MultiValueCombiner,
+    limit: usize,
+) -> Vec<VectorSearchResult> {
+    let mut doc_ordinals: rustc_hash::FxHashMap<DocId, Vec<(u32, f32)>> =
+        rustc_hash::FxHashMap::default();
+    for (doc_id, ordinal, score) in raw {
+        doc_ordinals
+            .entry(doc_id as DocId)
+            .or_default()
+            .push((ordinal as u32, score));
+    }
+    let mut results: Vec<VectorSearchResult> = doc_ordinals
+        .into_iter()
+        .map(|(doc_id, ordinals)| {
+            let combined_score = combiner.combine(&ordinals);
+            VectorSearchResult::new(doc_id, combined_score, ordinals)
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(limit);
+    results
+}
+
 /// Async segment reader with lazy loading
 ///
 /// - Term dictionary: only index loaded, blocks loaded on-demand
 /// - Postings: loaded on-demand per term via HTTP range requests
 /// - Document store: only index loaded, blocks loaded on-demand via HTTP range requests
-pub struct AsyncSegmentReader {
+pub struct SegmentReader {
     meta: SegmentMeta,
     /// Term dictionary with lazy block loading
     term_dict: Arc<AsyncSSTableReader<TermInfo>>,
@@ -81,7 +112,7 @@ pub struct AsyncSegmentReader {
     fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
 }
 
-impl AsyncSegmentReader {
+impl SegmentReader {
     /// Open a segment with lazy loading
     pub async fn open<D: Directory>(
         dir: &D,
@@ -748,32 +779,7 @@ impl AsyncSegmentReader {
             );
         }
 
-        // Track ordinals with individual scores for each doc_id
-        let mut doc_ordinals: rustc_hash::FxHashMap<DocId, Vec<(u32, f32)>> =
-            rustc_hash::FxHashMap::default();
-        for (doc_id, ordinal, score) in results {
-            let ordinals = doc_ordinals.entry(doc_id as DocId).or_default();
-            ordinals.push((ordinal as u32, score));
-        }
-
-        // Combine scores and build results with ordinal tracking
-        let mut final_results: Vec<VectorSearchResult> = doc_ordinals
-            .into_iter()
-            .map(|(doc_id, ordinals)| {
-                let combined_score = combiner.combine(&ordinals);
-                VectorSearchResult::new(doc_id, combined_score, ordinals)
-            })
-            .collect();
-
-        // Sort by score descending and take top k
-        final_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        final_results.truncate(k);
-
-        Ok(final_results)
+        Ok(combine_ordinal_results(results, combiner, k))
     }
 
     /// Check if this segment has dense vectors for the given field
@@ -924,33 +930,13 @@ impl AsyncSegmentReader {
             }
         }
 
-        // Track ordinals with individual scores for each doc_id
-        // Now using real ordinals from the posting lists
-        let mut doc_ordinals: rustc_hash::FxHashMap<u32, Vec<(u32, f32)>> =
-            rustc_hash::FxHashMap::default();
-        for r in raw_results {
-            let ordinals = doc_ordinals.entry(r.doc_id).or_default();
-            ordinals.push((r.ordinal as u32, r.score));
-        }
-
-        // Combine scores and build results with ordinal tracking
-        let mut results: Vec<VectorSearchResult> = doc_ordinals
-            .into_iter()
-            .map(|(doc_id, ordinals)| {
-                let combined_score = combiner.combine(&ordinals);
-                VectorSearchResult::new(doc_id, combined_score, ordinals)
-            })
-            .collect();
-
-        // Sort by score descending and take top limit
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(limit);
-
-        Ok(results)
+        Ok(combine_ordinal_results(
+            raw_results
+                .into_iter()
+                .map(|r| (r.doc_id, r.ordinal, r.score)),
+            combiner,
+            limit,
+        ))
     }
 
     /// Get positions for a term (for phrase queries)
@@ -1006,5 +992,288 @@ impl AsyncSegmentReader {
     }
 }
 
-/// Alias for AsyncSegmentReader
-pub type SegmentReader = AsyncSegmentReader;
+// ── Synchronous search methods (mmap/RAM only) ─────────────────────────────
+#[cfg(feature = "sync")]
+impl SegmentReader {
+    /// Synchronous posting list lookup — requires Inline (mmap/RAM) file handles.
+    pub fn get_postings_sync(&self, field: Field, term: &[u8]) -> Result<Option<BlockPostingList>> {
+        // Build key: field_id + term
+        let mut key = Vec::with_capacity(4 + term.len());
+        key.extend_from_slice(&field.0.to_le_bytes());
+        key.extend_from_slice(term);
+
+        // Look up in term dictionary (sync)
+        let term_info = match self.term_dict.get_sync(&key)? {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        // Check if posting list is inlined
+        if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
+            let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
+            for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs.into_iter()) {
+                posting_list.push(doc_id, tf);
+            }
+            let block_list = BlockPostingList::from_posting_list(&posting_list)?;
+            return Ok(Some(block_list));
+        }
+
+        // External posting list — sync range read
+        let (posting_offset, posting_len) = term_info.external_info().ok_or_else(|| {
+            Error::Corruption("TermInfo has neither inline nor external data".to_string())
+        })?;
+
+        let start = posting_offset;
+        let end = start + posting_len;
+
+        if end > self.postings_handle.len() {
+            return Err(Error::Corruption(
+                "Posting offset out of bounds".to_string(),
+            ));
+        }
+
+        let posting_bytes = self.postings_handle.read_bytes_range_sync(start..end)?;
+        let block_list = BlockPostingList::deserialize_zero_copy(posting_bytes)?;
+
+        Ok(Some(block_list))
+    }
+
+    /// Synchronous position list lookup — requires Inline (mmap/RAM) file handles.
+    pub fn get_positions_sync(
+        &self,
+        field: Field,
+        term: &[u8],
+    ) -> Result<Option<crate::structures::PositionPostingList>> {
+        let handle = match &self.positions_handle {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        // Build key: field_id + term
+        let mut key = Vec::with_capacity(4 + term.len());
+        key.extend_from_slice(&field.0.to_le_bytes());
+        key.extend_from_slice(term);
+
+        // Look up term in dictionary (sync)
+        let term_info = match self.term_dict.get_sync(&key)? {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        let (offset, length) = match term_info.position_info() {
+            Some((o, l)) => (o, l),
+            None => return Ok(None),
+        };
+
+        let slice = handle.slice(offset..offset + length);
+        let data = slice.read_bytes_sync()?;
+
+        let pos_list = crate::structures::PositionPostingList::deserialize(data.as_slice())?;
+        Ok(Some(pos_list))
+    }
+
+    /// Synchronous dense vector search — ANN indexes are already sync,
+    /// brute-force uses sync mmap reads.
+    pub fn search_dense_vector_sync(
+        &self,
+        field: Field,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        rerank_factor: f32,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let ann_index = self.vector_indexes.get(&field.0);
+        let lazy_flat = self.flat_vectors.get(&field.0);
+
+        if ann_index.is_none() && lazy_flat.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let unit_norm = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|e| e.dense_vector_config.as_ref())
+            .is_some_and(|c| c.unit_norm);
+
+        const BRUTE_FORCE_BATCH: usize = 4096;
+        let fetch_k = (k as f32 * rerank_factor.max(1.0)).ceil() as usize;
+
+        let mut results: Vec<(u32, u16, f32)> = if let Some(index) = ann_index {
+            // ANN search (already sync)
+            match index {
+                VectorIndex::RaBitQ(lazy) => {
+                    let rabitq = lazy.get().ok_or_else(|| {
+                        Error::Schema("RaBitQ index deserialization failed".to_string())
+                    })?;
+                    rabitq
+                        .search(query, fetch_k)
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
+                }
+                VectorIndex::IVF(lazy) => {
+                    let (index, codebook) = lazy.get().ok_or_else(|| {
+                        Error::Schema("IVF index deserialization failed".to_string())
+                    })?;
+                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
+                        Error::Schema(format!(
+                            "IVF index requires coarse centroids for field {}",
+                            field.0
+                        ))
+                    })?;
+                    let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
+                    index
+                        .search(centroids, codebook, query, fetch_k, Some(effective_nprobe))
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
+                }
+                VectorIndex::ScaNN(lazy) => {
+                    let (index, codebook) = lazy.get().ok_or_else(|| {
+                        Error::Schema("ScaNN index deserialization failed".to_string())
+                    })?;
+                    let centroids = self.coarse_centroids.get(&field.0).ok_or_else(|| {
+                        Error::Schema(format!(
+                            "ScaNN index requires coarse centroids for field {}",
+                            field.0
+                        ))
+                    })?;
+                    let effective_nprobe = if nprobe > 0 { nprobe } else { 32 };
+                    index
+                        .search(centroids, codebook, query, fetch_k, Some(effective_nprobe))
+                        .into_iter()
+                        .map(|(doc_id, ordinal, dist)| (doc_id, ordinal, 1.0 / (1.0 + dist)))
+                        .collect()
+                }
+            }
+        } else if let Some(lazy_flat) = lazy_flat {
+            // Batched brute-force (sync mmap reads)
+            let dim = lazy_flat.dim;
+            let n = lazy_flat.num_vectors;
+            let quant = lazy_flat.quantization;
+            let mut collector = crate::query::ScoreCollector::new(fetch_k);
+            let mut scores = vec![0f32; BRUTE_FORCE_BATCH];
+
+            for batch_start in (0..n).step_by(BRUTE_FORCE_BATCH) {
+                let batch_count = BRUTE_FORCE_BATCH.min(n - batch_start);
+                let batch_bytes = lazy_flat
+                    .read_vectors_batch_sync(batch_start, batch_count)
+                    .map_err(crate::Error::Io)?;
+                let raw = batch_bytes.as_slice();
+
+                Self::score_quantized_batch(
+                    query,
+                    raw,
+                    quant,
+                    dim,
+                    &mut scores[..batch_count],
+                    unit_norm,
+                );
+
+                for (i, &score) in scores.iter().enumerate().take(batch_count) {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                    collector.insert_with_ordinal(doc_id, score, ordinal);
+                }
+            }
+
+            collector
+                .into_sorted_results()
+                .into_iter()
+                .map(|(doc_id, score, ordinal)| (doc_id, ordinal, score))
+                .collect()
+        } else {
+            return Ok(Vec::new());
+        };
+
+        // Rerank ANN candidates using raw vectors (sync)
+        if ann_index.is_some()
+            && !results.is_empty()
+            && let Some(lazy_flat) = lazy_flat
+        {
+            let dim = lazy_flat.dim;
+            let quant = lazy_flat.quantization;
+            let vbs = lazy_flat.vector_byte_size();
+
+            let mut resolved: Vec<(usize, usize)> = Vec::new();
+            for (ri, c) in results.iter().enumerate() {
+                let (start, entries) = lazy_flat.flat_indexes_for_doc(c.0);
+                for (j, &(_, ord)) in entries.iter().enumerate() {
+                    if ord == c.1 {
+                        resolved.push((ri, start + j));
+                        break;
+                    }
+                }
+            }
+
+            if !resolved.is_empty() {
+                resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
+                let mut raw_buf = vec![0u8; resolved.len() * vbs];
+                for (buf_idx, &(_, flat_idx)) in resolved.iter().enumerate() {
+                    let _ = lazy_flat.read_vector_raw_into_sync(
+                        flat_idx,
+                        &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
+                    );
+                }
+
+                let mut scores = vec![0f32; resolved.len()];
+                Self::score_quantized_batch(query, &raw_buf, quant, dim, &mut scores, unit_norm);
+
+                for (buf_idx, &(ri, _)) in resolved.iter().enumerate() {
+                    results[ri].2 = scores[buf_idx];
+                }
+            }
+
+            results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            results.truncate(fetch_k);
+        }
+
+        Ok(combine_ordinal_results(results, combiner, k))
+    }
+
+    /// Synchronous sparse vector search.
+    pub fn search_sparse_vector_sync(
+        &self,
+        field: Field,
+        vector: &[(u32, f32)],
+        limit: usize,
+        combiner: crate::query::MultiValueCombiner,
+        heap_factor: f32,
+    ) -> Result<Vec<VectorSearchResult>> {
+        use crate::query::MaxScoreExecutor;
+
+        let sparse_index = match self.sparse_indexes.get(&field.0) {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut matched_terms: Vec<(u32, f32)> = Vec::with_capacity(vector.len());
+        for &(dim_id, query_weight) in vector {
+            if sparse_index.has_dimension(dim_id) {
+                matched_terms.push((dim_id, query_weight));
+            }
+        }
+
+        if matched_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let num_terms = matched_terms.len();
+        let over_fetch = limit * 2;
+        let raw_results = if num_terms > 12 {
+            crate::query::BmpExecutor::new(sparse_index, matched_terms, over_fetch, heap_factor)
+                .execute_sync()?
+        } else {
+            MaxScoreExecutor::sparse(sparse_index, matched_terms, over_fetch, heap_factor)
+                .execute_sync()?
+        };
+
+        Ok(combine_ordinal_results(
+            raw_results
+                .into_iter()
+                .map(|r| (r.doc_id, r.ordinal, r.score)),
+            combiner,
+            limit,
+        ))
+    }
+}

@@ -13,7 +13,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::FieldType;
-use crate::segment::reader::AsyncSegmentReader as SegmentReader;
+use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::structures::fast_field::{
     BLOCK_INDEX_ENTRY_SIZE, BlockIndexEntry, FastFieldColumnType, FastFieldTocEntry,

@@ -59,7 +59,60 @@ impl BooleanQuery {
     }
 }
 
-/// Try to create a MaxScore-optimized scorer for pure OR queries
+/// Check if SHOULD clauses are eligible for MaxScore optimization.
+/// Returns (term_infos, field) if all are single-field term queries, None otherwise.
+fn maxscore_eligible(
+    should: &[Arc<dyn Query>],
+) -> Option<(Vec<super::TermQueryInfo>, crate::Field)> {
+    let term_infos: Vec<_> = should
+        .iter()
+        .filter_map(|q| q.as_term_query_info())
+        .collect();
+    if term_infos.len() != should.len() {
+        return None;
+    }
+    let first_field = term_infos[0].field;
+    if !term_infos.iter().all(|t| t.field == first_field) {
+        return None;
+    }
+    Some((term_infos, first_field))
+}
+
+/// Compute IDF for a posting list, preferring global stats.
+fn compute_idf(
+    posting_list: &crate::structures::BlockPostingList,
+    field: crate::Field,
+    term: &[u8],
+    num_docs: f32,
+    global_stats: Option<&Arc<GlobalStats>>,
+) -> f32 {
+    if let Some(stats) = global_stats {
+        let global_idf = stats.text_idf(field, &String::from_utf8_lossy(term));
+        if global_idf > 0.0 {
+            return global_idf;
+        }
+    }
+    let doc_freq = posting_list.doc_count() as f32;
+    super::bm25_idf(doc_freq, num_docs)
+}
+
+/// Build MaxScore scorer from pre-fetched posting lists.
+fn maxscore_scorer_from_postings<'a>(
+    posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
+    avg_field_len: f32,
+    limit: usize,
+    predicate: Option<super::DocPredicate<'a>>,
+) -> crate::Result<Box<dyn Scorer + 'a>> {
+    if posting_lists.is_empty() {
+        return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
+    }
+    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit);
+    executor.set_predicate(predicate);
+    let results = executor.execute_sync()?;
+    Ok(Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>)
+}
+
+/// Try to create a MaxScore-optimized scorer for pure OR queries (async)
 async fn try_maxscore_scorer<'a>(
     should: &[Arc<dyn Query>],
     reader: &'a SegmentReader,
@@ -67,59 +120,67 @@ async fn try_maxscore_scorer<'a>(
     global_stats: Option<&Arc<GlobalStats>>,
     predicate: Option<super::DocPredicate<'a>>,
 ) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
-    // Extract term info from all SHOULD clauses
-    let mut term_infos: Vec<_> = should
-        .iter()
-        .filter_map(|q| q.as_term_query_info())
-        .collect();
+    let (mut term_infos, field) = match maxscore_eligible(should) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
 
-    // Check if all clauses are term queries
-    if term_infos.len() != should.len() {
-        return Ok(None);
-    }
-
-    // Check if all terms are for the same field
-    let first_field = term_infos[0].field;
-    if !term_infos.iter().all(|t| t.field == first_field) {
-        return Ok(None);
-    }
-
-    // Build (posting_list, idf) pairs for each term
-    let mut posting_lists: Vec<(crate::structures::BlockPostingList, f32)> =
-        Vec::with_capacity(term_infos.len());
     let avg_field_len = global_stats
-        .map(|s| s.avg_field_len(first_field))
-        .unwrap_or_else(|| reader.avg_field_len(first_field));
+        .map(|s| s.avg_field_len(field))
+        .unwrap_or_else(|| reader.avg_field_len(field));
     let num_docs = reader.num_docs() as f32;
 
+    let mut posting_lists: Vec<(crate::structures::BlockPostingList, f32)> =
+        Vec::with_capacity(term_infos.len());
     for info in term_infos.drain(..) {
-        if let Some(posting_list) = reader.get_postings(info.field, &info.term).await? {
-            let doc_freq = posting_list.doc_count() as f32;
-            let idf = if let Some(stats) = global_stats {
-                let global_idf = stats.text_idf(info.field, &String::from_utf8_lossy(&info.term));
-                if global_idf > 0.0 {
-                    global_idf
-                } else {
-                    super::bm25_idf(doc_freq, num_docs)
-                }
-            } else {
-                super::bm25_idf(doc_freq, num_docs)
-            };
-            posting_lists.push((posting_list, idf));
+        if let Some(pl) = reader.get_postings(info.field, &info.term).await? {
+            let idf = compute_idf(&pl, info.field, &info.term, num_docs, global_stats);
+            posting_lists.push((pl, idf));
         }
     }
 
-    if posting_lists.is_empty() {
-        return Ok(Some(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>));
+    Ok(Some(maxscore_scorer_from_postings(
+        posting_lists,
+        avg_field_len,
+        limit,
+        predicate,
+    )?))
+}
+
+/// Try to create a MaxScore-optimized scorer for pure OR queries (sync)
+#[cfg(feature = "sync")]
+fn try_maxscore_scorer_sync<'a>(
+    should: &[Arc<dyn Query>],
+    reader: &'a SegmentReader,
+    limit: usize,
+    global_stats: Option<&Arc<GlobalStats>>,
+    predicate: Option<super::DocPredicate<'a>>,
+) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
+    let (mut term_infos, field) = match maxscore_eligible(should) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let avg_field_len = global_stats
+        .map(|s| s.avg_field_len(field))
+        .unwrap_or_else(|| reader.avg_field_len(field));
+    let num_docs = reader.num_docs() as f32;
+
+    let mut posting_lists: Vec<(crate::structures::BlockPostingList, f32)> =
+        Vec::with_capacity(term_infos.len());
+    for info in term_infos.drain(..) {
+        if let Some(pl) = reader.get_postings_sync(info.field, &info.term)? {
+            let idf = compute_idf(&pl, info.field, &info.term, num_docs, global_stats);
+            posting_lists.push((pl, idf));
+        }
     }
 
-    // Use unified MaxScore executor for efficient top-k
-    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit);
-    executor.set_predicate(predicate);
-    let results = executor.execute_sync()?;
-    Ok(Some(
-        Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>
-    ))
+    Ok(Some(maxscore_scorer_from_postings(
+        posting_lists,
+        avg_field_len,
+        limit,
+        predicate,
+    )?))
 }
 
 impl Query for BooleanQuery {
@@ -175,6 +236,54 @@ impl Query for BooleanQuery {
             scorer.current_doc = scorer.find_next_match();
             Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
         })
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<super::DocPredicate<'a>>,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        // MaxScore optimization for pure OR queries
+        if self.must.is_empty()
+            && self.must_not.is_empty()
+            && self.should.len() >= 2
+            && let Some(scorer) = try_maxscore_scorer_sync(
+                &self.should,
+                reader,
+                limit,
+                self.global_stats.as_ref(),
+                predicate,
+            )?
+        {
+            return Ok(scorer);
+        }
+
+        // Fall back to standard boolean scoring
+        let mut must_scorers = Vec::with_capacity(self.must.len());
+        for q in &self.must {
+            must_scorers.push(q.scorer_sync(reader, limit, None)?);
+        }
+
+        let mut should_scorers = Vec::with_capacity(self.should.len());
+        for q in &self.should {
+            should_scorers.push(q.scorer_sync(reader, limit, None)?);
+        }
+
+        let mut must_not_scorers = Vec::with_capacity(self.must_not.len());
+        for q in &self.must_not {
+            must_not_scorers.push(q.scorer_sync(reader, limit, None)?);
+        }
+
+        let mut scorer = BooleanScorer {
+            must: must_scorers,
+            should: should_scorers,
+            must_not: must_not_scorers,
+            current_doc: 0,
+        };
+        scorer.current_doc = scorer.find_next_match();
+        Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {

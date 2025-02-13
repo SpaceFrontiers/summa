@@ -292,6 +292,34 @@ impl LazyFlatVectorData {
             .await
     }
 
+    /// Synchronous read of a single vector's raw bytes.
+    #[cfg(feature = "sync")]
+    pub fn read_vector_raw_into_sync(&self, idx: usize, out: &mut [u8]) -> io::Result<()> {
+        let vbs = self.vector_byte_size();
+        debug_assert!(out.len() >= vbs);
+        let byte_offset = self.vectors_offset + (idx * vbs) as u64;
+        let bytes = self
+            .handle
+            .read_bytes_range_sync(byte_offset..byte_offset + vbs as u64)?;
+        out[..vbs].copy_from_slice(bytes.as_slice());
+        Ok(())
+    }
+
+    /// Synchronous batch read of raw quantized bytes.
+    #[cfg(feature = "sync")]
+    pub fn read_vectors_batch_sync(
+        &self,
+        start_idx: usize,
+        count: usize,
+    ) -> io::Result<OwnedBytes> {
+        debug_assert!(start_idx + count <= self.num_vectors);
+        let vec_byte_len = self.dim * self.element_size;
+        let byte_offset = self.vectors_offset + (start_idx * vec_byte_len) as u64;
+        let byte_len = (count * vec_byte_len) as u64;
+        self.handle
+            .read_bytes_range_sync(byte_offset..byte_offset + byte_len)
+    }
+
     /// Find flat index range for a given doc_id (non-allocating).
     ///
     /// Returns `(start_index, count)` — the flat vector index range for this doc_id.

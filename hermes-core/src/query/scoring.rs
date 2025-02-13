@@ -245,47 +245,16 @@ impl PartialOrd for BmpMegaBlockEntry {
     }
 }
 
-impl<'a> BmpExecutor<'a> {
-    /// Create a new BMP executor with lazy block loading
-    ///
-    /// `query_terms` should contain only dimensions that exist in the index.
-    /// Block metadata (skip entries) is read from the sparse index directly.
-    pub fn new(
-        sparse_index: &'a crate::segment::SparseIndex,
-        query_terms: Vec<(u32, f32)>,
-        k: usize,
-        heap_factor: f32,
-    ) -> Self {
-        Self {
-            sparse_index,
-            query_terms,
-            k,
-            heap_factor: heap_factor.clamp(0.0, 1.0),
-            predicate: None,
-        }
-    }
-
-    /// Set a filter predicate that rejects documents at final collection.
-    pub fn set_predicate(&mut self, predicate: Option<super::DocPredicate<'a>>) {
-        self.predicate = predicate;
-    }
-
-    /// Execute BMP and return top-k results
-    ///
-    /// Builds the priority queue from skip entries (already in memory),
-    /// then loads blocks on-demand via mmap range reads as they are visited.
-    ///
-    /// Uses a hybrid accumulator: flat `Vec<f32>` for single-ordinal (ordinal=0)
-    /// entries with O(1) insert, FxHashMap fallback for multi-ordinal entries.
-    pub async fn execute(self) -> crate::Result<Vec<ScoredDoc>> {
+/// Macro to stamp out the BMP execution loop for both async and sync paths.
+///
+/// `$get_blocks:ident` is the SparseIndex method (get_blocks_range or get_blocks_range_sync).
+/// `$($aw:tt)*` captures `.await` for async or nothing for sync.
+macro_rules! bmp_execute_loop {
+    ($self:ident, $get_blocks:ident, $($aw:tt)*) => {{
         use rustc_hash::FxHashMap;
 
-        if self.query_terms.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let num_terms = self.query_terms.len();
-        let si = self.sparse_index;
+        let num_terms = $self.query_terms.len();
+        let si = $self.sparse_index;
 
         // Two-level queue construction:
         // 1. Build superblocks per term (flat Vecs)
@@ -296,14 +265,13 @@ impl<'a> BmpExecutor<'a> {
         let mut global_max_doc = 0u32;
         let mut total_remaining = 0.0f32;
 
-        for &(dim_id, qw) in &self.query_terms {
+        for &(dim_id, qw) in &$self.query_terms {
             let mut term_skip_start = 0usize;
             let mut superblocks = Vec::new();
 
             let abs_qw = qw.abs();
             if let Some((skip_start, skip_count, _global_max)) = si.get_skip_range(dim_id) {
                 term_skip_start = skip_start;
-                // Step 1: Build superblock entries
                 let mut sb_start = 0;
                 while sb_start < skip_count {
                     let sb_count = (skip_count - sb_start).min(BMP_SUPERBLOCK_SIZE);
@@ -353,54 +321,42 @@ impl<'a> BmpExecutor<'a> {
         } else {
             0
         };
-        // Use flat array if range is reasonable (< 256K docs)
         let use_flat = doc_range > 0 && doc_range <= 256 * 1024;
         let mut flat_scores: Vec<f32> = if use_flat {
             vec![0.0; doc_range]
         } else {
             Vec::new()
         };
-        // Dirty list: track which doc offsets were touched (avoids scanning full array)
         let mut dirty: Vec<u32> = if use_flat {
             Vec::with_capacity(4096)
         } else {
             Vec::new()
         };
-        // FxHashMap fallback for multi-ordinal entries or when flat array is too large
         let mut multi_ord_accumulators: FxHashMap<u64, f32> = FxHashMap::default();
 
         let mut blocks_processed = 0u64;
         let mut blocks_skipped = 0u64;
 
-        // Incremental top-k tracker for threshold
-        let mut top_k = ScoreCollector::new(self.k);
+        let mut top_k = ScoreCollector::new($self.k);
 
-        // Reusable decode buffers
         let mut doc_ids_buf: Vec<u32> = Vec::with_capacity(256);
         let mut weights_buf: Vec<f32> = Vec::with_capacity(256);
         let mut ordinals_buf: Vec<u16> = Vec::with_capacity(256);
 
-        // Warm-start: ensure at least one megablock per term is processed before
-        // enabling early termination. This diversifies initial scores across terms,
-        // giving the top-k heap a better starting threshold for pruning.
         let mut terms_warmed = vec![false; num_terms];
-        let mut warmup_remaining = self.k.min(num_terms);
+        let mut warmup_remaining = $self.k.min(num_terms);
 
-        // Two-level processing: outer loop pops megablocks, inner loop iterates superblocks
         while let Some(mega) = mega_queue.pop() {
             total_remaining -= mega.contribution;
 
-            // Track warm-start progress: count unique terms seen
             if !terms_warmed[mega.term_idx] {
                 terms_warmed[mega.term_idx] = true;
                 warmup_remaining = warmup_remaining.saturating_sub(1);
             }
 
-            // Megablock-level early termination (coarse)
             if warmup_remaining == 0 {
-                let adjusted_threshold = top_k.threshold() * self.heap_factor;
-                if top_k.len() >= self.k && total_remaining <= adjusted_threshold {
-                    // Count remaining blocks across all unprocessed megablocks
+                let adjusted_threshold = top_k.threshold() * $self.heap_factor;
+                if top_k.len() >= $self.k && total_remaining <= adjusted_threshold {
                     let remaining_blocks: u64 = mega_queue
                         .iter()
                         .map(|m| {
@@ -418,41 +374,36 @@ impl<'a> BmpExecutor<'a> {
                 }
             }
 
-            let dim_id = self.query_terms[mega.term_idx].0;
-            let qw = self.query_terms[mega.term_idx].1;
+            let dim_id = $self.query_terms[mega.term_idx].0;
+            let qw = $self.query_terms[mega.term_idx].1;
             let abs_qw = qw.abs();
             let skip_start = term_skip_starts[mega.term_idx];
 
-            // Inner loop: iterate superblocks within this megablock
             for sb in term_superblocks[mega.term_idx]
                 .iter()
                 .skip(mega.sb_start)
                 .take(mega.sb_count)
             {
-                // Superblock-level pruning (fine-grained)
-                if top_k.len() >= self.k {
-                    let adjusted_threshold = top_k.threshold() * self.heap_factor;
+                if top_k.len() >= $self.k {
+                    let adjusted_threshold = top_k.threshold() * $self.heap_factor;
                     if sb.contribution + total_remaining <= adjusted_threshold {
                         blocks_skipped += sb.block_count as u64;
                         continue;
                     }
                 }
 
-                // Coalesced superblock loading: single mmap read for all blocks
+                // Coalesced superblock loading — async or sync dispatch point
                 let sb_blocks = si
-                    .get_blocks_range(dim_id, sb.block_start, sb.block_count)
-                    .await?;
+                    .$get_blocks(dim_id, sb.block_start, sb.block_count)
+                    $($aw)*?;
 
-                let adjusted_threshold2 = top_k.threshold() * self.heap_factor;
-
-                // Track dirty start for deferred top_k insertion at superblock boundary
+                let adjusted_threshold2 = top_k.threshold() * $self.heap_factor;
                 let dirty_start = dirty.len();
 
                 for (blk_offset, block) in sb_blocks.into_iter().enumerate() {
                     let blk_idx = sb.block_start + blk_offset;
 
-                    // Per-block pruning within superblock
-                    if top_k.len() >= self.k {
+                    if top_k.len() >= $self.k {
                         let skip = si.read_skip_entry(skip_start + blk_idx);
                         let blk_contrib = abs_qw * skip.max_weight;
                         if blk_contrib + total_remaining <= adjusted_threshold2 {
@@ -463,7 +414,6 @@ impl<'a> BmpExecutor<'a> {
 
                     block.decode_doc_ids_into(&mut doc_ids_buf);
 
-                    // Fast path: ordinal=0 + flat accumulator → fused decode+scatter
                     if block.header.ordinal_bits == 0 && use_flat {
                         block.accumulate_scored_weights(
                             qw,
@@ -509,9 +459,6 @@ impl<'a> BmpExecutor<'a> {
                     blocks_processed += 1;
                 }
 
-                // Deferred top_k insertion at superblock boundary:
-                // Scan only newly-dirty entries (first-touch docs from this superblock).
-                // Eliminates ~90% of per-posting heap operations.
                 for &doc_id in &dirty[dirty_start..] {
                     let off = (doc_id - global_min_doc) as usize;
                     top_k.insert_with_ordinal(doc_id, flat_scores[off], 0);
@@ -519,15 +466,12 @@ impl<'a> BmpExecutor<'a> {
             }
         }
 
-        // Collect final top-k via heap — O(N log k) instead of O(N log N) sort.
-        // During execution, `top_k` received intermediate scores (before all
-        // terms were accumulated). Re-insert final scores into a fresh collector.
-        let mut final_top_k = ScoreCollector::new(self.k);
+        // Collect final top-k with predicate filtering
+        let mut final_top_k = ScoreCollector::new($self.k);
 
         let num_accumulators = if use_flat {
             for &doc_id in &dirty {
-                // Filter predicate check at collection time
-                if let Some(ref pred) = self.predicate
+                if let Some(ref pred) = $self.predicate
                     && !pred(doc_id)
                 {
                     continue;
@@ -543,11 +487,9 @@ impl<'a> BmpExecutor<'a> {
             multi_ord_accumulators.len()
         };
 
-        // Multi-ordinal entries
         for (key, score) in &multi_ord_accumulators {
-            let doc_id = (*key >> 16) as DocId;
-            // Filter predicate check at collection time
-            if let Some(ref pred) = self.predicate
+            let doc_id = (*key >> 16) as crate::DocId;
+            if let Some(ref pred) = $self.predicate
                 && !pred(doc_id)
             {
                 continue;
@@ -576,6 +518,49 @@ impl<'a> BmpExecutor<'a> {
         );
 
         Ok(results)
+    }};
+}
+
+impl<'a> BmpExecutor<'a> {
+    /// Create a new BMP executor with lazy block loading
+    ///
+    /// `query_terms` should contain only dimensions that exist in the index.
+    /// Block metadata (skip entries) is read from the sparse index directly.
+    pub fn new(
+        sparse_index: &'a crate::segment::SparseIndex,
+        query_terms: Vec<(u32, f32)>,
+        k: usize,
+        heap_factor: f32,
+    ) -> Self {
+        Self {
+            sparse_index,
+            query_terms,
+            k,
+            heap_factor: heap_factor.clamp(0.0, 1.0),
+            predicate: None,
+        }
+    }
+
+    /// Set a filter predicate that rejects documents at final collection.
+    pub fn set_predicate(&mut self, predicate: Option<super::DocPredicate<'a>>) {
+        self.predicate = predicate;
+    }
+
+    /// Execute BMP and return top-k results (async).
+    pub async fn execute(self) -> crate::Result<Vec<ScoredDoc>> {
+        if self.query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        bmp_execute_loop!(self, get_blocks_range, .await)
+    }
+
+    /// Synchronous BMP execution — works when sparse index is mmap-backed.
+    #[cfg(feature = "sync")]
+    pub fn execute_sync(self) -> crate::Result<Vec<ScoredDoc>> {
+        if self.query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        bmp_execute_loop!(self, get_blocks_range_sync,)
     }
 }
 

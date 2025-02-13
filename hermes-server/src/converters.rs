@@ -499,6 +499,8 @@ pub fn convert_proto_to_document(
     fields: &[proto::FieldEntry],
     schema: &Schema,
 ) -> Result<Document, String> {
+    use hermes_core::FieldType;
+
     let mut doc = Document::new();
 
     for entry in fields {
@@ -512,13 +514,35 @@ pub fn convert_proto_to_document(
             .get_field(name)
             .ok_or_else(|| format!("Field '{}' not found in schema", name))?;
 
-        match &value.value {
-            Some(Value::Text(s)) => doc.add_text(field, s),
-            Some(Value::U64(n)) => doc.add_u64(field, *n),
-            Some(Value::I64(n)) => doc.add_i64(field, *n),
-            Some(Value::F64(n)) => doc.add_f64(field, *n),
-            Some(Value::BytesValue(b)) => doc.add_bytes(field, b.clone()),
-            Some(Value::SparseVector(sv)) => {
+        let field_type = schema
+            .get_field_entry(field)
+            .map(|e| &e.field_type)
+            .ok_or_else(|| format!("Field '{}' has no entry", name))?;
+
+        // Extract a numeric value from any proto numeric variant for coercion.
+        // Clients infer the proto type from the native value (e.g. Python sends
+        // positive ints as u64 even for i64/f64 schema fields), so we coerce
+        // to match the schema field type.
+        match (&value.value, field_type) {
+            // ── Text ──
+            (Some(Value::Text(s)), _) => doc.add_text(field, s),
+
+            // ── Numeric: coerce any numeric proto variant to the schema type ──
+            (Some(Value::U64(n)), FieldType::U64) => doc.add_u64(field, *n),
+            (Some(Value::U64(n)), FieldType::I64) => doc.add_i64(field, *n as i64),
+            (Some(Value::U64(n)), FieldType::F64) => doc.add_f64(field, *n as f64),
+
+            (Some(Value::I64(n)), FieldType::I64) => doc.add_i64(field, *n),
+            (Some(Value::I64(n)), FieldType::U64) => doc.add_u64(field, *n as u64),
+            (Some(Value::I64(n)), FieldType::F64) => doc.add_f64(field, *n as f64),
+
+            (Some(Value::F64(n)), FieldType::F64) => doc.add_f64(field, *n),
+            (Some(Value::F64(n)), FieldType::U64) => doc.add_u64(field, *n as u64),
+            (Some(Value::F64(n)), FieldType::I64) => doc.add_i64(field, *n as i64),
+
+            // ── Non-numeric types: no coercion needed ──
+            (Some(Value::BytesValue(b)), _) => doc.add_bytes(field, b.clone()),
+            (Some(Value::SparseVector(sv)), _) => {
                 let entries: Vec<(u32, f32)> = sv
                     .indices
                     .iter()
@@ -527,15 +551,49 @@ pub fn convert_proto_to_document(
                     .collect();
                 doc.add_sparse_vector(field, entries);
             }
-            Some(Value::DenseVector(dv)) => {
+            (Some(Value::DenseVector(dv)), _) => {
                 doc.add_dense_vector(field, dv.values.clone());
             }
-            Some(Value::JsonValue(json_str)) => {
+            // ── JSON: expand string arrays into multi-valued text fields ──
+            // Python client serializes list[str] as json_value '["en","fr"]'
+            // because it can't distinguish from a generic list. When the schema
+            // field is Text, expand the array into multiple add_text calls.
+            (Some(Value::JsonValue(json_str)), FieldType::Text) => {
+                let json_val: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| format!("Invalid JSON in field '{}': {}", name, e))?;
+                if let serde_json::Value::Array(arr) = &json_val {
+                    for item in arr {
+                        if let serde_json::Value::String(s) = item {
+                            doc.add_text(field, s);
+                        } else {
+                            return Err(format!(
+                                "Field '{}': expected string in JSON array, got {}",
+                                name, item
+                            ));
+                        }
+                    }
+                } else if let serde_json::Value::String(s) = &json_val {
+                    doc.add_text(field, s);
+                } else {
+                    return Err(format!(
+                        "Field '{}': expected JSON string array for text field, got {}",
+                        name, json_val
+                    ));
+                }
+            }
+            (Some(Value::JsonValue(json_str)), _) => {
                 let json_val: serde_json::Value = serde_json::from_str(json_str)
                     .map_err(|e| format!("Invalid JSON in field '{}': {}", name, e))?;
                 doc.add_json(field, json_val);
             }
-            None => return Err(format!("Field '{}' has no value", name)),
+            (None, _) => return Err(format!("Field '{}' has no value", name)),
+            // Numeric value sent to a non-numeric field (e.g. u64 to text) — skip with warning
+            (Some(_), _) => {
+                warn!(
+                    "Field '{}': proto value type does not match schema type {:?}, skipping",
+                    name, field_type
+                );
+            }
         }
     }
 

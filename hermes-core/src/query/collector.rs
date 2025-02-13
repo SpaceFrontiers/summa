@@ -406,9 +406,14 @@ pub async fn collect_segment_with_limit<C: Collector>(
     collector: &mut C,
     limit: usize,
 ) -> Result<()> {
-    let needs_positions = collector.needs_positions();
     let mut scorer = query.scorer(reader, limit, None).await?;
+    drive_scorer(scorer.as_mut(), collector);
+    Ok(())
+}
 
+/// Drive a scorer through a collector (shared by async and sync paths).
+fn drive_scorer<C: Collector>(scorer: &mut dyn super::Scorer, collector: &mut C) {
+    let needs_positions = collector.needs_positions();
     let mut doc = scorer.doc();
     while doc != TERMINATED {
         if needs_positions {
@@ -419,7 +424,56 @@ pub async fn collect_segment_with_limit<C: Collector>(
         }
         doc = scorer.advance();
     }
+}
 
+// ── Synchronous collector functions (mmap/RAM only) ─────────────────────────
+
+/// Synchronous segment search — returns top-k results.
+#[cfg(feature = "sync")]
+pub fn search_segment_sync(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let mut collector = TopKCollector::new(limit);
+    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
+    Ok(collector.into_sorted_results())
+}
+
+/// Synchronous segment search — returns (results, total_seen).
+#[cfg(feature = "sync")]
+pub fn search_segment_with_count_sync(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let mut collector = TopKCollector::new(limit);
+    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
+    Ok(collector.into_results_with_count())
+}
+
+/// Synchronous segment search with position collection.
+#[cfg(feature = "sync")]
+pub fn search_segment_with_positions_and_count_sync(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let mut collector = TopKCollector::with_positions(limit);
+    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
+    Ok(collector.into_results_with_count())
+}
+
+/// Synchronous collect with limit — uses `scorer_sync`.
+#[cfg(feature = "sync")]
+pub fn collect_segment_with_limit_sync<C: Collector>(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    collector: &mut C,
+    limit: usize,
+) -> Result<()> {
+    let mut scorer = query.scorer_sync(reader, limit, None)?;
+    drive_scorer(scorer.as_mut(), collector);
     Ok(())
 }
 

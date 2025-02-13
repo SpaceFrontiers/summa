@@ -155,6 +155,66 @@ impl Query for PhraseQuery {
         })
     }
 
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<super::DocPredicate<'a>>,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        if self.terms.is_empty() {
+            return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>);
+        }
+
+        if self.terms.len() == 1 {
+            let term_query = super::TermQuery::new(self.field, self.terms[0].clone());
+            return term_query.scorer_sync(reader, limit, predicate);
+        }
+
+        if !reader.has_positions(self.field) {
+            let mut bool_query = super::BooleanQuery::new();
+            for term in &self.terms {
+                bool_query = bool_query.must(super::TermQuery::new(self.field, term.clone()));
+            }
+            return bool_query.scorer_sync(reader, limit, predicate);
+        }
+
+        let mut term_postings: Vec<BlockPostingList> = Vec::with_capacity(self.terms.len());
+        let mut term_positions: Vec<PositionPostingList> = Vec::with_capacity(self.terms.len());
+
+        for term in &self.terms {
+            let postings = reader.get_postings_sync(self.field, term)?;
+            let positions = reader.get_positions_sync(self.field, term)?;
+
+            match (postings, positions) {
+                (Some(p), Some(pos)) => {
+                    term_postings.push(p);
+                    term_positions.push(pos);
+                }
+                _ => return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
+            }
+        }
+
+        let idf: f32 = term_postings
+            .iter()
+            .map(|p| {
+                let num_docs = reader.num_docs() as f32;
+                let doc_freq = p.doc_count() as f32;
+                super::bm25_idf(doc_freq, num_docs)
+            })
+            .sum();
+
+        let avg_field_len = reader.avg_field_len(self.field);
+
+        Ok(Box::new(PhraseScorer::new(
+            term_postings,
+            term_positions,
+            self.slop,
+            idf,
+            avg_field_len,
+        )) as Box<dyn Scorer + 'a>)
+    }
+
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         let field = self.field;
         let terms = self.terms.clone();

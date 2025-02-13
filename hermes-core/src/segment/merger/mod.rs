@@ -8,66 +8,16 @@ mod postings;
 mod sparse;
 mod store;
 
-use std::io::Write;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
 use super::reader::SegmentReader;
 use super::types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta};
+use super::{OffsetWriter, format_bytes};
 use crate::Result;
-use crate::directories::{Directory, DirectoryWriter, StreamingWriter};
+use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::Schema;
-
-/// Write adapter that tracks bytes written.
-///
-/// Concrete type so it works with generic `serialize<W: Write>` functions
-/// (unlike `dyn StreamingWriter` which isn't `Sized`).
-pub(crate) struct OffsetWriter {
-    inner: Box<dyn StreamingWriter>,
-    offset: u64,
-}
-
-impl OffsetWriter {
-    fn new(inner: Box<dyn StreamingWriter>) -> Self {
-        Self { inner, offset: 0 }
-    }
-
-    /// Current write position (total bytes written so far).
-    fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    /// Finalize the underlying streaming writer.
-    fn finish(self) -> std::io::Result<()> {
-        self.inner.finish()
-    }
-}
-
-impl Write for OffsetWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.offset += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// Format byte count as human-readable string
-fn format_bytes(bytes: usize) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.2} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
 
 /// Compute per-segment doc ID offsets (each segment's docs start after the previous)
 fn doc_offsets(segments: &[SegmentReader]) -> Vec<u32> {

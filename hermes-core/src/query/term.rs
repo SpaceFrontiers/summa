@@ -131,6 +131,55 @@ impl Query for TermQuery {
         })
     }
 
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        _limit: usize,
+        _predicate: Option<super::DocPredicate<'a>>,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let postings = reader.get_postings_sync(self.field, &self.term)?;
+
+        match postings {
+            Some(posting_list) => {
+                let (idf, avg_field_len) = if let Some(ref stats) = self.global_stats {
+                    let term_str = String::from_utf8_lossy(&self.term);
+                    let global_idf = stats.text_idf(self.field, &term_str);
+                    if global_idf > 0.0 {
+                        (global_idf, stats.avg_field_len(self.field))
+                    } else {
+                        let num_docs = reader.num_docs() as f32;
+                        let doc_freq = posting_list.doc_count() as f32;
+                        (
+                            super::bm25_idf(doc_freq, num_docs),
+                            reader.avg_field_len(self.field),
+                        )
+                    }
+                } else {
+                    let num_docs = reader.num_docs() as f32;
+                    let doc_freq = posting_list.doc_count() as f32;
+                    (
+                        super::bm25_idf(doc_freq, num_docs),
+                        reader.avg_field_len(self.field),
+                    )
+                };
+
+                let positions = reader
+                    .get_positions_sync(self.field, &self.term)
+                    .ok()
+                    .flatten();
+
+                let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0);
+                if let Some(pos) = positions {
+                    scorer = scorer.with_positions(self.field.0, pos);
+                }
+
+                Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
+            }
+            None => Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
+        }
+    }
+
     fn as_term_query_info(&self) -> Option<TermQueryInfo> {
         Some(TermQueryInfo {
             field: self.field,

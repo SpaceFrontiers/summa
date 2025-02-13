@@ -316,6 +316,63 @@ impl Query for FastFieldFilterQuery {
         })
     }
 
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<DocPredicate<'a>>,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        // Compile filters against segment's fast-field readers
+        let mut compiled_vec: Vec<(u32, CompiledFilter)> = Vec::with_capacity(self.filters.len());
+        for filter in &self.filters {
+            let field_id = filter.field.0;
+            if let Some(ff_reader) = reader.fast_field(field_id) {
+                let cf = compile_condition(&filter.condition, ff_reader);
+                compiled_vec.push((field_id, cf));
+            } else {
+                compiled_vec.push((field_id, CompiledFilter::Never));
+            }
+        }
+
+        let compiled = Arc::new(compiled_vec);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        type SharedPred<'b> = Arc<dyn Fn(DocId) -> bool + Send + Sync + 'b>;
+        #[cfg(target_arch = "wasm32")]
+        type SharedPred<'b> = Arc<dyn Fn(DocId) -> bool + 'b>;
+
+        let outer_arc: Option<SharedPred<'a>> = predicate.map(Arc::from);
+
+        if let Some(ref inner_query) = self.inner {
+            let pred_for_inner = chain_predicates(
+                outer_arc.as_ref().map(|a| {
+                    let a = a.clone();
+                    Box::new(move |doc_id| a(doc_id)) as DocPredicate<'a>
+                }),
+                make_filter_predicate(compiled.clone(), reader),
+            );
+            let pred_for_wrapper = chain_predicates(
+                outer_arc.map(|a| Box::new(move |doc_id| a(doc_id)) as DocPredicate<'a>),
+                make_filter_predicate(compiled, reader),
+            );
+
+            let inner_scorer = inner_query.scorer_sync(reader, limit, Some(pred_for_inner))?;
+
+            Ok(
+                Box::new(PredicateFilterScorer::new(inner_scorer, pred_for_wrapper))
+                    as Box<dyn Scorer + 'a>,
+            )
+        } else {
+            let pred = chain_predicates(
+                outer_arc.map(|a| Box::new(move |doc_id| a(doc_id)) as DocPredicate<'a>),
+                make_filter_predicate(compiled, reader),
+            );
+            let num_docs = reader.num_docs();
+            Ok(Box::new(StandaloneFilterScorer::new(num_docs, pred)) as Box<dyn Scorer + 'a>)
+        }
+    }
+
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         if let Some(ref inner) = self.inner {
             inner.count_estimate(reader)

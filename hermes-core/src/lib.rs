@@ -50,9 +50,7 @@ pub use directories::{
 pub type DefaultDirectory = MmapDirectory;
 
 // Re-exports from segment
-pub use segment::{
-    AsyncSegmentReader, AsyncStoreReader, FieldStats, SegmentId, SegmentMeta, SegmentReader,
-};
+pub use segment::{AsyncStoreReader, FieldStats, SegmentId, SegmentMeta, SegmentReader};
 #[cfg(feature = "native")]
 pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 

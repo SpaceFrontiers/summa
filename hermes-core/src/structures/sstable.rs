@@ -1341,6 +1341,64 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         Ok(block)
     }
 
+    /// Synchronous block load — only works for Inline (mmap/RAM) file handles.
+    #[cfg(feature = "sync")]
+    fn load_block_sync(&self, block_idx: usize) -> io::Result<Arc<[u8]>> {
+        let addr = self.block_index.get_addr(block_idx).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Block index out of range")
+        })?;
+
+        // Check cache (write lock for LRU promotion on hit)
+        {
+            if let Some(block) = self.cache.write().get(addr.offset) {
+                return Ok(block);
+            }
+        }
+
+        // Load from FileSlice (sync — requires Inline handle)
+        let range = addr.byte_range();
+        let compressed = self.data_slice.read_bytes_range_sync(range)?;
+
+        // Decompress with dictionary if available
+        let decompressed = if let Some(ref dict) = self.dictionary {
+            crate::compression::decompress_with_dict(compressed.as_slice(), dict)?
+        } else {
+            crate::compression::decompress(compressed.as_slice())?
+        };
+
+        let block: Arc<[u8]> = Arc::from(decompressed);
+
+        // Insert into cache
+        {
+            let mut cache = self.cache.write();
+            cache.insert(addr.offset, Arc::clone(&block));
+        }
+
+        Ok(block)
+    }
+
+    /// Synchronous key lookup — only works for Inline (mmap/RAM) file handles.
+    #[cfg(feature = "sync")]
+    pub fn get_sync(&self, key: &[u8]) -> io::Result<Option<V>> {
+        // Check bloom filter first — fast negative lookup
+        if let Some(ref bloom) = self.bloom_filter
+            && !bloom.may_contain(key)
+        {
+            return Ok(None);
+        }
+
+        // Use block index to find the block that could contain the key
+        let block_idx = match self.block_index.locate(key) {
+            Some(idx) => idx,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        let block_data = self.load_block_sync(block_idx)?;
+        self.search_block(&block_data, key)
+    }
+
     fn search_block(&self, block_data: &[u8], target_key: &[u8]) -> io::Result<Option<V>> {
         let mut reader = block_data;
         let mut current_key = Vec::new();

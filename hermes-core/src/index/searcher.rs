@@ -434,33 +434,6 @@ impl<D: Directory + 'static> Searcher<D> {
         let batches = futures::future::try_join_all(futures).await?;
         let mut total_seen: u32 = 0;
 
-        // K-way merge: each batch is already sorted by score descending.
-        // Use a max-heap of (score, batch_idx, position) to merge in O(N log K).
-        use std::cmp::Ordering;
-        struct MergeEntry {
-            score: f32,
-            batch_idx: usize,
-            pos: usize,
-        }
-        impl PartialEq for MergeEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.score == other.score
-            }
-        }
-        impl Eq for MergeEntry {}
-        impl PartialOrd for MergeEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for MergeEntry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.score
-                    .partial_cmp(&other.score)
-                    .unwrap_or(Ordering::Equal)
-            }
-        }
-
         let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
             Vec::with_capacity(batches.len());
         for (batch, segment_seen) in batches {
@@ -470,36 +443,53 @@ impl<D: Directory + 'static> Searcher<D> {
             }
         }
 
-        let mut heap = std::collections::BinaryHeap::with_capacity(sorted_batches.len());
-        for (i, batch) in sorted_batches.iter().enumerate() {
-            heap.push(MergeEntry {
-                score: batch[0].score,
-                batch_idx: i,
-                pos: 0,
-            });
+        let results = merge_segment_results(sorted_batches, fetch_limit, offset);
+        Ok((results, total_seen))
+    }
+
+    /// Synchronous search across all segments using rayon for parallelism.
+    ///
+    /// This is the async-free boundary — no tokio involvement from here down.
+    #[cfg(feature = "sync")]
+    pub fn search_with_offset_and_count_sync(
+        &self,
+        query: &dyn crate::query::Query,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        use rayon::prelude::*;
+
+        let fetch_limit = offset + limit;
+
+        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> = self
+            .segments
+            .par_iter()
+            .map(|segment| {
+                let sid = segment.meta().id;
+                let (mut results, segment_seen) = crate::query::search_segment_with_count_sync(
+                    segment.as_ref(),
+                    query,
+                    fetch_limit,
+                )?;
+                for r in &mut results {
+                    r.segment_id = sid;
+                }
+                Ok((results, segment_seen))
+            })
+            .collect();
+
+        let mut total_seen: u32 = 0;
+        let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
+            Vec::with_capacity(batches.len());
+        for result in batches {
+            let (batch, segment_seen) = result?;
+            total_seen += segment_seen;
+            if !batch.is_empty() {
+                sorted_batches.push(batch);
+            }
         }
 
-        let mut results = Vec::with_capacity(fetch_limit.min(total_seen as usize));
-        let mut emitted = 0usize;
-        while let Some(entry) = heap.pop() {
-            if emitted >= fetch_limit {
-                break;
-            }
-            let batch = &sorted_batches[entry.batch_idx];
-            if emitted >= offset {
-                results.push(batch[entry.pos].clone());
-            }
-            emitted += 1;
-            let next_pos = entry.pos + 1;
-            if next_pos < batch.len() {
-                heap.push(MergeEntry {
-                    score: batch[next_pos].score,
-                    batch_idx: entry.batch_idx,
-                    pos: next_pos,
-                });
-            }
-        }
-
+        let results = merge_segment_results(sorted_batches, fetch_limit, offset);
         Ok((results, total_seen))
     }
 
@@ -608,6 +598,76 @@ impl<D: Directory + 'static> Searcher<D> {
 
         Ok(None)
     }
+}
+
+/// K-way merge of pre-sorted segment result batches.
+///
+/// Each batch is sorted by score descending. Uses a max-heap of
+/// (score, batch_idx, position) to merge in O(N log K).
+fn merge_segment_results(
+    sorted_batches: Vec<Vec<crate::query::SearchResult>>,
+    fetch_limit: usize,
+    offset: usize,
+) -> Vec<crate::query::SearchResult> {
+    use std::cmp::Ordering;
+
+    struct MergeEntry {
+        score: f32,
+        batch_idx: usize,
+        pos: usize,
+    }
+    impl PartialEq for MergeEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.score == other.score
+        }
+    }
+    impl Eq for MergeEntry {}
+    impl PartialOrd for MergeEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for MergeEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.score
+                .partial_cmp(&other.score)
+                .unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut heap = std::collections::BinaryHeap::with_capacity(sorted_batches.len());
+    for (i, batch) in sorted_batches.iter().enumerate() {
+        if !batch.is_empty() {
+            heap.push(MergeEntry {
+                score: batch[0].score,
+                batch_idx: i,
+                pos: 0,
+            });
+        }
+    }
+
+    let mut results = Vec::with_capacity(fetch_limit.min(64));
+    let mut emitted = 0usize;
+    while let Some(entry) = heap.pop() {
+        if emitted >= fetch_limit {
+            break;
+        }
+        let batch = &sorted_batches[entry.batch_idx];
+        if emitted >= offset {
+            results.push(batch[entry.pos].clone());
+        }
+        emitted += 1;
+        let next_pos = entry.pos + 1;
+        if next_pos < batch.len() {
+            heap.push(MergeEntry {
+                score: batch[next_pos].score,
+                batch_idx: entry.batch_idx,
+                pos: next_pos,
+            });
+        }
+    }
+
+    results
 }
 
 /// Get current process RSS in MB (best-effort, returns 0.0 on failure)

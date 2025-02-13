@@ -83,6 +83,23 @@ macro_rules! define_query_traits {
             /// Estimated number of matching documents in a segment (async)
             fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a>;
 
+            /// Create a scorer synchronously (mmap/RAM only).
+            ///
+            /// Available when the `sync` feature is enabled.
+            /// Default implementation returns an error.
+            #[cfg(feature = "sync")]
+            fn scorer_sync<'a>(
+                &self,
+                reader: &'a SegmentReader,
+                limit: usize,
+                predicate: Option<DocPredicate<'a>>,
+            ) -> Result<Box<dyn Scorer + 'a>> {
+                let _ = (reader, limit, predicate);
+                Err(crate::error::Error::Query(
+                    "sync scorer not supported for this query type".into(),
+                ))
+            }
+
             /// Return term info if this is a simple term query eligible for MaxScore optimization
             ///
             /// Returns None for complex queries (boolean, phrase, etc.)
@@ -139,6 +156,16 @@ impl Query for Box<dyn Query> {
 
     fn as_term_query_info(&self) -> Option<TermQueryInfo> {
         (**self).as_term_query_info()
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<DocPredicate<'a>>,
+    ) -> Result<Box<dyn Scorer + 'a>> {
+        (**self).scorer_sync(reader, limit, predicate)
     }
 }
 

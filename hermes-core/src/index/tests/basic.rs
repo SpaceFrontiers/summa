@@ -198,6 +198,7 @@ async fn test_match_query() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "sync"))]
 async fn test_slice_cache_warmup_and_load() {
     use crate::directories::SliceCachingDirectory;
 

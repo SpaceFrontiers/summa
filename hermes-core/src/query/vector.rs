@@ -190,6 +190,24 @@ impl Query for DenseVectorQuery {
         })
     }
 
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        _predicate: Option<super::DocPredicate<'a>>,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let results = reader.search_dense_vector_sync(
+            self.field,
+            &self.vector,
+            limit,
+            self.nprobe,
+            self.rerank_factor,
+            self.combiner,
+        )?;
+        Ok(Box::new(DenseVectorScorer::new(results, self.field.0)) as Box<dyn Scorer>)
+    }
+
     fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
         Box::pin(async move { Ok(u32::MAX) })
     }
@@ -581,6 +599,24 @@ impl Query for SparseVectorQuery {
 
             Ok(Box::new(SparseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)
         })
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        _predicate: Option<super::DocPredicate<'a>>,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let vector = self.pruned_vector();
+        let results = reader.search_sparse_vector_sync(
+            self.field,
+            &vector,
+            limit,
+            self.combiner,
+            self.heap_factor,
+        )?;
+        Ok(Box::new(SparseVectorScorer::new(results, self.field.0)) as Box<dyn Scorer>)
     }
 
     fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
