@@ -355,12 +355,12 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
 
             let filtered = n - survivors.len();
             log::debug!(
-                "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived, {} unique docs (filtered {}, per_doc_cap={})",
+                "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived from {} unique docs (filtered {}, per_doc_cap={})",
                 trunc_dim,
                 query_dim,
                 survivors.len(),
-                unique_docs,
                 n,
+                unique_docs,
                 filtered,
                 per_doc_cap
             );

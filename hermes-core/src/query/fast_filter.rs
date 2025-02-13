@@ -445,6 +445,10 @@ impl<'a> Scorer for PredicateFilterScorer<'a> {
     fn size_hint(&self) -> u32 {
         self.inner.size_hint()
     }
+
+    fn matched_positions(&self) -> Option<super::MatchedPositions> {
+        self.inner.matched_positions()
+    }
 }
 
 // ── Standalone filter scorer ──────────────────────────────────────────────
