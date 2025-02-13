@@ -384,40 +384,70 @@ impl super::Scorer for IntersectionScorer<'_> {
 
 // ── PredicatedScorer ─────────────────────────────────────────────────────
 
-/// Wraps a Scorer with a predicate closure, skipping docs that fail the predicate.
+/// Wraps a driving Scorer with filter conditions pushed down.
 ///
-/// Used by the query planner to convert non-selective MUST filters (e.g., Range)
-/// into O(1) per-doc checks instead of driving iteration from them.
-/// The `filter_score` is added to the inner score for each matching doc.
+/// Used by the query planner to flip iteration order: the SHOULD scorer
+/// drives and MUST/MUST_NOT clauses are checked per-doc via:
+/// - O(1) predicate closures (e.g., fast-field range checks)
+/// - seek()-based verifier scorers (e.g., TermQuery posting list lookups)
+///
+/// `filter_score` is a constant added for predicate-converted filters.
+/// Verifier scorers contribute their actual per-doc score (e.g., BM25).
 pub struct PredicatedScorer<'a> {
-    inner: Box<dyn super::Scorer + 'a>,
-    predicate: super::DocPredicate<'a>,
+    /// Driving scorer (typically SHOULD clauses)
+    driver: Box<dyn super::Scorer + 'a>,
+    /// O(1) predicate checks (from filter queries like RangeQuery, or negated MUST_NOT)
+    predicates: Vec<super::DocPredicate<'a>>,
+    /// MUST scorers verified via seek() — preserves per-doc scoring
+    must_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
+    /// MUST_NOT scorers — docs are excluded if these land on them
+    must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
+    /// Constant score from predicate-converted filters (1.0 per filter)
     filter_score: f32,
 }
 
 impl<'a> PredicatedScorer<'a> {
     pub fn new(
-        mut inner: Box<dyn super::Scorer + 'a>,
-        predicate: super::DocPredicate<'a>,
+        driver: Box<dyn super::Scorer + 'a>,
+        predicates: Vec<super::DocPredicate<'a>>,
+        must_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
+        must_not_verifiers: Vec<Box<dyn super::Scorer + 'a>>,
         filter_score: f32,
     ) -> Self {
-        // Advance to the first doc that satisfies the predicate
-        let mut doc = inner.doc();
-        while doc != TERMINATED && !(predicate)(doc) {
-            doc = inner.advance();
-        }
-        Self {
-            inner,
-            predicate,
+        let mut s = Self {
+            driver,
+            predicates,
+            must_verifiers,
+            must_not_verifiers,
             filter_score,
-        }
+        };
+        // Position on first matching doc
+        s.skip_non_matching();
+        s
     }
 
-    /// Advance inner past non-matching docs.
+    /// Check whether `doc` passes all filter conditions.
+    #[inline]
+    fn check_filters(&mut self, doc: DocId) -> bool {
+        // O(1) predicate checks first (cheapest)
+        if !self.predicates.iter().all(|p| p(doc)) {
+            return false;
+        }
+        // MUST verifiers: seek to doc, must land exactly on it
+        if !self.must_verifiers.iter_mut().all(|s| s.seek(doc) == doc) {
+            return false;
+        }
+        // MUST_NOT verifiers: seek to doc, must NOT land on it
+        self.must_not_verifiers
+            .iter_mut()
+            .all(|s| s.seek(doc) != doc)
+    }
+
+    /// Advance driver past non-matching docs.
     fn skip_non_matching(&mut self) -> DocId {
-        let mut doc = self.inner.doc();
-        while doc != TERMINATED && !(self.predicate)(doc) {
-            doc = self.inner.advance();
+        let mut doc = self.driver.doc();
+        while doc != TERMINATED && !self.check_filters(doc) {
+            doc = self.driver.advance();
         }
         doc
     }
@@ -425,31 +455,35 @@ impl<'a> PredicatedScorer<'a> {
 
 impl DocSet for PredicatedScorer<'_> {
     fn doc(&self) -> DocId {
-        self.inner.doc()
+        self.driver.doc()
     }
 
     fn advance(&mut self) -> DocId {
-        self.inner.advance();
+        self.driver.advance();
         self.skip_non_matching()
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
-        self.inner.seek(target);
+        self.driver.seek(target);
         self.skip_non_matching()
     }
 
     fn size_hint(&self) -> u32 {
-        self.inner.size_hint()
+        self.driver.size_hint()
     }
 }
 
 impl super::Scorer for PredicatedScorer<'_> {
     fn score(&self) -> crate::Score {
-        self.inner.score() + self.filter_score
+        let mut total = self.driver.score();
+        for v in &self.must_verifiers {
+            total += v.score();
+        }
+        total + self.filter_score
     }
 
     fn matched_positions(&self) -> Option<super::MatchedPositions> {
-        self.inner.matched_positions()
+        self.driver.matched_positions()
     }
 }
 
