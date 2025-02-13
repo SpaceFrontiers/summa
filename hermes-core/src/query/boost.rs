@@ -22,6 +22,12 @@ impl std::fmt::Debug for BoostQuery {
     }
 }
 
+impl std::fmt::Display for BoostQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}^{}", self.inner, self.boost)
+    }
+}
+
 impl BoostQuery {
     pub fn new(query: impl Query + 'static, boost: f32) -> Self {
         Self {

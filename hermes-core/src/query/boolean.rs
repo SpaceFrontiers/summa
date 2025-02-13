@@ -35,6 +35,35 @@ impl std::fmt::Debug for BooleanQuery {
     }
 }
 
+impl std::fmt::Display for BooleanQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Boolean(")?;
+        let mut first = true;
+        for q in &self.must {
+            if !first {
+                write!(f, " ")?;
+            }
+            write!(f, "+{}", q)?;
+            first = false;
+        }
+        for q in &self.should {
+            if !first {
+                write!(f, " ")?;
+            }
+            write!(f, "{}", q)?;
+            first = false;
+        }
+        for q in &self.must_not {
+            if !first {
+                write!(f, " ")?;
+            }
+            write!(f, "-{}", q)?;
+            first = false;
+        }
+        write!(f, ")")
+    }
+}
+
 impl BooleanQuery {
     pub fn new() -> Self {
         Self::default()

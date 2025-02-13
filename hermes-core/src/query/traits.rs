@@ -73,7 +73,7 @@ macro_rules! define_query_traits {
         /// Note: `scorer` takes `&self` (not `&'a self`) so that scorers don't borrow the query.
         /// This enables query composition - queries can create sub-queries locally and get their scorers.
         /// Implementations must clone/capture any data they need during scorer creation.
-        pub trait Query: $($send_bounds)* {
+        pub trait Query: std::fmt::Display + $($send_bounds)* {
             /// Create a scorer for this query against a single segment (async)
             ///
             /// The `limit` parameter specifies the maximum number of results to return.

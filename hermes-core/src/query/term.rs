@@ -28,6 +28,17 @@ impl std::fmt::Debug for TermQuery {
     }
 }
 
+impl std::fmt::Display for TermQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Term({}:\"{}\")",
+            self.field.0,
+            String::from_utf8_lossy(&self.term)
+        )
+    }
+}
+
 impl TermQuery {
     pub fn new(field: Field, term: impl Into<Vec<u8>>) -> Self {
         Self {

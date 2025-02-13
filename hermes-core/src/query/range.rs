@@ -92,6 +92,34 @@ pub struct RangeQuery {
     pub bound: RangeBound,
 }
 
+impl std::fmt::Display for RangeQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.bound {
+            RangeBound::U64 { min, max } => write!(
+                f,
+                "Range({}:[{} TO {}])",
+                self.field.0,
+                min.map_or("*".to_string(), |v| v.to_string()),
+                max.map_or("*".to_string(), |v| v.to_string()),
+            ),
+            RangeBound::I64 { min, max } => write!(
+                f,
+                "Range({}:[{} TO {}])",
+                self.field.0,
+                min.map_or("*".to_string(), |v| v.to_string()),
+                max.map_or("*".to_string(), |v| v.to_string()),
+            ),
+            RangeBound::F64 { min, max } => write!(
+                f,
+                "Range({}:[{} TO {}])",
+                self.field.0,
+                min.map_or("*".to_string(), |v| v.to_string()),
+                max.map_or("*".to_string(), |v| v.to_string()),
+            ),
+        }
+    }
+}
+
 impl RangeQuery {
     pub fn new(field: Field, bound: RangeBound) -> Self {
         Self { field, bound }

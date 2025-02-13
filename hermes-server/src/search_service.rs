@@ -41,6 +41,8 @@ impl SearchService for SearchServiceImpl {
         let core_query = convert_query(&query, reader.schema(), Some(searcher.global_stats()))
             .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
 
+        tracing::debug!(index = %req.index_name, query = %core_query, "search query");
+
         let limit = if req.limit == 0 {
             10
         } else {

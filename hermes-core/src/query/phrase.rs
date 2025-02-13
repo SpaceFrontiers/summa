@@ -24,6 +24,21 @@ pub struct PhraseQuery {
     global_stats: Option<Arc<GlobalStats>>,
 }
 
+impl std::fmt::Display for PhraseQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let terms: Vec<_> = self
+            .terms
+            .iter()
+            .map(|t| String::from_utf8_lossy(t))
+            .collect();
+        write!(f, "Phrase({}:\"{}\"", self.field.0, terms.join(" "))?;
+        if self.slop > 0 {
+            write!(f, "~{}", self.slop)?;
+        }
+        write!(f, ")")
+    }
+}
+
 impl std::fmt::Debug for PhraseQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let terms: Vec<_> = self

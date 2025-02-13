@@ -138,6 +138,19 @@ pub struct DenseVectorQuery {
     pub combiner: MultiValueCombiner,
 }
 
+impl std::fmt::Display for DenseVectorQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Dense({}, dim={}, nprobe={}, rerank={})",
+            self.field.0,
+            self.vector.len(),
+            self.nprobe,
+            self.rerank_factor
+        )
+    }
+}
+
 impl DenseVectorQuery {
     /// Create a new dense vector query
     pub fn new(field: Field, vector: Vec<f32>) -> Self {
@@ -302,6 +315,20 @@ pub struct SparseVectorQuery {
     pub over_fetch_factor: f32,
     /// Cached pruned vector; None = use `vector` as-is (no pruning applied)
     pruned: Option<Vec<(u32, f32)>>,
+}
+
+impl std::fmt::Display for SparseVectorQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dims = self.pruned_dims();
+        write!(f, "Sparse({}, dims={}", self.field.0, dims.len())?;
+        if self.heap_factor < 1.0 {
+            write!(f, ", heap={}", self.heap_factor)?;
+        }
+        if self.vector.len() != dims.len() {
+            write!(f, ", orig={}", self.vector.len())?;
+        }
+        write!(f, ")")
+    }
 }
 
 impl SparseVectorQuery {
@@ -687,6 +714,16 @@ pub struct SparseTermQuery {
     pub combiner: MultiValueCombiner,
     /// Multiplier on executor limit to compensate for ordinal deduplication
     pub over_fetch_factor: f32,
+}
+
+impl std::fmt::Display for SparseTermQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SparseTerm({}, dim={}, w={:.3})",
+            self.field.0, self.dim_id, self.weight
+        )
+    }
 }
 
 impl SparseTermQuery {
