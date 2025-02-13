@@ -200,6 +200,144 @@ fn try_maxscore_scorer_sync<'a>(
     )?))
 }
 
+/// Per-field MaxScore grouping for multi-field SHOULD queries (async).
+///
+/// When SHOULD clauses span multiple fields (e.g., "hello world" across title, body, desc),
+/// single-field MaxScore can't apply. This groups TermQuery clauses by field, runs MaxScore
+/// per group, and returns compact TopKResultScorer per field. The outer BooleanScorer then
+/// unions ~N_fields scorers instead of ~N_terms*N_fields raw posting list scorers.
+async fn try_per_field_maxscore<'a>(
+    should: &[Arc<dyn Query>],
+    reader: &'a SegmentReader,
+    limit: usize,
+    global_stats: Option<&Arc<GlobalStats>>,
+) -> crate::Result<Option<Vec<Box<dyn Scorer + 'a>>>> {
+    // Group TermQuery SHOULD clauses by field
+    let mut field_groups: rustc_hash::FxHashMap<crate::Field, Vec<(usize, super::TermQueryInfo)>> =
+        rustc_hash::FxHashMap::default();
+    let mut non_term_indices: Vec<usize> = Vec::new();
+
+    for (i, q) in should.iter().enumerate() {
+        if let Some(info) = q.as_term_query_info() {
+            field_groups.entry(info.field).or_default().push((i, info));
+        } else {
+            non_term_indices.push(i);
+        }
+    }
+
+    // Only optimize if at least one group has 2+ terms
+    if !field_groups.values().any(|g| g.len() >= 2) {
+        return Ok(None);
+    }
+
+    let num_groups = field_groups.len() + non_term_indices.len();
+    let per_field_limit = limit * num_groups; // over-fetch to compensate for cross-field scoring
+    let num_docs = reader.num_docs() as f32;
+
+    let mut scorers: Vec<Box<dyn Scorer + 'a>> = Vec::new();
+
+    for group in field_groups.values() {
+        if group.len() >= 2 {
+            let field = group[0].1.field;
+            let avg_field_len = global_stats
+                .map(|s| s.avg_field_len(field))
+                .unwrap_or_else(|| reader.avg_field_len(field));
+
+            let mut posting_lists = Vec::with_capacity(group.len());
+            for (_, info) in group {
+                if let Some(pl) = reader.get_postings(info.field, &info.term).await? {
+                    let idf = compute_idf(&pl, info.field, &info.term, num_docs, global_stats);
+                    posting_lists.push((pl, idf));
+                }
+            }
+
+            if !posting_lists.is_empty() {
+                scorers.push(finish_text_maxscore(
+                    posting_lists,
+                    avg_field_len,
+                    per_field_limit,
+                )?);
+            }
+        } else {
+            // Single term — create regular scorer
+            let idx = group[0].0;
+            scorers.push(should[idx].scorer(reader, limit).await?);
+        }
+    }
+
+    // Add non-term scorers
+    for idx in &non_term_indices {
+        scorers.push(should[*idx].scorer(reader, limit).await?);
+    }
+
+    Ok(Some(scorers))
+}
+
+/// Per-field MaxScore grouping for multi-field SHOULD queries (sync).
+#[cfg(feature = "sync")]
+fn try_per_field_maxscore_sync<'a>(
+    should: &[Arc<dyn Query>],
+    reader: &'a SegmentReader,
+    limit: usize,
+    global_stats: Option<&Arc<GlobalStats>>,
+) -> crate::Result<Option<Vec<Box<dyn Scorer + 'a>>>> {
+    let mut field_groups: rustc_hash::FxHashMap<crate::Field, Vec<(usize, super::TermQueryInfo)>> =
+        rustc_hash::FxHashMap::default();
+    let mut non_term_indices: Vec<usize> = Vec::new();
+
+    for (i, q) in should.iter().enumerate() {
+        if let Some(info) = q.as_term_query_info() {
+            field_groups.entry(info.field).or_default().push((i, info));
+        } else {
+            non_term_indices.push(i);
+        }
+    }
+
+    if !field_groups.values().any(|g| g.len() >= 2) {
+        return Ok(None);
+    }
+
+    let num_groups = field_groups.len() + non_term_indices.len();
+    let per_field_limit = limit * num_groups;
+    let num_docs = reader.num_docs() as f32;
+
+    let mut scorers: Vec<Box<dyn Scorer + 'a>> = Vec::new();
+
+    for group in field_groups.values() {
+        if group.len() >= 2 {
+            let field = group[0].1.field;
+            let avg_field_len = global_stats
+                .map(|s| s.avg_field_len(field))
+                .unwrap_or_else(|| reader.avg_field_len(field));
+
+            let mut posting_lists = Vec::with_capacity(group.len());
+            for (_, info) in group {
+                if let Some(pl) = reader.get_postings_sync(info.field, &info.term)? {
+                    let idf = compute_idf(&pl, info.field, &info.term, num_docs, global_stats);
+                    posting_lists.push((pl, idf));
+                }
+            }
+
+            if !posting_lists.is_empty() {
+                scorers.push(finish_text_maxscore(
+                    posting_lists,
+                    avg_field_len,
+                    per_field_limit,
+                )?);
+            }
+        } else {
+            let idx = group[0].0;
+            scorers.push(should[idx].scorer_sync(reader, limit)?);
+        }
+    }
+
+    for idx in &non_term_indices {
+        scorers.push(should[*idx].scorer_sync(reader, limit)?);
+    }
+
+    Ok(Some(scorers))
+}
+
 /// Try to build a sparse MaxScoreExecutor from SHOULD clauses.
 /// Returns None if not eligible, Some(Err) for empty segment, Some(Ok) otherwise.
 fn prepare_sparse_maxscore<'a>(
@@ -326,6 +464,25 @@ impl Query for BooleanQuery {
                 if let Some(scorer) = try_sparse_maxscore_scorer(&should, reader, limit).await? {
                     return Ok(scorer);
                 }
+                // Try per-field MaxScore grouping for multi-field text queries
+                if let Some(optimized_should) =
+                    try_per_field_maxscore(&should, reader, limit, global_stats.as_ref()).await?
+                {
+                    if optimized_should.is_empty() {
+                        return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
+                    }
+                    if optimized_should.len() == 1 {
+                        return Ok(optimized_should.into_iter().next().unwrap());
+                    }
+                    let mut scorer = BooleanScorer {
+                        must: vec![],
+                        should: optimized_should,
+                        must_not: vec![],
+                        current_doc: 0,
+                    };
+                    scorer.current_doc = scorer.find_next_match();
+                    return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
+                }
             }
 
             // Fall back to standard boolean scoring
@@ -381,6 +538,28 @@ impl Query for BooleanQuery {
             }
             if let Some(scorer) = try_sparse_maxscore_scorer_sync(&self.should, reader, limit)? {
                 return Ok(scorer);
+            }
+            // Try per-field MaxScore grouping for multi-field text queries
+            if let Some(optimized_should) = try_per_field_maxscore_sync(
+                &self.should,
+                reader,
+                limit,
+                self.global_stats.as_ref(),
+            )? {
+                if optimized_should.is_empty() {
+                    return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
+                }
+                if optimized_should.len() == 1 {
+                    return Ok(optimized_should.into_iter().next().unwrap());
+                }
+                let mut scorer = BooleanScorer {
+                    must: vec![],
+                    should: optimized_should,
+                    must_not: vec![],
+                    current_doc: 0,
+                };
+                scorer.current_doc = scorer.find_next_match();
+                return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
             }
         }
 

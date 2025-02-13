@@ -634,3 +634,111 @@ async fn test_pruning_score_impact() {
         "Doc 120 should NOT be in pruned results (dim 3000 dropped)"
     );
 }
+
+// ── Multi-field text search (per-field MaxScore) ──────────────────────
+
+/// Test that multi-field text SHOULD queries return correct results.
+/// This exercises the per-field MaxScore grouping optimization: terms on
+/// different fields are grouped by field, MaxScore runs per group, and the
+/// outer BooleanScorer unions the compact per-field results.
+#[tokio::test]
+async fn test_multi_field_text_should() {
+    use crate::directories::MmapDirectory;
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = MmapDirectory::new(tmp_dir.path());
+
+    let mut sb = SchemaBuilder::default();
+    let title = sb.add_text_field("title", true, true);
+    let body = sb.add_text_field("body", true, true);
+    let schema = sb.build();
+
+    let config = IndexConfig {
+        max_indexing_memory_bytes: 8192,
+        ..Default::default()
+    };
+
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // Doc 0: "rust" in title, "python" in body — matches both terms
+    let mut doc = Document::new();
+    doc.add_text(title, "rust programming");
+    doc.add_text(body, "python scripting");
+    writer.add_document(doc).unwrap();
+
+    // Doc 1: "rust" in both fields
+    let mut doc = Document::new();
+    doc.add_text(title, "rust language");
+    doc.add_text(body, "rust compiler");
+    writer.add_document(doc).unwrap();
+
+    // Doc 2: "python" only in body
+    let mut doc = Document::new();
+    doc.add_text(title, "java enterprise");
+    doc.add_text(body, "python machine learning");
+    writer.add_document(doc).unwrap();
+
+    // Doc 3: neither term
+    let mut doc = Document::new();
+    doc.add_text(title, "java enterprise");
+    doc.add_text(body, "java spring");
+    writer.add_document(doc).unwrap();
+
+    // Doc 4-13: filler docs to have enough data
+    for i in 4..14 {
+        let mut doc = Document::new();
+        doc.add_text(title, format!("filler title {}", i));
+        doc.add_text(body, format!("filler body {}", i));
+        writer.add_document(doc).unwrap();
+    }
+
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+
+    // Search "rust python" across both fields — SHOULD OR semantics
+    let mut query = BooleanQuery::new();
+    query = query.should(TermQuery::text(title, "rust"));
+    query = query.should(TermQuery::text(body, "rust"));
+    query = query.should(TermQuery::text(title, "python"));
+    query = query.should(TermQuery::text(body, "python"));
+
+    let results = index.search(&query, 10).await.unwrap();
+
+    // Docs 0, 1, 2 should all match (they contain "rust" or "python" in some field)
+    let doc_ids: Vec<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+    assert!(
+        doc_ids.contains(&0),
+        "Doc 0 should match (rust in title, python in body)"
+    );
+    assert!(
+        doc_ids.contains(&1),
+        "Doc 1 should match (rust in both fields)"
+    );
+    assert!(doc_ids.contains(&2), "Doc 2 should match (python in body)");
+
+    // Doc 3 should NOT match (no rust or python)
+    assert!(!doc_ids.contains(&3), "Doc 3 should not match (java only)");
+
+    // Doc 1 should score highest (rust in BOTH fields)
+    let doc1_score = results
+        .hits
+        .iter()
+        .find(|h| h.address.doc_id == 1)
+        .unwrap()
+        .score;
+    let doc2_score = results
+        .hits
+        .iter()
+        .find(|h| h.address.doc_id == 2)
+        .unwrap()
+        .score;
+    assert!(
+        doc1_score > doc2_score,
+        "Doc 1 (rust in both fields) should score higher than doc 2 (python in body only): {} vs {}",
+        doc1_score,
+        doc2_score
+    );
+}
