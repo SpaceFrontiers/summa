@@ -68,6 +68,20 @@ pub struct SparseTermQueryInfo {
     pub over_fetch_factor: f32,
 }
 
+/// Decomposition of a query for MaxScore optimization.
+///
+/// The planner inspects this to decide whether to use text MaxScore,
+/// sparse MaxScore, or standard BooleanScorer execution.
+#[derive(Debug, Clone)]
+pub enum QueryDecomposition {
+    /// Single text term — eligible for text MaxScore grouping
+    TextTerm(TermQueryInfo),
+    /// One or more sparse dimensions — eligible for sparse MaxScore
+    SparseTerms(Vec<SparseTermQueryInfo>),
+    /// Not decomposable — falls back to standard execution
+    Opaque,
+}
+
 /// Matched positions for a field (field_id, list of scored positions)
 /// Each position includes its individual score contribution
 pub type MatchedPositions = Vec<(u32, Vec<super::ScoredPosition>)>;
@@ -112,26 +126,13 @@ macro_rules! define_query_traits {
                 ))
             }
 
-            /// Return term info if this is a simple term query eligible for MaxScore optimization
+            /// Decompose this query for MaxScore optimization.
             ///
-            /// Returns None for complex queries (boolean, phrase, etc.)
-            fn as_term_query_info(&self) -> Option<TermQueryInfo> {
-                None
-            }
-
-            /// Return sparse term info if this is a single-dimension sparse query
-            /// eligible for MaxScore optimization
-            fn as_sparse_term_query_info(&self) -> Option<SparseTermQueryInfo> {
-                None
-            }
-
-            /// Decompose into sparse term query infos for MaxScore optimization.
-            ///
-            /// Returns `Some(vec)` if this query can be represented as a set of
-            /// sparse term queries on the same field. Used by the BooleanQuery
-            /// planner to build a predicate-aware MaxScoreExecutor directly.
-            fn as_sparse_term_queries(&self) -> Option<Vec<SparseTermQueryInfo>> {
-                None
+            /// Returns `TextTerm` for simple term queries, `SparseTerms` for
+            /// sparse vector queries (single or multi-dim), or `Opaque` if
+            /// the query cannot be decomposed.
+            fn decompose(&self) -> QueryDecomposition {
+                QueryDecomposition::Opaque
             }
 
             /// True if this query is a pure filter (always scores 1.0, no positions).
@@ -179,16 +180,8 @@ impl Query for Box<dyn Query> {
         (**self).count_estimate(reader)
     }
 
-    fn as_term_query_info(&self) -> Option<TermQueryInfo> {
-        (**self).as_term_query_info()
-    }
-
-    fn as_sparse_term_query_info(&self) -> Option<SparseTermQueryInfo> {
-        (**self).as_sparse_term_query_info()
-    }
-
-    fn as_sparse_term_queries(&self) -> Option<Vec<SparseTermQueryInfo>> {
-        (**self).as_sparse_term_queries()
+    fn decompose(&self) -> QueryDecomposition {
+        (**self).decompose()
     }
 
     fn is_filter(&self) -> bool {

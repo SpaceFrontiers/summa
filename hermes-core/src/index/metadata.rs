@@ -234,11 +234,24 @@ impl IndexMetadata {
     /// Uses write-then-rename so a crash mid-write won't corrupt the
     /// existing metadata file. On POSIX, rename is atomic.
     pub async fn save<D: crate::directories::DirectoryWriter>(&self, dir: &D) -> Result<()> {
+        let bytes = self.serialize_to_bytes()?;
+        Self::save_bytes(dir, &bytes).await
+    }
+
+    /// Serialize metadata to bytes (cheap, no I/O).
+    /// Useful when you need to release a lock before doing disk I/O.
+    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec_pretty(self).map_err(|e| Error::Serialization(e.to_string()))
+    }
+
+    /// Write pre-serialized metadata bytes to directory (atomic rename).
+    pub async fn save_bytes<D: crate::directories::DirectoryWriter>(
+        dir: &D,
+        bytes: &[u8],
+    ) -> Result<()> {
         let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
         let final_path = Path::new(INDEX_META_FILENAME);
-        let bytes =
-            serde_json::to_vec_pretty(self).map_err(|e| Error::Serialization(e.to_string()))?;
-        dir.write(tmp_path, &bytes).await.map_err(Error::Io)?;
+        dir.write(tmp_path, bytes).await.map_err(Error::Io)?;
         dir.rename(tmp_path, final_path).await.map_err(Error::Io)?;
         Ok(())
     }

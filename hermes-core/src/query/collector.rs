@@ -292,17 +292,6 @@ impl Collector for CountCollector {
     }
 }
 
-/// Execute a search query on a single segment (async)
-pub async fn search_segment(
-    reader: &SegmentReader,
-    query: &dyn Query,
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let mut collector = TopKCollector::new(limit);
-    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
-    Ok(collector.into_sorted_results())
-}
-
 /// Execute a search query on a single segment and return (results, total_seen) (async)
 pub async fn search_segment_with_count(
     reader: &SegmentReader,
@@ -314,17 +303,6 @@ pub async fn search_segment_with_count(
     Ok(collector.into_results_with_count())
 }
 
-/// Execute a search query on a single segment with position collection (async)
-pub async fn search_segment_with_positions(
-    reader: &SegmentReader,
-    query: &dyn Query,
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let mut collector = TopKCollector::with_positions(limit);
-    collect_segment_with_limit(reader, query, &mut collector, limit).await?;
-    Ok(collector.into_sorted_results())
-}
-
 /// Execute a search query on a single segment with positions and return (results, total_seen)
 pub async fn search_segment_with_positions_and_count(
     reader: &SegmentReader,
@@ -334,13 +312,6 @@ pub async fn search_segment_with_positions_and_count(
     let mut collector = TopKCollector::with_positions(limit);
     collect_segment_with_limit(reader, query, &mut collector, limit).await?;
     Ok(collector.into_results_with_count())
-}
-
-/// Count all documents matching a query on a single segment (async)
-pub async fn count_segment(reader: &SegmentReader, query: &dyn Query) -> Result<u64> {
-    let mut collector = CountCollector::new();
-    collect_segment(reader, query, &mut collector).await?;
-    Ok(collector.count())
 }
 
 // Implement Collector for tuple of 2 collectors
@@ -428,18 +399,6 @@ fn drive_scorer<C: Collector>(scorer: &mut dyn super::Scorer, collector: &mut C)
 
 // ── Synchronous collector functions (mmap/RAM only) ─────────────────────────
 
-/// Synchronous segment search — returns top-k results.
-#[cfg(feature = "sync")]
-pub fn search_segment_sync(
-    reader: &SegmentReader,
-    query: &dyn Query,
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
-    let mut collector = TopKCollector::new(limit);
-    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
-    Ok(collector.into_sorted_results())
-}
-
 /// Synchronous segment search — returns (results, total_seen).
 #[cfg(feature = "sync")]
 pub fn search_segment_with_count_sync(
@@ -448,18 +407,6 @@ pub fn search_segment_with_count_sync(
     limit: usize,
 ) -> Result<(Vec<SearchResult>, u32)> {
     let mut collector = TopKCollector::new(limit);
-    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
-    Ok(collector.into_results_with_count())
-}
-
-/// Synchronous segment search with position collection.
-#[cfg(feature = "sync")]
-pub fn search_segment_with_positions_and_count_sync(
-    reader: &SegmentReader,
-    query: &dyn Query,
-    limit: usize,
-) -> Result<(Vec<SearchResult>, u32)> {
-    let mut collector = TopKCollector::with_positions(limit);
     collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
     Ok(collector.into_results_with_count())
 }

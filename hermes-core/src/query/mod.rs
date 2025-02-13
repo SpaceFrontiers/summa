@@ -7,6 +7,7 @@ mod collector;
 pub mod docset;
 mod global_stats;
 mod phrase;
+mod planner;
 mod range;
 mod reranker;
 mod scoring;

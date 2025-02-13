@@ -46,11 +46,18 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-/// Efficient top-k collector using min-heap
+/// Efficient top-k collector using min-heap (internal, scoring-layer)
 ///
 /// Maintains the k highest-scoring documents using a min-heap where the
 /// lowest score is at the top for O(1) threshold lookup and O(log k) eviction.
-/// No deduplication - caller must ensure each doc_id is inserted only once.
+/// No deduplication — caller must ensure each doc_id is inserted only once.
+///
+/// This is intentionally separate from `TopKCollector` in `collector.rs`:
+/// `ScoreCollector` is used inside `MaxScoreExecutor` where only `(doc_id,
+/// score, ordinal)` tuples exist — no `Scorer` trait, no position tracking,
+/// and the threshold must be inlined for tight block-max loops.
+/// `TopKCollector` wraps a `Scorer` and drives the full `DocSet`/`Scorer`
+/// protocol, collecting positions on demand.
 pub struct ScoreCollector {
     /// Min-heap of top-k entries (lowest score at top for eviction)
     heap: BinaryHeap<HeapEntry>,
@@ -225,6 +232,96 @@ enum CursorVariant<'a> {
     },
 }
 
+// ── TermCursor async/sync macros ──────────────────────────────────────────
+//
+// Parameterised on:
+//   $load_block_fn – load_block_direct | load_block_direct_sync  (sparse I/O)
+//   $ensure_fn     – ensure_block_loaded | ensure_block_loaded_sync
+//   $($aw)*        – .await  (present for async, absent for sync)
+
+macro_rules! cursor_ensure_block {
+    ($self:ident, $load_block_fn:ident, $($aw:tt)*) => {{
+        if $self.exhausted || $self.block_loaded {
+            return Ok(!$self.exhausted);
+        }
+        match &mut $self.variant {
+            CursorVariant::Text {
+                list,
+                idf,
+                avg_field_len,
+                tfs,
+            } => {
+                if list.decode_block_into($self.block_idx, &mut $self.doc_ids, tfs) {
+                    $self.scores.clear();
+                    $self.scores.reserve(tfs.len());
+                    for &tf in tfs.iter() {
+                        let tf = tf as f32;
+                        $self.scores
+                            .push(super::bm25_score(tf, *idf, tf, *avg_field_len));
+                    }
+                    $self.pos = 0;
+                    $self.block_loaded = true;
+                    Ok(true)
+                } else {
+                    $self.exhausted = true;
+                    Ok(false)
+                }
+            }
+            CursorVariant::Sparse {
+                si,
+                query_weight,
+                skip_start,
+                block_data_offset,
+                ..
+            } => {
+                let block = si
+                    .$load_block_fn(*skip_start, *block_data_offset, $self.block_idx)
+                    $($aw)* ?;
+                match block {
+                    Some(b) => {
+                        b.decode_doc_ids_into(&mut $self.doc_ids);
+                        b.decode_ordinals_into(&mut $self.ordinals);
+                        b.decode_scored_weights_into(*query_weight, &mut $self.scores);
+                        $self.pos = 0;
+                        $self.block_loaded = true;
+                        Ok(true)
+                    }
+                    None => {
+                        $self.exhausted = true;
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }};
+}
+
+macro_rules! cursor_advance {
+    ($self:ident, $ensure_fn:ident, $($aw:tt)*) => {{
+        if $self.exhausted {
+            return Ok(u32::MAX);
+        }
+        $self.$ensure_fn() $($aw)* ?;
+        if $self.exhausted {
+            return Ok(u32::MAX);
+        }
+        Ok($self.advance_pos())
+    }};
+}
+
+macro_rules! cursor_seek {
+    ($self:ident, $ensure_fn:ident, $target:expr, $($aw:tt)*) => {{
+        if let Some(doc) = $self.seek_prepare($target) {
+            return Ok(doc);
+        }
+        $self.$ensure_fn() $($aw)* ?;
+        if $self.seek_finish($target) {
+            $self.$ensure_fn() $($aw)* ?;
+        }
+        Ok($self.doc())
+    }};
+}
+
 impl<'a> TermCursor<'a> {
     /// Create a full-text BM25 cursor (lazy — no blocks decoded yet).
     pub fn text(
@@ -383,161 +480,33 @@ impl<'a> TermCursor<'a> {
         self.doc()
     }
 
-    // ── Block loading (dispatch: decode format + I/O differ) ────────────
+    // ── Block loading / advance / seek ─────────────────────────────────
+    //
+    // Macros parameterised on sparse I/O method + optional .await to
+    // stamp out both async and sync variants without duplication.
 
     pub async fn ensure_block_loaded(&mut self) -> crate::Result<bool> {
-        if self.exhausted || self.block_loaded {
-            return Ok(!self.exhausted);
-        }
-        match &mut self.variant {
-            CursorVariant::Text {
-                list,
-                idf,
-                avg_field_len,
-                tfs,
-            } => {
-                if list.decode_block_into(self.block_idx, &mut self.doc_ids, tfs) {
-                    self.scores.clear();
-                    self.scores.reserve(tfs.len());
-                    for &tf in tfs.iter() {
-                        let tf = tf as f32;
-                        self.scores
-                            .push(super::bm25_score(tf, *idf, tf, *avg_field_len));
-                    }
-                    self.pos = 0;
-                    self.block_loaded = true;
-                    Ok(true)
-                } else {
-                    self.exhausted = true;
-                    Ok(false)
-                }
-            }
-            CursorVariant::Sparse {
-                si,
-                query_weight,
-                skip_start,
-                block_data_offset,
-                ..
-            } => {
-                let block = si
-                    .load_block_direct(*skip_start, *block_data_offset, self.block_idx)
-                    .await?;
-                match block {
-                    Some(b) => {
-                        b.decode_doc_ids_into(&mut self.doc_ids);
-                        b.decode_ordinals_into(&mut self.ordinals);
-                        b.decode_scored_weights_into(*query_weight, &mut self.scores);
-                        self.pos = 0;
-                        self.block_loaded = true;
-                        Ok(true)
-                    }
-                    None => {
-                        self.exhausted = true;
-                        Ok(false)
-                    }
-                }
-            }
-        }
+        cursor_ensure_block!(self, load_block_direct, .await)
     }
 
     pub fn ensure_block_loaded_sync(&mut self) -> crate::Result<bool> {
-        if self.exhausted || self.block_loaded {
-            return Ok(!self.exhausted);
-        }
-        match &mut self.variant {
-            CursorVariant::Text {
-                list,
-                idf,
-                avg_field_len,
-                tfs,
-            } => {
-                if list.decode_block_into(self.block_idx, &mut self.doc_ids, tfs) {
-                    self.scores.clear();
-                    self.scores.reserve(tfs.len());
-                    for &tf in tfs.iter() {
-                        let tf = tf as f32;
-                        self.scores
-                            .push(super::bm25_score(tf, *idf, tf, *avg_field_len));
-                    }
-                    self.pos = 0;
-                    self.block_loaded = true;
-                    Ok(true)
-                } else {
-                    self.exhausted = true;
-                    Ok(false)
-                }
-            }
-            CursorVariant::Sparse {
-                si,
-                query_weight,
-                skip_start,
-                block_data_offset,
-                ..
-            } => {
-                let block =
-                    si.load_block_direct_sync(*skip_start, *block_data_offset, self.block_idx)?;
-                match block {
-                    Some(b) => {
-                        b.decode_doc_ids_into(&mut self.doc_ids);
-                        b.decode_ordinals_into(&mut self.ordinals);
-                        b.decode_scored_weights_into(*query_weight, &mut self.scores);
-                        self.pos = 0;
-                        self.block_loaded = true;
-                        Ok(true)
-                    }
-                    None => {
-                        self.exhausted = true;
-                        Ok(false)
-                    }
-                }
-            }
-        }
+        cursor_ensure_block!(self, load_block_direct_sync,)
     }
 
-    // ── Advance / Seek ──────────────────────────────────────────────────
-
     pub async fn advance(&mut self) -> crate::Result<DocId> {
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        self.ensure_block_loaded().await?;
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        Ok(self.advance_pos())
+        cursor_advance!(self, ensure_block_loaded, .await)
     }
 
     pub fn advance_sync(&mut self) -> crate::Result<DocId> {
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        self.ensure_block_loaded_sync()?;
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        Ok(self.advance_pos())
+        cursor_advance!(self, ensure_block_loaded_sync,)
     }
 
     pub async fn seek(&mut self, target: DocId) -> crate::Result<DocId> {
-        if let Some(doc) = self.seek_prepare(target) {
-            return Ok(doc);
-        }
-        self.ensure_block_loaded().await?;
-        if self.seek_finish(target) {
-            self.ensure_block_loaded().await?;
-        }
-        Ok(self.doc())
+        cursor_seek!(self, ensure_block_loaded, target, .await)
     }
 
     pub fn seek_sync(&mut self, target: DocId) -> crate::Result<DocId> {
-        if let Some(doc) = self.seek_prepare(target) {
-            return Ok(doc);
-        }
-        self.ensure_block_loaded_sync()?;
-        if self.seek_finish(target) {
-            self.ensure_block_loaded_sync()?;
-        }
-        Ok(self.doc())
+        cursor_seek!(self, ensure_block_loaded_sync, target,)
     }
 
     fn seek_prepare(&mut self, target: DocId) -> Option<DocId> {
@@ -664,7 +633,11 @@ macro_rules! bms_execute_loop {
             } else {
                 0.0
             };
-            let adjusted_threshold = $self.collector.threshold() * $self.heap_factor;
+            // Small epsilon to guard against FP rounding in score accumulation.
+            // Without this, a document whose true score equals the threshold can
+            // be incorrectly pruned due to rounding in the heap_factor multiply
+            // or in the prefix_sum additions.
+            let adjusted_threshold = $self.collector.threshold() * $self.heap_factor - 1e-6;
 
             // --- Conjunction optimization ---
             if $self.collector.len() >= $self.collector.k {
@@ -769,7 +742,7 @@ macro_rules! bms_execute_loop {
             } else if !ordinal_scores.is_empty() {
                 if ordinal_scores.len() > 2 {
                     ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
-                } else if ordinal_scores[0].0 > ordinal_scores[1].0 {
+                } else if ordinal_scores.len() == 2 && ordinal_scores[0].0 > ordinal_scores[1].0 {
                     ordinal_scores.swap(0, 1);
                 }
                 let mut j = 0;

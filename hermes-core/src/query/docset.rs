@@ -2,8 +2,7 @@
 //!
 //! `DocSet` is the base abstraction for forward-only cursors over sorted document IDs.
 //! Posting lists, filter results, and scorers all implement this trait.
-//! `IntersectionScorer` intersects a Scorer with a DocSet filter, driving from
-//! the smaller side by `size_hint`.
+//! `PredicatedScorer` wraps a driving Scorer with pushed-down filter predicates.
 
 use std::sync::Arc;
 
@@ -262,123 +261,6 @@ impl DocSet for EmptyDocSet {
     }
     fn size_hint(&self) -> u32 {
         0
-    }
-}
-
-// ── IntersectionScorer ───────────────────────────────────────────────────
-
-/// Intersects a Scorer with a filter DocSet, driving from the smaller side.
-///
-/// This is the core composition primitive: filter queries create a filter DocSet,
-/// get the inner Scorer, and return `IntersectionScorer(scorer, filter)`.
-pub struct IntersectionScorer<'a> {
-    scorer: Box<dyn super::Scorer + 'a>,
-    filter: Box<dyn DocSet + 'a>,
-}
-
-impl<'a> IntersectionScorer<'a> {
-    pub fn new(mut scorer: Box<dyn super::Scorer + 'a>, mut filter: Box<dyn DocSet + 'a>) -> Self {
-        // Align both on first common doc
-        let mut ds = scorer.doc();
-        let mut df = filter.doc();
-        loop {
-            if ds == TERMINATED || df == TERMINATED {
-                break;
-            }
-            if ds == df {
-                break;
-            }
-            if ds < df {
-                ds = scorer.seek(df);
-            } else {
-                df = filter.seek(ds);
-            }
-        }
-        Self { scorer, filter }
-    }
-}
-
-impl DocSet for IntersectionScorer<'_> {
-    fn doc(&self) -> DocId {
-        let ds = self.scorer.doc();
-        if ds == TERMINATED || self.filter.doc() == TERMINATED {
-            TERMINATED
-        } else {
-            ds
-        }
-    }
-
-    fn advance(&mut self) -> DocId {
-        // Drive from the smaller side
-        let filter_smaller = self.filter.size_hint() < self.scorer.size_hint();
-
-        if filter_smaller {
-            // Filter drives
-            let mut df = self.filter.advance();
-            let mut ds = self.scorer.doc();
-            loop {
-                if df == TERMINATED || ds == TERMINATED {
-                    return TERMINATED;
-                }
-                if df == ds {
-                    return df;
-                }
-                if df < ds {
-                    df = self.filter.seek(ds);
-                } else {
-                    ds = self.scorer.seek(df);
-                }
-            }
-        } else {
-            // Scorer drives
-            let mut ds = self.scorer.advance();
-            let mut df = self.filter.doc();
-            loop {
-                if ds == TERMINATED || df == TERMINATED {
-                    return TERMINATED;
-                }
-                if ds == df {
-                    return ds;
-                }
-                if ds < df {
-                    ds = self.scorer.seek(df);
-                } else {
-                    df = self.filter.seek(ds);
-                }
-            }
-        }
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        let mut ds = self.scorer.seek(target);
-        let mut df = self.filter.seek(target);
-        loop {
-            if ds == TERMINATED || df == TERMINATED {
-                return TERMINATED;
-            }
-            if ds == df {
-                return ds;
-            }
-            if ds < df {
-                ds = self.scorer.seek(df);
-            } else {
-                df = self.filter.seek(ds);
-            }
-        }
-    }
-
-    fn size_hint(&self) -> u32 {
-        self.scorer.size_hint().min(self.filter.size_hint())
-    }
-}
-
-impl super::Scorer for IntersectionScorer<'_> {
-    fn score(&self) -> crate::Score {
-        self.scorer.score()
-    }
-
-    fn matched_positions(&self) -> Option<super::MatchedPositions> {
-        self.scorer.matched_positions()
     }
 }
 

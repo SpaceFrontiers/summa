@@ -57,7 +57,7 @@ pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 // Re-exports from query
 pub use query::{
     Bm25Params, BooleanQuery, BoostQuery, MaxScoreExecutor, Query, ScoredDoc, Scorer, SearchHit,
-    SearchResponse, SearchResult, TermQuery, TopKCollector, search_segment,
+    SearchResponse, SearchResult, TermQuery, TopKCollector,
 };
 
 // Re-exports from tokenizer

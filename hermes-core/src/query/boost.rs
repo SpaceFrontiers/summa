@@ -76,8 +76,8 @@ impl Query for BoostQuery {
         self.inner.as_doc_predicate(reader)
     }
 
-    fn as_sparse_term_queries(&self) -> Option<Vec<super::SparseTermQueryInfo>> {
-        self.inner.as_sparse_term_queries()
+    fn decompose(&self) -> super::QueryDecomposition {
+        self.inner.decompose()
     }
 }
 

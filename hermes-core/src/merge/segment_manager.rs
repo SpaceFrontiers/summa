@@ -459,6 +459,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
             st.metadata
                 .add_merged_segment(new_id, doc_count, ancestors, parent_gen + 1);
+            // Mutation + persist must be atomic — keep under lock
             st.metadata.save(self.directory.as_ref()).await?;
         }
 
@@ -517,6 +518,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     );
                     return Err(e);
                 }
+            }
+        }
+
+        // Pre-merge validation: verify each source segment's store doc count
+        // matches its metadata. Catching mismatches early avoids building a
+        // corrupted merged segment and leaving orphan files on disk.
+        for (i, reader) in readers.iter().enumerate() {
+            let meta_docs = reader.meta().num_docs;
+            let store_docs = reader.store().num_docs();
+            if store_docs != meta_docs {
+                return Err(Error::Corruption(format!(
+                    "pre-merge validation: segment {} store has {} docs but meta says {}",
+                    segment_ids_to_merge[i], store_docs, meta_docs
+                )));
             }
         }
 

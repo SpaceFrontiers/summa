@@ -6,10 +6,12 @@ use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
-use super::{
-    CountFuture, GlobalStats, MaxScoreExecutor, Query, ScoredDoc, Scorer, ScorerFuture,
-    SparseTermQueryInfo,
+use super::planner::{
+    build_sparse_maxscore_executor, chain_predicates, combine_sparse_results, compute_idf,
+    extract_all_sparse_infos, finish_text_maxscore, prepare_per_field_grouping,
+    prepare_text_maxscore,
 };
+use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture};
 
 /// Boolean query with MUST, SHOULD, and MUST_NOT clauses
 ///
@@ -91,125 +93,6 @@ impl BooleanQuery {
     }
 }
 
-/// Compute IDF for a posting list, preferring global stats.
-fn compute_idf(
-    posting_list: &crate::structures::BlockPostingList,
-    field: crate::Field,
-    term: &[u8],
-    num_docs: f32,
-    global_stats: Option<&Arc<GlobalStats>>,
-) -> f32 {
-    if let Some(stats) = global_stats {
-        let global_idf = stats.text_idf(field, &String::from_utf8_lossy(term));
-        if global_idf > 0.0 {
-            return global_idf;
-        }
-    }
-    let doc_freq = posting_list.doc_count() as f32;
-    super::bm25_idf(doc_freq, num_docs)
-}
-
-/// Shared pre-check for text MaxScore: extract term infos, field, avg_field_len, num_docs.
-/// Returns None if not all SHOULD clauses are single-field term queries.
-fn prepare_text_maxscore(
-    should: &[Arc<dyn Query>],
-    reader: &SegmentReader,
-    global_stats: Option<&Arc<GlobalStats>>,
-) -> Option<(Vec<super::TermQueryInfo>, crate::Field, f32, f32)> {
-    let infos: Vec<_> = should
-        .iter()
-        .filter_map(|q| q.as_term_query_info())
-        .collect();
-    if infos.len() != should.len() {
-        return None;
-    }
-    let field = infos[0].field;
-    if !infos.iter().all(|t| t.field == field) {
-        return None;
-    }
-    let avg_field_len = global_stats
-        .map(|s| s.avg_field_len(field))
-        .unwrap_or_else(|| reader.avg_field_len(field));
-    let num_docs = reader.num_docs() as f32;
-    Some((infos, field, avg_field_len, num_docs))
-}
-
-/// Build a TopK scorer from fetched posting lists via text MaxScore.
-fn finish_text_maxscore<'a>(
-    posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
-    avg_field_len: f32,
-    limit: usize,
-) -> crate::Result<Box<dyn Scorer + 'a>> {
-    if posting_lists.is_empty() {
-        return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
-    }
-    let results = MaxScoreExecutor::text(posting_lists, avg_field_len, limit).execute_sync()?;
-    Ok(Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>)
-}
-
-/// Shared grouping result for per-field MaxScore.
-struct PerFieldGrouping {
-    /// (field, avg_field_len, term_infos) for groups with 2+ terms
-    multi_term_groups: Vec<(crate::Field, f32, Vec<super::TermQueryInfo>)>,
-    /// Original indices of single-term and non-term SHOULD clauses (fallback scorers)
-    fallback_indices: Vec<usize>,
-    /// Limit per field group (over-fetched to compensate for cross-field scoring)
-    per_field_limit: usize,
-    num_docs: f32,
-}
-
-/// Group SHOULD clauses by field for per-field MaxScore.
-/// Returns None if no group has 2+ terms (no optimization benefit).
-fn prepare_per_field_grouping(
-    should: &[Arc<dyn Query>],
-    reader: &SegmentReader,
-    limit: usize,
-    global_stats: Option<&Arc<GlobalStats>>,
-) -> Option<PerFieldGrouping> {
-    let mut field_groups: rustc_hash::FxHashMap<crate::Field, Vec<(usize, super::TermQueryInfo)>> =
-        rustc_hash::FxHashMap::default();
-    let mut non_term_indices: Vec<usize> = Vec::new();
-
-    for (i, q) in should.iter().enumerate() {
-        if let Some(info) = q.as_term_query_info() {
-            field_groups.entry(info.field).or_default().push((i, info));
-        } else {
-            non_term_indices.push(i);
-        }
-    }
-
-    if !field_groups.values().any(|g| g.len() >= 2) {
-        return None;
-    }
-
-    let num_groups = field_groups.len() + non_term_indices.len();
-    let per_field_limit = limit * num_groups;
-    let num_docs = reader.num_docs() as f32;
-
-    let mut multi_term_groups = Vec::new();
-    let mut fallback_indices = non_term_indices;
-
-    for group in field_groups.into_values() {
-        if group.len() >= 2 {
-            let field = group[0].1.field;
-            let avg_field_len = global_stats
-                .map(|s| s.avg_field_len(field))
-                .unwrap_or_else(|| reader.avg_field_len(field));
-            let infos: Vec<_> = group.into_iter().map(|(_, info)| info).collect();
-            multi_term_groups.push((field, avg_field_len, infos));
-        } else {
-            fallback_indices.push(group[0].0);
-        }
-    }
-
-    Some(PerFieldGrouping {
-        multi_term_groups,
-        fallback_indices,
-        per_field_limit,
-        num_docs,
-    })
-}
-
 /// Build a SHOULD-only scorer from a vec of optimized scorers.
 fn build_should_scorer<'a>(scorers: Vec<Box<dyn Scorer + 'a>>) -> Box<dyn Scorer + 'a> {
     if scorers.is_empty() {
@@ -226,83 +109,6 @@ fn build_should_scorer<'a>(scorers: Vec<Box<dyn Scorer + 'a>>) -> Box<dyn Scorer
     };
     scorer.current_doc = scorer.find_next_match();
     Box::new(scorer)
-}
-
-/// Build a sparse MaxScoreExecutor from decomposed sparse infos.
-///
-/// Returns the executor + representative info (for combiner/field), or None
-/// if the sparse index doesn't exist or no query dims match.
-fn build_sparse_maxscore_executor<'a>(
-    infos: &[SparseTermQueryInfo],
-    reader: &'a SegmentReader,
-    limit: usize,
-    predicate: Option<super::DocPredicate<'a>>,
-) -> Option<(MaxScoreExecutor<'a>, SparseTermQueryInfo)> {
-    let field = infos[0].field;
-    let si = reader.sparse_index(field)?;
-    let query_terms: Vec<(u32, f32)> = infos
-        .iter()
-        .filter(|info| si.has_dimension(info.dim_id))
-        .map(|info| (info.dim_id, info.weight))
-        .collect();
-    if query_terms.is_empty() {
-        return None;
-    }
-    let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
-    let mut executor =
-        MaxScoreExecutor::sparse(si, query_terms, executor_limit, infos[0].heap_factor);
-    if let Some(pred) = predicate {
-        executor = executor.with_predicate(pred);
-    }
-    Some((executor, infos[0]))
-}
-
-/// Combine raw MaxScore results with ordinal deduplication into a scorer.
-fn combine_sparse_results<'a>(
-    raw: Vec<ScoredDoc>,
-    combiner: super::MultiValueCombiner,
-    field: crate::Field,
-    limit: usize,
-) -> Box<dyn Scorer + 'a> {
-    let combined = crate::segment::combine_ordinal_results(
-        raw.into_iter().map(|r| (r.doc_id, r.ordinal, r.score)),
-        combiner,
-        limit,
-    );
-    Box::new(VectorTopKResultScorer::new(combined, field.0))
-}
-
-/// Extract all sparse term infos from SHOULD clauses, flattening SparseVectorQuery.
-///
-/// Returns `None` if any SHOULD clause is not decomposable into sparse term queries
-/// or if the resulting infos span multiple fields.
-fn extract_all_sparse_infos(should: &[Arc<dyn Query>]) -> Option<Vec<SparseTermQueryInfo>> {
-    let mut all = Vec::new();
-    for q in should {
-        if let Some(info) = q.as_sparse_term_query_info() {
-            all.push(info);
-        } else if let Some(infos) = q.as_sparse_term_queries() {
-            all.extend(infos);
-        } else {
-            return None;
-        }
-    }
-    if all.is_empty() {
-        return None;
-    }
-    let field = all[0].field;
-    if !all.iter().all(|i| i.field == field) {
-        return None;
-    }
-    Some(all)
-}
-
-/// Chain multiple predicates into a single combined predicate.
-fn chain_predicates<'a>(predicates: Vec<super::DocPredicate<'a>>) -> super::DocPredicate<'a> {
-    if predicates.len() == 1 {
-        return predicates.into_iter().next().unwrap();
-    }
-    Box::new(move |doc_id| predicates.iter().all(|p| p(doc_id)))
 }
 
 // ── Planner macro ────────────────────────────────────────────────────────
@@ -768,157 +574,11 @@ impl Scorer for BooleanScorer<'_> {
     }
 }
 
-/// Scorer that iterates over pre-computed top-k results
-struct TopKResultScorer {
-    results: Vec<ScoredDoc>,
-    position: usize,
-}
-
-impl TopKResultScorer {
-    fn new(mut results: Vec<ScoredDoc>) -> Self {
-        // Sort by doc_id ascending — required for DocSet seek() correctness
-        results.sort_unstable_by_key(|r| r.doc_id);
-        Self {
-            results,
-            position: 0,
-        }
-    }
-}
-
-impl super::docset::DocSet for TopKResultScorer {
-    fn doc(&self) -> DocId {
-        if self.position < self.results.len() {
-            self.results[self.position].doc_id
-        } else {
-            TERMINATED
-        }
-    }
-
-    fn advance(&mut self) -> DocId {
-        self.position += 1;
-        self.doc()
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        let remaining = &self.results[self.position..];
-        self.position += remaining.partition_point(|r| r.doc_id < target);
-        self.doc()
-    }
-
-    fn size_hint(&self) -> u32 {
-        (self.results.len() - self.position) as u32
-    }
-}
-
-impl Scorer for TopKResultScorer {
-    fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
-        }
-    }
-}
-
-/// Scorer that iterates over pre-computed vector results with ordinal information.
-/// Used by sparse MaxScore path to preserve per-ordinal scores for matched_positions().
-struct VectorTopKResultScorer {
-    results: Vec<crate::segment::VectorSearchResult>,
-    position: usize,
-    field_id: u32,
-}
-
-impl VectorTopKResultScorer {
-    fn new(mut results: Vec<crate::segment::VectorSearchResult>, field_id: u32) -> Self {
-        results.sort_unstable_by_key(|r| r.doc_id);
-        Self {
-            results,
-            position: 0,
-            field_id,
-        }
-    }
-}
-
-impl super::docset::DocSet for VectorTopKResultScorer {
-    fn doc(&self) -> DocId {
-        if self.position < self.results.len() {
-            self.results[self.position].doc_id
-        } else {
-            TERMINATED
-        }
-    }
-
-    fn advance(&mut self) -> DocId {
-        self.position += 1;
-        self.doc()
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        let remaining = &self.results[self.position..];
-        self.position += remaining.partition_point(|r| r.doc_id < target);
-        self.doc()
-    }
-
-    fn size_hint(&self) -> u32 {
-        (self.results.len() - self.position) as u32
-    }
-}
-
-impl Scorer for VectorTopKResultScorer {
-    fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
-        }
-    }
-
-    fn matched_positions(&self) -> Option<super::MatchedPositions> {
-        if self.position >= self.results.len() {
-            return None;
-        }
-        let result = &self.results[self.position];
-        let scored_positions: Vec<super::ScoredPosition> = result
-            .ordinals
-            .iter()
-            .map(|&(ordinal, score)| super::ScoredPosition::new(ordinal, score))
-            .collect();
-        Some(vec![(self.field_id, scored_positions)])
-    }
-}
-
-/// Empty scorer for when no terms match
-struct EmptyScorer;
-
-impl super::docset::DocSet for EmptyScorer {
-    fn doc(&self) -> DocId {
-        TERMINATED
-    }
-
-    fn advance(&mut self) -> DocId {
-        TERMINATED
-    }
-
-    fn seek(&mut self, _target: DocId) -> DocId {
-        TERMINATED
-    }
-
-    fn size_hint(&self) -> u32 {
-        0
-    }
-}
-
-impl Scorer for EmptyScorer {
-    fn score(&self) -> Score {
-        0.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dsl::Field;
-    use crate::query::TermQuery;
+    use crate::query::{QueryDecomposition, TermQuery};
 
     #[test]
     fn test_maxscore_eligible_pure_or_same_field() {
@@ -933,14 +593,17 @@ mod tests {
             query
                 .should
                 .iter()
-                .all(|q| q.as_term_query_info().is_some())
+                .all(|q| matches!(q.decompose(), QueryDecomposition::TextTerm(_)))
         );
 
         // All should be same field
         let infos: Vec<_> = query
             .should
             .iter()
-            .filter_map(|q| q.as_term_query_info())
+            .filter_map(|q| match q.decompose() {
+                QueryDecomposition::TextTerm(info) => Some(info),
+                _ => None,
+            })
             .collect();
         assert_eq!(infos.len(), 3);
         assert!(infos.iter().all(|i| i.field == Field(0)));
@@ -956,7 +619,10 @@ mod tests {
         let infos: Vec<_> = query
             .should
             .iter()
-            .filter_map(|q| q.as_term_query_info())
+            .filter_map(|q| match q.decompose() {
+                QueryDecomposition::TextTerm(info) => Some(info),
+                _ => None,
+            })
             .collect();
         assert_eq!(infos.len(), 2);
         // Fields are different, MaxScore should not be used
@@ -999,12 +665,13 @@ mod tests {
     #[test]
     fn test_term_query_info_extraction() {
         let term_query = TermQuery::text(Field(42), "test");
-        let info = term_query.as_term_query_info();
-
-        assert!(info.is_some());
-        let info = info.unwrap();
-        assert_eq!(info.field, Field(42));
-        assert_eq!(info.term, b"test");
+        match term_query.decompose() {
+            QueryDecomposition::TextTerm(info) => {
+                assert_eq!(info.field, Field(42));
+                assert_eq!(info.term, b"test");
+            }
+            _ => panic!("Expected TextTerm decomposition"),
+        }
     }
 
     #[test]
@@ -1012,6 +679,6 @@ mod tests {
         // BooleanQuery itself should not return term info
         let query = BooleanQuery::new().should(TermQuery::text(Field(0), "hello"));
 
-        assert!(query.as_term_query_info().is_none());
+        assert!(matches!(query.decompose(), QueryDecomposition::Opaque));
     }
 }

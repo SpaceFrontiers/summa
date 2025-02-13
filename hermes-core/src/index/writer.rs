@@ -538,8 +538,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let state = Arc::clone(&self.worker_state);
         tokio::task::spawn_blocking(move || {
             let mut lock = state.flush_mutex.lock();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             while state.flush_count.load(Ordering::Acquire) < state.num_workers {
-                state.flush_cvar.wait(&mut lock);
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    log::error!(
+                        "[prepare_commit] timed out waiting for workers: {}/{} flushed",
+                        state.flush_count.load(Ordering::Acquire),
+                        state.num_workers
+                    );
+                    break;
+                }
+                state.flush_cvar.wait_for(&mut lock, remaining);
             }
         })
         .await
@@ -575,6 +585,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// If the tokio runtime has shut down (e.g., program exit), this is a no-op.
     fn resume_workers(&mut self) {
         if tokio::runtime::Handle::try_current().is_err() {
+            // Runtime is gone — signal permanent shutdown so workers don't
+            // hang forever on resume_cvar.
+            self.worker_state.shutdown.store(true, Ordering::Release);
+            self.worker_state.resume_cvar.notify_all();
             return;
         }
 

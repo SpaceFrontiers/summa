@@ -310,9 +310,12 @@ impl SparseBlock {
                 let eff_bias = query_weight * min_val;
                 let quant_data = &self.weights_data[8..];
 
-                for i in 0..count.min(quant_data.len()) {
+                for i in 0..count.min(quant_data.len()).min(doc_ids.len()) {
                     let w = quant_data[i] as f32 * eff_scale + eff_bias;
                     let off = (doc_ids[i] - base_doc) as usize;
+                    if off >= flat_scores.len() {
+                        continue;
+                    }
                     if flat_scores[off] == 0.0 {
                         dirty.push(doc_ids[i]);
                     }
@@ -329,9 +332,12 @@ impl SparseBlock {
                     count,
                     &mut weights_buf,
                 );
-                for i in 0..count {
+                for i in 0..count.min(weights_buf.len()).min(doc_ids.len()) {
                     let w = weights_buf[i] * query_weight;
                     let off = (doc_ids[i] - base_doc) as usize;
+                    if off >= flat_scores.len() {
+                        continue;
+                    }
                     if flat_scores[off] == 0.0 {
                         dirty.push(doc_ids[i]);
                     }
@@ -344,6 +350,20 @@ impl SparseBlock {
 
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
         self.header.write(w)?;
+        if self.doc_ids_data.len() > u16::MAX as usize
+            || self.ordinals_data.len() > u16::MAX as usize
+            || self.weights_data.len() > u16::MAX as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sparse sub-block too large for u16 length: doc_ids={}B ords={}B wts={}B",
+                    self.doc_ids_data.len(),
+                    self.ordinals_data.len(),
+                    self.weights_data.len()
+                ),
+            ));
+        }
         w.write_u16::<LittleEndian>(self.doc_ids_data.len() as u16)?;
         w.write_u16::<LittleEndian>(self.ordinals_data.len() as u16)?;
         w.write_u16::<LittleEndian>(self.weights_data.len() as u16)?;

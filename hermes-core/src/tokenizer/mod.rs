@@ -88,6 +88,30 @@ impl Tokenizer for LowercaseTokenizer {
     }
 }
 
+/// Strip non-alphanumeric characters and lowercase.
+///
+/// ASCII fast-path iterates bytes directly; falls back to full Unicode
+/// `char` iteration only when the word contains non-ASCII bytes.
+#[inline]
+fn clean_word(word: &str) -> String {
+    if word.is_ascii() {
+        // ASCII fast path – byte iteration, no char decoding
+        let mut result = String::with_capacity(word.len());
+        for &b in word.as_bytes() {
+            if b.is_ascii_alphanumeric() {
+                result.push(b.to_ascii_lowercase() as char);
+            }
+        }
+        result
+    } else {
+        // Unicode fallback
+        word.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
+}
+
 /// Shared tokenization logic: split on whitespace, clean (remove punctuation + lowercase),
 /// then apply a transform function to produce the final token text.
 fn tokenize_and_clean(text: &str, transform: impl Fn(&str) -> String) -> Vec<Token> {
@@ -95,11 +119,7 @@ fn tokenize_and_clean(text: &str, transform: impl Fn(&str) -> String) -> Vec<Tok
     let mut position = 0u32;
     for (offset, word) in split_whitespace_with_offsets(text) {
         if !word.is_empty() {
-            let cleaned: String = word
-                .chars()
-                .filter(|c| c.is_alphanumeric())
-                .flat_map(|c| c.to_lowercase())
-                .collect();
+            let cleaned = clean_word(word);
             if !cleaned.is_empty() {
                 tokens.push(Token::new(
                     transform(&cleaned),
@@ -114,14 +134,14 @@ fn tokenize_and_clean(text: &str, transform: impl Fn(&str) -> String) -> Vec<Tok
     tokens
 }
 
-/// Split text on whitespace, returning (offset, word) pairs
+/// Split text on whitespace, returning (byte-offset, word) pairs.
+///
+/// Uses pointer arithmetic on the subslices returned by `split_whitespace`
+/// instead of the previous O(n)-per-word `find()` approach.
 fn split_whitespace_with_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    let mut offset = 0;
-    text.split_whitespace().map(move |word| {
-        let word_start = text[offset..].find(word).unwrap() + offset;
-        offset = word_start + word.len();
-        (word_start, word)
-    })
+    let base = text.as_ptr() as usize;
+    text.split_whitespace()
+        .map(move |word| (word.as_ptr() as usize - base, word))
 }
 
 /// Supported stemmer languages

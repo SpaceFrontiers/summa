@@ -202,8 +202,8 @@ impl Query for TermQuery {
         }))
     }
 
-    fn as_term_query_info(&self) -> Option<TermQueryInfo> {
-        Some(TermQueryInfo {
+    fn decompose(&self) -> super::QueryDecomposition {
+        super::QueryDecomposition::TextTerm(TermQueryInfo {
             field: self.field,
             term: self.term.clone(),
         })

@@ -1,293 +1,12 @@
-//! Vector query types for dense and sparse vector search
+//! Sparse vector queries for similarity search (MaxScore-based)
 
 use crate::dsl::Field;
-use crate::segment::{SegmentReader, VectorSearchResult};
+use crate::segment::SegmentReader;
 use crate::{DocId, Score, TERMINATED};
 
-use super::ScoredPosition;
-use super::traits::{CountFuture, MatchedPositions, Query, Scorer, ScorerFuture};
-
-/// Strategy for combining scores when a document has multiple values for the same field
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MultiValueCombiner {
-    /// Sum all scores (accumulates dot product contributions)
-    Sum,
-    /// Take the maximum score
-    Max,
-    /// Take the average score
-    Avg,
-    /// Log-Sum-Exp: smooth maximum approximation (default)
-    /// `score = (1/t) * log(Σ exp(t * sᵢ))`
-    /// Higher temperature → closer to max; lower → closer to mean
-    LogSumExp {
-        /// Temperature parameter (default: 1.5)
-        temperature: f32,
-    },
-    /// Weighted Top-K: weight top scores with exponential decay
-    /// `score = Σ wᵢ * sorted_scores[i]` where `wᵢ = decay^i`
-    WeightedTopK {
-        /// Number of top scores to consider (default: 5)
-        k: usize,
-        /// Decay factor per rank (default: 0.7)
-        decay: f32,
-    },
-}
-
-impl Default for MultiValueCombiner {
-    fn default() -> Self {
-        // LogSumExp with temperature 1.5 provides good balance between
-        // max (best relevance) and sum (saturation from multiple matches)
-        MultiValueCombiner::LogSumExp { temperature: 1.5 }
-    }
-}
-
-impl MultiValueCombiner {
-    /// Create LogSumExp combiner with default temperature (1.5)
-    pub fn log_sum_exp() -> Self {
-        Self::LogSumExp { temperature: 1.5 }
-    }
-
-    /// Create LogSumExp combiner with custom temperature
-    pub fn log_sum_exp_with_temperature(temperature: f32) -> Self {
-        Self::LogSumExp { temperature }
-    }
-
-    /// Create WeightedTopK combiner with defaults (k=5, decay=0.7)
-    pub fn weighted_top_k() -> Self {
-        Self::WeightedTopK { k: 5, decay: 0.7 }
-    }
-
-    /// Create WeightedTopK combiner with custom parameters
-    pub fn weighted_top_k_with_params(k: usize, decay: f32) -> Self {
-        Self::WeightedTopK { k, decay }
-    }
-
-    /// Combine multiple scores into a single score
-    pub fn combine(&self, scores: &[(u32, f32)]) -> f32 {
-        if scores.is_empty() {
-            return 0.0;
-        }
-
-        match self {
-            MultiValueCombiner::Sum => scores.iter().map(|(_, s)| s).sum(),
-            MultiValueCombiner::Max => scores
-                .iter()
-                .map(|(_, s)| *s)
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or(0.0),
-            MultiValueCombiner::Avg => {
-                let sum: f32 = scores.iter().map(|(_, s)| s).sum();
-                sum / scores.len() as f32
-            }
-            MultiValueCombiner::LogSumExp { temperature } => {
-                // Numerically stable log-sum-exp:
-                // LSE(x) = max(x) + log(Σ exp(xᵢ - max(x)))
-                let t = *temperature;
-                let max_score = scores
-                    .iter()
-                    .map(|(_, s)| *s)
-                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or(0.0);
-
-                let sum_exp: f32 = scores
-                    .iter()
-                    .map(|(_, s)| (t * (s - max_score)).exp())
-                    .sum();
-
-                max_score + sum_exp.ln() / t
-            }
-            MultiValueCombiner::WeightedTopK { k, decay } => {
-                // Sort scores descending and take top k
-                let mut sorted: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
-                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                sorted.truncate(*k);
-
-                // Apply exponential decay weights
-                let mut weight = 1.0f32;
-                let mut weighted_sum = 0.0f32;
-                let mut weight_total = 0.0f32;
-
-                for score in sorted {
-                    weighted_sum += weight * score;
-                    weight_total += weight;
-                    weight *= decay;
-                }
-
-                if weight_total > 0.0 {
-                    weighted_sum / weight_total
-                } else {
-                    0.0
-                }
-            }
-        }
-    }
-}
-
-/// Dense vector query for similarity search
-#[derive(Debug, Clone)]
-pub struct DenseVectorQuery {
-    /// Field containing the dense vectors
-    pub field: Field,
-    /// Query vector
-    pub vector: Vec<f32>,
-    /// Number of clusters to probe (for IVF indexes)
-    pub nprobe: usize,
-    /// Re-ranking factor (multiplied by k for candidate selection, e.g. 3.0)
-    pub rerank_factor: f32,
-    /// How to combine scores for multi-valued documents
-    pub combiner: MultiValueCombiner,
-}
-
-impl std::fmt::Display for DenseVectorQuery {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Dense({}, dim={}, nprobe={}, rerank={})",
-            self.field.0,
-            self.vector.len(),
-            self.nprobe,
-            self.rerank_factor
-        )
-    }
-}
-
-impl DenseVectorQuery {
-    /// Create a new dense vector query
-    pub fn new(field: Field, vector: Vec<f32>) -> Self {
-        Self {
-            field,
-            vector,
-            nprobe: 32,
-            rerank_factor: 3.0,
-            combiner: MultiValueCombiner::Max,
-        }
-    }
-
-    /// Set the number of clusters to probe (for IVF indexes)
-    pub fn with_nprobe(mut self, nprobe: usize) -> Self {
-        self.nprobe = nprobe;
-        self
-    }
-
-    /// Set the re-ranking factor (e.g. 3.0 = fetch 3x candidates for reranking)
-    pub fn with_rerank_factor(mut self, factor: f32) -> Self {
-        self.rerank_factor = factor;
-        self
-    }
-
-    /// Set the multi-value score combiner
-    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
-        self.combiner = combiner;
-        self
-    }
-}
-
-impl Query for DenseVectorQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
-        let field = self.field;
-        let vector = self.vector.clone();
-        let nprobe = self.nprobe;
-        let rerank_factor = self.rerank_factor;
-        let combiner = self.combiner;
-        Box::pin(async move {
-            let results = reader
-                .search_dense_vector(field, &vector, limit, nprobe, rerank_factor, combiner)
-                .await?;
-
-            Ok(Box::new(DenseVectorScorer::new(results, field.0)) as Box<dyn Scorer>)
-        })
-    }
-
-    #[cfg(feature = "sync")]
-    fn scorer_sync<'a>(
-        &self,
-        reader: &'a SegmentReader,
-        limit: usize,
-    ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        let results = reader.search_dense_vector_sync(
-            self.field,
-            &self.vector,
-            limit,
-            self.nprobe,
-            self.rerank_factor,
-            self.combiner,
-        )?;
-        Ok(Box::new(DenseVectorScorer::new(results, self.field.0)) as Box<dyn Scorer>)
-    }
-
-    fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
-        Box::pin(async move { Ok(u32::MAX) })
-    }
-}
-
-/// Scorer for dense vector search results with ordinal tracking
-struct DenseVectorScorer {
-    results: Vec<VectorSearchResult>,
-    position: usize,
-    field_id: u32,
-}
-
-impl DenseVectorScorer {
-    fn new(mut results: Vec<VectorSearchResult>, field_id: u32) -> Self {
-        // Sort by doc_id ascending — DocSet contract requires monotonic doc IDs
-        results.sort_unstable_by_key(|r| r.doc_id);
-        Self {
-            results,
-            position: 0,
-            field_id,
-        }
-    }
-}
-
-impl super::docset::DocSet for DenseVectorScorer {
-    fn doc(&self) -> DocId {
-        if self.position < self.results.len() {
-            self.results[self.position].doc_id
-        } else {
-            TERMINATED
-        }
-    }
-
-    fn advance(&mut self) -> DocId {
-        self.position += 1;
-        self.doc()
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        // Binary search within remaining results for O(log k) seek
-        let remaining = &self.results[self.position..];
-        let offset = remaining.partition_point(|r| r.doc_id < target);
-        self.position += offset;
-        self.doc()
-    }
-
-    fn size_hint(&self) -> u32 {
-        (self.results.len() - self.position) as u32
-    }
-}
-
-impl Scorer for DenseVectorScorer {
-    fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
-        }
-    }
-
-    fn matched_positions(&self) -> Option<MatchedPositions> {
-        if self.position >= self.results.len() {
-            return None;
-        }
-        let result = &self.results[self.position];
-        let scored_positions: Vec<ScoredPosition> = result
-            .ordinals
-            .iter()
-            .map(|(ordinal, score)| ScoredPosition::new(*ordinal, *score))
-            .collect();
-        Some(vec![(self.field_id, scored_positions)])
-    }
-}
+use super::combiner::MultiValueCombiner;
+use crate::query::ScoredPosition;
+use crate::query::traits::{CountFuture, MatchedPositions, Query, Scorer, ScorerFuture};
 
 /// Sparse vector query for similarity search
 #[derive(Debug, Clone)]
@@ -353,7 +72,7 @@ impl SparseVectorQuery {
     }
 
     /// Effective query dimensions after pruning. Returns `vector` if no pruning is configured.
-    fn pruned_dims(&self) -> &[(u32, f32)] {
+    pub(crate) fn pruned_dims(&self) -> &[(u32, f32)] {
         self.pruned.as_deref().unwrap_or(&self.vector)
     }
 
@@ -552,7 +271,7 @@ impl SparseVectorQuery {
         text: &str,
         tokenizer: &crate::tokenizer::HfTokenizer,
         weighting: crate::structures::QueryWeighting,
-        global_stats: Option<&super::GlobalStats>,
+        global_stats: Option<&crate::query::GlobalStats>,
     ) -> crate::Result<Self> {
         use crate::structures::QueryWeighting;
 
@@ -600,7 +319,7 @@ impl SparseVectorQuery {
         text: &str,
         tokenizer_bytes: &[u8],
         weighting: crate::structures::QueryWeighting,
-        global_stats: Option<&super::GlobalStats>,
+        global_stats: Option<&crate::query::GlobalStats>,
     ) -> crate::Result<Self> {
         use crate::structures::QueryWeighting;
         use crate::tokenizer::HfTokenizer;
@@ -635,48 +354,60 @@ impl SparseVectorQuery {
 }
 
 impl SparseVectorQuery {
-    /// Build the inner query for this sparse vector search against a segment.
-    /// Filters pruned dims to those present in the segment, then returns:
-    /// - None if no dims match
-    /// - A single SparseTermQuery if one dim matches
-    /// - A BooleanQuery of SHOULD SparseTermQuery clauses otherwise
-    fn build_inner_query(&self, reader: &SegmentReader) -> Option<Box<dyn Query>> {
-        let si = reader.sparse_index(self.field)?;
-        let matched: Vec<(u32, f32)> = self
-            .pruned_dims()
+    /// Build SparseTermQueryInfo decomposition for MaxScore execution.
+    fn sparse_infos(&self) -> Vec<crate::query::SparseTermQueryInfo> {
+        self.pruned_dims()
             .iter()
-            .filter(|(d, _)| si.has_dimension(*d))
-            .copied()
-            .collect();
-        if matched.is_empty() {
-            return None;
-        }
-
-        let make_term = |(dim_id, weight)| {
-            SparseTermQuery::new(self.field, dim_id, weight)
-                .with_heap_factor(self.heap_factor)
-                .with_combiner(self.combiner)
-                .with_over_fetch_factor(self.over_fetch_factor)
-        };
-
-        if matched.len() == 1 {
-            return Some(Box::new(make_term(matched[0])));
-        }
-
-        let mut bool_q = super::BooleanQuery::new();
-        for dims in matched {
-            bool_q = bool_q.should(make_term(dims));
-        }
-        Some(Box::new(bool_q))
+            .map(|&(dim_id, weight)| crate::query::SparseTermQueryInfo {
+                field: self.field,
+                dim_id,
+                weight,
+                heap_factor: self.heap_factor,
+                combiner: self.combiner,
+                over_fetch_factor: self.over_fetch_factor,
+            })
+            .collect()
     }
 }
 
 impl Query for SparseVectorQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
-        match self.build_inner_query(reader) {
-            None => Box::pin(async { Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer>) }),
-            Some(q) => q.scorer(reader, limit),
-        }
+        let infos = self.sparse_infos();
+        let field = self.field;
+        let heap_factor = self.heap_factor;
+        let combiner = self.combiner;
+        let over_fetch_factor = self.over_fetch_factor;
+
+        Box::pin(async move {
+            if infos.is_empty() {
+                return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>);
+            }
+
+            // Single-dim fast path: lazy block-by-block iteration
+            if infos.len() == 1 {
+                let info = &infos[0];
+                let term = SparseTermQuery::new(field, info.dim_id, info.weight)
+                    .with_heap_factor(heap_factor)
+                    .with_combiner(combiner)
+                    .with_over_fetch_factor(over_fetch_factor);
+                return term.scorer(reader, limit).await;
+            }
+
+            // Multi-dim: direct MaxScore execution (bypasses BooleanQuery)
+            if let Some((executor, info)) =
+                crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
+            {
+                let raw = executor.execute().await?;
+                return Ok(crate::query::planner::combine_sparse_results(
+                    raw,
+                    info.combiner,
+                    info.field,
+                    limit,
+                ));
+            }
+
+            Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>)
+        })
     }
 
     #[cfg(feature = "sync")]
@@ -685,33 +416,48 @@ impl Query for SparseVectorQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        match self.build_inner_query(reader) {
-            None => Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
-            Some(q) => q.scorer_sync(reader, limit),
+        let infos = self.sparse_infos();
+        if infos.is_empty() {
+            return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>);
         }
+
+        // Single-dim fast path
+        if infos.len() == 1 {
+            let info = &infos[0];
+            let term = SparseTermQuery::new(self.field, info.dim_id, info.weight)
+                .with_heap_factor(self.heap_factor)
+                .with_combiner(self.combiner)
+                .with_over_fetch_factor(self.over_fetch_factor);
+            return term.scorer_sync(reader, limit);
+        }
+
+        // Multi-dim: direct MaxScore execution
+        if let Some((executor, info)) =
+            crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
+        {
+            let raw = executor.execute_sync()?;
+            return Ok(crate::query::planner::combine_sparse_results(
+                raw,
+                info.combiner,
+                info.field,
+                limit,
+            ));
+        }
+
+        Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>)
     }
 
     fn count_estimate<'a>(&self, _reader: &'a SegmentReader) -> CountFuture<'a> {
         Box::pin(async move { Ok(u32::MAX) })
     }
 
-    fn as_sparse_term_queries(&self) -> Option<Vec<super::SparseTermQueryInfo>> {
-        let dims = self.pruned_dims();
-        if dims.is_empty() {
-            return None;
+    fn decompose(&self) -> crate::query::QueryDecomposition {
+        let infos = self.sparse_infos();
+        if infos.is_empty() {
+            crate::query::QueryDecomposition::Opaque
+        } else {
+            crate::query::QueryDecomposition::SparseTerms(infos)
         }
-        Some(
-            dims.iter()
-                .map(|&(dim_id, weight)| super::SparseTermQueryInfo {
-                    field: self.field,
-                    dim_id,
-                    weight,
-                    heap_factor: self.heap_factor,
-                    combiner: self.combiner,
-                    over_fetch_factor: self.over_fetch_factor,
-                })
-                .collect(),
-        )
     }
 }
 
@@ -787,7 +533,7 @@ impl SparseTermQuery {
                 Some(v) => v,
                 None => return Ok(None),
             };
-        let cursor = super::TermCursor::sparse(
+        let cursor = crate::query::TermCursor::sparse(
             si,
             self.weight,
             skip_start,
@@ -808,7 +554,7 @@ impl Query for SparseTermQuery {
         Box::pin(async move {
             let mut scorer = match query.make_scorer(reader)? {
                 Some(s) => s,
-                None => return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
+                None => return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>),
             };
             scorer.cursor.ensure_block_loaded().await.ok();
             Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
@@ -823,7 +569,7 @@ impl Query for SparseTermQuery {
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         let mut scorer = match self.make_scorer(reader)? {
             Some(s) => s,
-            None => return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer + 'a>),
+            None => return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>),
         };
         scorer.cursor.ensure_block_loaded_sync().ok();
         Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
@@ -844,19 +590,15 @@ impl Query for SparseTermQuery {
         })
     }
 
-    fn as_sparse_term_query_info(&self) -> Option<super::SparseTermQueryInfo> {
-        Some(super::SparseTermQueryInfo {
+    fn decompose(&self) -> crate::query::QueryDecomposition {
+        crate::query::QueryDecomposition::SparseTerms(vec![crate::query::SparseTermQueryInfo {
             field: self.field,
             dim_id: self.dim_id,
             weight: self.weight,
             heap_factor: self.heap_factor,
             combiner: self.combiner,
             over_fetch_factor: self.over_fetch_factor,
-        })
-    }
-
-    fn as_sparse_term_queries(&self) -> Option<Vec<super::SparseTermQueryInfo>> {
-        Some(vec![self.as_sparse_term_query_info()?])
+        }])
     }
 }
 
@@ -865,11 +607,11 @@ impl Query for SparseTermQuery {
 /// Iterates through the posting list block-by-block using sync I/O.
 /// Score for each doc = `query_weight * quantized_stored_weight`.
 struct SparseTermScorer<'a> {
-    cursor: super::TermCursor<'a>,
+    cursor: crate::query::TermCursor<'a>,
     field_id: u32,
 }
 
-impl super::docset::DocSet for SparseTermScorer<'_> {
+impl crate::query::docset::DocSet for SparseTermScorer<'_> {
     fn doc(&self) -> DocId {
         let d = self.cursor.doc();
         if d == u32::MAX { TERMINATED } else { d }
@@ -920,18 +662,6 @@ mod tests {
     use crate::dsl::Field;
 
     #[test]
-    fn test_dense_vector_query_builder() {
-        let query = DenseVectorQuery::new(Field(0), vec![1.0, 2.0, 3.0])
-            .with_nprobe(64)
-            .with_rerank_factor(5.0);
-
-        assert_eq!(query.field, Field(0));
-        assert_eq!(query.vector.len(), 3);
-        assert_eq!(query.nprobe, 64);
-        assert_eq!(query.rerank_factor, 5.0);
-    }
-
-    #[test]
     fn test_sparse_vector_query_new() {
         let sparse = vec![(1, 0.5), (5, 0.3), (10, 0.2)];
         let query = SparseVectorQuery::new(Field(0), sparse.clone());
@@ -946,102 +676,5 @@ mod tests {
             SparseVectorQuery::from_indices_weights(Field(0), vec![1, 5, 10], vec![0.5, 0.3, 0.2]);
 
         assert_eq!(query.vector, vec![(1, 0.5), (5, 0.3), (10, 0.2)]);
-    }
-
-    #[test]
-    fn test_combiner_sum() {
-        let scores = vec![(0, 1.0), (1, 2.0), (2, 3.0)];
-        let combiner = MultiValueCombiner::Sum;
-        assert!((combiner.combine(&scores) - 6.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_combiner_max() {
-        let scores = vec![(0, 1.0), (1, 3.0), (2, 2.0)];
-        let combiner = MultiValueCombiner::Max;
-        assert!((combiner.combine(&scores) - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_combiner_avg() {
-        let scores = vec![(0, 1.0), (1, 2.0), (2, 3.0)];
-        let combiner = MultiValueCombiner::Avg;
-        assert!((combiner.combine(&scores) - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_combiner_log_sum_exp() {
-        let scores = vec![(0, 1.0), (1, 2.0), (2, 3.0)];
-        let combiner = MultiValueCombiner::log_sum_exp();
-        let result = combiner.combine(&scores);
-        // LogSumExp should be between max (3.0) and max + log(n)/t
-        assert!(result >= 3.0);
-        assert!(result <= 3.0 + (3.0_f32).ln() / 1.5);
-    }
-
-    #[test]
-    fn test_combiner_log_sum_exp_approaches_max_with_high_temp() {
-        let scores = vec![(0, 1.0), (1, 5.0), (2, 2.0)];
-        // High temperature should approach max
-        let combiner = MultiValueCombiner::log_sum_exp_with_temperature(10.0);
-        let result = combiner.combine(&scores);
-        // Should be very close to max (5.0)
-        assert!((result - 5.0).abs() < 0.5);
-    }
-
-    #[test]
-    fn test_combiner_weighted_top_k() {
-        let scores = vec![(0, 5.0), (1, 3.0), (2, 1.0), (3, 0.5)];
-        let combiner = MultiValueCombiner::weighted_top_k_with_params(3, 0.5);
-        let result = combiner.combine(&scores);
-        // Top 3: 5.0, 3.0, 1.0 with weights 1.0, 0.5, 0.25
-        // weighted_sum = 5*1 + 3*0.5 + 1*0.25 = 6.75
-        // weight_total = 1.75
-        // result = 6.75 / 1.75 ≈ 3.857
-        assert!((result - 3.857).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_combiner_weighted_top_k_less_than_k() {
-        let scores = vec![(0, 2.0), (1, 1.0)];
-        let combiner = MultiValueCombiner::weighted_top_k_with_params(5, 0.7);
-        let result = combiner.combine(&scores);
-        // Only 2 scores, weights 1.0 and 0.7
-        // weighted_sum = 2*1 + 1*0.7 = 2.7
-        // weight_total = 1.7
-        // result = 2.7 / 1.7 ≈ 1.588
-        assert!((result - 1.588).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_combiner_empty_scores() {
-        let scores: Vec<(u32, f32)> = vec![];
-        assert_eq!(MultiValueCombiner::Sum.combine(&scores), 0.0);
-        assert_eq!(MultiValueCombiner::Max.combine(&scores), 0.0);
-        assert_eq!(MultiValueCombiner::Avg.combine(&scores), 0.0);
-        assert_eq!(MultiValueCombiner::log_sum_exp().combine(&scores), 0.0);
-        assert_eq!(MultiValueCombiner::weighted_top_k().combine(&scores), 0.0);
-    }
-
-    #[test]
-    fn test_combiner_single_score() {
-        let scores = vec![(0, 5.0)];
-        // All combiners should return 5.0 for a single score
-        assert!((MultiValueCombiner::Sum.combine(&scores) - 5.0).abs() < 1e-6);
-        assert!((MultiValueCombiner::Max.combine(&scores) - 5.0).abs() < 1e-6);
-        assert!((MultiValueCombiner::Avg.combine(&scores) - 5.0).abs() < 1e-6);
-        assert!((MultiValueCombiner::log_sum_exp().combine(&scores) - 5.0).abs() < 1e-6);
-        assert!((MultiValueCombiner::weighted_top_k().combine(&scores) - 5.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_default_combiner_is_log_sum_exp() {
-        let combiner = MultiValueCombiner::default();
-        match combiner {
-            MultiValueCombiner::LogSumExp { temperature } => {
-                assert!((temperature - 1.5).abs() < 1e-6);
-            }
-            _ => panic!("Default combiner should be LogSumExp"),
-        }
     }
 }
