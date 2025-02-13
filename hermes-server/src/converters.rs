@@ -11,7 +11,7 @@ use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, Query, Schema, TermQuery,
     TokenizerRegistry,
 };
-use tracing::{debug, warn};
+use log::{debug, warn};
 
 static TOKENIZER_REGISTRY: LazyLock<TokenizerRegistry> = LazyLock::new(TokenizerRegistry::new);
 

@@ -32,8 +32,8 @@ prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+log = "0.4"
+env_logger = "0.11"
 clap = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = { workspace = true }

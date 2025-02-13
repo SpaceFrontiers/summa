@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use log::info;
 use tonic::{codec::CompressionEncoding, transport::Server};
-use tracing::info;
 
 use hermes_core::IndexConfig;
 
@@ -65,13 +65,11 @@ async fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("hermes_server=info".parse()?),
-        )
-        .init();
+    // Initialize logging
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("hermes_server=info"),
+    )
+    .init();
 
     let args = Args::parse();
 

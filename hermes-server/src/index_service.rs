@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
+use log::{info, warn};
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
 
 use hermes_core::parse_schema;
 
@@ -34,7 +34,7 @@ impl IndexServiceImpl {
                 match convert_proto_to_document(&req.fields, &schema) {
                     Ok(doc) => docs.push(doc),
                     Err(e) => {
-                        tracing::warn!("Skipping invalid document in stream batch: {}", e);
+                        warn!("Skipping invalid document in stream batch: {}", e);
                     }
                 }
             }
@@ -72,7 +72,7 @@ impl IndexService for IndexServiceImpl {
 
         self.registry.create_index(&req.index_name, schema).await?;
 
-        info!(index_name = %req.index_name, "Created index");
+        info!("Created index: {}", req.index_name);
 
         Ok(Response::new(CreateIndexResponse { success: true }))
     }
@@ -116,10 +116,8 @@ impl IndexService for IndexServiceImpl {
         let error_count = conversion_errors + index_errors;
 
         info!(
-            index_name = %req.index_name,
-            indexed = indexed_count,
-            errors = error_count,
-            "Batch indexed documents"
+            "Batch indexed documents: index={}, indexed={}, errors={}",
+            req.index_name, indexed_count, error_count
         );
 
         Ok(Response::new(BatchIndexDocumentsResponse {
@@ -225,7 +223,7 @@ impl IndexService for IndexServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
-        info!(index_name = %req.index_name, "Committed");
+        info!("Committed: {}", req.index_name);
 
         Ok(Response::new(CommitResponse {
             success: true,
@@ -258,7 +256,7 @@ impl IndexService for IndexServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
 
-        info!(index_name = %req.index_name, "Force merged");
+        info!("Force merged: {}", req.index_name);
 
         Ok(Response::new(ForceMergeResponse {
             success: true,
@@ -282,7 +280,10 @@ impl IndexService for IndexServiceImpl {
         if let Some(handle) = handle {
             let mut w = handle.writer.write().await;
             if let Err(e) = w.commit().await {
-                warn!(index_name = %req.index_name, error = %e, "Error committing writer during delete");
+                warn!(
+                    "Error committing writer during delete: index={}, error={}",
+                    req.index_name, e
+                );
             }
             w.wait_for_merging_thread().await;
         }
@@ -296,7 +297,7 @@ impl IndexService for IndexServiceImpl {
                 .map_err(|e| Status::internal(format!("Failed to delete index: {}", e)))?;
         }
 
-        info!(index_name = %req.index_name, "Deleted index");
+        info!("Deleted index: {}", req.index_name);
 
         Ok(Response::new(DeleteIndexResponse { success: true }))
     }
@@ -307,7 +308,7 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<ListIndexesResponse>, Status> {
         let index_names = self.registry.list_indexes();
 
-        info!(count = index_names.len(), "Listed indexes");
+        info!("Listed indexes: count={}", index_names.len());
 
         Ok(Response::new(ListIndexesResponse { index_names }))
     }
@@ -327,7 +328,7 @@ impl IndexService for IndexServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("Retrain failed: {}", e)))?;
 
-        info!(index_name = %req.index_name, "Retrained vector index");
+        info!("Retrained vector index: {}", req.index_name);
 
         Ok(Response::new(RetrainVectorIndexResponse { success: true }))
     }
