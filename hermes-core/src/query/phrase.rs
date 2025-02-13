@@ -78,7 +78,12 @@ impl PhraseQuery {
 }
 
 impl Query for PhraseQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<super::DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
         let field = self.field;
         let terms = self.terms.clone();
         let slop = self.slop;
@@ -92,7 +97,7 @@ impl Query for PhraseQuery {
             // Single term - delegate to TermQuery
             if terms.len() == 1 {
                 let term_query = super::TermQuery::new(field, terms[0].clone());
-                return term_query.scorer(reader, limit).await;
+                return term_query.scorer(reader, limit, predicate).await;
             }
 
             // Check if positions are available
@@ -102,7 +107,7 @@ impl Query for PhraseQuery {
                 for term in &terms {
                     bool_query = bool_query.must(super::TermQuery::new(field, term.clone()));
                 }
-                return bool_query.scorer(reader, limit).await;
+                return bool_query.scorer(reader, limit, predicate).await;
             }
 
             // Load postings and positions for all terms (parallel per term)

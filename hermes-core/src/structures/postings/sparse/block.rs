@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     fn test_scoring_simulation_after_merge() {
-        // Simulate what SparseTermScorer does - compute query_weight * stored_weight
+        // Simulate scoring: compute query_weight * stored_weight
         let postings1: Vec<(DocId, u16, f32)> = vec![
             (0, 0, 0.5), // doc 0, weight 0.5
             (5, 0, 0.8), // doc 5, weight 0.8

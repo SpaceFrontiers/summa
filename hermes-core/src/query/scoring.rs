@@ -1,60 +1,17 @@
 //! Shared scoring abstractions for text and sparse vector search
 //!
-//! Provides common traits and utilities for efficient top-k retrieval:
-//! - `ScoringIterator`: Common interface for posting list iteration with scoring
-//! - `TopKCollector`: Efficient min-heap for maintaining top-k results
+//! Provides common types and executors for efficient top-k retrieval:
+//! - `TermCursor`: Unified cursor for both BM25 text and sparse vector posting lists
+//! - `ScoreCollector`: Efficient min-heap for maintaining top-k results
 //! - `MaxScoreExecutor`: Unified Block-Max MaxScore with conjunction optimization
 //! - `BmpExecutor`: Block-at-a-time executor for learned sparse retrieval (12+ terms)
-//! - `SparseTermScorer`: ScoringIterator implementation for sparse vectors
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
 
-use log::{debug, trace};
+use log::debug;
 
 use crate::DocId;
-use crate::structures::BlockSparsePostingList;
-
-/// Common interface for scoring iterators (text terms or sparse dimensions)
-///
-/// Abstracts the common operations needed for MaxScore top-k retrieval.
-pub trait ScoringIterator {
-    /// Current document ID (u32::MAX if exhausted)
-    fn doc(&self) -> DocId;
-
-    /// Current ordinal for multi-valued fields (default 0)
-    fn ordinal(&mut self) -> u16 {
-        0
-    }
-
-    /// Advance to next document, returns new doc ID
-    fn advance(&mut self) -> DocId;
-
-    /// Seek to first document >= target, returns new doc ID
-    fn seek(&mut self, target: DocId) -> DocId;
-
-    /// Check if iterator is exhausted
-    fn is_exhausted(&self) -> bool {
-        self.doc() == u32::MAX
-    }
-
-    /// Score contribution for current document
-    fn score(&self) -> f32;
-
-    /// Maximum possible score for this term/dimension (global upper bound)
-    fn max_score(&self) -> f32;
-
-    /// Current block's maximum score upper bound (for block-level pruning)
-    fn current_block_max_score(&self) -> f32;
-
-    /// Skip to the next block, returning the first doc_id in the new block.
-    /// Used for block-max pruning when current block can't beat threshold.
-    /// Default implementation just advances (no block-level skipping).
-    fn skip_to_next_block(&mut self) -> DocId {
-        self.advance()
-    }
-}
 
 /// Entry for top-k min-heap
 #[derive(Clone, Copy)]
@@ -210,443 +167,6 @@ pub struct ScoredDoc {
     pub ordinal: u16,
 }
 
-/// Unified Block-Max MaxScore executor for top-k retrieval
-///
-/// Combines three optimizations from the literature into one executor:
-/// 1. **MaxScore partitioning** (Turtle & Flood 1995): terms split into essential
-///    (must check) and non-essential (only scored if candidate is promising)
-/// 2. **Block-max pruning** (Ding & Suel 2011): skip blocks where per-block
-///    upper bounds can't beat the current threshold
-/// 3. **Conjunction optimization** (Lucene/Grand 2023): progressively intersect
-///    essential terms as threshold rises, skipping docs that lack enough terms
-///
-/// Works with any type implementing `ScoringIterator` (text or sparse).
-/// Unified executor with better performance across all query lengths.
-pub struct MaxScoreExecutor<S: ScoringIterator> {
-    /// Scorers sorted by max_score ascending (non-essential first)
-    scorers: Vec<S>,
-    /// Cumulative max_score prefix sums: prefix_sums[i] = sum(max_score[0..=i])
-    prefix_sums: Vec<f32>,
-    /// Top-k collector
-    collector: ScoreCollector,
-    /// Heap factor for approximate search (SEISMIC-style)
-    /// - 1.0 = exact search (default)
-    /// - 0.8 = approximate, faster with minor recall loss
-    heap_factor: f32,
-}
-
-impl<S: ScoringIterator> MaxScoreExecutor<S> {
-    /// Create a new executor with exact search (heap_factor = 1.0)
-    pub fn new(scorers: Vec<S>, k: usize) -> Self {
-        Self::with_heap_factor(scorers, k, 1.0)
-    }
-
-    /// Create a new executor with approximate search
-    ///
-    /// `heap_factor` controls the trade-off between speed and recall:
-    /// - 1.0 = exact search
-    /// - 0.8 = ~20% faster, minor recall loss
-    /// - 0.5 = much faster, noticeable recall loss
-    pub fn with_heap_factor(mut scorers: Vec<S>, k: usize, heap_factor: f32) -> Self {
-        // Sort scorers by max_score ascending (non-essential terms first)
-        scorers.sort_by(|a, b| {
-            a.max_score()
-                .partial_cmp(&b.max_score())
-                .unwrap_or(Ordering::Equal)
-        });
-
-        // Compute prefix sums of max_scores
-        let mut prefix_sums = Vec::with_capacity(scorers.len());
-        let mut cumsum = 0.0f32;
-        for s in &scorers {
-            cumsum += s.max_score();
-            prefix_sums.push(cumsum);
-        }
-
-        debug!(
-            "Creating MaxScoreExecutor: num_scorers={}, k={}, total_upper={:.4}, heap_factor={:.2}",
-            scorers.len(),
-            k,
-            cumsum,
-            heap_factor
-        );
-
-        Self {
-            scorers,
-            prefix_sums,
-            collector: ScoreCollector::new(k),
-            heap_factor: heap_factor.clamp(0.0, 1.0),
-        }
-    }
-
-    /// Find partition point: [0..partition) = non-essential, [partition..n) = essential
-    /// Non-essential terms have cumulative max_score <= threshold
-    #[inline]
-    fn find_partition(&self) -> usize {
-        let threshold = self.collector.threshold() * self.heap_factor;
-        // Binary search: prefix_sums is monotonically increasing
-        self.prefix_sums.partition_point(|&sum| sum <= threshold)
-    }
-
-    /// Execute Block-Max MaxScore and return top-k results
-    ///
-    /// Algorithm:
-    /// 1. Partition terms into essential/non-essential based on max_score
-    /// 2. Find min_doc across essential scorers
-    /// 3. Conjunction check: skip if not enough essential terms present
-    /// 4. Block-max check: skip if block upper bounds can't beat threshold
-    /// 5. Score essential scorers, check if non-essential scoring is needed
-    /// 6. Score non-essential scorers, group by ordinal, insert results
-    pub fn execute(mut self) -> Vec<ScoredDoc> {
-        if self.scorers.is_empty() {
-            debug!("MaxScoreExecutor: no scorers, returning empty results");
-            return Vec::new();
-        }
-
-        let n = self.scorers.len();
-        let mut docs_scored = 0u64;
-        let mut docs_skipped = 0u64;
-        let mut blocks_skipped = 0u64;
-        let mut conjunction_skipped = 0u64;
-
-        // Pre-allocate scratch buffers outside the loop
-        let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
-
-        loop {
-            let partition = self.find_partition();
-
-            // If all terms are non-essential, we're done
-            if partition >= n {
-                debug!("BlockMaxScore: all terms non-essential, early termination");
-                break;
-            }
-
-            // Single fused pass over essential scorers: find min_doc and
-            // accumulate conjunction/block-max upper bounds simultaneously.
-            // This replaces 3 separate iterations with 1, reducing cache misses.
-            let mut min_doc = u32::MAX;
-            let mut present_upper = 0.0f32;
-            let mut block_max_sum = 0.0f32;
-            for i in partition..n {
-                let doc = self.scorers[i].doc();
-                if doc < min_doc {
-                    min_doc = doc;
-                    // New min_doc — reset accumulators to this scorer only
-                    present_upper = self.scorers[i].max_score();
-                    block_max_sum = self.scorers[i].current_block_max_score();
-                } else if doc == min_doc {
-                    present_upper += self.scorers[i].max_score();
-                    block_max_sum += self.scorers[i].current_block_max_score();
-                }
-            }
-
-            if min_doc == u32::MAX {
-                break; // All essential scorers exhausted
-            }
-
-            let non_essential_upper = if partition > 0 {
-                self.prefix_sums[partition - 1]
-            } else {
-                0.0
-            };
-            let adjusted_threshold = self.collector.threshold() * self.heap_factor;
-
-            // --- Conjunction optimization (Lucene-style) ---
-            // Check if enough essential terms are present at min_doc.
-            if self.collector.len() >= self.collector.k
-                && present_upper + non_essential_upper <= adjusted_threshold
-            {
-                for i in partition..n {
-                    if self.scorers[i].doc() == min_doc {
-                        self.scorers[i].advance();
-                    }
-                }
-                conjunction_skipped += 1;
-                continue;
-            }
-
-            // --- Block-max pruning ---
-            // If block-max sum + non-essential upper can't beat threshold, skip blocks.
-            if self.collector.len() >= self.collector.k
-                && block_max_sum + non_essential_upper <= adjusted_threshold
-            {
-                for i in partition..n {
-                    if self.scorers[i].doc() == min_doc {
-                        self.scorers[i].skip_to_next_block();
-                    }
-                }
-                blocks_skipped += 1;
-                continue;
-            }
-
-            // --- Score essential scorers ---
-            // Drain all entries for min_doc from each essential scorer
-            ordinal_scores.clear();
-
-            for i in partition..n {
-                if self.scorers[i].doc() == min_doc {
-                    while self.scorers[i].doc() == min_doc {
-                        ordinal_scores.push((self.scorers[i].ordinal(), self.scorers[i].score()));
-                        self.scorers[i].advance();
-                    }
-                }
-            }
-
-            // Check if essential score + non-essential upper could beat threshold
-            let essential_total: f32 = ordinal_scores.iter().map(|(_, s)| *s).sum();
-
-            if self.collector.len() >= self.collector.k
-                && essential_total + non_essential_upper <= adjusted_threshold
-            {
-                docs_skipped += 1;
-                continue;
-            }
-
-            // --- Score non-essential scorers ---
-            for i in 0..partition {
-                let doc = self.scorers[i].seek(min_doc);
-                if doc == min_doc {
-                    while self.scorers[i].doc() == min_doc {
-                        ordinal_scores.push((self.scorers[i].ordinal(), self.scorers[i].score()));
-                        self.scorers[i].advance();
-                    }
-                }
-            }
-
-            // --- Group by ordinal and insert ---
-            // Fast path: single entry (common for single-valued fields) — skip sort + grouping
-            if ordinal_scores.len() == 1 {
-                let (ord, score) = ordinal_scores[0];
-                trace!(
-                    "Doc {}: ordinal={}, score={:.4}, threshold={:.4}",
-                    min_doc, ord, score, adjusted_threshold
-                );
-                if self.collector.insert_with_ordinal(min_doc, score, ord) {
-                    docs_scored += 1;
-                } else {
-                    docs_skipped += 1;
-                }
-            } else if !ordinal_scores.is_empty() {
-                if ordinal_scores.len() > 2 {
-                    ordinal_scores.sort_unstable_by_key(|(ord, _)| *ord);
-                } else if ordinal_scores[0].0 > ordinal_scores[1].0 {
-                    ordinal_scores.swap(0, 1);
-                }
-                let mut j = 0;
-                while j < ordinal_scores.len() {
-                    let current_ord = ordinal_scores[j].0;
-                    let mut score = 0.0f32;
-                    while j < ordinal_scores.len() && ordinal_scores[j].0 == current_ord {
-                        score += ordinal_scores[j].1;
-                        j += 1;
-                    }
-
-                    trace!(
-                        "Doc {}: ordinal={}, score={:.4}, threshold={:.4}",
-                        min_doc, current_ord, score, adjusted_threshold
-                    );
-
-                    if self
-                        .collector
-                        .insert_with_ordinal(min_doc, score, current_ord)
-                    {
-                        docs_scored += 1;
-                    } else {
-                        docs_skipped += 1;
-                    }
-                }
-            }
-        }
-
-        let results: Vec<ScoredDoc> = self
-            .collector
-            .into_sorted_results()
-            .into_iter()
-            .map(|(doc_id, score, ordinal)| ScoredDoc {
-                doc_id,
-                score,
-                ordinal,
-            })
-            .collect();
-
-        debug!(
-            "MaxScoreExecutor completed: scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
-            docs_scored,
-            docs_skipped,
-            blocks_skipped,
-            conjunction_skipped,
-            results.len(),
-            results.first().map(|r| r.score).unwrap_or(0.0)
-        );
-
-        results
-    }
-}
-
-/// Scorer for full-text terms using MaxScore optimization
-///
-/// Wraps a `BlockPostingList` with BM25 parameters to implement `ScoringIterator`.
-/// Enables MaxScore pruning for efficient top-k retrieval in OR queries.
-pub struct TextTermScorer {
-    /// Iterator over the posting list (owned)
-    iter: crate::structures::BlockPostingIterator<'static>,
-    /// IDF component for BM25
-    idf: f32,
-    /// Average field length for BM25 normalization
-    avg_field_len: f32,
-    /// Pre-computed max score (using max_tf from posting list)
-    max_score: f32,
-}
-
-impl TextTermScorer {
-    /// Create a new text term scorer with BM25 parameters
-    pub fn new(
-        posting_list: crate::structures::BlockPostingList,
-        idf: f32,
-        avg_field_len: f32,
-    ) -> Self {
-        // Compute max score using actual max_tf from posting list
-        let max_tf = posting_list.max_tf() as f32;
-        let doc_count = posting_list.doc_count();
-        let max_score = super::bm25_upper_bound(max_tf.max(1.0), idf);
-
-        debug!(
-            "Created TextTermScorer: doc_count={}, max_tf={:.0}, idf={:.4}, avg_field_len={:.2}, max_score={:.4}",
-            doc_count, max_tf, idf, avg_field_len, max_score
-        );
-
-        Self {
-            iter: posting_list.into_iterator(),
-            idf,
-            avg_field_len,
-            max_score,
-        }
-    }
-}
-
-impl ScoringIterator for TextTermScorer {
-    #[inline]
-    fn doc(&self) -> DocId {
-        self.iter.doc()
-    }
-
-    #[inline]
-    fn advance(&mut self) -> DocId {
-        self.iter.advance()
-    }
-
-    #[inline]
-    fn seek(&mut self, target: DocId) -> DocId {
-        self.iter.seek(target)
-    }
-
-    #[inline]
-    fn score(&self) -> f32 {
-        let tf = self.iter.term_freq() as f32;
-        // Use tf as proxy for doc length (common approximation when field lengths aren't stored)
-        super::bm25_score(tf, self.idf, tf, self.avg_field_len)
-    }
-
-    #[inline]
-    fn max_score(&self) -> f32 {
-        self.max_score
-    }
-
-    #[inline]
-    fn current_block_max_score(&self) -> f32 {
-        // Use per-block max_tf for tighter block-max bounds
-        let block_max_tf = self.iter.current_block_max_tf() as f32;
-        super::bm25_upper_bound(block_max_tf.max(1.0), self.idf)
-    }
-
-    #[inline]
-    fn skip_to_next_block(&mut self) -> DocId {
-        self.iter.skip_to_next_block()
-    }
-}
-
-/// Scorer for sparse vector dimensions
-///
-/// Wraps a `BlockSparsePostingList` with a query weight to implement `ScoringIterator`.
-pub struct SparseTermScorer<'a> {
-    /// Iterator over the posting list
-    iter: crate::structures::BlockSparsePostingIterator<'a>,
-    /// Query weight for this dimension
-    query_weight: f32,
-    /// Pre-computed |query_weight| to avoid repeated .abs() in hot paths
-    abs_query_weight: f32,
-    /// Global max score (|query_weight| * global_max_weight)
-    max_score: f32,
-}
-
-impl<'a> SparseTermScorer<'a> {
-    /// Create a new sparse term scorer
-    ///
-    /// Note: Assumes positive weights for MaxScore upper bound calculation.
-    /// For negative query weights, uses absolute value to ensure valid upper bound.
-    pub fn new(posting_list: &'a BlockSparsePostingList, query_weight: f32) -> Self {
-        // Upper bound must account for sign: |query_weight| * max_weight
-        // This ensures the bound is valid regardless of weight sign
-        let abs_qw = query_weight.abs();
-        let max_score = abs_qw * posting_list.global_max_weight();
-        Self {
-            iter: posting_list.iterator(),
-            query_weight,
-            abs_query_weight: abs_qw,
-            max_score,
-        }
-    }
-
-    /// Create from Arc reference (for use with shared posting lists)
-    pub fn from_arc(posting_list: &'a Arc<BlockSparsePostingList>, query_weight: f32) -> Self {
-        Self::new(posting_list.as_ref(), query_weight)
-    }
-}
-
-impl ScoringIterator for SparseTermScorer<'_> {
-    #[inline]
-    fn doc(&self) -> DocId {
-        self.iter.doc()
-    }
-
-    #[inline]
-    fn ordinal(&mut self) -> u16 {
-        self.iter.ordinal()
-    }
-
-    #[inline]
-    fn advance(&mut self) -> DocId {
-        self.iter.advance()
-    }
-
-    #[inline]
-    fn seek(&mut self, target: DocId) -> DocId {
-        self.iter.seek(target)
-    }
-
-    #[inline]
-    fn score(&self) -> f32 {
-        // Dot product contribution: query_weight * stored_weight
-        self.query_weight * self.iter.weight()
-    }
-
-    #[inline]
-    fn max_score(&self) -> f32 {
-        self.max_score
-    }
-
-    #[inline]
-    fn current_block_max_score(&self) -> f32 {
-        self.iter
-            .current_block_max_contribution(self.abs_query_weight)
-    }
-
-    #[inline]
-    fn skip_to_next_block(&mut self) -> DocId {
-        self.iter.skip_to_next_block()
-    }
-}
-
 /// Block-Max Pruning (BMP) executor for learned sparse retrieval
 ///
 /// Processes blocks in score-descending order using a priority queue.
@@ -667,6 +187,8 @@ pub struct BmpExecutor<'a> {
     k: usize,
     /// Heap factor for approximate search
     heap_factor: f32,
+    /// Optional filter predicate (checked at final collection)
+    predicate: Option<super::DocPredicate<'a>>,
 }
 
 /// Superblock size: group S consecutive blocks into one priority queue entry.
@@ -739,7 +261,13 @@ impl<'a> BmpExecutor<'a> {
             query_terms,
             k,
             heap_factor: heap_factor.clamp(0.0, 1.0),
+            predicate: None,
         }
+    }
+
+    /// Set a filter predicate that rejects documents at final collection.
+    pub fn set_predicate(&mut self, predicate: Option<super::DocPredicate<'a>>) {
+        self.predicate = predicate;
     }
 
     /// Execute BMP and return top-k results
@@ -991,21 +519,23 @@ impl<'a> BmpExecutor<'a> {
             }
         }
 
-        // Collect results from both accumulators
-        let mut scored: Vec<ScoredDoc> = Vec::new();
+        // Collect final top-k via heap — O(N log k) instead of O(N log N) sort.
+        // During execution, `top_k` received intermediate scores (before all
+        // terms were accumulated). Re-insert final scores into a fresh collector.
+        let mut final_top_k = ScoreCollector::new(self.k);
 
         let num_accumulators = if use_flat {
-            // Flat array entries (ordinal=0)
-            scored.reserve(dirty.len() + multi_ord_accumulators.len());
             for &doc_id in &dirty {
+                // Filter predicate check at collection time
+                if let Some(ref pred) = self.predicate
+                    && !pred(doc_id)
+                {
+                    continue;
+                }
                 let off = (doc_id - global_min_doc) as usize;
                 let score = flat_scores[off];
                 if score > 0.0 {
-                    scored.push(ScoredDoc {
-                        doc_id,
-                        score,
-                        ordinal: 0,
-                    });
+                    final_top_k.insert_with_ordinal(doc_id, score, 0);
                 }
             }
             dirty.len() + multi_ord_accumulators.len()
@@ -1014,19 +544,26 @@ impl<'a> BmpExecutor<'a> {
         };
 
         // Multi-ordinal entries
-        scored.extend(
-            multi_ord_accumulators
-                .into_iter()
-                .map(|(key, score)| ScoredDoc {
-                    doc_id: (key >> 16) as DocId,
-                    score,
-                    ordinal: (key & 0xFFFF) as u16,
-                }),
-        );
+        for (key, score) in &multi_ord_accumulators {
+            let doc_id = (*key >> 16) as DocId;
+            // Filter predicate check at collection time
+            if let Some(ref pred) = self.predicate
+                && !pred(doc_id)
+            {
+                continue;
+            }
+            final_top_k.insert_with_ordinal(doc_id, *score, (*key & 0xFFFF) as u16);
+        }
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        scored.truncate(self.k);
-        let results = scored;
+        let results: Vec<ScoredDoc> = final_top_k
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| ScoredDoc {
+                doc_id,
+                score,
+                ordinal,
+            })
+            .collect();
 
         debug!(
             "BmpExecutor completed: blocks_processed={}, blocks_skipped={}, accumulators={}, flat={}, returned={}, top_score={:.4}",
@@ -1042,116 +579,215 @@ impl<'a> BmpExecutor<'a> {
     }
 }
 
-/// Lazy Block-Max MaxScore executor for sparse retrieval (1-11 terms)
+/// Unified Block-Max MaxScore executor for top-k retrieval
 ///
-/// Combines BlockMaxScore's cursor-based document-at-a-time traversal with
-/// BMP's lazy block loading. Skip entries (already in memory via zero-copy
-/// mmap) drive block-level navigation; actual block data is loaded on-demand
-/// only when the cursor visits that block.
-///
-/// For typical 1-11 term queries with MaxScore pruning, many blocks are
-/// skipped entirely — lazy loading avoids the I/O and decode cost for those
-/// blocks. This hybrid achieves BMP's memory efficiency with BlockMaxScore's
-/// superior pruning for few-term queries.
-pub struct SparseMaxScoreExecutor<'a> {
-    sparse_index: &'a crate::segment::SparseIndex,
-    cursors: Vec<LazyTermCursor>,
+/// Works with both full-text (BM25) and sparse vector (dot product) queries
+/// through the polymorphic `TermCursor`. Combines three optimizations:
+/// 1. **MaxScore partitioning** (Turtle & Flood 1995): terms split into essential
+///    (must check) and non-essential (only scored if candidate is promising)
+/// 2. **Block-max pruning** (Ding & Suel 2011): skip blocks where per-block
+///    upper bounds can't beat the current threshold
+/// 3. **Conjunction optimization** (Lucene/Grand 2023): progressively intersect
+///    essential terms as threshold rises, skipping docs that lack enough terms
+pub struct MaxScoreExecutor<'a> {
+    cursors: Vec<TermCursor<'a>>,
     prefix_sums: Vec<f32>,
     collector: ScoreCollector,
     heap_factor: f32,
+    predicate: Option<super::DocPredicate<'a>>,
 }
 
-/// Per-term cursor state for lazy block loading
-struct LazyTermCursor {
-    query_weight: f32,
-    /// Pre-computed |query_weight| to avoid repeated .abs() in hot paths
-    abs_query_weight: f32,
-    max_score: f32,
-    /// Index of first skip entry in the SparseIndex skip section (zero-alloc)
-    skip_start: usize,
-    /// Number of skip entries (blocks) for this dimension
-    skip_count: usize,
-    /// Base byte offset for block data (pre-resolved, avoids dim_id lookup per load)
-    block_data_offset: u64,
-    /// Current block index (0-based relative to this dimension's blocks)
+/// Unified term cursor for Block-Max MaxScore execution.
+///
+/// All per-position decode buffers (`doc_ids`, `scores`, `ordinals`) live in
+/// the struct directly and are filled by `ensure_block_loaded`.
+///
+/// Skip-list metadata is **not** materialized — it is read lazily from the
+/// underlying source (`BlockPostingList` for text, `SparseIndex` for sparse),
+/// both backed by zero-copy mmap'd `OwnedBytes`.
+pub(crate) struct TermCursor<'a> {
+    pub max_score: f32,
+    num_blocks: usize,
+    // ── Per-position state (filled by ensure_block_loaded) ──────────
     block_idx: usize,
-    /// Decoded block data (loaded on demand, reused across seeks)
     doc_ids: Vec<u32>,
+    scores: Vec<f32>,
     ordinals: Vec<u16>,
-    weights: Vec<f32>,
-    /// Position within current decoded block
     pos: usize,
-    /// Whether block at block_idx is decoded into doc_ids/ordinals/weights
     block_loaded: bool,
     exhausted: bool,
+    // ── Block decode + skip access source ───────────────────────────
+    variant: CursorVariant<'a>,
 }
 
-impl LazyTermCursor {
-    fn new(
+enum CursorVariant<'a> {
+    /// Full-text BM25 — in-memory BlockPostingList (skip list + block data)
+    Text {
+        list: crate::structures::BlockPostingList,
+        idf: f32,
+        avg_field_len: f32,
+        tfs: Vec<u32>, // temp decode buffer, converted to scores
+    },
+    /// Sparse vector — mmap'd SparseIndex (skip entries + block data)
+    Sparse {
+        si: &'a crate::segment::SparseIndex,
+        query_weight: f32,
+        skip_start: usize,
+        block_data_offset: u64,
+    },
+}
+
+impl<'a> TermCursor<'a> {
+    /// Create a full-text BM25 cursor (lazy — no blocks decoded yet).
+    pub fn text(
+        posting_list: crate::structures::BlockPostingList,
+        idf: f32,
+        avg_field_len: f32,
+    ) -> Self {
+        let max_tf = posting_list.max_tf() as f32;
+        let max_score = super::bm25_upper_bound(max_tf.max(1.0), idf);
+        let num_blocks = posting_list.num_blocks();
+        Self {
+            max_score,
+            num_blocks,
+            block_idx: 0,
+            doc_ids: Vec::with_capacity(128),
+            scores: Vec::with_capacity(128),
+            ordinals: Vec::new(),
+            pos: 0,
+            block_loaded: false,
+            exhausted: num_blocks == 0,
+            variant: CursorVariant::Text {
+                list: posting_list,
+                idf,
+                avg_field_len,
+                tfs: Vec::with_capacity(128),
+            },
+        }
+    }
+
+    /// Create a sparse vector cursor with lazy block loading.
+    /// Skip entries are **not** copied — they are read from `SparseIndex` mmap on demand.
+    pub fn sparse(
+        si: &'a crate::segment::SparseIndex,
         query_weight: f32,
         skip_start: usize,
         skip_count: usize,
         global_max_weight: f32,
         block_data_offset: u64,
     ) -> Self {
-        let exhausted = skip_count == 0;
-        let abs_qw = query_weight.abs();
         Self {
-            query_weight,
-            abs_query_weight: abs_qw,
-            max_score: abs_qw * global_max_weight,
-            skip_start,
-            skip_count,
-            block_data_offset,
+            max_score: query_weight.abs() * global_max_weight,
+            num_blocks: skip_count,
             block_idx: 0,
             doc_ids: Vec::with_capacity(256),
+            scores: Vec::with_capacity(256),
             ordinals: Vec::with_capacity(256),
-            weights: Vec::with_capacity(256),
             pos: 0,
             block_loaded: false,
-            exhausted,
+            exhausted: skip_count == 0,
+            variant: CursorVariant::Sparse {
+                si,
+                query_weight,
+                skip_start,
+                block_data_offset,
+            },
         }
     }
 
-    // --- Shared non-I/O helpers ---
+    // ── Skip-entry access (lazy, zero-copy for sparse) ──────────────────
 
-    /// Decode a loaded block into the cursor's buffers
     #[inline]
-    fn decode_block(&mut self, block: crate::structures::SparseBlock) {
-        block.decode_doc_ids_into(&mut self.doc_ids);
-        block.decode_ordinals_into(&mut self.ordinals);
-        block.decode_scored_weights_into(self.query_weight, &mut self.weights);
-        self.pos = 0;
-        self.block_loaded = true;
-    }
-
-    /// Handle a loaded block result (Some/None). Returns Ok(true) if block was loaded.
-    #[inline]
-    fn handle_block_result(
-        &mut self,
-        block: Option<crate::structures::SparseBlock>,
-    ) -> crate::Result<bool> {
-        match block {
-            Some(b) => {
-                self.decode_block(b);
-                Ok(true)
-            }
-            None => {
-                self.exhausted = true;
-                Ok(false)
+    fn block_first_doc(&self, idx: usize) -> DocId {
+        match &self.variant {
+            CursorVariant::Text { list, .. } => list.block_first_doc(idx).unwrap_or(u32::MAX),
+            CursorVariant::Sparse { si, skip_start, .. } => {
+                si.read_skip_entry(*skip_start + idx).first_doc
             }
         }
     }
 
-    /// Advance position within current block, moving to next block if needed.
-    /// Does NOT load the next block (lazy). Returns current doc.
+    #[inline]
+    fn block_last_doc(&self, idx: usize) -> DocId {
+        match &self.variant {
+            CursorVariant::Text { list, .. } => list.block_last_doc(idx).unwrap_or(0),
+            CursorVariant::Sparse { si, skip_start, .. } => {
+                si.read_skip_entry(*skip_start + idx).last_doc
+            }
+        }
+    }
+
+    // ── Read-only accessors ─────────────────────────────────────────────
+
+    #[inline]
+    pub fn doc(&self) -> DocId {
+        if self.exhausted {
+            return u32::MAX;
+        }
+        if self.block_loaded {
+            self.doc_ids.get(self.pos).copied().unwrap_or(u32::MAX)
+        } else {
+            self.block_first_doc(self.block_idx)
+        }
+    }
+
+    #[inline]
+    pub fn ordinal(&self) -> u16 {
+        if !self.block_loaded || self.ordinals.is_empty() {
+            return 0;
+        }
+        self.ordinals.get(self.pos).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn score(&self) -> f32 {
+        if !self.block_loaded {
+            return 0.0;
+        }
+        self.scores.get(self.pos).copied().unwrap_or(0.0)
+    }
+
+    #[inline]
+    pub fn current_block_max_score(&self) -> f32 {
+        if self.exhausted {
+            return 0.0;
+        }
+        match &self.variant {
+            CursorVariant::Text { list, idf, .. } => {
+                let block_max_tf = list.block_max_tf(self.block_idx).unwrap_or(0) as f32;
+                super::bm25_upper_bound(block_max_tf.max(1.0), *idf)
+            }
+            CursorVariant::Sparse {
+                si,
+                query_weight,
+                skip_start,
+                ..
+            } => query_weight.abs() * si.read_skip_entry(*skip_start + self.block_idx).max_weight,
+        }
+    }
+
+    // ── Block navigation ────────────────────────────────────────────────
+
+    pub fn skip_to_next_block(&mut self) -> DocId {
+        if self.exhausted {
+            return u32::MAX;
+        }
+        self.block_idx += 1;
+        self.block_loaded = false;
+        if self.block_idx >= self.num_blocks {
+            self.exhausted = true;
+            return u32::MAX;
+        }
+        self.block_first_doc(self.block_idx)
+    }
+
     #[inline]
     fn advance_pos(&mut self) -> DocId {
         self.pos += 1;
         if self.pos >= self.doc_ids.len() {
             self.block_idx += 1;
             self.block_loaded = false;
-            if self.block_idx >= self.skip_count {
+            if self.block_idx >= self.num_blocks {
                 self.exhausted = true;
                 return u32::MAX;
             }
@@ -1159,66 +795,226 @@ impl LazyTermCursor {
         self.doc()
     }
 
-    /// Seek preparation: handle in-block seek and binary search on skip entries.
-    /// Returns `Ok(Some(doc))` if seek resolved without needing a block load,
-    /// or `Ok(None)` if a block load is needed (block_idx updated, block_loaded = false).
-    fn seek_prepare(
-        &mut self,
-        si: &crate::segment::SparseIndex,
-        target: DocId,
-    ) -> crate::Result<Option<DocId>> {
+    // ── Block loading (dispatch: decode format + I/O differ) ────────────
+
+    pub async fn ensure_block_loaded(&mut self) -> crate::Result<bool> {
+        if self.exhausted || self.block_loaded {
+            return Ok(!self.exhausted);
+        }
+        match &mut self.variant {
+            CursorVariant::Text {
+                list,
+                idf,
+                avg_field_len,
+                tfs,
+            } => {
+                if list.decode_block_into(self.block_idx, &mut self.doc_ids, tfs) {
+                    self.scores.clear();
+                    self.scores.reserve(tfs.len());
+                    for &tf in tfs.iter() {
+                        let tf = tf as f32;
+                        self.scores
+                            .push(super::bm25_score(tf, *idf, tf, *avg_field_len));
+                    }
+                    self.pos = 0;
+                    self.block_loaded = true;
+                    Ok(true)
+                } else {
+                    self.exhausted = true;
+                    Ok(false)
+                }
+            }
+            CursorVariant::Sparse {
+                si,
+                query_weight,
+                skip_start,
+                block_data_offset,
+                ..
+            } => {
+                let block = si
+                    .load_block_direct(*skip_start, *block_data_offset, self.block_idx)
+                    .await?;
+                match block {
+                    Some(b) => {
+                        b.decode_doc_ids_into(&mut self.doc_ids);
+                        b.decode_ordinals_into(&mut self.ordinals);
+                        b.decode_scored_weights_into(*query_weight, &mut self.scores);
+                        self.pos = 0;
+                        self.block_loaded = true;
+                        Ok(true)
+                    }
+                    None => {
+                        self.exhausted = true;
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn ensure_block_loaded_sync(&mut self) -> crate::Result<bool> {
+        if self.exhausted || self.block_loaded {
+            return Ok(!self.exhausted);
+        }
+        match &mut self.variant {
+            CursorVariant::Text {
+                list,
+                idf,
+                avg_field_len,
+                tfs,
+            } => {
+                if list.decode_block_into(self.block_idx, &mut self.doc_ids, tfs) {
+                    self.scores.clear();
+                    self.scores.reserve(tfs.len());
+                    for &tf in tfs.iter() {
+                        let tf = tf as f32;
+                        self.scores
+                            .push(super::bm25_score(tf, *idf, tf, *avg_field_len));
+                    }
+                    self.pos = 0;
+                    self.block_loaded = true;
+                    Ok(true)
+                } else {
+                    self.exhausted = true;
+                    Ok(false)
+                }
+            }
+            CursorVariant::Sparse {
+                si,
+                query_weight,
+                skip_start,
+                block_data_offset,
+                ..
+            } => {
+                let block =
+                    si.load_block_direct_sync(*skip_start, *block_data_offset, self.block_idx)?;
+                match block {
+                    Some(b) => {
+                        b.decode_doc_ids_into(&mut self.doc_ids);
+                        b.decode_ordinals_into(&mut self.ordinals);
+                        b.decode_scored_weights_into(*query_weight, &mut self.scores);
+                        self.pos = 0;
+                        self.block_loaded = true;
+                        Ok(true)
+                    }
+                    None => {
+                        self.exhausted = true;
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Advance / Seek ──────────────────────────────────────────────────
+
+    pub async fn advance(&mut self) -> crate::Result<DocId> {
         if self.exhausted {
-            return Ok(Some(u32::MAX));
+            return Ok(u32::MAX);
+        }
+        self.ensure_block_loaded().await?;
+        if self.exhausted {
+            return Ok(u32::MAX);
+        }
+        Ok(self.advance_pos())
+    }
+
+    pub fn advance_sync(&mut self) -> crate::Result<DocId> {
+        if self.exhausted {
+            return Ok(u32::MAX);
+        }
+        self.ensure_block_loaded_sync()?;
+        if self.exhausted {
+            return Ok(u32::MAX);
+        }
+        Ok(self.advance_pos())
+    }
+
+    pub async fn seek(&mut self, target: DocId) -> crate::Result<DocId> {
+        if let Some(doc) = self.seek_prepare(target) {
+            return Ok(doc);
+        }
+        self.ensure_block_loaded().await?;
+        if self.seek_finish(target) {
+            self.ensure_block_loaded().await?;
+        }
+        Ok(self.doc())
+    }
+
+    pub fn seek_sync(&mut self, target: DocId) -> crate::Result<DocId> {
+        if let Some(doc) = self.seek_prepare(target) {
+            return Ok(doc);
+        }
+        self.ensure_block_loaded_sync()?;
+        if self.seek_finish(target) {
+            self.ensure_block_loaded_sync()?;
+        }
+        Ok(self.doc())
+    }
+
+    fn seek_prepare(&mut self, target: DocId) -> Option<DocId> {
+        if self.exhausted {
+            return Some(u32::MAX);
         }
 
-        // If block is loaded and target is within current block range
+        // Fast path: target is within the currently loaded block
         if self.block_loaded
             && let Some(&last) = self.doc_ids.last()
         {
             if last >= target && self.doc_ids[self.pos] < target {
                 let remaining = &self.doc_ids[self.pos..];
-                let offset = crate::structures::simd::find_first_ge_u32(remaining, target);
-                self.pos += offset;
+                self.pos += crate::structures::simd::find_first_ge_u32(remaining, target);
                 if self.pos >= self.doc_ids.len() {
                     self.block_idx += 1;
                     self.block_loaded = false;
-                    if self.block_idx >= self.skip_count {
+                    if self.block_idx >= self.num_blocks {
                         self.exhausted = true;
-                        return Ok(Some(u32::MAX));
+                        return Some(u32::MAX);
                     }
                 }
-                return Ok(Some(self.doc()));
+                return Some(self.doc());
             }
             if self.doc_ids[self.pos] >= target {
-                return Ok(Some(self.doc()));
+                return Some(self.doc());
             }
         }
 
-        // Binary search on skip entries: find first block where last_doc >= target.
-        let mut lo = self.block_idx;
-        let mut hi = self.skip_count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if si.read_skip_entry(self.skip_start + mid).last_doc < target {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        // Seek to the block containing target
+        let lo = match &self.variant {
+            // Text: SIMD-accelerated 2-level seek (L1 + L0)
+            CursorVariant::Text { list, .. } => match list.seek_block(target, self.block_idx) {
+                Some(idx) => idx,
+                None => {
+                    self.exhausted = true;
+                    return Some(u32::MAX);
+                }
+            },
+            // Sparse: binary search on skip entries (lazy mmap reads)
+            CursorVariant::Sparse { .. } => {
+                let mut lo = self.block_idx;
+                let mut hi = self.num_blocks;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if self.block_last_doc(mid) < target {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
             }
-        }
-        if lo >= self.skip_count {
+        };
+        if lo >= self.num_blocks {
             self.exhausted = true;
-            return Ok(Some(u32::MAX));
+            return Some(u32::MAX);
         }
         if lo != self.block_idx || !self.block_loaded {
             self.block_idx = lo;
             self.block_loaded = false;
         }
-        // Need a block load — caller handles sync/async
-        Ok(None)
+        None
     }
 
-    /// Finish seek after block load: position within the loaded block.
-    /// Returns `true` if a second block load is needed.
     #[inline]
     fn seek_finish(&mut self, target: DocId) -> bool {
         if self.exhausted {
@@ -1228,161 +1024,13 @@ impl LazyTermCursor {
         if self.pos >= self.doc_ids.len() {
             self.block_idx += 1;
             self.block_loaded = false;
-            if self.block_idx >= self.skip_count {
+            if self.block_idx >= self.num_blocks {
                 self.exhausted = true;
                 return false;
             }
-            return true; // need second block load
+            return true;
         }
         false
-    }
-
-    // --- Async methods (delegate to shared helpers) ---
-
-    async fn ensure_block_loaded(
-        &mut self,
-        si: &crate::segment::SparseIndex,
-    ) -> crate::Result<bool> {
-        if self.exhausted || self.block_loaded {
-            return Ok(!self.exhausted);
-        }
-        let block = si
-            .load_block_direct(self.skip_start, self.block_data_offset, self.block_idx)
-            .await?;
-        self.handle_block_result(block)
-    }
-
-    async fn advance(&mut self, si: &crate::segment::SparseIndex) -> crate::Result<DocId> {
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        self.ensure_block_loaded(si).await?;
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        Ok(self.advance_pos())
-    }
-
-    async fn seek(
-        &mut self,
-        si: &crate::segment::SparseIndex,
-        target: DocId,
-    ) -> crate::Result<DocId> {
-        if let Some(doc) = self.seek_prepare(si, target)? {
-            return Ok(doc);
-        }
-        self.ensure_block_loaded(si).await?;
-        if self.seek_finish(target) {
-            self.ensure_block_loaded(si).await?;
-        }
-        Ok(self.doc())
-    }
-
-    // --- Sync methods (delegate to same shared helpers) ---
-
-    fn ensure_block_loaded_sync(
-        &mut self,
-        si: &crate::segment::SparseIndex,
-    ) -> crate::Result<bool> {
-        if self.exhausted || self.block_loaded {
-            return Ok(!self.exhausted);
-        }
-        let block =
-            si.load_block_direct_sync(self.skip_start, self.block_data_offset, self.block_idx)?;
-        self.handle_block_result(block)
-    }
-
-    fn advance_sync(&mut self, si: &crate::segment::SparseIndex) -> crate::Result<DocId> {
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        self.ensure_block_loaded_sync(si)?;
-        if self.exhausted {
-            return Ok(u32::MAX);
-        }
-        Ok(self.advance_pos())
-    }
-
-    fn seek_sync(
-        &mut self,
-        si: &crate::segment::SparseIndex,
-        target: DocId,
-    ) -> crate::Result<DocId> {
-        if let Some(doc) = self.seek_prepare(si, target)? {
-            return Ok(doc);
-        }
-        self.ensure_block_loaded_sync(si)?;
-        if self.seek_finish(target) {
-            self.ensure_block_loaded_sync(si)?;
-        }
-        Ok(self.doc())
-    }
-
-    // --- Read-only accessors (shared) ---
-
-    #[inline]
-    fn doc_with_si(&self, si: &crate::segment::SparseIndex) -> DocId {
-        if self.exhausted {
-            return u32::MAX;
-        }
-        if !self.block_loaded {
-            return si
-                .read_skip_entry(self.skip_start + self.block_idx)
-                .first_doc;
-        }
-        self.doc_ids.get(self.pos).copied().unwrap_or(u32::MAX)
-    }
-
-    #[inline]
-    fn doc(&self) -> DocId {
-        if self.exhausted {
-            return u32::MAX;
-        }
-        if self.block_loaded {
-            return self.doc_ids.get(self.pos).copied().unwrap_or(u32::MAX);
-        }
-        u32::MAX
-    }
-
-    #[inline]
-    fn ordinal(&self) -> u16 {
-        if !self.block_loaded {
-            return 0;
-        }
-        self.ordinals.get(self.pos).copied().unwrap_or(0)
-    }
-
-    #[inline]
-    fn score(&self) -> f32 {
-        if !self.block_loaded {
-            return 0.0;
-        }
-        self.weights.get(self.pos).copied().unwrap_or(0.0)
-    }
-
-    #[inline]
-    fn current_block_max_score(&self, si: &crate::segment::SparseIndex) -> f32 {
-        if self.exhausted || self.block_idx >= self.skip_count {
-            return 0.0;
-        }
-        self.abs_query_weight
-            * si.read_skip_entry(self.skip_start + self.block_idx)
-                .max_weight
-    }
-
-    /// Skip to next block without loading it (for block-max pruning)
-    fn skip_to_next_block(&mut self, si: &crate::segment::SparseIndex) -> DocId {
-        if self.exhausted {
-            return u32::MAX;
-        }
-        self.block_idx += 1;
-        self.block_loaded = false;
-        if self.block_idx >= self.skip_count {
-            self.exhausted = true;
-            return u32::MAX;
-        }
-        si.read_skip_entry(self.skip_start + self.block_idx)
-            .first_doc
     }
 }
 
@@ -1393,17 +1041,15 @@ impl LazyTermCursor {
 macro_rules! bms_execute_loop {
     ($self:ident, $ensure:ident, $advance:ident, $seek:ident, $($aw:tt)*) => {{
         let n = $self.cursors.len();
-        let si = $self.sparse_index;
 
         // Load first block for each cursor (ensures doc() returns real values)
         for cursor in &mut $self.cursors {
-            cursor.$ensure(si) $($aw)* ?;
+            cursor.$ensure() $($aw)* ?;
         }
 
         let mut docs_scored = 0u64;
         let mut docs_skipped = 0u64;
         let mut blocks_skipped = 0u64;
-        let mut blocks_loaded = 0u64;
         let mut conjunction_skipped = 0u64;
         let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
 
@@ -1416,13 +1062,28 @@ macro_rules! bms_execute_loop {
             // Find minimum doc_id across essential cursors
             let mut min_doc = u32::MAX;
             for i in partition..n {
-                let doc = $self.cursors[i].doc_with_si(si);
+                let doc = $self.cursors[i].doc();
                 if doc < min_doc {
                     min_doc = doc;
                 }
             }
             if min_doc == u32::MAX {
                 break;
+            }
+
+            // --- Filter predicate check (before any scoring) ---
+            if let Some(ref pred) = $self.predicate {
+                if !pred(min_doc) {
+                    // Advance essential cursors past this doc
+                    for i in partition..n {
+                        if $self.cursors[i].doc() == min_doc {
+                            $self.cursors[i].$ensure() $($aw)* ?;
+                            $self.cursors[i].$advance() $($aw)* ?;
+                        }
+                    }
+                    docs_skipped += 1;
+                    continue;
+                }
             }
 
             let non_essential_upper = if partition > 0 {
@@ -1435,16 +1096,15 @@ macro_rules! bms_execute_loop {
             // --- Conjunction optimization ---
             if $self.collector.len() >= $self.collector.k {
                 let present_upper: f32 = (partition..n)
-                    .filter(|&i| $self.cursors[i].doc_with_si(si) == min_doc)
+                    .filter(|&i| $self.cursors[i].doc() == min_doc)
                     .map(|i| $self.cursors[i].max_score)
                     .sum();
 
                 if present_upper + non_essential_upper <= adjusted_threshold {
                     for i in partition..n {
-                        if $self.cursors[i].doc_with_si(si) == min_doc {
-                            $self.cursors[i].$ensure(si) $($aw)* ?;
-                            $self.cursors[i].$advance(si) $($aw)* ?;
-                            blocks_loaded += u64::from($self.cursors[i].block_loaded);
+                        if $self.cursors[i].doc() == min_doc {
+                            $self.cursors[i].$ensure() $($aw)* ?;
+                            $self.cursors[i].$advance() $($aw)* ?;
                         }
                     }
                     conjunction_skipped += 1;
@@ -1455,16 +1115,15 @@ macro_rules! bms_execute_loop {
             // --- Block-max pruning ---
             if $self.collector.len() >= $self.collector.k {
                 let block_max_sum: f32 = (partition..n)
-                    .filter(|&i| $self.cursors[i].doc_with_si(si) == min_doc)
-                    .map(|i| $self.cursors[i].current_block_max_score(si))
+                    .filter(|&i| $self.cursors[i].doc() == min_doc)
+                    .map(|i| $self.cursors[i].current_block_max_score())
                     .sum();
 
                 if block_max_sum + non_essential_upper <= adjusted_threshold {
                     for i in partition..n {
-                        if $self.cursors[i].doc_with_si(si) == min_doc {
-                            $self.cursors[i].skip_to_next_block(si);
-                            $self.cursors[i].$ensure(si) $($aw)* ?;
-                            blocks_loaded += 1;
+                        if $self.cursors[i].doc() == min_doc {
+                            $self.cursors[i].skip_to_next_block();
+                            $self.cursors[i].$ensure() $($aw)* ?;
                         }
                     }
                     blocks_skipped += 1;
@@ -1475,11 +1134,11 @@ macro_rules! bms_execute_loop {
             // --- Score essential cursors ---
             ordinal_scores.clear();
             for i in partition..n {
-                if $self.cursors[i].doc_with_si(si) == min_doc {
-                    $self.cursors[i].$ensure(si) $($aw)* ?;
-                    while $self.cursors[i].doc_with_si(si) == min_doc {
+                if $self.cursors[i].doc() == min_doc {
+                    $self.cursors[i].$ensure() $($aw)* ?;
+                    while $self.cursors[i].doc() == min_doc {
                         ordinal_scores.push(($self.cursors[i].ordinal(), $self.cursors[i].score()));
-                        $self.cursors[i].$advance(si) $($aw)* ?;
+                        $self.cursors[i].$advance() $($aw)* ?;
                     }
                 }
             }
@@ -1501,13 +1160,13 @@ macro_rules! bms_execute_loop {
                     break;
                 }
 
-                let doc = $self.cursors[i].$seek(si, min_doc) $($aw)* ?;
+                let doc = $self.cursors[i].$seek(min_doc) $($aw)* ?;
                 if doc == min_doc {
-                    while $self.cursors[i].doc_with_si(si) == min_doc {
+                    while $self.cursors[i].doc() == min_doc {
                         let s = $self.cursors[i].score();
                         running_total += s;
                         ordinal_scores.push(($self.cursors[i].ordinal(), s));
-                        $self.cursors[i].$advance(si) $($aw)* ?;
+                        $self.cursors[i].$advance() $($aw)* ?;
                     }
                 }
             }
@@ -1559,11 +1218,10 @@ macro_rules! bms_execute_loop {
             .collect();
 
         debug!(
-            "SparseMaxScoreExecutor: scored={}, skipped={}, blocks_skipped={}, blocks_loaded={}, conjunction_skipped={}, returned={}, top_score={:.4}",
+            "MaxScoreExecutor: scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
             docs_scored,
             docs_skipped,
             blocks_skipped,
-            blocks_loaded,
             conjunction_skipped,
             results.len(),
             results.first().map(|r| r.score).unwrap_or(0.0)
@@ -1573,32 +1231,12 @@ macro_rules! bms_execute_loop {
     }};
 }
 
-impl<'a> SparseMaxScoreExecutor<'a> {
-    /// Create a new lazy executor
+impl<'a> MaxScoreExecutor<'a> {
+    /// Create a new executor from pre-built cursors.
     ///
-    /// `query_terms` should contain only dimensions present in the index.
-    /// Skip entries are read from the zero-copy mmap section (no I/O).
-    pub fn new(
-        sparse_index: &'a crate::segment::SparseIndex,
-        query_terms: Vec<(u32, f32)>,
-        k: usize,
-        heap_factor: f32,
-    ) -> Self {
-        let mut cursors: Vec<LazyTermCursor> = query_terms
-            .iter()
-            .filter_map(|&(dim_id, qw)| {
-                let (skip_start, skip_count, global_max, block_data_offset) =
-                    sparse_index.get_skip_range_full(dim_id)?;
-                Some(LazyTermCursor::new(
-                    qw,
-                    skip_start,
-                    skip_count,
-                    global_max,
-                    block_data_offset,
-                ))
-            })
-            .collect();
-
+    /// Cursors are sorted by max_score ascending (non-essential first) and
+    /// prefix sums are computed for the MaxScore partitioning.
+    pub(crate) fn new(mut cursors: Vec<TermCursor<'a>>, k: usize, heap_factor: f32) -> Self {
         // Sort by max_score ascending (non-essential first)
         cursors.sort_by(|a, b| {
             a.max_score
@@ -1614,7 +1252,7 @@ impl<'a> SparseMaxScoreExecutor<'a> {
         }
 
         debug!(
-            "Creating SparseMaxScoreExecutor: num_terms={}, k={}, total_upper={:.4}, heap_factor={:.2}",
+            "Creating MaxScoreExecutor: num_cursors={}, k={}, total_upper={:.4}, heap_factor={:.2}",
             cursors.len(),
             k,
             cumsum,
@@ -1622,22 +1260,68 @@ impl<'a> SparseMaxScoreExecutor<'a> {
         );
 
         Self {
-            sparse_index,
             cursors,
             prefix_sums,
             collector: ScoreCollector::new(k),
             heap_factor: heap_factor.clamp(0.0, 1.0),
+            predicate: None,
         }
+    }
+
+    /// Set a filter predicate that rejects documents before scoring.
+    pub fn set_predicate(&mut self, predicate: Option<super::DocPredicate<'a>>) {
+        self.predicate = predicate;
+    }
+
+    /// Create an executor for sparse vector queries.
+    ///
+    /// Builds `TermCursor::Sparse` for each matched dimension.
+    pub fn sparse(
+        sparse_index: &'a crate::segment::SparseIndex,
+        query_terms: Vec<(u32, f32)>,
+        k: usize,
+        heap_factor: f32,
+    ) -> Self {
+        let cursors: Vec<TermCursor<'a>> = query_terms
+            .iter()
+            .filter_map(|&(dim_id, qw)| {
+                let (skip_start, skip_count, global_max, block_data_offset) =
+                    sparse_index.get_skip_range_full(dim_id)?;
+                Some(TermCursor::sparse(
+                    sparse_index,
+                    qw,
+                    skip_start,
+                    skip_count,
+                    global_max,
+                    block_data_offset,
+                ))
+            })
+            .collect();
+        Self::new(cursors, k, heap_factor)
+    }
+
+    /// Create an executor for full-text BM25 queries.
+    ///
+    /// Builds `TermCursor::Text` for each posting list.
+    pub fn text(
+        posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
+        avg_field_len: f32,
+        k: usize,
+    ) -> Self {
+        let cursors: Vec<TermCursor<'a>> = posting_lists
+            .into_iter()
+            .map(|(pl, idf)| TermCursor::text(pl, idf, avg_field_len))
+            .collect();
+        Self::new(cursors, k, 1.0)
     }
 
     #[inline]
     fn find_partition(&self) -> usize {
         let threshold = self.collector.threshold() * self.heap_factor;
-        // Binary search: prefix_sums is monotonically increasing
         self.prefix_sums.partition_point(|&sum| sum <= threshold)
     }
 
-    /// Execute lazy Block-Max MaxScore and return top-k results
+    /// Execute Block-Max MaxScore and return top-k results (async).
     pub async fn execute(mut self) -> crate::Result<Vec<ScoredDoc>> {
         if self.cursors.is_empty() {
             return Ok(Vec::new());
@@ -1645,8 +1329,7 @@ impl<'a> SparseMaxScoreExecutor<'a> {
         bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await)
     }
 
-    /// Synchronous execution — only works when the sparse index has an Inline (mmap/RAM) handle.
-    /// Bypasses all async overhead for mmap-backed indexes.
+    /// Synchronous execution — works when all cursors are text or mmap-backed sparse.
     pub fn execute_sync(mut self) -> crate::Result<Vec<ScoredDoc>> {
         if self.cursors.is_empty() {
             return Ok(Vec::new());

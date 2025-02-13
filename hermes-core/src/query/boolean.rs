@@ -6,10 +6,7 @@ use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
-use super::{
-    CountFuture, GlobalStats, MaxScoreExecutor, Query, ScoredDoc, Scorer, ScorerFuture,
-    TextTermScorer,
-};
+use super::{CountFuture, GlobalStats, MaxScoreExecutor, Query, ScoredDoc, Scorer, ScorerFuture};
 
 /// Boolean query with MUST, SHOULD, and MUST_NOT clauses
 ///
@@ -68,6 +65,7 @@ async fn try_maxscore_scorer<'a>(
     reader: &'a SegmentReader,
     limit: usize,
     global_stats: Option<&Arc<GlobalStats>>,
+    predicate: Option<super::DocPredicate<'a>>,
 ) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
     // Extract term info from all SHOULD clauses
     let mut term_infos: Vec<_> = should
@@ -86,8 +84,9 @@ async fn try_maxscore_scorer<'a>(
         return Ok(None);
     }
 
-    // Build scorers for each term
-    let mut scorers: Vec<TextTermScorer> = Vec::with_capacity(term_infos.len());
+    // Build (posting_list, idf) pairs for each term
+    let mut posting_lists: Vec<(crate::structures::BlockPostingList, f32)> =
+        Vec::with_capacity(term_infos.len());
     let avg_field_len = global_stats
         .map(|s| s.avg_field_len(first_field))
         .unwrap_or_else(|| reader.avg_field_len(first_field));
@@ -106,23 +105,30 @@ async fn try_maxscore_scorer<'a>(
             } else {
                 super::bm25_idf(doc_freq, num_docs)
             };
-            scorers.push(TextTermScorer::new(posting_list, idf, avg_field_len));
+            posting_lists.push((posting_list, idf));
         }
     }
 
-    if scorers.is_empty() {
+    if posting_lists.is_empty() {
         return Ok(Some(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>));
     }
 
-    // Use MaxScore executor for efficient top-k
-    let results = MaxScoreExecutor::new(scorers, limit).execute();
+    // Use unified MaxScore executor for efficient top-k
+    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit);
+    executor.set_predicate(predicate);
+    let results = executor.execute_sync()?;
     Ok(Some(
         Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>
     ))
 }
 
 impl Query for BooleanQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<super::DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
         // Clone Arc vectors - cheap reference counting
         let must = self.must.clone();
         let should = self.should.clone();
@@ -136,25 +142,27 @@ impl Query for BooleanQuery {
                 && must_not.is_empty()
                 && should.len() >= 2
                 && let Some(scorer) =
-                    try_maxscore_scorer(&should, reader, limit, global_stats.as_ref()).await?
+                    try_maxscore_scorer(&should, reader, limit, global_stats.as_ref(), predicate)
+                        .await?
             {
                 return Ok(scorer);
             }
 
             // Fall back to standard boolean scoring
+            // Predicate not passed to sub-scorers — it's only useful for executors
             let mut must_scorers = Vec::with_capacity(must.len());
             for q in &must {
-                must_scorers.push(q.scorer(reader, limit).await?);
+                must_scorers.push(q.scorer(reader, limit, None).await?);
             }
 
             let mut should_scorers = Vec::with_capacity(should.len());
             for q in &should {
-                should_scorers.push(q.scorer(reader, limit).await?);
+                should_scorers.push(q.scorer(reader, limit, None).await?);
             }
 
             let mut must_not_scorers = Vec::with_capacity(must_not.len());
             for q in &must_not {
-                must_not_scorers.push(q.scorer(reader, limit).await?);
+                must_not_scorers.push(q.scorer(reader, limit, None).await?);
             }
 
             let mut scorer = BooleanScorer {
@@ -316,7 +324,8 @@ impl Scorer for BooleanScorer<'_> {
             }
         }
 
-        self.find_next_match()
+        self.current_doc = self.find_next_match();
+        self.current_doc
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
@@ -328,7 +337,8 @@ impl Scorer for BooleanScorer<'_> {
             scorer.seek(target);
         }
 
-        self.find_next_match()
+        self.current_doc = self.find_next_match();
+        self.current_doc
     }
 
     fn size_hint(&self) -> u32 {

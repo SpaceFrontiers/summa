@@ -8,6 +8,16 @@ use std::pin::Pin;
 use crate::segment::SegmentReader;
 use crate::{DocId, Result, Score};
 
+/// Filter predicate checked per-doc during scoring.
+///
+/// Fast-field lookups are O(1) per doc — no bitset needed.
+/// Passed through the query tree so executors (MaxScore, BMP) can reject
+/// filtered documents *inside* the scoring loop, before they enter the heap.
+#[cfg(not(target_arch = "wasm32"))]
+pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + Send + Sync + 'a>;
+#[cfg(target_arch = "wasm32")]
+pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + 'a>;
+
 /// BM25 parameters
 #[derive(Debug, Clone, Copy)]
 pub struct Bm25Params {
@@ -63,7 +73,12 @@ macro_rules! define_query_traits {
             ///
             /// Note: The scorer borrows only the reader, not the query. Implementations
             /// should capture any needed query data (field, terms, etc.) during creation.
-            fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a>;
+            fn scorer<'a>(
+                &self,
+                reader: &'a SegmentReader,
+                limit: usize,
+                predicate: Option<DocPredicate<'a>>,
+            ) -> ScorerFuture<'a>;
 
             /// Estimated number of matching documents in a segment (async)
             fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a>;
@@ -109,8 +124,13 @@ define_query_traits!(Send + Sync);
 define_query_traits!();
 
 impl Query for Box<dyn Query> {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
-        (**self).scorer(reader, limit)
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
+        (**self).scorer(reader, limit, predicate)
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {

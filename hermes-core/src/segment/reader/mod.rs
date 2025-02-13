@@ -828,7 +828,7 @@ impl AsyncSegmentReader {
 
     /// Search for similar sparse vectors using dedicated sparse posting lists
     ///
-    /// Uses `BmpExecutor` or `SparseMaxScoreExecutor` for efficient top-k retrieval.
+    /// Uses `BmpExecutor` or `MaxScoreExecutor` for efficient top-k retrieval.
     /// Optimizations:
     /// 1. **MaxScore pruning**: Dimensions sorted by max contribution
     /// 2. **Block-max pruning**: Skips blocks where max contribution < threshold
@@ -888,7 +888,7 @@ impl AsyncSegmentReader {
 
         // Select executor based on number of query terms:
         // - 12+ terms: BMP (block-at-a-time, lazy block loading, best for SPLADE)
-        // - 1-11 terms: SparseMaxScoreExecutor (cursor-based traversal + lazy block loading)
+        // - 1-11 terms: MaxScoreExecutor (cursor-based DAAT + lazy block loading)
         let num_terms = matched_terms.len();
         let over_fetch = limit * 2; // Over-fetch for multi-value combining
         let raw_results = if num_terms > 12 {
@@ -897,9 +897,8 @@ impl AsyncSegmentReader {
                 .execute()
                 .await?
         } else {
-            // Lazy BlockMaxScore: skip entries drive navigation, blocks loaded on-demand.
-            // No upfront get_posting() — blocks only loaded when cursor actually visits them.
-            crate::query::SparseMaxScoreExecutor::new(
+            // Block-Max MaxScore: skip entries drive navigation, blocks loaded on-demand.
+            crate::query::MaxScoreExecutor::sparse(
                 sparse_index,
                 matched_terms,
                 over_fetch,

@@ -61,7 +61,12 @@ impl TermQuery {
 }
 
 impl Query for TermQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        _limit: usize,
+        _predicate: Option<super::DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
         let field = self.field;
         let term = self.term.clone();
         let global_stats = self.global_stats.clone();

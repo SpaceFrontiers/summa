@@ -1,14 +1,14 @@
-//! Fast-field merge: stackable columnar merge from source segments.
+//! Fast-field merge: raw block stacking from source segments.
 //!
-//! **Numeric columns** (u64/i64/f64): values are read via `get_u64()` from the
-//! zero-copy source readers and collected into a single `FastFieldWriter`.
-//! The reader operates directly on the mmap'd `.fast` file — no extra copies.
+//! Each source segment's fast-field column is a sequence of blocks.
+//! Merge = concatenate blocks from all source segments via raw byte copy
+//! (memcpy from mmap). No per-value decode/re-encode.
 //!
-//! **Text columns**: dictionaries differ across segments, so we rebuild the
-//! merged dictionary from the union of all unique strings. Ordinals are
-//! re-mapped via the new sorted dictionary.
+//! For segments missing a field, a zero-filled single block is synthesized.
 
-use rustc_hash::FxHashMap;
+use std::io::Write;
+
+use byteorder::{LittleEndian, WriteBytesExt};
 
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
@@ -16,7 +16,8 @@ use crate::dsl::FieldType;
 use crate::segment::reader::AsyncSegmentReader as SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::structures::fast_field::{
-    FastFieldColumnType, FastFieldTocEntry, FastFieldWriter, write_fast_field_toc_and_footer,
+    BLOCK_INDEX_ENTRY_SIZE, BlockIndexEntry, FastFieldColumnType, FastFieldTocEntry,
+    FastFieldWriter, write_fast_field_toc_and_footer,
 };
 
 use super::SegmentMerger;
@@ -24,9 +25,8 @@ use super::SegmentMerger;
 impl SegmentMerger {
     /// Merge fast-field columns from source segments into a new `.fast` file.
     ///
-    /// Source readers are zero-copy (backed by mmap/OwnedBytes), so the
-    /// per-doc `get_u64` calls read directly from the file without
-    /// intermediate allocations.
+    /// Uses raw block stacking: copies block data+dict bytes directly from
+    /// mmap'd source readers. Memory usage = O(block_index) per column.
     pub(super) async fn merge_fast_fields<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
@@ -59,76 +59,79 @@ impl SegmentMerger {
 
         let total_docs: u32 = segments.iter().map(|s| s.num_docs()).sum();
 
-        // Create writers for each fast field
-        let mut writers: FxHashMap<u32, FastFieldWriter> = FxHashMap::default();
-        for &(field_id, ref field_type) in &fast_fields {
-            let writer = match field_type {
-                FieldType::U64 => FastFieldWriter::new_numeric(FastFieldColumnType::U64),
-                FieldType::I64 => FastFieldWriter::new_numeric(FastFieldColumnType::I64),
-                FieldType::F64 => FastFieldWriter::new_numeric(FastFieldColumnType::F64),
-                FieldType::Text => FastFieldWriter::new_text(),
+        // Sort field_ids for deterministic output
+        let mut sorted_fields = fast_fields.clone();
+        sorted_fields.sort_by_key(|&(id, _)| id);
+
+        let mut fast_writer = dir.streaming_writer(&files.fast).await?;
+        let mut toc_entries: Vec<FastFieldTocEntry> = Vec::with_capacity(sorted_fields.len());
+        let mut current_offset = 0u64;
+
+        for &(field_id, ref field_type) in &sorted_fields {
+            let is_multi = self
+                .schema
+                .get_field_entry(crate::dsl::Field(field_id))
+                .map(|e| e.multi)
+                .unwrap_or(false);
+            let column_type = match field_type {
+                FieldType::U64 => FastFieldColumnType::U64,
+                FieldType::I64 => FastFieldColumnType::I64,
+                FieldType::F64 => FastFieldColumnType::F64,
+                FieldType::Text => FastFieldColumnType::TextOrdinal,
                 _ => continue,
             };
-            writers.insert(field_id, writer);
-        }
 
-        // Iterate source segments, reading from zero-copy mmap'd readers.
-        // For numeric columns: get_u64 reads directly from the mmap'd bitpacked data.
-        // For text columns: get_text borrows from the mmap'd dictionary.
-        let mut merged_doc_id: u32 = 0;
-        for segment in segments {
-            let num_docs = segment.num_docs();
-            for &(field_id, ref field_type) in &fast_fields {
-                let src = segment.fast_field(field_id);
-                let writer = match writers.get_mut(&field_id) {
-                    Some(w) => w,
-                    None => continue,
-                };
+            // Collect block info from all source segments
+            let mut all_blocks: Vec<SourceBlock> = Vec::new();
 
-                match (field_type, src) {
-                    (FieldType::Text, Some(src_reader)) => {
-                        for local in 0..num_docs {
-                            if let Some(text) = src_reader.get_text(local) {
-                                writer.add_text(merged_doc_id + local, text);
-                            }
-                            // Missing → leave as TEXT_MISSING_ORDINAL (default)
+            for segment in segments.iter() {
+                let num_docs = segment.num_docs();
+                match segment.fast_field(field_id) {
+                    Some(reader) => {
+                        // Flatten blocks from source reader
+                        for block in reader.blocks() {
+                            all_blocks.push(SourceBlock::Raw {
+                                num_docs: block.num_docs,
+                                data: block.data.as_slice(),
+                                dict_count: block.dict.as_ref().map(|d| d.len()).unwrap_or(0),
+                                dict_bytes: block.raw_dict.as_slice(),
+                            });
                         }
                     }
-                    (_, Some(src_reader)) => {
-                        // Numeric: read raw encoded u64 values directly
-                        for local in 0..num_docs {
-                            let val = src_reader.get_u64(local);
-                            writer.add_u64(merged_doc_id + local, val);
+                    None => {
+                        // No fast-field data — synthesize a zero block
+                        if num_docs > 0 {
+                            all_blocks.push(SourceBlock::Missing {
+                                num_docs,
+                                is_multi,
+                                column_type,
+                            });
                         }
-                    }
-                    (_, None) => {
-                        // No fast-field data in this segment — pad with zeros
-                        writer.pad_to(merged_doc_id + num_docs);
                     }
                 }
             }
-            merged_doc_id += num_docs;
-        }
 
-        // Serialize to .fast file (streaming)
-        let mut fast_writer = dir.streaming_writer(&files.fast).await?;
+            let bytes_written = write_merged_column(
+                &mut *fast_writer,
+                field_id,
+                column_type,
+                is_multi,
+                total_docs,
+                &all_blocks,
+            )
+            .map_err(crate::Error::Io)?;
 
-        let mut field_ids: Vec<u32> = writers.keys().copied().collect();
-        field_ids.sort_unstable();
-
-        let mut toc_entries: Vec<FastFieldTocEntry> = Vec::with_capacity(field_ids.len());
-        let mut current_offset = 0u64;
-
-        for &field_id in &field_ids {
-            let ff = writers.get_mut(&field_id).unwrap();
-            ff.pad_to(total_docs);
-
-            let (mut toc, bytes_written) = ff
-                .serialize(&mut *fast_writer, current_offset)
-                .map_err(crate::Error::Io)?;
-            toc.field_id = field_id;
+            toc_entries.push(FastFieldTocEntry {
+                field_id,
+                column_type,
+                multi: is_multi,
+                data_offset: current_offset,
+                data_len: bytes_written,
+                num_docs: total_docs,
+                dict_offset: 0,
+                dict_count: 0,
+            });
             current_offset += bytes_written;
-            toc_entries.push(toc);
         }
 
         let toc_offset = current_offset;
@@ -136,10 +139,10 @@ impl SegmentMerger {
             .map_err(crate::Error::Io)?;
         fast_writer.finish()?;
 
-        let total_bytes = toc_offset as usize + toc_entries.len() * 38 + 16; // data + toc + footer
+        let total_bytes = toc_offset as usize + toc_entries.len() * 38 + 16;
 
         log::info!(
-            "[merge] fast-fields: {} columns, {} docs, {}",
+            "[merge] fast-fields: {} columns, {} docs, {} (raw block stacking)",
             toc_entries.len(),
             total_docs,
             super::format_bytes(total_bytes)
@@ -147,4 +150,152 @@ impl SegmentMerger {
 
         Ok(total_bytes)
     }
+}
+
+/// A block from a source segment — either raw bytes or a synthetic zero block.
+enum SourceBlock<'a> {
+    /// Raw block data from an existing segment (memcpy)
+    Raw {
+        num_docs: u32,
+        data: &'a [u8],
+        dict_count: u32,
+        dict_bytes: &'a [u8],
+    },
+    /// Segment had no data for this field — synthesize zeros
+    Missing {
+        num_docs: u32,
+        is_multi: bool,
+        column_type: FastFieldColumnType,
+    },
+}
+
+/// Write a merged blocked column: [num_blocks] [block_index] [block_data+dict...]
+fn write_merged_column(
+    writer: &mut dyn Write,
+    _field_id: u32,
+    _column_type: FastFieldColumnType,
+    _is_multi: bool,
+    _total_docs: u32,
+    blocks: &[SourceBlock],
+) -> std::io::Result<u64> {
+    // Precompute block index entries (need to know data/dict sizes before writing)
+    let mut index_entries: Vec<BlockIndexEntry> = Vec::with_capacity(blocks.len());
+    let mut block_payloads: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(blocks.len());
+
+    for block in blocks {
+        match block {
+            SourceBlock::Raw {
+                num_docs,
+                data,
+                dict_count,
+                dict_bytes,
+            } => {
+                index_entries.push(BlockIndexEntry {
+                    num_docs: *num_docs,
+                    data_len: data.len() as u32,
+                    dict_count: *dict_count,
+                    dict_len: dict_bytes.len() as u32,
+                });
+                // Raw data is written directly from source — no allocation
+                block_payloads.push((Vec::new(), Vec::new())); // placeholder
+            }
+            SourceBlock::Missing {
+                num_docs,
+                is_multi: blk_multi,
+                column_type: blk_type,
+            } => {
+                // Synthesize a zero-filled block
+                let (data_buf, dict_buf, dict_count) =
+                    synthesize_zero_block(*num_docs, *blk_multi, *blk_type)?;
+                index_entries.push(BlockIndexEntry {
+                    num_docs: *num_docs,
+                    data_len: data_buf.len() as u32,
+                    dict_count,
+                    dict_len: dict_buf.len() as u32,
+                });
+                block_payloads.push((data_buf, dict_buf));
+            }
+        }
+    }
+
+    let mut total = 0u64;
+
+    // Write num_blocks
+    writer.write_u32::<LittleEndian>(blocks.len() as u32)?;
+    total += 4;
+
+    // Write block index
+    for entry in &index_entries {
+        entry.write_to(writer)?;
+    }
+    total += (blocks.len() * BLOCK_INDEX_ENTRY_SIZE) as u64;
+
+    // Write block data + dicts
+    for (i, block) in blocks.iter().enumerate() {
+        match block {
+            SourceBlock::Raw {
+                data, dict_bytes, ..
+            } => {
+                writer.write_all(data)?;
+                total += data.len() as u64;
+                writer.write_all(dict_bytes)?;
+                total += dict_bytes.len() as u64;
+            }
+            SourceBlock::Missing { .. } => {
+                let (ref data_buf, ref dict_buf) = block_payloads[i];
+                writer.write_all(data_buf)?;
+                total += data_buf.len() as u64;
+                writer.write_all(dict_buf)?;
+                total += dict_buf.len() as u64;
+            }
+        }
+    }
+
+    Ok(total)
+}
+
+/// Synthesize a zero-filled block for a segment that lacks a fast field.
+/// Returns (data_bytes, dict_bytes, dict_count).
+fn synthesize_zero_block(
+    num_docs: u32,
+    is_multi: bool,
+    column_type: FastFieldColumnType,
+) -> std::io::Result<(Vec<u8>, Vec<u8>, u32)> {
+    let mut writer = if is_multi {
+        match column_type {
+            FastFieldColumnType::TextOrdinal => FastFieldWriter::new_text_multi(),
+            _ => FastFieldWriter::new_numeric_multi(column_type),
+        }
+    } else {
+        match column_type {
+            FastFieldColumnType::TextOrdinal => FastFieldWriter::new_text(),
+            _ => FastFieldWriter::new_numeric(column_type),
+        }
+    };
+    writer.pad_to(num_docs);
+
+    // Serialize through the normal writer path, then strip the blocked header
+    // (we just want the inner block data + dict)
+    let mut buf = Vec::new();
+    let (_toc, _total) = writer.serialize(&mut buf, 0)?;
+
+    // The serialized format is: [num_blocks(4)] [BlockIndexEntry(16)] [data] [dict]
+    // We need to extract just the data and dict portions
+    if buf.len() < 4 + BLOCK_INDEX_ENTRY_SIZE {
+        return Ok((Vec::new(), Vec::new(), 0));
+    }
+    let mut cursor = std::io::Cursor::new(&buf[4..4 + BLOCK_INDEX_ENTRY_SIZE]);
+    let entry = BlockIndexEntry::read_from(&mut cursor)?;
+    let data_start = 4 + BLOCK_INDEX_ENTRY_SIZE;
+    let data_end = data_start + entry.data_len as usize;
+    let dict_end = data_end + entry.dict_len as usize;
+
+    let data_bytes = buf[data_start..data_end].to_vec();
+    let dict_bytes = if dict_end > data_end {
+        buf[data_end..dict_end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok((data_bytes, dict_bytes, entry.dict_count))
 }

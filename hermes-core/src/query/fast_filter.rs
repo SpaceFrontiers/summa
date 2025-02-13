@@ -9,11 +9,11 @@ use crate::dsl::Field;
 use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
 use crate::structures::fast_field::{
-    FastFieldColumnType, FastFieldReader, TEXT_MISSING_ORDINAL, f64_to_sortable_u64, zigzag_encode,
+    FAST_FIELD_MISSING, FastFieldReader, f64_to_sortable_u64, zigzag_decode, zigzag_encode,
 };
 use crate::{DocId, Score};
 
-use super::{CountFuture, Query, Scorer, ScorerFuture};
+use super::{CountFuture, DocPredicate, Query, Scorer, ScorerFuture};
 
 // ── Filter condition ──────────────────────────────────────────────────────
 
@@ -53,27 +53,38 @@ enum CompiledFilter {
         min: u64,
         max: u64,
     },
-    In(Vec<u64>),
-    Exists {
-        column_type: FastFieldColumnType,
+    /// Range on i64 values — checked on decoded (zigzag) values since zigzag
+    /// encoding does NOT preserve order.
+    RangeI64Decoded {
+        min: i64,
+        max: i64,
     },
+    In(Vec<u64>),
+    Exists,
     /// Always fails (e.g. text value not in dictionary)
     Never,
 }
 
 impl CompiledFilter {
     /// Check if a raw column value passes this filter.
+    ///
+    /// Absent values ([`FAST_FIELD_MISSING`]) never match any value filter
+    /// (Eq, Range, In). Only [`Exists`](CompiledFilter::Exists) explicitly
+    /// tests for presence.
     #[inline]
     fn matches(&self, raw: u64) -> bool {
         match self {
+            CompiledFilter::Exists => raw != FAST_FIELD_MISSING,
+            CompiledFilter::Never => false,
+            // All value-matching filters reject absent docs
+            _ if raw == FAST_FIELD_MISSING => false,
             CompiledFilter::Eq(v) => raw == *v,
             CompiledFilter::Range { min, max } => raw >= *min && raw <= *max,
+            CompiledFilter::RangeI64Decoded { min, max } => {
+                let decoded = zigzag_decode(raw);
+                decoded >= *min && decoded <= *max
+            }
             CompiledFilter::In(vals) => vals.contains(&raw),
-            CompiledFilter::Exists { column_type } => match column_type {
-                FastFieldColumnType::TextOrdinal => raw != TEXT_MISSING_ORDINAL,
-                _ => true, // numeric columns always "exist" (0 is a valid value)
-            },
-            CompiledFilter::Never => false,
         }
     }
 }
@@ -95,26 +106,10 @@ fn compile_condition(condition: &FastFieldCondition, reader: &FastFieldReader) -
             max: max.unwrap_or(u64::MAX),
         },
         FastFieldCondition::RangeI64 { min, max } => {
-            // Zigzag encoding does NOT preserve order, so we need to handle ranges differently.
-            // For i64 ranges, we iterate and check decoded values.
-            // Simple approach: encode both bounds. But zigzag doesn't preserve order.
-            // Instead, we store the raw range and check at eval time.
-            // We'll use a special path — encode as-is and check decoded.
-            // Actually, let's just store min/max as zigzag and use a range check
-            // on the decoded value in a custom filter. For now, use Eq-based approach:
-            // This is a simplification — for proper i64 range, we'd need a custom comparator.
-            // Let's compile to a range on raw u64 space if both bounds have the same sign.
-            // For the general case, we'll iterate all and check decoded. Use In() as fallback.
-            let min_val = min.unwrap_or(i64::MIN);
-            let max_val = max.unwrap_or(i64::MAX);
-            // Since zigzag doesn't preserve order, we need the scorer to check decoded values.
-            // Store as a range on the original i64 space by using a wrapper.
-            // For simplicity in v1: compile to a closure-like check via Eq/In.
-            // Better approach: store raw min/max and check at runtime.
-            // We'll handle this in the scorer with a special i64/f64 range path.
-            CompiledFilter::Range {
-                min: zigzag_encode(min_val),
-                max: zigzag_encode(max_val),
+            // Zigzag encoding does NOT preserve order, so we check decoded values at runtime.
+            CompiledFilter::RangeI64Decoded {
+                min: min.unwrap_or(i64::MIN),
+                max: max.unwrap_or(i64::MAX),
             }
         }
         FastFieldCondition::RangeF64 { min, max } => {
@@ -139,9 +134,7 @@ fn compile_condition(condition: &FastFieldCondition, reader: &FastFieldReader) -
                 CompiledFilter::In(ordinals)
             }
         }
-        FastFieldCondition::Exists => CompiledFilter::Exists {
-            column_type: reader.column_type,
-        },
+        FastFieldCondition::Exists => CompiledFilter::Exists,
     }
 }
 
@@ -197,35 +190,129 @@ impl FastFieldFilterQuery {
     }
 }
 
+/// Check a doc against compiled filters using the segment reader.
+#[inline]
+fn check_compiled_filters(
+    compiled: &[(u32, CompiledFilter)],
+    reader: &SegmentReader,
+    doc_id: DocId,
+) -> bool {
+    for (field_id, filter) in compiled {
+        if let Some(ff) = reader.fast_field(*field_id) {
+            if ff.multi {
+                let any_match = ff.for_each_multi_value(doc_id, |val| filter.matches(val));
+                if !any_match {
+                    return false;
+                }
+            } else {
+                let raw = ff.get_u64(doc_id);
+                if !filter.matches(raw) {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build a [`DocPredicate`] from Arc-shared compiled filters.
+fn make_filter_predicate<'a>(
+    compiled: Arc<Vec<(u32, CompiledFilter)>>,
+    reader: &'a SegmentReader,
+) -> DocPredicate<'a> {
+    Box::new(move |doc_id: DocId| check_compiled_filters(&compiled, reader, doc_id))
+}
+
+/// Chain an optional outer predicate with our filter predicate.
+fn chain_predicates<'a>(
+    outer: Option<DocPredicate<'a>>,
+    inner: DocPredicate<'a>,
+) -> DocPredicate<'a> {
+    match outer {
+        Some(outer) => Box::new(move |doc_id| outer(doc_id) && inner(doc_id)),
+        None => inner,
+    }
+}
+
 impl Query for FastFieldFilterQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
         let inner = self.inner.clone();
         let filters = self.filters.clone();
 
         Box::pin(async move {
             // Compile filters against segment's fast-field readers
-            let mut compiled: Vec<(u32, CompiledFilter)> = Vec::with_capacity(filters.len());
+            let mut compiled_vec: Vec<(u32, CompiledFilter)> = Vec::with_capacity(filters.len());
             for filter in &filters {
                 let field_id = filter.field.0;
                 if let Some(ff_reader) = reader.fast_field(field_id) {
                     let cf = compile_condition(&filter.condition, ff_reader);
-                    compiled.push((field_id, cf));
+                    compiled_vec.push((field_id, cf));
                 } else {
-                    // No fast-field data for this field in this segment — skip all docs
-                    compiled.push((field_id, CompiledFilter::Never));
+                    log::warn!(
+                        "[fast-filter] field {} has no fast-field data in segment, filter will reject all docs",
+                        field_id
+                    );
+                    compiled_vec.push((field_id, CompiledFilter::Never));
                 }
             }
 
-            let scorer: Box<dyn Scorer + 'a> = if let Some(ref inner_query) = inner {
-                let inner_scorer = inner_query.scorer(reader, limit).await?;
-                Box::new(FastFieldFilterScorer::new(inner_scorer, compiled, reader))
-            } else {
-                // Standalone: iterate all docs
-                let num_docs = reader.num_docs();
-                Box::new(StandaloneFilterScorer::new(num_docs, compiled, reader))
-            };
+            // Arc-share compiled filters so we can build two predicates
+            let compiled = Arc::new(compiled_vec);
 
-            Ok(scorer)
+            // Convert incoming predicate to Arc so it can be shared too
+            #[cfg(not(target_arch = "wasm32"))]
+            type SharedPred<'b> = Arc<dyn Fn(DocId) -> bool + Send + Sync + 'b>;
+            #[cfg(target_arch = "wasm32")]
+            type SharedPred<'b> = Arc<dyn Fn(DocId) -> bool + 'b>;
+
+            let outer_arc: Option<SharedPred<'a>> = predicate.map(Arc::from);
+
+            if let Some(ref inner_query) = inner {
+                // Build two predicates: one for inner query (executor optimization),
+                // one for wrapper (safety net for non-executor scorer paths).
+                let pred_for_inner = chain_predicates(
+                    outer_arc.as_ref().map(|a| {
+                        let a = a.clone();
+                        Box::new(move |doc_id| a(doc_id)) as DocPredicate<'a>
+                    }),
+                    make_filter_predicate(compiled.clone(), reader),
+                );
+                let pred_for_wrapper = chain_predicates(
+                    outer_arc.map(|a| Box::new(move |doc_id| a(doc_id)) as DocPredicate<'a>),
+                    make_filter_predicate(compiled, reader),
+                );
+
+                // Pass predicate to inner query — executors (MaxScore, BMP) check it
+                // during scoring for early rejection.
+                let inner_scorer = inner_query
+                    .scorer(reader, limit, Some(pred_for_inner))
+                    .await?;
+
+                // Wrap with PredicateFilterScorer — safety net for paths where the
+                // predicate isn't consumed (TermQuery, BooleanScorer MUST, PhraseQuery,
+                // vector queries). For executor paths, docs already passed → cheap no-op.
+                Ok(
+                    Box::new(PredicateFilterScorer::new(inner_scorer, pred_for_wrapper))
+                        as Box<dyn Scorer + 'a>,
+                )
+            } else {
+                // Standalone: iterate all docs, filter with predicate
+                let pred = chain_predicates(
+                    outer_arc.map(|a| Box::new(move |doc_id| a(doc_id)) as DocPredicate<'a>),
+                    make_filter_predicate(compiled, reader),
+                );
+                let num_docs = reader.num_docs();
+                let scorer: Box<dyn Scorer + 'a> =
+                    Box::new(StandaloneFilterScorer::new(num_docs, pred));
+                Ok(scorer)
+            }
         })
     }
 
@@ -239,67 +326,40 @@ impl Query for FastFieldFilterQuery {
     }
 }
 
-// ── Inner-query filter scorer ─────────────────────────────────────────────
+// ── Predicate filter scorer ───────────────────────────────────────────────
 
-/// Pre-filter scorer: wraps an inner scorer and skips documents that don't
-/// pass the fast-field predicates **before** they reach the collector.
+/// Lightweight wrapper that checks a [`DocPredicate`] per-doc.
 ///
-/// All doc IDs are segment-local (0-based). The collector adds the segment
-/// offset when converting to global IDs.
-struct FastFieldFilterScorer<'a> {
+/// Safety net for non-executor scorer paths (TermQuery, BooleanScorer with MUST,
+/// PhraseQuery, vector queries) where the predicate isn't consumed by an executor.
+/// For executor paths (MaxScore, BMP), docs already passed the predicate inside
+/// the executor, so the wrapper check is a cheap no-op.
+struct PredicateFilterScorer<'a> {
     inner: Box<dyn Scorer + 'a>,
-    compiled: Vec<(u32, CompiledFilter)>,
-    reader: &'a SegmentReader,
+    predicate: DocPredicate<'a>,
 }
 
-impl<'a> FastFieldFilterScorer<'a> {
-    fn new(
-        inner: Box<dyn Scorer + 'a>,
-        compiled: Vec<(u32, CompiledFilter)>,
-        reader: &'a SegmentReader,
-    ) -> Self {
-        let mut s = Self {
-            inner,
-            compiled,
-            reader,
-        };
-        // Advance to first matching doc
+impl<'a> PredicateFilterScorer<'a> {
+    fn new(inner: Box<dyn Scorer + 'a>, predicate: DocPredicate<'a>) -> Self {
+        let mut s = Self { inner, predicate };
         let doc = s.inner.doc();
-        if doc != TERMINATED && !s.passes(doc) {
+        if doc != TERMINATED && !(s.predicate)(doc) {
             s.advance_to_next_match();
         }
         s
     }
 
-    /// Check if a segment-local doc_id passes all filters.
-    #[inline]
-    fn passes(&self, doc_id: DocId) -> bool {
-        // doc_id is already segment-local (0-based) — scorers never add offsets
-        for (field_id, filter) in &self.compiled {
-            if let Some(ff) = self.reader.fast_field(*field_id) {
-                let raw = ff.get_u64(doc_id);
-                if !filter.matches(raw) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Advance inner scorer until we find a doc that passes, or TERMINATED.
     fn advance_to_next_match(&mut self) {
         loop {
             let doc = self.inner.advance();
-            if doc == TERMINATED || self.passes(doc) {
+            if doc == TERMINATED || (self.predicate)(doc) {
                 break;
             }
         }
     }
 }
 
-impl<'a> Scorer for FastFieldFilterScorer<'a> {
+impl<'a> Scorer for PredicateFilterScorer<'a> {
     fn doc(&self) -> DocId {
         self.inner.doc()
     }
@@ -318,7 +378,7 @@ impl<'a> Scorer for FastFieldFilterScorer<'a> {
         if doc == TERMINATED {
             return TERMINATED;
         }
-        if self.passes(doc) {
+        if (self.predicate)(doc) {
             return doc;
         }
         self.advance_to_next_match();
@@ -333,45 +393,28 @@ impl<'a> Scorer for FastFieldFilterScorer<'a> {
 // ── Standalone filter scorer ──────────────────────────────────────────────
 
 /// Scorer that iterates all docs (segment-local 0..num_docs) and yields
-/// only those matching the fast-field filters. Used when no inner query is
+/// only those matching the predicate. Used when no inner query is
 /// provided (pure filter mode).
 struct StandaloneFilterScorer<'a> {
     /// Current segment-local doc_id (0-based), or TERMINATED.
     current_doc: DocId,
     num_docs: u32,
-    compiled: Vec<(u32, CompiledFilter)>,
-    reader: &'a SegmentReader,
+    predicate: super::DocPredicate<'a>,
 }
 
 impl<'a> StandaloneFilterScorer<'a> {
-    fn new(num_docs: u32, compiled: Vec<(u32, CompiledFilter)>, reader: &'a SegmentReader) -> Self {
+    fn new(num_docs: u32, predicate: super::DocPredicate<'a>) -> Self {
         let mut s = Self {
             current_doc: 0,
             num_docs,
-            compiled,
-            reader,
+            predicate,
         };
         if num_docs == 0 {
             s.current_doc = TERMINATED;
-        } else if !s.passes(0) {
+        } else if !(s.predicate)(0) {
             s.advance_to_next_match();
         }
         s
-    }
-
-    #[inline]
-    fn passes(&self, doc_id: u32) -> bool {
-        for (field_id, filter) in &self.compiled {
-            if let Some(ff) = self.reader.fast_field(*field_id) {
-                let raw = ff.get_u64(doc_id);
-                if !filter.matches(raw) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-        true
     }
 
     fn advance_to_next_match(&mut self) {
@@ -381,7 +424,7 @@ impl<'a> StandaloneFilterScorer<'a> {
                 self.current_doc = TERMINATED;
                 return;
             }
-            if self.passes(self.current_doc) {
+            if (self.predicate)(self.current_doc) {
                 return;
             }
         }
@@ -405,7 +448,7 @@ impl<'a> Scorer for StandaloneFilterScorer<'a> {
     fn seek(&mut self, target: DocId) -> DocId {
         if target > self.current_doc && target < self.num_docs {
             self.current_doc = target;
-            if self.passes(self.current_doc) {
+            if (self.predicate)(self.current_doc) {
                 return self.current_doc;
             }
             self.advance_to_next_match();

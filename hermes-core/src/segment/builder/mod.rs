@@ -166,12 +166,28 @@ impl SegmentBuilder {
         let mut fast_fields = FxHashMap::default();
         for (field, entry) in schema.fields() {
             if entry.fast {
-                let writer = match entry.field_type {
-                    FieldType::U64 => FastFieldWriter::new_numeric(FastFieldColumnType::U64),
-                    FieldType::I64 => FastFieldWriter::new_numeric(FastFieldColumnType::I64),
-                    FieldType::F64 => FastFieldWriter::new_numeric(FastFieldColumnType::F64),
-                    FieldType::Text => FastFieldWriter::new_text(),
-                    _ => continue, // fast not supported for other types
+                let writer = if entry.multi {
+                    match entry.field_type {
+                        FieldType::U64 => {
+                            FastFieldWriter::new_numeric_multi(FastFieldColumnType::U64)
+                        }
+                        FieldType::I64 => {
+                            FastFieldWriter::new_numeric_multi(FastFieldColumnType::I64)
+                        }
+                        FieldType::F64 => {
+                            FastFieldWriter::new_numeric_multi(FastFieldColumnType::F64)
+                        }
+                        FieldType::Text => FastFieldWriter::new_text_multi(),
+                        _ => continue,
+                    }
+                } else {
+                    match entry.field_type {
+                        FieldType::U64 => FastFieldWriter::new_numeric(FastFieldColumnType::U64),
+                        FieldType::I64 => FastFieldWriter::new_numeric(FastFieldColumnType::I64),
+                        FieldType::F64 => FastFieldWriter::new_numeric(FastFieldColumnType::F64),
+                        FieldType::Text => FastFieldWriter::new_text(),
+                        _ => continue,
+                    }
                 };
                 fast_fields.insert(field.0, writer);
             }
@@ -372,25 +388,28 @@ impl SegmentBuilder {
             };
 
             // Dense vectors are written to .vectors when indexed || stored
-            // Other field types require indexed
-            if !matches!(&entry.field_type, FieldType::DenseVector) && !entry.indexed {
+            // Other field types require indexed or fast
+            if !matches!(&entry.field_type, FieldType::DenseVector) && !entry.indexed && !entry.fast
+            {
                 continue;
             }
 
             match (&entry.field_type, value) {
                 (FieldType::Text, FieldValue::Text(text)) => {
-                    let element_ordinal = self.next_element_ordinal(field.0);
-                    let token_count =
-                        self.index_text_field(*field, doc_id, text, element_ordinal)?;
+                    if entry.indexed {
+                        let element_ordinal = self.next_element_ordinal(field.0);
+                        let token_count =
+                            self.index_text_field(*field, doc_id, text, element_ordinal)?;
 
-                    let stats = self.field_stats.entry(field.0).or_default();
-                    stats.total_tokens += token_count as u64;
-                    if element_ordinal == 0 {
-                        stats.doc_count += 1;
-                    }
+                        let stats = self.field_stats.entry(field.0).or_default();
+                        stats.total_tokens += token_count as u64;
+                        if element_ordinal == 0 {
+                            stats.doc_count += 1;
+                        }
 
-                    if let Some(&slot) = self.field_to_slot.get(&field.0) {
-                        self.doc_field_lengths[base_idx + slot] = token_count;
+                        if let Some(&slot) = self.field_to_slot.get(&field.0) {
+                            self.doc_field_lengths[base_idx + slot] = token_count;
+                        }
                     }
 
                     // Fast-field: store raw text for text ordinal column
@@ -399,19 +418,25 @@ impl SegmentBuilder {
                     }
                 }
                 (FieldType::U64, FieldValue::U64(v)) => {
-                    self.index_numeric_field(*field, doc_id, *v)?;
+                    if entry.indexed {
+                        self.index_numeric_field(*field, doc_id, *v)?;
+                    }
                     if let Some(ff) = self.fast_fields.get_mut(&field.0) {
                         ff.add_u64(doc_id, *v);
                     }
                 }
                 (FieldType::I64, FieldValue::I64(v)) => {
-                    self.index_numeric_field(*field, doc_id, *v as u64)?;
+                    if entry.indexed {
+                        self.index_numeric_field(*field, doc_id, *v as u64)?;
+                    }
                     if let Some(ff) = self.fast_fields.get_mut(&field.0) {
                         ff.add_i64(doc_id, *v);
                     }
                 }
                 (FieldType::F64, FieldValue::F64(v)) => {
-                    self.index_numeric_field(*field, doc_id, v.to_bits())?;
+                    if entry.indexed {
+                        self.index_numeric_field(*field, doc_id, v.to_bits())?;
+                    }
                     if let Some(ff) = self.fast_fields.get_mut(&field.0) {
                         ff.add_f64(doc_id, *v);
                     }

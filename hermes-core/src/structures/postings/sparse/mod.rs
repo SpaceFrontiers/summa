@@ -97,6 +97,35 @@ impl SparseSkipEntry {
         query_weight * self.max_weight
     }
 
+    /// Read a skip entry from a 24-byte LE slice (zero-copy, no I/O).
+    #[inline]
+    pub fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            first_doc: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+            last_doc: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+            length: u32::from_le_bytes(b[16..20].try_into().unwrap()),
+            max_weight: f32::from_le_bytes(b[20..24].try_into().unwrap()),
+        }
+    }
+
+    /// Append the 24-byte LE representation to a byte buffer.
+    #[inline]
+    pub fn write_to_vec(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.first_doc.to_le_bytes());
+        buf.extend_from_slice(&self.last_doc.to_le_bytes());
+        buf.extend_from_slice(&self.offset.to_le_bytes());
+        buf.extend_from_slice(&self.length.to_le_bytes());
+        buf.extend_from_slice(&self.max_weight.to_le_bytes());
+    }
+
+    /// Read a skip entry at `idx` from a contiguous skip byte slice.
+    #[inline]
+    pub fn read_at(skip_bytes: &[u8], idx: usize) -> Self {
+        let off = idx * Self::SIZE;
+        Self::from_bytes(&skip_bytes[off..off + Self::SIZE])
+    }
+
     /// Write skip entry to writer
     pub fn write<W: Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_u32::<LittleEndian>(self.first_doc)?;

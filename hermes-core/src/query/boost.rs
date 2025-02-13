@@ -32,11 +32,16 @@ impl BoostQuery {
 }
 
 impl Query for BoostQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        predicate: Option<super::DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
         let inner = self.inner.clone();
         let boost = self.boost;
         Box::pin(async move {
-            let inner_scorer = inner.scorer(reader, limit).await?;
+            let inner_scorer = inner.scorer(reader, limit, predicate).await?;
             Ok(Box::new(BoostScorer {
                 inner: inner_scorer,
                 boost,

@@ -1,13 +1,17 @@
 //! Posting list implementation with compact representation
 //!
-//! Uses delta encoding and variable-length integers for compact storage.
+//! Text blocks use SIMD-friendly packed bit-width encoding:
+//! - Doc IDs: delta-encoded, packed at rounded bit width (0/8/16/32)
+//! - Term frequencies: packed at rounded bit width
+//! - Same SIMD primitives as sparse blocks (`simd::pack_rounded` / `unpack_rounded`)
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{self, Read, Write};
 
 use super::posting_common::{read_vint, write_vint};
 use crate::DocId;
 use crate::directories::OwnedBytes;
+use crate::structures::simd;
 
 /// A posting entry containing doc_id and term frequency
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,99 +164,219 @@ impl<'a> PostingListIterator<'a> {
 /// Sentinel value indicating iterator is exhausted
 pub const TERMINATED: DocId = DocId::MAX;
 
-/// Block-based posting list for skip-list style access
-/// Each block contains up to BLOCK_SIZE postings
+/// Block-based posting list with 2-level skip index.
+///
+/// Each block contains up to `BLOCK_SIZE` postings encoded as packed bit-width arrays.
+/// Skip entries use a compact 2-level structure for cache-friendly seeking:
+/// - **Level-0** (16 bytes/block): `first_doc`, `last_doc`, `offset`, `max_weight`
+/// - **Level-1** (4 bytes/group): `last_doc` per `L1_INTERVAL` blocks
+///
+/// Seek algorithm: binary search L1, then linear scan ≤`L1_INTERVAL` L0 entries.
 pub const BLOCK_SIZE: usize = 128;
+
+/// Number of L0 blocks per L1 skip entry.
+const L1_INTERVAL: usize = 8;
+
+/// Compact level-0 skip entry — 16 bytes.
+/// `length` is omitted: computable from the block's 8-byte header.
+const L0_SIZE: usize = 16;
+
+/// Level-1 skip entry — 4 bytes (just `last_doc`).
+const L1_SIZE: usize = 4;
+
+/// Footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) + max_tf(4) = 24 bytes.
+const FOOTER_SIZE: usize = 24;
+
+/// Read a compact L0 entry from raw bytes at the given index.
+#[inline]
+fn read_l0(bytes: &[u8], idx: usize) -> (u32, u32, u32, f32) {
+    let p = idx * L0_SIZE;
+    let first_doc = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+    let last_doc = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap());
+    let offset = u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap());
+    let max_weight = f32::from_le_bytes(bytes[p + 12..p + 16].try_into().unwrap());
+    (first_doc, last_doc, offset, max_weight)
+}
+
+/// Write a compact L0 entry.
+#[inline]
+fn write_l0(buf: &mut Vec<u8>, first_doc: u32, last_doc: u32, offset: u32, max_weight: f32) {
+    buf.extend_from_slice(&first_doc.to_le_bytes());
+    buf.extend_from_slice(&last_doc.to_le_bytes());
+    buf.extend_from_slice(&offset.to_le_bytes());
+    buf.extend_from_slice(&max_weight.to_le_bytes());
+}
+
+/// Compute block data size from the 8-byte header at `stream[pos..]`.
+///
+/// Header: `[count: u16][first_doc: u32][doc_id_bits: u8][tf_bits: u8]`
+/// Data size = 8 + (count-1) × bytes_per_value(doc_id_bits) + count × bytes_per_value(tf_bits)
+#[inline]
+fn block_data_size(stream: &[u8], pos: usize) -> usize {
+    let count = u16::from_le_bytes(stream[pos..pos + 2].try_into().unwrap()) as usize;
+    let doc_rounded = simd::RoundedBitWidth::from_u8(stream[pos + 6]);
+    let tf_rounded = simd::RoundedBitWidth::from_u8(stream[pos + 7]);
+    let delta_bytes = if count > 1 {
+        (count - 1) * doc_rounded.bytes_per_value()
+    } else {
+        0
+    };
+    8 + delta_bytes + count * tf_rounded.bytes_per_value()
+}
 
 #[derive(Debug, Clone)]
 pub struct BlockPostingList {
-    /// Skip list: (base_doc_id, last_doc_id_in_block, byte_offset, block_max_tf)
-    /// base_doc_id is the first doc_id in the block (absolute, not delta)
-    /// block_max_tf enables block-max pruning optimization
-    skip_list: Vec<(DocId, DocId, u64, u32)>,
-    /// Compressed posting data (OwnedBytes for zero-copy mmap support)
-    data: OwnedBytes,
-    /// Total number of postings
+    /// Block data stream (packed blocks laid out sequentially).
+    stream: OwnedBytes,
+    /// Level-0 skip entries: `(first_doc, last_doc, offset, max_weight)` × `l0_count`.
+    /// 16 bytes per entry. Supports O(1) random access by block index.
+    l0_bytes: OwnedBytes,
+    /// Number of blocks (= number of L0 entries).
+    l0_count: usize,
+    /// Level-1 skip `last_doc` values — one per `L1_INTERVAL` blocks.
+    /// Stored as `Vec<u32>` for direct SIMD-accelerated `find_first_ge_u32`.
+    l1_docs: Vec<u32>,
+    /// Total posting count.
     doc_count: u32,
-    /// Maximum term frequency across all postings (for MaxScore upper bound)
+    /// Max TF across all blocks.
     max_tf: u32,
 }
 
 impl BlockPostingList {
-    /// Build from a posting list
+    /// Read L0 entry by block index. Returns `(first_doc, last_doc, offset, max_weight)`.
+    #[inline]
+    fn read_l0_entry(&self, idx: usize) -> (u32, u32, u32, f32) {
+        read_l0(&self.l0_bytes, idx)
+    }
+
+    /// Build from a posting list.
+    ///
+    /// Block format (8-byte header + packed arrays):
+    /// ```text
+    /// [count: u16][first_doc: u32][doc_id_bits: u8][tf_bits: u8]
+    /// [packed doc_id deltas: (count-1) × bytes_per_value(doc_id_bits)]
+    /// [packed tfs: count × bytes_per_value(tf_bits)]
+    /// ```
     pub fn from_posting_list(list: &PostingList) -> io::Result<Self> {
-        let mut skip_list = Vec::new();
-        let mut data = Vec::new();
+        let mut stream: Vec<u8> = Vec::new();
+        let mut l0_buf: Vec<u8> = Vec::new();
+        let mut l1_docs: Vec<u32> = Vec::new();
+        let mut l0_count = 0usize;
         let mut max_tf = 0u32;
 
         let postings = &list.postings;
         let mut i = 0;
 
+        // Temp buffers reused across blocks
+        let mut deltas = Vec::with_capacity(BLOCK_SIZE);
+        let mut tf_buf = Vec::with_capacity(BLOCK_SIZE);
+
         while i < postings.len() {
-            let block_start = data.len() as u64;
+            let block_start = stream.len() as u32;
             let block_end = (i + BLOCK_SIZE).min(postings.len());
             let block = &postings[i..block_end];
+            let count = block.len();
 
             // Compute block's max term frequency for block-max pruning
             let block_max_tf = block.iter().map(|p| p.term_freq).max().unwrap_or(0);
             max_tf = max_tf.max(block_max_tf);
 
-            // Record skip entry with base_doc_id (first doc in block)
             let base_doc_id = block.first().unwrap().doc_id;
             let last_doc_id = block.last().unwrap().doc_id;
-            skip_list.push((base_doc_id, last_doc_id, block_start, block_max_tf));
 
-            // Write block: fixed u32 count + first_doc (8-byte prefix), then vint deltas
-            data.write_u32::<LittleEndian>(block.len() as u32)?;
-            data.write_u32::<LittleEndian>(base_doc_id)?;
+            // Delta-encode doc IDs (skip first — stored in header)
+            deltas.clear();
+            let mut prev = base_doc_id;
+            for posting in block.iter().skip(1) {
+                deltas.push(posting.doc_id - prev);
+                prev = posting.doc_id;
+            }
+            let max_delta = deltas.iter().copied().max().unwrap_or(0);
+            let doc_id_bits = simd::round_bit_width(simd::bits_needed(max_delta));
 
-            let mut prev_doc_id = base_doc_id;
-            for (j, posting) in block.iter().enumerate() {
-                if j == 0 {
-                    // First doc already in fixed prefix, just write tf
-                    write_vint(&mut data, posting.term_freq as u64)?;
-                } else {
-                    let delta = posting.doc_id - prev_doc_id;
-                    write_vint(&mut data, delta as u64)?;
-                    write_vint(&mut data, posting.term_freq as u64)?;
-                }
-                prev_doc_id = posting.doc_id;
+            // Collect TFs
+            tf_buf.clear();
+            tf_buf.extend(block.iter().map(|p| p.term_freq));
+            let tf_bits = simd::round_bit_width(simd::bits_needed(block_max_tf));
+
+            // Write 8-byte header: [count: u16][first_doc: u32][doc_id_bits: u8][tf_bits: u8]
+            stream.write_u16::<LittleEndian>(count as u16)?;
+            stream.write_u32::<LittleEndian>(base_doc_id)?;
+            stream.push(doc_id_bits);
+            stream.push(tf_bits);
+
+            // Write packed doc_id deltas ((count-1) values)
+            if count > 1 {
+                let rounded = simd::RoundedBitWidth::from_u8(doc_id_bits);
+                let byte_count = (count - 1) * rounded.bytes_per_value();
+                let start = stream.len();
+                stream.resize(start + byte_count, 0);
+                simd::pack_rounded(&deltas, rounded, &mut stream[start..]);
+            }
+
+            // Write packed TFs (count values)
+            {
+                let rounded = simd::RoundedBitWidth::from_u8(tf_bits);
+                let byte_count = count * rounded.bytes_per_value();
+                let start = stream.len();
+                stream.resize(start + byte_count, 0);
+                simd::pack_rounded(&tf_buf, rounded, &mut stream[start..]);
+            }
+
+            // L0 skip entry
+            write_l0(
+                &mut l0_buf,
+                base_doc_id,
+                last_doc_id,
+                block_start,
+                block_max_tf as f32,
+            );
+            l0_count += 1;
+
+            // L1 entry at the end of each L1_INTERVAL group
+            if l0_count.is_multiple_of(L1_INTERVAL) {
+                l1_docs.push(last_doc_id);
             }
 
             i = block_end;
         }
 
+        // Final L1 entry for partial group
+        if !l0_count.is_multiple_of(L1_INTERVAL) && l0_count > 0 {
+            let (_, last_doc, _, _) = read_l0(&l0_buf, l0_count - 1);
+            l1_docs.push(last_doc);
+        }
+
         Ok(Self {
-            skip_list,
-            data: OwnedBytes::new(data),
+            stream: OwnedBytes::new(stream),
+            l0_bytes: OwnedBytes::new(l0_buf),
+            l0_count,
+            l1_docs,
             doc_count: postings.len() as u32,
             max_tf,
         })
     }
 
-    /// Serialize the block posting list (footer-based: data first).
+    /// Serialize the block posting list (footer-based: stream first).
     ///
     /// Format:
     /// ```text
-    /// [block data: data_len bytes]
-    /// [skip entries: N × 20 bytes (base_doc, last_doc, offset_u64, block_max_tf)]
-    /// [footer: data_len(8) + skip_count(4) + doc_count(4) + max_tf(4) = 20 bytes]
+    /// [stream: block data]
+    /// [L0 entries: l0_count × 16 bytes (first_doc, last_doc, offset, max_weight)]
+    /// [L1 entries: l1_count × 4 bytes (last_doc)]
+    /// [footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) + max_tf(4) = 24 bytes]
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Data first (enables streaming writes during merge)
-        writer.write_all(&self.data)?;
-
-        // Skip list
-        for (base_doc_id, last_doc_id, offset, block_max_tf) in &self.skip_list {
-            writer.write_u32::<LittleEndian>(*base_doc_id)?;
-            writer.write_u32::<LittleEndian>(*last_doc_id)?;
-            writer.write_u64::<LittleEndian>(*offset)?;
-            writer.write_u32::<LittleEndian>(*block_max_tf)?;
+        writer.write_all(&self.stream)?;
+        writer.write_all(&self.l0_bytes)?;
+        for &doc in &self.l1_docs {
+            writer.write_u32::<LittleEndian>(doc)?;
         }
 
-        // Footer
-        writer.write_u64::<LittleEndian>(self.data.len() as u64)?;
-        writer.write_u32::<LittleEndian>(self.skip_list.len() as u32)?;
+        // Footer (24 bytes)
+        writer.write_u64::<LittleEndian>(self.stream.len() as u64)?;
+        writer.write_u32::<LittleEndian>(self.l0_count as u32)?;
+        writer.write_u32::<LittleEndian>(self.l1_docs.len() as u32)?;
         writer.write_u32::<LittleEndian>(self.doc_count)?;
         writer.write_u32::<LittleEndian>(self.max_tf)?;
 
@@ -261,78 +385,78 @@ impl BlockPostingList {
 
     /// Deserialize from a byte slice (footer-based format).
     pub fn deserialize(raw: &[u8]) -> io::Result<Self> {
-        if raw.len() < 20 {
+        if raw.len() < FOOTER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "posting data too short",
             ));
         }
 
-        // Parse footer (last 20 bytes)
-        let f = raw.len() - 20;
-        let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
-        let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
-        let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
-        let max_tf = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
+        let f = raw.len() - FOOTER_SIZE;
+        let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+        let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+        let l1_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
+        let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
 
-        // Parse skip list (between data and footer)
-        let mut skip_list = Vec::with_capacity(skip_count);
-        let mut pos = data_len;
-        for _ in 0..skip_count {
-            let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
-            let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-            let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
-            let block_max_tf = u32::from_le_bytes(raw[pos + 16..pos + 20].try_into().unwrap());
-            skip_list.push((base, last, offset, block_max_tf));
-            pos += 20;
-        }
+        let l0_start = stream_len;
+        let l0_end = l0_start + l0_count * L0_SIZE;
+        let l1_start = l0_end;
 
-        let data = OwnedBytes::new(raw[..data_len].to_vec());
+        let l1_docs = Self::extract_l1_docs(&raw[l1_start..], l1_count);
 
         Ok(Self {
-            skip_list,
-            data,
-            max_tf,
+            stream: OwnedBytes::new(raw[..stream_len].to_vec()),
+            l0_bytes: OwnedBytes::new(raw[l0_start..l0_end].to_vec()),
+            l0_count,
+            l1_docs,
             doc_count,
+            max_tf,
         })
     }
 
     /// Zero-copy deserialization from OwnedBytes.
-    /// The data section is sliced from the source without copying.
+    /// Stream and L0 are sliced from the source without copying.
+    /// L1 is extracted into a `Vec<u32>` for SIMD-friendly access (tiny: ≤ N/8 entries).
     pub fn deserialize_zero_copy(raw: OwnedBytes) -> io::Result<Self> {
-        if raw.len() < 20 {
+        if raw.len() < FOOTER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "posting data too short",
             ));
         }
 
-        let f = raw.len() - 20;
-        let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
-        let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
-        let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
-        let max_tf = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
+        let f = raw.len() - FOOTER_SIZE;
+        let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+        let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+        let l1_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
+        let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
 
-        let mut skip_list = Vec::with_capacity(skip_count);
-        let mut pos = data_len;
-        for _ in 0..skip_count {
-            let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
-            let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-            let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
-            let block_max_tf = u32::from_le_bytes(raw[pos + 16..pos + 20].try_into().unwrap());
-            skip_list.push((base, last, offset, block_max_tf));
-            pos += 20;
-        }
+        let l0_start = stream_len;
+        let l0_end = l0_start + l0_count * L0_SIZE;
+        let l1_start = l0_end;
 
-        // Zero-copy: slice references the source OwnedBytes (backed by mmap or Arc<Vec>)
-        let data = raw.slice(0..data_len);
+        let l1_docs = Self::extract_l1_docs(&raw[l1_start..], l1_count);
 
         Ok(Self {
-            skip_list,
-            data,
-            max_tf,
+            stream: raw.slice(0..stream_len),
+            l0_bytes: raw.slice(l0_start..l0_end),
+            l0_count,
+            l1_docs,
             doc_count,
+            max_tf,
         })
+    }
+
+    /// Extract L1 last_doc values from raw LE bytes into a Vec<u32>.
+    fn extract_l1_docs(bytes: &[u8], count: usize) -> Vec<u32> {
+        let mut docs = Vec::with_capacity(count);
+        for i in 0..count {
+            let p = i * L1_SIZE;
+            docs.push(u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()));
+        }
+        docs
     }
 
     pub fn doc_count(&self) -> u32 {
@@ -346,81 +470,71 @@ impl BlockPostingList {
 
     /// Get number of blocks
     pub fn num_blocks(&self) -> usize {
-        self.skip_list.len()
-    }
-
-    /// Get block metadata: (base_doc_id, last_doc_id, data_offset, data_len, block_max_tf)
-    pub fn block_info(&self, block_idx: usize) -> Option<(DocId, DocId, usize, usize, u32)> {
-        if block_idx >= self.skip_list.len() {
-            return None;
-        }
-        let (base, last, offset, block_max_tf) = self.skip_list[block_idx];
-        let next_offset = if block_idx + 1 < self.skip_list.len() {
-            self.skip_list[block_idx + 1].2 as usize
-        } else {
-            self.data.len()
-        };
-        Some((
-            base,
-            last,
-            offset as usize,
-            next_offset - offset as usize,
-            block_max_tf,
-        ))
+        self.l0_count
     }
 
     /// Get block's max term frequency for block-max pruning
     pub fn block_max_tf(&self, block_idx: usize) -> Option<u32> {
-        self.skip_list
-            .get(block_idx)
-            .map(|(_, _, _, max_tf)| *max_tf)
+        if block_idx >= self.l0_count {
+            return None;
+        }
+        let (_, _, _, max_weight) = self.read_l0_entry(block_idx);
+        Some(max_weight as u32)
     }
 
-    /// Get raw block data for direct copying during merge
-    pub fn block_data(&self, block_idx: usize) -> Option<&[u8]> {
-        let (_, _, offset, len, _) = self.block_info(block_idx)?;
-        Some(&self.data[offset..offset + len])
-    }
-
-    /// Concatenate blocks from multiple posting lists with doc_id remapping
-    /// This is O(num_blocks) instead of O(num_postings)
+    /// Concatenate blocks from multiple posting lists with doc_id remapping.
+    /// This is O(num_blocks) instead of O(num_postings).
     pub fn concatenate_blocks(sources: &[(BlockPostingList, u32)]) -> io::Result<Self> {
-        let mut skip_list = Vec::new();
-        let mut data = Vec::new();
+        let mut stream: Vec<u8> = Vec::new();
+        let mut l0_buf: Vec<u8> = Vec::new();
+        let mut l1_docs: Vec<u32> = Vec::new();
+        let mut l0_count = 0usize;
         let mut total_docs = 0u32;
         let mut max_tf = 0u32;
 
         for (source, doc_offset) in sources {
             max_tf = max_tf.max(source.max_tf);
             for block_idx in 0..source.num_blocks() {
-                if let Some((base, last, src_offset, len, block_max_tf)) =
-                    source.block_info(block_idx)
-                {
-                    let new_base = base + doc_offset;
-                    let new_last = last + doc_offset;
-                    let new_offset = data.len() as u64;
+                let (first_doc, last_doc, offset, max_weight) = source.read_l0_entry(block_idx);
+                let blk_size = block_data_size(&source.stream, offset as usize);
+                let block_bytes = &source.stream[offset as usize..offset as usize + blk_size];
 
-                    // Copy block data, but we need to adjust the first doc_id in the block
-                    let block_bytes = &source.data[src_offset..src_offset + len];
+                let count = u16::from_le_bytes(block_bytes[0..2].try_into().unwrap());
+                let new_offset = stream.len() as u32;
 
-                    // Fixed 8-byte prefix: count(u32) + first_doc(u32)
-                    let count = u32::from_le_bytes(block_bytes[0..4].try_into().unwrap());
-                    let first_doc = u32::from_le_bytes(block_bytes[4..8].try_into().unwrap());
+                // Write patched header + copy packed arrays verbatim
+                stream.write_u16::<LittleEndian>(count)?;
+                stream.write_u32::<LittleEndian>(first_doc + doc_offset)?;
+                stream.extend_from_slice(&block_bytes[6..]);
 
-                    // Write patched prefix + copy rest verbatim
-                    data.write_u32::<LittleEndian>(count)?;
-                    data.write_u32::<LittleEndian>(first_doc + doc_offset)?;
-                    data.extend_from_slice(&block_bytes[8..]);
+                let new_last = last_doc + doc_offset;
+                write_l0(
+                    &mut l0_buf,
+                    first_doc + doc_offset,
+                    new_last,
+                    new_offset,
+                    max_weight,
+                );
+                l0_count += 1;
+                total_docs += count as u32;
 
-                    skip_list.push((new_base, new_last, new_offset, block_max_tf));
-                    total_docs += count;
+                if l0_count.is_multiple_of(L1_INTERVAL) {
+                    l1_docs.push(new_last);
                 }
             }
         }
 
+        // Final L1 entry for partial group
+        if !l0_count.is_multiple_of(L1_INTERVAL) && l0_count > 0 {
+            let (_, last_doc, _, _) = read_l0(&l0_buf, l0_count - 1);
+            l1_docs.push(last_doc);
+        }
+
         Ok(Self {
-            skip_list,
-            data: OwnedBytes::new(data),
+            stream: OwnedBytes::new(stream),
+            l0_bytes: OwnedBytes::new(l0_buf),
+            l0_count,
+            l1_docs,
             doc_count: total_docs,
             max_tf,
         })
@@ -428,109 +542,245 @@ impl BlockPostingList {
 
     /// Streaming merge: write blocks directly to output writer (bounded memory).
     ///
-    /// Parses only footer + skip_list from each source (no data copy),
-    /// streams block data with patched 8-byte prefixes directly to `writer`,
-    /// then appends merged skip_list + footer.
+    /// **Zero-materializing**: reads L0 entries directly from source bytes
+    /// (mmap or &[u8]) without parsing into Vecs. Block sizes computed from
+    /// the 8-byte header (deterministic with packed encoding).
     ///
-    /// Memory per term: O(total_blocks × 16) for skip entries only.
-    /// Block data flows source mmap → output writer without buffering.
+    /// Output L0 + L1 are buffered (bounded O(total_blocks × 16 + total_blocks/8 × 4)).
+    /// Block data flows source → output writer without intermediate buffering.
     ///
     /// Returns `(doc_count, bytes_written)`.
     pub fn concatenate_streaming<W: Write>(
         sources: &[(&[u8], u32)], // (serialized_bytes, doc_offset)
         writer: &mut W,
     ) -> io::Result<(u32, usize)> {
-        // Parse footer + skip_list from each source (no data copy)
-        struct RawSource<'a> {
-            skip_list: Vec<(u32, u32, u64, u32)>, // (base, last, offset, block_max_tf)
-            data: &'a [u8],                       // slice of block data section
-            max_tf: u32,
-            doc_count: u32,
-            doc_offset: u32,
+        struct SourceMeta {
+            stream_len: usize,
+            l0_count: usize,
         }
 
-        let mut parsed: Vec<RawSource<'_>> = Vec::with_capacity(sources.len());
-        for (raw, doc_offset) in sources {
-            if raw.len() < 20 {
+        let mut metas: Vec<SourceMeta> = Vec::with_capacity(sources.len());
+        let mut total_docs = 0u32;
+        let mut merged_max_tf = 0u32;
+
+        for (raw, _) in sources {
+            if raw.len() < FOOTER_SIZE {
                 continue;
             }
-            let f = raw.len() - 20;
-            let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
-            let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
-            let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
-            let max_tf = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
-
-            let mut skip_list = Vec::with_capacity(skip_count);
-            let mut pos = data_len;
-            for _ in 0..skip_count {
-                let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
-                let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-                let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
-                let block_max_tf = u32::from_le_bytes(raw[pos + 16..pos + 20].try_into().unwrap());
-                skip_list.push((base, last, offset, block_max_tf));
-                pos += 20;
-            }
-            parsed.push(RawSource {
-                skip_list,
-                data: &raw[..data_len],
-                max_tf,
-                doc_count,
-                doc_offset: *doc_offset,
+            let f = raw.len() - FOOTER_SIZE;
+            let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+            let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+            // l1_count not needed — we rebuild L1
+            let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
+            let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
+            total_docs += doc_count;
+            merged_max_tf = merged_max_tf.max(max_tf);
+            metas.push(SourceMeta {
+                stream_len,
+                l0_count,
             });
         }
 
-        let total_docs: u32 = parsed.iter().map(|s| s.doc_count).sum();
-        let merged_max_tf: u32 = parsed.iter().map(|s| s.max_tf).max().unwrap_or(0);
+        // Phase 1: Stream block data, reading L0 entries on-the-fly.
+        // Accumulate output L0 + L1 (bounded).
+        let mut out_l0: Vec<u8> = Vec::new();
+        let mut out_l1_docs: Vec<u32> = Vec::new();
+        let mut out_l0_count = 0usize;
+        let mut stream_written = 0u64;
+        let mut patch_buf = [0u8; 8];
 
-        // Phase 1: Stream block data with patched first_doc directly to writer.
-        // Accumulate merged skip entries (20 bytes each — bounded).
-        let mut merged_skip: Vec<(u32, u32, u64, u32)> = Vec::new();
-        let mut data_written = 0u64;
-        let mut patch_buf = [0u8; 8]; // reusable 8-byte prefix buffer
+        for (src_idx, meta) in metas.iter().enumerate() {
+            let (raw, doc_offset) = &sources[src_idx];
+            let l0_base = meta.stream_len; // L0 entries start right after stream
+            let src_stream = &raw[..meta.stream_len];
 
-        for src in &parsed {
-            for (i, &(base, last, offset, block_max_tf)) in src.skip_list.iter().enumerate() {
-                let start = offset as usize;
-                let end = if i + 1 < src.skip_list.len() {
-                    src.skip_list[i + 1].2 as usize
-                } else {
-                    src.data.len()
-                };
-                let block = &src.data[start..end];
+            for i in 0..meta.l0_count {
+                // Read source L0 entry directly from raw bytes
+                let (first_doc, last_doc, offset, max_weight) = read_l0(&raw[l0_base..], i);
 
-                merged_skip.push((
-                    base + src.doc_offset,
-                    last + src.doc_offset,
-                    data_written,
-                    block_max_tf,
-                ));
+                // Compute block size from header
+                let blk_size = block_data_size(src_stream, offset as usize);
+                let block = &src_stream[offset as usize..offset as usize + blk_size];
 
-                // Write patched 8-byte prefix + rest of block verbatim
-                patch_buf[0..4].copy_from_slice(&block[0..4]); // count unchanged
-                let first_doc = u32::from_le_bytes(block[4..8].try_into().unwrap());
-                patch_buf[4..8].copy_from_slice(&(first_doc + src.doc_offset).to_le_bytes());
+                // Write output L0 entry
+                let new_last = last_doc + doc_offset;
+                write_l0(
+                    &mut out_l0,
+                    first_doc + doc_offset,
+                    new_last,
+                    stream_written as u32,
+                    max_weight,
+                );
+                out_l0_count += 1;
+
+                // L1 entry at group boundary
+                if out_l0_count.is_multiple_of(L1_INTERVAL) {
+                    out_l1_docs.push(new_last);
+                }
+
+                // Patch 8-byte header: [count: u16][first_doc: u32][bits: 2 bytes]
+                patch_buf.copy_from_slice(&block[0..8]);
+                let blk_first = u32::from_le_bytes(patch_buf[2..6].try_into().unwrap());
+                patch_buf[2..6].copy_from_slice(&(blk_first + doc_offset).to_le_bytes());
                 writer.write_all(&patch_buf)?;
                 writer.write_all(&block[8..])?;
 
-                data_written += block.len() as u64;
+                stream_written += blk_size as u64;
             }
         }
 
-        // Phase 2: Write skip_list + footer
-        for (base, last, offset, block_max_tf) in &merged_skip {
-            writer.write_u32::<LittleEndian>(*base)?;
-            writer.write_u32::<LittleEndian>(*last)?;
-            writer.write_u64::<LittleEndian>(*offset)?;
-            writer.write_u32::<LittleEndian>(*block_max_tf)?;
+        // Final L1 entry for partial group
+        if !out_l0_count.is_multiple_of(L1_INTERVAL) && out_l0_count > 0 {
+            let (_, last_doc, _, _) = read_l0(&out_l0, out_l0_count - 1);
+            out_l1_docs.push(last_doc);
         }
 
-        writer.write_u64::<LittleEndian>(data_written)?;
-        writer.write_u32::<LittleEndian>(merged_skip.len() as u32)?;
+        // Phase 2: Write L0 + L1 + footer
+        writer.write_all(&out_l0)?;
+        for &doc in &out_l1_docs {
+            writer.write_u32::<LittleEndian>(doc)?;
+        }
+
+        writer.write_u64::<LittleEndian>(stream_written)?;
+        writer.write_u32::<LittleEndian>(out_l0_count as u32)?;
+        writer.write_u32::<LittleEndian>(out_l1_docs.len() as u32)?;
         writer.write_u32::<LittleEndian>(total_docs)?;
         writer.write_u32::<LittleEndian>(merged_max_tf)?;
 
-        let total_bytes = data_written as usize + merged_skip.len() * 20 + 20;
+        let l1_bytes_len = out_l1_docs.len() * L1_SIZE;
+        let total_bytes = stream_written as usize + out_l0.len() + l1_bytes_len + FOOTER_SIZE;
         Ok((total_docs, total_bytes))
+    }
+
+    /// Decode a specific block into caller-provided buffers.
+    ///
+    /// Returns `true` if the block was decoded, `false` if `block_idx` is out of range.
+    /// Reuses `doc_ids` and `tfs` buffers (cleared before filling).
+    ///
+    /// Uses SIMD-accelerated unpack for 8/16/32-bit packed arrays.
+    pub fn decode_block_into(
+        &self,
+        block_idx: usize,
+        doc_ids: &mut Vec<u32>,
+        tfs: &mut Vec<u32>,
+    ) -> bool {
+        if block_idx >= self.l0_count {
+            return false;
+        }
+
+        let (_, _, offset, _) = self.read_l0_entry(block_idx);
+        let pos = offset as usize;
+        let blk_size = block_data_size(&self.stream, pos);
+        let block_data = &self.stream[pos..pos + blk_size];
+
+        // 8-byte header: [count: u16][first_doc: u32][doc_id_bits: u8][tf_bits: u8]
+        let count = u16::from_le_bytes(block_data[0..2].try_into().unwrap()) as usize;
+        let first_doc = u32::from_le_bytes(block_data[2..6].try_into().unwrap());
+        let doc_id_bits = block_data[6];
+        let tf_bits = block_data[7];
+
+        // Decode doc IDs: unpack deltas + prefix sum
+        doc_ids.clear();
+        doc_ids.resize(count, 0);
+        doc_ids[0] = first_doc;
+
+        let doc_rounded = simd::RoundedBitWidth::from_u8(doc_id_bits);
+        let deltas_bytes = if count > 1 {
+            (count - 1) * doc_rounded.bytes_per_value()
+        } else {
+            0
+        };
+
+        if count > 1 {
+            simd::unpack_rounded(
+                &block_data[8..8 + deltas_bytes],
+                doc_rounded,
+                &mut doc_ids[1..],
+                count - 1,
+            );
+            for i in 1..count {
+                doc_ids[i] += doc_ids[i - 1];
+            }
+        }
+
+        // Decode TFs
+        tfs.clear();
+        tfs.resize(count, 0);
+        let tf_rounded = simd::RoundedBitWidth::from_u8(tf_bits);
+        let tfs_start = 8 + deltas_bytes;
+        simd::unpack_rounded(
+            &block_data[tfs_start..tfs_start + count * tf_rounded.bytes_per_value()],
+            tf_rounded,
+            tfs,
+            count,
+        );
+
+        true
+    }
+
+    /// First doc_id of a block (from L0 skip entry). Returns `None` if out of range.
+    #[inline]
+    pub fn block_first_doc(&self, block_idx: usize) -> Option<DocId> {
+        if block_idx >= self.l0_count {
+            return None;
+        }
+        let (first_doc, _, _, _) = self.read_l0_entry(block_idx);
+        Some(first_doc)
+    }
+
+    /// Last doc_id of a block (from L0 skip entry). Returns `None` if out of range.
+    #[inline]
+    pub fn block_last_doc(&self, block_idx: usize) -> Option<DocId> {
+        if block_idx >= self.l0_count {
+            return None;
+        }
+        let (_, last_doc, _, _) = self.read_l0_entry(block_idx);
+        Some(last_doc)
+    }
+
+    /// Find the first block whose `last_doc >= target`, starting from `from_block`.
+    ///
+    /// Uses SIMD-accelerated linear scan:
+    /// 1. `find_first_ge_u32` on the contiguous L1 `last_doc` array
+    /// 2. Extract ≤`L1_INTERVAL` L0 `last_doc` values into a stack buffer → `find_first_ge_u32`
+    ///
+    /// Returns `None` if no block contains `target`.
+    pub fn seek_block(&self, target: DocId, from_block: usize) -> Option<usize> {
+        if from_block >= self.l0_count {
+            return None;
+        }
+
+        let from_l1 = from_block / L1_INTERVAL;
+
+        // SIMD scan L1 to find the group containing target
+        let l1_idx = if !self.l1_docs.is_empty() {
+            let idx = from_l1 + simd::find_first_ge_u32(&self.l1_docs[from_l1..], target);
+            if idx >= self.l1_docs.len() {
+                return None;
+            }
+            idx
+        } else {
+            return None;
+        };
+
+        // Extract L0 last_doc values within the group into a stack buffer for SIMD scan
+        let start = (l1_idx * L1_INTERVAL).max(from_block);
+        let end = ((l1_idx + 1) * L1_INTERVAL).min(self.l0_count);
+        let count = end - start;
+
+        let mut last_docs = [u32::MAX; L1_INTERVAL];
+        for (j, idx) in (start..end).enumerate() {
+            let (_, ld, _, _) = read_l0(&self.l0_bytes, idx);
+            last_docs[j] = ld;
+        }
+        let within = simd::find_first_ge_u32(&last_docs[..count], target);
+        let block_idx = start + within;
+
+        if block_idx < self.l0_count {
+            Some(block_idx)
+        } else {
+            None
+        }
     }
 
     /// Create an iterator with skip support
@@ -559,13 +809,9 @@ pub struct BlockPostingIterator<'a> {
     exhausted: bool,
 }
 
-/// Type alias for owned iterator
-#[allow(dead_code)]
-pub type OwnedBlockPostingIterator = BlockPostingIterator<'static>;
-
 impl<'a> BlockPostingIterator<'a> {
     fn new(block_list: &'a BlockPostingList) -> Self {
-        let exhausted = block_list.skip_list.is_empty();
+        let exhausted = block_list.l0_count == 0;
         let mut iter = Self {
             block_list: std::borrow::Cow::Borrowed(block_list),
             current_block: 0,
@@ -581,7 +827,7 @@ impl<'a> BlockPostingIterator<'a> {
     }
 
     fn owned(block_list: BlockPostingList) -> BlockPostingIterator<'static> {
-        let exhausted = block_list.skip_list.is_empty();
+        let exhausted = block_list.l0_count == 0;
         let mut iter = BlockPostingIterator {
             block_list: std::borrow::Cow::Owned(block_list),
             current_block: 0,
@@ -597,7 +843,7 @@ impl<'a> BlockPostingIterator<'a> {
     }
 
     fn load_block(&mut self, block_idx: usize) {
-        if block_idx >= self.block_list.skip_list.len() {
+        if block_idx >= self.block_list.l0_count {
             self.exhausted = true;
             return;
         }
@@ -605,33 +851,8 @@ impl<'a> BlockPostingIterator<'a> {
         self.current_block = block_idx;
         self.position_in_block = 0;
 
-        let offset = self.block_list.skip_list[block_idx].2 as usize;
-        let mut reader = &self.block_list.data[offset..];
-
-        // Fixed 8-byte prefix: count(u32) + first_doc(u32)
-        let count = reader.read_u32::<LittleEndian>().unwrap_or(0) as usize;
-        let first_doc = reader.read_u32::<LittleEndian>().unwrap_or(0);
-        self.block_doc_ids.clear();
-        self.block_doc_ids.reserve(count);
-        self.block_tfs.clear();
-        self.block_tfs.reserve(count);
-
-        let mut prev_doc_id = first_doc;
-
-        for i in 0..count {
-            if i == 0 {
-                // First doc from fixed prefix, read only tf
-                if let Ok(tf) = read_vint(&mut reader) {
-                    self.block_doc_ids.push(first_doc);
-                    self.block_tfs.push(tf as u32);
-                }
-            } else if let (Ok(delta), Ok(tf)) = (read_vint(&mut reader), read_vint(&mut reader)) {
-                let doc_id = prev_doc_id + delta as u32;
-                self.block_doc_ids.push(doc_id);
-                self.block_tfs.push(tf as u32);
-                prev_doc_id = doc_id;
-            }
-        }
+        self.block_list
+            .decode_block_into(block_idx, &mut self.block_doc_ids, &mut self.block_tfs);
     }
 
     pub fn doc(&self) -> DocId {
@@ -669,16 +890,14 @@ impl<'a> BlockPostingIterator<'a> {
             return TERMINATED;
         }
 
-        // Binary search on skip_list: find first block whose last_doc >= target
-        let block_idx = self
-            .block_list
-            .skip_list
-            .partition_point(|(_, last_doc, _, _)| *last_doc < target);
-
-        if block_idx >= self.block_list.skip_list.len() {
-            self.exhausted = true;
-            return TERMINATED;
-        }
+        // SIMD-accelerated 2-level seek (forward from current block)
+        let block_idx = match self.block_list.seek_block(target, self.current_block) {
+            Some(idx) => idx,
+            None => {
+                self.exhausted = true;
+                return TERMINATED;
+            }
+        };
 
         if block_idx != self.current_block {
             self.load_block(block_idx);
@@ -715,16 +934,17 @@ impl<'a> BlockPostingIterator<'a> {
     /// Get total number of blocks
     #[inline]
     pub fn num_blocks(&self) -> usize {
-        self.block_list.skip_list.len()
+        self.block_list.l0_count
     }
 
     /// Get the current block's max term frequency for block-max pruning
     #[inline]
     pub fn current_block_max_tf(&self) -> u32 {
-        if self.exhausted || self.current_block >= self.block_list.skip_list.len() {
+        if self.exhausted || self.current_block >= self.block_list.l0_count {
             0
         } else {
-            self.block_list.skip_list[self.current_block].3
+            let (_, _, _, max_weight) = self.block_list.read_l0_entry(self.current_block);
+            max_weight as u32
         }
     }
 }
@@ -1169,5 +1389,276 @@ mod tests {
         let merged = BlockPostingList::deserialize(&out).unwrap();
         assert_eq!(merged.max_tf(), 50);
         assert_eq!(merged.doc_count(), 400);
+    }
+
+    // ── 2-level skip list format tests ──────────────────────────────────
+
+    #[test]
+    fn test_l0_l1_counts() {
+        // 1 block (< L1_INTERVAL) → 1 L1 entry (partial group)
+        let bpl = build_bpl(&(0..50u32).map(|i| (i, 1)).collect::<Vec<_>>());
+        assert_eq!(bpl.num_blocks(), 1);
+        assert_eq!(bpl.l1_docs.len(), 1);
+
+        // Exactly L1_INTERVAL blocks → 1 L1 entry (full group)
+        let n = BLOCK_SIZE * L1_INTERVAL;
+        let bpl = build_bpl(&(0..n as u32).map(|i| (i * 2, 1)).collect::<Vec<_>>());
+        assert_eq!(bpl.num_blocks(), L1_INTERVAL);
+        assert_eq!(bpl.l1_docs.len(), 1);
+
+        // L1_INTERVAL + 1 blocks → 2 L1 entries
+        let n = BLOCK_SIZE * L1_INTERVAL + 1;
+        let bpl = build_bpl(&(0..n as u32).map(|i| (i * 2, 1)).collect::<Vec<_>>());
+        assert_eq!(bpl.num_blocks(), L1_INTERVAL + 1);
+        assert_eq!(bpl.l1_docs.len(), 2);
+
+        // 3 × L1_INTERVAL blocks → 3 L1 entries (all full groups)
+        let n = BLOCK_SIZE * L1_INTERVAL * 3;
+        let bpl = build_bpl(&(0..n as u32).map(|i| (i, 1)).collect::<Vec<_>>());
+        assert_eq!(bpl.num_blocks(), L1_INTERVAL * 3);
+        assert_eq!(bpl.l1_docs.len(), 3);
+    }
+
+    #[test]
+    fn test_l1_last_doc_values() {
+        // 20 blocks: 2 full L1 groups (8+8) + 1 partial (4) → 3 L1 entries
+        let n = BLOCK_SIZE * 20;
+        let docs: Vec<(u32, u32)> = (0..n as u32).map(|i| (i * 3, 1)).collect();
+        let bpl = build_bpl(&docs);
+        assert_eq!(bpl.num_blocks(), 20);
+        assert_eq!(bpl.l1_docs.len(), 3); // ceil(20/8) = 3
+
+        // L1[0] = last_doc of block 7 (end of first group)
+        let expected_l1_0 = bpl.block_last_doc(7).unwrap();
+        assert_eq!(bpl.l1_docs[0], expected_l1_0);
+
+        // L1[1] = last_doc of block 15 (end of second group)
+        let expected_l1_1 = bpl.block_last_doc(15).unwrap();
+        assert_eq!(bpl.l1_docs[1], expected_l1_1);
+
+        // L1[2] = last_doc of block 19 (end of partial group)
+        let expected_l1_2 = bpl.block_last_doc(19).unwrap();
+        assert_eq!(bpl.l1_docs[2], expected_l1_2);
+    }
+
+    #[test]
+    fn test_seek_block_basic() {
+        // 20 blocks spanning large doc ID range
+        let n = BLOCK_SIZE * 20;
+        let docs: Vec<(u32, u32)> = (0..n as u32).map(|i| (i * 10, 1)).collect();
+        let bpl = build_bpl(&docs);
+
+        // Seek to doc 0 → block 0
+        assert_eq!(bpl.seek_block(0, 0), Some(0));
+
+        // Seek to the first doc of each block
+        for blk in 0..20 {
+            let first = bpl.block_first_doc(blk).unwrap();
+            assert_eq!(
+                bpl.seek_block(first, 0),
+                Some(blk),
+                "seek to block {} first_doc",
+                blk
+            );
+        }
+
+        // Seek to the last doc of each block
+        for blk in 0..20 {
+            let last = bpl.block_last_doc(blk).unwrap();
+            assert_eq!(
+                bpl.seek_block(last, 0),
+                Some(blk),
+                "seek to block {} last_doc",
+                blk
+            );
+        }
+
+        // Seek past all docs
+        let max_doc = bpl.block_last_doc(19).unwrap();
+        assert_eq!(bpl.seek_block(max_doc + 1, 0), None);
+
+        // Seek with from_block > 0 (skip early blocks)
+        let mid_doc = bpl.block_first_doc(10).unwrap();
+        assert_eq!(bpl.seek_block(mid_doc, 10), Some(10));
+        assert_eq!(
+            bpl.seek_block(mid_doc, 11),
+            Some(11).or(bpl.seek_block(mid_doc, 11))
+        );
+    }
+
+    #[test]
+    fn test_seek_block_across_l1_boundaries() {
+        // 24 blocks = 3 L1 groups of 8
+        let n = BLOCK_SIZE * 24;
+        let docs: Vec<(u32, u32)> = (0..n as u32).map(|i| (i * 5, 1)).collect();
+        let bpl = build_bpl(&docs);
+        assert_eq!(bpl.l1_docs.len(), 3);
+
+        // Seek into each L1 group
+        for group in 0..3 {
+            let blk = group * L1_INTERVAL;
+            let target = bpl.block_first_doc(blk).unwrap();
+            assert_eq!(
+                bpl.seek_block(target, 0),
+                Some(blk),
+                "seek to group {} block {}",
+                group,
+                blk
+            );
+        }
+
+        // Seek to doc in the middle of group 2 (block 20)
+        let target = bpl.block_first_doc(20).unwrap() + 1;
+        assert_eq!(bpl.seek_block(target, 0), Some(20));
+    }
+
+    #[test]
+    fn test_block_data_size_helper() {
+        // Build a posting list and verify block_data_size matches actual block sizes
+        let docs: Vec<(u32, u32)> = (0..500u32).map(|i| (i * 7, (i % 20) + 1)).collect();
+        let bpl = build_bpl(&docs);
+
+        for blk in 0..bpl.num_blocks() {
+            let (_, _, offset, _) = bpl.read_l0_entry(blk);
+            let computed_size = block_data_size(&bpl.stream, offset as usize);
+
+            // Verify: next block's offset - this block's offset should equal computed_size
+            // (for all but last block)
+            if blk + 1 < bpl.num_blocks() {
+                let (_, _, next_offset, _) = bpl.read_l0_entry(blk + 1);
+                assert_eq!(
+                    computed_size,
+                    (next_offset - offset) as usize,
+                    "block_data_size mismatch at block {}",
+                    blk
+                );
+            } else {
+                // Last block: offset + size should equal stream length
+                assert_eq!(
+                    offset as usize + computed_size,
+                    bpl.stream.len(),
+                    "last block size mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_l0_entry_roundtrip() {
+        // Verify L0 entries survive serialize → deserialize
+        let docs: Vec<(u32, u32)> = (0..1000u32).map(|i| (i * 3, (i % 10) + 1)).collect();
+        let bpl = build_bpl(&docs);
+
+        let bytes = serialize_bpl(&bpl);
+        let bpl2 = BlockPostingList::deserialize(&bytes).unwrap();
+
+        assert_eq!(bpl.num_blocks(), bpl2.num_blocks());
+        for blk in 0..bpl.num_blocks() {
+            assert_eq!(
+                bpl.read_l0_entry(blk),
+                bpl2.read_l0_entry(blk),
+                "L0 entry mismatch at block {}",
+                blk
+            );
+        }
+
+        // Verify L1 docs match
+        assert_eq!(bpl.l1_docs, bpl2.l1_docs);
+    }
+
+    #[test]
+    fn test_zero_copy_deserialize_matches() {
+        let docs: Vec<(u32, u32)> = (0..2000u32).map(|i| (i * 2, (i % 5) + 1)).collect();
+        let bpl = build_bpl(&docs);
+        let bytes = serialize_bpl(&bpl);
+
+        let copied = BlockPostingList::deserialize(&bytes).unwrap();
+        let zero_copy =
+            BlockPostingList::deserialize_zero_copy(OwnedBytes::new(bytes.clone())).unwrap();
+
+        // Same structure
+        assert_eq!(copied.l0_count, zero_copy.l0_count);
+        assert_eq!(copied.l1_docs, zero_copy.l1_docs);
+        assert_eq!(copied.doc_count, zero_copy.doc_count);
+        assert_eq!(copied.max_tf, zero_copy.max_tf);
+
+        // Same iteration
+        let p1 = collect_postings(&copied);
+        let p2 = collect_postings(&zero_copy);
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn test_l1_preserved_through_streaming_merge() {
+        // Merge 3 segments, verify L1 is correctly rebuilt
+        let seg_a = build_bpl(&(0..1000u32).map(|i| (i * 2, 1)).collect::<Vec<_>>());
+        let seg_b = build_bpl(&(0..800u32).map(|i| (i * 3, 2)).collect::<Vec<_>>());
+        let seg_c = build_bpl(&(0..500u32).map(|i| (i * 5, 3)).collect::<Vec<_>>());
+
+        let bytes_a = serialize_bpl(&seg_a);
+        let bytes_b = serialize_bpl(&seg_b);
+        let bytes_c = serialize_bpl(&seg_c);
+
+        let sources: Vec<(&[u8], u32)> = vec![(&bytes_a, 0), (&bytes_b, 10000), (&bytes_c, 20000)];
+        let mut out = Vec::new();
+        BlockPostingList::concatenate_streaming(&sources, &mut out).unwrap();
+
+        let merged = BlockPostingList::deserialize(&out).unwrap();
+        let expected_l1_count = merged.num_blocks().div_ceil(L1_INTERVAL);
+        assert_eq!(merged.l1_docs.len(), expected_l1_count);
+
+        // Verify L1 values are correct
+        for (i, &l1_doc) in merged.l1_docs.iter().enumerate() {
+            let last_block_in_group = ((i + 1) * L1_INTERVAL - 1).min(merged.num_blocks() - 1);
+            let expected = merged.block_last_doc(last_block_in_group).unwrap();
+            assert_eq!(l1_doc, expected, "L1[{}] mismatch", i);
+        }
+
+        // Verify seek_block works on merged result
+        for blk in 0..merged.num_blocks() {
+            let first = merged.block_first_doc(blk).unwrap();
+            assert_eq!(merged.seek_block(first, 0), Some(blk));
+        }
+    }
+
+    #[test]
+    fn test_seek_block_single_block() {
+        // Edge case: single block (< L1_INTERVAL)
+        let bpl = build_bpl(&[(0, 1), (10, 2), (20, 3)]);
+        assert_eq!(bpl.num_blocks(), 1);
+        assert_eq!(bpl.l1_docs.len(), 1);
+
+        assert_eq!(bpl.seek_block(0, 0), Some(0));
+        assert_eq!(bpl.seek_block(10, 0), Some(0));
+        assert_eq!(bpl.seek_block(20, 0), Some(0));
+        assert_eq!(bpl.seek_block(21, 0), None);
+    }
+
+    #[test]
+    fn test_footer_size() {
+        // Verify serialized size = stream + L0 + L1 + FOOTER_SIZE
+        let docs: Vec<(u32, u32)> = (0..500u32).map(|i| (i * 2, 1)).collect();
+        let bpl = build_bpl(&docs);
+        let bytes = serialize_bpl(&bpl);
+
+        let expected =
+            bpl.stream.len() + bpl.l0_count * L0_SIZE + bpl.l1_docs.len() * L1_SIZE + FOOTER_SIZE;
+        assert_eq!(bytes.len(), expected);
+    }
+
+    #[test]
+    fn test_seek_block_from_block_skips_earlier() {
+        // 16 blocks: seek with from_block should skip earlier blocks
+        let n = BLOCK_SIZE * 16;
+        let docs: Vec<(u32, u32)> = (0..n as u32).map(|i| (i * 3, 1)).collect();
+        let bpl = build_bpl(&docs);
+
+        // Target is in block 5, but from_block=8 → should find block >= 8
+        let target_in_5 = bpl.block_first_doc(5).unwrap() + 1;
+        // from_block=8 means we only look at blocks 8+
+        // target_in_5 < last_doc of block 8, so seek_block(target, 8) should return 8
+        let result = bpl.seek_block(target_in_5, 8);
+        assert!(result.is_some());
+        assert!(result.unwrap() >= 8);
     }
 }

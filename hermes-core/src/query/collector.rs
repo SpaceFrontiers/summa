@@ -407,7 +407,7 @@ pub async fn collect_segment_with_limit<C: Collector>(
     limit: usize,
 ) -> Result<()> {
     let needs_positions = collector.needs_positions();
-    let mut scorer = query.scorer(reader, limit).await?;
+    let mut scorer = query.scorer(reader, limit, None).await?;
 
     let mut doc = scorer.doc();
     while doc != TERMINATED {

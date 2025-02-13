@@ -170,7 +170,12 @@ impl DenseVectorQuery {
 }
 
 impl Query for DenseVectorQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        _predicate: Option<super::DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
         let field = self.field;
         let vector = self.vector.clone();
         let nprobe = self.nprobe;
@@ -559,7 +564,12 @@ impl SparseVectorQuery {
 }
 
 impl Query for SparseVectorQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        _predicate: Option<super::DocPredicate<'a>>,
+    ) -> ScorerFuture<'a> {
         let field = self.field;
         let vector = self.pruned_vector();
         let combiner = self.combiner;

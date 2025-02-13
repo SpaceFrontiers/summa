@@ -327,15 +327,7 @@ impl SparseIndex {
     /// Parse a single skip entry from the zero-copy skip section
     #[inline]
     pub fn read_skip_entry(&self, entry_idx: usize) -> SparseSkipEntry {
-        let off = entry_idx * SparseSkipEntry::SIZE;
-        let d = &self.skip_bytes[off..off + SparseSkipEntry::SIZE];
-        SparseSkipEntry {
-            first_doc: u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
-            last_doc: u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
-            offset: u64::from_le_bytes([d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]]),
-            length: u32::from_le_bytes([d[16], d[17], d[18], d[19]]),
-            max_weight: f32::from_le_bytes([d[20], d[21], d[22], d[23]]),
-        }
+        SparseSkipEntry::read_at(&self.skip_bytes, entry_idx)
     }
 
     /// Get skip entries for a dimension as a Vec (parsed from skip section)

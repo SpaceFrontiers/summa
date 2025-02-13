@@ -285,23 +285,34 @@ impl PositionPostingList {
         None
     }
 
+    /// Size of one serialized skip entry:
+    /// first_doc(4) + last_doc(4) + offset(8) + length(4) = 20 bytes
+    const SKIP_ENTRY_SIZE: usize = 20;
+
     /// Serialize to bytes (footer-based: data first).
     ///
     /// Format:
     /// ```text
     /// [block data: data_len bytes]
-    /// [skip entries: N × 16 bytes (base_doc, last_doc, offset_u64)]
+    /// [skip entries: N × 20 bytes (base_doc, last_doc, offset, length)]
     /// [footer: data_len(8) + skip_count(4) + doc_count(4) = 16 bytes]
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Data first
         writer.write_all(&self.data)?;
 
-        // Skip list
-        for (base_doc_id, last_doc_id, offset) in &self.skip_list {
+        // Skip list — compute length from adjacent entries
+        for (i, (base_doc_id, last_doc_id, offset)) in self.skip_list.iter().enumerate() {
+            let next_offset = if i + 1 < self.skip_list.len() {
+                self.skip_list[i + 1].2
+            } else {
+                self.data.len() as u64
+            };
+            let length = (next_offset - offset) as u32;
             writer.write_u32::<LittleEndian>(*base_doc_id)?;
             writer.write_u32::<LittleEndian>(*last_doc_id)?;
             writer.write_u64::<LittleEndian>(*offset)?;
+            writer.write_u32::<LittleEndian>(length)?;
         }
 
         // Footer
@@ -327,15 +338,16 @@ impl PositionPostingList {
         let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
         let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
 
-        // Parse skip list (between data and footer)
+        // Parse skip list (20-byte entries; length field not stored in-memory)
         let mut skip_list = Vec::with_capacity(skip_count);
         let mut pos = data_len;
         for _ in 0..skip_count {
             let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
             let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
             let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
+            // pos + 16..pos + 20 = length (not needed in-memory; adjacent entries suffice)
             skip_list.push((base, last, offset));
-            pos += 16;
+            pos += Self::SKIP_ENTRY_SIZE;
         }
 
         let data = raw[..data_len].to_vec();
@@ -392,26 +404,28 @@ impl PositionPostingList {
 
     /// Streaming merge: write blocks directly to output writer (bounded memory).
     ///
-    /// Parses only footer + skip_list from each source (no data copy),
-    /// streams block data with patched 8-byte prefixes directly to `writer`,
-    /// then appends merged skip_list + footer.
+    /// **Zero-materializing**: reads skip entries directly from source bytes
+    /// without parsing into Vecs. Explicit `length` field in each 20-byte
+    /// entry eliminates adjacent-entry lookups.
     ///
-    /// Memory per term: O(total_blocks × 12) for skip entries only.
+    /// Only output skip bytes are buffered (bounded O(total_blocks × 20)).
+    /// Block data flows source → output writer without intermediate buffering.
     ///
     /// Returns `(doc_count, bytes_written)`.
     pub fn concatenate_streaming<W: Write>(
         sources: &[(&[u8], u32)],
         writer: &mut W,
     ) -> io::Result<(u32, usize)> {
-        struct RawSource<'a> {
-            skip_list: Vec<(u32, u32, u64)>,
-            data: &'a [u8],
-            doc_count: u32,
-            doc_offset: u32,
+        // Parse only footers (16 bytes each) — no skip entries materialized
+        struct SourceMeta {
+            data_len: usize,
+            skip_count: usize,
         }
 
-        let mut parsed: Vec<RawSource<'_>> = Vec::with_capacity(sources.len());
-        for (raw, doc_offset) in sources {
+        let mut metas: Vec<SourceMeta> = Vec::with_capacity(sources.len());
+        let mut total_docs = 0u32;
+
+        for (raw, _) in sources {
             if raw.len() < 16 {
                 continue;
             }
@@ -419,46 +433,47 @@ impl PositionPostingList {
             let data_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
             let skip_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
             let doc_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap());
-
-            let mut skip_list = Vec::with_capacity(skip_count);
-            let mut pos = data_len;
-            for _ in 0..skip_count {
-                let base = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
-                let last = u32::from_le_bytes(raw[pos + 4..pos + 8].try_into().unwrap());
-                let offset = u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap());
-                skip_list.push((base, last, offset));
-                pos += 16;
-            }
-            parsed.push(RawSource {
-                skip_list,
-                data: &raw[..data_len],
-                doc_count,
-                doc_offset: *doc_offset,
+            total_docs += doc_count;
+            metas.push(SourceMeta {
+                data_len,
+                skip_count,
             });
         }
 
-        let total_docs: u32 = parsed.iter().map(|s| s.doc_count).sum();
-
-        // Phase 1: Stream block data with patched first_doc
-        let mut merged_skip: Vec<(u32, u32, u64)> = Vec::new();
+        // Phase 1: Stream block data, reading skip entries on-the-fly.
+        // Accumulate output skip bytes (bounded: 20 bytes × total_blocks).
+        let mut out_skip: Vec<u8> = Vec::new();
+        let mut out_skip_count = 0u32;
         let mut data_written = 0u64;
         let mut patch_buf = [0u8; 8];
+        let es = Self::SKIP_ENTRY_SIZE;
 
-        for src in &parsed {
-            for (i, &(base, last, offset)) in src.skip_list.iter().enumerate() {
-                let start = offset as usize;
-                let end = if i + 1 < src.skip_list.len() {
-                    src.skip_list[i + 1].2 as usize
-                } else {
-                    src.data.len()
-                };
-                let block = &src.data[start..end];
+        for (src_idx, meta) in metas.iter().enumerate() {
+            let (raw, doc_offset) = &sources[src_idx];
+            let skip_base = meta.data_len;
+            let data = &raw[..meta.data_len];
 
-                merged_skip.push((base + src.doc_offset, last + src.doc_offset, data_written));
+            for i in 0..meta.skip_count {
+                // Read source skip entry directly from raw bytes
+                let p = skip_base + i * es;
+                let base = u32::from_le_bytes(raw[p..p + 4].try_into().unwrap());
+                let last = u32::from_le_bytes(raw[p + 4..p + 8].try_into().unwrap());
+                let offset = u64::from_le_bytes(raw[p + 8..p + 16].try_into().unwrap());
+                let length = u32::from_le_bytes(raw[p + 16..p + 20].try_into().unwrap());
 
+                let block = &data[offset as usize..(offset as usize + length as usize)];
+
+                // Write output skip entry
+                out_skip.extend_from_slice(&(base + doc_offset).to_le_bytes());
+                out_skip.extend_from_slice(&(last + doc_offset).to_le_bytes());
+                out_skip.extend_from_slice(&data_written.to_le_bytes());
+                out_skip.extend_from_slice(&length.to_le_bytes());
+                out_skip_count += 1;
+
+                // Write patched 8-byte prefix + rest of block verbatim
                 patch_buf[0..4].copy_from_slice(&block[0..4]);
                 let first_doc = u32::from_le_bytes(block[4..8].try_into().unwrap());
-                patch_buf[4..8].copy_from_slice(&(first_doc + src.doc_offset).to_le_bytes());
+                patch_buf[4..8].copy_from_slice(&(first_doc + doc_offset).to_le_bytes());
                 writer.write_all(&patch_buf)?;
                 writer.write_all(&block[8..])?;
 
@@ -466,18 +481,14 @@ impl PositionPostingList {
             }
         }
 
-        // Phase 2: Write skip_list + footer
-        for (base, last, offset) in &merged_skip {
-            writer.write_u32::<LittleEndian>(*base)?;
-            writer.write_u32::<LittleEndian>(*last)?;
-            writer.write_u64::<LittleEndian>(*offset)?;
-        }
+        // Phase 2: Write skip entries + footer
+        writer.write_all(&out_skip)?;
 
         writer.write_u64::<LittleEndian>(data_written)?;
-        writer.write_u32::<LittleEndian>(merged_skip.len() as u32)?;
+        writer.write_u32::<LittleEndian>(out_skip_count)?;
         writer.write_u32::<LittleEndian>(total_docs)?;
 
-        let total_bytes = data_written as usize + merged_skip.len() * 16 + 16;
+        let total_bytes = data_written as usize + out_skip.len() + 16;
         Ok((total_docs, total_bytes))
     }
 

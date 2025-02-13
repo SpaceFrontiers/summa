@@ -357,7 +357,10 @@ pub async fn load_fast_fields_file<D: Directory>(
     // Try to open the .fast file (may not exist for old segments)
     let handle = match dir.open_read(&files.fast).await {
         Ok(h) => h,
-        Err(_) => return Ok(FxHashMap::default()),
+        Err(e) => {
+            log::debug!("[fast-fields] .fast file not found ({}), skipping", e);
+            return Ok(FxHashMap::default());
+        }
     };
 
     let file_data = handle.read_bytes().await?;
@@ -366,10 +369,11 @@ pub async fn load_fast_fields_file<D: Directory>(
     }
 
     let (toc_offset, num_columns) = read_fast_field_footer(&file_data).map_err(crate::Error::Io)?;
-    let toc_entries =
-        read_fast_field_toc(&file_data, toc_offset, num_columns).map_err(crate::Error::Io)?;
 
     let mut readers = FxHashMap::default();
+
+    let toc_entries =
+        read_fast_field_toc(&file_data, toc_offset, num_columns).map_err(crate::Error::Io)?;
     for toc in &toc_entries {
         let reader = FastFieldReader::open(&file_data, toc).map_err(crate::Error::Io)?;
         readers.insert(toc.field_id, reader);
@@ -377,7 +381,7 @@ pub async fn load_fast_fields_file<D: Directory>(
 
     log::debug!(
         "[fast-fields] loaded {} columns from .fast file",
-        readers.len()
+        readers.len(),
     );
 
     Ok(readers)

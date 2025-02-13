@@ -3,7 +3,7 @@
 //! Implements the VBMW approach (Mallia et al., SIGIR 2017): partition a posting
 //! list into variable-sized blocks to minimize "block error" — the sum of
 //! (block_max - actual_weight) across all postings. Tighter block-max upper
-//! bounds improve pruning in both BmpExecutor and SparseMaxScoreExecutor.
+//! bounds improve pruning in both BmpExecutor and MaxScoreExecutor.
 //!
 //! Algorithm: 1-D DP over posting positions with allowed block sizes
 //! [16, 32, 64, 128, 256]. Precomputed prefix sums and sparse-table RMQ
