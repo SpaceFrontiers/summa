@@ -405,6 +405,7 @@ fn prepare_sparse_maxscore<'a>(
 fn combine_sparse_results<'a>(
     raw: Vec<ScoredDoc>,
     combiner: super::MultiValueCombiner,
+    field: crate::Field,
     limit: usize,
 ) -> Box<dyn Scorer + 'a> {
     let combined = crate::segment::combine_ordinal_results(
@@ -412,15 +413,7 @@ fn combine_sparse_results<'a>(
         combiner,
         limit,
     );
-    let scored: Vec<ScoredDoc> = combined
-        .into_iter()
-        .map(|r| ScoredDoc {
-            doc_id: r.doc_id,
-            score: r.score,
-            ordinal: 0,
-        })
-        .collect();
-    Box::new(TopKResultScorer::new(scored))
+    Box::new(VectorTopKResultScorer::new(combined, field.0))
 }
 
 /// Build MaxScore scorer from sparse term infos (async).
@@ -434,9 +427,14 @@ async fn try_sparse_maxscore_scorer<'a>(
         Some(Err(empty)) => return Ok(Some(empty)),
         Some(Ok(e)) => e,
     };
-    let combiner = should[0].as_sparse_term_query_info().unwrap().combiner;
+    let info = should[0].as_sparse_term_query_info().unwrap();
     let raw = executor.execute().await?;
-    Ok(Some(combine_sparse_results(raw, combiner, limit)))
+    Ok(Some(combine_sparse_results(
+        raw,
+        info.combiner,
+        info.field,
+        limit,
+    )))
 }
 
 /// Build MaxScore scorer from sparse term infos (sync).
@@ -451,9 +449,14 @@ fn try_sparse_maxscore_scorer_sync<'a>(
         Some(Err(empty)) => return Ok(Some(empty)),
         Some(Ok(e)) => e,
     };
-    let combiner = should[0].as_sparse_term_query_info().unwrap().combiner;
+    let info = should[0].as_sparse_term_query_info().unwrap();
     let raw = executor.execute_sync()?;
-    Ok(Some(combine_sparse_results(raw, combiner, limit)))
+    Ok(Some(combine_sparse_results(
+        raw,
+        info.combiner,
+        info.field,
+        limit,
+    )))
 }
 
 impl Query for BooleanQuery {
@@ -841,6 +844,73 @@ impl Scorer for TopKResultScorer {
         } else {
             0.0
         }
+    }
+}
+
+/// Scorer that iterates over pre-computed vector results with ordinal information.
+/// Used by sparse MaxScore path to preserve per-ordinal scores for matched_positions().
+struct VectorTopKResultScorer {
+    results: Vec<crate::segment::VectorSearchResult>,
+    position: usize,
+    field_id: u32,
+}
+
+impl VectorTopKResultScorer {
+    fn new(mut results: Vec<crate::segment::VectorSearchResult>, field_id: u32) -> Self {
+        results.sort_unstable_by_key(|r| r.doc_id);
+        Self {
+            results,
+            position: 0,
+            field_id,
+        }
+    }
+}
+
+impl super::docset::DocSet for VectorTopKResultScorer {
+    fn doc(&self) -> DocId {
+        if self.position < self.results.len() {
+            self.results[self.position].doc_id
+        } else {
+            TERMINATED
+        }
+    }
+
+    fn advance(&mut self) -> DocId {
+        self.position += 1;
+        self.doc()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        let remaining = &self.results[self.position..];
+        self.position += remaining.partition_point(|r| r.doc_id < target);
+        self.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        (self.results.len() - self.position) as u32
+    }
+}
+
+impl Scorer for VectorTopKResultScorer {
+    fn score(&self) -> Score {
+        if self.position < self.results.len() {
+            self.results[self.position].score
+        } else {
+            0.0
+        }
+    }
+
+    fn matched_positions(&self) -> Option<super::MatchedPositions> {
+        if self.position >= self.results.len() {
+            return None;
+        }
+        let result = &self.results[self.position];
+        let scored_positions: Vec<super::ScoredPosition> = result
+            .ordinals
+            .iter()
+            .map(|&(ordinal, score)| super::ScoredPosition::new(ordinal, score))
+            .collect();
+        Some(vec![(self.field_id, scored_positions)])
     }
 }
 
