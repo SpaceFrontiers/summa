@@ -53,7 +53,9 @@ pub trait Tokenizer: Send + Sync + Clone + 'static {
     fn tokenize(&self, text: &str) -> Vec<Token>;
 }
 
-/// Simple whitespace tokenizer
+/// Simple tokenizer — splits on whitespace and lowercases.
+///
+/// Does NOT strip punctuation. "Hello, World!" → ["hello,", "world!"]
 #[derive(Debug, Clone, Default)]
 pub struct SimpleTokenizer;
 
@@ -65,7 +67,7 @@ impl Tokenizer for SimpleTokenizer {
         for (offset, word) in split_whitespace_with_offsets(text) {
             if !word.is_empty() {
                 tokens.push(Token::new(
-                    word.to_string(),
+                    lowercase_word(word),
                     position,
                     offset,
                     offset + word.len(),
@@ -78,13 +80,79 @@ impl Tokenizer for SimpleTokenizer {
     }
 }
 
-/// Lowercase tokenizer - splits on whitespace and lowercases
+/// Raw tokenizer — no tokenization at all.
+///
+/// The entire input text becomes a single token (trimmed).
+#[derive(Debug, Clone, Default)]
+pub struct RawTokenizer;
+
+impl Tokenizer for RawTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let offset = text.as_ptr() as usize;
+        let trimmed_offset = trimmed.as_ptr() as usize - offset;
+        vec![Token::new(
+            trimmed.to_string(),
+            0,
+            trimmed_offset,
+            trimmed_offset + trimmed.len(),
+        )]
+    }
+}
+
+/// Raw case-insensitive tokenizer — lowercases the entire input without splitting.
+///
+/// The entire input text becomes a single lowercased token (trimmed).
+#[derive(Debug, Clone, Default)]
+pub struct RawCiTokenizer;
+
+impl Tokenizer for RawCiTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let offset = text.as_ptr() as usize;
+        let trimmed_offset = trimmed.as_ptr() as usize - offset;
+        vec![Token::new(
+            lowercase_word(trimmed),
+            0,
+            trimmed_offset,
+            trimmed_offset + trimmed.len(),
+        )]
+    }
+}
+
+/// Lowercase tokenizer — splits on whitespace, strips non-alphanumeric, and lowercases.
+///
+/// "Hello, World!" → ["hello", "world"]
 #[derive(Debug, Clone, Default)]
 pub struct LowercaseTokenizer;
 
 impl Tokenizer for LowercaseTokenizer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
         tokenize_and_clean(text, std::convert::identity)
+    }
+}
+
+/// Lowercase a word, preserving all characters (no stripping).
+///
+/// ASCII fast-path avoids char decoding.
+#[inline]
+fn lowercase_word(word: &str) -> String {
+    if word.is_ascii() {
+        // Fast check: already lowercase?
+        if word.bytes().all(|b| !b.is_ascii_uppercase()) {
+            return word.to_string();
+        }
+        let mut s = word.to_string();
+        s.make_ascii_lowercase();
+        s
+    } else {
+        word.chars().flat_map(|c| c.to_lowercase()).collect()
     }
 }
 
@@ -483,7 +551,8 @@ impl TokenizerRegistry {
         // Basic tokenizers
         self.register("simple", SimpleTokenizer);
         self.register("lowercase", LowercaseTokenizer);
-        self.register("raw", SimpleTokenizer);
+        self.register("raw", RawTokenizer);
+        self.register("raw_ci", RawCiTokenizer);
 
         // English stemmer variants
         self.register("en_stem", StemmerTokenizer::new(Language::English));
@@ -608,18 +677,74 @@ mod tests {
     #[test]
     fn test_simple_tokenizer() {
         let tokenizer = SimpleTokenizer;
-        let tokens = Tokenizer::tokenize(&tokenizer, "hello world");
+        // SimpleTokenizer: whitespace split + lowercase, preserves punctuation
+        let tokens = Tokenizer::tokenize(&tokenizer, "Hello, World!");
 
         assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[0].text, "hello,");
         assert_eq!(tokens[0].position, 0);
-        assert_eq!(tokens[1].text, "world");
+        assert_eq!(tokens[1].text, "world!");
         assert_eq!(tokens[1].position, 1);
+    }
+
+    #[test]
+    fn test_simple_tokenizer_preserves_punctuation() {
+        let tokenizer = SimpleTokenizer;
+        let tokens = Tokenizer::tokenize(&tokenizer, "https://example.com/page");
+
+        // Single token — no whitespace to split on
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "https://example.com/page");
+    }
+
+    #[test]
+    fn test_raw_tokenizer() {
+        let tokenizer = RawTokenizer;
+        // Entire input becomes one token, preserving case and punctuation
+        let tokens = Tokenizer::tokenize(&tokenizer, "Hello, World!");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "Hello, World!");
+        assert_eq!(tokens[0].position, 0);
+    }
+
+    #[test]
+    fn test_raw_tokenizer_trims() {
+        let tokenizer = RawTokenizer;
+        let tokens = Tokenizer::tokenize(&tokenizer, "  spaced  ");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "spaced");
+        assert_eq!(tokens[0].offset_from, 2);
+    }
+
+    #[test]
+    fn test_raw_tokenizer_empty() {
+        let tokenizer = RawTokenizer;
+        assert!(Tokenizer::tokenize(&tokenizer, "").is_empty());
+        assert!(Tokenizer::tokenize(&tokenizer, "   ").is_empty());
+    }
+
+    #[test]
+    fn test_raw_ci_tokenizer() {
+        let tokenizer = RawCiTokenizer;
+        // Entire input lowercased as one token
+        let tokens = Tokenizer::tokenize(&tokenizer, "Hello, World!");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "hello, world!");
+        assert_eq!(tokens[0].position, 0);
+    }
+
+    #[test]
+    fn test_raw_ci_tokenizer_preserves_structure() {
+        let tokenizer = RawCiTokenizer;
+        let tokens = Tokenizer::tokenize(&tokenizer, "HTTPS://Example.COM/Page");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "https://example.com/page");
     }
 
     #[test]
     fn test_lowercase_tokenizer() {
         let tokenizer = LowercaseTokenizer;
+        // LowercaseTokenizer: whitespace split + strip non-alnum + lowercase
         let tokens = Tokenizer::tokenize(&tokenizer, "Hello, World!");
 
         assert_eq!(tokens.len(), 2);
@@ -741,6 +866,8 @@ mod tests {
         // Check default tokenizers are registered
         assert!(registry.contains("simple"));
         assert!(registry.contains("lowercase"));
+        assert!(registry.contains("raw"));
+        assert!(registry.contains("raw_ci"));
         assert!(registry.contains("en_stem"));
         assert!(registry.contains("german"));
         assert!(registry.contains("russian"));

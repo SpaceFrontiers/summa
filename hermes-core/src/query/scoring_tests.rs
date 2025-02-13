@@ -1276,4 +1276,222 @@ mod tests {
             extra
         );
     }
+
+    // ==================== Multi-value URI Field Tests ====================
+
+    #[tokio::test]
+    async fn test_multivalue_uri_field_search() {
+        // Schema: multi-value "uris" field (lowercase tokenizer) + "title" field
+        //
+        // The lowercase tokenizer strips non-alphanumeric chars and lowercases.
+        // A URI like "https://github.com/rust" becomes the single token
+        // "httpsgithubcomrust". Each add_text() call for the same field adds
+        // another value — all values get independently tokenized and indexed.
+        let mut schema_builder = SchemaBuilder::default();
+        let uris = schema_builder.add_text_field_with_tokenizer("uris", true, true, "lowercase");
+        let title = schema_builder.add_text_field_with_tokenizer("title", true, true, "lowercase");
+        schema_builder.set_default_fields(vec!["uris".to_string(), "title".to_string()]);
+        let schema = schema_builder.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig::default();
+
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+            .await
+            .unwrap();
+
+        // Each URI value is a space-separated list of path segments so the
+        // lowercase tokenizer produces one token per segment.
+        // This mirrors a realistic pre-processing step where URIs are split
+        // into searchable components before indexing.
+
+        // Doc 0: 8 URIs — Rust ecosystem resources
+        let mut doc = Document::new();
+        doc.add_text(uris, "example com page1");
+        doc.add_text(uris, "example com page2");
+        doc.add_text(uris, "docs rust lang org book");
+        doc.add_text(uris, "github com rust lang rust");
+        doc.add_text(uris, "crates io serde");
+        doc.add_text(uris, "blog example com post 123");
+        doc.add_text(uris, "api example com v2 users");
+        doc.add_text(uris, "cdn example com assets logo");
+        doc.add_text(title, "Rust Resources Collection");
+        writer.add_document(doc).unwrap();
+
+        // Doc 1: 6 URIs — Tokio async
+        let mut doc = Document::new();
+        doc.add_text(uris, "github com tokio rs tokio");
+        doc.add_text(uris, "docs rs tokio latest");
+        doc.add_text(uris, "crates io tokio");
+        doc.add_text(uris, "tokio rs tutorial");
+        doc.add_text(uris, "example com async guide");
+        doc.add_text(uris, "blog example com post 456");
+        doc.add_text(title, "Tokio Async Runtime Links");
+        writer.add_document(doc).unwrap();
+
+        // Doc 2: 7 URIs — Python
+        let mut doc = Document::new();
+        doc.add_text(uris, "python org docs");
+        doc.add_text(uris, "pypi org project requests");
+        doc.add_text(uris, "github com psf requests");
+        doc.add_text(uris, "docs python org library");
+        doc.add_text(uris, "flask palletsprojects com");
+        doc.add_text(uris, "fastapi tiangolo com tutorial");
+        doc.add_text(uris, "blog example com post 789");
+        doc.add_text(title, "Python Web Framework Links");
+        writer.add_document(doc).unwrap();
+
+        // Doc 3: 5 URIs — Rust community
+        let mut doc = Document::new();
+        doc.add_text(uris, "stackoverflow com questions rust");
+        doc.add_text(uris, "reddit com r rust");
+        doc.add_text(uris, "discord gg rust lang");
+        doc.add_text(uris, "users rust lang org forum");
+        doc.add_text(uris, "internals rust lang org ideas");
+        doc.add_text(title, "Rust Community Links");
+        writer.add_document(doc).unwrap();
+
+        // Doc 4: 10 URIs — official Rust docs
+        let mut doc = Document::new();
+        doc.add_text(uris, "docs rust lang org std");
+        doc.add_text(uris, "docs rust lang org reference");
+        doc.add_text(uris, "docs rust lang org nomicon");
+        doc.add_text(uris, "docs rust lang org cargo");
+        doc.add_text(uris, "docs rust lang org rustc");
+        doc.add_text(uris, "docs rust lang org edition guide");
+        doc.add_text(uris, "docs rust lang org embedded book");
+        doc.add_text(uris, "docs rust lang org rustdoc");
+        doc.add_text(uris, "docs rust lang org clippy");
+        doc.add_text(uris, "docs rust lang org error index");
+        doc.add_text(title, "Official Rust Documentation");
+        writer.add_document(doc).unwrap();
+
+        writer.commit().await.unwrap();
+
+        let index = Index::open(dir, config).await.unwrap();
+
+        // --- Search by domain/segment in URIs ---
+
+        // "github" appears in doc 0, 1, 2
+        let results = index.query("uris:github", 10).await.unwrap();
+        let found: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert_eq!(
+            found,
+            [0, 1, 2].into_iter().collect::<HashSet<u32>>(),
+            "github should match docs 0, 1, 2"
+        );
+
+        // "tokio" appears in doc 1 URIs and title
+        let results = index.query("uris:tokio", 10).await.unwrap();
+        let found: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert_eq!(
+            found,
+            [1].into_iter().collect::<HashSet<u32>>(),
+            "tokio in URIs should match doc 1"
+        );
+
+        // "python" appears in doc 2 URIs and title
+        let results = index.query("uris:python", 10).await.unwrap();
+        let found: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert_eq!(
+            found,
+            [2].into_iter().collect::<HashSet<u32>>(),
+            "python in URIs should match doc 2"
+        );
+
+        // "docs" appears in URIs of doc 0, 1, 2, 4
+        let results = index.query("uris:docs", 10).await.unwrap();
+        let found: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert_eq!(
+            found,
+            [0, 1, 2, 4].into_iter().collect::<HashSet<u32>>(),
+            "docs should match docs 0, 1, 2, 4"
+        );
+        // Doc 4 should rank highest (10 URIs all containing "docs" → highest TF)
+        assert_eq!(
+            results.hits[0].address.doc_id, 4,
+            "Doc 4 should rank first for 'docs' (highest TF)"
+        );
+
+        // "blog" appears in docs 0, 1, 2
+        let results = index.query("uris:blog", 10).await.unwrap();
+        let found: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert_eq!(
+            found,
+            [0, 1, 2].into_iter().collect::<HashSet<u32>>(),
+            "blog should match docs 0, 1, 2"
+        );
+
+        // "crates" appears in doc 0, 1
+        let results = index.query("uris:crates", 10).await.unwrap();
+        let found: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert_eq!(
+            found,
+            [0, 1].into_iter().collect::<HashSet<u32>>(),
+            "crates should match docs 0, 1"
+        );
+
+        // "stackoverflow" only in doc 3
+        let results = index.query("uris:stackoverflow", 10).await.unwrap();
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].address.doc_id, 3);
+
+        // --- Search across title + uris (default fields) ---
+
+        // "rust" appears in title of doc 0, 3, 4 and URIs of doc 0, 3, 4
+        let results = index.query("rust", 10).await.unwrap();
+        let found: HashSet<u32> = results.hits.iter().map(|h| h.address.doc_id).collect();
+        assert!(
+            found.contains(&0) && found.contains(&3) && found.contains(&4),
+            "unqualified 'rust' should match docs with rust in title or URIs, found: {:?}",
+            found
+        );
+
+        // --- Verify stored multi-value fields round-trip ---
+
+        // Retrieve doc 0 and verify all 8 URIs are stored
+        let doc0_hit = results.hits.iter().find(|h| h.address.doc_id == 0).unwrap();
+        let doc0 = index
+            .get_document(&doc0_hit.address)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_uris: Vec<_> = doc0.get_all(uris).collect();
+        assert_eq!(
+            stored_uris.len(),
+            8,
+            "Doc 0 should have 8 stored URI values"
+        );
+        assert_eq!(stored_uris[0].as_text(), Some("example com page1"));
+        assert_eq!(
+            stored_uris[7].as_text(),
+            Some("cdn example com assets logo")
+        );
+
+        // Retrieve doc 4 and verify all 10 URIs are stored
+        let results = index.query("uris:clippy", 10).await.unwrap();
+        assert_eq!(results.hits.len(), 1);
+        let doc4 = index
+            .get_document(&results.hits[0].address)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_uris: Vec<_> = doc4.get_all(uris).collect();
+        assert_eq!(
+            stored_uris.len(),
+            10,
+            "Doc 4 should have 10 stored URI values"
+        );
+
+        // --- No false positives ---
+
+        // "flask" only in doc 2
+        let results = index.query("uris:flask", 10).await.unwrap();
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].address.doc_id, 2);
+
+        // "nonexistent" should return 0 results
+        let results = index.query("uris:nonexistent", 10).await.unwrap();
+        assert_eq!(results.hits.len(), 0);
+    }
 }
