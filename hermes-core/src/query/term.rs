@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
 use crate::structures::BlockPostingList;
+use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture, TermQueryInfo};
@@ -121,7 +122,15 @@ impl Query for TermQuery {
 
                     Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
                 }
-                None => Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
+                None => {
+                    // Fall back to fast field scanning for fast-only text fields
+                    let term_str = String::from_utf8_lossy(&term);
+                    if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
+                        Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
+                    } else {
+                        Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>)
+                    }
+                }
             }
         })
     }
@@ -181,7 +190,14 @@ impl Query for TermQuery {
 
                 Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
             }
-            None => Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
+            None => {
+                let term_str = String::from_utf8_lossy(&self.term);
+                if let Some(scorer) = FastFieldTextScorer::try_new(reader, self.field, &term_str) {
+                    Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
+                } else {
+                    Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>)
+                }
+            }
         }
     }
 
@@ -249,6 +265,87 @@ impl super::docset::DocSet for TermScorer {
 
     fn size_hint(&self) -> u32 {
         0
+    }
+}
+
+// ── Fast field text equality scorer ──────────────────────────────────────
+
+/// Scorer that scans a text fast field for exact string equality.
+/// Used as fallback when a TermQuery targets a fast-only text field (no inverted index).
+/// Returns score 1.0 for matching docs (filter-style, like RangeScorer).
+struct FastFieldTextScorer<'a> {
+    fast_field: &'a crate::structures::fast_field::FastFieldReader,
+    target_ordinal: u64,
+    current: u32,
+    num_docs: u32,
+}
+
+impl<'a> FastFieldTextScorer<'a> {
+    fn try_new(reader: &'a SegmentReader, field: Field, text: &str) -> Option<Self> {
+        let fast_field = reader.fast_field(field.0)?;
+        let target_ordinal = fast_field.text_ordinal(text)?;
+        let num_docs = reader.num_docs();
+        let mut scorer = Self {
+            fast_field,
+            target_ordinal,
+            current: 0,
+            num_docs,
+        };
+        // Position on first matching doc
+        if num_docs > 0 && fast_field.get_u64(0) != target_ordinal {
+            scorer.scan_forward();
+        }
+        Some(scorer)
+    }
+
+    fn scan_forward(&mut self) {
+        loop {
+            self.current += 1;
+            if self.current >= self.num_docs {
+                self.current = self.num_docs;
+                return;
+            }
+            if self.fast_field.get_u64(self.current) == self.target_ordinal {
+                return;
+            }
+        }
+    }
+}
+
+impl super::docset::DocSet for FastFieldTextScorer<'_> {
+    fn doc(&self) -> DocId {
+        if self.current >= self.num_docs {
+            TERMINATED
+        } else {
+            self.current
+        }
+    }
+
+    fn advance(&mut self) -> DocId {
+        self.scan_forward();
+        self.doc()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target > self.current {
+            self.current = target;
+            if self.current < self.num_docs
+                && self.fast_field.get_u64(self.current) != self.target_ordinal
+            {
+                self.scan_forward();
+            }
+        }
+        self.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        0
+    }
+}
+
+impl Scorer for FastFieldTextScorer<'_> {
+    fn score(&self) -> Score {
+        1.0
     }
 }
 
