@@ -369,6 +369,45 @@ impl Query for BooleanQuery {
         )
     }
 
+    fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
+        // Need at least some clauses
+        if self.must.is_empty() && self.should.is_empty() {
+            return None;
+        }
+
+        // Try converting all clauses to predicates; bail if any child can't
+        let must_preds: Vec<_> = self
+            .must
+            .iter()
+            .map(|q| q.as_doc_predicate(reader))
+            .collect::<Option<Vec<_>>>()?;
+        let should_preds: Vec<_> = self
+            .should
+            .iter()
+            .map(|q| q.as_doc_predicate(reader))
+            .collect::<Option<Vec<_>>>()?;
+        let must_not_preds: Vec<_> = self
+            .must_not
+            .iter()
+            .map(|q| q.as_doc_predicate(reader))
+            .collect::<Option<Vec<_>>>()?;
+
+        let has_must = !must_preds.is_empty();
+
+        Some(Box::new(move |doc_id| {
+            // All MUST predicates must pass
+            if !must_preds.iter().all(|p| p(doc_id)) {
+                return false;
+            }
+            // When there are no MUST clauses, at least one SHOULD must pass
+            if !has_must && !should_preds.is_empty() && !should_preds.iter().any(|p| p(doc_id)) {
+                return false;
+            }
+            // No MUST_NOT predicate should pass
+            must_not_preds.iter().all(|p| !p(doc_id))
+        }))
+    }
+
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         let must = self.must.clone();
         let should = self.should.clone();
