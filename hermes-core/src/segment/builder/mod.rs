@@ -414,7 +414,7 @@ impl SegmentBuilder {
                         }
 
                         if let Some(&slot) = self.field_to_slot.get(&field.0) {
-                            self.doc_field_lengths[base_idx + slot] += token_count;
+                            self.doc_field_lengths[base_idx + slot] = token_count;
                         }
                     }
 
