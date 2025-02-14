@@ -196,10 +196,13 @@ impl Query for TermQuery {
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
         let fast_field = reader.fast_field(self.field.0)?;
         let term_str = String::from_utf8_lossy(&self.term);
-        let target_ordinal = fast_field.text_ordinal(&term_str)?;
-        Some(Box::new(move |doc_id: DocId| -> bool {
-            fast_field.get_u64(doc_id) == target_ordinal
-        }))
+        match fast_field.text_ordinal(&term_str) {
+            Some(target_ordinal) => Some(Box::new(move |doc_id: DocId| -> bool {
+                fast_field.get_u64(doc_id) == target_ordinal
+            })),
+            // Term doesn't exist in this segment — no doc can match.
+            None => Some(Box::new(|_| false)),
+        }
     }
 
     fn decompose(&self) -> super::QueryDecomposition {
