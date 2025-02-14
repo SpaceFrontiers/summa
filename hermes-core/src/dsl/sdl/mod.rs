@@ -78,6 +78,8 @@ pub struct FieldDef {
     pub dense_vector_config: Option<DenseVectorConfig>,
     /// Whether this field has columnar fast-field storage
     pub fast: bool,
+    /// Whether this field is a primary key (unique constraint)
+    pub primary: bool,
 }
 
 /// Parsed index definition
@@ -142,6 +144,9 @@ impl IndexDef {
             }
             if field.fast {
                 builder.set_fast(f, true);
+            }
+            if field.primary {
+                builder.set_primary_key(f);
             }
             // Set positions: explicit > auto (ordinal for multi vectors)
             let positions = field.positions.or({
@@ -228,21 +233,22 @@ struct IndexConfig {
 }
 
 /// Parse attributes from pest pair
-/// Returns (indexed, stored, multi, fast, index_config)
+/// Returns (indexed, stored, multi, fast, primary, index_config)
 /// positions is now inside index_config (via indexed<positions> or indexed<ordinal> etc.)
 /// multi is now inside stored<multi>
 fn parse_attributes(
     pair: pest::iterators::Pair<Rule>,
-) -> (bool, bool, bool, bool, Option<IndexConfig>) {
+) -> (bool, bool, bool, bool, bool, Option<IndexConfig>) {
     let mut indexed = false;
     let mut stored = false;
     let mut multi = false;
     let mut fast = false;
+    let mut primary = false;
     let mut index_config = None;
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::attribute {
-            // attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" }
+            // attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" }
             let mut found_config = false;
             for inner in attr.clone().into_inner() {
                 match inner.as_rule() {
@@ -267,13 +273,14 @@ fn parse_attributes(
                     "indexed" => indexed = true,
                     "stored" => stored = true,
                     "fast" => fast = true,
+                    "primary" => primary = true,
                     _ => {}
                 }
             }
         }
     }
 
-    (indexed, stored, multi, fast, index_config)
+    (indexed, stored, multi, fast, primary, index_config)
 }
 
 /// Parse index configuration from indexed<...> attribute
@@ -467,6 +474,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut stored = true;
     let mut multi = false;
     let mut fast = false;
+    let mut primary = false;
     let mut index_config: Option<IndexConfig> = None;
 
     for item in inner {
@@ -486,15 +494,22 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 dense_vector_config = Some(parse_dense_vector_config(item));
             }
             Rule::attributes => {
-                let (idx, sto, mul, fst, idx_cfg) = parse_attributes(item);
+                let (idx, sto, mul, fst, pri, idx_cfg) = parse_attributes(item);
                 indexed = idx;
                 stored = sto;
                 multi = mul;
                 fast = fst;
+                primary = pri;
                 index_config = idx_cfg;
             }
             _ => {}
         }
+    }
+
+    // Primary key implies fast + indexed (needed for dedup lookups)
+    if primary {
+        fast = true;
+        indexed = true;
     }
 
     // Merge index config into vector configs if both exist
@@ -521,6 +536,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         sparse_vector_config,
         dense_vector_config,
         fast,
+        primary,
     })
 }
 
@@ -813,6 +829,30 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
                 query_routers.push(parse_query_router_def(item)?);
             }
             _ => {}
+        }
+    }
+
+    // Validate primary key constraints
+    let primary_fields: Vec<&FieldDef> = fields.iter().filter(|f| f.primary).collect();
+    if primary_fields.len() > 1 {
+        return Err(Error::Schema(format!(
+            "Index '{}' has {} primary key fields, but at most one is allowed",
+            name,
+            primary_fields.len()
+        )));
+    }
+    if let Some(pk) = primary_fields.first() {
+        if pk.field_type != FieldType::Text {
+            return Err(Error::Schema(format!(
+                "Primary key field '{}' must be of type text, got {:?}",
+                pk.name, pk.field_type
+            )));
+        }
+        if pk.multi {
+            return Err(Error::Schema(format!(
+                "Primary key field '{}' cannot be multi-valued",
+                pk.name
+            )));
         }
     }
 
@@ -1766,5 +1806,126 @@ mod tests {
 
         let name_field = schema.get_field("name").unwrap();
         assert!(!schema.get_field_entry(name_field).unwrap().fast);
+    }
+
+    #[test]
+    fn test_primary_attribute() {
+        let sdl = r#"
+            index documents {
+                field id: text [primary, stored]
+                field title: text [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes.len(), 1);
+        let index = &indexes[0];
+        assert_eq!(index.fields.len(), 2);
+
+        // id should be primary, and auto-set fast + indexed
+        let id_field = &index.fields[0];
+        assert!(id_field.primary, "id should be primary");
+        assert!(id_field.fast, "primary implies fast");
+        assert!(id_field.indexed, "primary implies indexed");
+
+        // title should NOT be primary
+        assert!(!index.fields[1].primary);
+
+        // Verify schema conversion preserves primary_key
+        let schema = index.to_schema();
+        let id = schema.get_field("id").unwrap();
+        let id_entry = schema.get_field_entry(id).unwrap();
+        assert!(id_entry.primary_key);
+        assert!(id_entry.fast);
+        assert!(id_entry.indexed);
+
+        let title = schema.get_field("title").unwrap();
+        assert!(!schema.get_field_entry(title).unwrap().primary_key);
+
+        // primary_field() should return the primary field
+        assert_eq!(schema.primary_field(), Some(id));
+    }
+
+    #[test]
+    fn test_primary_with_other_attributes() {
+        let sdl = r#"
+            index documents {
+                field id: text<simple> [primary, indexed, stored]
+                field body: text [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let id_field = &indexes[0].fields[0];
+        assert!(id_field.primary);
+        assert!(id_field.indexed);
+        assert!(id_field.stored);
+        assert!(id_field.fast);
+        assert_eq!(id_field.tokenizer, Some("simple".to_string()));
+    }
+
+    #[test]
+    fn test_primary_only_one_allowed() {
+        let sdl = r#"
+            index documents {
+                field id: text [primary]
+                field alt_id: text [primary]
+            }
+        "#;
+
+        let result = parse_sdl(sdl);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("primary key"),
+            "Error should mention primary key: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_primary_must_be_text() {
+        let sdl = r#"
+            index documents {
+                field id: u64 [primary]
+            }
+        "#;
+
+        let result = parse_sdl(sdl);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("text"),
+            "Error should mention text type: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_primary_cannot_be_multi() {
+        let sdl = r#"
+            index documents {
+                field id: text [primary, stored<multi>]
+            }
+        "#;
+
+        let result = parse_sdl(sdl);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("multi"), "Error should mention multi: {}", err);
+    }
+
+    #[test]
+    fn test_no_primary_field() {
+        // Schema without primary field should work fine
+        let sdl = r#"
+            index documents {
+                field title: text [indexed, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let schema = indexes[0].to_schema();
+        assert!(schema.primary_field().is_none());
     }
 }

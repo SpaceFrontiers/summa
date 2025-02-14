@@ -76,7 +76,11 @@ impl IndexRegistry {
             .map_err(|e| Status::internal(format!("Failed to open index: {}", e)))?;
 
         let index = Arc::new(index);
-        let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
+        let mut w = index.writer();
+        w.init_primary_key_dedup()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to init primary key dedup: {}", e)))?;
+        let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         self.handles.write().insert(
             name.to_string(),
@@ -108,7 +112,11 @@ impl IndexRegistry {
             .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
 
         let index = Arc::new(index);
-        let writer = Arc::new(tokio::sync::RwLock::new(index.writer()));
+        let mut w = index.writer();
+        w.init_primary_key_dedup()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to init primary key dedup: {}", e)))?;
+        let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         self.handles.write().insert(
             name.to_string(),

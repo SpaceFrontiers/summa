@@ -20,13 +20,12 @@ pub struct IndexServiceImpl {
 impl IndexServiceImpl {
     /// Convert a batch of streaming proto messages to Documents off the async
     /// runtime (spawn_blocking) and feed them to the index writer.
-    /// Returns (indexed_count, recycled_batch_vec) — the Vec is drained but
-    /// retains its capacity so the caller can reuse it.
+    /// Returns (indexed_count, errors, recycled_batch_vec).
     async fn flush_stream_batch(
         batch: Vec<IndexDocumentRequest>,
         schema: &Arc<hermes_core::Schema>,
         writer: &Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::MmapDirectory>>>,
-    ) -> Result<(u32, Vec<IndexDocumentRequest>), Status> {
+    ) -> Result<(u32, Vec<DocumentError>, Vec<IndexDocumentRequest>), Status> {
         let schema = Arc::clone(schema);
         let (docs, recycled) = tokio::task::spawn_blocking(move || {
             let mut docs = Vec::with_capacity(batch.len());
@@ -45,13 +44,27 @@ impl IndexServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("Conversion task failed: {}", e)))?;
 
-        let count = docs.len() as u32;
+        let mut count = 0u32;
+        let mut errors = Vec::new();
         let w = writer.read().await;
-        for doc in docs {
-            w.add_document(doc)
-                .map_err(|e| Status::internal(format!("Failed to index: {}", e)))?;
+        for (i, doc) in docs.into_iter().enumerate() {
+            match w.add_document(doc) {
+                Ok(()) => count += 1,
+                Err(hermes_core::Error::DuplicatePrimaryKey(key)) => {
+                    errors.push(DocumentError {
+                        index: i as u32,
+                        error: format!("Duplicate primary key: {}", key),
+                    });
+                }
+                Err(e) => {
+                    errors.push(DocumentError {
+                        index: i as u32,
+                        error: e.to_string(),
+                    });
+                }
+            }
         }
-        Ok((count, recycled))
+        Ok((count, errors, recycled))
     }
 }
 
@@ -103,17 +116,35 @@ impl IndexService for IndexServiceImpl {
         .await
         .map_err(|e| Status::internal(format!("Conversion task failed: {}", e)))?;
 
-        // Read lock allows concurrent document addition from multiple requests
-        let doc_count = documents.len() as u32;
-        let indexed_count = {
+        // Index documents individually to collect per-document errors (e.g. duplicate PK)
+        let mut indexed_count = 0u32;
+        let mut doc_errors = Vec::new();
+        {
             let w = writer.read().await;
-            w.add_documents(documents)
-                .map_err(|e| Status::internal(format!("Failed to index documents: {}", e)))?
-                as u32
-        };
-        let index_errors = doc_count - indexed_count;
+            for (i, doc) in documents.into_iter().enumerate() {
+                match w.add_document(doc) {
+                    Ok(()) => indexed_count += 1,
+                    Err(hermes_core::Error::DuplicatePrimaryKey(key)) => {
+                        doc_errors.push(DocumentError {
+                            index: i as u32,
+                            error: format!("Duplicate primary key: {}", key),
+                        });
+                    }
+                    Err(hermes_core::Error::QueueFull) => {
+                        // Stop on backpressure — remaining docs not indexed
+                        break;
+                    }
+                    Err(e) => {
+                        doc_errors.push(DocumentError {
+                            index: i as u32,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
 
-        let error_count = conversion_errors + index_errors;
+        let error_count = conversion_errors + doc_errors.len() as u32;
 
         info!(
             "Batch indexed documents: index={}, indexed={}, errors={}",
@@ -123,6 +154,7 @@ impl IndexService for IndexServiceImpl {
         Ok(Response::new(BatchIndexDocumentsResponse {
             indexed_count,
             error_count,
+            errors: doc_errors,
         }))
     }
 
@@ -132,6 +164,7 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<IndexDocumentsResponse>, Status> {
         let mut stream = request.into_inner();
         let mut indexed_count = 0u32;
+        let mut all_errors = Vec::new();
         let mut current_schema: Option<Arc<hermes_core::Schema>> = None;
         let mut current_writer: Option<
             Arc<tokio::sync::RwLock<hermes_core::IndexWriter<hermes_core::MmapDirectory>>>,
@@ -148,13 +181,14 @@ impl IndexService for IndexServiceImpl {
 
             // Flush current batch before switching indexes
             if needs_switch && !batch.is_empty() {
-                let (count, recycled) = Self::flush_stream_batch(
+                let (count, errors, recycled) = Self::flush_stream_batch(
                     batch,
                     current_schema.as_ref().unwrap(),
                     current_writer.as_ref().unwrap(),
                 )
                 .await?;
                 indexed_count += count;
+                all_errors.extend(errors);
                 batch = recycled;
             }
 
@@ -169,20 +203,21 @@ impl IndexService for IndexServiceImpl {
             batch.push(req);
 
             if batch.len() >= STREAM_BATCH_SIZE {
-                let (count, recycled) = Self::flush_stream_batch(
+                let (count, errors, recycled) = Self::flush_stream_batch(
                     batch,
                     current_schema.as_ref().unwrap(),
                     current_writer.as_ref().unwrap(),
                 )
                 .await?;
                 indexed_count += count;
+                all_errors.extend(errors);
                 batch = recycled;
             }
         }
 
         // Flush remaining batch
         if !batch.is_empty() {
-            let (count, _recycled) = Self::flush_stream_batch(
+            let (count, errors, _recycled) = Self::flush_stream_batch(
                 batch,
                 current_schema
                     .as_ref()
@@ -193,9 +228,13 @@ impl IndexService for IndexServiceImpl {
             )
             .await?;
             indexed_count += count;
+            all_errors.extend(errors);
         }
 
-        Ok(Response::new(IndexDocumentsResponse { indexed_count }))
+        Ok(Response::new(IndexDocumentsResponse {
+            indexed_count,
+            errors: all_errors,
+        }))
     }
 
     async fn commit(

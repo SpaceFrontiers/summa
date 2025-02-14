@@ -42,6 +42,9 @@ pub enum Error {
 
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
+
+    #[error("Duplicate primary key: {0}")]
+    DuplicatePrimaryKey(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

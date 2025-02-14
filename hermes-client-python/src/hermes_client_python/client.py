@@ -196,7 +196,7 @@ class HermesClient:
 
     async def index_documents(
         self, index_name: str, documents: list[dict[str, Any]]
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[dict[str, Any]]]:
         """Index multiple documents in batch.
 
         Args:
@@ -204,7 +204,8 @@ class HermesClient:
             documents: List of documents (dicts with field names as keys)
 
         Returns:
-            Tuple of (indexed_count, error_count)
+            Tuple of (indexed_count, error_count, errors) where errors is a list
+            of dicts with 'index' (0-based position) and 'error' (message) keys.
         """
         self._ensure_connected()
 
@@ -217,7 +218,8 @@ class HermesClient:
             index_name=index_name, documents=named_docs
         )
         response = await self._index_stub.BatchIndexDocuments(request)
-        return response.indexed_count, response.error_count
+        errors = [{"index": e.index, "error": e.error} for e in response.errors]
+        return response.indexed_count, response.error_count, errors
 
     async def index_document(self, index_name: str, document: dict[str, Any]) -> None:
         """Index a single document.
@@ -230,7 +232,7 @@ class HermesClient:
 
     async def index_documents_stream(
         self, index_name: str, documents: AsyncIterator[dict[str, Any]]
-    ) -> int:
+    ) -> tuple[int, list[dict[str, Any]]]:
         """Stream documents for indexing.
 
         Args:
@@ -238,7 +240,8 @@ class HermesClient:
             documents: Async iterator of documents
 
         Returns:
-            Number of indexed documents
+            Tuple of (indexed_count, errors) where errors is a list of dicts
+            with 'index' and 'error' keys.
         """
         self._ensure_connected()
 
@@ -248,7 +251,8 @@ class HermesClient:
                 yield pb.IndexDocumentRequest(index_name=index_name, fields=fields)
 
         response = await self._index_stub.IndexDocuments(request_iterator())
-        return response.indexed_count
+        errors = [{"index": e.index, "error": e.error} for e in response.errors]
+        return response.indexed_count, errors
 
     async def commit(self, index_name: str) -> int:
         """Commit pending changes.

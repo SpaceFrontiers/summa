@@ -18,11 +18,15 @@ mod searcher;
 pub use searcher::Searcher;
 
 #[cfg(feature = "native")]
+mod primary_key;
+#[cfg(feature = "native")]
 mod reader;
 #[cfg(feature = "native")]
 mod vector_builder;
 #[cfg(feature = "native")]
 mod writer;
+#[cfg(feature = "native")]
+pub use primary_key::PrimaryKeyIndex;
 #[cfg(feature = "native")]
 pub use reader::IndexReader;
 #[cfg(feature = "native")]

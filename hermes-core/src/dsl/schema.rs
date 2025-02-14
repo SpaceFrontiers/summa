@@ -61,6 +61,9 @@ pub struct FieldEntry {
     /// Valid for u64, i64, f64, and text fields.
     #[serde(default)]
     pub fast: bool,
+    /// Whether this field is a primary key (unique constraint, at most one per schema)
+    #[serde(default)]
+    pub primary_key: bool,
 }
 
 /// Position tracking mode for text fields
@@ -373,6 +376,15 @@ impl Schema {
     pub fn set_query_routers(&mut self, rules: Vec<QueryRouterRule>) {
         self.query_routers = rules;
     }
+
+    /// Get the primary key field, if one is defined
+    pub fn primary_field(&self) -> Option<Field> {
+        self.fields
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.primary_key)
+            .map(|(i, _)| Field(i as u32))
+    }
 }
 
 /// Builder for Schema
@@ -470,6 +482,7 @@ impl SchemaBuilder {
             sparse_vector_config: Some(config),
             dense_vector_config: None,
             fast: false,
+            primary_key: false,
         });
         field
     }
@@ -519,6 +532,7 @@ impl SchemaBuilder {
             sparse_vector_config: None,
             dense_vector_config: Some(config),
             fast: false,
+            primary_key: false,
         });
         field
     }
@@ -565,6 +579,7 @@ impl SchemaBuilder {
             sparse_vector_config: None,
             dense_vector_config: None,
             fast: false,
+            primary_key: false,
         });
         field
     }
@@ -581,6 +596,13 @@ impl SchemaBuilder {
     pub fn set_fast(&mut self, field: Field, fast: bool) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.fast = fast;
+        }
+    }
+
+    /// Mark a field as the primary key (unique constraint)
+    pub fn set_primary_key(&mut self, field: Field) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.primary_key = true;
         }
     }
 

@@ -314,6 +314,13 @@ message BatchIndexDocumentsRequest {
 message BatchIndexDocumentsResponse {
   uint32 indexed_count = 1;
   uint32 error_count = 2;
+  repeated DocumentError errors = 3;
+}
+
+// Per-document error detail (e.g. duplicate primary key)
+message DocumentError {
+  uint32 index = 1;   // 0-based index in the request batch
+  string error = 2;   // Human-readable error message
 }
 
 // Index document request/response
@@ -324,6 +331,7 @@ message IndexDocumentRequest {
 
 message IndexDocumentsResponse {
   uint32 indexed_count = 1;
+  repeated DocumentError errors = 2;
 }
 
 // Commit request/response

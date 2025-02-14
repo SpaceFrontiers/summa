@@ -71,6 +71,8 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) segment_manager: Arc<crate::merge::SegmentManager<D>>,
     /// Segments flushed to disk but not yet registered in metadata
     flushed_segments: Vec<(String, u32)>,
+    /// Primary key dedup index (None if schema has no primary field)
+    primary_key_index: Option<super::primary_key::PrimaryKeyIndex>,
 }
 
 /// Shared state for worker threads.
@@ -244,6 +246,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             worker_state,
             segment_manager,
             flushed_segments: Vec::new(),
+            primary_key_index: None,
         }
     }
 
@@ -285,11 +288,44 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .insert(field, Box::new(tokenizer));
     }
 
+    /// Initialize primary key deduplication from committed segments.
+    ///
+    /// Reads existing primary key values from fast-field text dictionaries and
+    /// builds a bloom filter for O(1) negative lookups. Must be called before
+    /// `add_document` for dedup to take effect. No-op if schema has no primary field.
+    pub async fn init_primary_key_dedup(&mut self) -> Result<()> {
+        let field = match self.schema.primary_field() {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+
+        let snapshot = self.segment_manager.acquire_snapshot().await;
+        let mut readers = Vec::new();
+        for seg_id_str in snapshot.segment_ids() {
+            let seg_id = crate::segment::SegmentId::from_hex(seg_id_str)
+                .ok_or_else(|| Error::Internal(format!("Invalid segment id: {}", seg_id_str)))?;
+            let reader = crate::segment::SegmentReader::open(
+                self.directory.as_ref(),
+                seg_id,
+                Arc::clone(&self.schema),
+                self.config.term_cache_blocks,
+            )
+            .await?;
+            readers.push(Arc::new(reader));
+        }
+
+        self.primary_key_index = Some(super::primary_key::PrimaryKeyIndex::new(field, readers));
+        Ok(())
+    }
+
     /// Add a document to the indexing queue (sync, O(1), lock-free).
     ///
     /// `Document` is moved into the channel (zero-copy). Workers compete to pull it.
     /// Returns `Error::QueueFull` when the queue is at capacity — caller must back off.
     pub fn add_document(&self, doc: Document) -> Result<()> {
+        if let Some(ref pk_index) = self.primary_key_index {
+            pk_index.check_and_insert(&doc)?;
+        }
         self.doc_sender.try_send(doc).map_err(|e| match e {
             async_channel::TrySendError::Full(_) => Error::QueueFull,
             async_channel::TrySendError::Closed(_) => {
@@ -657,6 +693,27 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
         self.is_resolved = true;
         let segments = std::mem::take(&mut self.writer.flushed_segments);
         self.writer.segment_manager.commit(segments).await?;
+
+        // Refresh primary key index with new committed readers
+        if let Some(ref mut pk_index) = self.writer.primary_key_index {
+            let snapshot = self.writer.segment_manager.acquire_snapshot().await;
+            let mut readers = Vec::new();
+            for seg_id_str in snapshot.segment_ids() {
+                if let Some(seg_id) = crate::segment::SegmentId::from_hex(seg_id_str)
+                    && let Ok(reader) = crate::segment::SegmentReader::open(
+                        self.writer.directory.as_ref(),
+                        seg_id,
+                        Arc::clone(&self.writer.schema),
+                        self.writer.config.term_cache_blocks,
+                    )
+                    .await
+                {
+                    readers.push(Arc::new(reader));
+                }
+            }
+            pk_index.refresh(readers);
+        }
+
         self.writer.segment_manager.maybe_merge().await;
         self.writer.resume_workers();
         Ok(())
@@ -667,6 +724,9 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
     pub fn abort(mut self) {
         self.is_resolved = true;
         self.writer.flushed_segments.clear();
+        if let Some(ref mut pk_index) = self.writer.primary_key_index {
+            pk_index.clear_uncommitted();
+        }
         self.writer.resume_workers();
     }
 }
@@ -676,6 +736,9 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
         if !self.is_resolved {
             log::warn!("PreparedCommit dropped without commit/abort — auto-aborting");
             self.writer.flushed_segments.clear();
+            if let Some(ref mut pk_index) = self.writer.primary_key_index {
+                pk_index.clear_uncommitted();
+            }
             self.writer.resume_workers();
         }
     }

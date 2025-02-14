@@ -558,6 +558,10 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             attrs.push("fast".to_string());
         }
 
+        if entry.primary_key {
+            attrs.push("primary".to_string());
+        }
+
         if attrs.is_empty() {
             lines.push(format!("    field {}: {}", entry.name, type_part));
         } else {
@@ -813,6 +817,11 @@ mod tests {
                 orig.name
             );
             assert_eq!(orig.fast, reparsed.fast, "fast mismatch for {}", orig.name);
+            assert_eq!(
+                orig.primary_key, reparsed.primary_key,
+                "primary_key mismatch for {}",
+                orig.name
+            );
             assert_eq!(
                 orig.tokenizer, reparsed.tokenizer,
                 "tokenizer mismatch for {}",

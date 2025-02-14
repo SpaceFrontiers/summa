@@ -105,7 +105,7 @@ tokenizer_spec = { "<" ~ identifier ~ ">" }
 // indexed can have optional index config: indexed<positions> or indexed<rabitq, centroids: "path">
 // stored can have optional multi config: stored<multi> for array fields
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" }
+attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" }
 
 // Stored attribute with optional multi flag
 // Examples:
