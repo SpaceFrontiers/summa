@@ -146,17 +146,23 @@ impl SegmentBuilder {
                 .open(&store_path)?,
         );
 
-        // Count indexed fields for compact field length storage
-        // Also track which fields have position recording enabled
+        // Count indexed fields, track positions, and auto-configure tokenizers
+        let registry = crate::tokenizer::TokenizerRegistry::new();
         let mut num_indexed_fields = 0;
         let mut field_to_slot = FxHashMap::default();
         let mut position_enabled_fields = FxHashMap::default();
+        let mut tokenizers = FxHashMap::default();
         for (field, entry) in schema.fields() {
             if entry.indexed && matches!(entry.field_type, FieldType::Text) {
                 field_to_slot.insert(field.0, num_indexed_fields);
                 num_indexed_fields += 1;
                 if entry.positions.is_some() {
                     position_enabled_fields.insert(field.0, entry.positions);
+                }
+                if let Some(ref tok_name) = entry.tokenizer
+                    && let Some(tokenizer) = registry.get(tok_name)
+                {
+                    tokenizers.insert(field, tokenizer);
                 }
             }
         }
@@ -195,7 +201,7 @@ impl SegmentBuilder {
 
         Ok(Self {
             schema,
-            tokenizers: FxHashMap::default(),
+            tokenizers,
             term_interner: Rodeo::new(),
             inverted_index: HashMap::with_capacity(config.posting_map_capacity),
             store_file,
@@ -408,7 +414,7 @@ impl SegmentBuilder {
                         }
 
                         if let Some(&slot) = self.field_to_slot.get(&field.0) {
-                            self.doc_field_lengths[base_idx + slot] = token_count;
+                            self.doc_field_lengths[base_idx + slot] += token_count;
                         }
                     }
 

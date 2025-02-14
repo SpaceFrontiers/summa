@@ -305,3 +305,70 @@ async fn test_multivalue_field_indexing_and_search() {
     let results = index.query("uris:nonexistent", 10).await.unwrap();
     assert_eq!(results.hits.len(), 0, "Should not find non-existent value");
 }
+
+#[tokio::test]
+async fn test_multivalue_field_with_custom_tokenizer() {
+    let mut schema_builder = SchemaBuilder::default();
+    let uris = schema_builder.add_text_field_with_tokenizer("uris", true, true, "raw_ci");
+    let title = schema_builder.add_text_field("title", true, true);
+    let schema = schema_builder.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // raw_ci tokenizer should be auto-configured from schema — no manual set_tokenizer needed
+
+    let mut doc = Document::new();
+    doc.add_text(uris, "https://Example.COM/Page1");
+    doc.add_text(uris, "https://Example.COM/Page2");
+    doc.add_text(title, "Test Document");
+    writer.add_document(doc).unwrap();
+
+    let mut doc2 = Document::new();
+    doc2.add_text(uris, "https://Other.ORG/Resource");
+    doc2.add_text(title, "Another Document");
+    writer.add_document(doc2).unwrap();
+
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.num_docs().await.unwrap(), 2);
+
+    // Verify both URI values are searchable via inverted index using raw_ci tokenization
+    // raw_ci lowercases the entire input without splitting — so the term is the full lowercased URI
+    let results = index
+        .query("uris:\"https://example.com/page1\"", 10)
+        .await
+        .unwrap();
+    assert_eq!(results.hits.len(), 1, "Should find doc with page1 URI");
+    assert_eq!(results.hits[0].address.doc_id, 0);
+
+    let results = index
+        .query("uris:\"https://example.com/page2\"", 10)
+        .await
+        .unwrap();
+    assert_eq!(results.hits.len(), 1, "Should find doc with page2 URI");
+    assert_eq!(results.hits[0].address.doc_id, 0);
+
+    let results = index
+        .query("uris:\"https://other.org/resource\"", 10)
+        .await
+        .unwrap();
+    assert_eq!(results.hits.len(), 1, "Should find doc with other URI");
+    assert_eq!(results.hits[0].address.doc_id, 1);
+
+    // Verify case-insensitive matching (search with different case)
+    let results = index
+        .query("uris:\"HTTPS://EXAMPLE.COM/PAGE1\"", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        results.hits.len(),
+        1,
+        "Case-insensitive search should find the doc"
+    );
+}
