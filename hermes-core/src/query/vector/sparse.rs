@@ -373,27 +373,13 @@ impl SparseVectorQuery {
 impl Query for SparseVectorQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let infos = self.sparse_infos();
-        let field = self.field;
-        let heap_factor = self.heap_factor;
-        let combiner = self.combiner;
-        let over_fetch_factor = self.over_fetch_factor;
 
         Box::pin(async move {
             if infos.is_empty() {
                 return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>);
             }
 
-            // Single-dim fast path: lazy block-by-block iteration
-            if infos.len() == 1 {
-                let info = &infos[0];
-                let term = SparseTermQuery::new(field, info.dim_id, info.weight)
-                    .with_heap_factor(heap_factor)
-                    .with_combiner(combiner)
-                    .with_over_fetch_factor(over_fetch_factor);
-                return term.scorer(reader, limit).await;
-            }
-
-            // Multi-dim: direct MaxScore execution (bypasses BooleanQuery)
+            // MaxScore execution with ordinal combining (handles both single and multi-dim)
             if let Some((executor, info)) =
                 crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
             {
@@ -421,17 +407,7 @@ impl Query for SparseVectorQuery {
             return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>);
         }
 
-        // Single-dim fast path
-        if infos.len() == 1 {
-            let info = &infos[0];
-            let term = SparseTermQuery::new(self.field, info.dim_id, info.weight)
-                .with_heap_factor(self.heap_factor)
-                .with_combiner(self.combiner)
-                .with_over_fetch_factor(self.over_fetch_factor);
-            return term.scorer_sync(reader, limit);
-        }
-
-        // Multi-dim: direct MaxScore execution
+        // MaxScore execution with ordinal combining (handles both single and multi-dim)
         if let Some((executor, info)) =
             crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
         {

@@ -65,6 +65,21 @@ pub(crate) fn combine_ordinal_results(
 ) -> Vec<VectorSearchResult> {
     let collected: Vec<(u32, u16, f32)> = raw.into_iter().collect();
 
+    let num_raw = collected.len();
+    let unique_docs = {
+        let mut ids: Vec<u32> = collected.iter().map(|(d, _, _)| *d).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    log::debug!(
+        "combine_ordinal_results: {} raw entries, {} unique docs, combiner={:?}, limit={}",
+        num_raw,
+        unique_docs,
+        combiner,
+        limit
+    );
+
     // Fast path: all ordinals are 0 → no grouping needed, skip HashMap
     let all_single = collected.iter().all(|&(_, ord, _)| ord == 0);
     if all_single {

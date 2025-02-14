@@ -212,8 +212,10 @@ macro_rules! boolean_plan {
             let mut must_verifiers: Vec<Box<dyn super::Scorer + '_>> = Vec::new();
             for q in must {
                 if let Some(pred) = q.as_doc_predicate(reader) {
+                    log::debug!("BooleanQuery planner 3a: MUST clause → predicate ({})", q);
                     predicates.push(pred);
                 } else {
+                    log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
                     must_verifiers.push(q.$scorer_fn(reader, limit) $(. $aw)* ?);
                 }
             }
@@ -294,6 +296,12 @@ macro_rules! boolean_plan {
             }
 
             // size_hint < limit with verifiers → BooleanScorer
+            log::debug!(
+                "BooleanQuery planner: BooleanScorer fallback, size_hint={} < limit={}, \
+                 {} must_v + {} must_not_v",
+                should_scorer.size_hint(), limit,
+                must_verifiers.len(), must_not_verifiers.len()
+            );
             let mut scorer = BooleanScorer {
                 must: must_verifiers,
                 should: vec![should_scorer],

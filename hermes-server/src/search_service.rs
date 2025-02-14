@@ -108,6 +108,28 @@ impl SearchService for SearchServiceImpl {
             };
 
         // Convert to response with optional field loading
+        // Debug: detect duplicate doc_ids across results
+        {
+            let mut seen: rustc_hash::FxHashMap<(u128, u32), usize> =
+                rustc_hash::FxHashMap::default();
+            for (i, r) in results.iter().enumerate() {
+                if let Some(prev) = seen.insert((r.segment_id, r.doc_id), i) {
+                    log::warn!(
+                        "Duplicate doc_id in results: seg={:032x} doc={} at positions {} and {}, \
+                         scores={:.4}/{:.4}, ordinals={:?}/{:?}",
+                        r.segment_id,
+                        r.doc_id,
+                        prev,
+                        i,
+                        results[prev].score,
+                        r.score,
+                        results[prev].positions,
+                        r.positions,
+                    );
+                }
+            }
+        }
+
         let mut hits = Vec::new();
         for result in results {
             let mut fields: HashMap<String, FieldValueList> = HashMap::new();
