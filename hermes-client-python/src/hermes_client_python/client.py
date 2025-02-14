@@ -519,6 +519,22 @@ def _to_field_entries(doc: dict[str, Any]) -> list[pb.FieldEntry]:
                     )
                     entries.append(pb.FieldEntry(name=name, value=fv))
                 continue
+            # Single sparse vector: [(idx, val), ...]
+            if _is_sparse_vector(value):
+                indices = [int(item[0]) for item in value]
+                values = [float(item[1]) for item in value]
+                fv = pb.FieldValue(
+                    sparse_vector=pb.SparseVector(indices=indices, values=values)
+                )
+                entries.append(pb.FieldEntry(name=name, value=fv))
+                continue
+            # Single dense vector: [f1, f2, ...]
+            if _is_dense_vector(value):
+                fv = pb.FieldValue(
+                    dense_vector=pb.DenseVector(values=[float(v) for v in value])
+                )
+                entries.append(pb.FieldEntry(name=name, value=fv))
+                continue
             # Multi-value plain field: ["val1", "val2", ...] -> separate entries
             for item in value:
                 entries.append(pb.FieldEntry(name=name, value=_to_field_value(item)))
