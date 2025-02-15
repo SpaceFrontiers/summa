@@ -294,7 +294,7 @@ impl RemoteIndex {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Index not loaded"))?;
 
-        let address = hermes_core::query::DocAddress { segment_id, doc_id };
+        let address = hermes_core::query::DocAddress::new(segment_id, doc_id);
 
         let doc = searcher
             .get_document(&address)
