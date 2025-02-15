@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-client-python"
-version = "1.7.43"
+version = "1.7.44"
 description = "Async Python client for Hermes search server"
 readme = "README.md"
 license = "MIT"
