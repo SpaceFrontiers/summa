@@ -252,11 +252,17 @@ impl IndexService for IndexServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("Commit failed: {}", e)))?;
 
-        // Get doc count from fresh searcher
+        // Force reader reload to pick up newly committed segments.
+        // Without this, the 1-second debounce in reader.searcher() would
+        // return the stale pre-commit searcher.
         let reader = index
             .reader()
             .await
             .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+        reader
+            .reload()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to reload reader: {}", e)))?;
         let searcher = reader
             .searcher()
             .await
@@ -285,11 +291,15 @@ impl IndexService for IndexServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("Merge failed: {}", e)))?;
 
-        // Get segment count from fresh searcher
+        // Force reader reload to pick up merged segments
         let reader = index
             .reader()
             .await
             .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+        reader
+            .reload()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to reload reader: {}", e)))?;
         let searcher = reader
             .searcher()
             .await

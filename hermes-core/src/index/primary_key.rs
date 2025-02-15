@@ -10,7 +10,7 @@ use rustc_hash::FxHashSet;
 
 use crate::dsl::Field;
 use crate::error::{Error, Result};
-use crate::segment::SegmentReader;
+use crate::segment::{SegmentReader, SegmentSnapshot};
 use crate::structures::BloomFilter;
 
 /// Bloom filter sizing: 10 bits/key ≈ 1% false positive rate.
@@ -33,6 +33,8 @@ pub struct PrimaryKeyIndex {
     /// Segment readers for checking committed keys.
     /// Only mutated by `&mut self` methods (refresh/clear) — no lock needed.
     committed_readers: Vec<Arc<SegmentReader>>,
+    /// Holds ref counts so segments aren't deleted while we hold readers.
+    _snapshot: Option<SegmentSnapshot>,
 }
 
 struct PrimaryKeyState {
@@ -44,8 +46,9 @@ impl PrimaryKeyIndex {
     /// Create a new PrimaryKeyIndex by scanning committed segments.
     ///
     /// Iterates each reader's fast-field text dictionary to populate the bloom
-    /// filter with all existing primary key values.
-    pub fn new(field: Field, readers: Vec<Arc<SegmentReader>>) -> Self {
+    /// filter with all existing primary key values. The snapshot keeps ref counts
+    /// alive so segments aren't deleted while we hold readers.
+    pub fn new(field: Field, readers: Vec<Arc<SegmentReader>>, snapshot: SegmentSnapshot) -> Self {
         // Count total unique keys across all segments for bloom sizing.
         let mut total_keys: usize = 0;
         for reader in &readers {
@@ -76,6 +79,7 @@ impl PrimaryKeyIndex {
                 uncommitted: FxHashSet::default(),
             }),
             committed_readers: readers,
+            _snapshot: Some(snapshot),
         }
     }
 
@@ -130,8 +134,11 @@ impl PrimaryKeyIndex {
     ///
     /// The new readers include the just-committed segments, so their text
     /// dictionaries already contain the previously-uncommitted keys.
-    pub fn refresh(&mut self, new_readers: Vec<Arc<SegmentReader>>) {
+    /// The snapshot keeps ref counts alive so segments aren't deleted while
+    /// we hold readers to them.
+    pub fn refresh(&mut self, new_readers: Vec<Arc<SegmentReader>>, snapshot: SegmentSnapshot) {
         self.committed_readers = new_readers;
+        self._snapshot = Some(snapshot);
         // get_mut() bypasses the mutex — safe because we have &mut self.
         let state = self.state.get_mut();
         state.uncommitted.clear();
@@ -149,6 +156,7 @@ impl PrimaryKeyIndex {
 mod tests {
     use super::*;
     use crate::dsl::{Document, Field};
+    use crate::segment::SegmentTracker;
 
     fn make_doc(field: Field, key: &str) -> Document {
         let mut doc = Document::new();
@@ -156,10 +164,14 @@ mod tests {
         doc
     }
 
+    fn empty_snapshot() -> SegmentSnapshot {
+        SegmentSnapshot::new(Arc::new(SegmentTracker::new()), vec![])
+    }
+
     #[test]
     fn test_new_empty_readers() {
         let field = Field(0);
-        let pk = PrimaryKeyIndex::new(field, vec![]);
+        let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
         // Should construct without panicking
         let doc = make_doc(field, "key1");
         assert!(pk.check_and_insert(&doc).is_ok());
@@ -168,7 +180,7 @@ mod tests {
     #[test]
     fn test_unique_keys_accepted() {
         let field = Field(0);
-        let pk = PrimaryKeyIndex::new(field, vec![]);
+        let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
 
         assert!(pk.check_and_insert(&make_doc(field, "a")).is_ok());
         assert!(pk.check_and_insert(&make_doc(field, "b")).is_ok());
@@ -178,7 +190,7 @@ mod tests {
     #[test]
     fn test_duplicate_uncommitted_rejected() {
         let field = Field(0);
-        let pk = PrimaryKeyIndex::new(field, vec![]);
+        let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
 
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_ok());
         let result = pk.check_and_insert(&make_doc(field, "key1"));
@@ -193,7 +205,7 @@ mod tests {
     fn test_missing_field_rejected() {
         let field = Field(0);
         let other_field = Field(1);
-        let pk = PrimaryKeyIndex::new(field, vec![]);
+        let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
 
         // Document has a different field, not the primary key field
         let doc = make_doc(other_field, "value");
@@ -208,7 +220,7 @@ mod tests {
     #[test]
     fn test_empty_key_rejected() {
         let field = Field(0);
-        let pk = PrimaryKeyIndex::new(field, vec![]);
+        let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
 
         let result = pk.check_and_insert(&make_doc(field, ""));
         assert!(result.is_err());
@@ -221,7 +233,7 @@ mod tests {
     #[test]
     fn test_clear_uncommitted() {
         let field = Field(0);
-        let mut pk = PrimaryKeyIndex::new(field, vec![]);
+        let mut pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
 
         // Insert key1
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_ok());
@@ -240,7 +252,7 @@ mod tests {
     #[test]
     fn test_many_unique_keys() {
         let field = Field(0);
-        let pk = PrimaryKeyIndex::new(field, vec![]);
+        let pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
 
         for i in 0..1000 {
             let key = format!("key_{}", i);
@@ -257,14 +269,14 @@ mod tests {
     #[test]
     fn test_refresh_clears_uncommitted() {
         let field = Field(0);
-        let mut pk = PrimaryKeyIndex::new(field, vec![]);
+        let mut pk = PrimaryKeyIndex::new(field, vec![], empty_snapshot());
 
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_ok());
         assert!(pk.check_and_insert(&make_doc(field, "key1")).is_err());
 
         // Refresh with empty readers (simulates commit where segment readers
         // don't have fast fields — edge case)
-        pk.refresh(vec![]);
+        pk.refresh(vec![], empty_snapshot());
 
         // After refresh, uncommitted is cleared and no committed readers have
         // the key, so it should be accepted again
@@ -276,7 +288,7 @@ mod tests {
         use std::sync::Arc;
 
         let field = Field(0);
-        let pk = Arc::new(PrimaryKeyIndex::new(field, vec![]));
+        let pk = Arc::new(PrimaryKeyIndex::new(field, vec![], empty_snapshot()));
 
         // Spawn multiple threads trying to insert the same key
         let mut handles = vec![];

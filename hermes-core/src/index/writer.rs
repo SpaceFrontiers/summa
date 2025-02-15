@@ -314,7 +314,9 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             readers.push(Arc::new(reader));
         }
 
-        self.primary_key_index = Some(super::primary_key::PrimaryKeyIndex::new(field, readers));
+        self.primary_key_index = Some(super::primary_key::PrimaryKeyIndex::new(
+            field, readers, snapshot,
+        ));
         Ok(())
     }
 
@@ -711,7 +713,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
                     readers.push(Arc::new(reader));
                 }
             }
-            pk_index.refresh(readers);
+            pk_index.refresh(readers, snapshot);
         }
 
         self.writer.segment_manager.maybe_merge().await;
