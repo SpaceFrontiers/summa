@@ -65,5 +65,5 @@ export {
   MemoryStats,
   IndexingBufferStats,
   SegmentReaderStats,
-  OrdinalScore,
+  OrdinalScore as PbOrdinalScore,
 } from "./generated/hermes";
