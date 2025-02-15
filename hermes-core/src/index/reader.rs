@@ -163,15 +163,23 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
 
     /// Force reload reader with fresh snapshot.
     ///
-    /// Uses the `reloading` guard to prevent races with `do_reload_check()`.
+    /// Waits for any in-progress reload (from `searcher()`) to finish, then
+    /// performs its own reload with the latest segment IDs. This guarantees
+    /// the reload actually happens — unlike `searcher()` which silently skips
+    /// if another reload is in progress.
     pub async fn reload(&self) -> Result<()> {
-        // Acquire reload guard (skip if another reload is already in progress)
-        if self
-            .reloading
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Ok(()); // Another reload in progress
+        // Wait for any in-progress reload to finish, then acquire the guard.
+        // This is critical: a concurrent do_reload_check() may have started
+        // before a commit, so its reload won't see the new segments.
+        loop {
+            if self
+                .reloading
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
         let new_segment_ids = self.segment_manager.get_segment_ids().await;
         let result = self.reload_with_segments(new_segment_ids).await;

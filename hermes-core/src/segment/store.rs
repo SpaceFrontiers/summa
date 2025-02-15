@@ -24,9 +24,11 @@ use crate::dsl::{Document, Schema};
 
 const STORE_MAGIC: u32 = 0x53544F52; // "STOR"
 const STORE_VERSION: u32 = 2; // Version 2 supports dictionaries
-/// Block size for document store (256KB for better compression)
-/// Larger blocks = better compression ratio but more memory per block load
-pub const STORE_BLOCK_SIZE: usize = 256 * 1024;
+/// Block size for document store (16KB).
+/// Smaller blocks reduce read amplification for single-doc fetches at the
+/// cost of slightly worse compression ratio. Zstd dictionary training
+/// recovers most of the compression loss.
+pub const STORE_BLOCK_SIZE: usize = 16 * 1024;
 
 /// Default dictionary size (4KB is a good balance)
 pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
