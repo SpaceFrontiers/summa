@@ -19,6 +19,7 @@ from .types import (
     DocAddress,
     Document,
     IndexInfo,
+    OrdinalScore,
     SearchHit,
     SearchResponse,
     SearchTimings,
@@ -403,6 +404,10 @@ class HermesClient:
                 ),
                 score=hit.score,
                 fields={k: _from_field_value_list(v) for k, v in hit.fields.items()},
+                ordinal_scores=[
+                    OrdinalScore(ordinal=os.ordinal, score=os.score)
+                    for os in hit.ordinal_scores
+                ],
             )
             for hit in response.hits
         ]

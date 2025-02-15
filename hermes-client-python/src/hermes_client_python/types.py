@@ -129,12 +129,21 @@ class DocAddress:
 
 
 @dataclass
+class OrdinalScore:
+    """Score contribution from a specific ordinal in a multi-valued field."""
+
+    ordinal: int
+    score: float
+
+
+@dataclass
 class SearchHit:
     """A single search result."""
 
     address: DocAddress
     score: float
     fields: dict[str, Any] = field(default_factory=dict)
+    ordinal_scores: list[OrdinalScore] = field(default_factory=list)
 
 
 @dataclass

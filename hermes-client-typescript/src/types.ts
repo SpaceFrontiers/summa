@@ -13,11 +13,18 @@ export interface DocAddress {
   docId: number;
 }
 
+/** Score contribution from a specific ordinal in a multi-valued field. */
+export interface OrdinalScore {
+  ordinal: number;
+  score: number;
+}
+
 /** A single search result. */
 export interface SearchHit {
   address: DocAddress;
   score: number;
   fields: Record<string, any>;
+  ordinalScores: OrdinalScore[];
 }
 
 /** Detailed timing breakdown for search phases (all values in microseconds). */

@@ -243,6 +243,10 @@ export class HermesClient {
       fields: Object.fromEntries(
         Object.entries(hit.fields).map(([k, v]) => [k, fromFieldValueList(v)])
       ),
+      ordinalScores: (hit.ordinalScores ?? []).map((os) => ({
+        ordinal: os.ordinal,
+        score: os.score,
+      })),
     }));
 
     const timings: SearchTimings | undefined = response.timings

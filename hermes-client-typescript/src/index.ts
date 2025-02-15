@@ -2,6 +2,7 @@ export { HermesClient } from "./client";
 export type {
   DocAddress,
   Document,
+  OrdinalScore,
   SearchHit,
   SearchResponse,
   SearchTimings,
