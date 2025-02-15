@@ -314,22 +314,40 @@ impl FstBlockIndex {
 /// Mmap'd raw block index (Option 2)
 ///
 /// Keeps the prefix-compressed block index as raw bytes and decodes
-/// entries on-demand. No heap allocation for keys.
+/// entries on-demand. Uses restart points every R entries for O(log N)
+/// lookup via binary search instead of O(N) linear scan.
 pub struct MmapBlockIndex {
     data: OwnedBytes,
     num_blocks: u32,
     block_addrs: BlockAddrStore,
     /// Offset where the prefix-compressed keys start
     keys_offset: usize,
+    /// Offset where the keys section ends (restart array begins)
+    keys_end: usize,
+    /// Byte offset in data where the restart offsets array starts
+    restart_array_offset: usize,
+    /// Number of restart points
+    restart_count: usize,
+    /// Restart interval (R) — a restart point every R entries
+    restart_interval: usize,
 }
 
+/// Restart interval: store full (uncompressed) key every R entries
+const RESTART_INTERVAL: usize = 16;
+
 impl MmapBlockIndex {
-    /// Build mmap-friendly index from entries
+    /// Build mmap-friendly index from entries.
+    ///
+    /// Format: `num_blocks (u32) | BlockAddrStore | prefix-compressed keys
+    /// (with restart points) | restart_offsets[..] | restart_count (u32) | restart_interval (u16)`
     pub fn build(entries: &[(Vec<u8>, BlockAddr)]) -> io::Result<Vec<u8>> {
         if entries.is_empty() {
-            let mut buf = Vec::with_capacity(10);
+            let mut buf = Vec::with_capacity(16);
             buf.write_u32::<LittleEndian>(0)?; // num_blocks
             buf.extend_from_slice(&BlockAddrStore::build(&[])?);
+            // Empty restart array + footer
+            buf.write_u32::<LittleEndian>(0)?; // restart_count
+            buf.write_u16::<LittleEndian>(RESTART_INTERVAL as u16)?;
             return Ok(buf);
         }
 
@@ -337,27 +355,48 @@ impl MmapBlockIndex {
         let addrs: Vec<BlockAddr> = entries.iter().map(|(_, addr)| *addr).collect();
         let addr_bytes = BlockAddrStore::build(&addrs)?;
 
-        // Build prefix-compressed keys
+        // Build prefix-compressed keys with restart points
         let mut keys_buf = Vec::new();
         let mut prev_key: Vec<u8> = Vec::new();
+        let mut restart_offsets: Vec<u32> = Vec::new();
 
-        for (key, _) in entries {
-            let prefix_len = common_prefix_len(&prev_key, key);
-            let suffix = &key[prefix_len..];
+        for (i, (key, _)) in entries.iter().enumerate() {
+            let is_restart = i % RESTART_INTERVAL == 0;
 
-            write_vint(&mut keys_buf, prefix_len as u64)?;
-            write_vint(&mut keys_buf, suffix.len() as u64)?;
-            keys_buf.extend_from_slice(suffix);
+            if is_restart {
+                restart_offsets.push(keys_buf.len() as u32);
+                // Store full key (no prefix compression)
+                write_vint(&mut keys_buf, 0)?;
+                write_vint(&mut keys_buf, key.len() as u64)?;
+                keys_buf.extend_from_slice(key);
+            } else {
+                let prefix_len = common_prefix_len(&prev_key, key);
+                let suffix = &key[prefix_len..];
+                write_vint(&mut keys_buf, prefix_len as u64)?;
+                write_vint(&mut keys_buf, suffix.len() as u64)?;
+                keys_buf.extend_from_slice(suffix);
+            }
 
             prev_key.clear();
             prev_key.extend_from_slice(key);
         }
 
-        // Combine: num_blocks (u32) + addr_bytes + keys_bytes
-        let mut result = Vec::with_capacity(4 + addr_bytes.len() + keys_buf.len());
+        // Combine: num_blocks + addr_bytes + keys + restart_offsets + footer
+        let restart_count = restart_offsets.len();
+        let mut result =
+            Vec::with_capacity(4 + addr_bytes.len() + keys_buf.len() + restart_count * 4 + 6);
         result.write_u32::<LittleEndian>(entries.len() as u32)?;
         result.extend_from_slice(&addr_bytes);
         result.extend_from_slice(&keys_buf);
+
+        // Write restart offsets array
+        for &off in &restart_offsets {
+            result.write_u32::<LittleEndian>(off)?;
+        }
+
+        // Write footer
+        result.write_u32::<LittleEndian>(restart_count as u32)?;
+        result.write_u16::<LittleEndian>(RESTART_INTERVAL as u16)?;
 
         Ok(result)
     }
@@ -384,30 +423,113 @@ impl MmapBlockIndex {
         let addr_packed_size = total_bits.div_ceil(8);
         let keys_offset = addr_data_start + 6 + addr_packed_size; // 6 = header of BlockAddrStore
 
+        // Read footer (last 6 bytes: restart_count u32 + restart_interval u16)
+        if data.len() < keys_offset + 6 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MmapBlockIndex missing restart footer",
+            ));
+        }
+        let footer_start = data.len() - 6;
+        let restart_count = u32::from_le_bytes([
+            data[footer_start],
+            data[footer_start + 1],
+            data[footer_start + 2],
+            data[footer_start + 3],
+        ]) as usize;
+        let restart_interval =
+            u16::from_le_bytes([data[footer_start + 4], data[footer_start + 5]]) as usize;
+
+        // Restart offsets array: restart_count × 4 bytes, just before footer
+        let restart_array_offset = footer_start - restart_count * 4;
+
+        // Keys section spans from keys_offset to restart_array_offset
+        let keys_end = restart_array_offset;
+
         Ok(Self {
             data,
             num_blocks,
             block_addrs,
             keys_offset,
+            keys_end,
+            restart_array_offset,
+            restart_count,
+            restart_interval,
         })
     }
 
-    /// Binary search for a key, returning the block ordinal
-    /// Decodes keys on-demand during the search
+    /// Read restart offset at given index directly from mmap'd data
+    #[inline]
+    fn restart_offset(&self, idx: usize) -> u32 {
+        let pos = self.restart_array_offset + idx * 4;
+        u32::from_le_bytes([
+            self.data[pos],
+            self.data[pos + 1],
+            self.data[pos + 2],
+            self.data[pos + 3],
+        ])
+    }
+
+    /// Decode the full key at a restart point (prefix_len is always 0)
+    fn decode_restart_key<'a>(&self, keys_data: &'a [u8], restart_idx: usize) -> &'a [u8] {
+        let offset = self.restart_offset(restart_idx) as usize;
+        let mut reader = &keys_data[offset..];
+
+        let prefix_len = read_vint(&mut reader).unwrap_or(0) as usize;
+        debug_assert_eq!(prefix_len, 0, "restart point should have prefix_len=0");
+        let suffix_len = read_vint(&mut reader).unwrap_or(0) as usize;
+
+        // reader now points to the suffix bytes
+        &reader[..suffix_len]
+    }
+
+    /// O(log(N/R) + R) lookup using binary search on restart points, then
+    /// linear scan with prefix decompression within the interval.
     pub fn locate(&self, target: &[u8]) -> Option<usize> {
         if self.num_blocks == 0 {
             return None;
         }
 
-        // We need to do linear scan with prefix decompression
-        // For a true binary search, we'd need restart points
-        // This is still better than loading all keys into memory
-        let keys_data = &self.data.as_slice()[self.keys_offset..];
-        let mut reader = keys_data;
+        let keys_data = &self.data.as_slice()[self.keys_offset..self.keys_end];
+
+        // Binary search on restart points to find the interval
+        let mut lo = 0usize;
+        let mut hi = self.restart_count;
+
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let key = self.decode_restart_key(keys_data, mid);
+            match key.cmp(target) {
+                std::cmp::Ordering::Equal => {
+                    return Some(mid * self.restart_interval);
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+
+        // lo is the first restart point whose key > target (or restart_count)
+        // Search in the interval starting at restart (lo - 1), or 0 if lo == 0
+        if lo == 0 {
+            // target < first restart key — might be before all keys
+            // but we still need to scan from the beginning
+        }
+
+        let restart_idx = if lo > 0 { lo - 1 } else { 0 };
+        let start_ordinal = restart_idx * self.restart_interval;
+        let end_ordinal = if restart_idx + 1 < self.restart_count {
+            (restart_idx + 1) * self.restart_interval
+        } else {
+            self.num_blocks as usize
+        };
+
+        // Linear scan from restart point through at most R entries
+        let scan_offset = self.restart_offset(restart_idx) as usize;
+        let mut reader = &keys_data[scan_offset..];
         let mut current_key = Vec::new();
         let mut last_le_block: Option<usize> = None;
 
-        for i in 0..self.num_blocks as usize {
+        for i in start_ordinal..end_ordinal {
             let prefix_len = match read_vint(&mut reader) {
                 Ok(v) => v as usize,
                 Err(_) => break,
@@ -427,14 +549,10 @@ impl MmapBlockIndex {
             match current_key.as_slice().cmp(target) {
                 std::cmp::Ordering::Equal => return Some(i),
                 std::cmp::Ordering::Less => last_le_block = Some(i),
-                std::cmp::Ordering::Greater => {
-                    // First key greater than target - return previous block
-                    return last_le_block;
-                }
+                std::cmp::Ordering::Greater => return last_le_block,
             }
         }
 
-        // Target is >= all keys, return last block
         last_le_block
     }
 
@@ -461,7 +579,7 @@ impl MmapBlockIndex {
     /// Decode all keys (for debugging/merging)
     pub fn all_keys(&self) -> Vec<Vec<u8>> {
         let mut result = Vec::with_capacity(self.num_blocks as usize);
-        let keys_data = &self.data.as_slice()[self.keys_offset..];
+        let keys_data = &self.data.as_slice()[self.keys_offset..self.keys_end];
         let mut reader = keys_data;
         let mut current_key = Vec::new();
 

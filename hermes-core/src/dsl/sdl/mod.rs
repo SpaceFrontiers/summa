@@ -335,19 +335,34 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
         Rule::num_clusters_kwarg => {
             // num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }
             if let Some(n) = p.into_inner().next() {
-                config.num_clusters = Some(n.as_str().parse().unwrap_or(256));
+                config.num_clusters = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid num_clusters value '{}', using default 256",
+                        n.as_str()
+                    );
+                    256
+                }));
             }
         }
         Rule::build_threshold_kwarg => {
             // build_threshold_kwarg = { "build_threshold" ~ ":" ~ build_threshold_spec }
             if let Some(n) = p.into_inner().next() {
-                config.build_threshold = Some(n.as_str().parse().unwrap_or(10000));
+                config.build_threshold = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid build_threshold value '{}', using default 10000",
+                        n.as_str()
+                    );
+                    10000
+                }));
             }
         }
         Rule::nprobe_kwarg => {
             // nprobe_kwarg = { "nprobe" ~ ":" ~ nprobe_spec }
             if let Some(n) = p.into_inner().next() {
-                config.nprobe = Some(n.as_str().parse().unwrap_or(32));
+                config.nprobe = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!("Invalid nprobe value '{}', using default 32", n.as_str());
+                    32
+                }));
             }
         }
         Rule::quantization_kwarg => {
@@ -365,19 +380,34 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
         Rule::weight_threshold_kwarg => {
             // weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
             if let Some(t) = p.into_inner().next() {
-                config.weight_threshold = Some(t.as_str().parse().unwrap_or(0.0));
+                config.weight_threshold = Some(t.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid weight_threshold value '{}', using default 0.0",
+                        t.as_str()
+                    );
+                    0.0
+                }));
             }
         }
         Rule::block_size_kwarg => {
             // block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
             if let Some(n) = p.into_inner().next() {
-                config.block_size = Some(n.as_str().parse().unwrap_or(128));
+                config.block_size = Some(n.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid block_size value '{}', using default 128",
+                        n.as_str()
+                    );
+                    128
+                }));
             }
         }
         Rule::pruning_kwarg => {
             // pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
             if let Some(f) = p.into_inner().next() {
-                config.pruning = Some(f.as_str().parse().unwrap_or(1.0));
+                config.pruning = Some(f.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!("Invalid pruning value '{}', using default 1.0", f.as_str());
+                    1.0
+                }));
             }
         }
         Rule::query_config_block => {
@@ -427,17 +457,37 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                             Rule::query_weight_threshold_kwarg => {
                                 if let Some(t) = p.into_inner().next() {
                                     config.query_weight_threshold =
-                                        Some(t.as_str().parse().unwrap_or(0.0));
+                                        Some(t.as_str().parse().unwrap_or_else(|_| {
+                                            log::warn!(
+                                                "Invalid query weight_threshold '{}', using 0.0",
+                                                t.as_str()
+                                            );
+                                            0.0
+                                        }));
                                 }
                             }
                             Rule::query_max_dims_kwarg => {
                                 if let Some(t) = p.into_inner().next() {
-                                    config.query_max_dims = Some(t.as_str().parse().unwrap_or(0));
+                                    config.query_max_dims =
+                                        Some(t.as_str().parse().unwrap_or_else(|_| {
+                                            log::warn!(
+                                                "Invalid query max_dims '{}', using 0",
+                                                t.as_str()
+                                            );
+                                            0
+                                        }));
                                 }
                             }
                             Rule::query_pruning_kwarg => {
                                 if let Some(t) = p.into_inner().next() {
-                                    config.query_pruning = Some(t.as_str().parse().unwrap_or(1.0));
+                                    config.query_pruning =
+                                        Some(t.as_str().parse().unwrap_or_else(|_| {
+                                            log::warn!(
+                                                "Invalid query pruning '{}', using 1.0",
+                                                t.as_str()
+                                            );
+                                            1.0
+                                        }));
                                 }
                             }
                             _ => {}

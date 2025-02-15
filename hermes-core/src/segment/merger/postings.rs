@@ -63,7 +63,7 @@ impl SegmentMerger {
         postings_out: &mut OffsetWriter,
         positions_out: &mut OffsetWriter,
     ) -> Result<usize> {
-        let doc_offs = doc_offsets(segments);
+        let doc_offs = doc_offsets(segments)?;
 
         // Parallel prefetch all term dict blocks
         let prefetch_start = std::time::Instant::now();
@@ -207,12 +207,20 @@ impl SegmentMerger {
         // === Merge postings ===
         let (posting_offset, posting_len, doc_count) = if all_external && sources.len() > 1 {
             // Fast path: streaming merge (blocks → output writer, no buffering)
-            let mut raw_sources: Vec<(Vec<u8>, u32)> = Vec::with_capacity(sources.len());
-            for (seg_idx, ti, doc_off) in sources.iter() {
-                let (off, len) = ti.external_info().unwrap();
-                let bytes = segments[*seg_idx].read_postings(off, len).await?;
-                raw_sources.push((bytes, *doc_off));
-            }
+            // Read all segments' postings in parallel
+            let read_futs: Vec<_> = sources
+                .iter()
+                .map(|(seg_idx, ti, doc_off)| {
+                    let (off, len) = ti.external_info().unwrap();
+                    let seg = &segments[*seg_idx];
+                    let doc_off = *doc_off;
+                    async move {
+                        let bytes = seg.read_postings(off, len).await?;
+                        Ok::<_, crate::Error>((bytes, doc_off))
+                    }
+                })
+                .collect();
+            let raw_sources: Vec<(Vec<u8>, u32)> = futures::future::try_join_all(read_futs).await?;
             let refs: Vec<(&[u8], u32)> = raw_sources
                 .iter()
                 .map(|(b, off)| (b.as_slice(), *off))
@@ -259,16 +267,26 @@ impl SegmentMerger {
 
         // === Merge positions (if any source has them) ===
         if any_positions {
-            let mut raw_pos: Vec<(Vec<u8>, u32)> = Vec::new();
-            for (seg_idx, ti, doc_off) in sources.iter() {
-                if let Some((pos_off, pos_len)) = ti.position_info()
-                    && let Some(bytes) = segments[*seg_idx]
-                        .read_position_bytes(pos_off, pos_len)
-                        .await?
-                {
-                    raw_pos.push((bytes, *doc_off));
-                }
-            }
+            // Read all position data in parallel
+            let pos_futs: Vec<_> = sources
+                .iter()
+                .filter_map(|(seg_idx, ti, doc_off)| {
+                    let (pos_off, pos_len) = ti.position_info()?;
+                    let seg = &segments[*seg_idx];
+                    let doc_off = *doc_off;
+                    Some(async move {
+                        match seg.read_position_bytes(pos_off, pos_len).await? {
+                            Some(bytes) => Ok::<_, crate::Error>(Some((bytes, doc_off))),
+                            None => Ok(None),
+                        }
+                    })
+                })
+                .collect();
+            let raw_pos: Vec<(Vec<u8>, u32)> = futures::future::try_join_all(pos_futs)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
             if !raw_pos.is_empty() {
                 let refs: Vec<(&[u8], u32)> = raw_pos
                     .iter()

@@ -575,7 +575,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             total_docs,
         );
 
-        Ok((output_hex, total_docs.min(u32::MAX as u64) as u32))
+        if total_docs > u32::MAX as u64 {
+            return Err(Error::Internal(format!(
+                "Merged segment doc count ({}) exceeds u32::MAX",
+                total_docs
+            )));
+        }
+        Ok((output_hex, total_docs as u32))
     }
 
     /// Wait for all current in-flight merges to complete.

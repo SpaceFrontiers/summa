@@ -55,14 +55,14 @@ async fn feed_segment(
     field: crate::dsl::Field,
     doc_id_offset: u32,
     mut add_fn: impl FnMut(u32, u16, &[f32]),
-) -> usize {
+) -> crate::Result<usize> {
     let lazy_flat = match segment.flat_vectors().get(&field.0) {
         Some(f) => f,
-        None => return 0,
+        None => return Ok(0),
     };
     let n = lazy_flat.num_vectors;
     if n == 0 {
-        return 0;
+        return Ok(0);
     }
     let dim = lazy_flat.dim;
     let quant = lazy_flat.quantization;
@@ -73,17 +73,10 @@ async fn feed_segment(
 
     for batch_start in (0..n).step_by(VECTOR_BATCH_SIZE) {
         let batch_count = VECTOR_BATCH_SIZE.min(n - batch_start);
-        let batch_bytes = match lazy_flat.read_vectors_batch(batch_start, batch_count).await {
-            Ok(b) => b,
-            Err(e) => {
-                log::error!(
-                    "[merge_vectors] failed to read vector batch at offset {}: {:?}",
-                    batch_start,
-                    e
-                );
-                continue;
-            }
-        };
+        let batch_bytes = lazy_flat
+            .read_vectors_batch(batch_start, batch_count)
+            .await
+            .map_err(crate::Error::Io)?;
         let raw = batch_bytes.as_slice();
         let batch_floats = batch_count * dim;
 
@@ -94,10 +87,12 @@ async fn feed_segment(
             dequantize_raw(raw, quant, batch_floats, &mut f32_buf);
             &f32_buf
         } else {
-            debug_assert!(
+            assert!(
                 (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
                 "f32 vector data not 4-byte aligned"
             );
+            // Safety: mmap-backed vector data is page-aligned. Assertion above
+            // guards against unexpected misalignment.
             unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats) }
         };
 
@@ -111,7 +106,7 @@ async fn feed_segment(
             count += 1;
         }
     }
-    count
+    Ok(count)
 }
 
 impl SegmentMerger {
@@ -131,7 +126,7 @@ impl SegmentMerger {
     ) -> Result<usize> {
         let mut blob_fields: Vec<BlobField> = Vec::new();
         let mut flat_fields: Vec<FlatStreamField> = Vec::new();
-        let doc_offs = doc_offsets(segments);
+        let doc_offs = doc_offsets(segments)?;
 
         for (field, entry) in self.schema.fields() {
             if !matches!(entry.field_type, FieldType::DenseVector)
@@ -316,7 +311,7 @@ impl SegmentMerger {
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
                                     index.add_vector(centroids, &codebook, doc_id, ordinal, vec);
                                 })
-                                .await;
+                                .await?;
                             total_fed += fed;
                             if fed > 0 {
                                 log::debug!(
@@ -352,7 +347,7 @@ impl SegmentMerger {
                                 feed_segment(segment, field, offset, |doc_id, ordinal, vec| {
                                     index.add_vector(centroids, codebook, doc_id, ordinal, vec);
                                 })
-                                .await;
+                                .await?;
                             total_fed += fed;
                             if fed > 0 {
                                 log::debug!(

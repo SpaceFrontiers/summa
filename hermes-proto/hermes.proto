@@ -202,7 +202,7 @@ message DenseVector {
 
 message SearchResponse {
   repeated SearchHit hits = 1;
-  uint32 total_hits = 2;
+  uint64 total_hits = 2;
   uint64 took_ms = 3;
   SearchTimings timings = 4;
 }

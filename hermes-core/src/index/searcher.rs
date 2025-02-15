@@ -81,7 +81,7 @@ impl<D: Directory + 'static> Searcher<D> {
             &trained_centroids,
             term_cache_blocks,
         )
-        .await;
+        .await?;
 
         Ok(Self {
             _snapshot: snapshot,
@@ -112,7 +112,7 @@ impl<D: Directory + 'static> Searcher<D> {
             &trained_centroids,
             term_cache_blocks,
         )
-        .await;
+        .await?;
 
         #[cfg(feature = "native")]
         let _snapshot = {
@@ -143,13 +143,13 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
-    ) -> (
+    ) -> Result<(
         Vec<Arc<SegmentReader>>,
         Vec<crate::Field>,
         Arc<LazyGlobalStats>,
         FxHashMap<u128, usize>,
         u32,
-    ) {
+    )> {
         let segments = Self::load_segments(
             directory,
             schema,
@@ -157,17 +157,17 @@ impl<D: Directory + 'static> Searcher<D> {
             trained_centroids,
             term_cache_blocks,
         )
-        .await;
+        .await?;
         let default_fields = Self::build_default_fields(schema);
         let global_stats = Arc::new(LazyGlobalStats::new(segments.clone()));
         let (segment_map, total_docs) = Self::build_lookup_tables(&segments);
-        (
+        Ok((
             segments,
             default_fields,
             global_stats,
             segment_map,
             total_docs,
-        )
+        ))
     }
 
     /// Load segment readers from IDs (parallel loading for performance)
@@ -177,7 +177,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_centroids: &FxHashMap<u32, Arc<CoarseCentroids>>,
         term_cache_blocks: usize,
-    ) -> Vec<Arc<SegmentReader>> {
+    ) -> Result<Vec<Arc<SegmentReader>>> {
         // Parse segment IDs and filter invalid ones
         let valid_segments: Vec<(usize, SegmentId)> = segment_ids
             .iter()
@@ -204,11 +204,10 @@ impl<D: Directory + 'static> Searcher<D> {
             match result {
                 Ok(reader) => loaded.push((idx, reader)),
                 Err(e) => {
-                    panic!(
-                        "Failed to open segment {:016x}: {:?}. \
-                         Refusing to serve with incomplete data.",
+                    return Err(crate::error::Error::Internal(format!(
+                        "Failed to open segment {:016x}: {:?}",
                         sid.0, e
-                    );
+                    )));
                 }
             }
         }
@@ -226,7 +225,7 @@ impl<D: Directory + 'static> Searcher<D> {
         }
 
         // Log searcher loading summary with per-segment memory breakdown
-        let total_docs: u32 = segments.iter().map(|s| s.meta().num_docs).sum();
+        let total_docs: u64 = segments.iter().map(|s| s.meta().num_docs as u64).sum();
         let mut total_mem = 0usize;
         for seg in &segments {
             let stats = seg.memory_stats();
@@ -255,7 +254,7 @@ impl<D: Directory + 'static> Searcher<D> {
             rss_mb,
         );
 
-        segments
+        Ok(segments)
     }
 
     /// Build default fields from schema
@@ -401,6 +400,17 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
         let fetch_limit = offset + limit;
 
+        // Multi-segment: use rayon for true CPU parallelism (sync feature required).
+        // Only works on multi-threaded tokio runtime (block_in_place panics on current_thread).
+        #[cfg(feature = "sync")]
+        if self.segments.len() > 1
+            && tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            return self.search_internal_parallel(query, fetch_limit, offset, collect_positions);
+        }
+
+        // Single segment or no sync feature: use async path
         let futures: Vec<_> = self
             .segments
             .iter()
@@ -437,7 +447,63 @@ impl<D: Directory + 'static> Searcher<D> {
         let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
             Vec::with_capacity(batches.len());
         for (batch, segment_seen) in batches {
-            total_seen += segment_seen;
+            total_seen = total_seen.saturating_add(segment_seen);
+            if !batch.is_empty() {
+                sorted_batches.push(batch);
+            }
+        }
+
+        let results = merge_segment_results(sorted_batches, fetch_limit, offset);
+        Ok((results, total_seen))
+    }
+
+    /// Multi-segment parallel search using rayon (CPU-bound scoring on thread pool).
+    ///
+    /// `block_in_place` tells tokio this worker is occupied so it can steal tasks.
+    /// `rayon::par_iter` distributes segment scoring across the rayon thread pool.
+    #[cfg(feature = "sync")]
+    fn search_internal_parallel(
+        &self,
+        query: &dyn crate::query::Query,
+        fetch_limit: usize,
+        offset: usize,
+        collect_positions: bool,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        use rayon::prelude::*;
+
+        let batches: Vec<Result<(Vec<crate::query::SearchResult>, u32)>> =
+            tokio::task::block_in_place(|| {
+                self.segments
+                    .par_iter()
+                    .map(|segment| {
+                        let sid = segment.meta().id;
+                        let (mut results, segment_seen) = if collect_positions {
+                            crate::query::search_segment_with_positions_and_count_sync(
+                                segment.as_ref(),
+                                query,
+                                fetch_limit,
+                            )?
+                        } else {
+                            crate::query::search_segment_with_count_sync(
+                                segment.as_ref(),
+                                query,
+                                fetch_limit,
+                            )?
+                        };
+                        for r in &mut results {
+                            r.segment_id = sid;
+                        }
+                        Ok((results, segment_seen))
+                    })
+                    .collect()
+            });
+
+        let mut total_seen: u32 = 0;
+        let mut sorted_batches: Vec<Vec<crate::query::SearchResult>> =
+            Vec::with_capacity(batches.len());
+        for result in batches {
+            let (batch, segment_seen) = result?;
+            total_seen = total_seen.saturating_add(segment_seen);
             if !batch.is_empty() {
                 sorted_batches.push(batch);
             }
@@ -483,7 +549,7 @@ impl<D: Directory + 'static> Searcher<D> {
             Vec::with_capacity(batches.len());
         for result in batches {
             let (batch, segment_seen) = result?;
-            total_seen += segment_seen;
+            total_seen = total_seen.saturating_add(segment_seen);
             if !batch.is_empty() {
                 sorted_batches.push(batch);
             }
@@ -587,7 +653,7 @@ impl<D: Directory + 'static> Searcher<D> {
         fields: Option<&rustc_hash::FxHashSet<u32>>,
     ) -> Result<Option<crate::dsl::Document>> {
         let segment_id = address.segment_id_u128().ok_or_else(|| {
-            crate::error::Error::Query(format!("Invalid segment ID: {}", address.segment_id))
+            crate::error::Error::Query(format!("Invalid segment ID: {}", address.segment_id()))
         })?;
 
         if let Some(&idx) = self.segment_map.get(&segment_id) {

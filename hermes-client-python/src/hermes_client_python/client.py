@@ -120,9 +120,9 @@ class HermesClient:
 
         Example SDL schema:
             index myindex {
-                title: text indexed stored
-                body: text indexed stored
-                score: f64 stored
+                field title: text [indexed, stored]
+                field body: text [indexed, stored]
+                field score: f64 [stored]
             }
 
         Example JSON schema:
@@ -736,8 +736,21 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
     if "all" in q:
         return pb.Query(all=pb.AllQuery())
 
-    # Default: match all
-    return pb.Query(boolean=pb.BooleanQuery())
+    # No recognized query key found
+    valid_keys = [
+        "term",
+        "match",
+        "boolean",
+        "sparse_vector",
+        "dense_vector",
+        "boost",
+        "range",
+        "all",
+    ]
+    raise ValueError(
+        f"Unrecognized query key(s): {set(q.keys()) - set(valid_keys)}. "
+        f"Valid keys: {valid_keys}"
+    )
 
 
 def _build_reranker(r: dict[str, Any]) -> pb.Reranker:

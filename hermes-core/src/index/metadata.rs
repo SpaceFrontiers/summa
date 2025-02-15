@@ -216,7 +216,7 @@ impl IndexMetadata {
                 serde_json::from_slice(bytes.as_slice())
                     .map_err(|e| Error::Serialization(e.to_string()))
             }
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Try recovering from temp file (crash between write and rename)
                 let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
                 let slice = dir.open_read(tmp_path).await?;
@@ -226,6 +226,7 @@ impl IndexMetadata {
                 log::warn!("Recovered metadata from temp file (previous crash during save)");
                 Ok(meta)
             }
+            Err(e) => Err(Error::Io(e)),
         }
     }
 
@@ -244,7 +245,10 @@ impl IndexMetadata {
         serde_json::to_vec_pretty(self).map_err(|e| Error::Serialization(e.to_string()))
     }
 
-    /// Write pre-serialized metadata bytes to directory (atomic rename).
+    /// Write pre-serialized metadata bytes to directory (atomic rename + fsync).
+    ///
+    /// The fsync ensures durability: without it, a power failure after rename
+    /// could lose the metadata update on systems with volatile write caches.
     pub async fn save_bytes<D: crate::directories::DirectoryWriter>(
         dir: &D,
         bytes: &[u8],
@@ -252,7 +256,9 @@ impl IndexMetadata {
         let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
         let final_path = Path::new(INDEX_META_FILENAME);
         dir.write(tmp_path, bytes).await.map_err(Error::Io)?;
+        dir.sync().await.map_err(Error::Io)?;
         dir.rename(tmp_path, final_path).await.map_err(Error::Io)?;
+        dir.sync().await.map_err(Error::Io)?;
         Ok(())
     }
 

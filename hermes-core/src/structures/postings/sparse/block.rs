@@ -75,6 +75,8 @@ pub struct SparseBlock {
     pub ordinals_data: OwnedBytes,
     /// Quantized weights (zero-copy from mmap when loaded lazily)
     pub weights_data: OwnedBytes,
+    /// Cached last doc_id in the block (avoids full decode in serialize())
+    last_doc_id: DocId,
 }
 
 impl SparseBlock {
@@ -131,6 +133,8 @@ impl SparseBlock {
         });
         let weights_data = OwnedBytes::new(encode_weights(&weights, weight_quant)?);
 
+        let last_doc_id = postings.last().unwrap().0;
+
         Ok(Self {
             header: BlockHeader {
                 count: count as u16,
@@ -143,7 +147,14 @@ impl SparseBlock {
             doc_ids_data,
             ordinals_data,
             weights_data,
+            last_doc_id,
         })
+    }
+
+    /// Last doc_id in the block (cached from construction).
+    #[inline]
+    pub fn last_doc_id(&self) -> DocId {
+        self.last_doc_id
     }
 
     pub fn decode_doc_ids(&self) -> Vec<DocId> {
@@ -388,11 +399,15 @@ impl SparseBlock {
         let mut weights_vec = vec![0u8; weights_len];
         r.read_exact(&mut weights_vec)?;
 
+        // Compute last_doc_id from deltas (stack-allocated, no heap alloc)
+        let last_doc_id = compute_last_doc(&header, &doc_ids_vec);
+
         Ok(Self {
             header,
             doc_ids_data: OwnedBytes::new(doc_ids_vec),
             ordinals_data: OwnedBytes::new(ordinals_vec),
             weights_data: OwnedBytes::new(weights_vec),
+            last_doc_id,
         })
     }
 
@@ -456,11 +471,16 @@ impl SparseBlock {
             )));
         }
 
+        let doc_ids_slice = data.slice(data_start..ord_start);
+        // Compute last_doc_id from deltas (stack-allocated, no heap alloc)
+        let last_doc_id = compute_last_doc(&header, &doc_ids_slice);
+
         Ok(Self {
             header,
-            doc_ids_data: data.slice(data_start..ord_start),
+            doc_ids_data: doc_ids_slice,
             ordinals_data: data.slice(ord_start..wt_start),
             weights_data: data.slice(wt_start..wt_start + weights_len),
+            last_doc_id,
         })
     }
 
@@ -478,6 +498,7 @@ impl SparseBlock {
             doc_ids_data: self.doc_ids_data.clone(),
             ordinals_data: self.ordinals_data.clone(),
             weights_data: self.weights_data.clone(),
+            last_doc_id: self.last_doc_id + doc_offset,
         }
     }
 }
@@ -636,8 +657,7 @@ impl BlockSparsePostingList {
             let length = buf.len() as u32;
 
             let first_doc = block.header.first_doc_id;
-            let doc_ids = block.decode_doc_ids();
-            let last_doc = doc_ids.last().copied().unwrap_or(first_doc);
+            let last_doc = block.last_doc_id;
 
             skip_entries.push(super::SparseSkipEntry::new(
                 first_doc,
@@ -924,6 +944,25 @@ impl<'a> BlockSparsePostingIterator<'a> {
 // ============================================================================
 // Bit-packing utilities
 // ============================================================================
+
+/// Compute the last doc_id from the block header + delta-encoded data.
+/// Uses a stack array (no heap allocation).
+fn compute_last_doc(header: &BlockHeader, doc_ids_data: &[u8]) -> DocId {
+    let count = header.count as usize;
+    if count <= 1 {
+        return header.first_doc_id;
+    }
+    let bits = header.doc_id_bits;
+    if bits == 0 {
+        return header.first_doc_id; // all deltas are 0
+    }
+    let rounded = simd::RoundedBitWidth::from_u8(bits);
+    let num_deltas = count - 1;
+    let mut deltas = [0u32; MAX_BLOCK_SIZE];
+    simd::unpack_rounded(doc_ids_data, rounded, &mut deltas[..num_deltas], num_deltas);
+    let sum: u32 = deltas[..num_deltas].iter().sum();
+    header.first_doc_id + sum
+}
 
 fn find_optimal_bit_width(values: &[u32]) -> u8 {
     if values.is_empty() {

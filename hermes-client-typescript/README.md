@@ -21,8 +21,8 @@ await client.createIndex(
   "articles",
   `
   index articles {
-    title: text indexed stored
-    body: text indexed stored
+    field title: text [indexed, stored]
+    field body: text [indexed, stored]
   }
 `,
 );
@@ -57,7 +57,7 @@ client.close();
 
 ### Document Indexing
 
-- `indexDocuments(indexName, docs)` — Batch index documents, returns `[indexedCount, errorCount]`
+- `indexDocuments(indexName, docs)` — Batch index documents, returns `[indexedCount, errorCount, errors]`
 - `indexDocument(indexName, doc)` — Index a single document
 - `indexDocumentsStream(indexName, asyncIterable)` — Stream documents for indexing
 - `commit(indexName)` — Commit pending changes, returns total doc count

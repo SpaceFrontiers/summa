@@ -177,7 +177,10 @@ async fn test_match_query() {
 
     // Verify hit has address (segment_id + doc_id)
     let hit = &results.hits[0];
-    assert!(!hit.address.segment_id.is_empty(), "Should have segment_id");
+    assert!(
+        !hit.address.segment_id().is_empty(),
+        "Should have segment_id"
+    );
 
     // Verify document retrieval by address
     let doc = index.get_document(&hit.address).await.unwrap().unwrap();

@@ -19,9 +19,9 @@ async def main():
         # Create index with SDL schema
         await client.create_index("articles", '''
             index articles {
-                title: text indexed stored
-                body: text indexed stored
-                score: f64 stored
+                field title: text [indexed, stored]
+                field body: text [indexed, stored]
+                field score: f64 [stored]
             }
         ''')
 
@@ -77,8 +77,8 @@ await client.close()
 # Create index with SDL schema
 await client.create_index("myindex", '''
     index myindex {
-        title: text indexed stored
-        body: text indexed stored
+        field title: text [indexed, stored]
+        field body: text [indexed, stored]
     }
 ''')
 

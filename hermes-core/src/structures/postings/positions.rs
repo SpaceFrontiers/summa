@@ -226,8 +226,23 @@ impl PositionPostingList {
         self.doc_count == 0
     }
 
+    /// Get positions for a specific document into a reusable buffer (zero allocation).
+    /// Returns true if the document was found.
+    pub fn get_positions_into(&self, target_doc_id: DocId, out: &mut Vec<u32>) -> bool {
+        out.clear();
+        self.get_positions_impl(target_doc_id, Some(out)).is_some()
+    }
+
     /// Get positions for a specific document using binary search on skip list
     pub fn get_positions(&self, target_doc_id: DocId) -> Option<Vec<u32>> {
+        self.get_positions_impl(target_doc_id, None)
+    }
+
+    fn get_positions_impl(
+        &self,
+        target_doc_id: DocId,
+        mut out: Option<&mut Vec<u32>>,
+    ) -> Option<Vec<u32>> {
         if self.skip_list.is_empty() {
             return None;
         }
@@ -268,6 +283,15 @@ impl PositionPostingList {
 
             if doc_id == target_doc_id {
                 // Found it! Read positions (stored absolute)
+                if let Some(buf) = &mut out {
+                    // Buffer-based path: write into caller's reusable buffer
+                    buf.reserve(num_positions);
+                    for _ in 0..num_positions {
+                        let pos = read_vint(&mut reader).ok()? as u32;
+                        buf.push(pos);
+                    }
+                    return Some(Vec::new()); // sentinel: actual data is in `out`
+                }
                 let mut positions = Vec::with_capacity(num_positions);
                 for _ in 0..num_positions {
                     let pos = read_vint(&mut reader).ok()? as u32;
@@ -277,7 +301,9 @@ impl PositionPostingList {
             } else {
                 // Skip positions
                 for _ in 0..num_positions {
-                    let _ = read_vint(&mut reader);
+                    if read_vint(&mut reader).is_err() {
+                        return None;
+                    }
                 }
             }
         }
@@ -499,11 +525,24 @@ impl PositionPostingList {
 }
 
 /// Iterator over block-based position posting list
+///
+/// Uses flat buffers instead of per-posting `Vec<u32>` to avoid heap
+/// allocations on every block load. Positions are concatenated into a
+/// single `Vec<u32>` with offset/length pairs for O(1) slicing.
 pub struct PositionPostingIterator<'a> {
     list: &'a PositionPostingList,
     current_block: usize,
     position_in_block: usize,
-    block_postings: Vec<PostingWithPositions>,
+    /// Number of postings in the current block
+    block_count: usize,
+    /// Doc IDs for each posting in the block
+    block_doc_ids: Vec<DocId>,
+    /// Term frequency for each posting in the block
+    block_term_freqs: Vec<u32>,
+    /// All positions concatenated (flat buffer, reused across blocks)
+    block_positions: Vec<u32>,
+    /// Start offset into block_positions for each posting
+    block_pos_offsets: Vec<usize>,
     exhausted: bool,
 }
 
@@ -514,7 +553,11 @@ impl<'a> PositionPostingIterator<'a> {
             list,
             current_block: 0,
             position_in_block: 0,
-            block_postings: Vec::new(),
+            block_count: 0,
+            block_doc_ids: Vec::with_capacity(POSITION_BLOCK_SIZE),
+            block_term_freqs: Vec::with_capacity(POSITION_BLOCK_SIZE),
+            block_positions: Vec::new(),
+            block_pos_offsets: Vec::with_capacity(POSITION_BLOCK_SIZE + 1),
             exhausted,
         };
         if !iter.exhausted {
@@ -538,8 +581,12 @@ impl<'a> PositionPostingIterator<'a> {
         // Fixed 8-byte prefix: count(u32) + first_doc(u32)
         let count = reader.read_u32::<LittleEndian>().unwrap_or(0) as usize;
         let first_doc = reader.read_u32::<LittleEndian>().unwrap_or(0);
-        self.block_postings.clear();
-        self.block_postings.reserve(count);
+
+        self.block_count = count;
+        self.block_doc_ids.clear();
+        self.block_term_freqs.clear();
+        self.block_positions.clear();
+        self.block_pos_offsets.clear();
 
         let mut prev_doc_id = first_doc;
 
@@ -553,41 +600,41 @@ impl<'a> PositionPostingIterator<'a> {
             prev_doc_id = doc_id;
 
             let num_positions = read_vint(&mut reader).unwrap_or(0) as usize;
-            let mut positions = Vec::with_capacity(num_positions);
+            self.block_doc_ids.push(doc_id);
+            self.block_term_freqs.push(num_positions as u32);
+            self.block_pos_offsets.push(self.block_positions.len());
             for _ in 0..num_positions {
                 let pos = read_vint(&mut reader).unwrap_or(0) as u32;
-                positions.push(pos);
+                self.block_positions.push(pos);
             }
-
-            self.block_postings.push(PostingWithPositions {
-                doc_id,
-                term_freq: num_positions as u32,
-                positions,
-            });
         }
+        // Sentinel offset for the last posting's end
+        self.block_pos_offsets.push(self.block_positions.len());
     }
 
     pub fn doc(&self) -> DocId {
-        if self.exhausted || self.position_in_block >= self.block_postings.len() {
+        if self.exhausted || self.position_in_block >= self.block_count {
             u32::MAX
         } else {
-            self.block_postings[self.position_in_block].doc_id
+            self.block_doc_ids[self.position_in_block]
         }
     }
 
     pub fn term_freq(&self) -> u32 {
-        if self.exhausted || self.position_in_block >= self.block_postings.len() {
+        if self.exhausted || self.position_in_block >= self.block_count {
             0
         } else {
-            self.block_postings[self.position_in_block].term_freq
+            self.block_term_freqs[self.position_in_block]
         }
     }
 
     pub fn positions(&self) -> &[u32] {
-        if self.exhausted || self.position_in_block >= self.block_postings.len() {
+        if self.exhausted || self.position_in_block >= self.block_count {
             &[]
         } else {
-            &self.block_postings[self.position_in_block].positions
+            let start = self.block_pos_offsets[self.position_in_block];
+            let end = self.block_pos_offsets[self.position_in_block + 1];
+            &self.block_positions[start..end]
         }
     }
 
@@ -597,7 +644,7 @@ impl<'a> PositionPostingIterator<'a> {
         }
 
         self.position_in_block += 1;
-        if self.position_in_block >= self.block_postings.len() {
+        if self.position_in_block >= self.block_count {
             self.load_block(self.current_block + 1);
         }
     }
@@ -612,12 +659,12 @@ impl<'a> PositionPostingIterator<'a> {
             && target <= *last
         {
             // Target might be in current block, scan forward
-            while self.position_in_block < self.block_postings.len()
-                && self.block_postings[self.position_in_block].doc_id < target
+            while self.position_in_block < self.block_count
+                && self.block_doc_ids[self.position_in_block] < target
             {
                 self.position_in_block += 1;
             }
-            if self.position_in_block >= self.block_postings.len() {
+            if self.position_in_block >= self.block_count {
                 self.load_block(self.current_block + 1);
                 self.seek(target); // Continue seeking in next block
             }
@@ -646,13 +693,13 @@ impl<'a> PositionPostingIterator<'a> {
         self.load_block(block_idx);
 
         // Linear scan within block
-        while self.position_in_block < self.block_postings.len()
-            && self.block_postings[self.position_in_block].doc_id < target
+        while self.position_in_block < self.block_count
+            && self.block_doc_ids[self.position_in_block] < target
         {
             self.position_in_block += 1;
         }
 
-        if self.position_in_block >= self.block_postings.len() {
+        if self.position_in_block >= self.block_count {
             self.load_block(self.current_block + 1);
         }
     }

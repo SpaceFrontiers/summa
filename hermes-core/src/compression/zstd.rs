@@ -5,7 +5,7 @@
 //! - Trained dictionaries for even better compression of similar documents
 //! - Larger block sizes to improve compression efficiency
 
-use std::io::{self, Write};
+use std::io;
 
 /// Compression level (1-22 for zstd)
 #[derive(Debug, Clone, Copy)]
@@ -26,7 +26,7 @@ impl CompressionLevel {
 
 impl Default for CompressionLevel {
     fn default() -> Self {
-        Self::MAX // Use maximum compression for static indexes
+        Self::FAST // Level 3: good balance of speed and compression
     }
 }
 
@@ -77,20 +77,59 @@ impl CompressionDict {
 }
 
 /// Compress data using Zstd
+///
+/// Uses a thread-local bulk compressor to avoid per-call encoder allocation.
+/// Only rebuilds when the compression level changes.
 pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
-    zstd::encode_all(data, level.0).map_err(io::Error::other)
+    thread_local! {
+        static COMPRESSOR: std::cell::RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    COMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(l, _)| *l != level.0) {
+            let cmp = zstd::bulk::Compressor::new(level.0).map_err(io::Error::other)?;
+            *slot = Some((level.0, cmp));
+        }
+        slot.as_mut()
+            .unwrap()
+            .1
+            .compress(data)
+            .map_err(io::Error::other)
+    })
 }
 
 /// Compress data using Zstd with a trained dictionary
+///
+/// Caches the dictionary compressor in a thread-local, keyed by dictionary
+/// pointer + compression level. Only rebuilt when dict or level changes.
 pub fn compress_with_dict(
     data: &[u8],
     level: CompressionLevel,
     dict: &CompressionDict,
 ) -> io::Result<Vec<u8>> {
-    let mut encoder = zstd::Encoder::with_dictionary(Vec::new(), level.0, dict.raw_dict.as_slice())
-        .map_err(io::Error::other)?;
-    encoder.write_all(data)?;
-    encoder.finish().map_err(io::Error::other)
+    thread_local! {
+        static DICT_CMP: std::cell::RefCell<Option<(usize, i32, zstd::bulk::Compressor<'static>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let dict_key = dict.as_bytes().as_ptr() as usize;
+
+    DICT_CMP.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|(k, l, _)| *k != dict_key || *l != level.0)
+        {
+            let cmp = zstd::bulk::Compressor::with_dictionary(level.0, dict.as_bytes())
+                .map_err(io::Error::other)?;
+            *slot = Some((dict_key, level.0, cmp));
+        }
+        slot.as_mut()
+            .unwrap()
+            .2
+            .compress(data)
+            .map_err(io::Error::other)
+    })
 }
 
 /// Capacity hint for bulk decompressor (covers typical 256KB store blocks).

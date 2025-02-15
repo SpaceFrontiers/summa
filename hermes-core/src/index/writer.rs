@@ -300,19 +300,28 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         };
 
         let snapshot = self.segment_manager.acquire_snapshot().await;
-        let mut readers = Vec::new();
-        for seg_id_str in snapshot.segment_ids() {
-            let seg_id = crate::segment::SegmentId::from_hex(seg_id_str)
-                .ok_or_else(|| Error::Internal(format!("Invalid segment id: {}", seg_id_str)))?;
-            let reader = crate::segment::SegmentReader::open(
-                self.directory.as_ref(),
-                seg_id,
-                Arc::clone(&self.schema),
-                self.config.term_cache_blocks,
-            )
-            .await?;
-            readers.push(Arc::new(reader));
-        }
+        // Open all segment readers concurrently for faster PK init
+        let open_futures: Vec<_> = snapshot
+            .segment_ids()
+            .iter()
+            .map(|seg_id_str| {
+                let seg_id_str = seg_id_str.clone();
+                let dir = self.directory.as_ref();
+                let schema = Arc::clone(&self.schema);
+                let cache_blocks = self.config.term_cache_blocks;
+                async move {
+                    let seg_id =
+                        crate::segment::SegmentId::from_hex(&seg_id_str).ok_or_else(|| {
+                            Error::Internal(format!("Invalid segment id: {}", seg_id_str))
+                        })?;
+                    let reader =
+                        crate::segment::SegmentReader::open(dir, seg_id, schema, cache_blocks)
+                            .await?;
+                    Ok::<_, Error>(Arc::new(reader))
+                }
+            })
+            .collect();
+        let readers = futures::future::try_join_all(open_futures).await?;
 
         self.primary_key_index = Some(super::primary_key::PrimaryKeyIndex::new(
             field, readers, snapshot,
@@ -328,12 +337,23 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         if let Some(ref pk_index) = self.primary_key_index {
             pk_index.check_and_insert(&doc)?;
         }
-        self.doc_sender.try_send(doc).map_err(|e| match e {
-            async_channel::TrySendError::Full(_) => Error::QueueFull,
-            async_channel::TrySendError::Closed(_) => {
-                Error::Internal("Document channel closed".into())
+        match self.doc_sender.try_send(doc) {
+            Ok(()) => Ok(()),
+            Err(async_channel::TrySendError::Full(doc)) => {
+                // Roll back PK registration so the caller can retry later
+                if let Some(ref pk_index) = self.primary_key_index {
+                    pk_index.rollback_uncommitted_key(&doc);
+                }
+                Err(Error::QueueFull)
             }
-        })
+            Err(async_channel::TrySendError::Closed(doc)) => {
+                // Roll back PK registration for defense-in-depth
+                if let Some(ref pk_index) = self.primary_key_index {
+                    pk_index.rollback_uncommitted_key(&doc);
+                }
+                Err(Error::Internal("Document channel closed".into()))
+            }
+        }
     }
 
     /// Add multiple documents to the indexing queue.
@@ -586,7 +606,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // 2. Wait for all workers to complete their flush (via spawn_blocking
         //    to avoid blocking the tokio runtime)
         let state = Arc::clone(&self.worker_state);
-        tokio::task::spawn_blocking(move || {
+        let all_flushed = tokio::task::spawn_blocking(move || {
             let mut lock = state.flush_mutex.lock();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             while state.flush_count.load(Ordering::Acquire) < state.num_workers {
@@ -597,13 +617,24 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         state.flush_count.load(Ordering::Acquire),
                         state.num_workers
                     );
-                    break;
+                    return false;
                 }
                 state.flush_cvar.wait_for(&mut lock, remaining);
             }
+            true
         })
         .await
         .map_err(|e| Error::Internal(format!("Failed to wait for workers: {}", e)))?;
+
+        if !all_flushed {
+            // Resume workers so the system isn't stuck, then return error
+            self.resume_workers();
+            return Err(Error::Internal(format!(
+                "prepare_commit timed out: {}/{} workers flushed",
+                self.worker_state.flush_count.load(Ordering::Acquire),
+                self.worker_state.num_workers
+            )));
+        }
 
         // 3. Collect built segments
         let built = std::mem::take(&mut *self.worker_state.built_segments.lock());
@@ -696,23 +727,25 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
         let segments = std::mem::take(&mut self.writer.flushed_segments);
         self.writer.segment_manager.commit(segments).await?;
 
-        // Refresh primary key index with new committed readers
+        // Refresh primary key index with new committed readers (parallel open)
         if let Some(ref mut pk_index) = self.writer.primary_key_index {
             let snapshot = self.writer.segment_manager.acquire_snapshot().await;
-            let mut readers = Vec::new();
-            for seg_id_str in snapshot.segment_ids() {
-                if let Some(seg_id) = crate::segment::SegmentId::from_hex(seg_id_str)
-                    && let Ok(reader) = crate::segment::SegmentReader::open(
-                        self.writer.directory.as_ref(),
-                        seg_id,
-                        Arc::clone(&self.writer.schema),
-                        self.writer.config.term_cache_blocks,
-                    )
-                    .await
-                {
-                    readers.push(Arc::new(reader));
-                }
-            }
+            let open_futures: Vec<_> = snapshot
+                .segment_ids()
+                .iter()
+                .filter_map(|seg_id_str| {
+                    let seg_id = crate::segment::SegmentId::from_hex(seg_id_str)?;
+                    let dir = self.writer.directory.as_ref();
+                    let schema = Arc::clone(&self.writer.schema);
+                    let cache_blocks = self.writer.config.term_cache_blocks;
+                    Some(async move {
+                        crate::segment::SegmentReader::open(dir, seg_id, schema, cache_blocks)
+                            .await
+                            .map(Arc::new)
+                    })
+                })
+                .collect();
+            let readers = futures::future::try_join_all(open_futures).await?;
             pk_index.refresh(readers, snapshot);
         }
 

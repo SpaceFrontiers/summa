@@ -9,11 +9,13 @@ use crate::{DocId, Result, Score};
 
 use super::Query;
 
-/// Unique document address: segment_id (hex) + local doc_id within segment
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// Unique document address: segment_id + local doc_id within segment.
+/// Stores segment_id as u128 internally (16 bytes) but serializes as hex string
+/// for backward compatibility with JSON/gRPC clients.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DocAddress {
-    /// Segment ID as hex string (32 chars)
-    pub segment_id: String,
+    /// Segment ID as u128 (avoids heap allocation vs String)
+    segment_id_raw: u128,
     /// Document ID within the segment
     pub doc_id: DocId,
 }
@@ -21,14 +23,50 @@ pub struct DocAddress {
 impl DocAddress {
     pub fn new(segment_id: u128, doc_id: DocId) -> Self {
         Self {
-            segment_id: format!("{:032x}", segment_id),
+            segment_id_raw: segment_id,
             doc_id,
         }
     }
 
-    /// Parse segment_id from hex string
+    /// Get segment_id as hex string (for display/API)
+    pub fn segment_id(&self) -> String {
+        format!("{:032x}", self.segment_id_raw)
+    }
+
+    /// Get segment_id as u128 (zero-cost)
     pub fn segment_id_u128(&self) -> Option<u128> {
-        u128::from_str_radix(&self.segment_id, 16).ok()
+        Some(self.segment_id_raw)
+    }
+}
+
+impl serde::Serialize for DocAddress {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("DocAddress", 2)?;
+        s.serialize_field("segment_id", &format!("{:032x}", self.segment_id_raw))?;
+        s.serialize_field("doc_id", &self.doc_id)?;
+        s.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DocAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Helper {
+            segment_id: String,
+            doc_id: DocId,
+        }
+        let h = Helper::deserialize(deserializer)?;
+        let raw = u128::from_str_radix(&h.segment_id, 16).map_err(serde::de::Error::custom)?;
+        Ok(DocAddress {
+            segment_id_raw: raw,
+            doc_id: h.doc_id,
+        })
     }
 }
 
@@ -230,7 +268,7 @@ impl TopKCollector {
 
 impl Collector for TopKCollector {
     fn collect(&mut self, doc_id: DocId, score: Score, positions: &[(u32, Vec<ScoredPosition>)]) {
-        self.total_seen += 1;
+        self.total_seen = self.total_seen.saturating_add(1);
 
         // Only clone positions when the document will actually be kept in the heap.
         // This avoids deep-cloning Vec<ScoredPosition> for documents that are
@@ -407,6 +445,18 @@ pub fn search_segment_with_count_sync(
     limit: usize,
 ) -> Result<(Vec<SearchResult>, u32)> {
     let mut collector = TopKCollector::new(limit);
+    collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
+    Ok(collector.into_results_with_count())
+}
+
+/// Synchronous segment search with positions — returns (results, total_seen).
+#[cfg(feature = "sync")]
+pub fn search_segment_with_positions_and_count_sync(
+    reader: &SegmentReader,
+    query: &dyn Query,
+    limit: usize,
+) -> Result<(Vec<SearchResult>, u32)> {
+    let mut collector = TopKCollector::with_positions(limit);
     collect_segment_with_limit_sync(reader, query, &mut collector, limit)?;
     Ok(collector.into_results_with_count())
 }

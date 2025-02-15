@@ -242,6 +242,8 @@ struct PhraseScorer {
     idf: f32,
     /// Average field length
     avg_field_len: f32,
+    /// Reusable position buffers (one per term, avoids per-document allocation)
+    position_bufs: Vec<Vec<u32>>,
 }
 
 impl PhraseScorer {
@@ -257,6 +259,7 @@ impl PhraseScorer {
             .map(|p| p.into_iterator())
             .collect();
 
+        let num_terms = position_lists.len();
         let mut scorer = Self {
             posting_iters,
             position_lists,
@@ -264,6 +267,7 @@ impl PhraseScorer {
             current_doc: 0,
             idf,
             avg_field_len,
+            position_bufs: (0..num_terms).map(|_| Vec::new()).collect(),
         };
 
         scorer.find_next_phrase_match();
@@ -322,32 +326,27 @@ impl PhraseScorer {
     }
 
     /// Check if positions form a valid phrase for the given document
-    fn check_phrase_positions(&self, doc_id: DocId) -> bool {
-        // Get positions for each term in this document
-        let mut term_positions: Vec<Vec<u32>> = Vec::with_capacity(self.position_lists.len());
-
-        for pos_list in &self.position_lists {
-            match pos_list.get_positions(doc_id) {
-                Some(positions) => term_positions.push(positions.to_vec()),
-                None => return false,
+    fn check_phrase_positions(&mut self, doc_id: DocId) -> bool {
+        // Get positions for each term into reusable buffers (zero allocation)
+        for (i, pos_list) in self.position_lists.iter().enumerate() {
+            if !pos_list.get_positions_into(doc_id, &mut self.position_bufs[i]) {
+                return false;
             }
         }
 
         // Check for consecutive positions
         // For exact phrase (slop=0), position[i+1] = position[i] + 1
-        self.find_phrase_match(&term_positions)
+        self.find_phrase_match_from_bufs()
     }
 
-    /// Find if there's a valid phrase match among the positions
-    fn find_phrase_match(&self, term_positions: &[Vec<u32>]) -> bool {
-        if term_positions.is_empty() {
+    /// Find phrase match using the internal reusable buffers
+    fn find_phrase_match_from_bufs(&self) -> bool {
+        if self.position_bufs.is_empty() || self.position_bufs[0].is_empty() {
             return false;
         }
 
-        // For each position of the first term, check if subsequent terms
-        // have positions that form a phrase
-        for &first_pos in &term_positions[0] {
-            if self.check_phrase_from_position(first_pos, term_positions) {
+        for &first_pos in &self.position_bufs[0] {
+            if self.check_phrase_from_position(first_pos, &self.position_bufs) {
                 return true;
             }
         }

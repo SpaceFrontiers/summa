@@ -69,6 +69,10 @@ impl MergePolicy for NoMergePolicy {
 /// - Tier 1: tier_floor to tier_floor * tier_factor docs
 /// - Tier 2: tier_floor * tier_factor to tier_floor * tier_factor^2 docs
 /// - etc.
+///
+/// For large-scale indexes (10M-1B docs), use [`TieredMergePolicy::large_scale()`] or
+/// [`TieredMergePolicy::bulk_indexing()`] presets which enable budget-aware triggering,
+/// scored candidate selection, and oversized segment exclusion.
 #[derive(Debug, Clone)]
 pub struct TieredMergePolicy {
     /// Minimum number of segments in a tier before merging (default: 10)
@@ -82,6 +86,25 @@ pub struct TieredMergePolicy {
     pub tier_floor: u32,
     /// Maximum total docs to merge at once (default: 5_000_000)
     pub max_merged_docs: u32,
+
+    /// Floor size for scoring — tiny segments are treated as this size when
+    /// computing merge scores. Prevents degenerate scores from near-empty segments.
+    /// (default: 1000)
+    pub floor_segment_docs: u32,
+    /// Exclude segments larger than `max_merged_docs * oversized_threshold` from
+    /// merge candidates. Prevents rewriting already-large segments. (default: 0.5)
+    pub oversized_threshold: f64,
+    /// Merge output must be >= `(1 + min_growth_ratio) * largest_input` docs.
+    /// Rejects merges that rewrite a large segment just to absorb tiny ones.
+    /// Set to 0.0 to disable. (default: 0.0)
+    pub min_growth_ratio: f64,
+    /// Only merge when segment count exceeds the ideal budget
+    /// (`num_tiers * segments_per_tier`). Prevents unnecessary merges when
+    /// the index is already well-structured. (default: false)
+    pub budget_trigger: bool,
+    /// Use Lucene-style skew scoring to pick the most balanced merge candidate
+    /// instead of greedily taking the first valid group. (default: false)
+    pub scored_selection: bool,
 }
 
 impl Default for TieredMergePolicy {
@@ -92,6 +115,11 @@ impl Default for TieredMergePolicy {
             tier_factor: 10.0,
             tier_floor: 1000,
             max_merged_docs: 5_000_000,
+            floor_segment_docs: 1000,
+            oversized_threshold: 0.5,
+            min_growth_ratio: 0.0,
+            budget_trigger: false,
+            scored_selection: false,
         }
     }
 }
@@ -114,29 +142,114 @@ impl TieredMergePolicy {
             tier_factor: 10.0,
             tier_floor: 500,
             max_merged_docs: 10_000_000,
+            ..Default::default()
+        }
+    }
+
+    /// Large-scale merge policy for indexes with 100M-1B documents.
+    ///
+    /// Enables budget-aware triggering and scored candidate selection to avoid
+    /// unnecessary IO on already well-structured indexes. Oversized segments
+    /// (>10M docs) are excluded from merge candidates.
+    ///
+    /// Good for live read/write workloads at scale.
+    pub fn large_scale() -> Self {
+        Self {
+            segments_per_tier: 10,
+            max_merge_at_once: 10,
+            tier_factor: 10.0,
+            tier_floor: 50_000,
+            max_merged_docs: 20_000_000,
+            floor_segment_docs: 50_000,
+            oversized_threshold: 0.5,
+            min_growth_ratio: 0.5,
+            budget_trigger: true,
+            scored_selection: true,
+        }
+    }
+
+    /// Bulk-indexing merge policy for high-throughput initial loads.
+    ///
+    /// Uses larger merge batches and higher thresholds to maximize throughput.
+    /// Call `force_merge()` after the bulk load is complete.
+    pub fn bulk_indexing() -> Self {
+        Self {
+            segments_per_tier: 20,
+            max_merge_at_once: 20,
+            tier_factor: 10.0,
+            tier_floor: 100_000,
+            max_merged_docs: 50_000_000,
+            floor_segment_docs: 100_000,
+            oversized_threshold: 0.5,
+            min_growth_ratio: 0.75,
+            budget_trigger: true,
+            scored_selection: true,
         }
     }
 }
 
-impl MergePolicy for TieredMergePolicy {
-    fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<MergeCandidate> {
-        if segments.len() < 2 {
-            return Vec::new();
+impl TieredMergePolicy {
+    /// Compute the ideal segment count for the given total document count.
+    /// Based on Lucene's budget model: segments arrange in tiers of `tier_factor`
+    /// width, with up to `segments_per_tier` segments per tier.
+    fn compute_ideal_segment_count(&self, total_docs: u64) -> usize {
+        if total_docs == 0 {
+            return 0;
         }
+        let floor = self.floor_segment_docs.max(1) as f64;
+        // Number of tiers needed to cover total_docs
+        let num_tiers = ((total_docs as f64 / floor).max(1.0))
+            .log(self.tier_factor)
+            .ceil() as usize;
+        let num_tiers = num_tiers.max(1);
+        num_tiers * self.segments_per_tier
+    }
 
-        // Sort by size ascending — greedily merge from smallest.
-        // This replaces per-tier grouping, allowing cross-tier promotion:
-        // many small segments can jump several tiers in one merge.
-        let mut sorted: Vec<&SegmentInfo> = segments.iter().collect();
-        sorted.sort_by_key(|s| s.num_docs);
+    /// Score a merge group. Lower score = better (more balanced) merge.
+    /// Uses Lucene-style skew scoring: `skew * size_factor`.
+    /// - skew = largest_floored / total_floored (1/N for perfectly balanced, 1.0 for singleton)
+    /// - size_factor = total_floored^0.05 (mild preference for larger merges)
+    fn score_candidate(&self, group: &[usize], sorted: &[&SegmentInfo]) -> f64 {
+        let floor = self.floor_segment_docs.max(1) as f64;
+        let mut total_floored = 0.0f64;
+        let mut largest_floored = 0.0f64;
+        for &idx in group {
+            let floored = (sorted[idx].num_docs as f64).max(floor);
+            total_floored += floored;
+            if floored > largest_floored {
+                largest_floored = floored;
+            }
+        }
+        if total_floored == 0.0 {
+            return f64::MAX;
+        }
+        let skew = largest_floored / total_floored;
+        skew * total_floored.powf(0.05)
+    }
 
+    /// Check whether a merge group passes the minimum growth ratio.
+    /// Returns true if the output (total docs) is at least `(1 + ratio) * largest_input`.
+    fn passes_min_growth(&self, group: &[usize], sorted: &[&SegmentInfo]) -> bool {
+        if self.min_growth_ratio <= 0.0 || group.len() < 2 {
+            return true;
+        }
+        let largest = group
+            .iter()
+            .map(|&i| sorted[i].num_docs as u64)
+            .max()
+            .unwrap_or(0);
+        let total: u64 = group.iter().map(|&i| sorted[i].num_docs as u64).sum();
+        total as f64 >= (1.0 + self.min_growth_ratio) * largest as f64
+    }
+
+    /// Greedy merge selection — the original algorithm with min_growth_ratio added.
+    fn find_merges_greedy(&self, sorted: &[&SegmentInfo]) -> Vec<MergeCandidate> {
         let mut candidates = Vec::new();
         let mut used = vec![false; sorted.len()];
         let max_ratio = self.tier_factor as u64;
 
         let mut start = 0;
         loop {
-            // Find next unused segment
             while start < sorted.len() && used[start] {
                 start += 1;
             }
@@ -144,12 +257,6 @@ impl MergePolicy for TieredMergePolicy {
                 break;
             }
 
-            // Build a merge group starting from the smallest unused segment.
-            // Accumulate segments as long as:
-            //   - group size < max_merge_at_once
-            //   - total docs < max_merged_docs
-            //   - the next segment isn't disproportionately larger than the group
-            //     (ratio guard prevents rewriting a huge segment to absorb tiny ones)
             let mut group = vec![start];
             let mut total_docs: u64 = sorted[start].num_docs as u64;
 
@@ -164,10 +271,6 @@ impl MergePolicy for TieredMergePolicy {
                 if total_docs + next_docs > self.max_merged_docs as u64 {
                     break;
                 }
-                // Ratio guard: don't include a segment that dwarfs the accumulated group.
-                // Uses the actual accumulated total — NOT inflated by tier_floor — so
-                // a group of tiny segments won't attract a previously-merged large segment.
-                // max(1) prevents a zero-doc starting segment from blocking all accumulation.
                 if next_docs > total_docs.max(1) * max_ratio {
                     break;
                 }
@@ -175,7 +278,10 @@ impl MergePolicy for TieredMergePolicy {
                 total_docs += next_docs;
             }
 
-            if group.len() >= self.segments_per_tier && group.len() >= 2 {
+            if group.len() >= self.segments_per_tier
+                && group.len() >= 2
+                && self.passes_min_growth(&group, sorted)
+            {
                 for &i in &group {
                     used[i] = true;
                 }
@@ -184,12 +290,108 @@ impl MergePolicy for TieredMergePolicy {
                 });
             }
 
-            // Always advance past start (whether or not we formed a group)
-            // so we try starting from the next unused segment.
             start += 1;
         }
 
         candidates
+    }
+
+    /// Scored merge selection — evaluates all possible groups and picks the
+    /// most balanced ones using skew scoring.
+    fn find_merges_scored(&self, sorted: &[&SegmentInfo]) -> Vec<MergeCandidate> {
+        let max_ratio = self.tier_factor as u64;
+
+        // Build all valid merge groups with their scores
+        let mut scored_groups: Vec<(f64, Vec<usize>)> = Vec::new();
+
+        for start in 0..sorted.len() {
+            let mut group = vec![start];
+            let mut total_docs: u64 = sorted[start].num_docs as u64;
+
+            for j in (start + 1)..sorted.len() {
+                if group.len() >= self.max_merge_at_once {
+                    break;
+                }
+                let next_docs = sorted[j].num_docs as u64;
+                if total_docs + next_docs > self.max_merged_docs as u64 {
+                    break;
+                }
+                if next_docs > total_docs.max(1) * max_ratio {
+                    break;
+                }
+                group.push(j);
+                total_docs += next_docs;
+
+                // Record every valid group (>= segments_per_tier)
+                if group.len() >= self.segments_per_tier
+                    && group.len() >= 2
+                    && self.passes_min_growth(&group, sorted)
+                {
+                    let score = self.score_candidate(&group, sorted);
+                    scored_groups.push((score, group.clone()));
+                }
+            }
+        }
+
+        // Sort by score ascending (best first)
+        scored_groups.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        // Greedily select non-overlapping candidates
+        let mut used = vec![false; sorted.len()];
+        let mut candidates = Vec::new();
+
+        for (_score, group) in scored_groups {
+            if group.iter().any(|&i| used[i]) {
+                continue;
+            }
+            for &i in &group {
+                used[i] = true;
+            }
+            candidates.push(MergeCandidate {
+                segment_ids: group.iter().map(|&i| sorted[i].id.clone()).collect(),
+            });
+        }
+
+        candidates
+    }
+}
+
+impl MergePolicy for TieredMergePolicy {
+    fn find_merges(&self, segments: &[SegmentInfo]) -> Vec<MergeCandidate> {
+        if segments.len() < 2 {
+            return Vec::new();
+        }
+
+        // Phase 1: Filter oversized segments
+        let oversized_limit = (self.max_merged_docs as f64 * self.oversized_threshold) as u64;
+        let eligible: Vec<&SegmentInfo> = segments
+            .iter()
+            .filter(|s| (s.num_docs as u64) <= oversized_limit || oversized_limit == 0)
+            .collect();
+
+        if eligible.len() < 2 {
+            return Vec::new();
+        }
+
+        // Phase 2: Budget check — skip merging if segment count is healthy
+        if self.budget_trigger {
+            let total_docs: u64 = segments.iter().map(|s| s.num_docs as u64).sum();
+            let ideal = self.compute_ideal_segment_count(total_docs);
+            if eligible.len() <= ideal {
+                return Vec::new();
+            }
+        }
+
+        // Sort eligible segments by size ascending
+        let mut sorted = eligible;
+        sorted.sort_by_key(|s| s.num_docs);
+
+        // Phase 3: Select merge candidates
+        if self.scored_selection {
+            self.find_merges_scored(&sorted)
+        } else {
+            self.find_merges_greedy(&sorted)
+        }
     }
 
     fn clone_box(&self) -> Box<dyn MergePolicy> {
@@ -277,6 +479,7 @@ mod tests {
             tier_floor: 1000,
             max_merge_at_once: 20,
             max_merged_docs: 5_000_000,
+            ..Default::default()
         };
 
         // 4 small (tier 0) + 3 medium (tier 1) — should merge ALL into one group
@@ -315,6 +518,7 @@ mod tests {
             tier_floor: 100,
             max_merge_at_once: 20,
             max_merged_docs: 5_000_000,
+            ..Default::default()
         };
 
         // 4 tiny (10 docs) + 4 large (100_000 docs)
@@ -355,6 +559,7 @@ mod tests {
             tier_floor: 1000,
             max_merge_at_once: 10,
             max_merged_docs: 5_000_000,
+            ..Default::default()
         };
 
         // 2 tiny segments (can't form a group) + 5 medium segments (can)
@@ -397,6 +602,7 @@ mod tests {
             tier_factor: 10.0,
             tier_floor: 1000,
             max_merged_docs: 500,
+            ..Default::default()
         };
 
         // 10 segments of 100 docs each — total would be 1000 but max_merged_docs=500
@@ -488,5 +694,225 @@ mod tests {
         ];
 
         assert!(policy.find_merges(&segments).is_empty());
+    }
+
+    #[test]
+    fn test_oversized_exclusion() {
+        // max_merged_docs=1M, oversized_threshold=0.5 → exclude segments > 500K
+        let policy = TieredMergePolicy {
+            segments_per_tier: 3,
+            max_merged_docs: 1_000_000,
+            oversized_threshold: 0.5,
+            ..Default::default()
+        };
+
+        // 4 small segments + 2 oversized segments (600K each)
+        let mut segments: Vec<_> = (0..4)
+            .map(|i| SegmentInfo {
+                id: format!("small_{}", i),
+                num_docs: 1000,
+            })
+            .collect();
+        segments.push(SegmentInfo {
+            id: "oversized_0".into(),
+            num_docs: 600_000,
+        });
+        segments.push(SegmentInfo {
+            id: "oversized_1".into(),
+            num_docs: 700_000,
+        });
+
+        let candidates = policy.find_merges(&segments);
+        // Oversized segments must not appear in any merge candidate
+        for c in &candidates {
+            assert!(
+                !c.segment_ids.contains(&"oversized_0".into()),
+                "oversized_0 should be excluded"
+            );
+            assert!(
+                !c.segment_ids.contains(&"oversized_1".into()),
+                "oversized_1 should be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn test_budget_trigger_prevents_unnecessary_merge() {
+        let policy = TieredMergePolicy {
+            segments_per_tier: 10,
+            tier_factor: 10.0,
+            tier_floor: 1000,
+            floor_segment_docs: 1000,
+            budget_trigger: true,
+            ..Default::default()
+        };
+
+        // 5 segments of 10K docs each = 50K total
+        // Budget: ceil(log10(50K/1000)) = ceil(log10(50)) = 2 tiers → 2*10 = 20 ideal segments
+        // 5 segments < 20 ideal → should NOT merge
+        let segments: Vec<_> = (0..5)
+            .map(|i| SegmentInfo {
+                id: format!("seg_{}", i),
+                num_docs: 10_000,
+            })
+            .collect();
+
+        let candidates = policy.find_merges(&segments);
+        assert!(
+            candidates.is_empty(),
+            "should not merge when under budget: {:?}",
+            candidates
+        );
+    }
+
+    #[test]
+    fn test_budget_trigger_allows_merge_when_over_budget() {
+        let policy = TieredMergePolicy {
+            segments_per_tier: 3,
+            tier_factor: 10.0,
+            tier_floor: 1000,
+            floor_segment_docs: 1000,
+            budget_trigger: true,
+            ..Default::default()
+        };
+
+        // 10 segments of 1000 docs = 10K total
+        // Budget: ceil(log10(10K/1000)) = 1 tier → 1*3 = 3 ideal segments
+        // 10 segments > 3 ideal → should merge
+        let segments: Vec<_> = (0..10)
+            .map(|i| SegmentInfo {
+                id: format!("seg_{}", i),
+                num_docs: 1000,
+            })
+            .collect();
+
+        let candidates = policy.find_merges(&segments);
+        assert!(!candidates.is_empty(), "should merge when over budget");
+    }
+
+    #[test]
+    fn test_min_growth_ratio_rejects_wasteful_merge() {
+        let policy = TieredMergePolicy {
+            segments_per_tier: 3,
+            min_growth_ratio: 0.5,
+            max_merge_at_once: 10,
+            ..Default::default()
+        };
+
+        // 1 large segment (100K) + 3 tiny segments (10 docs each)
+        // Total = 100_030, largest = 100_000
+        // Growth check: 100_030 >= 1.5 * 100_000 = 150_000? NO → reject
+        let mut segments = vec![SegmentInfo {
+            id: "big".into(),
+            num_docs: 100_000,
+        }];
+        for i in 0..3 {
+            segments.push(SegmentInfo {
+                id: format!("tiny_{}", i),
+                num_docs: 10,
+            });
+        }
+
+        let candidates = policy.find_merges(&segments);
+        // The 3 tiny segments alone can form a group, but the big one shouldn't
+        // be merged with them. Let's verify no candidate includes "big".
+        for c in &candidates {
+            if c.segment_ids.contains(&"big".into()) {
+                let total: u64 = c
+                    .segment_ids
+                    .iter()
+                    .map(|id| segments.iter().find(|s| s.id == *id).unwrap().num_docs as u64)
+                    .sum();
+                let largest: u64 = c
+                    .segment_ids
+                    .iter()
+                    .map(|id| segments.iter().find(|s| s.id == *id).unwrap().num_docs as u64)
+                    .max()
+                    .unwrap();
+                assert!(
+                    total as f64 >= 1.5 * largest as f64,
+                    "merge with 'big' segment violates min_growth_ratio: total={}, largest={}",
+                    total,
+                    largest
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_scored_selection_prefers_balanced_merge() {
+        let policy = TieredMergePolicy {
+            segments_per_tier: 3,
+            max_merge_at_once: 5,
+            scored_selection: true,
+            ..Default::default()
+        };
+
+        // Group A: 3 balanced segments (1000, 1100, 1200)
+        // Group B: 3 unbalanced segments (100, 100, 5000) — placed so greedy would pick them first
+        let segments = vec![
+            SegmentInfo {
+                id: "unbal_0".into(),
+                num_docs: 100,
+            },
+            SegmentInfo {
+                id: "unbal_1".into(),
+                num_docs: 100,
+            },
+            SegmentInfo {
+                id: "bal_0".into(),
+                num_docs: 1000,
+            },
+            SegmentInfo {
+                id: "bal_1".into(),
+                num_docs: 1100,
+            },
+            SegmentInfo {
+                id: "bal_2".into(),
+                num_docs: 1200,
+            },
+            SegmentInfo {
+                id: "unbal_2".into(),
+                num_docs: 5000,
+            },
+        ];
+
+        let candidates = policy.find_merges(&segments);
+        assert!(!candidates.is_empty(), "should find at least one merge");
+
+        // The first candidate (best score) should be the balanced group
+        let first = &candidates[0];
+        let has_balanced = first.segment_ids.iter().any(|id| id.starts_with("bal_"));
+        assert!(
+            has_balanced,
+            "scored selection should prefer balanced group, got: {:?}",
+            first.segment_ids
+        );
+    }
+
+    #[test]
+    fn test_large_scale_preset_values() {
+        let p = TieredMergePolicy::large_scale();
+        assert_eq!(p.tier_floor, 50_000);
+        assert_eq!(p.max_merged_docs, 20_000_000);
+        assert_eq!(p.floor_segment_docs, 50_000);
+        assert!(p.budget_trigger);
+        assert!(p.scored_selection);
+        assert_eq!(p.segments_per_tier, 10);
+        assert!((p.min_growth_ratio - 0.5).abs() < f64::EPSILON);
+        assert!((p.oversized_threshold - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_bulk_indexing_preset_values() {
+        let p = TieredMergePolicy::bulk_indexing();
+        assert_eq!(p.segments_per_tier, 20);
+        assert_eq!(p.max_merge_at_once, 20);
+        assert_eq!(p.tier_floor, 100_000);
+        assert_eq!(p.max_merged_docs, 50_000_000);
+        assert_eq!(p.floor_segment_docs, 100_000);
+        assert!(p.budget_trigger);
+        assert!(p.scored_selection);
+        assert!((p.min_growth_ratio - 0.75).abs() < f64::EPSILON);
     }
 }

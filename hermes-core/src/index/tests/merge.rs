@@ -663,6 +663,7 @@ async fn test_segment_count_bounded_during_sustained_indexing() {
         tier_factor: 10.0,
         tier_floor: 50,
         max_merged_docs: 1_000_000,
+        ..Default::default()
     };
 
     let config = IndexConfig {
@@ -1075,5 +1076,91 @@ async fn test_store_large_scale_multi_merge() {
     eprintln!(
         "All {} docs verified across 4 large-scale merge rounds",
         total_docs
+    );
+}
+
+/// Integration test for the large_scale merge policy preset.
+/// Exercises budget-aware triggering, oversized exclusion, and scored selection
+/// with a realistic multi-tier segment distribution.
+#[tokio::test]
+async fn test_large_scale_merge_policy() {
+    use crate::merge::{MergePolicy, SegmentInfo, TieredMergePolicy};
+
+    let policy = TieredMergePolicy::large_scale();
+
+    // Simulate a large index with segments across multiple tiers:
+    // - 15 small segments (10K docs each)
+    // - 5 medium segments (500K docs each)
+    // - 2 large segments (5M docs each)
+    // - 1 oversized segment (15M docs — above 20M * 0.5 = 10M threshold)
+    let mut segments = Vec::new();
+
+    for i in 0..15 {
+        segments.push(SegmentInfo {
+            id: format!("small_{}", i),
+            num_docs: 10_000,
+        });
+    }
+    for i in 0..5 {
+        segments.push(SegmentInfo {
+            id: format!("medium_{}", i),
+            num_docs: 500_000,
+        });
+    }
+    for i in 0..2 {
+        segments.push(SegmentInfo {
+            id: format!("large_{}", i),
+            num_docs: 5_000_000,
+        });
+    }
+    segments.push(SegmentInfo {
+        id: "oversized_0".into(),
+        num_docs: 15_000_000,
+    });
+
+    let candidates = policy.find_merges(&segments);
+
+    // 1. Oversized segment (15M > 10M threshold) must not appear in any candidate
+    for c in &candidates {
+        assert!(
+            !c.segment_ids.contains(&"oversized_0".into()),
+            "oversized segment should be excluded from merges"
+        );
+    }
+
+    // 2. If merges are produced, they should respect max_merged_docs
+    for c in &candidates {
+        let total: u64 = c
+            .segment_ids
+            .iter()
+            .map(|id| segments.iter().find(|s| s.id == *id).unwrap().num_docs as u64)
+            .sum();
+        assert!(
+            total <= policy.max_merged_docs as u64,
+            "merge total {} exceeds max_merged_docs {}",
+            total,
+            policy.max_merged_docs
+        );
+    }
+
+    // 3. No candidate should contain duplicate segment IDs
+    for c in &candidates {
+        let mut ids = c.segment_ids.clone();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            c.segment_ids.len(),
+            "duplicate segment IDs in merge candidate"
+        );
+    }
+
+    // 4. Verify preset produces sensible results — with 23 segments (excl oversized)
+    //    and budget of ~3 tiers * 10 = 30, it may or may not merge depending on budget.
+    //    But at minimum, the policy should not panic or produce invalid output.
+    eprintln!(
+        "large_scale policy produced {} merge candidates from {} segments",
+        candidates.len(),
+        segments.len()
     );
 }

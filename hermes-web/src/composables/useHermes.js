@@ -249,6 +249,24 @@ export function useHermes() {
     }
 
     const results = await index.value.search_offset(query, limit, offset)
+
+    // Load all documents inline to avoid N+1 round-trips from the UI
+    if (results?.hits) {
+      const docPromises = results.hits.map(async (hit) => {
+        try {
+          const doc = await index.value.get_document(
+            hit.address.segment_id,
+            hit.address.doc_id
+          )
+          hit.document = doc
+        } catch (e) {
+          console.warn('Failed to load document:', hit.address, e)
+          hit.document = null
+        }
+      })
+      await Promise.all(docPromises)
+    }
+
     updateStats()
 
     // Save cache to IndexedDB after search (non-blocking)

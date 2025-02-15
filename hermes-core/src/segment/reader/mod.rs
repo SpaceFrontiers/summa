@@ -66,19 +66,18 @@ pub(crate) fn combine_ordinal_results(
     let collected: Vec<(u32, u16, f32)> = raw.into_iter().collect();
 
     let num_raw = collected.len();
-    let unique_docs = {
+    if log::log_enabled!(log::Level::Debug) {
         let mut ids: Vec<u32> = collected.iter().map(|(d, _, _)| *d).collect();
         ids.sort_unstable();
         ids.dedup();
-        ids.len()
-    };
-    log::debug!(
-        "combine_ordinal_results: {} raw entries, {} unique docs, combiner={:?}, limit={}",
-        num_raw,
-        unique_docs,
-        combiner,
-        limit
-    );
+        log::debug!(
+            "combine_ordinal_results: {} raw entries, {} unique docs, combiner={:?}, limit={}",
+            num_raw,
+            ids.len(),
+            combiner,
+            limit
+        );
+    }
 
     // Fast path: all ordinals are 0 → no grouping needed, skip HashMap
     let all_single = collected.iter().all(|&(_, ord, _)| ord == 0);
@@ -812,7 +811,7 @@ impl SegmentReader {
                 );
             }
 
-            results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| b.2.total_cmp(&a.2));
             results.truncate(fetch_k);
             log::debug!(
                 "[search_dense] field {}: rerank total={:.1}ms",
@@ -1159,7 +1158,7 @@ impl SegmentReader {
                 }
             }
 
-            results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| b.2.total_cmp(&a.2));
             results.truncate(fetch_k);
         }
 

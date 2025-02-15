@@ -46,6 +46,22 @@
           <span class="ml-3 text-gray-500">Searching...</span>
         </div>
 
+        <!-- Search error -->
+        <div
+          v-else-if="searchError"
+          class="bg-red-50 border border-red-200 rounded-xl p-4 text-red-700 text-sm"
+        >
+          <div class="flex items-start">
+            <svg class="h-5 w-5 text-red-400 mr-2 mt-0.5 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd" />
+            </svg>
+            <div>
+              <div class="font-medium">Search failed</div>
+              <div class="mt-1">{{ searchError }}</div>
+            </div>
+          </div>
+        </div>
+
         <!-- Results (only show after search) -->
         <SearchResults
           v-else-if="searchResults"
@@ -54,7 +70,6 @@
           :field-names="hermes.indexInfo.value?.fieldNames || []"
           :current-offset="currentOffset"
           :page-size="pageSize"
-          @load-document="handleLoadDocument"
           @next-page="handleNextPage"
           @prev-page="handlePrevPage"
         />
@@ -76,6 +91,7 @@ const hermes = useHermes()
 const connectionsStore = useConnectionsStore()
 const isSearching = ref(false)
 const searchResults = ref(null)
+const searchError = ref(null)
 const showConnectModal = ref(false)
 
 // Auto-connect to last used engine on startup
@@ -97,6 +113,7 @@ const handleDisconnect = () => {
   hermes.disconnect()
   connectionsStore.disconnect()
   searchResults.value = null
+  searchError.value = null
 }
 
 const currentQuery = ref('')
@@ -105,12 +122,15 @@ const pageSize = 5
 
 const handleSearch = async ({ query, limit, offset = 0 }) => {
   isSearching.value = true
+  searchError.value = null
   currentQuery.value = query
   currentOffset.value = offset
   try {
     searchResults.value = await hermes.search(query, limit || pageSize, offset)
   } catch (e) {
     console.error('Search error:', e)
+    searchError.value = e.message || String(e)
+    searchResults.value = null
   } finally {
     isSearching.value = false
   }
@@ -128,14 +148,4 @@ const handlePrevPage = () => {
   }
 }
 
-const handleLoadDocument = async ({ segmentId, docId, callback }) => {
-  try {
-    const doc = await hermes.getDocument(segmentId, docId)
-    console.log('Loaded document:', segmentId, docId, doc)
-    callback(doc)
-  } catch (e) {
-    console.error('Load document error:', e)
-    callback(null)
-  }
-}
 </script>

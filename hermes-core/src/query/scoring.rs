@@ -31,12 +31,12 @@ impl Eq for HeapEntry {}
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap: lower scores come first (to be evicted)
+        // Min-heap: lower scores come first (to be evicted).
+        // total_cmp is branchless (compiles to a single comparison instruction).
         other
             .score
-            .partial_cmp(&self.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| self.doc_id.cmp(&other.doc_id))
+            .total_cmp(&self.score)
+            .then(self.doc_id.cmp(&other.doc_id))
     }
 }
 
@@ -112,7 +112,10 @@ impl ScoreCollector {
                 score,
                 ordinal,
             });
-            self.update_threshold();
+            // Only recompute threshold when heap just became full
+            if self.heap.len() == self.k {
+                self.update_threshold();
+            }
             true
         } else if score > self.cached_threshold {
             self.heap.push(HeapEntry {
@@ -155,11 +158,7 @@ impl ScoreCollector {
         }
 
         // Sort by score descending, then doc_id ascending
-        results.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        results.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
         results
     }
@@ -211,6 +210,14 @@ pub(crate) struct TermCursor<'a> {
     pos: usize,
     block_loaded: bool,
     exhausted: bool,
+    // ── Lazy ordinal decode (sparse only) ───────────────────────────
+    /// When true, ordinal decode is deferred until ordinal_mut() is called.
+    /// Set to true for MaxScoreExecutor cursors (most blocks never need ordinals).
+    lazy_ordinals: bool,
+    /// Whether ordinals have been decoded for the current block.
+    ordinals_loaded: bool,
+    /// Stored sparse block for deferred ordinal decode (cheap Arc clone of mmap data).
+    current_sparse_block: Option<crate::structures::SparseBlock>,
     // ── Block decode + skip access source ───────────────────────────
     variant: CursorVariant<'a>,
 }
@@ -220,7 +227,10 @@ enum CursorVariant<'a> {
     Text {
         list: crate::structures::BlockPostingList,
         idf: f32,
-        avg_field_len: f32,
+        /// Precomputed: BM25_B / max(avg_field_len, 1.0)
+        b_over_avgfl: f32,
+        /// Precomputed: 1.0 - BM25_B
+        one_minus_b: f32,
         tfs: Vec<u32>, // temp decode buffer, converted to scores
     },
     /// Sparse vector — mmap'd SparseIndex (skip entries + block data)
@@ -248,16 +258,24 @@ macro_rules! cursor_ensure_block {
             CursorVariant::Text {
                 list,
                 idf,
-                avg_field_len,
+                b_over_avgfl,
+                one_minus_b,
                 tfs,
             } => {
                 if list.decode_block_into($self.block_idx, &mut $self.doc_ids, tfs) {
+                    let idf_val = *idf;
+                    let b_avg = *b_over_avgfl;
+                    let one_b = *one_minus_b;
                     $self.scores.clear();
                     $self.scores.reserve(tfs.len());
+                    // Precomputed BM25: length_norm = one_minus_b + b_over_avgfl * tf
+                    // (tf is used as both term frequency and doc length — a known approx)
                     for &tf in tfs.iter() {
                         let tf = tf as f32;
-                        $self.scores
-                            .push(super::bm25_score(tf, *idf, tf, *avg_field_len));
+                        let length_norm = one_b + b_avg * tf;
+                        let tf_norm = (tf * (super::BM25_K1 + 1.0))
+                            / (tf + super::BM25_K1 * length_norm);
+                        $self.scores.push(idf_val * tf_norm);
                     }
                     $self.pos = 0;
                     $self.block_loaded = true;
@@ -280,8 +298,17 @@ macro_rules! cursor_ensure_block {
                 match block {
                     Some(b) => {
                         b.decode_doc_ids_into(&mut $self.doc_ids);
-                        b.decode_ordinals_into(&mut $self.ordinals);
                         b.decode_scored_weights_into(*query_weight, &mut $self.scores);
+                        if $self.lazy_ordinals {
+                            // Defer ordinal decode until ordinal_mut() is called.
+                            // Stores cheap Arc-backed mmap slice, no copy.
+                            $self.current_sparse_block = Some(b);
+                            $self.ordinals_loaded = false;
+                        } else {
+                            b.decode_ordinals_into(&mut $self.ordinals);
+                            $self.ordinals_loaded = true;
+                            $self.current_sparse_block = None;
+                        }
                         $self.pos = 0;
                         $self.block_loaded = true;
                         Ok(true)
@@ -332,6 +359,7 @@ impl<'a> TermCursor<'a> {
         let max_tf = posting_list.max_tf() as f32;
         let max_score = super::bm25_upper_bound(max_tf.max(1.0), idf);
         let num_blocks = posting_list.num_blocks();
+        let safe_avg = avg_field_len.max(1.0);
         Self {
             max_score,
             num_blocks,
@@ -342,10 +370,14 @@ impl<'a> TermCursor<'a> {
             pos: 0,
             block_loaded: false,
             exhausted: num_blocks == 0,
+            lazy_ordinals: false,
+            ordinals_loaded: true, // text cursors never have ordinals
+            current_sparse_block: None,
             variant: CursorVariant::Text {
                 list: posting_list,
                 idf,
-                avg_field_len,
+                b_over_avgfl: super::BM25_B / safe_avg,
+                one_minus_b: 1.0 - super::BM25_B,
                 tfs: Vec::with_capacity(128),
             },
         }
@@ -371,6 +403,9 @@ impl<'a> TermCursor<'a> {
             pos: 0,
             block_loaded: false,
             exhausted: skip_count == 0,
+            lazy_ordinals: false,
+            ordinals_loaded: true,
+            current_sparse_block: None,
             variant: CursorVariant::Sparse {
                 si,
                 query_weight,
@@ -410,7 +445,9 @@ impl<'a> TermCursor<'a> {
             return u32::MAX;
         }
         if self.block_loaded {
-            self.doc_ids.get(self.pos).copied().unwrap_or(u32::MAX)
+            debug_assert!(self.pos < self.doc_ids.len());
+            // SAFETY: pos < doc_ids.len() is maintained by advance_pos/ensure_block_loaded.
+            unsafe { *self.doc_ids.get_unchecked(self.pos) }
         } else {
             self.block_first_doc(self.block_idx)
         }
@@ -421,7 +458,32 @@ impl<'a> TermCursor<'a> {
         if !self.block_loaded || self.ordinals.is_empty() {
             return 0;
         }
-        self.ordinals.get(self.pos).copied().unwrap_or(0)
+        debug_assert!(self.pos < self.ordinals.len());
+        // SAFETY: pos < ordinals.len() is maintained by advance_pos/ensure_block_loaded.
+        unsafe { *self.ordinals.get_unchecked(self.pos) }
+    }
+
+    /// Lazily-decoded ordinal accessor for MaxScore executor.
+    ///
+    /// When `lazy_ordinals=true`, ordinals are not decoded during block loading.
+    /// This method triggers the deferred decode on first access, amortized over
+    /// the block. Subsequent calls within the same block are free.
+    #[inline]
+    pub fn ordinal_mut(&mut self) -> u16 {
+        if !self.block_loaded {
+            return 0;
+        }
+        if !self.ordinals_loaded {
+            if let Some(ref block) = self.current_sparse_block {
+                block.decode_ordinals_into(&mut self.ordinals);
+            }
+            self.ordinals_loaded = true;
+        }
+        if self.ordinals.is_empty() {
+            return 0;
+        }
+        debug_assert!(self.pos < self.ordinals.len());
+        unsafe { *self.ordinals.get_unchecked(self.pos) }
     }
 
     #[inline]
@@ -429,7 +491,9 @@ impl<'a> TermCursor<'a> {
         if !self.block_loaded {
             return 0.0;
         }
-        self.scores.get(self.pos).copied().unwrap_or(0.0)
+        debug_assert!(self.pos < self.scores.len());
+        // SAFETY: pos < scores.len() is maintained by advance_pos/ensure_block_loaded.
+        unsafe { *self.scores.get_unchecked(self.pos) }
     }
 
     #[inline]
@@ -616,12 +680,22 @@ macro_rules! bms_execute_loop {
                 break;
             }
 
-            // Find minimum doc_id across essential cursors
+            // Find minimum doc_id across essential cursors and collect
+            // which cursors are at min_doc (avoids redundant re-checks in
+            // conjunction, block-max, predicate, and scoring passes).
             let mut min_doc = u32::MAX;
+            let mut at_min_mask = 0u64; // bitset of cursor indices at min_doc
             for i in partition..n {
                 let doc = $self.cursors[i].doc();
-                if doc < min_doc {
-                    min_doc = doc;
+                match doc.cmp(&min_doc) {
+                    std::cmp::Ordering::Less => {
+                        min_doc = doc;
+                        at_min_mask = 1u64 << (i as u32);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        at_min_mask |= 1u64 << (i as u32);
+                    }
+                    _ => {}
                 }
             }
             if min_doc == u32::MAX {
@@ -641,17 +715,21 @@ macro_rules! bms_execute_loop {
 
             // --- Conjunction optimization ---
             if $self.collector.len() >= $self.collector.k {
-                let present_upper: f32 = (partition..n)
-                    .filter(|&i| $self.cursors[i].doc() == min_doc)
-                    .map(|i| $self.cursors[i].max_score)
-                    .sum();
+                let mut present_upper: f32 = 0.0;
+                let mut mask = at_min_mask;
+                while mask != 0 {
+                    let i = mask.trailing_zeros() as usize;
+                    present_upper += $self.cursors[i].max_score;
+                    mask &= mask - 1;
+                }
 
                 if present_upper + non_essential_upper <= adjusted_threshold {
-                    for i in partition..n {
-                        if $self.cursors[i].doc() == min_doc {
-                            $self.cursors[i].$ensure() $($aw)* ?;
-                            $self.cursors[i].$advance() $($aw)* ?;
-                        }
+                    let mut mask = at_min_mask;
+                    while mask != 0 {
+                        let i = mask.trailing_zeros() as usize;
+                        $self.cursors[i].$ensure() $($aw)* ?;
+                        $self.cursors[i].$advance() $($aw)* ?;
+                        mask &= mask - 1;
                     }
                     conjunction_skipped += 1;
                     continue;
@@ -660,17 +738,21 @@ macro_rules! bms_execute_loop {
 
             // --- Block-max pruning ---
             if $self.collector.len() >= $self.collector.k {
-                let block_max_sum: f32 = (partition..n)
-                    .filter(|&i| $self.cursors[i].doc() == min_doc)
-                    .map(|i| $self.cursors[i].current_block_max_score())
-                    .sum();
+                let mut block_max_sum: f32 = 0.0;
+                let mut mask = at_min_mask;
+                while mask != 0 {
+                    let i = mask.trailing_zeros() as usize;
+                    block_max_sum += $self.cursors[i].current_block_max_score();
+                    mask &= mask - 1;
+                }
 
                 if block_max_sum + non_essential_upper <= adjusted_threshold {
-                    for i in partition..n {
-                        if $self.cursors[i].doc() == min_doc {
-                            $self.cursors[i].skip_to_next_block();
-                            $self.cursors[i].$ensure() $($aw)* ?;
-                        }
+                    let mut mask = at_min_mask;
+                    while mask != 0 {
+                        let i = mask.trailing_zeros() as usize;
+                        $self.cursors[i].skip_to_next_block();
+                        $self.cursors[i].$ensure() $($aw)* ?;
+                        mask &= mask - 1;
                     }
                     blocks_skipped += 1;
                     continue;
@@ -680,11 +762,12 @@ macro_rules! bms_execute_loop {
             // --- Predicate filter (after block-max, before scoring) ---
             if let Some(ref pred) = $self.predicate {
                 if !pred(min_doc) {
-                    for i in partition..n {
-                        if $self.cursors[i].doc() == min_doc {
-                            $self.cursors[i].$ensure() $($aw)* ?;
-                            $self.cursors[i].$advance() $($aw)* ?;
-                        }
+                    let mut mask = at_min_mask;
+                    while mask != 0 {
+                        let i = mask.trailing_zeros() as usize;
+                        $self.cursors[i].$ensure() $($aw)* ?;
+                        $self.cursors[i].$advance() $($aw)* ?;
+                        mask &= mask - 1;
                     }
                     continue;
                 }
@@ -692,13 +775,18 @@ macro_rules! bms_execute_loop {
 
             // --- Score essential cursors ---
             ordinal_scores.clear();
-            for i in partition..n {
-                if $self.cursors[i].doc() == min_doc {
+            {
+                let mut mask = at_min_mask;
+                while mask != 0 {
+                    let i = mask.trailing_zeros() as usize;
                     $self.cursors[i].$ensure() $($aw)* ?;
                     while $self.cursors[i].doc() == min_doc {
-                        ordinal_scores.push(($self.cursors[i].ordinal(), $self.cursors[i].score()));
+                        let ord = $self.cursors[i].ordinal_mut();
+                        let sc = $self.cursors[i].score();
+                        ordinal_scores.push((ord, sc));
                         $self.cursors[i].$advance() $($aw)* ?;
                     }
+                    mask &= mask - 1;
                 }
             }
 
@@ -724,7 +812,8 @@ macro_rules! bms_execute_loop {
                     while $self.cursors[i].doc() == min_doc {
                         let s = $self.cursors[i].score();
                         running_total += s;
-                        ordinal_scores.push(($self.cursors[i].ordinal(), s));
+                        let ord = $self.cursors[i].ordinal_mut();
+                        ordinal_scores.push((ord, s));
                         $self.cursors[i].$advance() $($aw)* ?;
                     }
                 }
@@ -796,6 +885,12 @@ impl<'a> MaxScoreExecutor<'a> {
     /// Cursors are sorted by max_score ascending (non-essential first) and
     /// prefix sums are computed for the MaxScore partitioning.
     pub(crate) fn new(mut cursors: Vec<TermCursor<'a>>, k: usize, heap_factor: f32) -> Self {
+        // Enable lazy ordinal decode — ordinals are only decoded when a doc
+        // actually reaches the scoring phase (saves ~100ns per skipped block).
+        for c in &mut cursors {
+            c.lazy_ordinals = true;
+        }
+
         // Sort by max_score ascending (non-essential first)
         cursors.sort_by(|a, b| {
             a.max_score

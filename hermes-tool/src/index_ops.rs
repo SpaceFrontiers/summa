@@ -137,16 +137,9 @@ pub async fn index_documents(
     max_indexing_memory_mb: usize,
     indexing_threads: Option<usize>,
     compression_threads: Option<usize>,
-    optimization: String,
+    optimization: hermes_core::structures::IndexOptimization,
 ) -> Result<()> {
-    use hermes_core::structures::IndexOptimization;
-
-    let optimization_mode = IndexOptimization::parse(&optimization).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Invalid optimization mode '{}'. Valid options: adaptive, size, performance",
-            optimization
-        )
-    })?;
+    let optimization_mode = optimization;
 
     let dir = FsDirectory::new(&index_path);
     let default_config = IndexConfig::default();
@@ -215,6 +208,51 @@ pub async fn merge_index(index_path: PathBuf) -> Result<()> {
     info!("Starting force merge...");
     writer.force_merge().await?;
     info!("Force merge completed");
+
+    Ok(())
+}
+
+pub async fn search_index(
+    index_path: PathBuf,
+    query_str: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<()> {
+    let dir = FsDirectory::new(&index_path);
+    let config = IndexConfig::default();
+    let index = hermes_core::Index::open(dir, config).await?;
+    let schema = index.schema().clone();
+
+    let response = index
+        .query_offset(query_str, limit, offset)
+        .await
+        .with_context(|| format!("Search failed for query: {}", query_str))?;
+
+    info!(
+        "Found {} results (total: {})",
+        response.hits.len(),
+        response.total_hits
+    );
+
+    for (i, hit) in response.hits.iter().enumerate() {
+        println!(
+            "--- Result {} (score: {:.4}) ---",
+            offset + i + 1,
+            hit.score
+        );
+        if let Some(doc) = index.get_document(&hit.address).await? {
+            let json = doc.to_json(&schema);
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        }
+    }
+
+    println!("---");
+    println!(
+        "Showing {}-{} of {} results",
+        offset + 1,
+        offset + response.hits.len(),
+        response.total_hits
+    );
 
     Ok(())
 }

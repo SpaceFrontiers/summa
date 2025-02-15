@@ -63,7 +63,7 @@ impl Default for SegmentBuilderConfig {
     fn default() -> Self {
         Self {
             temp_dir: std::env::temp_dir(),
-            compression_level: CompressionLevel(7),
+            compression_level: CompressionLevel(3),
             num_compression_threads: crate::default_compression_threads(),
             interner_capacity: 1_000_000,
             posting_map_capacity: 500_000,

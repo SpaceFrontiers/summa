@@ -18,7 +18,10 @@ index <index_name> {
 ```
 # Article index schema
 index articles {
-    # Primary text field with English stemming
+    # Unique article URL (primary key, deduplicates on insert)
+    field url: text [indexed, stored, primary]
+
+    # Text fields with English stemming
     field title: text<en_stem> [indexed, stored]
 
     # Body content with default tokenizer
@@ -43,22 +46,27 @@ index articles {
 
 ## Field Types
 
-| Type    | Aliases            | Description                                |
-| ------- | ------------------ | ------------------------------------------ |
-| `text`  | `string`, `str`    | UTF-8 text, tokenized for full-text search |
-| `u64`   | `uint`, `unsigned` | Unsigned 64-bit integer                    |
-| `i64`   | `int`, `integer`   | Signed 64-bit integer                      |
-| `f64`   | `float`, `double`  | 64-bit floating point number               |
-| `bytes` | `binary`, `blob`   | Raw binary data                            |
+| Type            | Aliases            | Description                                   |
+| --------------- | ------------------ | --------------------------------------------- |
+| `text`          | `string`, `str`    | UTF-8 text, tokenized for full-text search    |
+| `u64`           | `uint`, `unsigned` | Unsigned 64-bit integer                       |
+| `i64`           | `int`, `integer`   | Signed 64-bit integer                         |
+| `f64`           | `float`, `double`  | 64-bit floating point number                  |
+| `bytes`         | `binary`, `blob`   | Raw binary data                               |
+| `json`          |                    | Arbitrary JSON values                         |
+| `dense_vector`  |                    | Dense float vector for ANN search (see below) |
+| `sparse_vector` |                    | Sparse vector for learned sparse retrieval    |
 
 ## Attributes
 
 Attributes control how fields are processed and stored:
 
-| Attribute | Description                                |
-| --------- | ------------------------------------------ |
-| `indexed` | Field is indexed for searching             |
-| `stored`  | Field value is stored and can be retrieved |
+| Attribute | Description                                                       |
+| --------- | ----------------------------------------------------------------- |
+| `indexed` | Field is indexed for searching                                    |
+| `stored`  | Field value is stored and can be retrieved                        |
+| `primary` | Field is the primary key (enforces uniqueness, deduplicates)      |
+| `fast`    | Field is a fast field (column-oriented storage for range queries) |
 
 ### Attribute Syntax
 
@@ -69,7 +77,36 @@ field name: text [indexed, stored]    # Both indexed and stored
 field name: text [indexed]            # Indexed only (not stored)
 field name: text [stored]             # Stored only (not indexed)
 field name: text                      # Default: indexed and stored
+field id: text [indexed, stored, primary]  # Primary key field
 ```
+
+### Primary Key
+
+The `primary` attribute designates a field as the primary key. When a primary key is defined:
+
+- Documents with duplicate primary key values are rejected during indexing
+- The server automatically initializes deduplication tracking on index open
+- Only one field per index should be marked as `primary`
+- Works with `text`, `u64`, `i64`, and `bytes` field types
+
+```
+index articles {
+    field url: text [indexed, stored, primary]
+    field title: text<en_stem> [indexed, stored]
+    field body: text [indexed]
+}
+```
+
+### Multi-Value Fields
+
+Fields can store multiple values per document using `stored<multi>`:
+
+```
+field tags: text [indexed, stored<multi>]
+field embeddings: dense_vector<768> [indexed, stored<multi>]
+```
+
+Multi-value fields are useful for documents with multiple embeddings (e.g., chunked passages) or multiple values for the same attribute. Dense and sparse vector queries support configurable multi-value combiners (Sum, Max, Avg, LogSumExp, WeightedTopK).
 
 ### Default Behavior
 
@@ -156,13 +193,13 @@ index users {
 ### Create index from SDL file
 
 ```bash
-hermes-index create -i ./myindex -s schema.sdl
+hermes-tool create -i ./myindex -s schema.sdl
 ```
 
 ### Create index from inline SDL
 
 ```bash
-hermes-index init -i ./myindex -s 'index test { field title: text [indexed, stored] }'
+hermes-tool init -i ./myindex -s 'index test { field title: text [indexed, stored] }'
 ```
 
 ## Grammar (PEG)
@@ -181,13 +218,15 @@ field_type = {
     "u64" | "uint" | "unsigned" |
     "i64" | "int" | "integer" |
     "f64" | "float" | "double" |
-    "bytes" | "binary" | "blob"
+    "bytes" | "binary" | "blob" |
+    "json" |
+    "dense_vector" | "sparse_vector"
 }
 
 tokenizer_spec = { "<" ~ identifier ~ ">" }
 
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { "indexed" | "stored" }
+attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" }
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
@@ -236,6 +275,40 @@ index documents {
     field embedding: dense_vector<768, f16> [indexed<ivf_rabitq>, stored<multi>]
     field span: json [stored<multi>]
 }
+```
+
+## Sparse Vectors
+
+Sparse vector fields store learned sparse representations (SPLADE, uniCOIL, etc.) using an inverted index with quantized weights. They support the same Block-Max MaxScore query pipeline as BM25 text fields.
+
+### Syntax
+
+```
+field sparse_emb: sparse_vector [indexed]
+field sparse_emb: sparse_vector [indexed, stored]
+```
+
+Sparse vectors are indexed as posting lists with float weights. At query time, you can provide raw `(indices, values)` pairs or raw text (tokenized server-side if a HuggingFace tokenizer is configured).
+
+### Quantization and Pruning
+
+Sparse posting lists support configurable weight quantization and pruning via `SparseVectorConfig`:
+
+| Preset         | Quantization | Compression | Speed    | Quality loss |
+| -------------- | ------------ | ----------- | -------- | ------------ |
+| `conservative` | Float16      | 2x          | Baseline | <1%          |
+| `splade`       | UInt8        | 5-7x        | 40-60%   | 2-4%         |
+| `compact`      | UInt4        | 7-10x       | 50-70%   | 3-5%         |
+
+These are configured programmatically, not in SDL.
+
+## JSON Fields
+
+JSON fields store arbitrary JSON values. They must be `stored` (not indexed):
+
+```
+field metadata: json [stored]
+field spans: json [stored<multi>]    # Multi-value JSON
 ```
 
 ## Best Practices

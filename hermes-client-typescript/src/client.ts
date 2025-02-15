@@ -114,11 +114,11 @@ export class HermesClient {
   // Document Indexing
   // =========================================================================
 
-  /** Index multiple documents in batch. Returns [indexedCount, errorCount]. */
+  /** Index multiple documents in batch. Returns [indexedCount, errorCount, errors]. */
   async indexDocuments(
     indexName: string,
     documents: Record<string, any>[]
-  ): Promise<[number, number]> {
+  ): Promise<[number, number, Array<{ index: number; error: string }>]> {
     this.ensureConnected();
 
     const namedDocs = documents.map((doc) => ({
@@ -129,7 +129,11 @@ export class HermesClient {
       indexName,
       documents: namedDocs,
     });
-    return [response.indexedCount, response.errorCount];
+    const errors = (response.errors ?? []).map((e) => ({
+      index: e.index,
+      error: e.error,
+    }));
+    return [response.indexedCount, response.errorCount, errors];
   }
 
   /** Index a single document. */
@@ -282,7 +286,9 @@ export class HermesClient {
       );
       return { fields };
     } catch (err: any) {
-      if (err?.code === 5) {
+      // gRPC NOT_FOUND status code
+      const GRPC_NOT_FOUND = 5;
+      if (err?.code === GRPC_NOT_FOUND) {
         return null;
       }
       throw err;
@@ -376,7 +382,11 @@ function buildQuery(q: Query): PbQuery {
   if ("all" in q) {
     return { all: {} };
   }
-  return { all: {} };
+  const validKeys = ["term", "match", "boolean", "sparseVector", "denseVector", "boost", "range", "all"];
+  const keys = Object.keys(q);
+  throw new Error(
+    `Unrecognized query key(s): ${keys.join(", ")}. Valid keys: ${validKeys.join(", ")}`
+  );
 }
 
 function buildReranker(r: Reranker): any {

@@ -35,12 +35,46 @@ impl IndexRegistry {
         }
     }
 
+    /// Validate index name to prevent path traversal and other issues.
+    /// Allows alphanumeric characters, hyphens, underscores, and dots (not leading).
+    fn validate_index_name(name: &str) -> Result<(), Status> {
+        if name.is_empty() {
+            return Err(Status::invalid_argument("Index name must not be empty"));
+        }
+        if name.len() > 255 {
+            return Err(Status::invalid_argument(
+                "Index name must not exceed 255 characters",
+            ));
+        }
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err(Status::invalid_argument(
+                "Index name must not contain '/', '\\', or '..'",
+            ));
+        }
+        if name.starts_with('.') || name.starts_with('-') {
+            return Err(Status::invalid_argument(
+                "Index name must not start with '.' or '-'",
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(Status::invalid_argument(
+                "Index name must contain only alphanumeric characters, hyphens, underscores, or dots",
+            ));
+        }
+        Ok(())
+    }
+
     /// Get or open an index
     ///
     /// Uses a per-index mutex to prevent concurrent Index::open for the same name.
     /// Without this, two concurrent requests can both miss the cache and open the
     /// index twice (wasting ~30s loading segments redundantly).
     pub async fn get_or_open_index(&self, name: &str) -> Result<Arc<Index<MmapDirectory>>, Status> {
+        Self::validate_index_name(name)?;
+
         // Fast path: already cached
         if let Some(h) = self.handles.read().get(name) {
             return Ok(Arc::clone(&h.index));
@@ -73,13 +107,13 @@ impl IndexRegistry {
         let dir = MmapDirectory::new(&index_path);
         let index = Index::open(dir, self.config.clone())
             .await
-            .map_err(|e| Status::internal(format!("Failed to open index: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         let index = Arc::new(index);
         let mut w = index.writer();
         w.init_primary_key_dedup()
             .await
-            .map_err(|e| Status::internal(format!("Failed to init primary key dedup: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         self.handles.write().insert(
@@ -94,6 +128,7 @@ impl IndexRegistry {
 
     /// Create a new index
     pub async fn create_index(&self, name: &str, schema: Schema) -> Result<(), Status> {
+        Self::validate_index_name(name)?;
         let index_path = self.data_dir.join(name);
 
         if index_path.exists() {
@@ -109,13 +144,13 @@ impl IndexRegistry {
         let dir = MmapDirectory::new(&index_path);
         let index = Index::create(dir, schema, self.config.clone())
             .await
-            .map_err(|e| Status::internal(format!("Failed to create index: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         let index = Arc::new(index);
         let mut w = index.writer();
         w.init_primary_key_dedup()
             .await
-            .map_err(|e| Status::internal(format!("Failed to init primary key dedup: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         self.handles.write().insert(
@@ -157,21 +192,29 @@ impl IndexRegistry {
         self.handles.write().remove(name)
     }
 
-    /// List all indexes on disk
-    pub fn list_indexes(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.data_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if entry.file_type().ok()?.is_dir() {
-                    entry.file_name().into_string().ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        names.sort();
-        names
+    /// List all indexes on disk.
+    ///
+    /// Filesystem I/O is done inside `spawn_blocking` to avoid stalling
+    /// the tokio worker threads under heavy load.
+    pub async fn list_indexes(&self) -> Result<Vec<String>, Status> {
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut names: Vec<String> = std::fs::read_dir(&data_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    if entry.file_type().ok()?.is_dir() {
+                        entry.file_name().into_string().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            names.sort();
+            names
+        })
+        .await
+        .map_err(|e| Status::internal(format!("list_indexes task failed: {}", e)))
     }
 }

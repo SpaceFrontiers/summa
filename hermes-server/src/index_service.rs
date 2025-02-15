@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tonic::{Request, Response, Status};
 
 use hermes_core::parse_schema;
@@ -46,6 +46,7 @@ impl IndexServiceImpl {
 
         let mut count = 0u32;
         let mut errors = Vec::new();
+        let total_docs = docs.len();
         let w = writer.read().await;
         for (i, doc) in docs.into_iter().enumerate() {
             match w.add_document(doc) {
@@ -55,6 +56,13 @@ impl IndexServiceImpl {
                         index: i as u32,
                         error: format!("Duplicate primary key: {}", key),
                     });
+                }
+                Err(hermes_core::Error::QueueFull) => {
+                    warn!(
+                        "QueueFull during stream batch: indexed {}/{} docs before backpressure",
+                        count, total_docs
+                    );
+                    break;
                 }
                 Err(e) => {
                     errors.push(DocumentError {
@@ -119,6 +127,7 @@ impl IndexService for IndexServiceImpl {
         // Index documents individually to collect per-document errors (e.g. duplicate PK)
         let mut indexed_count = 0u32;
         let mut doc_errors = Vec::new();
+        let total_docs = documents.len();
         {
             let w = writer.read().await;
             for (i, doc) in documents.into_iter().enumerate() {
@@ -131,7 +140,15 @@ impl IndexService for IndexServiceImpl {
                         });
                     }
                     Err(hermes_core::Error::QueueFull) => {
-                        // Stop on backpressure — remaining docs not indexed
+                        let skipped = total_docs - i;
+                        warn!(
+                            "QueueFull during batch_index: index={}, indexed {}/{} docs, {} skipped",
+                            req.index_name, indexed_count, total_docs, skipped
+                        );
+                        doc_errors.push(DocumentError {
+                            index: i as u32,
+                            error: format!("Queue full — {} remaining documents skipped", skipped),
+                        });
                         break;
                     }
                     Err(e) => {
@@ -146,7 +163,7 @@ impl IndexService for IndexServiceImpl {
 
         let error_count = conversion_errors + doc_errors.len() as u32;
 
-        info!(
+        debug!(
             "Batch indexed documents: index={}, indexed={}, errors={}",
             req.index_name, indexed_count, error_count
         );
@@ -173,7 +190,7 @@ impl IndexService for IndexServiceImpl {
 
         // Buffer messages and batch-convert off the async runtime to avoid
         // blocking tokio threads with CPU-bound proto → Document conversion.
-        const STREAM_BATCH_SIZE: usize = 64;
+        const STREAM_BATCH_SIZE: usize = 512;
         let mut batch: Vec<IndexDocumentRequest> = Vec::with_capacity(STREAM_BATCH_SIZE);
 
         while let Some(req) = stream.message().await? {
@@ -183,8 +200,12 @@ impl IndexService for IndexServiceImpl {
             if needs_switch && !batch.is_empty() {
                 let (count, errors, recycled) = Self::flush_stream_batch(
                     batch,
-                    current_schema.as_ref().unwrap(),
-                    current_writer.as_ref().unwrap(),
+                    current_schema
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("No schema for current index"))?,
+                    current_writer
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("No writer for current index"))?,
                 )
                 .await?;
                 indexed_count += count;
@@ -205,8 +226,12 @@ impl IndexService for IndexServiceImpl {
             if batch.len() >= STREAM_BATCH_SIZE {
                 let (count, errors, recycled) = Self::flush_stream_batch(
                     batch,
-                    current_schema.as_ref().unwrap(),
-                    current_writer.as_ref().unwrap(),
+                    current_schema
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("No schema for current index"))?,
+                    current_writer
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("No writer for current index"))?,
                 )
                 .await?;
                 indexed_count += count;
@@ -250,7 +275,7 @@ impl IndexService for IndexServiceImpl {
             .await
             .commit()
             .await
-            .map_err(|e| Status::internal(format!("Commit failed: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         // Force reader reload to pick up newly committed segments.
         // Without this, the 1-second debounce in reader.searcher() would
@@ -258,15 +283,15 @@ impl IndexService for IndexServiceImpl {
         let reader = index
             .reader()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         reader
             .reload()
             .await
-            .map_err(|e| Status::internal(format!("Failed to reload reader: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         let searcher = reader
             .searcher()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         info!("Committed: {}", req.index_name);
 
@@ -289,21 +314,21 @@ impl IndexService for IndexServiceImpl {
             .await
             .force_merge()
             .await
-            .map_err(|e| Status::internal(format!("Merge failed: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         // Force reader reload to pick up merged segments
         let reader = index
             .reader()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         reader
             .reload()
             .await
-            .map_err(|e| Status::internal(format!("Failed to reload reader: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         let searcher = reader
             .searcher()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         info!("Force merged: {}", req.index_name);
 
@@ -342,7 +367,9 @@ impl IndexService for IndexServiceImpl {
         //    - All in-flight writes finished (write lock acquired above)
         let index_path = self.registry.data_dir.join(&req.index_name);
         if index_path.exists() {
-            std::fs::remove_dir_all(&index_path)
+            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&index_path))
+                .await
+                .map_err(|e| Status::internal(format!("Delete task failed: {}", e)))?
                 .map_err(|e| Status::internal(format!("Failed to delete index: {}", e)))?;
         }
 
@@ -355,9 +382,9 @@ impl IndexService for IndexServiceImpl {
         &self,
         _request: Request<ListIndexesRequest>,
     ) -> Result<Response<ListIndexesResponse>, Status> {
-        let index_names = self.registry.list_indexes();
+        let index_names = self.registry.list_indexes().await?;
 
-        info!("Listed indexes: count={}", index_names.len());
+        debug!("Listed indexes: count={}", index_names.len());
 
         Ok(Response::new(ListIndexesResponse { index_names }))
     }
@@ -375,7 +402,7 @@ impl IndexService for IndexServiceImpl {
             .await
             .rebuild_vector_index()
             .await
-            .map_err(|e| Status::internal(format!("Retrain failed: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         info!("Retrained vector index: {}", req.index_name);
 

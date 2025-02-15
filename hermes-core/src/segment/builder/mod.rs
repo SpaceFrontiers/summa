@@ -510,11 +510,13 @@ impl SegmentBuilder {
         if let Some(tokens) = custom_tokens {
             // Custom tokenizer path
             for token in &tokens {
-                let is_new_string = !self.term_interner.contains(&token.text);
-                let term_spur = self.term_interner.get_or_intern(&token.text);
-                if is_new_string {
+                let term_spur = if let Some(spur) = self.term_interner.get(&token.text) {
+                    spur
+                } else {
+                    let spur = self.term_interner.get_or_intern(&token.text);
                     self.estimated_memory += token.text.len() + INTERN_OVERHEAD;
-                }
+                    spur
+                };
                 *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
 
                 if let Some(mode) = position_mode {
@@ -546,11 +548,13 @@ impl SegmentBuilder {
                     continue;
                 }
 
-                let is_new_string = !self.term_interner.contains(&self.token_buffer);
-                let term_spur = self.term_interner.get_or_intern(&self.token_buffer);
-                if is_new_string {
+                let term_spur = if let Some(spur) = self.term_interner.get(&self.token_buffer) {
+                    spur
+                } else {
+                    let spur = self.term_interner.get_or_intern(&self.token_buffer);
                     self.estimated_memory += self.token_buffer.len() + INTERN_OVERHEAD;
-                }
+                    spur
+                };
                 *self.local_tf_buffer.entry(term_spur).or_insert(0) += 1;
 
                 if let Some(mode) = position_mode {
@@ -577,32 +581,38 @@ impl SegmentBuilder {
                 term: term_spur,
             };
 
-            let is_new_term = !self.inverted_index.contains_key(&term_key);
-            let posting = self
-                .inverted_index
-                .entry(term_key)
-                .or_insert_with(PostingListBuilder::new);
-            posting.add(doc_id, tf);
-
-            self.estimated_memory += size_of::<CompactPosting>();
-            if is_new_term {
-                self.estimated_memory += NEW_TERM_OVERHEAD;
+            match self.inverted_index.entry(term_key) {
+                hashbrown::hash_map::Entry::Occupied(mut o) => {
+                    o.get_mut().add(doc_id, tf);
+                    self.estimated_memory += size_of::<CompactPosting>();
+                }
+                hashbrown::hash_map::Entry::Vacant(v) => {
+                    let mut posting = PostingListBuilder::new();
+                    posting.add(doc_id, tf);
+                    v.insert(posting);
+                    self.estimated_memory += size_of::<CompactPosting>() + NEW_TERM_OVERHEAD;
+                }
             }
 
             if position_mode.is_some()
                 && let Some(positions) = self.local_positions.get(&term_spur)
             {
-                let is_new_pos_term = !self.position_index.contains_key(&term_key);
-                let pos_posting = self
-                    .position_index
-                    .entry(term_key)
-                    .or_insert_with(PositionPostingListBuilder::new);
-                for &pos in positions {
-                    pos_posting.add_position(doc_id, pos);
-                }
-                self.estimated_memory += positions.len() * size_of::<u32>();
-                if is_new_pos_term {
-                    self.estimated_memory += NEW_POS_TERM_OVERHEAD;
+                match self.position_index.entry(term_key) {
+                    hashbrown::hash_map::Entry::Occupied(mut o) => {
+                        for &pos in positions {
+                            o.get_mut().add_position(doc_id, pos);
+                        }
+                        self.estimated_memory += positions.len() * size_of::<u32>();
+                    }
+                    hashbrown::hash_map::Entry::Vacant(v) => {
+                        let mut pos_posting = PositionPostingListBuilder::new();
+                        for &pos in positions {
+                            pos_posting.add_position(doc_id, pos);
+                        }
+                        self.estimated_memory +=
+                            positions.len() * size_of::<u32>() + NEW_POS_TERM_OVERHEAD;
+                        v.insert(pos_posting);
+                    }
                 }
             }
         }
@@ -615,27 +625,30 @@ impl SegmentBuilder {
 
         self.numeric_buffer.clear();
         write!(self.numeric_buffer, "__num_{}", value).unwrap();
-        let is_new_string = !self.term_interner.contains(&self.numeric_buffer);
-        let term_spur = self.term_interner.get_or_intern(&self.numeric_buffer);
+        let term_spur = if let Some(spur) = self.term_interner.get(&self.numeric_buffer) {
+            spur
+        } else {
+            let spur = self.term_interner.get_or_intern(&self.numeric_buffer);
+            self.estimated_memory += self.numeric_buffer.len() + INTERN_OVERHEAD;
+            spur
+        };
 
         let term_key = TermKey {
             field: field.0,
             term: term_spur,
         };
 
-        let is_new_term = !self.inverted_index.contains_key(&term_key);
-        let posting = self
-            .inverted_index
-            .entry(term_key)
-            .or_insert_with(PostingListBuilder::new);
-        posting.add(doc_id, 1);
-
-        self.estimated_memory += size_of::<CompactPosting>();
-        if is_new_term {
-            self.estimated_memory += NEW_TERM_OVERHEAD;
-        }
-        if is_new_string {
-            self.estimated_memory += self.numeric_buffer.len() + INTERN_OVERHEAD;
+        match self.inverted_index.entry(term_key) {
+            hashbrown::hash_map::Entry::Occupied(mut o) => {
+                o.get_mut().add(doc_id, 1);
+                self.estimated_memory += size_of::<CompactPosting>();
+            }
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                let mut posting = PostingListBuilder::new();
+                posting.add(doc_id, 1);
+                v.insert(posting);
+                self.estimated_memory += size_of::<CompactPosting>() + NEW_TERM_OVERHEAD;
+            }
         }
 
         Ok(())

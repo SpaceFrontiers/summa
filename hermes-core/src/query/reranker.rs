@@ -39,12 +39,23 @@ fn score_batch_precomp(
     match (quant, unit_norm) {
         (DenseVectorQuantization::F32, false) => {
             let num_floats = scores.len() * dim;
+            // Safety: Vec<u8> from the global allocator is guaranteed to be at least
+            // 8-byte aligned on 64-bit platforms (aligned to max_align_t). Assert at
+            // runtime to guard against custom allocators with weaker guarantees.
+            assert!(
+                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                "f32 vector data not 4-byte aligned"
+            );
             let vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
             simd::batch_cosine_scores_precomp(query, vectors, dim, scores, inv_norm_q);
         }
         (DenseVectorQuantization::F32, true) => {
             let num_floats = scores.len() * dim;
+            assert!(
+                (raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()),
+                "f32 vector data not 4-byte aligned"
+            );
             let vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, num_floats) };
             simd::batch_dot_scores_precomp(query, vectors, dim, scores, inv_norm_q);
@@ -114,7 +125,7 @@ fn score_document(
     let combined = config.combiner.combine(&values);
 
     // Sort ordinals by score descending (best chunk first)
-    values.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    values.sort_by(|a, b| b.1.total_cmp(&a.1));
     let positions: Vec<ScoredPosition> = values
         .into_iter()
         .map(|(ordinal, score)| ScoredPosition::new(ordinal, score))
@@ -176,210 +187,233 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         }
     }
 
-    // ── Phase 2: Per-segment batched resolve + read + score ───────────────
-    // Flat buffer: (candidate_idx, ordinal, score) — one allocation for all candidates.
-    // Multi-value docs produce multiple entries per candidate_idx.
+    // ── Phase 2: Per-segment batched resolve + read + score (concurrent) ──
+    // Each segment runs independently: resolve flat indexes, read vectors,
+    // and score — all overlapping I/O across segments via join_all.
+    let query_ref = pq.query;
+    let inv_norm_q_val = pq.inv_norm_q;
+    let query_f16_ref = pq.query_f16;
+
+    let segment_futs: Vec<_> = segment_groups
+        .into_iter()
+        .map(|(si, candidate_indices)| {
+            #[allow(clippy::redundant_locals)]
+            let segments = &segments;
+            #[allow(clippy::redundant_locals)]
+            let candidates = candidates;
+            #[allow(clippy::redundant_locals)]
+            let query_ref = query_ref;
+            #[allow(clippy::redundant_locals)]
+            let query_f16_ref = query_f16_ref;
+            #[allow(clippy::redundant_locals)]
+            let config = config;
+            async move {
+                let mut scores: Vec<(usize, u32, f32)> = Vec::new();
+                let mut vectors = 0usize;
+                let mut seg_skipped = 0u32;
+
+                let Some(lazy_flat) = segments[si].flat_vectors().get(&field_id) else {
+                    return Ok::<_, crate::error::Error>((
+                        scores,
+                        vectors,
+                        candidate_indices.len() as u32,
+                    ));
+                };
+                if lazy_flat.dim != query_dim {
+                    return Ok((scores, vectors, candidate_indices.len() as u32));
+                }
+
+                let vbs = lazy_flat.vector_byte_size();
+                let quant = lazy_flat.quantization;
+
+                // Resolve flat indexes for all candidates in this segment
+                let mut resolved: Vec<(usize, usize, u32)> = Vec::new();
+                for &ci in &candidate_indices {
+                    let local_doc_id = candidates[ci].doc_id;
+                    let (start, count) = lazy_flat.flat_indexes_for_doc_range(local_doc_id);
+                    if count == 0 {
+                        seg_skipped += 1;
+                        continue;
+                    }
+                    for j in 0..count {
+                        let (_, ordinal) = lazy_flat.get_doc_id(start + j);
+                        resolved.push((ci, start + j, ordinal as u32));
+                    }
+                }
+
+                if resolved.is_empty() {
+                    return Ok((scores, vectors, seg_skipped));
+                }
+
+                let n = resolved.len();
+                vectors = n;
+
+                // Sort by flat_idx for sequential mmap access
+                resolved.sort_unstable_by_key(|&(_, flat_idx, _)| flat_idx);
+
+                let first_idx = resolved[0].1;
+                let last_idx = resolved[n - 1].1;
+                let span = last_idx - first_idx + 1;
+
+                let mut raw_buf: Vec<u8> = vec![0u8; n * vbs];
+
+                if span <= n * 4 {
+                    let range_bytes = lazy_flat
+                        .read_vectors_batch(first_idx, span)
+                        .await
+                        .map_err(crate::error::Error::Io)?;
+                    let rb = range_bytes.as_slice();
+                    for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
+                        let rel = flat_idx - first_idx;
+                        let src = &rb[rel * vbs..(rel + 1) * vbs];
+                        raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs].copy_from_slice(src);
+                    }
+                } else {
+                    for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
+                        lazy_flat
+                            .read_vector_raw_into(
+                                flat_idx,
+                                &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
+                            )
+                            .await
+                            .map_err(crate::error::Error::Io)?;
+                    }
+                }
+
+                // Reconstruct PrecompQuery from captured components
+                let pq = PrecompQuery {
+                    query: query_ref,
+                    inv_norm_q: inv_norm_q_val,
+                    query_f16: query_f16_ref,
+                };
+
+                let mut scores_buf: Vec<f32> = vec![0.0; n];
+
+                // Matryoshka pre-filter
+                if let Some(mdims) = config.matryoshka_dims
+                    && mdims < query_dim
+                    && n > final_limit * 2
+                {
+                    let trunc_dim = mdims;
+                    let trunc_pq = PrecompQuery {
+                        query: &query_ref[..trunc_dim],
+                        inv_norm_q: {
+                            let nq = simd::dot_product_f32(
+                                &query_ref[..trunc_dim],
+                                &query_ref[..trunc_dim],
+                                trunc_dim,
+                            );
+                            if nq < f32::EPSILON {
+                                0.0
+                            } else {
+                                simd::fast_inv_sqrt(nq)
+                            }
+                        },
+                        query_f16: &query_f16_ref[..trunc_dim],
+                    };
+                    let trunc_vbs = trunc_dim * quant.element_size();
+                    for i in 0..n {
+                        let vec_start = i * vbs;
+                        score_batch_precomp(
+                            &trunc_pq,
+                            &raw_buf[vec_start..vec_start + trunc_vbs],
+                            quant,
+                            trunc_dim,
+                            &mut scores_buf[i..i + 1],
+                            config.unit_norm,
+                        );
+                    }
+
+                    let per_doc_cap: usize = match &config.combiner {
+                        super::MultiValueCombiner::Max => 1,
+                        super::MultiValueCombiner::WeightedTopK { k, .. } => *k,
+                        _ => usize::MAX,
+                    };
+
+                    let mut ranked: Vec<(usize, f32)> =
+                        (0..n).map(|i| (i, scores_buf[i])).collect();
+                    ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
+                    let mut survivors: Vec<(usize, f32)> =
+                        Vec::with_capacity(n.min(final_limit * 4));
+                    let mut doc_vector_counts: FxHashMap<usize, usize> = FxHashMap::default();
+                    let mut unique_docs = 0usize;
+
+                    for &(orig_idx, score) in &ranked {
+                        let ci = resolved[orig_idx].0;
+                        let count = doc_vector_counts.entry(ci).or_insert(0);
+
+                        if *count >= per_doc_cap {
+                            continue;
+                        }
+                        if *count == 0 {
+                            unique_docs += 1;
+                        }
+                        *count += 1;
+                        survivors.push((orig_idx, score));
+
+                        if unique_docs >= final_limit && survivors.len() >= final_limit * 2 {
+                            break;
+                        }
+                    }
+
+                    scores.reserve(survivors.len());
+                    for &(orig_idx, _) in &survivors {
+                        let vec_start = orig_idx * vbs;
+                        let mut score = 0.0f32;
+                        score_batch_precomp(
+                            &pq,
+                            &raw_buf[vec_start..vec_start + vbs],
+                            quant,
+                            query_dim,
+                            std::slice::from_mut(&mut score),
+                            config.unit_norm,
+                        );
+                        let (ci, _, ordinal) = resolved[orig_idx];
+                        scores.push((ci, ordinal, score));
+                    }
+
+                    let filtered = n - survivors.len();
+                    log::debug!(
+                        "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived from {} unique docs (filtered {}, per_doc_cap={})",
+                        trunc_dim,
+                        query_dim,
+                        survivors.len(),
+                        n,
+                        unique_docs,
+                        filtered,
+                        per_doc_cap
+                    );
+                } else {
+                    score_batch_precomp(
+                        &pq,
+                        &raw_buf[..n * vbs],
+                        quant,
+                        query_dim,
+                        &mut scores_buf[..n],
+                        config.unit_norm,
+                    );
+
+                    scores.reserve(n);
+                    for (buf_idx, &(ci, _, ordinal)) in resolved.iter().enumerate() {
+                        scores.push((ci, ordinal, scores_buf[buf_idx]));
+                    }
+                }
+
+                Ok((scores, vectors, seg_skipped))
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(segment_futs).await;
+
     let mut all_scores: Vec<(usize, u32, f32)> = Vec::new();
     let mut total_vectors = 0usize;
-    // Reusable buffers across segments (avoids per-candidate allocation)
-    let mut raw_buf: Vec<u8> = Vec::new();
-    let mut scores_buf: Vec<f32> = Vec::new();
-
-    for (si, candidate_indices) in &segment_groups {
-        let Some(lazy_flat) = segments[*si].flat_vectors().get(&field_id) else {
-            skipped += candidate_indices.len() as u32;
-            continue;
-        };
-        if lazy_flat.dim != query_dim {
-            skipped += candidate_indices.len() as u32;
-            continue;
-        }
-
-        let vbs = lazy_flat.vector_byte_size();
-        let quant = lazy_flat.quantization;
-
-        // Resolve flat indexes for all candidates in this segment
-        // Each entry: (candidate_idx, flat_vector_idx, ordinal)
-        let mut resolved: Vec<(usize, usize, u32)> = Vec::new();
-        for &ci in candidate_indices {
-            let local_doc_id = candidates[ci].doc_id;
-            let (start, count) = lazy_flat.flat_indexes_for_doc_range(local_doc_id);
-            if count == 0 {
-                skipped += 1;
-                continue;
-            }
-            for j in 0..count {
-                let (_, ordinal) = lazy_flat.get_doc_id(start + j);
-                resolved.push((ci, start + j, ordinal as u32));
-            }
-        }
-
-        if resolved.is_empty() {
-            continue;
-        }
-
-        let n = resolved.len();
-        total_vectors += n;
-
-        // Sort by flat_idx for sequential mmap access (better page locality)
-        resolved.sort_unstable_by_key(|&(_, flat_idx, _)| flat_idx);
-
-        // Coalesced range read: single mmap read covering [min_idx..max_idx+1],
-        // then selectively copy needed vectors. One page fault instead of N.
-        let first_idx = resolved[0].1;
-        let last_idx = resolved[n - 1].1;
-        let span = last_idx - first_idx + 1;
-
-        raw_buf.resize(n * vbs, 0);
-
-        // Use coalesced read if span waste is reasonable (< 4× the needed count),
-        // otherwise fall back to individual reads for very sparse patterns
-        if span <= n * 4 {
-            let range_bytes = lazy_flat
-                .read_vectors_batch(first_idx, span)
-                .await
-                .expect("reranker: failed to read vector batch from flat storage");
-            let rb = range_bytes.as_slice();
-            for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
-                let rel = flat_idx - first_idx;
-                let src = &rb[rel * vbs..(rel + 1) * vbs];
-                raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs].copy_from_slice(src);
-            }
-        } else {
-            for (buf_idx, &(_, flat_idx, _)) in resolved.iter().enumerate() {
-                lazy_flat
-                    .read_vector_raw_into(
-                        flat_idx,
-                        &mut raw_buf[buf_idx * vbs..(buf_idx + 1) * vbs],
-                    )
-                    .await
-                    .expect("reranker: failed to read individual vector from flat storage");
-            }
-        }
-
-        // Single batch SIMD scoring for all vectors in this segment
-        scores_buf.resize(n, 0.0);
-
-        // Matryoshka pre-filter: score on truncated dimensions first, then
-        // full-dimension scoring only on survivors.
-        if let Some(mdims) = config.matryoshka_dims
-            && mdims < query_dim
-            && n > final_limit * 2
-        {
-            // Phase 2a: truncated-dimension approximate SIMD scoring.
-            // Score directly from raw_buf — no intermediate buffer copy needed.
-            // Each vector's first trunc_vbs bytes are the leading dimensions
-            // (storage is dimension-contiguous within each vector).
-            let trunc_dim = mdims;
-            let trunc_pq = PrecompQuery {
-                query: &query[..trunc_dim],
-                inv_norm_q: {
-                    let nq =
-                        simd::dot_product_f32(&query[..trunc_dim], &query[..trunc_dim], trunc_dim);
-                    if nq < f32::EPSILON {
-                        0.0
-                    } else {
-                        simd::fast_inv_sqrt(nq)
-                    }
-                },
-                query_f16: &query_f16[..trunc_dim],
-            };
-            let trunc_vbs = trunc_dim * quant.element_size();
-            for i in 0..n {
-                let vec_start = i * vbs;
-                score_batch_precomp(
-                    &trunc_pq,
-                    &raw_buf[vec_start..vec_start + trunc_vbs],
-                    quant,
-                    trunc_dim,
-                    &mut scores_buf[i..i + 1],
-                    config.unit_norm,
-                );
-            }
-
-            // Phase 2b: diversity-aware selection — ensure at least final_limit
-            // unique documents survive the pre-filter. For saturating combiners
-            // (Max, WeightedTopK), cap per-doc vectors to avoid one multi-valued
-            // doc crowding out others.
-            let per_doc_cap: usize = match &config.combiner {
-                super::MultiValueCombiner::Max => 1,
-                super::MultiValueCombiner::WeightedTopK { k, .. } => *k,
-                _ => usize::MAX,
-            };
-
-            let mut ranked: Vec<(usize, f32)> = (0..n).map(|i| (i, scores_buf[i])).collect();
-            ranked.sort_unstable_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            let mut survivors: Vec<(usize, f32)> = Vec::with_capacity(n.min(final_limit * 4));
-            let mut doc_vector_counts: FxHashMap<usize, usize> = FxHashMap::default();
-            let mut unique_docs = 0usize;
-
-            for &(orig_idx, score) in &ranked {
-                let ci = resolved[orig_idx].0;
-                let count = doc_vector_counts.entry(ci).or_insert(0);
-
-                if *count >= per_doc_cap {
-                    continue;
-                }
-                if *count == 0 {
-                    unique_docs += 1;
-                }
-                *count += 1;
-                survivors.push((orig_idx, score));
-
-                // Stop once we have enough unique docs AND enough entries
-                if unique_docs >= final_limit && survivors.len() >= final_limit * 2 {
-                    break;
-                }
-            }
-
-            // Phase 2c: full-dimension exact SIMD scoring on survivors only.
-            // Score directly from raw_buf at original offsets — zero-copy.
-            all_scores.reserve(survivors.len());
-            for &(orig_idx, _) in &survivors {
-                let vec_start = orig_idx * vbs;
-                let mut score = 0.0f32;
-                score_batch_precomp(
-                    &pq,
-                    &raw_buf[vec_start..vec_start + vbs],
-                    quant,
-                    query_dim,
-                    std::slice::from_mut(&mut score),
-                    config.unit_norm,
-                );
-                let (ci, _, ordinal) = resolved[orig_idx];
-                all_scores.push((ci, ordinal, score));
-            }
-
-            let filtered = n - survivors.len();
-            log::debug!(
-                "[reranker] matryoshka pre-filter: {}/{} dims, {}/{} vectors survived from {} unique docs (filtered {}, per_doc_cap={})",
-                trunc_dim,
-                query_dim,
-                survivors.len(),
-                n,
-                unique_docs,
-                filtered,
-                per_doc_cap
-            );
-        } else {
-            // No pre-filter: full-dimension SIMD scoring on all candidates
-            score_batch_precomp(
-                &pq,
-                &raw_buf[..n * vbs],
-                quant,
-                query_dim,
-                &mut scores_buf[..n],
-                config.unit_norm,
-            );
-
-            all_scores.reserve(n);
-            for (buf_idx, &(ci, _, ordinal)) in resolved.iter().enumerate() {
-                all_scores.push((ci, ordinal, scores_buf[buf_idx]));
-            }
-        }
+    for result in results {
+        let (scores, vectors, seg_skipped) = result?;
+        all_scores.extend(scores);
+        total_vectors += vectors;
+        skipped += seg_skipped;
     }
 
     let read_score_elapsed = t0.elapsed();
@@ -412,7 +446,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         let combined = config.combiner.combine(&ordinal_pairs);
 
         // Sort positions by score descending (best chunk first)
-        run.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        run.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
         let positions: Vec<ScoredPosition> = run
             .iter()
             .map(|&(_, ord, score)| ScoredPosition::new(ord, score))

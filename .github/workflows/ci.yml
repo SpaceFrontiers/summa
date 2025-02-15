@@ -48,6 +48,19 @@ jobs:
       - name: Build
         run: cargo build --release
 
+  # Security audit - check for known vulnerabilities
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
+
   # WASM build - separate due to different target
   wasm:
     name: WASM Build

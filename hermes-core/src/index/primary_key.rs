@@ -100,21 +100,24 @@ impl PrimaryKeyIndex {
         }
 
         let key_bytes = key.as_bytes();
-        let mut state = self.state.lock();
 
-        // Fast path: bloom says definitely not present → new key.
-        if !state.bloom.may_contain(key_bytes) {
-            state.bloom.insert(key_bytes);
-            state.uncommitted.insert(key_bytes.to_vec());
-            return Ok(());
+        {
+            let mut state = self.state.lock();
+
+            // Fast path: bloom says definitely not present → new key.
+            if !state.bloom.may_contain(key_bytes) {
+                state.bloom.insert(key_bytes);
+                state.uncommitted.insert(key_bytes.to_vec());
+                return Ok(());
+            }
+
+            // Bloom positive → check uncommitted set first (fast, in-memory).
+            if state.uncommitted.contains(key_bytes) {
+                return Err(Error::DuplicatePrimaryKey(key.to_string()));
+            }
         }
-
-        // Bloom positive → check uncommitted set first (fast, in-memory).
-        if state.uncommitted.contains(key_bytes) {
-            return Err(Error::DuplicatePrimaryKey(key.to_string()));
-        }
-
-        // Check committed segments via fast-field text dictionary.
+        // Lock released — check committed segments without holding mutex.
+        // committed_readers is immutable (only changed via &mut self methods).
         for reader in &self.committed_readers {
             if let Some(ff) = reader.fast_field(self.field.0)
                 && let Some(dict) = ff.text_dict()
@@ -122,6 +125,13 @@ impl PrimaryKeyIndex {
             {
                 return Err(Error::DuplicatePrimaryKey(key.to_string()));
             }
+        }
+
+        // Re-acquire lock to insert. Re-check uncommitted in case another
+        // thread inserted the same key while we were scanning committed segments.
+        let mut state = self.state.lock();
+        if state.uncommitted.contains(key_bytes) {
+            return Err(Error::DuplicatePrimaryKey(key.to_string()));
         }
 
         // Bloom false positive — key is genuinely new.
@@ -142,6 +152,17 @@ impl PrimaryKeyIndex {
         // get_mut() bypasses the mutex — safe because we have &mut self.
         let state = self.state.get_mut();
         state.uncommitted.clear();
+    }
+
+    /// Roll back an uncommitted key registration (e.g. when channel send fails
+    /// after check_and_insert succeeded). Bloom may retain the key but that only
+    /// causes harmless false positives, never missed duplicates.
+    pub fn rollback_uncommitted_key(&self, doc: &crate::dsl::Document) {
+        if let Some(value) = doc.get_first(self.field)
+            && let Some(key) = value.as_text()
+        {
+            self.state.lock().uncommitted.remove(key.as_bytes());
+        }
     }
 
     /// Clear uncommitted keys (e.g. on abort). Bloom may retain stale entries

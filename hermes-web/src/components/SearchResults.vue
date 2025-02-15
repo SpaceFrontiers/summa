@@ -23,24 +23,15 @@
         :class="[uxConfig?.hasRowClick?.value ? 'cursor-pointer hover:border-blue-300' : '', uxConfig?.config?.value?.styles?.result_card || '']"
         @click="handleRowClick(idx)"
       >
-        <!-- Loading state -->
-        <div v-if="loadingDocs.has(idx)" class="flex items-center justify-center py-8">
-          <svg class="animate-spin h-6 w-6 text-blue-600" viewBox="0 0 24 24">
-            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/>
-            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/>
-          </svg>
-          <span class="ml-2 text-gray-500">Loading document...</span>
-        </div>
-
         <!-- Document content -->
-        <div v-else-if="loadedDocs[idx]" class="space-y-3">
+        <div v-if="hit.document" class="space-y-3">
             <!-- Use UX config columns if available -->
             <template v-if="displayColumns.length > 0">
               <template
                 v-for="fieldName in displayColumns"
                 :key="fieldName"
               >
-              <div v-if="!isFieldEmpty(loadedDocs[idx][fieldName])"
+              <div v-if="!isFieldEmpty(hit.document[fieldName])"
               >
                 <!-- Label (skip for ipfs_files which handles its own label) -->
                 <div v-if="getFieldLabel(fieldName) && getRenderType(fieldName) !== 'ipfs_files'" class="text-xs font-medium text-gray-400 uppercase tracking-wide mb-0.5">
@@ -50,7 +41,7 @@
                 <template v-if="getRenderType(fieldName) === 'uri_links'">
                   <div class="flex flex-wrap gap-2">
                     <a
-                      v-for="(link, linkIdx) in formatField(fieldName, loadedDocs[idx][fieldName]).links"
+                      v-for="(link, linkIdx) in formatField(fieldName, hit.document[fieldName]).links"
                       :key="linkIdx"
                       :href="link.url"
                       target="_blank"
@@ -62,14 +53,14 @@
                 </template>
                 <template v-else-if="getRenderType(fieldName) === 'split_newline'">
                   <div class="text-sm text-gray-900">
-                    <div v-for="(line, lineIdx) in formatField(fieldName, loadedDocs[idx][fieldName]).lines" :key="lineIdx" :class="lineIdx === 0 ? 'font-semibold' : 'text-gray-600'">
+                    <div v-for="(line, lineIdx) in formatField(fieldName, hit.document[fieldName]).lines" :key="lineIdx" :class="lineIdx === 0 ? 'font-semibold' : 'text-gray-600'">
                       {{ line }}
                     </div>
                   </div>
                 </template>
                 <template v-else-if="getRenderType(fieldName) === 'ipfs_files'">
                   <IpfsFileLinks
-                    :id="String(loadedDocs[idx][fieldName])"
+                    :id="String(hit.document[fieldName])"
                     :formats="getFieldConfig(fieldName).ipfs_formats || ['pdf', 'epub', 'djvu']"
                     :base="getFieldConfig(fieldName).ipfs_base || ''"
                     :label="getFieldLabel(fieldName)"
@@ -80,9 +71,9 @@
                   v-else
                   class="text-sm text-gray-900"
                   :class="[getFieldStyles(fieldName), isFieldClickable(fieldName) ? 'cursor-pointer hover:underline' : '']"
-                  @click="handleFieldClick(fieldName, loadedDocs[idx])"
+                  @click="handleFieldClick(fieldName, hit.document)"
                 >
-                  {{ formatField(fieldName, loadedDocs[idx][fieldName]) }}
+                  {{ formatField(fieldName, hit.document[fieldName]) }}
                 </div>
               </div>
               </template>
@@ -90,7 +81,7 @@
             <!-- Fallback: show all fields -->
             <template v-else>
               <div
-                v-for="(value, key) in loadedDocs[idx]"
+                v-for="(value, key) in hit.document"
                 :key="key"
               >
                 <div class="text-xs font-medium text-gray-400 uppercase tracking-wide mb-0.5">{{ key }}</div>
@@ -145,7 +136,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, watch, computed } from 'vue'
+import { ref, computed } from 'vue'
 import IpfsFileLinks from './IpfsFileLinks.vue'
 
 const props = defineProps({
@@ -165,10 +156,8 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['loadDocument', 'next-page', 'prev-page'])
+const emit = defineEmits(['next-page', 'prev-page'])
 
-const loadingDocs = ref(new Set())
-const loadedDocs = reactive({})
 const showRaw = ref(false)
 
 // Check if a field value is empty (null, undefined, empty string, empty array, 0)
@@ -239,35 +228,10 @@ const handleFieldClick = (fieldName, doc) => {
 }
 
 const handleRowClick = (idx) => {
-  if (props.uxConfig?.hasRowClick?.value && loadedDocs[idx]) {
-    props.uxConfig.handleRowClick(loadedDocs[idx])
+  const hit = props.results?.hits?.[idx]
+  if (props.uxConfig?.hasRowClick?.value && hit?.document) {
+    props.uxConfig.handleRowClick(hit.document)
   }
 }
 
-watch(() => props.results, async () => {
-  loadingDocs.value = new Set()
-  Object.keys(loadedDocs).forEach(key => delete loadedDocs[key])
-
-  // Fetch all documents immediately
-  if (props.results?.hits) {
-    for (let idx = 0; idx < props.results.hits.length; idx++) {
-      loadingDocs.value.add(idx)
-    }
-    loadingDocs.value = new Set(loadingDocs.value)
-
-    for (let idx = 0; idx < props.results.hits.length; idx++) {
-      const hit = props.results.hits[idx]
-      emit('loadDocument', {
-        idx,
-        segmentId: hit.address.segment_id,
-        docId: hit.address.doc_id,
-        callback: (doc) => {
-          loadedDocs[idx] = doc
-          loadingDocs.value.delete(idx)
-          loadingDocs.value = new Set(loadingDocs.value)
-        }
-      })
-    }
-  }
-}, { immediate: true })
 </script>

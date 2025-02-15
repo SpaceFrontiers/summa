@@ -28,11 +28,11 @@ impl SearchService for SearchServiceImpl {
         let reader = index
             .reader()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         let searcher = reader
             .searcher()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         let query = req
             .query
@@ -67,13 +67,13 @@ impl SearchService for SearchServiceImpl {
             let (candidates, seen) = searcher
                 .search_with_count(core_query.as_ref(), l1_limit)
                 .await
-                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
+                .map_err(crate::error::hermes_error_to_status)?;
             (candidates, seen, Some((config, limit)))
         } else {
             let (results, seen) = searcher
                 .search_with_positions(core_query.as_ref(), limit)
                 .await
-                .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
+                .map_err(crate::error::hermes_error_to_status)?;
             (results, seen, None)
         };
         let search_us = t_search.elapsed().as_micros() as u64;
@@ -83,7 +83,7 @@ impl SearchService for SearchServiceImpl {
         let results = if let Some((config, final_limit)) = rerank_config {
             hermes_core::query::rerank(&searcher, &results, &config, final_limit)
                 .await
-                .map_err(|e| Status::internal(format!("Rerank failed: {}", e)))?
+                .map_err(crate::error::hermes_error_to_status)?
         } else {
             results
         };
@@ -107,8 +107,8 @@ impl SearchService for SearchServiceImpl {
                 )
             };
 
-        // Convert to response with optional field loading
-        // Debug: detect duplicate doc_ids across results
+        // Debug: detect duplicate doc_ids across results (only in debug builds)
+        #[cfg(debug_assertions)]
         {
             let mut seen: rustc_hash::FxHashMap<(u128, u32), usize> =
                 rustc_hash::FxHashMap::default();
@@ -130,9 +130,10 @@ impl SearchService for SearchServiceImpl {
             }
         }
 
-        let mut hits = Vec::new();
+        let num_fields = req.fields_to_load.len();
+        let mut hits = Vec::with_capacity(results.len());
         for result in results {
-            let mut fields: HashMap<String, FieldValueList> = HashMap::new();
+            let mut fields: HashMap<String, FieldValueList> = HashMap::with_capacity(num_fields);
 
             if !req.fields_to_load.is_empty() {
                 let doc = searcher
@@ -141,7 +142,7 @@ impl SearchService for SearchServiceImpl {
                         requested_field_ids.as_ref(),
                     )
                     .await
-                    .map_err(|e| Status::internal(format!("Failed to load doc fields: {}", e)))?;
+                    .map_err(crate::error::hermes_error_to_status)?;
 
                 if let Some(doc) = doc {
                     for field_name in &req.fields_to_load {
@@ -186,7 +187,7 @@ impl SearchService for SearchServiceImpl {
         // total_seen = number of documents that were actually scored across all segments
         Ok(Response::new(SearchResponse {
             hits,
-            total_hits: total_seen,
+            total_hits: total_seen as u64,
             took_ms,
             timings: Some(SearchTimings {
                 search_us,
@@ -206,11 +207,11 @@ impl SearchService for SearchServiceImpl {
         let reader = index
             .reader()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         let searcher = reader
             .searcher()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         let addr = req
             .address
@@ -221,7 +222,7 @@ impl SearchService for SearchServiceImpl {
         let doc = searcher
             .doc(segment_id, addr.doc_id)
             .await
-            .map_err(|e| Status::internal(format!("Failed to get document: {}", e)))?
+            .map_err(crate::error::hermes_error_to_status)?
             .ok_or_else(|| Status::not_found("Document not found"))?;
 
         let mut fields: HashMap<String, FieldValueList> = HashMap::new();
@@ -247,11 +248,11 @@ impl SearchService for SearchServiceImpl {
         let reader = index
             .reader()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get reader: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
         let searcher = reader
             .searcher()
             .await
-            .map_err(|e| Status::internal(format!("Failed to get searcher: {}", e)))?;
+            .map_err(crate::error::hermes_error_to_status)?;
 
         // Convert schema to SDL string
         let schema_str = schema_to_sdl(index.schema());

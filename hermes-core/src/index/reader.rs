@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 
 use crate::directories::DirectoryWriter;
@@ -18,21 +19,25 @@ use super::Searcher;
 ///
 /// The IndexReader periodically reloads its Searcher to pick up new segments.
 /// Uses SegmentManager as authoritative source for segment state (avoids race conditions).
+/// Combined searcher + segment IDs, swapped atomically via ArcSwap (wait-free reads).
+struct SearcherState<D: DirectoryWriter + 'static> {
+    searcher: Arc<Searcher<D>>,
+    segment_ids: Vec<String>,
+}
+
 pub struct IndexReader<D: DirectoryWriter + 'static> {
     /// Schema
     schema: Arc<Schema>,
     /// Segment manager - authoritative source for segments
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
-    /// Current searcher
-    searcher: RwLock<Arc<Searcher<D>>>,
+    /// Current searcher + segment IDs (ArcSwap for wait-free reads)
+    state: ArcSwap<SearcherState<D>>,
     /// Term cache blocks
     term_cache_blocks: usize,
     /// Last reload check time
     last_reload_check: RwLock<std::time::Instant>,
     /// Reload check interval (default 1 second)
     reload_check_interval: std::time::Duration,
-    /// Current segment IDs (to detect changes)
-    current_segment_ids: RwLock<Vec<String>>,
     /// Guard against concurrent reloads
     reloading: AtomicBool,
 }
@@ -56,11 +61,13 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         Ok(Self {
             schema,
             segment_manager,
-            searcher: RwLock::new(Arc::new(reader)),
+            state: ArcSwap::from_pointee(SearcherState {
+                searcher: Arc::new(reader),
+                segment_ids: initial_segment_ids,
+            }),
             term_cache_blocks,
             last_reload_check: RwLock::new(std::time::Instant::now()),
             reload_check_interval: std::time::Duration::from_millis(reload_interval_ms),
-            current_segment_ids: RwLock::new(initial_segment_ids),
             reloading: AtomicBool::new(false),
         })
     }
@@ -100,9 +107,8 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
 
     /// Get current searcher (reloads only if segments changed)
     ///
-    /// Uses an `AtomicBool` guard to prevent concurrent reloads: if another
-    /// caller is already reloading, subsequent callers return the current
-    /// searcher immediately instead of triggering a duplicate reload.
+    /// Wait-free read path via ArcSwap::load(). Reload checks are guarded
+    /// by an AtomicBool to prevent concurrent reloads.
     pub async fn searcher(&self) -> Result<Arc<Searcher<D>>> {
         // Check if we should check for segment changes
         let should_check = {
@@ -125,7 +131,8 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             // Otherwise another reload is in progress — just return current searcher
         }
 
-        Ok(Arc::clone(&*self.searcher.read()))
+        // Wait-free load (no lock contention with reloads)
+        Ok(Arc::clone(&self.state.load().searcher))
     }
 
     /// Actual reload check (called under the `reloading` guard)
@@ -135,14 +142,14 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         // Get current segment IDs from segment manager
         let new_segment_ids = self.segment_manager.get_segment_ids().await;
 
-        // Check if segments actually changed
+        // Check if segments actually changed (wait-free read)
         let segments_changed = {
-            let current = self.current_segment_ids.read();
-            *current != new_segment_ids
+            let state = self.state.load();
+            state.segment_ids != new_segment_ids
         };
 
         if segments_changed {
-            let old_count = self.current_segment_ids.read().len();
+            let old_count = self.state.load().segment_ids.len();
             let new_count = new_segment_ids.len();
             log::info!(
                 "[index_reload] old_count={} new_count={}",
@@ -154,21 +161,36 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         Ok(())
     }
 
-    /// Force reload reader with fresh snapshot
+    /// Force reload reader with fresh snapshot.
+    ///
+    /// Uses the `reloading` guard to prevent races with `do_reload_check()`.
     pub async fn reload(&self) -> Result<()> {
+        // Acquire reload guard (skip if another reload is already in progress)
+        if self
+            .reloading
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(()); // Another reload in progress
+        }
         let new_segment_ids = self.segment_manager.get_segment_ids().await;
-        self.reload_with_segments(new_segment_ids).await
+        let result = self.reload_with_segments(new_segment_ids).await;
+        self.reloading.store(false, Ordering::Release);
+        result
     }
 
-    /// Internal reload with specific segment IDs
+    /// Internal reload with specific segment IDs.
+    /// Atomic swap via ArcSwap::store (wait-free for readers).
     async fn reload_with_segments(&self, new_segment_ids: Vec<String>) -> Result<()> {
         let new_reader =
             Self::create_reader(&self.schema, &self.segment_manager, self.term_cache_blocks)
                 .await?;
 
-        // Swap in new searcher and update segment IDs
-        *self.searcher.write() = Arc::new(new_reader);
-        *self.current_segment_ids.write() = new_segment_ids;
+        // Atomic swap — readers see old or new state, never a torn read
+        self.state.store(Arc::new(SearcherState {
+            searcher: Arc::new(new_reader),
+            segment_ids: new_segment_ids,
+        }));
 
         Ok(())
     }

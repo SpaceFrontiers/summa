@@ -172,7 +172,7 @@ impl SparseVectorQuery {
             v.truncate(max_dims);
         }
 
-        if v.len() < original_len {
+        if v.len() < original_len && log::log_enabled!(log::Level::Debug) {
             let src: Vec<_> = self
                 .vector
                 .iter()

@@ -272,6 +272,12 @@ impl BlockPostingList {
         let mut tf_buf = Vec::with_capacity(BLOCK_SIZE);
 
         while i < postings.len() {
+            if stream.len() > u32::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "posting list stream exceeds u32::MAX bytes",
+                ));
+            }
             let block_start = stream.len() as u32;
             let block_end = (i + BLOCK_SIZE).min(postings.len());
             let block = &postings[i..block_end];
@@ -500,6 +506,12 @@ impl BlockPostingList {
                 let block_bytes = &source.stream[offset as usize..offset as usize + blk_size];
 
                 let count = u16::from_le_bytes(block_bytes[0..2].try_into().unwrap());
+                if stream.len() > u32::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "posting list stream exceeds u32::MAX bytes during concatenation",
+                    ));
+                }
                 let new_offset = stream.len() as u32;
 
                 // Write patched header + copy packed arrays verbatim
@@ -604,6 +616,12 @@ impl BlockPostingList {
 
                 // Write output L0 entry
                 let new_last = last_doc + doc_offset;
+                if stream_written > u32::MAX as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "posting list stream exceeds u32::MAX bytes during streaming merge",
+                    ));
+                }
                 write_l0(
                     &mut out_l0,
                     first_doc + doc_offset,

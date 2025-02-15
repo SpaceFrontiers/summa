@@ -223,13 +223,11 @@ mod neon {
         for group in 0..full_groups {
             let base = group * 4;
 
-            // Load 4 bytes and widen to u32
-            let b0 = input[base] as u32;
-            let b1 = input[base + 1] as u32;
-            let b2 = input[base + 2] as u32;
-            let b3 = input[base + 3] as u32;
-            let deltas = [b0, b1, b2, b3];
-            let d = vld1q_u32(deltas.as_ptr());
+            // Load 4 bytes as a u32, then widen u8→u16→u32 via NEON
+            let raw = std::ptr::read_unaligned(input.as_ptr().add(base) as *const u32);
+            let bytes = vreinterpret_u8_u32(vdup_n_u32(raw));
+            let u16s = vmovl_u8(bytes); // 8×u8 → 8×u16 (only low 4 matter)
+            let d = vmovl_u16(vget_low_u16(u16s)); // 4×u16 → 4×u32
 
             // Add 1 (since we store gap-1)
             let gaps = vaddq_u32(d, ones);
@@ -732,6 +730,139 @@ mod avx2 {
         }
     }
 
+    /// AVX2 prefix sum for 8 u32 values (Hillis-Steele)
+    /// Input:  [a, b, c, d, e, f, g, h]
+    /// Output: [a, a+b, a+b+c, ..., a+b+c+d+e+f+g+h]
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn prefix_sum_8(v: __m256i) -> __m256i {
+        // Step 1: intra-lane shift by 1 element (4 bytes) and add
+        let s1 = _mm256_slli_si256(v, 4);
+        let r1 = _mm256_add_epi32(v, s1);
+
+        // Step 2: intra-lane shift by 2 elements (8 bytes) and add
+        let s2 = _mm256_slli_si256(r1, 8);
+        let r2 = _mm256_add_epi32(r1, s2);
+
+        // Step 3: propagate lower lane sum to upper lane
+        // Broadcast element 3 (lower lane sum) within each lane
+        let lo_sum = _mm256_shuffle_epi32(r2, 0xFF);
+        // Duplicate lane 0 to both lanes
+        let carry = _mm256_permute2x128_si256(lo_sum, lo_sum, 0x00);
+        // Zero carry for lower lane, keep for upper
+        let carry_hi = _mm256_blend_epi32::<0xF0>(_mm256_setzero_si256(), carry);
+        _mm256_add_epi32(r2, carry_hi)
+    }
+
+    /// AVX2 fused unpack 8-bit + delta decode (processes 8 values at a time)
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn unpack_8bit_delta_decode(
+        input: &[u8],
+        output: &mut [u32],
+        first_value: u32,
+        count: usize,
+    ) {
+        output[0] = first_value;
+        if count <= 1 {
+            return;
+        }
+
+        let ones = _mm256_set1_epi32(1);
+        let mut carry = _mm256_set1_epi32(first_value as i32);
+        let broadcast_idx = _mm256_set1_epi32(7);
+
+        let full_groups = (count - 1) / 8;
+        let remainder = (count - 1) % 8;
+
+        for group in 0..full_groups {
+            let base = group * 8;
+
+            // Load 8 bytes and zero-extend to 8×u32
+            let bytes = _mm_loadl_epi64(input.as_ptr().add(base) as *const __m128i);
+            let d = _mm256_cvtepu8_epi32(bytes);
+
+            // Add 1 (since we store gap-1)
+            let gaps = _mm256_add_epi32(d, ones);
+
+            // Compute prefix sum within 8 elements
+            let prefix = prefix_sum_8(gaps);
+
+            // Add carry from previous group
+            let result = _mm256_add_epi32(prefix, carry);
+
+            // Store 8 results
+            _mm256_storeu_si256(output[base + 1..].as_mut_ptr() as *mut __m256i, result);
+
+            // Update carry: broadcast element 7 to all positions
+            carry = _mm256_permutevar8x32_epi32(result, broadcast_idx);
+        }
+
+        // Handle remainder with scalar
+        let base = full_groups * 8;
+        let mut scalar_carry = _mm256_extract_epi32::<0>(carry) as u32;
+        for j in 0..remainder {
+            scalar_carry = scalar_carry
+                .wrapping_add(input[base + j] as u32)
+                .wrapping_add(1);
+            output[base + j + 1] = scalar_carry;
+        }
+    }
+
+    /// AVX2 fused unpack 16-bit + delta decode (processes 8 values at a time)
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn unpack_16bit_delta_decode(
+        input: &[u8],
+        output: &mut [u32],
+        first_value: u32,
+        count: usize,
+    ) {
+        output[0] = first_value;
+        if count <= 1 {
+            return;
+        }
+
+        let ones = _mm256_set1_epi32(1);
+        let mut carry = _mm256_set1_epi32(first_value as i32);
+        let broadcast_idx = _mm256_set1_epi32(7);
+
+        let full_groups = (count - 1) / 8;
+        let remainder = (count - 1) % 8;
+
+        for group in 0..full_groups {
+            let base = group * 8;
+            let in_ptr = input.as_ptr().add(base * 2);
+
+            // Load 16 bytes (8 u16 values) and zero-extend to 8×u32
+            let vals = _mm_loadu_si128(in_ptr as *const __m128i);
+            let d = _mm256_cvtepu16_epi32(vals);
+
+            // Add 1 (since we store gap-1)
+            let gaps = _mm256_add_epi32(d, ones);
+
+            // Compute prefix sum within 8 elements
+            let prefix = prefix_sum_8(gaps);
+
+            // Add carry from previous group
+            let result = _mm256_add_epi32(prefix, carry);
+
+            // Store 8 results
+            _mm256_storeu_si256(output[base + 1..].as_mut_ptr() as *mut __m256i, result);
+
+            // Update carry: broadcast element 7 to all positions
+            carry = _mm256_permutevar8x32_epi32(result, broadcast_idx);
+        }
+
+        // Handle remainder with scalar
+        let base = full_groups * 8;
+        let mut scalar_carry = _mm256_extract_epi32::<0>(carry) as u32;
+        for j in 0..remainder {
+            let idx = (base + j) * 2;
+            let delta = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
+            scalar_carry = scalar_carry.wrapping_add(delta).wrapping_add(1);
+            output[base + j + 1] = scalar_carry;
+        }
+    }
+
     /// Check if AVX2 is available at runtime
     #[inline]
     pub fn is_available() -> bool {
@@ -1123,17 +1254,20 @@ pub fn unpack_rounded_delta_decode(
         RoundedBitWidth::Bits8 => unpack_8bit_delta_decode(input, output, first_value, count),
         RoundedBitWidth::Bits16 => unpack_16bit_delta_decode(input, output, first_value, count),
         RoundedBitWidth::Bits32 => {
-            // For 32-bit, unpack then delta decode (no fused version needed)
-            unpack_32bit(input, output, count);
-            // Delta decode in place - but we need the deltas separate
-            // Actually for 32-bit we should just unpack and delta decode separately
+            // Unpack count-1 deltas from input, then prefix sum to absolute values
             if count > 0 {
-                let mut carry = first_value;
                 output[0] = first_value;
-                for item in output.iter_mut().take(count).skip(1) {
-                    // item currently holds delta (gap-1)
-                    carry = carry.wrapping_add(*item).wrapping_add(1);
-                    *item = carry;
+                let mut carry = first_value;
+                for i in 0..count - 1 {
+                    let idx = i * 4;
+                    let delta = u32::from_le_bytes([
+                        input[idx],
+                        input[idx + 1],
+                        input[idx + 2],
+                        input[idx + 3],
+                    ]);
+                    carry = carry.wrapping_add(delta).wrapping_add(1);
+                    output[i + 1] = carry;
                 }
             }
         }
@@ -1171,6 +1305,12 @@ pub fn unpack_8bit_delta_decode(input: &[u8], output: &mut [u32], first_value: u
 
     #[cfg(target_arch = "x86_64")]
     {
+        if avx2::is_available() {
+            unsafe {
+                avx2::unpack_8bit_delta_decode(input, output, first_value, count);
+            }
+            return;
+        }
         if sse::is_available() {
             unsafe {
                 sse::unpack_8bit_delta_decode(input, output, first_value, count);
@@ -1211,6 +1351,12 @@ pub fn unpack_16bit_delta_decode(input: &[u8], output: &mut [u32], first_value: 
 
     #[cfg(target_arch = "x86_64")]
     {
+        if avx2::is_available() {
+            unsafe {
+                avx2::unpack_16bit_delta_decode(input, output, first_value, count);
+            }
+            return;
+        }
         if sse::is_available() {
             unsafe {
                 sse::unpack_16bit_delta_decode(input, output, first_value, count);
@@ -1415,13 +1561,11 @@ unsafe fn dequantize_uint8_sse(
     for chunk in 0..chunks {
         let base = chunk * 4;
 
-        // Load 4 bytes and zero-extend to 32-bit
-        let b0 = input[base] as i32;
-        let b1 = input[base + 1] as i32;
-        let b2 = input[base + 2] as i32;
-        let b3 = input[base + 3] as i32;
-
-        let ints = _mm_set_epi32(b3, b2, b1, b0);
+        // Load 4 bytes as a single i32 and zero-extend u8→u32 via SSE4.1
+        let bytes = _mm_cvtsi32_si128(std::ptr::read_unaligned(
+            input.as_ptr().add(base) as *const i32
+        ));
+        let ints = _mm_cvtepu8_epi32(bytes);
         let floats = _mm_cvtepi32_ps(ints);
 
         // Apply scale and min_val: result = floats * scale + min_val
@@ -2078,11 +2222,31 @@ pub fn f32_to_f16(value: f32) -> u16 {
         if exp16 < -10 {
             return sign as u16; // too small → zero
         }
-        let m = (mantissa | 0x80_0000) >> (1 - exp16);
-        return (sign | (m >> 13)) as u16;
+        let shift = (1 - exp16) as u32;
+        let m = (mantissa | 0x80_0000) >> shift;
+        // Round-to-nearest-even
+        let round_bit = (m >> 12) & 1;
+        let sticky = m & 0xFFF;
+        let m13 = m >> 13;
+        let rounded = m13 + (round_bit & (m13 | if sticky != 0 { 1 } else { 0 }));
+        return (sign | rounded) as u16;
     }
 
-    (sign | ((exp16 as u32) << 10) | (mantissa >> 13)) as u16
+    // Round-to-nearest-even for normal numbers
+    let round_bit = (mantissa >> 12) & 1;
+    let sticky = mantissa & 0xFFF;
+    let m13 = mantissa >> 13;
+    let rounded = m13 + (round_bit & (m13 | if sticky != 0 { 1 } else { 0 }));
+    // Check if rounding caused mantissa overflow (carry into exponent)
+    if rounded > 0x3FF {
+        let exp16_inc = exp16 as u32 + 1;
+        if exp16_inc >= 31 {
+            return (sign | 0x7C00) as u16; // overflow → infinity
+        }
+        (sign | (exp16_inc << 10)) as u16
+    } else {
+        (sign | ((exp16 as u32) << 10) | rounded) as u16
+    }
 }
 
 /// Convert f16 (stored as u16) to f32
@@ -2166,37 +2330,54 @@ mod neon_quant {
     /// Both query and vectors are f16 (stored as u16). Uses hardware `vcvt_f32_f16`
     /// for SIMD f16→f32 conversion (replaces scalar bit manipulation), processes
     /// 8 elements per iteration with f32 accumulation for precision.
+    #[allow(clippy::incompatible_msrv)]
     #[target_feature(enable = "neon")]
     pub unsafe fn fused_dot_norm_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
-        let chunks8 = dim / 8;
-        let remainder = dim % 8;
+        let chunks16 = dim / 16;
+        let remainder = dim % 16;
 
-        let mut acc_dot = vdupq_n_f32(0.0);
-        let mut acc_norm = vdupq_n_f32(0.0);
+        // 2 accumulator pairs to hide FMA latency (processes 16 f16 per iteration)
+        let mut acc_dot0 = vdupq_n_f32(0.0);
+        let mut acc_dot1 = vdupq_n_f32(0.0);
+        let mut acc_norm0 = vdupq_n_f32(0.0);
+        let mut acc_norm1 = vdupq_n_f32(0.0);
 
-        for c in 0..chunks8 {
-            let base = c * 8;
+        for c in 0..chunks16 {
+            let base = c * 16;
 
-            // Load 8 f16 vector values, hardware-convert to 2×4 f32
-            let v_raw = vld1q_u16(vec_f16.as_ptr().add(base));
-            let v_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(v_raw)));
-            let v_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(v_raw)));
+            // First 8 f16 elements
+            let v_raw0 = vld1q_u16(vec_f16.as_ptr().add(base));
+            let v_lo0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(v_raw0)));
+            let v_hi0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(v_raw0)));
+            let q_raw0 = vld1q_u16(query_f16.as_ptr().add(base));
+            let q_lo0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(q_raw0)));
+            let q_hi0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(q_raw0)));
 
-            // Load 8 f16 query values, hardware-convert to 2×4 f32
-            let q_raw = vld1q_u16(query_f16.as_ptr().add(base));
-            let q_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(q_raw)));
-            let q_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(q_raw)));
+            acc_dot0 = vfmaq_f32(acc_dot0, q_lo0, v_lo0);
+            acc_dot0 = vfmaq_f32(acc_dot0, q_hi0, v_hi0);
+            acc_norm0 = vfmaq_f32(acc_norm0, v_lo0, v_lo0);
+            acc_norm0 = vfmaq_f32(acc_norm0, v_hi0, v_hi0);
 
-            acc_dot = vfmaq_f32(acc_dot, q_lo, v_lo);
-            acc_dot = vfmaq_f32(acc_dot, q_hi, v_hi);
-            acc_norm = vfmaq_f32(acc_norm, v_lo, v_lo);
-            acc_norm = vfmaq_f32(acc_norm, v_hi, v_hi);
+            // Second 8 f16 elements (independent accumulator chain)
+            let v_raw1 = vld1q_u16(vec_f16.as_ptr().add(base + 8));
+            let v_lo1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(v_raw1)));
+            let v_hi1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(v_raw1)));
+            let q_raw1 = vld1q_u16(query_f16.as_ptr().add(base + 8));
+            let q_lo1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(q_raw1)));
+            let q_hi1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(q_raw1)));
+
+            acc_dot1 = vfmaq_f32(acc_dot1, q_lo1, v_lo1);
+            acc_dot1 = vfmaq_f32(acc_dot1, q_hi1, v_hi1);
+            acc_norm1 = vfmaq_f32(acc_norm1, v_lo1, v_lo1);
+            acc_norm1 = vfmaq_f32(acc_norm1, v_hi1, v_hi1);
         }
 
-        let mut dot = vaddvq_f32(acc_dot);
-        let mut norm = vaddvq_f32(acc_norm);
+        // Combine accumulator pairs
+        let mut dot = vaddvq_f32(vaddq_f32(acc_dot0, acc_dot1));
+        let mut norm = vaddvq_f32(vaddq_f32(acc_norm0, acc_norm1));
 
-        let base = chunks8 * 8;
+        // Handle remainder
+        let base = chunks16 * 16;
         for i in 0..remainder {
             let v = super::f16_to_f32(*vec_f16.get_unchecked(base + i));
             let q = super::f16_to_f32(*query_f16.get_unchecked(base + i));
@@ -2279,6 +2460,7 @@ mod neon_quant {
     }
 
     /// Dot product only for f16 vectors on NEON (no norm — for unit_norm vectors).
+    #[allow(clippy::incompatible_msrv)]
     #[target_feature(enable = "neon")]
     pub unsafe fn dot_product_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
         let chunks8 = dim / 8;
@@ -2528,22 +2710,38 @@ unsafe fn fused_dot_norm_u8_sse(query: &[f32], vec_u8: &[u8], dim: usize) -> (f3
 unsafe fn fused_dot_norm_f16_f16c(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
     use std::arch::x86_64::*;
 
-    let chunks = dim / 8;
-    let remainder = dim % 8;
+    let chunks16 = dim / 16;
+    let remainder = dim % 16;
 
-    let mut acc_dot = _mm256_setzero_ps();
-    let mut acc_norm = _mm256_setzero_ps();
+    // 2 accumulator pairs to hide FMA latency (processes 16 f16 per iteration)
+    let mut acc_dot0 = _mm256_setzero_ps();
+    let mut acc_dot1 = _mm256_setzero_ps();
+    let mut acc_norm0 = _mm256_setzero_ps();
+    let mut acc_norm1 = _mm256_setzero_ps();
 
-    for chunk in 0..chunks {
-        let base = chunk * 8;
-        // Hardware f16→f32: 8 values at once via F16C
-        let v_raw = _mm_loadu_si128(vec_f16.as_ptr().add(base) as *const __m128i);
-        let vb = _mm256_cvtph_ps(v_raw);
-        let q_raw = _mm_loadu_si128(query_f16.as_ptr().add(base) as *const __m128i);
-        let qa = _mm256_cvtph_ps(q_raw);
-        acc_dot = _mm256_fmadd_ps(qa, vb, acc_dot);
-        acc_norm = _mm256_fmadd_ps(vb, vb, acc_norm);
+    for c in 0..chunks16 {
+        let base = c * 16;
+
+        // First 8 f16 elements
+        let v_raw0 = _mm_loadu_si128(vec_f16.as_ptr().add(base) as *const __m128i);
+        let vb0 = _mm256_cvtph_ps(v_raw0);
+        let q_raw0 = _mm_loadu_si128(query_f16.as_ptr().add(base) as *const __m128i);
+        let qa0 = _mm256_cvtph_ps(q_raw0);
+        acc_dot0 = _mm256_fmadd_ps(qa0, vb0, acc_dot0);
+        acc_norm0 = _mm256_fmadd_ps(vb0, vb0, acc_norm0);
+
+        // Second 8 f16 elements (independent accumulator chain)
+        let v_raw1 = _mm_loadu_si128(vec_f16.as_ptr().add(base + 8) as *const __m128i);
+        let vb1 = _mm256_cvtph_ps(v_raw1);
+        let q_raw1 = _mm_loadu_si128(query_f16.as_ptr().add(base + 8) as *const __m128i);
+        let qa1 = _mm256_cvtph_ps(q_raw1);
+        acc_dot1 = _mm256_fmadd_ps(qa1, vb1, acc_dot1);
+        acc_norm1 = _mm256_fmadd_ps(vb1, vb1, acc_norm1);
     }
+
+    // Combine accumulator pairs
+    let acc_dot = _mm256_add_ps(acc_dot0, acc_dot1);
+    let acc_norm = _mm256_add_ps(acc_norm0, acc_norm1);
 
     // Horizontal sum 256→128→scalar
     let hi_d = _mm256_extractf128_ps(acc_dot, 1);
@@ -2562,7 +2760,7 @@ unsafe fn fused_dot_norm_f16_f16c(query_f16: &[u16], vec_f16: &[u16], dim: usize
     let shuf2_n = _mm_movehl_ps(sums_n, sums_n);
     let mut norm = _mm_cvtss_f32(_mm_add_ss(sums_n, shuf2_n));
 
-    let base = chunks * 8;
+    let base = chunks16 * 16;
     for i in 0..remainder {
         let v = f16_to_f32(*vec_f16.get_unchecked(base + i));
         let q = f16_to_f32(*query_f16.get_unchecked(base + i));
@@ -3084,7 +3282,7 @@ pub fn squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if avx2::is_available() {
+        if avx2::is_available() && is_x86_feature_detected!("fma") {
             return unsafe { squared_euclidean_avx2(a, b, count) };
         }
         if sse::is_available() {
@@ -3108,24 +3306,44 @@ pub fn squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn squared_euclidean_neon(a: &[f32], b: &[f32], count: usize) -> f32 {
     use std::arch::aarch64::*;
 
-    let chunks = count / 4;
-    let remainder = count % 4;
+    let chunks16 = count / 16;
+    let remainder = count % 16;
 
-    let mut acc = vdupq_n_f32(0.0);
+    // 4 independent accumulators to hide FMA latency
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
 
-    for chunk in 0..chunks {
-        let base = chunk * 4;
-        let va = vld1q_f32(a.as_ptr().add(base));
-        let vb = vld1q_f32(b.as_ptr().add(base));
-        let diff = vsubq_f32(va, vb);
-        acc = vfmaq_f32(acc, diff, diff); // acc += diff * diff (fused multiply-add)
+    for c in 0..chunks16 {
+        let base = c * 16;
+        let va0 = vld1q_f32(a.as_ptr().add(base));
+        let vb0 = vld1q_f32(b.as_ptr().add(base));
+        let d0 = vsubq_f32(va0, vb0);
+        acc0 = vfmaq_f32(acc0, d0, d0);
+
+        let va1 = vld1q_f32(a.as_ptr().add(base + 4));
+        let vb1 = vld1q_f32(b.as_ptr().add(base + 4));
+        let d1 = vsubq_f32(va1, vb1);
+        acc1 = vfmaq_f32(acc1, d1, d1);
+
+        let va2 = vld1q_f32(a.as_ptr().add(base + 8));
+        let vb2 = vld1q_f32(b.as_ptr().add(base + 8));
+        let d2 = vsubq_f32(va2, vb2);
+        acc2 = vfmaq_f32(acc2, d2, d2);
+
+        let va3 = vld1q_f32(a.as_ptr().add(base + 12));
+        let vb3 = vld1q_f32(b.as_ptr().add(base + 12));
+        let d3 = vsubq_f32(va3, vb3);
+        acc3 = vfmaq_f32(acc3, d3, d3);
     }
 
-    // Horizontal sum
-    let mut sum = vaddvq_f32(acc);
+    // Combine accumulators and horizontal sum
+    let combined = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    let mut sum = vaddvq_f32(combined);
 
     // Handle remainder
-    let base = chunks * 4;
+    let base = chunks16 * 16;
     for i in 0..remainder {
         let d = a[base + i] - b[base + i];
         sum += d * d;
@@ -3140,29 +3358,56 @@ unsafe fn squared_euclidean_neon(a: &[f32], b: &[f32], count: usize) -> f32 {
 unsafe fn squared_euclidean_sse(a: &[f32], b: &[f32], count: usize) -> f32 {
     use std::arch::x86_64::*;
 
-    let chunks = count / 4;
-    let remainder = count % 4;
+    let chunks16 = count / 16;
+    let remainder = count % 16;
 
-    let mut acc = _mm_setzero_ps();
+    // 4 independent accumulators to hide multiply latency
+    let mut acc0 = _mm_setzero_ps();
+    let mut acc1 = _mm_setzero_ps();
+    let mut acc2 = _mm_setzero_ps();
+    let mut acc3 = _mm_setzero_ps();
 
-    for chunk in 0..chunks {
-        let base = chunk * 4;
-        let va = _mm_loadu_ps(a.as_ptr().add(base));
-        let vb = _mm_loadu_ps(b.as_ptr().add(base));
-        let diff = _mm_sub_ps(va, vb);
-        acc = _mm_add_ps(acc, _mm_mul_ps(diff, diff));
+    for c in 0..chunks16 {
+        let base = c * 16;
+
+        let d0 = _mm_sub_ps(
+            _mm_loadu_ps(a.as_ptr().add(base)),
+            _mm_loadu_ps(b.as_ptr().add(base)),
+        );
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(d0, d0));
+
+        let d1 = _mm_sub_ps(
+            _mm_loadu_ps(a.as_ptr().add(base + 4)),
+            _mm_loadu_ps(b.as_ptr().add(base + 4)),
+        );
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(d1, d1));
+
+        let d2 = _mm_sub_ps(
+            _mm_loadu_ps(a.as_ptr().add(base + 8)),
+            _mm_loadu_ps(b.as_ptr().add(base + 8)),
+        );
+        acc2 = _mm_add_ps(acc2, _mm_mul_ps(d2, d2));
+
+        let d3 = _mm_sub_ps(
+            _mm_loadu_ps(a.as_ptr().add(base + 12)),
+            _mm_loadu_ps(b.as_ptr().add(base + 12)),
+        );
+        acc3 = _mm_add_ps(acc3, _mm_mul_ps(d3, d3));
     }
 
+    // Combine accumulators
+    let combined = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
+
     // Horizontal sum: [a, b, c, d] -> a + b + c + d
-    let shuf = _mm_shuffle_ps(acc, acc, 0b10_11_00_01); // [b, a, d, c]
-    let sums = _mm_add_ps(acc, shuf); // [a+b, a+b, c+d, c+d]
-    let shuf2 = _mm_movehl_ps(sums, sums); // [c+d, c+d, ?, ?]
-    let final_sum = _mm_add_ss(sums, shuf2); // [a+b+c+d, ?, ?, ?]
+    let shuf = _mm_shuffle_ps(combined, combined, 0b10_11_00_01);
+    let sums = _mm_add_ps(combined, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let final_sum = _mm_add_ss(sums, shuf2);
 
     let mut sum = _mm_cvtss_f32(final_sum);
 
     // Handle remainder
-    let base = chunks * 4;
+    let base = chunks16 * 16;
     for i in 0..remainder {
         let d = a[base + i] - b[base + i];
         sum += d * d;
@@ -3172,31 +3417,56 @@ unsafe fn squared_euclidean_sse(a: &[f32], b: &[f32], count: usize) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn squared_euclidean_avx2(a: &[f32], b: &[f32], count: usize) -> f32 {
     use std::arch::x86_64::*;
 
-    let chunks = count / 8;
-    let remainder = count % 8;
+    let chunks32 = count / 32;
+    let remainder = count % 32;
 
-    let mut acc = _mm256_setzero_ps();
+    // 4 independent accumulators to hide FMA latency
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
 
-    for chunk in 0..chunks {
-        let base = chunk * 8;
-        let va = _mm256_loadu_ps(a.as_ptr().add(base));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(base));
-        let diff = _mm256_sub_ps(va, vb);
-        acc = _mm256_fmadd_ps(diff, diff, acc); // acc += diff * diff (FMA)
+    for c in 0..chunks32 {
+        let base = c * 32;
+
+        let d0 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base)),
+            _mm256_loadu_ps(b.as_ptr().add(base)),
+        );
+        acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+
+        let d1 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base + 8)),
+            _mm256_loadu_ps(b.as_ptr().add(base + 8)),
+        );
+        acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+
+        let d2 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base + 16)),
+            _mm256_loadu_ps(b.as_ptr().add(base + 16)),
+        );
+        acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+
+        let d3 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(base + 24)),
+            _mm256_loadu_ps(b.as_ptr().add(base + 24)),
+        );
+        acc3 = _mm256_fmadd_ps(d3, d3, acc3);
     }
 
+    // Combine accumulators
+    let combined = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+
     // Horizontal sum of 8 floats
-    // First, add high 128 bits to low 128 bits
-    let high = _mm256_extractf128_ps(acc, 1);
-    let low = _mm256_castps256_ps128(acc);
+    let high = _mm256_extractf128_ps(combined, 1);
+    let low = _mm256_castps256_ps128(combined);
     let sum128 = _mm_add_ps(low, high);
 
-    // Now sum the 4 floats in sum128
     let shuf = _mm_shuffle_ps(sum128, sum128, 0b10_11_00_01);
     let sums = _mm_add_ps(sum128, shuf);
     let shuf2 = _mm_movehl_ps(sums, sums);
@@ -3205,7 +3475,7 @@ unsafe fn squared_euclidean_avx2(a: &[f32], b: &[f32], count: usize) -> f32 {
     let mut sum = _mm_cvtss_f32(final_sum);
 
     // Handle remainder
-    let base = chunks * 8;
+    let base = chunks32 * 32;
     for i in 0..remainder {
         let d = a[base + i] - b[base + i];
         sum += d * d;
@@ -3229,7 +3499,7 @@ pub fn batch_squared_euclidean_distances(
 
     #[cfg(target_arch = "x86_64")]
     {
-        if avx2::is_available() {
+        if avx2::is_available() && is_x86_feature_detected!("fma") {
             for (i, vec) in vectors.iter().enumerate() {
                 distances[i] = unsafe { squared_euclidean_avx2(query, vec, query.len()) };
             }
@@ -3946,7 +4216,7 @@ unsafe fn find_first_ge_u32_neon(slice: &[u32], target: u32) -> usize {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2", enable = "sse4.1")]
+#[target_feature(enable = "sse2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn find_first_ge_u32_sse(slice: &[u32], target: u32) -> usize {
     use std::arch::x86_64::*;

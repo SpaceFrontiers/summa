@@ -19,15 +19,22 @@ use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::Schema;
 
-/// Compute per-segment doc ID offsets (each segment's docs start after the previous)
-fn doc_offsets(segments: &[SegmentReader]) -> Vec<u32> {
+/// Compute per-segment doc ID offsets (each segment's docs start after the previous).
+///
+/// Returns an error if the total document count across segments exceeds `u32::MAX`.
+fn doc_offsets(segments: &[SegmentReader]) -> Result<Vec<u32>> {
     let mut offsets = Vec::with_capacity(segments.len());
     let mut acc = 0u32;
     for seg in segments {
         offsets.push(acc);
-        acc += seg.num_docs();
+        acc = acc.checked_add(seg.num_docs()).ok_or_else(|| {
+            crate::Error::Internal(format!(
+                "Total document count across segments exceeds u32::MAX ({})",
+                u32::MAX
+            ))
+        })?;
     }
-    offsets
+    Ok(offsets)
 }
 
 /// Statistics for merge operations
@@ -192,7 +199,15 @@ impl SegmentMerger {
             }
         }
 
-        let total_docs: u32 = segments.iter().map(|s| s.num_docs()).sum();
+        let total_docs: u32 = segments
+            .iter()
+            .try_fold(0u32, |acc, s| acc.checked_add(s.num_docs()))
+            .ok_or_else(|| {
+                crate::Error::Internal(format!(
+                    "Total document count exceeds u32::MAX ({})",
+                    u32::MAX
+                ))
+            })?;
 
         // Verify store doc count matches metadata — a mismatch here means
         // some store blocks were lost (e.g., compression thread panic) or

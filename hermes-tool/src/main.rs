@@ -84,7 +84,7 @@ fn release_memory_to_os() {
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "hermes-tool")]
@@ -93,6 +93,27 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Index optimization mode for balancing compression ratio vs query speed
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OptimizationMode {
+    /// Balanced compression/speed (zstd level 7)
+    Adaptive,
+    /// Best compression ratio (OptP4D + zstd level 22)
+    Size,
+    /// Fastest queries (Roaring + zstd level 3)
+    Performance,
+}
+
+impl OptimizationMode {
+    fn to_index_optimization(self) -> hermes_core::structures::IndexOptimization {
+        match self {
+            Self::Adaptive => hermes_core::structures::IndexOptimization::Adaptive,
+            Self::Size => hermes_core::structures::IndexOptimization::SizeOptimized,
+            Self::Performance => hermes_core::structures::IndexOptimization::PerformanceOptimized,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -138,7 +159,7 @@ enum Commands {
         #[arg(short, long, default_value = "100000")]
         progress: usize,
 
-        /// Max indexing memory in MB before auto-flush (default: 256)
+        /// Max indexing memory in MB before auto-flush (default: 3072)
         #[arg(short = 'm', long, default_value = "3072")]
         max_indexing_memory_mb: usize,
 
@@ -150,12 +171,12 @@ enum Commands {
         #[arg(short = 'c', long)]
         compression_threads: Option<usize>,
 
-        /// Index optimization mode: adaptive (default), size, performance
+        /// Index optimization mode
         /// - adaptive: balanced compression/speed (zstd level 7)
         /// - size: best compression ratio (OptP4D + zstd level 22)
         /// - performance: fastest queries (Roaring + zstd level 3)
         #[arg(short = 'O', long, default_value = "adaptive")]
-        optimization: String,
+        optimization: OptimizationMode,
     },
 
     /// Commit pending changes
@@ -177,6 +198,25 @@ enum Commands {
         /// Path to the index directory
         #[arg(short, long)]
         index: PathBuf,
+    },
+
+    /// Search an index with a query string
+    Search {
+        /// Path to the index directory
+        #[arg(short, long)]
+        index: PathBuf,
+
+        /// Query string (e.g. "rust", "title:rust", "rust AND search")
+        #[arg(short, long)]
+        query: String,
+
+        /// Number of results to return
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Offset for pagination
+        #[arg(short, long, default_value = "0")]
+        offset: usize,
     },
 
     /// Warm up slice cache and save to file
@@ -348,7 +388,7 @@ async fn main() -> Result<()> {
                 max_indexing_memory_mb,
                 indexing_threads,
                 compression_threads,
-                optimization,
+                optimization.to_index_optimization(),
             )
             .await?;
         }
@@ -360,6 +400,14 @@ async fn main() -> Result<()> {
         }
         Commands::Info { index } => {
             index_ops::show_info(index).await?;
+        }
+        Commands::Search {
+            index,
+            query,
+            limit,
+            offset,
+        } => {
+            index_ops::search_index(index, &query, limit, offset).await?;
         }
         Commands::Warmup { index, cache_size } => {
             index_ops::warmup_cache(index, cache_size).await?;

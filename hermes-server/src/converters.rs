@@ -163,20 +163,22 @@ pub fn convert_query(
                                 .zip(idf_weights.iter())
                                 .map(|((_, count), idf)| *count as f32 * idf)
                                 .collect();
-                            let paired: Vec<_> = token_ids
-                                .iter()
-                                .zip(final_weights.iter())
-                                .map(|(id, w)| {
-                                    let tok = tokenizer.id_to_token(*id).unwrap_or_default();
-                                    format!("({:?},{},{:.4})", tok, id, w)
-                                })
-                                .collect();
-                            debug!(
-                                "Sparse IDF (global stats): field={}, total_docs={}, tokens=[{}]",
-                                sv_query.field,
-                                stats.total_docs(),
-                                paired.join(", "),
-                            );
+                            if log::log_enabled!(log::Level::Debug) {
+                                let paired: Vec<_> = token_ids
+                                    .iter()
+                                    .zip(final_weights.iter())
+                                    .map(|(id, w)| {
+                                        let tok = tokenizer.id_to_token(*id).unwrap_or_default();
+                                        format!("({:?},{},{:.4})", tok, id, w)
+                                    })
+                                    .collect();
+                                debug!(
+                                    "Sparse IDF (global stats): field={}, total_docs={}, tokens=[{}]",
+                                    sv_query.field,
+                                    stats.total_docs(),
+                                    paired.join(", "),
+                                );
+                            }
                             final_weights
                         } else {
                             warn!(
@@ -198,19 +200,21 @@ pub fn convert_query(
                                 .iter()
                                 .map(|&(id, count)| count as f32 * idf_weights.get(id))
                                 .collect();
-                            let paired: Vec<_> = token_ids
-                                .iter()
-                                .zip(weights.iter())
-                                .map(|(id, w)| {
-                                    let tok = tokenizer.id_to_token(*id).unwrap_or_default();
-                                    format!("({:?},{},{:.4})", tok, id, w)
-                                })
-                                .collect();
-                            debug!(
-                                "Sparse IDF (idf.json): tokenizer={}, tokens=[{}]",
-                                tokenizer_name,
-                                paired.join(", "),
-                            );
+                            if log::log_enabled!(log::Level::Debug) {
+                                let paired: Vec<_> = token_ids
+                                    .iter()
+                                    .zip(weights.iter())
+                                    .map(|(id, w)| {
+                                        let tok = tokenizer.id_to_token(*id).unwrap_or_default();
+                                        format!("({:?},{},{:.4})", tok, id, w)
+                                    })
+                                    .collect();
+                                debug!(
+                                    "Sparse IDF (idf.json): tokenizer={}, tokens=[{}]",
+                                    tokenizer_name,
+                                    paired.join(", "),
+                                );
+                            }
                             weights
                         } else {
                             warn!(

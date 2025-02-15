@@ -66,7 +66,7 @@ impl MultiValueCombiner {
             MultiValueCombiner::Max => scores
                 .iter()
                 .map(|(_, s)| *s)
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.total_cmp(b))
                 .unwrap_or(0.0),
             MultiValueCombiner::Avg => {
                 let sum: f32 = scores.iter().map(|(_, s)| s).sum();
@@ -79,7 +79,7 @@ impl MultiValueCombiner {
                 let max_score = scores
                     .iter()
                     .map(|(_, s)| *s)
-                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .max_by(|a, b| a.total_cmp(b))
                     .unwrap_or(0.0);
 
                 let sum_exp: f32 = scores
@@ -92,7 +92,7 @@ impl MultiValueCombiner {
             MultiValueCombiner::WeightedTopK { k, decay } => {
                 // Sort scores descending and take top k
                 let mut sorted: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
-                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                sorted.sort_by(|a, b| b.total_cmp(a));
                 sorted.truncate(*k);
 
                 // Apply exponential decay weights
