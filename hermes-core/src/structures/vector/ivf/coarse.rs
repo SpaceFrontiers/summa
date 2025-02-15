@@ -230,8 +230,12 @@ impl CoarseCentroids {
             })
             .collect();
 
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        distances.truncate(k);
+        // Partial sort: O(n + k log k) instead of O(n log n)
+        if distances.len() > k {
+            distances.select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            distances.truncate(k);
+        }
+        distances.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         distances.into_iter().map(|(c, _)| c).collect()
     }
 
@@ -249,8 +253,12 @@ impl CoarseCentroids {
             })
             .collect();
 
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        distances.truncate(k);
+        // Partial sort: O(n + k log k) instead of O(n log n)
+        if distances.len() > k {
+            distances.select_nth_unstable_by(k, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            distances.truncate(k);
+        }
+        distances.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         distances
     }
 
@@ -306,8 +314,12 @@ impl CoarseCentroids {
             })
             .collect();
 
-        // Sort by orthogonality (smallest dot product first)
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // Partial sort by orthogonality (smallest dot product first)
+        let take = config.num_secondary.min(candidates.len());
+        if candidates.len() > take {
+            candidates.select_nth_unstable_by(take, |a, b| a.1.partial_cmp(&b.1).unwrap());
+            candidates.truncate(take);
+        }
 
         MultiAssignment {
             primary_cluster: primary,

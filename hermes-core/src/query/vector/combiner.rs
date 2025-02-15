@@ -92,7 +92,7 @@ impl MultiValueCombiner {
             MultiValueCombiner::WeightedTopK { k, decay } => {
                 // Sort scores descending and take top k
                 let mut sorted: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
-                sorted.sort_by(|a, b| b.total_cmp(a));
+                sorted.sort_unstable_by(|a, b| b.total_cmp(a));
                 sorted.truncate(*k);
 
                 // Apply exponential decay weights

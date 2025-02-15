@@ -658,12 +658,10 @@ impl<'a> PositionPostingIterator<'a> {
         if let Some((_, last, _)) = self.list.skip_list.get(self.current_block)
             && target <= *last
         {
-            // Target might be in current block, scan forward
-            while self.position_in_block < self.block_count
-                && self.block_doc_ids[self.position_in_block] < target
-            {
-                self.position_in_block += 1;
-            }
+            // SIMD-accelerated scan within block
+            let remaining = &self.block_doc_ids[self.position_in_block..self.block_count];
+            let offset = crate::structures::simd::find_first_ge_u32(remaining, target);
+            self.position_in_block += offset;
             if self.position_in_block >= self.block_count {
                 self.load_block(self.current_block + 1);
                 self.seek(target); // Continue seeking in next block
@@ -692,12 +690,10 @@ impl<'a> PositionPostingIterator<'a> {
 
         self.load_block(block_idx);
 
-        // Linear scan within block
-        while self.position_in_block < self.block_count
-            && self.block_doc_ids[self.position_in_block] < target
-        {
-            self.position_in_block += 1;
-        }
+        // SIMD-accelerated scan within block
+        let remaining = &self.block_doc_ids[self.position_in_block..self.block_count];
+        let offset = crate::structures::simd::find_first_ge_u32(remaining, target);
+        self.position_in_block += offset;
 
         if self.position_in_block >= self.block_count {
             self.load_block(self.current_block + 1);

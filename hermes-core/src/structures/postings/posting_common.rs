@@ -133,11 +133,17 @@ impl SkipList {
         self.entries.get(index)
     }
 
-    /// Find block index containing doc_id >= target
+    /// Find block index containing doc_id >= target.
+    /// Uses binary search on monotonically increasing `last_doc` values.
     ///
     /// Returns None if target is beyond all blocks.
     pub fn find_block(&self, target: DocId) -> Option<usize> {
-        self.entries.iter().position(|e| e.last_doc >= target)
+        let idx = self.entries.partition_point(|e| e.last_doc < target);
+        if idx < self.entries.len() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     /// Iterate over entries

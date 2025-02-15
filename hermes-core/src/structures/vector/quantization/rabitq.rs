@@ -138,22 +138,22 @@ impl RaBitQCodebook {
     pub fn encode(&self, vector: &[f32], centroid: Option<&[f32]>) -> QuantizedVector {
         let dim = self.config.dim;
 
-        // Step 1: Subtract centroid (if provided) and compute norm
-        let centered: Vec<f32> = if let Some(c) = centroid {
+        // Step 1: Center + normalize in-place (single allocation instead of two)
+        let mut normalized: Vec<f32> = if let Some(c) = centroid {
             vector.iter().zip(c).map(|(&v, &c)| v - c).collect()
         } else {
             vector.to_vec()
         };
 
-        let norm: f32 = centered.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
         let dist_to_centroid = norm;
 
-        // Normalize (handle zero vector)
-        let normalized: Vec<f32> = if norm > 1e-10 {
-            centered.iter().map(|x| x / norm).collect()
-        } else {
-            centered
-        };
+        if norm > 1e-10 {
+            let inv_norm = 1.0 / norm;
+            for x in normalized.iter_mut() {
+                *x *= inv_norm;
+            }
+        }
 
         // Step 2: Apply random transform (sign flip + permutation)
         let transformed: Vec<f32> = (0..dim)
@@ -199,22 +199,22 @@ impl RaBitQCodebook {
     pub fn prepare_query(&self, query: &[f32], centroid: Option<&[f32]>) -> QuantizedQuery {
         let dim = self.config.dim;
 
-        // Step 1: Subtract centroid (if provided) and compute norm
-        let centered: Vec<f32> = if let Some(c) = centroid {
+        // Step 1: Center + normalize in-place (single allocation instead of two)
+        let mut normalized: Vec<f32> = if let Some(c) = centroid {
             query.iter().zip(c).map(|(&v, &c)| v - c).collect()
         } else {
             query.to_vec()
         };
 
-        let norm: f32 = centered.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
         let dist_to_centroid = norm;
 
-        // Normalize
-        let normalized: Vec<f32> = if norm > 1e-10 {
-            centered.iter().map(|x| x / norm).collect()
-        } else {
-            centered
-        };
+        if norm > 1e-10 {
+            let inv_norm = 1.0 / norm;
+            for x in normalized.iter_mut() {
+                *x *= inv_norm;
+            }
+        }
 
         // Step 2: Apply random transform
         let transformed: Vec<f32> = (0..dim)

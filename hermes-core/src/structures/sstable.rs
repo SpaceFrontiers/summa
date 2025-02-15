@@ -1412,10 +1412,15 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             let common_prefix_len = read_vint(&mut reader)? as usize;
             let suffix_len = read_vint(&mut reader)? as usize;
 
+            if suffix_len > reader.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SSTable block suffix truncated",
+                ));
+            }
             current_key.truncate(common_prefix_len);
-            let mut suffix = vec![0u8; suffix_len];
-            reader.read_exact(&mut suffix)?;
-            current_key.extend_from_slice(&suffix);
+            current_key.extend_from_slice(&reader[..suffix_len]);
+            reader = &reader[suffix_len..];
 
             let value = V::deserialize(&mut reader)?;
 
@@ -1462,10 +1467,15 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 let common_prefix_len = read_vint(&mut reader)? as usize;
                 let suffix_len = read_vint(&mut reader)? as usize;
 
+                if suffix_len > reader.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SSTable block suffix truncated",
+                    ));
+                }
                 current_key.truncate(common_prefix_len);
-                let mut suffix = vec![0u8; suffix_len];
-                reader.read_exact(&mut suffix)?;
-                current_key.extend_from_slice(&suffix);
+                current_key.extend_from_slice(&reader[..suffix_len]);
+                reader = &reader[suffix_len..];
 
                 let value = V::deserialize(&mut reader)?;
                 results.push((current_key.clone(), value));
@@ -1536,10 +1546,15 @@ impl<'a, V: SSTableValue> AsyncSSTableIterator<'a, V> {
             let common_prefix_len = read_vint(&mut reader)? as usize;
             let suffix_len = read_vint(&mut reader)? as usize;
 
+            if suffix_len > reader.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SSTable block suffix truncated",
+                ));
+            }
             self.current_key.truncate(common_prefix_len);
-            let mut suffix = vec![0u8; suffix_len];
-            reader.read_exact(&mut suffix)?;
-            self.current_key.extend_from_slice(&suffix);
+            self.current_key.extend_from_slice(&reader[..suffix_len]);
+            reader = &reader[suffix_len..];
 
             let value = V::deserialize(&mut reader)?;
 

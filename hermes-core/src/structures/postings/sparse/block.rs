@@ -1041,21 +1041,30 @@ fn encode_weights(weights: &[f32], quant: WeightQuantization) -> io::Result<Vec<
 }
 
 fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out: &mut Vec<f32>) {
-    let mut cursor = Cursor::new(data);
     match quant {
         WeightQuantization::Float32 => {
-            for _ in 0..count {
-                out.push(cursor.read_f32::<LittleEndian>().unwrap_or(0.0));
+            out.reserve(count);
+            for chunk in data[..count * 4].chunks_exact(4) {
+                out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
         }
         WeightQuantization::Float16 => {
+            // Bulk convert: read u16 bits → f16 → batch convert_to_f32_slice
+            // Uses SIMD F16C on x86_64 when available (half 2.x auto-detects)
             use half::f16;
-            for _ in 0..count {
-                let bits = cursor.read_u16::<LittleEndian>().unwrap_or(0);
-                out.push(f16::from_bits(bits).to_f32());
+            use half::slice::HalfFloatSliceExt;
+            let byte_count = count * 2;
+            let src = &data[..byte_count];
+            let mut f16_buf: Vec<f16> = Vec::with_capacity(count);
+            for chunk in src.chunks_exact(2) {
+                f16_buf.push(f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])));
             }
+            let start = out.len();
+            out.resize(start + count, 0.0);
+            f16_buf.convert_to_f32_slice(&mut out[start..start + count]);
         }
         WeightQuantization::UInt8 => {
+            let mut cursor = Cursor::new(data);
             let scale = cursor.read_f32::<LittleEndian>().unwrap_or(1.0);
             let min_val = cursor.read_f32::<LittleEndian>().unwrap_or(0.0);
             let offset = cursor.position() as usize;
@@ -1063,6 +1072,7 @@ fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out
             simd::dequantize_uint8(&data[offset..], out, scale, min_val, count);
         }
         WeightQuantization::UInt4 => {
+            let mut cursor = Cursor::new(data);
             let scale = cursor.read_f32::<LittleEndian>().unwrap_or(1.0);
             let min = cursor.read_f32::<LittleEndian>().unwrap_or(0.0);
             let mut i = 0;

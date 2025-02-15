@@ -125,7 +125,7 @@ fn score_document(
     let combined = config.combiner.combine(&values);
 
     // Sort ordinals by score descending (best chunk first)
-    values.sort_by(|a, b| b.1.total_cmp(&a.1));
+    values.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     let positions: Vec<ScoredPosition> = values
         .into_iter()
         .map(|(ordinal, score)| ScoredPosition::new(ordinal, score))
@@ -432,6 +432,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     all_scores.sort_unstable_by_key(|&(ci, _, _)| ci);
 
     let mut scored: Vec<SearchResult> = Vec::with_capacity(candidates.len().min(final_limit * 2));
+    let mut ordinal_pairs: Vec<(u32, f32)> = Vec::new();
     let mut i = 0;
     while i < all_scores.len() {
         let ci = all_scores[i].0;
@@ -441,8 +442,9 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         }
         let run = &mut all_scores[run_start..i];
 
-        // Build (ordinal, score) slice for combiner
-        let ordinal_pairs: Vec<(u32, f32)> = run.iter().map(|&(_, ord, s)| (ord, s)).collect();
+        // Build (ordinal, score) slice for combiner (reuses hoisted buffer)
+        ordinal_pairs.clear();
+        ordinal_pairs.extend(run.iter().map(|&(_, ord, s)| (ord, s)));
         let combined = config.combiner.combine(&ordinal_pairs);
 
         // Sort positions by score descending (best chunk first)
@@ -460,7 +462,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
         });
     }
 
-    scored.sort_by(|a, b| {
+    scored.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)

@@ -168,9 +168,12 @@ impl IVFRaBitQIndex {
             }
         }
 
-        // Sort by distance and truncate
-        candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-        candidates.truncate(k);
+        // Partial sort: O(n + k log k) instead of O(n log n)
+        if candidates.len() > k {
+            candidates.select_nth_unstable_by(k, |a, b| a.2.partial_cmp(&b.2).unwrap());
+            candidates.truncate(k);
+        }
+        candidates.sort_unstable_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
         candidates
     }
 

@@ -51,8 +51,8 @@ pub(super) fn validate_merge_source(
 
         // Check contiguity: offset[i] + length[i] == offset[i+1]
         if i + 1 < raw.skip_entries.len() {
-            let expected_next = entry.offset + entry.length as u64;
-            let actual_next = raw.skip_entries[i + 1].offset;
+            let _expected_next = entry.offset + entry.length as u64;
+            let _actual_next = raw.skip_entries[i + 1].offset;
         }
     }
     Ok(())

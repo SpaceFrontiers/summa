@@ -811,8 +811,11 @@ impl SegmentReader {
                 );
             }
 
-            results.sort_by(|a, b| b.2.total_cmp(&a.2));
-            results.truncate(fetch_k);
+            if results.len() > fetch_k {
+                results.select_nth_unstable_by(fetch_k, |a, b| b.2.total_cmp(&a.2));
+                results.truncate(fetch_k);
+            }
+            results.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
             log::debug!(
                 "[search_dense] field {}: rerank total={:.1}ms",
                 field.0,
@@ -1158,8 +1161,11 @@ impl SegmentReader {
                 }
             }
 
-            results.sort_by(|a, b| b.2.total_cmp(&a.2));
-            results.truncate(fetch_k);
+            if results.len() > fetch_k {
+                results.select_nth_unstable_by(fetch_k, |a, b| b.2.total_cmp(&a.2));
+                results.truncate(fetch_k);
+            }
+            results.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
         }
 
         Ok(combine_ordinal_results(results, combiner, k))

@@ -188,13 +188,15 @@ const L1_SIZE: usize = 4;
 const FOOTER_SIZE: usize = 24;
 
 /// Read a compact L0 entry from raw bytes at the given index.
+///
+/// Uses a single bounds check (`[..L0_SIZE]`) instead of 4× `try_into().unwrap()`.
 #[inline]
 fn read_l0(bytes: &[u8], idx: usize) -> (u32, u32, u32, f32) {
-    let p = idx * L0_SIZE;
-    let first_doc = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
-    let last_doc = u32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap());
-    let offset = u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap());
-    let max_weight = f32::from_le_bytes(bytes[p + 12..p + 16].try_into().unwrap());
+    let b = &bytes[idx * L0_SIZE..][..L0_SIZE];
+    let first_doc = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let last_doc = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    let offset = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+    let max_weight = f32::from_le_bytes([b[12], b[13], b[14], b[15]]);
     (first_doc, last_doc, offset, max_weight)
 }
 

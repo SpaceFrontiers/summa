@@ -250,7 +250,7 @@ impl TopKCollector {
 
     pub fn into_sorted_results(self) -> Vec<SearchResult> {
         let mut results: Vec<_> = self.heap.into_vec();
-        results.sort_by(|a, b| {
+        results.sort_unstable_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(Ordering::Equal)

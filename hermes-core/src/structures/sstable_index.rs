@@ -41,11 +41,11 @@ impl BlockAddr {
 /// stores lengths directly (typically similar sizes).
 #[derive(Debug)]
 pub struct BlockAddrStore {
-    data: OwnedBytes,
     num_blocks: u32,
     offset_bits: u8,
     length_bits: u8,
-    header_size: usize,
+    /// Eagerly decoded addresses for O(1) random access
+    addrs: Vec<BlockAddr>,
 }
 
 impl BlockAddrStore {
@@ -107,7 +107,7 @@ impl BlockAddrStore {
         Ok(buf)
     }
 
-    /// Load from raw bytes (zero-copy if mmap'd)
+    /// Load from raw bytes — eagerly decodes all addresses for O(1) access
     pub fn load(data: OwnedBytes) -> io::Result<Self> {
         if data.len() < 6 {
             return Err(io::Error::new(
@@ -121,12 +121,30 @@ impl BlockAddrStore {
         let offset_bits = reader.read_u8()?;
         let length_bits = reader.read_u8()?;
 
+        // Eagerly decode all block addresses once at load time
+        let packed_data = &data.as_slice()[6..];
+        let mut bit_reader = BitReader::new(packed_data);
+        let mut addrs = Vec::with_capacity(num_blocks as usize);
+        let mut current_offset: u64 = 0;
+
+        for _ in 0..num_blocks {
+            if let (Ok(delta), Ok(length)) =
+                (bit_reader.read(offset_bits), bit_reader.read(length_bits))
+            {
+                current_offset += delta;
+                addrs.push(BlockAddr {
+                    offset: current_offset,
+                    length: length as u32,
+                });
+                current_offset += length;
+            }
+        }
+
         Ok(Self {
-            data,
             num_blocks,
             offset_bits,
             length_bits,
-            header_size: 6,
+            addrs,
         })
     }
 
@@ -140,59 +158,15 @@ impl BlockAddrStore {
         self.num_blocks == 0
     }
 
-    /// Get block address by index (decodes on-demand)
+    /// Get block address by index — O(1) from eagerly decoded array
+    #[inline]
     pub fn get(&self, idx: usize) -> Option<BlockAddr> {
-        if idx >= self.num_blocks as usize {
-            return None;
-        }
-
-        let packed_data = &self.data.as_slice()[self.header_size..];
-
-        // We need to decode from the start to accumulate offsets
-        let mut bit_reader = BitReader::new(packed_data);
-        let mut current_offset: u64 = 0;
-
-        for i in 0..=idx {
-            let delta = bit_reader.read(self.offset_bits).ok()?;
-            let length = bit_reader.read(self.length_bits).ok()? as u32;
-
-            current_offset += delta;
-
-            if i == idx {
-                return Some(BlockAddr {
-                    offset: current_offset,
-                    length,
-                });
-            }
-
-            current_offset += length as u64;
-        }
-
-        None
+        self.addrs.get(idx).copied()
     }
 
-    /// Get all block addresses (for iteration)
+    /// Get all block addresses
     pub fn all(&self) -> Vec<BlockAddr> {
-        let mut result = Vec::with_capacity(self.num_blocks as usize);
-        let packed_data = &self.data.as_slice()[self.header_size..];
-        let mut bit_reader = BitReader::new(packed_data);
-        let mut current_offset: u64 = 0;
-
-        for _ in 0..self.num_blocks {
-            if let (Ok(delta), Ok(length)) = (
-                bit_reader.read(self.offset_bits),
-                bit_reader.read(self.length_bits),
-            ) {
-                current_offset += delta;
-                result.push(BlockAddr {
-                    offset: current_offset,
-                    length: length as u32,
-                });
-                current_offset += length;
-            }
-        }
-
-        result
+        self.addrs.clone()
     }
 }
 
@@ -265,29 +239,26 @@ impl FstBlockIndex {
     }
 
     /// Look up the block index for a key
-    /// Returns the block ordinal that could contain this key
+    /// Returns the block ordinal that could contain this key.
+    /// O(key_len) via FST exact lookup + single stream step.
     pub fn locate(&self, key: &[u8]) -> Option<usize> {
-        // FST gives us the block whose first_key <= key
-        // We need to find the largest key <= target
-        use fst::{IntoStreamer, Streamer};
-
-        let mut stream = self.fst.range().ge(key).into_stream();
-
-        // If exact match, return that block
-        if let Some((found_key, ordinal)) = stream.next()
-            && found_key == key
-        {
+        // Fast exact match — O(key_len), no stream allocation
+        if let Some(ordinal) = self.fst.get(key) {
             return Some(ordinal as usize);
         }
 
-        // Otherwise, find the block before (largest key < target)
-        let mut stream = self.fst.range().lt(key).into_stream();
-        let mut last_ordinal = None;
-        while let Some((_, ordinal)) = stream.next() {
-            last_ordinal = Some(ordinal as usize);
+        // Find the first block whose first_key > target (single stream step)
+        use fst::{IntoStreamer, Streamer};
+        let mut stream = self.fst.range().gt(key).into_stream();
+        match stream.next() {
+            Some((_, ordinal)) if ordinal > 0 => Some(ordinal as usize - 1),
+            Some(_) => None, // key < first block's first key
+            None => {
+                // No key > target → target is after all keys; use last block
+                let len = self.fst.len();
+                if len > 0 { Some(len - 1) } else { None }
+            }
         }
-
-        last_ordinal
     }
 
     /// Get block address by ordinal

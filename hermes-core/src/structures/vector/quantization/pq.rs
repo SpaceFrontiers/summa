@@ -480,13 +480,15 @@ impl PQCodebook {
         reconstructed
     }
 
-    /// Apply rotation matrix to vector
+    /// Apply rotation matrix to vector (SIMD-accelerated dot product per row)
     fn apply_rotation(rotation: &[f32], vector: &[f32], dim: usize) -> Vec<f32> {
         let mut result = vec![0.0f32; dim];
         for i in 0..dim {
-            for j in 0..dim {
-                result[i] += rotation[i * dim + j] * vector[j];
-            }
+            result[i] = crate::structures::simd::dot_product_f32(
+                &rotation[i * dim..(i + 1) * dim],
+                vector,
+                dim,
+            );
         }
         result
     }

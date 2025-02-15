@@ -151,14 +151,15 @@ impl ScoreCollector {
 
     /// Convert to sorted top-k results (descending by score)
     pub fn into_sorted_results(self) -> Vec<(DocId, f32, u16)> {
-        let heap_vec = self.heap.into_vec();
-        let mut results: Vec<(DocId, f32, u16)> = Vec::with_capacity(heap_vec.len());
-        for e in heap_vec {
-            results.push((e.doc_id, e.score, e.ordinal));
-        }
+        let mut results: Vec<(DocId, f32, u16)> = self
+            .heap
+            .into_vec()
+            .into_iter()
+            .map(|e| (e.doc_id, e.score, e.ordinal))
+            .collect();
 
         // Sort by score descending, then doc_id ascending
-        results.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
         results
     }
