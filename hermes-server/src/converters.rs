@@ -193,7 +193,7 @@ pub fn convert_query(
                         }
                     }
                     QueryWeighting::IdfFile => {
-                        // Use pre-computed IDF from model's idf.json (no global stats fallback)
+                        // Use pre-computed IDF from model's idf.json
                         let precomputed =
                             idf_weights_cache().get_or_load(tokenizer_name, idf_cache_dir);
 
@@ -218,10 +218,24 @@ pub fn convert_query(
                                 );
                             }
                             weights
+                        } else if let Some(stats) = global_stats {
+                            // Fallback: use index-derived IDF from global stats.
+                            // Without IDF weighting, all query dimensions get equal weight,
+                            // which disables MaxScore pruning and causes full posting list scans.
+                            warn!(
+                                "Sparse IdfFile: no idf.json for model '{}', field={}, falling back to index-derived IDF",
+                                tokenizer_name, sv_query.field,
+                            );
+                            let idf_weights = stats.sparse_idf_weights(field, &token_ids);
+                            token_counts
+                                .iter()
+                                .zip(idf_weights.iter())
+                                .map(|((_, count), idf)| *count as f32 * idf)
+                                .collect()
                         } else {
                             warn!(
-                                "Sparse IdfFile: no idf.json available for model '{}', field={}, falling back to count",
-                                tokenizer_name, sv_query.field,
+                                "Sparse IdfFile: no idf.json and no global stats for field={}, falling back to count",
+                                sv_query.field,
                             );
                             token_counts
                                 .iter()

@@ -29,6 +29,8 @@ pub struct LazyGlobalStats {
     total_docs: u64,
     /// Cached sparse IDF values: field_id -> (dim_id -> idf)
     sparse_idf_cache: RwLock<FxHashMap<u32, FxHashMap<u32, f32>>>,
+    /// Cached total_vectors per sparse field (computed once per field, not per dim)
+    sparse_total_vectors_cache: RwLock<FxHashMap<u32, u64>>,
     /// Cached text IDF values: field_id -> (term -> idf)
     text_idf_cache: RwLock<FxHashMap<u32, FxHashMap<String, f32>>>,
     /// Cached average field lengths: field_id -> avg_len
@@ -43,6 +45,7 @@ impl LazyGlobalStats {
             segments,
             total_docs,
             sparse_idf_cache: RwLock::new(FxHashMap::default()),
+            sparse_total_vectors_cache: RwLock::new(FxHashMap::default()),
             text_idf_cache: RwLock::new(FxHashMap::default()),
             avg_field_len_cache: RwLock::new(FxHashMap::default()),
         }
@@ -70,11 +73,7 @@ impl LazyGlobalStats {
 
         // Slow path: compute and cache
         let df = self.compute_sparse_df(field, dim_id);
-        // N = total unique documents. doc_count per dimension counts unique
-        // documents (not ordinals), so df <= total_docs is always true.
-        // total_vectors is a safety bound (currently equals total_docs).
-        let total_vectors = self.compute_sparse_total_vectors(field);
-        let n = total_vectors.max(self.total_docs);
+        let n = self.cached_sparse_n(field);
         let idf = if df > 0 && n > 0 {
             (n as f32 / df as f32).ln().max(0.0)
         } else {
@@ -91,8 +90,75 @@ impl LazyGlobalStats {
     }
 
     /// Compute IDF weights for multiple sparse dimensions (batch, uses cache)
+    ///
+    /// More efficient than calling `sparse_idf()` per dimension: resolves
+    /// total_vectors once and acquires write lock once for all cache misses.
     pub fn sparse_idf_weights(&self, field: Field, dim_ids: &[u32]) -> Vec<f32> {
-        dim_ids.iter().map(|&d| self.sparse_idf(field, d)).collect()
+        // Fast path: check how many are already cached
+        let mut result = vec![0.0f32; dim_ids.len()];
+        let mut misses: Vec<usize> = Vec::new();
+        {
+            let cache = self.sparse_idf_cache.read();
+            if let Some(field_cache) = cache.get(&field.0) {
+                for (i, &dim_id) in dim_ids.iter().enumerate() {
+                    if let Some(&idf) = field_cache.get(&dim_id) {
+                        result[i] = idf;
+                    } else {
+                        misses.push(i);
+                    }
+                }
+            } else {
+                misses.extend(0..dim_ids.len());
+            }
+        }
+
+        if misses.is_empty() {
+            return result;
+        }
+
+        // Compute N once for all misses (was previously per-dimension)
+        let n = self.cached_sparse_n(field);
+
+        // Compute missing IDF values
+        let mut new_entries: Vec<(u32, f32)> = Vec::with_capacity(misses.len());
+        for &i in &misses {
+            let dim_id = dim_ids[i];
+            let df = self.compute_sparse_df(field, dim_id);
+            let idf = if df > 0 && n > 0 {
+                (n as f32 / df as f32).ln().max(0.0)
+            } else {
+                0.0
+            };
+            result[i] = idf;
+            new_entries.push((dim_id, idf));
+        }
+
+        // Batch-insert into cache with single write lock
+        {
+            let mut cache = self.sparse_idf_cache.write();
+            let field_cache = cache.entry(field.0).or_default();
+            for (dim_id, idf) in new_entries {
+                field_cache.insert(dim_id, idf);
+            }
+        }
+
+        result
+    }
+
+    /// Get cached N = max(total_vectors, total_docs) for a sparse field.
+    /// Computed once per field and cached.
+    fn cached_sparse_n(&self, field: Field) -> u64 {
+        // Fast path
+        {
+            let cache = self.sparse_total_vectors_cache.read();
+            if let Some(&tv) = cache.get(&field.0) {
+                return tv.max(self.total_docs);
+            }
+        }
+        // Slow path: compute and cache
+        let tv = self.compute_sparse_total_vectors(field);
+        self.sparse_total_vectors_cache.write().insert(field.0, tv);
+        tv.max(self.total_docs)
     }
 
     /// Get or compute IDF for a full-text term (lazy + cached)
