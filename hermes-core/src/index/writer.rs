@@ -650,7 +650,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ///
     /// Guarantees all prior `add_document` calls are committed.
     /// Vector training is decoupled — call `build_vector_index()` manually.
-    pub async fn commit(&mut self) -> Result<()> {
+    pub async fn commit(&mut self) -> Result<bool> {
         self.prepare_commit().await?.commit().await
     }
 
@@ -722,9 +722,19 @@ pub struct PreparedCommit<'a, D: DirectoryWriter + 'static> {
 
 impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
     /// Finalize: register segments in metadata, evaluate merge policy, resume workers.
-    pub async fn commit(mut self) -> Result<()> {
+    ///
+    /// Returns `true` if new segments were committed, `false` if nothing changed.
+    pub async fn commit(mut self) -> Result<bool> {
         self.is_resolved = true;
         let segments = std::mem::take(&mut self.writer.flushed_segments);
+
+        // Fast path: nothing to commit
+        if segments.is_empty() {
+            log::debug!("[commit] no segments to commit, skipping");
+            self.writer.resume_workers();
+            return Ok(false);
+        }
+
         self.writer.segment_manager.commit(segments).await?;
 
         // Refresh primary key index with new committed readers (parallel open)
@@ -751,7 +761,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
 
         self.writer.segment_manager.maybe_merge().await;
         self.writer.resume_workers();
-        Ok(())
+        Ok(true)
     }
 
     /// Abort: discard prepared segments, resume workers.

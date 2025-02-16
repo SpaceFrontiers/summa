@@ -270,7 +270,7 @@ impl IndexService for IndexServiceImpl {
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
 
-        writer
+        let changed = writer
             .write()
             .await
             .commit()
@@ -284,16 +284,18 @@ impl IndexService for IndexServiceImpl {
             .reader()
             .await
             .map_err(crate::error::hermes_error_to_status)?;
-        reader
-            .reload()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
+        if changed {
+            reader
+                .reload()
+                .await
+                .map_err(crate::error::hermes_error_to_status)?;
+        }
         let searcher = reader
             .searcher()
             .await
             .map_err(crate::error::hermes_error_to_status)?;
 
-        info!("Committed: {}", req.index_name);
+        info!("Committed: {} (changed={})", req.index_name, changed);
 
         Ok(Response::new(CommitResponse {
             success: true,

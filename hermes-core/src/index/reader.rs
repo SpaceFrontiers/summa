@@ -182,7 +182,19 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             tokio::task::yield_now().await;
         }
         let new_segment_ids = self.segment_manager.get_segment_ids().await;
-        let result = self.reload_with_segments(new_segment_ids).await;
+
+        // Fast path: skip reload if segments haven't changed
+        let segments_changed = {
+            let state = self.state.load();
+            state.segment_ids != new_segment_ids
+        };
+
+        let result = if segments_changed {
+            self.reload_with_segments(new_segment_ids).await
+        } else {
+            log::debug!("[reload] segments unchanged, skipping");
+            Ok(())
+        };
         self.reloading.store(false, Ordering::Release);
         result
     }
