@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use log::debug;
+use log::{debug, warn};
 
 use crate::DocId;
 
@@ -674,6 +674,7 @@ macro_rules! bms_execute_loop {
         let mut blocks_skipped = 0u64;
         let mut conjunction_skipped = 0u64;
         let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
+        let _bms_start = std::time::Instant::now();
 
         loop {
             let partition = $self.find_partition();
@@ -866,15 +867,31 @@ macro_rules! bms_execute_loop {
             })
             .collect();
 
-        debug!(
-            "MaxScoreExecutor: scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
-            docs_scored,
-            docs_skipped,
-            blocks_skipped,
-            conjunction_skipped,
-            results.len(),
-            results.first().map(|r| r.score).unwrap_or(0.0)
-        );
+        let _bms_elapsed_ms = _bms_start.elapsed().as_millis() as u64;
+        if _bms_elapsed_ms > 500 {
+            warn!(
+                "slow MaxScore: {}ms, cursors={}, scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
+                _bms_elapsed_ms,
+                n,
+                docs_scored,
+                docs_skipped,
+                blocks_skipped,
+                conjunction_skipped,
+                results.len(),
+                results.first().map(|r| r.score).unwrap_or(0.0)
+            );
+        } else {
+            debug!(
+                "MaxScoreExecutor: {}ms, scored={}, skipped={}, blocks_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
+                _bms_elapsed_ms,
+                docs_scored,
+                docs_skipped,
+                blocks_skipped,
+                conjunction_skipped,
+                results.len(),
+                results.first().map(|r| r.score).unwrap_or(0.0)
+            );
+        }
 
         Ok(results)
     }};

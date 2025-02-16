@@ -46,9 +46,10 @@ impl SearchService for SearchServiceImpl {
         )
         .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
 
-        log::debug!(
-            "search query: index={}, query={}",
+        log::info!(
+            "search: index={}, limit={}, query={}",
             req.index_name,
+            req.limit,
             core_query
         );
 
@@ -188,6 +189,20 @@ impl SearchService for SearchServiceImpl {
 
         let total_us = start.elapsed().as_micros() as u64;
         let took_ms = total_us / 1000;
+
+        if took_ms > 1000 {
+            log::warn!(
+                "slow query: index={}, took={}ms (search={}us, rerank={}us, load={}us), hits={}, total_seen={}, query={}",
+                req.index_name,
+                took_ms,
+                search_us,
+                rerank_us,
+                load_us,
+                hits.len(),
+                total_seen,
+                core_query
+            );
+        }
 
         // total_seen = number of documents that were actually scored across all segments
         Ok(Response::new(SearchResponse {
