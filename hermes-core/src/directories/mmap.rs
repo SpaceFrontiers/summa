@@ -39,6 +39,11 @@ impl MmapDirectory {
         }
     }
 
+    /// Get the root directory path
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn resolve(&self, path: &Path) -> PathBuf {
         self.root.join(path)
     }

@@ -38,8 +38,13 @@ impl SearchService for SearchServiceImpl {
             .query
             .ok_or_else(|| Status::invalid_argument("Query is required"))?;
 
-        let core_query = convert_query(&query, reader.schema(), Some(searcher.global_stats()))
-            .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
+        let core_query = convert_query(
+            &query,
+            reader.schema(),
+            Some(searcher.global_stats()),
+            Some(index.directory().root()),
+        )
+        .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
 
         log::debug!(
             "search query: index={}, query={}",

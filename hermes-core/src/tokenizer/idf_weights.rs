@@ -13,6 +13,8 @@
 #[cfg(feature = "native")]
 use std::collections::HashMap;
 #[cfg(feature = "native")]
+use std::path::Path;
+#[cfg(feature = "native")]
 use std::sync::Arc;
 
 #[cfg(feature = "native")]
@@ -121,11 +123,19 @@ impl IdfWeightsCache {
 
     /// Get or load IDF weights for a model
     ///
-    /// Downloads `idf.json` from the HuggingFace model repo if not cached.
+    /// Lookup order:
+    /// 1. In-memory cache
+    /// 2. Local file in `cache_dir` (e.g. index directory): `idf_<sanitized_model>.json`
+    /// 3. HuggingFace hub download (saved to `cache_dir` on success)
+    ///
     /// Returns `None` if `idf.json` is not available (graceful fallback).
-    /// Both successes and failures are cached to avoid repeated download attempts.
-    pub fn get_or_load(&self, model_name: &str) -> Option<Arc<IdfWeights>> {
-        // Check cache first (covers both success and cached failure)
+    /// Both successes and failures are cached to avoid repeated attempts.
+    pub fn get_or_load(
+        &self,
+        model_name: &str,
+        cache_dir: Option<&Path>,
+    ) -> Option<Arc<IdfWeights>> {
+        // Check in-memory cache first (covers both success and cached failure)
         {
             let cache = self.cache.read();
             if let Some(entry) = cache.get(model_name) {
@@ -133,8 +143,8 @@ impl IdfWeightsCache {
             }
         }
 
-        // Try to load from HF hub
-        match self.download_and_parse(model_name) {
+        // Try local cache file, then HF hub
+        match self.load_with_local_cache(model_name, cache_dir) {
             Ok(weights) => {
                 let weights = Arc::new(weights);
                 let mut cache = self.cache.write();
@@ -146,7 +156,6 @@ impl IdfWeightsCache {
                     "Could not load idf.json for model '{}': {}. Falling back to index-derived IDF.",
                     model_name, e
                 );
-                // Cache the failure so we don't retry on every query
                 let mut cache = self.cache.write();
                 cache.insert(model_name.to_string(), None);
                 None
@@ -154,10 +163,70 @@ impl IdfWeightsCache {
         }
     }
 
-    /// Download idf.json from HuggingFace hub and parse it
-    ///
-    /// Also loads the model's tokenizer to resolve token strings → IDs.
-    fn download_and_parse(&self, model_name: &str) -> Result<IdfWeights> {
+    /// Sanitize model name for use as a filename component
+    fn sanitized_model_name(model_name: &str) -> String {
+        model_name.replace('/', "--")
+    }
+
+    /// Local cache filename for a model's idf.json
+    fn local_cache_path(cache_dir: &Path, model_name: &str) -> std::path::PathBuf {
+        cache_dir.join(format!(
+            "idf_{}.json",
+            Self::sanitized_model_name(model_name)
+        ))
+    }
+
+    /// Try loading from local cache file first, then fall back to HF hub download.
+    /// On successful HF download, saves a copy to the local cache directory.
+    fn load_with_local_cache(
+        &self,
+        model_name: &str,
+        cache_dir: Option<&Path>,
+    ) -> Result<IdfWeights> {
+        let tokenizer = super::tokenizer_cache().get_or_load(model_name)?;
+
+        // Try local cache first
+        if let Some(dir) = cache_dir {
+            let local_path = Self::local_cache_path(dir, model_name);
+            if local_path.exists() {
+                let json_bytes = std::fs::read(&local_path).map_err(|e| {
+                    Error::Tokenizer(format!(
+                        "Failed to read cached idf.json at {:?}: {}",
+                        local_path, e
+                    ))
+                })?;
+                debug!(
+                    "Loaded idf.json from local cache: {:?} for model '{}'",
+                    local_path, model_name
+                );
+                return IdfWeights::from_json_with_tokenizer(&json_bytes, &tokenizer.tokenizer);
+            }
+        }
+
+        // Download from HF hub
+        let json_bytes = self.download_idf_json(model_name)?;
+
+        // Save to local cache for next time
+        if let Some(dir) = cache_dir {
+            let local_path = Self::local_cache_path(dir, model_name);
+            if let Err(e) = std::fs::write(&local_path, &json_bytes) {
+                warn!(
+                    "Failed to cache idf.json to {:?}: {} (non-fatal)",
+                    local_path, e
+                );
+            } else {
+                debug!(
+                    "Cached idf.json to {:?} for model '{}'",
+                    local_path, model_name
+                );
+            }
+        }
+
+        IdfWeights::from_json_with_tokenizer(&json_bytes, &tokenizer.tokenizer)
+    }
+
+    /// Download raw idf.json bytes from HuggingFace hub
+    fn download_idf_json(&self, model_name: &str) -> Result<Vec<u8>> {
         let api = hf_hub::api::sync::Api::new()
             .map_err(|e| Error::Tokenizer(format!("Failed to create HF hub API: {}", e)))?;
         let repo = api.model(model_name.to_string());
@@ -173,14 +242,9 @@ impl IdfWeightsCache {
             model_name, idf_path
         );
 
-        let json_bytes = std::fs::read(&idf_path).map_err(|e| {
+        std::fs::read(&idf_path).map_err(|e| {
             Error::Tokenizer(format!("Failed to read idf.json at {:?}: {}", idf_path, e))
-        })?;
-
-        // Load tokenizer to resolve token strings → numeric IDs
-        let tokenizer = super::tokenizer_cache().get_or_load(model_name)?;
-
-        IdfWeights::from_json_with_tokenizer(&json_bytes, &tokenizer.tokenizer)
+        })
     }
 
     /// Clear the cache
@@ -276,7 +340,7 @@ mod tests {
     fn test_idf_weights_cache_miss_graceful() {
         let cache = IdfWeightsCache::new();
         // Non-existent model should return None gracefully
-        let result = cache.get_or_load("nonexistent-model-xyz-12345");
+        let result = cache.get_or_load("nonexistent-model-xyz-12345", None);
         assert!(result.is_none());
     }
 }

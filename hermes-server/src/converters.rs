@@ -41,6 +41,7 @@ pub fn convert_query(
     query: &proto::Query,
     schema: &Schema,
     global_stats: Option<&LazyGlobalStats>,
+    idf_cache_dir: Option<&std::path::Path>,
 ) -> Result<Box<dyn Query>, String> {
     match &query.query {
         Some(ProtoQueryType::Term(term_query)) => {
@@ -99,14 +100,14 @@ pub fn convert_query(
             Ok(Box::new(query))
         }
         Some(ProtoQueryType::Boolean(bool_query)) => {
-            convert_boolean_query(bool_query, schema, global_stats)
+            convert_boolean_query(bool_query, schema, global_stats, idf_cache_dir)
         }
         Some(ProtoQueryType::Boost(boost_query)) => {
             let inner = boost_query
                 .query
                 .as_ref()
                 .ok_or_else(|| "Boost query requires inner query".to_string())?;
-            let inner_query = convert_query(inner, schema, global_stats)?;
+            let inner_query = convert_query(inner, schema, global_stats, idf_cache_dir)?;
             Ok(Box::new(BoostQuery {
                 inner: inner_query.into(),
                 boost: boost_query.boost,
@@ -193,7 +194,8 @@ pub fn convert_query(
                     }
                     QueryWeighting::IdfFile => {
                         // Use pre-computed IDF from model's idf.json (no global stats fallback)
-                        let precomputed = idf_weights_cache().get_or_load(tokenizer_name);
+                        let precomputed =
+                            idf_weights_cache().get_or_load(tokenizer_name, idf_cache_dir);
 
                         if let Some(idf_weights) = &precomputed {
                             let weights: Vec<f32> = token_counts
@@ -320,18 +322,19 @@ fn convert_boolean_query(
     bool_query: &proto::BooleanQuery,
     schema: &Schema,
     global_stats: Option<&LazyGlobalStats>,
+    idf_cache_dir: Option<&std::path::Path>,
 ) -> Result<Box<dyn Query>, String> {
     let mut bq = BooleanQuery::new();
     for q in &bool_query.must {
-        let inner = convert_query(q, schema, global_stats)?;
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir)?;
         bq.must.push(inner.into());
     }
     for q in &bool_query.should {
-        let inner = convert_query(q, schema, global_stats)?;
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir)?;
         bq.should.push(inner.into());
     }
     for q in &bool_query.must_not {
-        let inner = convert_query(q, schema, global_stats)?;
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir)?;
         bq.must_not.push(inner.into());
     }
     Ok(Box::new(bq))

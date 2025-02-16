@@ -242,7 +242,7 @@ impl SparseVectorQuery {
             }
             QueryWeighting::IdfFile => {
                 use crate::tokenizer::idf_weights_cache;
-                if let Some(idf) = idf_weights_cache().get_or_load(tokenizer_name) {
+                if let Some(idf) = idf_weights_cache().get_or_load(tokenizer_name, None) {
                     token_ids.iter().map(|&id| idf.get(id)).collect()
                 } else {
                     vec![1.0f32; token_ids.len()]
