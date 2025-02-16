@@ -130,11 +130,23 @@ macro_rules! boolean_plan {
      $scorer_fn:ident, $get_postings_fn:ident, $execute_fn:ident
      $(, $aw:tt)*) => {{
         let must: &[Arc<dyn Query>] = &$must;
-        let should: &[Arc<dyn Query>] = &$should;
+        let should_all: &[Arc<dyn Query>] = &$should;
         let must_not: &[Arc<dyn Query>] = &$must_not;
         let global_stats: Option<&Arc<GlobalStats>> = $global_stats;
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
+
+        // Hard-cap SHOULD clauses to MAX_QUERY_TOKENS
+        let should: &[Arc<dyn Query>] = if should_all.len() > super::MAX_QUERY_TOKENS {
+            log::debug!(
+                "BooleanQuery: capping SHOULD clauses from {} to {}",
+                should_all.len(),
+                super::MAX_QUERY_TOKENS,
+            );
+            &should_all[..super::MAX_QUERY_TOKENS]
+        } else {
+            should_all
+        };
 
         // ── 1. Single-clause optimisation ────────────────────────────────
         if must_not.is_empty() {

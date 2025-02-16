@@ -58,17 +58,19 @@ impl SparseVectorQuery {
     /// This prevents over-weighting from multiple matches while still allowing
     /// additional matches to contribute to the score.
     pub fn new(field: Field, vector: Vec<(u32, f32)>) -> Self {
-        Self {
+        let mut q = Self {
             field,
             vector,
             combiner: MultiValueCombiner::LogSumExp { temperature: 0.7 },
             heap_factor: 1.0,
             weight_threshold: 0.0,
-            max_query_dims: None,
+            max_query_dims: Some(crate::query::MAX_QUERY_TOKENS),
             pruning: None,
             over_fetch_factor: 2.0,
             pruned: None,
-        }
+        };
+        q.pruned = Some(q.compute_pruned_vector());
+        q
     }
 
     /// Effective query dimensions after pruning. Returns `vector` if no pruning is configured.

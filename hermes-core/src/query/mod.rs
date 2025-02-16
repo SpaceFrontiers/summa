@@ -1,5 +1,9 @@
 //! Query types and search execution
 
+/// Maximum number of query tokens (terms / dimensions) for text and sparse queries.
+/// Queries exceeding this limit are trimmed to the top-weighted terms.
+pub const MAX_QUERY_TOKENS: usize = 16;
+
 mod bm25;
 mod boolean;
 mod boost;
