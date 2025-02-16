@@ -7,6 +7,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
 
+use hermes_core::structures::QueryWeighting;
 use hermes_core::{Index, IndexConfig, IndexWriter, MmapDirectory, Schema};
 
 /// Combined index + writer handle under a single registry entry
@@ -116,6 +117,8 @@ impl IndexRegistry {
             .map_err(crate::error::hermes_error_to_status)?;
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
+        Self::precache_idf_files(&index);
+
         self.handles.write().insert(
             name.to_string(),
             IndexHandle {
@@ -153,6 +156,8 @@ impl IndexRegistry {
             .map_err(crate::error::hermes_error_to_status)?;
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
+        Self::precache_idf_files(&index);
+
         self.handles.write().insert(
             name.to_string(),
             IndexHandle {
@@ -181,6 +186,35 @@ impl IndexRegistry {
             .get(name)
             .map(|h| Arc::clone(&h.writer))
             .ok_or_else(|| Status::internal("Failed to create writer"))
+    }
+
+    /// Eagerly download and cache idf.json for all sparse vector fields
+    /// that use `IdfFile` weighting. Runs in background threads so it doesn't
+    /// block index open/create. On success the file is saved to the index
+    /// directory; on failure a warning is logged (non-fatal).
+    fn precache_idf_files(index: &Index<MmapDirectory>) {
+        let index_dir = index.directory().root().to_path_buf();
+
+        // Collect model names that need IDF files
+        let models: Vec<String> = index
+            .schema()
+            .fields()
+            .filter_map(|(_, entry)| {
+                let query_cfg = entry.sparse_vector_config.as_ref()?.query_config.as_ref()?;
+                if query_cfg.weighting == QueryWeighting::IdfFile {
+                    query_cfg.tokenizer.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for name in models {
+            let dir = index_dir.clone();
+            std::thread::spawn(move || {
+                hermes_core::tokenizer::idf_weights_cache().get_or_load(&name, Some(&dir));
+            });
+        }
     }
 
     /// Evict an index from the registry atomically.
