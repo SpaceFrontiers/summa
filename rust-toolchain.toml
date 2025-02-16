@@ -1,2 +1,3 @@
 [toolchain]
 channel = "nightly-2026-02-17"
+components = ["rustfmt", "clippy"]

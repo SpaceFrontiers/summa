@@ -20,6 +20,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-02-17
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -70,6 +71,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-02-17
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
