@@ -96,10 +96,11 @@ impl IdfWeights {
     }
 }
 
-/// Global cache for IDF weights, keyed by model name
+/// Global cache for IDF weights, keyed by model name.
+/// Caches both successful loads and failures to avoid repeated download attempts.
 #[cfg(feature = "native")]
 pub struct IdfWeightsCache {
-    cache: RwLock<HashMap<String, Arc<IdfWeights>>>,
+    cache: RwLock<HashMap<String, Option<Arc<IdfWeights>>>>,
 }
 
 #[cfg(feature = "native")]
@@ -122,12 +123,13 @@ impl IdfWeightsCache {
     ///
     /// Downloads `idf.json` from the HuggingFace model repo if not cached.
     /// Returns `None` if `idf.json` is not available (graceful fallback).
+    /// Both successes and failures are cached to avoid repeated download attempts.
     pub fn get_or_load(&self, model_name: &str) -> Option<Arc<IdfWeights>> {
-        // Check cache first
+        // Check cache first (covers both success and cached failure)
         {
             let cache = self.cache.read();
-            if let Some(weights) = cache.get(model_name) {
-                return Some(Arc::clone(weights));
+            if let Some(entry) = cache.get(model_name) {
+                return entry.as_ref().map(Arc::clone);
             }
         }
 
@@ -136,7 +138,7 @@ impl IdfWeightsCache {
             Ok(weights) => {
                 let weights = Arc::new(weights);
                 let mut cache = self.cache.write();
-                cache.insert(model_name.to_string(), Arc::clone(&weights));
+                cache.insert(model_name.to_string(), Some(Arc::clone(&weights)));
                 Some(weights)
             }
             Err(e) => {
@@ -144,6 +146,9 @@ impl IdfWeightsCache {
                     "Could not load idf.json for model '{}': {}. Falling back to index-derived IDF.",
                     model_name, e
                 );
+                // Cache the failure so we don't retry on every query
+                let mut cache = self.cache.write();
+                cache.insert(model_name.to_string(), None);
                 None
             }
         }
