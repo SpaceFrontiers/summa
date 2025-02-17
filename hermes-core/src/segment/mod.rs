@@ -15,6 +15,8 @@ mod vector_data;
 pub use builder::{MemoryBreakdown, SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
+pub(crate) use reader::BmpIndex;
+pub(crate) use reader::bmp::BMP_SUPERBLOCK_SIZE;
 pub(crate) use reader::combine_ordinal_results;
 pub use reader::{SegmentReader, SparseIndex, VectorIndex, VectorSearchResult};
 pub use store::*;

@@ -1,8 +1,10 @@
 //! Async segment reader with lazy loading
 
+pub(crate) mod bmp;
 mod loader;
 mod types;
 
+pub use bmp::BmpIndex;
 #[cfg(feature = "diagnostics")]
 pub use types::DimRawData;
 pub use types::{SparseIndex, VectorIndex, VectorSearchResult};
@@ -140,8 +142,10 @@ pub struct SegmentReader {
     flat_vectors: FxHashMap<u32, LazyFlatVectorData>,
     /// Per-field coarse centroids for IVF/ScaNN search
     coarse_centroids: FxHashMap<u32, Arc<CoarseCentroids>>,
-    /// Sparse vector indexes per field
+    /// Sparse vector indexes per field (MaxScore format)
     sparse_indexes: FxHashMap<u32, SparseIndex>,
+    /// BMP sparse vector indexes per field (BMP format)
+    bmp_indexes: FxHashMap<u32, BmpIndex>,
     /// Position file handle for phrase queries (lazy loading)
     positions_handle: Option<FileHandle>,
     /// Fast-field columnar readers per field_id
@@ -180,8 +184,10 @@ impl SegmentReader {
         let vector_indexes = vectors_data.indexes;
         let flat_vectors = vectors_data.flat_vectors;
 
-        // Load sparse vector indexes from .sparse file
-        let sparse_indexes = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
+        // Load sparse vector indexes from .sparse file (MaxScore + BMP)
+        let sparse_data = loader::load_sparse_file(dir, &files, meta.num_docs, &schema).await?;
+        let sparse_indexes = sparse_data.maxscore_indexes;
+        let bmp_indexes = sparse_data.bmp_indexes;
 
         // Open positions file handle (if exists) - offsets are now in TermInfo
         let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
@@ -210,6 +216,14 @@ impl SegmentReader {
                     idx.num_dimensions() as f64 * 24.0 / 1024.0
                 ));
             }
+            for (field_id, idx) in &bmp_indexes {
+                parts.push(format!(
+                    "bmp field {}: {} dims, {} blocks",
+                    field_id,
+                    idx.num_dimensions(),
+                    idx.num_blocks
+                ));
+            }
             if !fast_fields.is_empty() {
                 parts.push(format!("fast: {} fields", fast_fields.len()));
             }
@@ -226,6 +240,7 @@ impl SegmentReader {
             flat_vectors,
             coarse_centroids: FxHashMap::default(),
             sparse_indexes,
+            bmp_indexes,
             positions_handle,
             fast_fields,
         })
@@ -253,9 +268,19 @@ impl SegmentReader {
         &self.sparse_indexes
     }
 
-    /// Get sparse index for a specific field
+    /// Get sparse index for a specific field (MaxScore format)
     pub fn sparse_index(&self, field: Field) -> Option<&SparseIndex> {
         self.sparse_indexes.get(&field.0)
+    }
+
+    /// Get BMP index for a specific field
+    pub fn bmp_index(&self, field: Field) -> Option<&BmpIndex> {
+        self.bmp_indexes.get(&field.0)
+    }
+
+    /// Get all BMP indexes
+    pub fn bmp_indexes(&self) -> &FxHashMap<u32, BmpIndex> {
+        &self.bmp_indexes
     }
 
     /// Get vector indexes for all fields
@@ -296,12 +321,17 @@ impl SegmentReader {
         // Store cache: similar estimate
         let store_cache_bytes = self.store.cached_blocks() * 4096;
 
-        // Sparse index: SoA dim table + OwnedBytes skip section
+        // Sparse index: SoA dim table + OwnedBytes skip section + BMP grids
         let sparse_index_bytes: usize = self
             .sparse_indexes
             .values()
             .map(|s| s.estimated_memory_bytes())
-            .sum();
+            .sum::<usize>()
+            + self
+                .bmp_indexes
+                .values()
+                .map(|b| b.estimated_memory_bytes())
+                .sum::<usize>();
 
         // Dense index: vectors are memory-mapped, but we track index structures
         // RaBitQ/IVF indexes have cluster assignments in memory

@@ -709,11 +709,11 @@ macro_rules! bms_execute_loop {
             } else {
                 0.0
             };
-            // Small epsilon to guard against FP rounding in score accumulation.
-            // Without this, a document whose true score equals the threshold can
-            // be incorrectly pruned due to rounding in the heap_factor multiply
-            // or in the prefix_sum additions.
-            let adjusted_threshold = $self.collector.threshold() * $self.heap_factor - 1e-6;
+            // Approximate retrieval: alpha < 1.0 raises the effective threshold,
+            // pruning more aggressively. Matches BMP alpha parameter semantics.
+            // Division: threshold / alpha > threshold when alpha < 1.0.
+            // Small epsilon guards against FP rounding in score accumulation.
+            let adjusted_threshold = $self.collector.threshold() / $self.heap_factor - 1e-6;
 
             // --- Conjunction optimization ---
             if $self.collector.len() >= $self.collector.k {
@@ -935,7 +935,7 @@ impl<'a> MaxScoreExecutor<'a> {
             cursors,
             prefix_sums,
             collector: ScoreCollector::new(k),
-            heap_factor: heap_factor.clamp(0.0, 1.0),
+            heap_factor: heap_factor.clamp(0.01, 1.0),
             predicate: None,
         }
     }
@@ -984,7 +984,9 @@ impl<'a> MaxScoreExecutor<'a> {
 
     #[inline]
     fn find_partition(&self) -> usize {
-        let threshold = self.collector.threshold() * self.heap_factor;
+        // Alpha < 1.0 raises the effective threshold → more terms become
+        // non-essential → more aggressive pruning (approximate retrieval).
+        let threshold = self.collector.threshold() / self.heap_factor;
         self.prefix_sums.partition_point(|&sum| sum <= threshold)
     }
 

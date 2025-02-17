@@ -7,9 +7,9 @@ use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
 use super::planner::{
-    build_sparse_maxscore_executor, chain_predicates, combine_sparse_results, compute_idf,
-    extract_all_sparse_infos, finish_text_maxscore, prepare_per_field_grouping,
-    prepare_text_maxscore,
+    build_sparse_bmp_results, build_sparse_bmp_results_filtered, build_sparse_maxscore_executor,
+    chain_predicates, combine_sparse_results, compute_idf, extract_all_sparse_infos,
+    finish_text_maxscore, prepare_per_field_grouping, prepare_text_maxscore,
 };
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture};
 
@@ -136,14 +136,44 @@ macro_rules! boolean_plan {
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
 
-        // Hard-cap SHOULD clauses to MAX_QUERY_TOKENS
-        let should: &[Arc<dyn Query>] = if should_all.len() > super::MAX_QUERY_TOKENS {
-            log::debug!(
-                "BooleanQuery: capping SHOULD clauses from {} to {}",
-                should_all.len(),
-                super::MAX_QUERY_TOKENS,
-            );
-            &should_all[..super::MAX_QUERY_TOKENS]
+        // Cap SHOULD clauses to MAX_QUERY_TERMS, but only count queries that need
+        // posting-list cursors. Fast-field predicates (O(1) per doc) are exempt.
+        let should_capped: Vec<Arc<dyn Query>>;
+        let should: &[Arc<dyn Query>] = if should_all.len() > super::MAX_QUERY_TERMS {
+            let is_predicate: Vec<bool> = should_all
+                .iter()
+                .map(|q| q.is_filter() || q.as_doc_predicate(reader).is_some())
+                .collect();
+            let cursor_count = is_predicate.iter().filter(|&&p| !p).count();
+
+            if cursor_count > super::MAX_QUERY_TERMS {
+                let mut kept = Vec::with_capacity(should_all.len());
+                let mut cursor_kept = 0usize;
+                for (q, &is_pred) in should_all.iter().zip(is_predicate.iter()) {
+                    if is_pred {
+                        kept.push(q.clone());
+                    } else if cursor_kept < super::MAX_QUERY_TERMS {
+                        kept.push(q.clone());
+                        cursor_kept += 1;
+                    }
+                }
+                log::debug!(
+                    "BooleanQuery: capping cursor SHOULD from {} to {} ({} fast-field predicates exempt)",
+                    cursor_count,
+                    super::MAX_QUERY_TERMS,
+                    kept.len() - cursor_kept,
+                );
+                should_capped = kept;
+                &should_capped
+            } else {
+                log::debug!(
+                    "BooleanQuery: {} SHOULD clauses OK ({} need cursors, {} fast-field predicates)",
+                    should_all.len(),
+                    cursor_count,
+                    should_all.len() - cursor_count,
+                );
+                should_all
+            }
         } else {
             should_all
         };
@@ -176,8 +206,14 @@ macro_rules! boolean_plan {
                 return finish_text_maxscore(posting_lists, avg_field_len, limit);
             }
 
-            // 2b. Sparse MaxScore (single-field, all sparse term queries)
+            // 2b. Sparse (single-field, all sparse term queries)
+            // Auto-detect: BMP executor if field has BMP index, else MaxScore
             if let Some(infos) = extract_all_sparse_infos(should) {
+                if let Some((raw, info)) =
+                    build_sparse_bmp_results(&infos, reader, limit)
+                {
+                    return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
+                }
                 if let Some((executor, info)) =
                     build_sparse_maxscore_executor(&infos, reader, limit, None)
                 {
@@ -243,13 +279,24 @@ macro_rules! boolean_plan {
                 }
             }
 
-            // 3b. Fast path: pure predicates + sparse SHOULD → MaxScore w/ predicate
+            // 3b. Fast path: pure predicates + sparse SHOULD → BMP or MaxScore w/ predicate
             if must_verifiers.is_empty()
                 && must_not_verifiers.is_empty()
                 && !predicates.is_empty()
             {
                 if let Some(infos) = extract_all_sparse_infos(should) {
+                    // Try BMP with predicate first (BMP is the default format)
                     let combined = chain_predicates(predicates);
+                    if let Some((raw, info)) =
+                        build_sparse_bmp_results_filtered(&infos, reader, limit, &*combined)
+                    {
+                        log::debug!(
+                            "BooleanQuery planner: predicate-aware sparse BMP, {} dims",
+                            infos.len()
+                        );
+                        return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
+                    }
+                    // Try MaxScore with predicate
                     if let Some((executor, info)) =
                         build_sparse_maxscore_executor(&infos, reader, limit, Some(combined))
                     {
@@ -261,7 +308,7 @@ macro_rules! boolean_plan {
                         return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
                     }
                     // predicates consumed — cannot fall through; rebuild them
-                    // (this path only triggers if sparse index is absent)
+                    // (this path only triggers if neither sparse index exists)
                     predicates = Vec::new();
                     for q in must {
                         if let Some(pred) = q.as_doc_predicate(reader) {

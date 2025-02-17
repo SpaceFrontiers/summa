@@ -1,4 +1,5 @@
 mod basic;
+mod bmp;
 mod boolean;
 mod merge;
 mod primary_key;

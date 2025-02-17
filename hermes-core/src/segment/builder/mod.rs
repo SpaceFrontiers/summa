@@ -8,6 +8,7 @@
 //! - **Parallel posting serialization**: Rayon parallel sort + serialize
 //! - **Inline posting fast path**: Small terms skip PostingList/BlockPostingList entirely
 
+pub(crate) mod bmp;
 mod config;
 mod dense;
 #[cfg(feature = "diagnostics")]

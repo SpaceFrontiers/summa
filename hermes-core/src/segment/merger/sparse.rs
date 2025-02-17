@@ -21,11 +21,12 @@ use super::doc_offsets;
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::FieldType;
+use crate::segment::BmpIndex;
 use crate::segment::SparseIndex;
 use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
-use crate::structures::SparseSkipEntry;
+use crate::structures::{SparseFormat, SparseSkipEntry};
 
 impl SegmentMerger {
     /// Merge sparse vector indexes via byte-level block stacking (V3 format).
@@ -63,11 +64,44 @@ impl SegmentMerger {
         let mut all_skip_entries: Vec<SparseSkipEntry> = Vec::new();
 
         for (field, sparse_config) in &sparse_fields {
+            let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
             let quantization = sparse_config
                 .as_ref()
                 .map(|c| c.weight_quantization)
                 .unwrap_or(crate::structures::WeightQuantization::Float32);
 
+            // BMP format: iterate source blocks, remap doc_ids, stream to output
+            if format == SparseFormat::Bmp {
+                let bmp_indexes: Vec<Option<&BmpIndex>> = segments
+                    .iter()
+                    .map(|seg| seg.bmp_indexes().get(&field.0))
+                    .collect();
+                let total_vectors: u32 = bmp_indexes
+                    .iter()
+                    .filter_map(|bi| bi.map(|idx| idx.total_vectors))
+                    .sum();
+                let has_data = bmp_indexes.iter().any(|bi| bi.is_some());
+                if has_data {
+                    let bmp_block_size = sparse_config
+                        .as_ref()
+                        .map(|c| c.bmp_block_size)
+                        .unwrap_or(64);
+
+                    merge_bmp_field(
+                        &bmp_indexes,
+                        &doc_offs,
+                        field.0,
+                        quantization,
+                        bmp_block_size,
+                        total_vectors,
+                        &mut writer,
+                        &mut field_tocs,
+                    )?;
+                }
+                continue;
+            }
+
+            // MaxScore format: byte-level block stacking
             // Collect all unique dimension IDs across segments (sorted for determinism)
             let all_dims: Vec<u32> = {
                 let mut set = rustc_hash::FxHashSet::default();
@@ -241,4 +275,181 @@ impl SegmentMerger {
 
         Ok(output_size)
     }
+}
+
+/// Merge BMP fields by iterating source blocks directly, remapping doc_ids,
+/// and streaming the rebuilt blob to the writer.
+///
+/// Memory-bounded: uses a single flat Vec of compact entries (12 bytes each)
+/// plus the block-max grid (num_dims x num_blocks bytes). No HashMap, no
+/// per-block Vec allocations, no intermediate blob buffer.
+#[allow(clippy::too_many_arguments)]
+fn merge_bmp_field(
+    bmp_indexes: &[Option<&BmpIndex>],
+    doc_offs: &[u32],
+    field_id: u32,
+    quantization: crate::structures::WeightQuantization,
+    bmp_block_size: u32,
+    total_vectors: u32,
+    writer: &mut OffsetWriter,
+    field_tocs: &mut Vec<SparseFieldToc>,
+) -> Result<()> {
+    use rustc_hash::FxHashMap;
+
+    // Phase 1: Compute merged parameters from source segments
+    let mut new_max_weight_scale: f32 = 0.0;
+    let mut new_num_ordinals: u32 = 0;
+    let mut max_merged_virtual: u64 = 0;
+    let mut dim_set = rustc_hash::FxHashSet::default();
+    let mut total_postings_est: usize = 0;
+
+    for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
+        let bmp = match bmp_opt {
+            Some(b) => b,
+            None => continue,
+        };
+        if bmp.max_weight_scale > new_max_weight_scale {
+            new_max_weight_scale = bmp.max_weight_scale;
+        }
+        if bmp.num_ordinals > new_num_ordinals {
+            new_num_ordinals = bmp.num_ordinals;
+        }
+        for &dim_id in bmp.dim_ids() {
+            dim_set.insert(dim_id);
+        }
+        total_postings_est += bmp.total_postings() as usize;
+
+        // Compute max virtual_id this segment can contribute in merged space
+        if bmp.num_blocks > 0 {
+            let src_max_virtual = bmp.num_blocks as u64 * bmp.bmp_block_size as u64 - 1;
+            let src_max_doc = src_max_virtual / bmp.num_ordinals as u64;
+            let remapped_doc = src_max_doc + doc_offs[seg_idx] as u64;
+            // In merged space with new_num_ordinals (use max possible)
+            let merged_virtual = remapped_doc * new_num_ordinals.max(1) as u64
+                + (new_num_ordinals.max(1) - 1) as u64;
+            if merged_virtual > max_merged_virtual {
+                max_merged_virtual = merged_virtual;
+            }
+        }
+    }
+
+    if new_max_weight_scale == 0.0 || dim_set.is_empty() {
+        return Ok(());
+    }
+
+    let mut dim_ids: Vec<u32> = dim_set.into_iter().collect();
+    dim_ids.sort_unstable();
+    let num_dims = dim_ids.len();
+    let dim_to_idx: FxHashMap<u32, usize> =
+        dim_ids.iter().enumerate().map(|(i, &d)| (d, i)).collect();
+
+    let num_blocks = (max_merged_virtual / bmp_block_size as u64 + 1) as usize;
+
+    // Phase 2: Iterate source segments, collect flat entries + build grid
+    let mut entries: Vec<(u32, u32, u8, u8)> = Vec::with_capacity(total_postings_est);
+    let mut grid = vec![0u8; num_dims * num_blocks];
+
+    for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
+        let bmp = match bmp_opt {
+            Some(b) => b,
+            None => continue,
+        };
+        let doc_offset = doc_offs[seg_idx];
+        let rescale = bmp.max_weight_scale / new_max_weight_scale;
+
+        for block_id in 0..bmp.num_blocks {
+            let (term_start, term_end) = bmp.block_term_range(block_id);
+            let block_dim_ids = bmp.block_term_dim_ids(term_start, term_end);
+
+            for (rel_idx, &dim_id) in block_dim_ids.iter().enumerate() {
+                let ti = term_start + rel_idx as u32;
+                let dim_idx = dim_to_idx[&dim_id];
+
+                for p in bmp.term_postings(ti) {
+                    // Decode virtual_id in source space
+                    let src_virtual = block_id * bmp.bmp_block_size + p.local_slot as u32;
+                    let (doc_id, ordinal) = bmp.virtual_to_doc(src_virtual);
+
+                    // Remap to merged space
+                    let new_doc_id = doc_id + doc_offset;
+                    let new_virtual = new_doc_id as u64 * new_num_ordinals as u64 + ordinal as u64;
+                    let new_block_id = (new_virtual / bmp_block_size as u64) as u32;
+                    let new_local_slot = (new_virtual % bmp_block_size as u64) as u8;
+
+                    // Rescale impact (u8 → u8, no f32 roundtrip)
+                    let new_impact = if rescale >= 1.0 {
+                        p.impact
+                    } else {
+                        let v = (p.impact as f32 * rescale).round();
+                        v.min(255.0) as u8
+                    };
+                    if new_impact == 0 {
+                        continue;
+                    }
+
+                    // Update grid
+                    let grid_idx = dim_idx * num_blocks + new_block_id as usize;
+                    if new_impact > grid[grid_idx] {
+                        grid[grid_idx] = new_impact;
+                    }
+
+                    entries.push((new_block_id, dim_id, new_local_slot, new_impact));
+                }
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    log::debug!(
+        "[merge_bmp] field {}: {} dims, {} entries, {} blocks (bmp_block_size={})",
+        field_id,
+        num_dims,
+        entries.len(),
+        num_blocks,
+        bmp_block_size,
+    );
+
+    // Phase 3: Sort entries by (block_id, dim_id, local_slot)
+    entries.sort_unstable();
+
+    // Phase 4: Stream BMP blob to writer
+    let current_offset = writer.offset();
+    let blob_len = super::super::builder::bmp::write_bmp_blob_streaming(
+        &entries,
+        &dim_ids,
+        &grid,
+        num_blocks,
+        bmp_block_size,
+        new_num_ordinals,
+        new_max_weight_scale,
+        writer,
+    )
+    .map_err(crate::Error::Io)?;
+
+    if blob_len > 0 {
+        let mut config_for_byte =
+            crate::structures::SparseVectorConfig::from_byte(quantization as u8)
+                .unwrap_or_default();
+        config_for_byte.format = SparseFormat::Bmp;
+        config_for_byte.weight_quantization = quantization;
+
+        field_tocs.push(SparseFieldToc {
+            field_id,
+            quantization: config_for_byte.to_byte(),
+            total_vectors,
+            dims: vec![SparseDimTocEntry {
+                dim_id: 0xFFFFFFFF, // sentinel for BMP
+                block_data_offset: current_offset,
+                skip_start: (blob_len & 0xFFFFFFFF) as u32,
+                num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
+                doc_count: 0,
+                max_weight: 0.0,
+            }],
+        });
+    }
+
+    Ok(())
 }

@@ -2,6 +2,10 @@
 //!
 //! Data is written first (one dim at a time), then the TOC and footer
 //! are appended. Parallel sort + prune + serialize per dimension.
+//!
+//! Supports two formats:
+//! - **MaxScore** (default): Per-dimension variable-size blocks with skip entries
+//! - **BMP**: Fixed doc_id range blocks with block-max grid
 
 use std::io::Write;
 
@@ -12,7 +16,7 @@ use crate::Result;
 use crate::dsl::{Field, Schema};
 use crate::segment::format::{SparseDimTocEntry, SparseFieldToc, write_sparse_toc_and_footer};
 use crate::structures::{
-    BlockSparsePostingList, SparseSkipEntry, WeightQuantization, optimal_partition,
+    BlockSparsePostingList, SparseFormat, SparseSkipEntry, WeightQuantization, optimal_partition,
 };
 
 use crate::DocId;
@@ -60,6 +64,9 @@ impl SparseVectorBuilder {
 ///
 /// Data is written first (one dim at a time), then the TOC and footer
 /// are appended. This matches the dense vectors format pattern.
+///
+/// For BMP-format fields, a self-contained BMP blob is written and a special
+/// TOC entry (num_dims=0, single BmpDescriptor) is used.
 pub(super) fn build_sparse_streaming(
     sparse_vectors: &mut FxHashMap<u32, SparseVectorBuilder>,
     schema: &Schema,
@@ -88,96 +95,74 @@ pub(super) fn build_sparse_streaming(
             .get_field_entry(field)
             .and_then(|e| e.sparse_vector_config.as_ref());
 
+        let format = sparse_config.map(|c| c.format).unwrap_or_default();
+
         let quantization = sparse_config
             .map(|c| c.weight_quantization)
             .unwrap_or(WeightQuantization::Float32);
 
         let pruning_fraction = sparse_config.and_then(|c| c.pruning);
-
         let total_vectors = builder.total_vectors;
 
-        // Parallel: sort + prune + serialize each dimension independently
-        let mut dims: Vec<_> = std::mem::take(&mut builder.postings).into_iter().collect();
-        dims.sort_unstable_by_key(|(id, _)| *id);
+        match format {
+            SparseFormat::Bmp => {
+                let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
+                let weight_threshold = sparse_config.map(|c| c.weight_threshold).unwrap_or(0.0);
 
-        let serialized_dims: Vec<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> = dims
-            .into_par_iter()
-            .map(|(dim_id, mut postings)| {
-                let pruned = if let Some(fraction) = pruning_fraction
-                    && postings.len() > 1
-                    && fraction < 1.0
-                {
-                    let original_len = postings.len();
-                    postings.sort_unstable_by(|a, b| {
-                        b.2.abs()
-                            .partial_cmp(&a.2.abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
-                    postings.truncate(keep);
-                    true
-                } else {
-                    false
-                };
-                // Postings arrive in (doc_id, ordinal) order from sequential indexing;
-                // only re-sort if pruning destroyed that order.
-                if pruned {
-                    postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
-                }
+                let max_grid_bytes = sparse_config
+                    .map(|c| c.max_bmp_grid_bytes)
+                    .unwrap_or(256 * 1024 * 1024);
 
-                let weights: Vec<f32> = postings.iter().map(|(_, _, w)| w.abs()).collect();
-                let partition = optimal_partition(&weights);
-                let block_list = BlockSparsePostingList::from_postings_with_partition(
-                    &postings,
-                    quantization,
-                    &partition,
+                let blob_offset = current_offset;
+                let blob_len = super::bmp::build_bmp_blob_with_grid_cap(
+                    &mut builder.postings,
+                    bmp_block_size,
+                    weight_threshold,
+                    pruning_fraction,
+                    max_grid_bytes,
+                    writer,
                 )
                 .map_err(crate::Error::Io)?;
 
-                let doc_count = block_list.doc_count;
-                let (block_data, skip_entries) =
-                    block_list.serialize().map_err(crate::Error::Io)?;
+                if blob_len > 0 {
+                    current_offset += blob_len;
 
-                #[cfg(feature = "diagnostics")]
-                super::diagnostics::validate_serialized_blocks(dim_id, &block_data, &skip_entries)?;
+                    // For BMP, we encode the format bit in the quant byte and use
+                    // num_dims=0 with a single pseudo-dim entry containing blob location.
+                    let mut config_for_byte =
+                        crate::structures::SparseVectorConfig::from_byte(quantization as u8)
+                            .unwrap_or_default();
+                    config_for_byte.format = SparseFormat::Bmp;
+                    config_for_byte.weight_quantization = quantization;
 
-                Ok((dim_id, doc_count, block_data, skip_entries))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Phase 1: Write block data sequentially, accumulate skip entries
-        let mut dim_toc_entries: Vec<SparseDimTocEntry> = Vec::with_capacity(serialized_dims.len());
-        for (dim_id, doc_count, block_data, skip_entries) in &serialized_dims {
-            let block_data_offset = current_offset;
-            let skip_start = all_skip_entries.len() as u32;
-            let num_blocks = skip_entries.len() as u32;
-            let max_weight = skip_entries
-                .iter()
-                .map(|e| e.max_weight)
-                .fold(0.0f32, f32::max);
-
-            writer.write_all(block_data)?;
-            current_offset += block_data.len() as u64;
-
-            all_skip_entries.extend_from_slice(skip_entries);
-
-            dim_toc_entries.push(SparseDimTocEntry {
-                dim_id: *dim_id,
-                block_data_offset,
-                skip_start,
-                num_blocks,
-                doc_count: *doc_count,
-                max_weight,
-            });
-        }
-
-        if !dim_toc_entries.is_empty() {
-            field_tocs.push(SparseFieldToc {
-                field_id,
-                quantization: quantization as u8,
-                total_vectors,
-                dims: dim_toc_entries,
-            });
+                    field_tocs.push(SparseFieldToc {
+                        field_id,
+                        quantization: config_for_byte.to_byte(),
+                        total_vectors,
+                        dims: vec![SparseDimTocEntry {
+                            dim_id: 0xFFFFFFFF, // sentinel for BMP
+                            block_data_offset: blob_offset,
+                            skip_start: (blob_len & 0xFFFFFFFF) as u32,
+                            num_blocks: ((blob_len >> 32) & 0xFFFFFFFF) as u32,
+                            doc_count: 0,
+                            max_weight: 0.0,
+                        }],
+                    });
+                }
+            }
+            SparseFormat::MaxScore => {
+                build_maxscore_field(
+                    builder,
+                    field_id,
+                    quantization,
+                    pruning_fraction,
+                    total_vectors,
+                    writer,
+                    &mut current_offset,
+                    &mut all_skip_entries,
+                    &mut field_tocs,
+                )?;
+            }
         }
     }
 
@@ -185,7 +170,7 @@ pub(super) fn build_sparse_streaming(
         return Ok(());
     }
 
-    // Phase 2: Write skip section
+    // Phase 2: Write skip section (only MaxScore fields have skip entries)
     let skip_offset = current_offset;
     for entry in &all_skip_entries {
         entry.write(writer).map_err(crate::Error::Io)?;
@@ -196,6 +181,105 @@ pub(super) fn build_sparse_streaming(
     let toc_offset = current_offset;
     write_sparse_toc_and_footer(writer, skip_offset, toc_offset, &field_tocs)
         .map_err(crate::Error::Io)?;
+
+    Ok(())
+}
+
+/// Build a MaxScore-format field (existing logic extracted for clarity).
+#[allow(clippy::too_many_arguments)]
+fn build_maxscore_field(
+    builder: &mut SparseVectorBuilder,
+    field_id: u32,
+    quantization: WeightQuantization,
+    pruning_fraction: Option<f32>,
+    total_vectors: u32,
+    writer: &mut dyn Write,
+    current_offset: &mut u64,
+    all_skip_entries: &mut Vec<SparseSkipEntry>,
+    field_tocs: &mut Vec<SparseFieldToc>,
+) -> Result<()> {
+    // Parallel: sort + prune + serialize each dimension independently
+    let mut dims: Vec<_> = std::mem::take(&mut builder.postings).into_iter().collect();
+    dims.sort_unstable_by_key(|(id, _)| *id);
+
+    let serialized_dims: Vec<(u32, u32, Vec<u8>, Vec<SparseSkipEntry>)> = dims
+        .into_par_iter()
+        .map(|(dim_id, mut postings)| {
+            let pruned = if let Some(fraction) = pruning_fraction
+                && postings.len() > 1
+                && fraction < 1.0
+            {
+                let original_len = postings.len();
+                postings.sort_unstable_by(|a, b| {
+                    b.2.abs()
+                        .partial_cmp(&a.2.abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let keep = ((original_len as f64 * fraction as f64).ceil() as usize).max(1);
+                postings.truncate(keep);
+                true
+            } else {
+                false
+            };
+            // Postings arrive in (doc_id, ordinal) order from sequential indexing;
+            // only re-sort if pruning destroyed that order.
+            if pruned {
+                postings.sort_unstable_by_key(|(doc_id, ordinal, _)| (*doc_id, *ordinal));
+            }
+
+            let weights: Vec<f32> = postings.iter().map(|(_, _, w)| w.abs()).collect();
+            let partition = optimal_partition(&weights);
+            let block_list = BlockSparsePostingList::from_postings_with_partition(
+                &postings,
+                quantization,
+                &partition,
+            )
+            .map_err(crate::Error::Io)?;
+
+            let doc_count = block_list.doc_count;
+            let (block_data, skip_entries) = block_list.serialize().map_err(crate::Error::Io)?;
+
+            #[cfg(feature = "diagnostics")]
+            super::diagnostics::validate_serialized_blocks(dim_id, &block_data, &skip_entries)?;
+
+            Ok((dim_id, doc_count, block_data, skip_entries))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Phase 1: Write block data sequentially, accumulate skip entries
+    let mut dim_toc_entries: Vec<SparseDimTocEntry> = Vec::with_capacity(serialized_dims.len());
+    for (dim_id, doc_count, block_data, skip_entries) in &serialized_dims {
+        let block_data_offset = *current_offset;
+        let skip_start = all_skip_entries.len() as u32;
+        let num_blocks = skip_entries.len() as u32;
+        let max_weight = skip_entries
+            .iter()
+            .map(|e| e.max_weight)
+            .fold(0.0f32, f32::max);
+
+        writer.write_all(block_data)?;
+        *current_offset += block_data.len() as u64;
+
+        all_skip_entries.extend_from_slice(skip_entries);
+
+        dim_toc_entries.push(SparseDimTocEntry {
+            dim_id: *dim_id,
+            block_data_offset,
+            skip_start,
+            num_blocks,
+            doc_count: *doc_count,
+            max_weight,
+        });
+    }
+
+    if !dim_toc_entries.is_empty() {
+        field_tocs.push(SparseFieldToc {
+            field_id,
+            quantization: quantization as u8,
+            total_vectors,
+            dims: dim_toc_entries,
+        });
+    }
 
     Ok(())
 }

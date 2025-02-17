@@ -173,6 +173,70 @@ pub(crate) fn build_sparse_maxscore_executor<'a>(
     Some((executor, infos[0]))
 }
 
+/// Build a sparse BMP executor from decomposed sparse infos.
+///
+/// Auto-detected: called when the field has a BMP index. Returns scored
+/// results directly (BMP is always synchronous), or None if no BMP index
+/// exists for the field.
+pub(crate) fn build_sparse_bmp_results(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
+    let field = infos[0].field;
+    let bmp = reader.bmp_index(field)?;
+    let query_terms: Vec<(u32, f32)> = infos
+        .iter()
+        .map(|info| (info.dim_id, info.weight))
+        .collect();
+    if query_terms.is_empty() {
+        return None;
+    }
+    let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
+    match super::bmp::execute_bmp(bmp, &query_terms, executor_limit, infos[0].heap_factor) {
+        Ok(results) => Some((results, infos[0])),
+        Err(e) => {
+            log::warn!("BMP execution failed for field {}: {}", field.0, e);
+            None
+        }
+    }
+}
+
+/// Build a sparse BMP executor with a document predicate filter.
+///
+/// The predicate is applied during BMP scoring (not post-filter), ensuring
+/// the collector only contains valid documents and the threshold evolves correctly.
+pub(crate) fn build_sparse_bmp_results_filtered(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    predicate: &dyn Fn(crate::DocId) -> bool,
+) -> Option<(Vec<ScoredDoc>, SparseTermQueryInfo)> {
+    let field = infos[0].field;
+    let bmp = reader.bmp_index(field)?;
+    let query_terms: Vec<(u32, f32)> = infos
+        .iter()
+        .map(|info| (info.dim_id, info.weight))
+        .collect();
+    if query_terms.is_empty() {
+        return None;
+    }
+    let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
+    match super::bmp::execute_bmp_filtered(
+        bmp,
+        &query_terms,
+        executor_limit,
+        infos[0].heap_factor,
+        predicate,
+    ) {
+        Ok(results) => Some((results, infos[0])),
+        Err(e) => {
+            log::warn!("BMP filtered execution failed for field {}: {}", field.0, e);
+            None
+        }
+    }
+}
+
 /// Combine raw MaxScore results with ordinal deduplication into a scorer.
 pub(crate) fn combine_sparse_results<'a>(
     raw: Vec<ScoredDoc>,

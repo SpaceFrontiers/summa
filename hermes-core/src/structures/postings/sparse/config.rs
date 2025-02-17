@@ -2,6 +2,24 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Sparse vector index format
+///
+/// Determines the on-disk layout and query execution strategy:
+/// - **MaxScore**: Per-dimension variable-size blocks (DAAT — document-at-a-time).
+///   Default, optimal for general sparse retrieval with block-max pruning.
+/// - **Bmp**: Fixed doc_id range blocks (BAAT — block-at-a-time).
+///   Based on Mallia, Suel & Tonellotto (SIGIR 2024). Divides the document
+///   space into fixed-size blocks and processes them in decreasing upper-bound
+///   order, enabling aggressive early termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SparseFormat {
+    /// Per-dimension variable-size blocks (existing format, DAAT MaxScore)
+    MaxScore,
+    /// Fixed doc_id range blocks (BMP, BAAT block-at-a-time)
+    #[default]
+    Bmp,
+}
+
 /// Size of the index (term/dimension ID) in sparse vectors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[repr(u8)]
@@ -175,6 +193,9 @@ impl Default for SparseQueryConfig {
 /// - **UInt8 quantization**: 4x compression, 1-2% nDCG loss (optimal trade-off)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseVectorConfig {
+    /// Index format: MaxScore (DAAT) or BMP (BAAT)
+    #[serde(default)]
+    pub format: SparseFormat,
     /// Size of dimension/term indices
     pub index_size: IndexSize,
     /// Quantization for weights (see WeightQuantization docs for trade-offs)
@@ -188,9 +209,26 @@ pub struct SparseVectorConfig {
     #[serde(default)]
     pub weight_threshold: f32,
     /// Block size for posting lists (must be power of 2, default 128 for SIMD)
-    /// Larger blocks = better compression, smaller blocks = faster seeks
+    /// Larger blocks = better compression, smaller blocks = faster seeks.
+    /// Used by MaxScore format only.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
+    /// BMP block size: number of consecutive doc_ids per block (must be power of 2).
+    /// Default 64. Only used when format = Bmp.
+    /// Smaller = better pruning granularity, larger = less overhead.
+    #[serde(default = "default_bmp_block_size")]
+    pub bmp_block_size: u32,
+    /// Maximum BMP grid memory in bytes. If the grid (num_dims × num_blocks)
+    /// would exceed this, bmp_block_size is automatically increased to cap memory.
+    /// Default: 256MB. Set to 0 to disable the cap.
+    #[serde(default = "default_max_bmp_grid_bytes")]
+    pub max_bmp_grid_bytes: u64,
+    /// BMP superblock size: number of consecutive blocks grouped for hierarchical
+    /// pruning (Carlson et al., SIGIR 2025). Must be power of 2.
+    /// Default 64. Set to 0 to disable superblock pruning (flat BMP scoring).
+    /// Only used when format = Bmp.
+    #[serde(default = "default_bmp_superblock_size")]
+    pub bmp_superblock_size: u32,
     /// Static pruning: fraction of postings to keep per inverted list (SEISMIC-style)
     /// Lists are sorted by weight descending and truncated to top fraction.
     ///
@@ -213,13 +251,29 @@ fn default_block_size() -> usize {
     128
 }
 
+fn default_bmp_block_size() -> u32 {
+    64
+}
+
+fn default_max_bmp_grid_bytes() -> u64 {
+    0 // disabled by default — masks eliminate DRAM stalls during scoring
+}
+
+fn default_bmp_superblock_size() -> u32 {
+    64
+}
+
 impl Default for SparseVectorConfig {
     fn default() -> Self {
         Self {
+            format: SparseFormat::Bmp,
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
             block_size: 128,
+            bmp_block_size: 64,
+            max_bmp_grid_bytes: 0,
+            bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
         }
@@ -244,10 +298,14 @@ impl SparseVectorConfig {
     /// Vocabulary: ~30K dimensions (fits in u16)
     pub fn splade() -> Self {
         Self {
+            format: SparseFormat::MaxScore,
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt8,
             weight_threshold: 0.01, // Remove ~30-50% of low-weight postings
             block_size: 128,
+            bmp_block_size: 64,
+            max_bmp_grid_bytes: 0,
+            bmp_superblock_size: 64,
             pruning: Some(0.1), // Keep top 10% per dimension
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -256,6 +314,34 @@ impl SparseVectorConfig {
                 weight_threshold: 0.01,   // Drop low-IDF query tokens
                 max_query_dims: Some(20), // Process top 20 query dimensions
                 pruning: Some(0.1),       // Keep top 10% of query dims
+            }),
+        }
+    }
+
+    /// SPLADE-optimized config with BMP (Block-Max Pruning) format
+    ///
+    /// Same optimization settings as `splade()` but uses the BMP block-at-a-time
+    /// format (Mallia, Suel & Tonellotto, SIGIR 2024) instead of MaxScore.
+    /// BMP divides the document space into fixed-size blocks and processes them
+    /// in decreasing upper-bound order, enabling aggressive early termination.
+    pub fn splade_bmp() -> Self {
+        Self {
+            format: SparseFormat::Bmp,
+            index_size: IndexSize::U16,
+            weight_quantization: WeightQuantization::UInt8,
+            weight_threshold: 0.01,
+            block_size: 128,
+            bmp_block_size: 64,
+            max_bmp_grid_bytes: 0,
+            bmp_superblock_size: 64,
+            pruning: Some(0.1),
+            query_config: Some(SparseQueryConfig {
+                tokenizer: None,
+                weighting: QueryWeighting::One,
+                heap_factor: 0.8,
+                weight_threshold: 0.01,
+                max_query_dims: Some(20),
+                pruning: Some(0.1),
             }),
         }
     }
@@ -270,10 +356,14 @@ impl SparseVectorConfig {
     /// Recommended for: Memory-constrained environments, cache-heavy workloads
     pub fn compact() -> Self {
         Self {
+            format: SparseFormat::MaxScore,
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt4,
             weight_threshold: 0.02, // Slightly higher threshold for UInt4
             block_size: 128,
+            bmp_block_size: 64,
+            max_bmp_grid_bytes: 0,
+            bmp_superblock_size: 64,
             pruning: Some(0.15), // Keep top 15% per dimension
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -291,10 +381,14 @@ impl SparseVectorConfig {
     /// Use for: Research baselines, when effectiveness is critical
     pub fn full_precision() -> Self {
         Self {
+            format: SparseFormat::MaxScore,
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
             block_size: 128,
+            bmp_block_size: 64,
+            max_bmp_grid_bytes: 0,
+            bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
         }
@@ -311,10 +405,14 @@ impl SparseVectorConfig {
     /// Recommended for: Production deployments prioritizing effectiveness
     pub fn conservative() -> Self {
         Self {
+            format: SparseFormat::MaxScore,
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float16,
             weight_threshold: 0.005, // Minimal pruning
             block_size: 128,
+            bmp_block_size: 64,
+            max_bmp_grid_bytes: 0,
+            bmp_superblock_size: 64,
             pruning: None, // No posting list pruning
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -345,21 +443,39 @@ impl SparseVectorConfig {
         self.index_size.bytes() as f32 + self.weight_quantization.bytes_per_weight()
     }
 
-    /// Serialize config to a single byte
+    /// Serialize config to a single byte.
+    ///
+    /// Layout: bits 7-4 = IndexSize, bit 3 = format (0=MaxScore, 1=BMP), bits 2-0 = WeightQuantization
     pub fn to_byte(&self) -> u8 {
-        ((self.index_size as u8) << 4) | (self.weight_quantization as u8)
+        let format_bit = if self.format == SparseFormat::Bmp {
+            0x08
+        } else {
+            0
+        };
+        ((self.index_size as u8) << 4) | format_bit | (self.weight_quantization as u8)
     }
 
-    /// Deserialize config from a single byte
-    /// Note: weight_threshold, block_size and query_config are not serialized in the byte
+    /// Deserialize config from a single byte.
+    ///
+    /// Note: weight_threshold, block_size, bmp_block_size, and query_config are not
+    /// serialized in the byte — they come from the schema.
     pub fn from_byte(b: u8) -> Option<Self> {
-        let index_size = IndexSize::from_u8(b >> 4)?;
-        let weight_quantization = WeightQuantization::from_u8(b & 0x0F)?;
+        let index_size = IndexSize::from_u8((b >> 4) & 0x03)?;
+        let format = if b & 0x08 != 0 {
+            SparseFormat::Bmp
+        } else {
+            SparseFormat::MaxScore
+        };
+        let weight_quantization = WeightQuantization::from_u8(b & 0x07)?;
         Some(Self {
+            format,
             index_size,
             weight_quantization,
             weight_threshold: 0.0,
             block_size: 128,
+            bmp_block_size: 64,
+            max_bmp_grid_bytes: 0,
+            bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
         })

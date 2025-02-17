@@ -85,6 +85,7 @@ pub use postings::{
     SkipList,
     SparseBlock,
     SparseEntry,
+    SparseFormat,
     SparsePosting,
     SparsePostingIterator,
     SparsePostingList,

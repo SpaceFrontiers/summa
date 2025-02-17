@@ -2,9 +2,10 @@
 
 /// Maximum number of query tokens (terms / dimensions) for text and sparse queries.
 /// Queries exceeding this limit are trimmed to the top-weighted terms.
-pub const MAX_QUERY_TOKENS: usize = 16;
+pub const MAX_QUERY_TERMS: usize = 64;
 
 mod bm25;
+pub(crate) mod bmp;
 mod boolean;
 mod boost;
 mod collector;

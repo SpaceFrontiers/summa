@@ -8,10 +8,17 @@ use std::io::Cursor;
 
 use super::super::types::SegmentFiles;
 use super::super::vector_data::LazyFlatVectorData;
+use super::bmp::BmpIndex;
 use super::{SparseIndex, VectorIndex};
 use crate::Result;
 use crate::directories::{Directory, FileHandle};
 use crate::dsl::Schema;
+
+/// Result of loading the `.sparse` file — may contain MaxScore and/or BMP indexes.
+pub struct SparseFileData {
+    pub maxscore_indexes: FxHashMap<u32, SparseIndex>,
+    pub bmp_indexes: FxHashMap<u32, BmpIndex>,
+}
 
 /// Vectors file loading result
 pub struct VectorsFileData {
@@ -183,17 +190,24 @@ pub async fn load_sparse_file<D: Directory>(
     files: &SegmentFiles,
     total_docs: u32,
     schema: &Schema,
-) -> Result<FxHashMap<u32, SparseIndex>> {
+) -> Result<SparseFileData> {
     use crate::segment::format::{SPARSE_FOOTER_MAGIC, SPARSE_FOOTER_SIZE};
+    use crate::structures::SparseVectorConfig;
 
-    let mut indexes = FxHashMap::default();
+    let empty = || SparseFileData {
+        maxscore_indexes: FxHashMap::default(),
+        bmp_indexes: FxHashMap::default(),
+    };
+
+    let mut maxscore_indexes = FxHashMap::default();
+    let mut bmp_indexes = FxHashMap::default();
 
     // Skip loading sparse file if schema has no sparse vector fields
     let has_sparse_vectors = schema
         .fields()
         .any(|(_, entry)| entry.sparse_vector_config.is_some());
     if !has_sparse_vectors {
-        return Ok(indexes);
+        return Ok(empty());
     }
 
     // Try to open sparse file lazily (may not exist if no sparse vectors were indexed)
@@ -201,13 +215,13 @@ pub async fn load_sparse_file<D: Directory>(
         Ok(h) => h,
         Err(e) => {
             log::debug!("No sparse file found ({}): {:?}", files.sparse.display(), e);
-            return Ok(indexes);
+            return Ok(empty());
         }
     };
 
     let file_size = handle.len();
     if file_size < SPARSE_FOOTER_SIZE {
-        return Ok(indexes);
+        return Ok(empty());
     }
 
     // Read footer (24 bytes): skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)
@@ -216,7 +230,7 @@ pub async fn load_sparse_file<D: Directory>(
         .await
     {
         Ok(d) => d,
-        Err(_) => return Ok(indexes),
+        Err(_) => return Ok(empty()),
     };
     let fb = footer_bytes.as_slice();
 
@@ -241,7 +255,7 @@ pub async fn load_sparse_file<D: Directory>(
     );
 
     if num_fields == 0 {
-        return Ok(indexes);
+        return Ok(empty());
     }
 
     // Single tail read: skip section + TOC (skip_offset .. footer_start)
@@ -262,60 +276,114 @@ pub async fn load_sparse_file<D: Directory>(
     for _ in 0..num_fields {
         // Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13 bytes
         let field_id = u32::from_le_bytes(toc_data[pos..pos + 4].try_into().unwrap());
-        let _quantization = toc_data[pos + 4];
+        let quantization = toc_data[pos + 4];
         let ndims = u32::from_le_bytes(toc_data[pos + 5..pos + 9].try_into().unwrap()) as usize;
         let total_vectors = u32::from_le_bytes(toc_data[pos + 9..pos + 13].try_into().unwrap());
         pos += 13;
 
-        // Parse per-dim entries directly into SoA DimensionTable
-        let mut dims = super::types::DimensionTable::with_capacity(ndims);
-        for _ in 0..ndims {
+        // Detect BMP format from the quant byte (bit 3 = format flag)
+        let is_bmp = SparseVectorConfig::from_byte(quantization)
+            .is_some_and(|c| c.format == crate::structures::SparseFormat::Bmp);
+
+        if is_bmp && ndims >= 1 {
+            // BMP field: single sentinel entry with blob location
             let d = &toc_data[pos..pos + 28];
             let dim_id = u32::from_le_bytes(d[0..4].try_into().unwrap());
-            let block_data_offset = u64::from_le_bytes(d[4..12].try_into().unwrap());
-            let skip_start = u32::from_le_bytes(d[12..16].try_into().unwrap());
-            let num_blocks = u32::from_le_bytes(d[16..20].try_into().unwrap());
-            let doc_count = u32::from_le_bytes(d[20..24].try_into().unwrap());
-            let max_weight = f32::from_le_bytes(d[24..28].try_into().unwrap());
-            dims.push(
-                dim_id,
-                block_data_offset,
-                skip_start,
-                num_blocks,
-                doc_count,
-                max_weight,
-            );
+            let blob_offset = u64::from_le_bytes(d[4..12].try_into().unwrap());
+            let blob_len_low = u32::from_le_bytes(d[12..16].try_into().unwrap());
+            let blob_len_high = u32::from_le_bytes(d[16..20].try_into().unwrap());
             pos += 28;
-        }
-        // Ensure sorted by dim_id for binary search
-        dims.sort_by_dim_id();
 
-        log::debug!(
-            "Loaded sparse index for field {}: num_dims={}, total_vectors={}, skip_bytes={}",
-            field_id,
-            dims.len(),
-            total_vectors,
-            skip_section.len(),
-        );
+            // Skip any additional dim entries (shouldn't have more, but be safe)
+            for _ in 1..ndims {
+                pos += 28;
+            }
 
-        indexes.insert(
-            field_id,
-            SparseIndex::new(
+            if dim_id != 0xFFFFFFFF {
+                log::warn!(
+                    "BMP field {} has unexpected dim_id {:#x} (expected sentinel)",
+                    field_id,
+                    dim_id
+                );
+            }
+
+            let blob_len = (blob_len_high as u64) << 32 | blob_len_low as u64;
+
+            match BmpIndex::parse(
                 handle.clone(),
-                dims,
-                skip_section.clone(),
+                blob_offset,
+                blob_len,
                 total_docs,
                 total_vectors,
-            ),
-        );
+            ) {
+                Ok(idx) => {
+                    log::debug!(
+                        "Loaded BMP index for field {}: num_dims={}, num_blocks={}, total_vectors={}",
+                        field_id,
+                        idx.num_dimensions(),
+                        idx.num_blocks,
+                        total_vectors,
+                    );
+                    bmp_indexes.insert(field_id, idx);
+                }
+                Err(e) => {
+                    log::warn!("Failed to load BMP index for field {}: {}", field_id, e);
+                }
+            }
+        } else {
+            // MaxScore field: standard per-dimension entries
+            let mut dims = super::types::DimensionTable::with_capacity(ndims);
+            for _ in 0..ndims {
+                let d = &toc_data[pos..pos + 28];
+                let dim_id = u32::from_le_bytes(d[0..4].try_into().unwrap());
+                let block_data_offset = u64::from_le_bytes(d[4..12].try_into().unwrap());
+                let skip_start = u32::from_le_bytes(d[12..16].try_into().unwrap());
+                let num_blocks = u32::from_le_bytes(d[16..20].try_into().unwrap());
+                let doc_count = u32::from_le_bytes(d[20..24].try_into().unwrap());
+                let max_weight = f32::from_le_bytes(d[24..28].try_into().unwrap());
+                dims.push(
+                    dim_id,
+                    block_data_offset,
+                    skip_start,
+                    num_blocks,
+                    doc_count,
+                    max_weight,
+                );
+                pos += 28;
+            }
+            dims.sort_by_dim_id();
+
+            log::debug!(
+                "Loaded sparse index for field {}: num_dims={}, total_vectors={}, skip_bytes={}",
+                field_id,
+                dims.len(),
+                total_vectors,
+                skip_section.len(),
+            );
+
+            maxscore_indexes.insert(
+                field_id,
+                SparseIndex::new(
+                    handle.clone(),
+                    dims,
+                    skip_section.clone(),
+                    total_docs,
+                    total_vectors,
+                ),
+            );
+        }
     }
 
     log::debug!(
-        "Sparse file loaded: fields={:?}",
-        indexes.keys().collect::<Vec<_>>()
+        "Sparse file loaded: maxscore_fields={:?}, bmp_fields={:?}",
+        maxscore_indexes.keys().collect::<Vec<_>>(),
+        bmp_indexes.keys().collect::<Vec<_>>()
     );
 
-    Ok(indexes)
+    Ok(SparseFileData {
+        maxscore_indexes,
+        bmp_indexes,
+    })
 }
 
 /// Open positions file handle (no header parsing needed - offsets are in TermInfo)

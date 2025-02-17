@@ -29,8 +29,8 @@ mod partitioner;
 
 pub use block::{BlockSparsePostingIterator, BlockSparsePostingList, SparseBlock};
 pub use config::{
-    IndexSize, QueryWeighting, SparseEntry, SparseQueryConfig, SparseVector, SparseVectorConfig,
-    WeightQuantization,
+    IndexSize, QueryWeighting, SparseEntry, SparseFormat, SparseQueryConfig, SparseVector,
+    SparseVectorConfig, WeightQuantization,
 };
 pub use partitioner::optimal_partition;
 

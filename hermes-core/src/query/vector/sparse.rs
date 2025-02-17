@@ -64,7 +64,7 @@ impl SparseVectorQuery {
             combiner: MultiValueCombiner::LogSumExp { temperature: 0.7 },
             heap_factor: 1.0,
             weight_threshold: 0.0,
-            max_query_dims: Some(crate::query::MAX_QUERY_TOKENS),
+            max_query_dims: Some(crate::query::MAX_QUERY_TERMS),
             pruning: None,
             over_fetch_factor: 2.0,
             pruned: None,
@@ -381,7 +381,19 @@ impl Query for SparseVectorQuery {
                 return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>);
             }
 
-            // MaxScore execution with ordinal combining (handles both single and multi-dim)
+            // Auto-detect: try BMP executor first (coupled to index format)
+            if let Some((raw, info)) =
+                crate::query::planner::build_sparse_bmp_results(&infos, reader, limit)
+            {
+                return Ok(crate::query::planner::combine_sparse_results(
+                    raw,
+                    info.combiner,
+                    info.field,
+                    limit,
+                ));
+            }
+
+            // Fall back to MaxScore execution
             if let Some((executor, info)) =
                 crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
             {
@@ -409,7 +421,19 @@ impl Query for SparseVectorQuery {
             return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>);
         }
 
-        // MaxScore execution with ordinal combining (handles both single and multi-dim)
+        // Auto-detect: try BMP executor first (coupled to index format)
+        if let Some((raw, info)) =
+            crate::query::planner::build_sparse_bmp_results(&infos, reader, limit)
+        {
+            return Ok(crate::query::planner::combine_sparse_results(
+                raw,
+                info.combiner,
+                info.field,
+                limit,
+            ));
+        }
+
+        // Fall back to MaxScore execution
         if let Some((executor, info)) =
             crate::query::planner::build_sparse_maxscore_executor(&infos, reader, limit, None)
         {
@@ -496,6 +520,31 @@ impl SparseTermQuery {
         self
     }
 
+    /// BMP fallback: execute BMP for this single dimension and wrap in a TopK scorer.
+    fn bmp_fallback_scorer<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        if let Some(bmp) = reader.bmp_index(self.field) {
+            let results = crate::query::bmp::execute_bmp(
+                bmp,
+                &[(self.dim_id, self.weight)],
+                limit,
+                self.heap_factor,
+            )?;
+            let combined = crate::segment::combine_ordinal_results(
+                results.into_iter().map(|r| (r.doc_id, r.ordinal, r.score)),
+                self.combiner,
+                limit,
+            );
+            return Ok(Box::new(
+                crate::query::planner::VectorTopKResultScorer::new(combined, self.field.0),
+            ));
+        }
+        Ok(Box::new(crate::query::EmptyScorer))
+    }
+
     /// Create a SparseTermScorer from this query's config against a segment.
     /// Returns EmptyScorer if the dimension doesn't exist.
     fn make_scorer<'a>(
@@ -527,12 +576,12 @@ impl SparseTermQuery {
 }
 
 impl Query for SparseTermQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let query = self.clone();
         Box::pin(async move {
             let mut scorer = match query.make_scorer(reader)? {
                 Some(s) => s,
-                None => return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>),
+                None => return query.bmp_fallback_scorer(reader, limit),
             };
             scorer.cursor.ensure_block_loaded().await.ok();
             Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
@@ -543,11 +592,11 @@ impl Query for SparseTermQuery {
     fn scorer_sync<'a>(
         &self,
         reader: &'a SegmentReader,
-        _limit: usize,
+        limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         let mut scorer = match self.make_scorer(reader)? {
             Some(s) => s,
-            None => return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>),
+            None => return self.bmp_fallback_scorer(reader, limit),
         };
         scorer.cursor.ensure_block_loaded_sync().ok();
         Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)

@@ -630,10 +630,14 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
     }
 
     SparseVectorConfig {
+        format: crate::structures::SparseFormat::Bmp,
         index_size,
         weight_quantization: WeightQuantization::default(),
         weight_threshold: 0.0,
         block_size: 128,
+        bmp_block_size: 64,
+        max_bmp_grid_bytes: 0,
+        bmp_superblock_size: 64,
         pruning: None,
         query_config: None,
     }
