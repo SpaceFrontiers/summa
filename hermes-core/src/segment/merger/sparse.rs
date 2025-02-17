@@ -3,14 +3,14 @@
 //! V3 file layout (footer-based, data-first):
 //! ```text
 //! [block data for all dims across all fields]
-//! [skip section: SparseSkipEntry × total (20B each), contiguous]
+//! [skip section: SparseSkipEntry × total (24B each), contiguous]
 //! [TOC: per-field header(9B) + per-dim entries(24B each)]
 //! [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24B]
 //! ```
 //!
 //! Each dimension is merged by stacking raw block bytes from source segments.
 //! No deserialization or re-serialization of block data — only the small
-//! skip entries (20 bytes per block) are written fresh in a separate section.
+//! skip entries (24 bytes per block) are written fresh in a separate section.
 //! The raw block bytes are copied directly from mmap.
 
 use std::io::Write;
@@ -60,8 +60,9 @@ impl SegmentMerger {
 
         // Accumulated per-field data for TOC
         let mut field_tocs: Vec<SparseFieldToc> = Vec::new();
-        // Accumulated skip entries (written in Phase 2)
-        let mut all_skip_entries: Vec<SparseSkipEntry> = Vec::new();
+        // Skip entries serialized as contiguous bytes (24B each)
+        let mut skip_bytes: Vec<u8> = Vec::new();
+        let mut skip_count: u32 = 0;
 
         for (field, sparse_config) in &sparse_fields {
             let format = sparse_config.as_ref().map(|c| c.format).unwrap_or_default();
@@ -171,8 +172,8 @@ impl SegmentMerger {
                 // Phase 1: Write block data only (no header, no skip entries)
                 let block_data_offset = writer.offset();
 
-                // Accumulate adjusted skip entries for Phase 2
-                let skip_start = all_skip_entries.len() as u32;
+                // Serialize adjusted skip entries directly to byte buffer
+                let skip_start = skip_count;
                 let mut cumulative_block_offset = 0u64;
 
                 // Block header layout: count(2) + doc_id_bits(1) + ordinal_bits(1)
@@ -185,15 +186,17 @@ impl SegmentMerger {
                     #[cfg(feature = "diagnostics")]
                     super::diagnostics::validate_merge_source(dim_id, src_idx, raw)?;
 
-                    // Adjust skip entries (doc offsets + block data offsets)
+                    // Serialize adjusted skip entries to byte buffer
                     for entry in &raw.skip_entries {
-                        all_skip_entries.push(SparseSkipEntry::new(
+                        SparseSkipEntry::new(
                             entry.first_doc + doc_offset,
                             entry.last_doc + doc_offset,
                             cumulative_block_offset + entry.offset,
                             entry.length,
                             entry.max_weight,
-                        ));
+                        )
+                        .write_to_vec(&mut skip_bytes);
+                        skip_count += 1;
                     }
                     // Advance cumulative offset by this source's total block data size
                     if let Some(last) = raw.skip_entries.last() {
@@ -250,11 +253,10 @@ impl SegmentMerger {
             return Ok(0);
         }
 
-        // Phase 2: Write skip section (all skip entries contiguous)
+        // Phase 2: Write skip section (dump serialized bytes)
         let skip_offset = writer.offset();
-        for entry in &all_skip_entries {
-            entry.write(&mut writer).map_err(crate::Error::Io)?;
-        }
+        writer.write_all(&skip_bytes).map_err(crate::Error::Io)?;
+        drop(skip_bytes);
 
         // Phase 3 + 4: Write TOC + footer
         let toc_offset = writer.offset();
@@ -270,28 +272,28 @@ impl SegmentMerger {
             output_size as f64 / (1024.0 * 1024.0),
             field_tocs.len(),
             total_dims,
-            all_skip_entries.len(),
+            skip_count,
         );
 
         Ok(output_size)
     }
 }
 
-/// Merge BMP fields using a **two-pass streaming** approach.
+/// Merge BMP fields using a **block-at-a-time** approach.
 ///
-/// Eliminates the O(total_postings) entries Vec and O(total_postings) sort that
-/// caused OOM on large merges. Instead:
+/// Eliminates the O(total_terms) FxHashMap counting structure and O(total_terms)
+/// sorted key vector that caused high memory usage on large merges. Instead:
 ///
-/// **Pass 1 (counting):** Iterates all source postings to build:
-///   - Grid: `num_dims × num_blocks` bytes (with auto-scaling if > 256MB)
-///   - Posting counts per `(output_block, dim_id)` via HashMap
+/// **Fused counting pass:** Iterates output blocks sequentially. For each block:
+///   1. Find contributing source blocks via `source_blocks_for_output()`
+///   2. Count postings per dim_id using a small reusable scratch Vec
+///   3. Update grid and append to metadata arrays incrementally
 ///
-/// **Pass 2 (writing):** Iterates output blocks in order, for each `(block, dim)`
-///   finds source postings via `find_dim_in_block()` and streams them directly
-///   to the V3 blob writer. No intermediate buffer.
+/// **Writing pass (same as before):** Re-iterates source blocks in output order,
+/// streaming postings directly to the V3 blob writer.
 ///
-/// Memory: `O(grid + total_terms)` instead of `O(grid + total_postings)`.
-/// For typical data: ~300MB grid + ~72MB counts vs ~1.5GB grid + 360MB entries + sort.
+/// Memory: `O(grid + metadata_arrays)` instead of `O(grid + counts_hashmap + term_keys)`.
+/// For typical data: ~128MB grid + ~16MB metadata vs ~256MB grid + ~88MB HashMap/keys.
 #[allow(clippy::too_many_arguments)]
 fn merge_bmp_field(
     bmp_indexes: &[Option<&BmpIndex>],
@@ -304,7 +306,6 @@ fn merge_bmp_field(
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
     use byteorder::{LittleEndian, WriteBytesExt};
-    use rustc_hash::FxHashMap;
 
     // ── Phase 0: Compute merged parameters from source segments ──────────
     let mut new_max_weight_scale: f32 = 0.0;
@@ -346,11 +347,9 @@ fn merge_bmp_field(
     let mut dim_ids: Vec<u32> = dim_set.into_iter().collect();
     dim_ids.sort_unstable();
     let num_dims = dim_ids.len();
-    let dim_to_idx: FxHashMap<u32, usize> =
-        dim_ids.iter().enumerate().map(|(i, &d)| (d, i)).collect();
 
-    // ── Grid cap: auto-scale block_size if grid would exceed 256MB ───────
-    const MAX_GRID_BYTES: u64 = 256 * 1024 * 1024;
+    // ── Grid cap: auto-scale block_size if grid would exceed 128MB ───────
+    const MAX_GRID_BYTES: u64 = 128 * 1024 * 1024;
     let mut effective_block_size = bmp_block_size;
     let mut num_blocks = if max_merged_virtual == 0 {
         1
@@ -380,90 +379,106 @@ fn merge_bmp_field(
 
     let ebs = effective_block_size as u64;
 
-    // ── Pass 1: Counting — iterate all source postings ───────────────────
-    // Build grid + count postings per (output_block, dim_id).
-    // Key encoding: (block_id as u64) << 32 | dim_id — avoids tuple hashing.
+    // ── Fused counting pass: block-at-a-time ─────────────────────────────
+    // Build grid + metadata arrays incrementally, one output block at a time.
+    // Per-block scratch (dim_id, posting_count, max_impact) is reused each block.
+    // Eliminates global FxHashMap<u64, u32> counts + Vec<u64> term_keys.
+
     let mut grid = vec![0u8; num_dims * num_blocks];
-    let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
+    let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
+    let mut term_dim_ids: Vec<u32> = Vec::new();
+    let mut term_posting_starts: Vec<u32> = vec![0]; // prefix sums
+    let mut cumulative_postings: u32 = 0;
 
-    for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
-        let bmp = match bmp_opt {
-            Some(b) => b,
-            None => continue,
-        };
-        let doc_offset = doc_offs[seg_idx];
-        let rescale = bmp.max_weight_scale / new_max_weight_scale;
+    // Per-block scratch: (dim_id, posting_count, max_impact) — reused each iteration
+    let mut block_scratch: Vec<(u32, u32, u8)> = Vec::new();
 
-        for block_id in 0..bmp.num_blocks {
-            let (term_start, term_end) = bmp.block_term_range(block_id);
+    for block in 0..num_blocks as u32 {
+        block_term_starts.push(term_dim_ids.len() as u32);
+        block_scratch.clear();
 
-            for rel_idx in 0..(term_end - term_start) {
-                let ti = term_start + rel_idx;
-                let dim_id = bmp.block_term_dim_id(ti);
-                let dim_idx = dim_to_idx[&dim_id];
+        for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
+            let bmp = match bmp_opt {
+                Some(b) => b,
+                None => continue,
+            };
+            let doc_offset = doc_offs[seg_idx];
+            let rescale = bmp.max_weight_scale / new_max_weight_scale;
 
-                for p in bmp.term_postings(ti) {
-                    let src_virtual = block_id * bmp.bmp_block_size + p.local_slot as u32;
-                    let (doc_id, ordinal) = bmp.virtual_to_doc(src_virtual);
-                    let new_doc_id = doc_id + doc_offset;
-                    let new_virtual = new_doc_id as u64 * new_num_ordinals as u64 + ordinal as u64;
-                    let new_block_id = (new_virtual / ebs) as u32;
-
-                    let new_impact = rescale_impact(p.impact, rescale);
-                    if new_impact == 0 {
-                        continue;
+            let (src_start, src_end) =
+                source_blocks_for_output(block, ebs, bmp, doc_offset, new_num_ordinals);
+            for src_block in src_start..src_end {
+                let (st, et) = bmp.block_term_range(src_block);
+                for ti in st..et {
+                    let dim_id = bmp.block_term_dim_id(ti);
+                    let mut count = 0u32;
+                    let mut max_imp = 0u8;
+                    for p in bmp.term_postings(ti) {
+                        let src_virtual = src_block * bmp.bmp_block_size + p.local_slot as u32;
+                        let (doc_id, ordinal) = bmp.virtual_to_doc(src_virtual);
+                        let new_doc_id = doc_id + doc_offset;
+                        let new_virtual =
+                            new_doc_id as u64 * new_num_ordinals as u64 + ordinal as u64;
+                        let new_block_id = (new_virtual / ebs) as u32;
+                        if new_block_id != block {
+                            continue;
+                        }
+                        let imp = rescale_impact(p.impact, rescale);
+                        if imp == 0 {
+                            continue;
+                        }
+                        count += 1;
+                        if imp > max_imp {
+                            max_imp = imp;
+                        }
                     }
-
-                    let grid_idx = dim_idx * num_blocks + new_block_id as usize;
-                    if new_impact > grid[grid_idx] {
-                        grid[grid_idx] = new_impact;
+                    if count > 0 {
+                        block_scratch.push((dim_id, count, max_imp));
                     }
-
-                    let key = (new_block_id as u64) << 32 | dim_id as u64;
-                    *counts.entry(key).or_default() += 1;
                 }
             }
         }
-    }
 
-    if counts.is_empty() {
-        return Ok(());
-    }
+        if block_scratch.is_empty() {
+            continue;
+        }
 
-    // ── Build V3 metadata from counts ────────────────────────────────────
-    let mut term_keys: Vec<u64> = counts.keys().copied().collect();
-    term_keys.sort_unstable(); // sorted by (block_id, dim_id) due to key encoding
+        // Sort by dim_id, merge duplicates
+        block_scratch.sort_unstable_by_key(|&(d, _, _)| d);
 
-    let total_terms = term_keys.len();
-    let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
-    let mut term_dim_ids: Vec<u32> = Vec::with_capacity(total_terms);
-    let mut term_posting_starts: Vec<u32> = Vec::with_capacity(total_terms + 1);
-    term_posting_starts.push(0);
-
-    let mut cumulative_postings = 0u32;
-    let mut key_idx = 0;
-    for block in 0..num_blocks as u32 {
-        block_term_starts.push(term_dim_ids.len() as u32);
-        while key_idx < term_keys.len() {
-            let key = term_keys[key_idx];
-            let block_id = (key >> 32) as u32;
-            if block_id != block {
-                break;
+        let mut i = 0;
+        while i < block_scratch.len() {
+            let dim_id = block_scratch[i].0;
+            let mut total_count = 0u32;
+            let mut max_imp = 0u8;
+            while i < block_scratch.len() && block_scratch[i].0 == dim_id {
+                total_count += block_scratch[i].1;
+                if block_scratch[i].2 > max_imp {
+                    max_imp = block_scratch[i].2;
+                }
+                i += 1;
             }
-            let dim_id = (key & 0xFFFFFFFF) as u32;
+
+            // Update grid (binary search instead of HashMap lookup)
+            let dim_idx = dim_ids.binary_search(&dim_id).unwrap();
+            let grid_idx = dim_idx * num_blocks + block as usize;
+            if max_imp > grid[grid_idx] {
+                grid[grid_idx] = max_imp;
+            }
+
             term_dim_ids.push(dim_id);
-            cumulative_postings += counts[&key];
+            cumulative_postings += total_count;
             term_posting_starts.push(cumulative_postings);
-            key_idx += 1;
         }
     }
     block_term_starts.push(term_dim_ids.len() as u32);
 
+    let total_terms = term_dim_ids.len();
     let total_postings = cumulative_postings;
 
-    // Drop counting structures — no longer needed
-    drop(counts);
-    drop(term_keys);
+    if total_terms == 0 {
+        return Ok(());
+    }
 
     log::debug!(
         "[merge_bmp] field {}: {} dims, {} terms, {} postings, {} blocks (block_size={})",
@@ -475,7 +490,7 @@ fn merge_bmp_field(
         effective_block_size,
     );
 
-    // ── Pass 2: Write V3 blob — sections streamed in order ───────────────
+    // ── Write V3 blob — sections streamed in order ───────────────────────
     let blob_start = writer.offset();
     let mut bytes_written: u64 = 0;
 
