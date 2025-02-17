@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SparseFormat {
     /// Per-dimension variable-size blocks (existing format, DAAT MaxScore)
-    #[default]
     MaxScore,
     /// Fixed doc_id range blocks (BMP, BAAT block-at-a-time)
+    #[default]
     Bmp,
 }
 
@@ -266,7 +266,7 @@ fn default_bmp_superblock_size() -> u32 {
 impl Default for SparseVectorConfig {
     fn default() -> Self {
         Self {
-            format: SparseFormat::MaxScore,
+            format: SparseFormat::Bmp,
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,

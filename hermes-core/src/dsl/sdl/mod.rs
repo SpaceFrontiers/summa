@@ -630,7 +630,7 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
     }
 
     SparseVectorConfig {
-        format: crate::structures::SparseFormat::MaxScore,
+        format: crate::structures::SparseFormat::Bmp,
         index_size,
         weight_quantization: WeightQuantization::default(),
         weight_threshold: 0.0,

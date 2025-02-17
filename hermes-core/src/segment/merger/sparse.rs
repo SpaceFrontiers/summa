@@ -71,40 +71,36 @@ impl SegmentMerger {
                 .map(|c| c.weight_quantization)
                 .unwrap_or(crate::structures::WeightQuantization::Float32);
 
-            // BMP format: iterate source blocks, remap doc_ids, stream to output
+            // BMP format: merge BMP indexes if any source segments have them
             if format == SparseFormat::Bmp {
                 let bmp_indexes: Vec<Option<&BmpIndex>> = segments
                     .iter()
                     .map(|seg| seg.bmp_indexes().get(&field.0))
                     .collect();
-                let total_vectors_bmp: u32 = bmp_indexes
-                    .iter()
-                    .filter_map(|bi| bi.map(|idx| idx.total_vectors))
-                    .sum();
                 let has_bmp_data = bmp_indexes.iter().any(|bi| bi.is_some());
                 if has_bmp_data {
+                    let total_vectors_bmp: u32 = bmp_indexes
+                        .iter()
+                        .filter_map(|bi| bi.map(|idx| idx.total_vectors))
+                        .sum();
                     let bmp_block_size = sparse_config
                         .as_ref()
                         .map(|c| c.bmp_block_size)
                         .unwrap_or(64);
-                    let max_grid_bytes = sparse_config
-                        .as_ref()
-                        .map(|c| c.max_bmp_grid_bytes)
-                        .unwrap_or(0);
-
                     merge_bmp_field(
                         &bmp_indexes,
                         &doc_offs,
                         field.0,
                         quantization,
                         bmp_block_size,
-                        max_grid_bytes,
                         total_vectors_bmp,
                         &mut writer,
                         &mut field_tocs,
                     )?;
+                    continue;
                 }
-                continue;
+                // No BMP data — fall through to MaxScore path
+                // (handles legacy segments that used MaxScore format)
             }
 
             // MaxScore format: byte-level block stacking
@@ -306,7 +302,6 @@ fn merge_bmp_field(
     field_id: u32,
     quantization: crate::structures::WeightQuantization,
     bmp_block_size: u32,
-    max_grid_bytes: u64,
     total_vectors: u32,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
@@ -354,63 +349,13 @@ fn merge_bmp_field(
     dim_ids.sort_unstable();
     let num_dims = dim_ids.len();
 
-    // ── Grid cap: auto-scale block_size if grid would exceed limit ─────
-    // 0 = use default (512MB); otherwise honour the per-field config value
-    let grid_cap = if max_grid_bytes > 0 {
-        max_grid_bytes
-    } else {
-        512 * 1024 * 1024
-    };
-    let mut effective_block_size = bmp_block_size;
-    let mut num_blocks = if max_merged_virtual == 0 {
+    // Safety: local_slot is u8, so block_size must not exceed 256
+    let effective_block_size = bmp_block_size.min(256);
+    let num_blocks = if max_merged_virtual == 0 {
         1
     } else {
         (max_merged_virtual / effective_block_size as u64 + 1) as usize
     };
-
-    let grid_bytes = num_dims as u64 * num_blocks as u64;
-    if grid_bytes > grid_cap && num_dims > 0 {
-        let max_blocks = grid_cap / num_dims as u64;
-        if let Some(ratio) = max_merged_virtual.checked_div(max_blocks) {
-            effective_block_size = (ratio + 1).next_power_of_two() as u32;
-            effective_block_size = effective_block_size.max(bmp_block_size);
-            num_blocks = (max_merged_virtual / effective_block_size as u64 + 1) as usize;
-            log::info!(
-                "[merge_bmp] grid cap: {:.0}MB ({} dims × {} blocks), \
-                 auto-scaled block_size {} → {} (num_blocks {})",
-                grid_bytes as f64 / (1024.0 * 1024.0),
-                num_dims,
-                grid_bytes / num_dims as u64,
-                bmp_block_size,
-                effective_block_size,
-                num_blocks,
-            );
-        }
-    }
-
-    // Cap block_size at 256 to prevent u8 overflow in local_slot postings
-    if effective_block_size > 256 {
-        effective_block_size = 256;
-        num_blocks = if max_merged_virtual == 0 {
-            1
-        } else {
-            (max_merged_virtual / effective_block_size as u64 + 1) as usize
-        };
-
-        let capped_grid = num_dims as u64 * num_blocks as u64;
-        if capped_grid > grid_cap {
-            log::warn!(
-                "[merge_bmp] Grid {:.0}MB ({} dims × {} blocks) exceeds {:.0}MB cap at block_size=256 \
-                 for field {}, skipping BMP merge",
-                capped_grid as f64 / (1024.0 * 1024.0),
-                num_dims,
-                num_blocks,
-                grid_cap as f64 / (1024.0 * 1024.0),
-                field_id,
-            );
-            return Ok(());
-        }
-    }
 
     let ebs = effective_block_size as u64;
 

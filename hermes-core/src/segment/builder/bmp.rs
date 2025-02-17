@@ -51,36 +51,15 @@ use rustc_hash::FxHashMap;
 use crate::DocId;
 use crate::segment::format::BMP_BLOB_MAGIC_V3;
 
-/// Build a BMP blob from per-dimension postings (convenience wrapper for tests).
-#[cfg(test)]
-fn build_bmp_blob(
-    postings: &mut FxHashMap<u32, Vec<(DocId, u16, f32)>>,
-    bmp_block_size: u32,
-    weight_threshold: f32,
-    pruning_fraction: Option<f32>,
-    writer: &mut dyn Write,
-) -> std::io::Result<u64> {
-    build_bmp_blob_with_grid_cap(
-        postings,
-        bmp_block_size,
-        weight_threshold,
-        pruning_fraction,
-        0,
-        writer,
-    )
-}
-
-/// Build a BMP blob with configurable grid memory cap.
+/// Build a BMP V3 blob from per-dimension postings.
 ///
-/// If the grid (num_dims × num_blocks bytes) would exceed `max_grid_bytes`,
-/// `bmp_block_size` is automatically increased (to next power of 2) to reduce
-/// num_blocks until the grid fits. Set `max_grid_bytes = 0` to disable the cap.
-pub(crate) fn build_bmp_blob_with_grid_cap(
+/// The grid (num_dims × num_blocks bytes) is allocated as a transient Vec
+/// and freed after writing. `bmp_block_size` is clamped to 256 max (u8 local_slot).
+pub(crate) fn build_bmp_blob(
     postings: &mut FxHashMap<u32, Vec<(DocId, u16, f32)>>,
     bmp_block_size: u32,
     weight_threshold: f32,
     pruning_fraction: Option<f32>,
-    max_grid_bytes: u64,
     writer: &mut dyn Write,
 ) -> std::io::Result<u64> {
     if postings.is_empty() {
@@ -138,57 +117,13 @@ pub(crate) fn build_bmp_blob_with_grid_cap(
 
     // Virtual ID space
     let max_virtual_id = max_doc_id as u64 * num_ordinals as u64 + max_ordinal as u64;
-    let mut effective_block_size = bmp_block_size;
-    let mut num_blocks = (max_virtual_id / effective_block_size as u64 + 1) as usize;
+    // Safety: local_slot is u8, so block_size must not exceed 256
+    let effective_block_size = bmp_block_size.min(256);
+    let num_blocks = (max_virtual_id / effective_block_size as u64 + 1) as usize;
 
     let mut dim_ids: Vec<u32> = postings.keys().copied().collect();
     dim_ids.sort_unstable();
     let num_dims = dim_ids.len();
-
-    // Auto-scale block_size if grid would exceed memory cap
-    if max_grid_bytes > 0 {
-        let grid_bytes = num_dims as u64 * num_blocks as u64;
-        if grid_bytes > max_grid_bytes && num_dims > 0 {
-            let max_blocks = max_grid_bytes / num_dims as u64;
-            if let Some(ratio) = max_virtual_id.checked_div(max_blocks) {
-                effective_block_size = ((ratio) + 1).next_power_of_two() as u32;
-                effective_block_size = effective_block_size.max(bmp_block_size);
-                num_blocks = (max_virtual_id / effective_block_size as u64 + 1) as usize;
-                log::info!(
-                    "BMP grid would be {:.0}MB ({} dims × {} blocks), \
-                     auto-scaled block_size {} → {} (num_blocks {})",
-                    grid_bytes as f64 / (1024.0 * 1024.0),
-                    num_dims,
-                    grid_bytes / num_dims as u64,
-                    bmp_block_size,
-                    effective_block_size,
-                    num_blocks,
-                );
-            }
-        }
-    }
-
-    // Cap block_size at 256 to prevent u8 overflow in local_slot postings
-    if effective_block_size > 256 {
-        effective_block_size = 256;
-        num_blocks = (max_virtual_id / effective_block_size as u64 + 1) as usize;
-
-        // If grid still exceeds cap at max block_size, BMP is infeasible
-        if max_grid_bytes > 0 {
-            let capped_grid = num_dims as u64 * num_blocks as u64;
-            if capped_grid > max_grid_bytes {
-                log::info!(
-                    "[bmp] Grid {:.0}MB ({} dims × {} blocks) exceeds {:.0}MB cap at block_size=256, \
-                     BMP infeasible for this field",
-                    capped_grid as f64 / (1024.0 * 1024.0),
-                    num_dims,
-                    num_blocks,
-                    max_grid_bytes as f64 / (1024.0 * 1024.0),
-                );
-                return Ok(0);
-            }
-        }
-    }
 
     // Phase 2: Flatten all postings into a single sorted Vec + build grid
     let dim_to_idx: FxHashMap<u32, usize> =

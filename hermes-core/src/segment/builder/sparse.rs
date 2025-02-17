@@ -109,17 +109,12 @@ pub(super) fn build_sparse_streaming(
                 let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
                 let weight_threshold = sparse_config.map(|c| c.weight_threshold).unwrap_or(0.0);
 
-                let max_grid_bytes = sparse_config
-                    .map(|c| c.max_bmp_grid_bytes)
-                    .unwrap_or(1024 * 1024 * 1024);
-
                 let blob_offset = current_offset;
-                let blob_len = super::bmp::build_bmp_blob_with_grid_cap(
+                let blob_len = super::bmp::build_bmp_blob(
                     &mut builder.postings,
                     bmp_block_size,
                     weight_threshold,
                     pruning_fraction,
-                    max_grid_bytes,
                     writer,
                 )
                 .map_err(crate::Error::Io)?;
