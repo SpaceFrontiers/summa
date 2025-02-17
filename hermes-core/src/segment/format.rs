@@ -92,14 +92,14 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Magic number for BMP V3 blob footer within `.sparse` file ("BMP3" in LE)
-pub const BMP_BLOB_MAGIC_V3: u32 = 0x33504D42;
+/// Magic number for BMP V5 blob footer within `.sparse` file ("BMP5" in LE)
+pub const BMP_BLOB_MAGIC_V5: u32 = 0x35504D42;
 
-/// BMP V3 blob footer size (48 bytes):
+/// BMP V5 blob footer size (48 bytes):
 /// total_terms(4) + total_postings(4) + dim_ids_offset(4) + grid_offset(4) +
 /// num_blocks(4) + num_dims(4) + bmp_block_size(4) + num_ordinals(4) +
-/// max_weight_scale(4) + _reserved(4) + _reserved(4) + magic(4)
-pub const BMP_BLOB_FOOTER_SIZE_V3: usize = 48;
+/// max_weight_scale(4) + sb_grid_offset(4) + _reserved(4) + magic(4)
+pub const BMP_BLOB_FOOTER_SIZE_V5: usize = 48;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;

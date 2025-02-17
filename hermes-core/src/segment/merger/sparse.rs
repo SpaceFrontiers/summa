@@ -280,21 +280,16 @@ impl SegmentMerger {
     }
 }
 
-/// Merge BMP fields using a **block-at-a-time** approach.
+/// Merge BMP fields using a **single-pass block-at-a-time** approach.
 ///
-/// Eliminates the O(total_terms) FxHashMap counting structure and O(total_terms)
-/// sorted key vector that caused high memory usage on large merges. Instead:
-///
-/// **Fused counting pass:** Iterates output blocks sequentially. For each block:
-///   1. Find contributing source blocks via `source_blocks_for_output()`
-///   2. Count postings per dim_id using a small reusable scratch Vec
-///   3. Update grid and append to metadata arrays incrementally
-///
-/// **Writing pass (same as before):** Re-iterates source blocks in output order,
-/// streaming postings directly to the V3 blob writer.
-///
-/// Memory: `O(grid + metadata_arrays)` instead of `O(grid + counts_hashmap + term_keys)`.
-/// For typical data: ~128MB grid + ~16MB metadata vs ~256MB grid + ~88MB HashMap/keys.
+/// V4 improvements over V3:
+/// - **Single pass**: postings are buffered per-dim during the counting pass,
+///   eliminating the second iteration over source segments entirely.
+/// - **FxHashMap dim lookup**: O(1) dim_id → dim_idx instead of O(log n) binary search.
+/// - **Indexed arrays**: per-dim counts and max impacts use flat arrays indexed by dim_idx,
+///   with a `touched_dims` list for O(touched) reset instead of O(num_dims).
+/// - **sb_grid on disk**: superblock grid is computed during merge and persisted in V4 format.
+/// - **Bulk writes**: `write_u32_slice_le()` for sections 1-3, 6.
 #[allow(clippy::too_many_arguments)]
 fn merge_bmp_field(
     bmp_indexes: &[Option<&BmpIndex>],
@@ -306,6 +301,8 @@ fn merge_bmp_field(
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
+    use crate::segment::builder::bmp::{pack_grid_4bit, write_u32_slice_le};
+    use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
     use byteorder::{LittleEndian, WriteBytesExt};
 
     // ── Phase 0: Compute merged parameters from source segments ──────────
@@ -349,6 +346,10 @@ fn merge_bmp_field(
     dim_ids.sort_unstable();
     let num_dims = dim_ids.len();
 
+    // FxHashMap for O(1) dim_id → dim_idx lookup (replaces binary search)
+    let dim_to_idx: rustc_hash::FxHashMap<u32, usize> =
+        dim_ids.iter().enumerate().map(|(i, &d)| (d, i)).collect();
+
     // Safety: local_slot is u8, so block_size must not exceed 256
     let effective_block_size = bmp_block_size.min(256);
     let num_blocks = if max_merged_virtual == 0 {
@@ -358,24 +359,34 @@ fn merge_bmp_field(
     };
 
     let ebs = effective_block_size as u64;
+    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
-    // ── Fused counting pass: block-at-a-time ─────────────────────────────
-    // Build grid + metadata arrays incrementally, one output block at a time.
-    // Per-block scratch (dim_id, posting_count, max_impact) is reused each block.
-    // Eliminates global FxHashMap<u64, u32> counts + Vec<u64> term_keys.
-
+    // ── Single-pass: buffer postings + count simultaneously ──────────────
     let mut grid = vec![0u8; num_dims * num_blocks];
+    let mut sb_grid = vec![0u8; num_dims * num_superblocks];
     let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
     let mut term_dim_ids: Vec<u32> = Vec::new();
     let mut term_posting_starts: Vec<u32> = vec![0]; // prefix sums
     let mut cumulative_postings: u32 = 0;
 
-    // Per-block scratch: (dim_id, posting_count, max_impact) — reused each iteration
-    let mut block_scratch: Vec<(u32, u32, u8)> = Vec::new();
+    // Per-dim indexed arrays (reused each block via touched_dims)
+    let mut dim_counts = vec![0u32; num_dims];
+    let mut dim_max_imp = vec![0u8; num_dims];
+    let mut touched_dims: Vec<usize> = Vec::new();
+    let mut dim_posting_bufs: Vec<Vec<u8>> = vec![Vec::new(); num_dims];
+
+    // Flat buffer for all postings across all blocks
+    let mut postings_buf: Vec<u8> = Vec::new();
 
     for block in 0..num_blocks as u32 {
         block_term_starts.push(term_dim_ids.len() as u32);
-        block_scratch.clear();
+
+        // Reset touched dims — O(touched) not O(num_dims)
+        for &d in &touched_dims {
+            dim_counts[d] = 0;
+            dim_max_imp[d] = 0;
+        }
+        touched_dims.clear();
 
         for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
             let bmp = match bmp_opt {
@@ -391,8 +402,8 @@ fn merge_bmp_field(
                 let (st, et) = bmp.block_term_range(src_block);
                 for ti in st..et {
                     let dim_id = bmp.block_term_dim_id(ti);
-                    let mut count = 0u32;
-                    let mut max_imp = 0u8;
+                    let dim_idx = dim_to_idx[&dim_id];
+
                     for p in bmp.term_postings(ti) {
                         let src_virtual = src_block * bmp.bmp_block_size + p.local_slot as u32;
                         let (doc_id, ordinal) = bmp.virtual_to_doc(src_virtual);
@@ -407,48 +418,48 @@ fn merge_bmp_field(
                         if imp == 0 {
                             continue;
                         }
-                        count += 1;
-                        if imp > max_imp {
-                            max_imp = imp;
+
+                        if dim_counts[dim_idx] == 0 {
+                            touched_dims.push(dim_idx);
                         }
-                    }
-                    if count > 0 {
-                        block_scratch.push((dim_id, count, max_imp));
+                        dim_counts[dim_idx] += 1;
+                        if imp > dim_max_imp[dim_idx] {
+                            dim_max_imp[dim_idx] = imp;
+                        }
+
+                        let new_local_slot = (new_virtual % ebs) as u8;
+                        dim_posting_bufs[dim_idx].push(new_local_slot);
+                        dim_posting_bufs[dim_idx].push(imp);
                     }
                 }
             }
         }
 
-        if block_scratch.is_empty() {
+        if touched_dims.is_empty() {
             continue;
         }
 
-        // Sort by dim_id, merge duplicates
-        block_scratch.sort_unstable_by_key(|&(d, _, _)| d);
-
-        let mut i = 0;
-        while i < block_scratch.len() {
-            let dim_id = block_scratch[i].0;
-            let mut total_count = 0u32;
-            let mut max_imp = 0u8;
-            while i < block_scratch.len() && block_scratch[i].0 == dim_id {
-                total_count += block_scratch[i].1;
-                if block_scratch[i].2 > max_imp {
-                    max_imp = block_scratch[i].2;
-                }
-                i += 1;
-            }
-
-            // Update grid (binary search instead of HashMap lookup)
-            let dim_idx = dim_ids.binary_search(&dim_id).unwrap();
-            let grid_idx = dim_idx * num_blocks + block as usize;
-            if max_imp > grid[grid_idx] {
-                grid[grid_idx] = max_imp;
-            }
-
-            term_dim_ids.push(dim_id);
-            cumulative_postings += total_count;
+        // Sort touched dims by dim_id, emit metadata + buffer postings
+        touched_dims.sort_unstable_by_key(|&idx| dim_ids[idx]);
+        for &dim_idx in &touched_dims {
+            term_dim_ids.push(dim_ids[dim_idx]);
+            cumulative_postings += dim_counts[dim_idx];
             term_posting_starts.push(cumulative_postings);
+
+            // Grid
+            let grid_idx = dim_idx * num_blocks + block as usize;
+            grid[grid_idx] = dim_max_imp[dim_idx];
+
+            // sb_grid
+            let sb = block as usize / BMP_SUPERBLOCK_SIZE as usize;
+            let sb_idx = dim_idx * num_superblocks + sb;
+            if dim_max_imp[dim_idx] > sb_grid[sb_idx] {
+                sb_grid[sb_idx] = dim_max_imp[dim_idx];
+            }
+
+            // Flush dim postings to flat buffer
+            postings_buf.extend_from_slice(&dim_posting_bufs[dim_idx]);
+            dim_posting_bufs[dim_idx].clear();
         }
     }
     block_term_starts.push(term_dim_ids.len() as u32);
@@ -470,96 +481,29 @@ fn merge_bmp_field(
         effective_block_size,
     );
 
-    // ── Write V3 blob — sections streamed in order ───────────────────────
+    // ── Write V4 blob — no second pass ───────────────────────────────────
     let blob_start = writer.offset();
     let mut bytes_written: u64 = 0;
 
     // Section 1: block_term_starts [u32-LE × (num_blocks + 1)]
-    for &v in &block_term_starts {
-        writer
-            .write_u32::<LittleEndian>(v)
-            .map_err(crate::Error::Io)?;
-    }
-    bytes_written += block_term_starts.len() as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, &block_term_starts).map_err(crate::Error::Io)?;
 
     // Section 2: term_dim_ids [u32-LE × total_terms]
-    for &v in &term_dim_ids {
-        writer
-            .write_u32::<LittleEndian>(v)
-            .map_err(crate::Error::Io)?;
-    }
-    bytes_written += total_terms as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, &term_dim_ids).map_err(crate::Error::Io)?;
 
     // Section 3: term_posting_starts [u32-LE × (total_terms + 1)]
-    for &v in &term_posting_starts {
-        writer
-            .write_u32::<LittleEndian>(v)
-            .map_err(crate::Error::Io)?;
-    }
-    bytes_written += term_posting_starts.len() as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, &term_posting_starts).map_err(crate::Error::Io)?;
 
-    // Section 4: postings — re-iterate source segments in output order
-    // For each (output_block, dim_id), find source postings and stream them.
-    let mut postings_written = 0u32;
-    for block in 0..num_blocks as u32 {
-        let ts = block_term_starts[block as usize] as usize;
-        let te = block_term_starts[block as usize + 1] as usize;
-        if ts == te {
-            continue;
-        }
-
-        for &dim_id in &term_dim_ids[ts..te] {
-            for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
-                let bmp = match bmp_opt {
-                    Some(b) => b,
-                    None => continue,
-                };
-                let doc_offset = doc_offs[seg_idx];
-                let rescale = bmp.max_weight_scale / new_max_weight_scale;
-
-                // Determine which source blocks contribute to this output block
-                let (src_start, src_end) =
-                    source_blocks_for_output(block, ebs, bmp, doc_offset, new_num_ordinals);
-                if src_start >= src_end {
-                    continue;
-                }
-
-                for src_block in src_start..src_end {
-                    let (st, et) = bmp.block_term_range(src_block);
-                    if let Some(src_ti) = bmp.find_dim_in_block(st, et, dim_id) {
-                        for p in bmp.term_postings(src_ti) {
-                            let src_virtual = src_block * bmp.bmp_block_size + p.local_slot as u32;
-                            let (doc_id, ordinal) = bmp.virtual_to_doc(src_virtual);
-                            let new_doc_id = doc_id + doc_offset;
-                            let new_virtual =
-                                new_doc_id as u64 * new_num_ordinals as u64 + ordinal as u64;
-                            let new_block_id = (new_virtual / ebs) as u32;
-                            if new_block_id != block {
-                                continue;
-                            }
-
-                            let new_local_slot = (new_virtual % ebs) as u8;
-                            let new_impact = rescale_impact(p.impact, rescale);
-                            if new_impact == 0 {
-                                continue;
-                            }
-
-                            writer
-                                .write_all(&[new_local_slot, new_impact])
-                                .map_err(crate::Error::Io)?;
-                            postings_written += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    bytes_written += postings_written as u64 * 2;
+    // Section 4: postings — single write from buffer (no second pass!)
+    writer.write_all(&postings_buf).map_err(crate::Error::Io)?;
+    bytes_written += postings_buf.len() as u64;
 
     debug_assert_eq!(
-        postings_written, total_postings,
-        "BMP merge posting count mismatch: wrote {} but expected {}",
-        postings_written, total_postings
+        postings_buf.len() as u32,
+        total_postings * 2,
+        "BMP merge posting count mismatch: buffered {} bytes but expected {} postings × 2",
+        postings_buf.len(),
+        total_postings
     );
 
     // Section 5: padding to 4-byte boundary
@@ -573,20 +517,21 @@ fn merge_bmp_field(
 
     // Section 6: dim_ids [u32-LE × num_dims]
     let dim_ids_offset = bytes_written as u32;
-    for &d in &dim_ids {
-        writer
-            .write_u32::<LittleEndian>(d)
-            .map_err(crate::Error::Io)?;
-    }
-    bytes_written += num_dims as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, &dim_ids).map_err(crate::Error::Io)?;
 
-    // Section 7: grid [u8 × (num_dims × num_blocks)]
+    // Section 7: grid_packed4 [u8 × (num_dims × packed_row_size)] — 4-bit packed
     let grid_offset = bytes_written as u32;
-    writer.write_all(&grid).map_err(crate::Error::Io)?;
-    bytes_written += grid.len() as u64;
+    let packed_grid = pack_grid_4bit(&grid, num_dims, num_blocks);
+    writer.write_all(&packed_grid).map_err(crate::Error::Io)?;
+    bytes_written += packed_grid.len() as u64;
 
-    // BMP V3 Footer (48 bytes)
-    use crate::segment::format::BMP_BLOB_MAGIC_V3;
+    // Section 8: sb_grid [u8 × (num_dims × num_superblocks)] — full 8-bit precision
+    let sb_grid_offset = bytes_written as u32;
+    writer.write_all(&sb_grid).map_err(crate::Error::Io)?;
+    bytes_written += sb_grid.len() as u64;
+
+    // BMP V5 Footer (48 bytes)
+    use crate::segment::format::BMP_BLOB_MAGIC_V5;
     writer
         .write_u32::<LittleEndian>(total_terms as u32)
         .map_err(crate::Error::Io)?;
@@ -615,13 +560,13 @@ fn merge_bmp_field(
         .write_f32::<LittleEndian>(new_max_weight_scale)
         .map_err(crate::Error::Io)?;
     writer
-        .write_u32::<LittleEndian>(0)
+        .write_u32::<LittleEndian>(sb_grid_offset)
         .map_err(crate::Error::Io)?;
     writer
         .write_u32::<LittleEndian>(0)
         .map_err(crate::Error::Io)?;
     writer
-        .write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V3)
+        .write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V5)
         .map_err(crate::Error::Io)?;
     bytes_written += 48;
 

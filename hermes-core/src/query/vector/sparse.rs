@@ -532,6 +532,7 @@ impl SparseTermQuery {
                 &[(self.dim_id, self.weight)],
                 limit,
                 self.heap_factor,
+                0,
             )?;
             let combined = crate::segment::combine_ordinal_results(
                 results.into_iter().map(|r| (r.doc_id, r.ordinal, r.score)),

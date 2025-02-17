@@ -193,7 +193,7 @@ pub(crate) fn build_sparse_bmp_results(
         return None;
     }
     let executor_limit = (limit as f32 * infos[0].over_fetch_factor).ceil() as usize;
-    match super::bmp::execute_bmp(bmp, &query_terms, executor_limit, infos[0].heap_factor) {
+    match super::bmp::execute_bmp(bmp, &query_terms, executor_limit, infos[0].heap_factor, 0) {
         Ok(results) => Some((results, infos[0])),
         Err(e) => {
             log::warn!("BMP execution failed for field {}: {}", field.0, e);
@@ -227,6 +227,7 @@ pub(crate) fn build_sparse_bmp_results_filtered(
         &query_terms,
         executor_limit,
         infos[0].heap_factor,
+        0,
         predicate,
     ) {
         Ok(results) => Some((results, infos[0])),

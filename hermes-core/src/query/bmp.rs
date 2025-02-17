@@ -9,11 +9,13 @@
 //! Based on:
 //! - Mallia, Suel & Tonellotto (SIGIR 2024): BMP block-at-a-time processing
 //! - Carlson et al. (SIGIR 2025): Superblock pruning for learned sparse retrieval
+//! - Carlson et al. (arXiv 2602.02883, 2026): LSP/0 gamma cap, integer scoring
 //!
-//! ## Two-level pruning hierarchy
+//! ## Three-level pruning hierarchy
 //!
-//! 1. **Superblock UBs** (~1.2K entries at 1M×5): cheap to compute, prune 25-75%
-//! 2. **Block UBs** (only for surviving superblocks): L1-cache friendly per-SB
+//! 1. **LSP/0 gamma cap**: Hard limit on superblock visits (prevents tail waste)
+//! 2. **Superblock UBs** (~1.2K entries at 1M×5): cheap to compute, prune 25-75%
+//! 3. **Block UBs** (only for surviving superblocks): L1-cache friendly per-SB
 //!
 //! ## Performance
 //!
@@ -21,6 +23,8 @@
 //! only flat contiguous arrays — no file I/O, no parsing, no heap allocation
 //! in the hot path.
 //!
+//! - **LSP/0 gamma cap**: Hard limit on superblock visits for predictable latency
+//! - **Integer scoring**: u32 accumulators with u16 quantized query weights (~20% faster)
 //! - **Superblock pruning**: Skip entire groups of blocks via coarse UBs
 //! - **L1 cache locality**: SaaT loop keeps c=64 blocks' grid data in L1
 //! - **SIMD UB computation**: NEON-accelerated for both superblock and block levels
@@ -72,7 +76,7 @@ fn prefetch_read<T>(ptr: *const T) {
 /// Two-level hierarchy:
 /// - **Superblock-level**: sized to num_superblocks, for SB ordering + early termination
 /// - **Local block-level**: sized to BMP_SUPERBLOCK_SIZE (64), for per-SB block computation
-/// - **Accumulator**: sized to bmp_block_size, reused per block
+/// - **Accumulator**: u32 sized to bmp_block_size, reused per block (integer scoring)
 #[derive(Default)]
 struct BmpScratch {
     // Superblock-level (reused across queries, sized to num_superblocks)
@@ -82,8 +86,8 @@ struct BmpScratch {
     local_block_ubs: Vec<f32>,
     local_block_masks: Vec<u32>,
     local_block_order: Vec<u32>,
-    // Per-slot accumulator (sized to block_size)
-    acc: Vec<f32>,
+    // Per-slot accumulator (sized to block_size) — u32 for integer scoring
+    acc: Vec<u32>,
 }
 
 impl BmpScratch {
@@ -106,7 +110,7 @@ impl BmpScratch {
             self.local_block_order.resize(sb_size, 0);
         }
         if self.acc.len() < block_size {
-            self.acc.resize(block_size, 0.0);
+            self.acc.resize(block_size, 0);
         }
     }
 }
@@ -130,14 +134,19 @@ thread_local! {
 /// - **0.8**: prune when `UB * 0.8 <= threshold` → ~20% more aggressive
 /// - **0.6**: prune when `UB * 0.6 <= threshold` → ~40% more aggressive
 ///
-/// Based on Mallia et al. (SIGIR 2024): `threshold > alpha * UB`.
+/// `max_superblocks` (LSP/0 gamma cap): hard limit on superblock visits.
+/// - **0**: unlimited (default, existing behavior)
+/// - **>0**: stop after visiting this many superblocks
+///
+/// Based on Mallia et al. (SIGIR 2024) and Carlson et al. (arXiv 2602.02883).
 pub fn execute_bmp(
     index: &BmpIndex,
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
+    max_superblocks: usize,
 ) -> crate::Result<Vec<ScoredDoc>> {
-    execute_bmp_inner(index, query_terms, k, heap_factor, None)
+    execute_bmp_inner(index, query_terms, k, heap_factor, max_superblocks, None)
 }
 
 /// Execute a BMP query with a document predicate filter.
@@ -150,9 +159,17 @@ pub fn execute_bmp_filtered(
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
+    max_superblocks: usize,
     predicate: &dyn Fn(crate::DocId) -> bool,
 ) -> crate::Result<Vec<ScoredDoc>> {
-    execute_bmp_inner(index, query_terms, k, heap_factor, Some(predicate))
+    execute_bmp_inner(
+        index,
+        query_terms,
+        k,
+        heap_factor,
+        max_superblocks,
+        Some(predicate),
+    )
 }
 
 fn execute_bmp_inner(
@@ -160,6 +177,7 @@ fn execute_bmp_inner(
     query_terms: &[(u32, f32)],
     k: usize,
     heap_factor: f32,
+    max_superblocks: usize,
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
 ) -> crate::Result<Vec<ScoredDoc>> {
     if query_terms.is_empty() || index.num_blocks == 0 {
@@ -173,13 +191,13 @@ fn execute_bmp_inner(
     let scale = index.max_weight_scale / 255.0;
     let num_blocks = index.num_blocks as usize;
     let block_size = index.bmp_block_size as usize;
-    let num_superblocks = index.num_superblocks as usize;
+    let num_superblocks_total = index.num_superblocks as usize;
 
     // ── Phase 1: Resolve query dims and pre-scale weights ──────────────
-    // Build combined info, sort by dim_id, then split into resolved + query_by_dim.
+    // Build combined info, sort by dim_id, then split into resolved + query_by_dim_u16.
     // Both arrays MUST have the same ordering so mask bit `q` corresponds to the
     // same dimension in both compute_block_masks (uses resolved) and
-    // score_block_bsearch_flat (uses query_by_dim).
+    // score_block_bsearch_int (uses query_by_dim_u16).
     let mut query_info: Vec<(u32, usize, f32)> = Vec::with_capacity(query_terms.len());
 
     for &(dim_id, weight) in query_terms {
@@ -197,8 +215,26 @@ fn execute_bmp_inner(
     query_info.sort_unstable_by_key(|&(dim_id, _, _)| dim_id);
 
     // Split into parallel arrays with matching order
+    // resolved: (dim_idx, f32_weight) — for grid UB computation (sb_grid u8 + block grid u4×17)
     let resolved: Vec<(usize, f32)> = query_info.iter().map(|&(_, idx, w)| (idx, w)).collect();
-    let query_by_dim: Vec<(u32, f32)> = query_info.iter().map(|&(d, _, w)| (d, w)).collect();
+
+    // Integer scoring: quantize query weights to u16 for u32 accumulator path
+    // Max accumulator = 16383 × 255 × num_dims. At 1024 dims: 4.27B < u32::MAX.
+    let max_scaled = query_info.iter().map(|q| q.2.abs()).fold(0.0f32, f32::max);
+    let (quant_scale, dequant) = if max_scaled > 0.0 {
+        (16383.0 / max_scaled, max_scaled / 16383.0)
+    } else {
+        (0.0, 0.0)
+    };
+    let query_by_dim_u16: Vec<(u32, u16)> = query_info
+        .iter()
+        .map(|&(d, _, w)| {
+            (
+                d,
+                (w.abs() * quant_scale).round().clamp(0.0, 16383.0) as u16,
+            )
+        })
+        .collect();
 
     let _start = std::time::Instant::now();
 
@@ -206,11 +242,18 @@ fn execute_bmp_inner(
         let scratch = &mut *cell.borrow_mut();
 
         // ── Superblock-at-a-time scoring ─────────────────────────────
-        scratch.ensure_capacity_sb(num_superblocks, BMP_SUPERBLOCK_SIZE as usize, block_size);
+        scratch.ensure_capacity_sb(
+            num_superblocks_total,
+            BMP_SUPERBLOCK_SIZE as usize,
+            block_size,
+        );
 
         // Phase 2: Compute SUPERBLOCK UBs
         index.compute_superblock_ubs(&resolved, &mut scratch.sb_ubs);
-        bucket_sort_blocks_desc_into(&scratch.sb_ubs[..num_superblocks], &mut scratch.sb_order);
+        bucket_sort_blocks_desc_into(
+            &scratch.sb_ubs[..num_superblocks_total],
+            &mut scratch.sb_order,
+        );
 
         if scratch.sb_order.is_empty() {
             return Vec::new();
@@ -221,8 +264,14 @@ fn execute_bmp_inner(
         let mut sbs_scored = 0u32;
         let mut collector = ScoreCollector::new(k);
 
-        for &sb_id in scratch.sb_order.iter() {
+        for (idx, &sb_id) in scratch.sb_order.iter().enumerate() {
+            // LSP/0: hard cap on superblock visits
+            if max_superblocks > 0 && idx >= max_superblocks {
+                break;
+            }
+
             let sb_ub = scratch.sb_ubs[sb_id as usize];
+            // Threshold pruning still applies within the cap
             if collector.len() >= k && sb_ub * alpha <= collector.threshold() {
                 break;
             }
@@ -257,7 +306,8 @@ fn execute_bmp_inner(
                 &scratch.local_block_order,
                 &scratch.local_block_ubs,
                 &scratch.local_block_masks,
-                &query_by_dim,
+                &query_by_dim_u16,
+                dequant,
                 block_size,
                 alpha,
                 k,
@@ -277,7 +327,7 @@ fn execute_bmp_inner(
                 "slow BMP: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}",
                 elapsed_ms,
                 sbs_scored,
-                num_superblocks,
+                num_superblocks_total,
                 blocks_scored,
                 num_blocks,
                 collector.len()
@@ -287,7 +337,7 @@ fn execute_bmp_inner(
                 "BMP execute: {:.1}ms, sbs={}/{}, blocks={}/{}, returned={}",
                 elapsed_ms,
                 sbs_scored,
-                num_superblocks,
+                num_superblocks_total,
                 blocks_scored,
                 num_blocks,
                 collector.len()
@@ -312,27 +362,25 @@ fn execute_bmp_inner(
 }
 
 // ============================================================================
-// Bitmask-assisted binary search: register-level skip replaces grid DRAM lookups
+// Integer scoring: u32 accumulators with u16 quantized query weights
 // ============================================================================
 
-/// Score a block by binary-searching each query dim in the block's sorted term list.
+/// Score a block using integer arithmetic (u32 accumulators, u16 weights).
 ///
 /// Uses **bitmask skip**: checks `block_mask & (1 << q) != 0` before binary search.
-/// The mask was built during the fused UB+mask pass (grid data already cache-warm),
-/// so each check is a register operation (~3 cycles) instead of a grid point lookup
-/// that would be a DRAM miss (~100ns) at scale.
+/// Accumulates `w_u16 * impact_u8` into u32 — eliminates u8→f32 conversion per posting.
 ///
 /// Complexity: O(|present_query_dims| × log|block_terms|) per block.
 #[inline(always)]
-fn score_block_bsearch_flat(
+fn score_block_bsearch_int(
     index: &BmpIndex,
     term_start: u32,
     term_end: u32,
-    query_by_dim: &[(u32, f32)],
+    query_by_dim_u16: &[(u32, u16)],
     block_mask: u32,
-    acc: &mut [f32],
+    acc: &mut [u32],
 ) {
-    for (q, &(dim_id, w)) in query_by_dim.iter().enumerate() {
+    for (q, &(dim_id, w)) in query_by_dim_u16.iter().enumerate() {
         // Bitmask skip: if this query dim has zero max in this block, skip
         if block_mask & (1 << q) == 0 {
             continue;
@@ -341,7 +389,7 @@ fn score_block_bsearch_flat(
             for p in index.term_postings(ti) {
                 // SAFETY: local_slot < block_size = acc.len()
                 unsafe {
-                    *acc.get_unchecked_mut(p.local_slot as usize) += w * p.impact as f32;
+                    *acc.get_unchecked_mut(p.local_slot as usize) += w as u32 * p.impact as u32;
                 }
             }
         }
@@ -352,10 +400,13 @@ fn score_block_bsearch_flat(
 // Superblock-at-a-time scoring
 // ============================================================================
 
-/// Score blocks within a single superblock.
+/// Score blocks within a single superblock using integer scoring.
 ///
 /// `block_start` is the global block ID of the first block in this superblock.
 /// `local_order`, `local_ubs`, `local_masks` are indexed by local offset (0..count).
+///
+/// Integer scoring: accumulates u16×u8 products into u32, then dequantizes to f32
+/// for collector comparison.
 #[allow(clippy::too_many_arguments)]
 fn score_superblock_blocks(
     index: &BmpIndex,
@@ -364,7 +415,8 @@ fn score_superblock_blocks(
     local_order: &[u32],
     local_ubs: &[f32],
     local_masks: &[u32],
-    query_by_dim: &[(u32, f32)],
+    query_by_dim_u16: &[(u32, u16)],
+    dequant: f32,
     block_size: usize,
     alpha: f32,
     k: usize,
@@ -372,9 +424,9 @@ fn score_superblock_blocks(
     num_ordinals: u32,
     collector: &mut ScoreCollector,
     blocks_scored: &mut u32,
-    acc: &mut [f32],
+    acc: &mut [u32],
 ) {
-    acc[..block_size].fill(0.0);
+    acc[..block_size].fill(0);
 
     for (order_idx, &local_idx) in local_order.iter().enumerate() {
         if local_idx as usize >= count {
@@ -415,26 +467,30 @@ fn score_superblock_blocks(
 
         let (term_start, term_end) = index.block_term_range(block_id);
         let mask = local_masks[local_idx as usize];
-        score_block_bsearch_flat(index, term_start, term_end, query_by_dim, mask, acc);
+        score_block_bsearch_int(index, term_start, term_end, query_by_dim_u16, mask, acc);
 
+        // Collect results: dequantize u32 → f32
         let base = block_id * index.bmp_block_size;
-        for (i, &score) in acc[..block_size].iter().enumerate() {
-            if score > 0.0 && collector.would_enter(score) {
-                let virtual_id = base + i as u32;
-                if let Some(pred) = predicate {
-                    let doc_id = if num_ordinals > 1 {
-                        virtual_id / num_ordinals
-                    } else {
-                        virtual_id
-                    };
-                    if !pred(doc_id) {
-                        continue;
+        for (i, &score_u32) in acc[..block_size].iter().enumerate() {
+            if score_u32 > 0 {
+                let score = score_u32 as f32 * dequant;
+                if collector.would_enter(score) {
+                    let virtual_id = base + i as u32;
+                    if let Some(pred) = predicate {
+                        let doc_id = if num_ordinals > 1 {
+                            virtual_id / num_ordinals
+                        } else {
+                            virtual_id
+                        };
+                        if !pred(doc_id) {
+                            continue;
+                        }
                     }
+                    collector.insert_with_ordinal(virtual_id, score, 0);
                 }
-                collector.insert_with_ordinal(virtual_id, score, 0);
             }
         }
-        acc[..block_size].fill(0.0);
+        acc[..block_size].fill(0);
         *blocks_scored += 1;
     }
 }

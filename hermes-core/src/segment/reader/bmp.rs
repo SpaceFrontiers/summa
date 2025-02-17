@@ -1,9 +1,12 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V3 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V5 zero-copy**.
 //!
-//! V3 stores contiguous arrays on disk so that at load time the entire blob
+//! V5 stores contiguous arrays on disk so that at load time the entire blob
 //! is acquired as a single `OwnedBytes` (mmap-backed or Arc-Vec) and sliced
-//! into typed sections. No heap allocation for posting data — only the
-//! superblock grid is computed and heap-allocated.
+//! into typed sections. No heap allocation — all data including the superblock
+//! grid is mmap-backed.
+//!
+//! V5 packs the block grid to 4-bit (50% grid memory reduction) while keeping
+//! the superblock grid at full 8-bit precision for safe hierarchical pruning.
 //!
 //! Uses **virtual coordinates**: `virtual_id = doc_id * num_ordinals + ordinal`.
 //! Blocks are over virtual_ids. Postings are 2 bytes: `(local_slot, impact)`.
@@ -59,10 +62,15 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
     }
 }
 
-/// BMP V3 index for a single sparse field — zero-copy mmap-backed.
+/// BMP V5 index for a single sparse field — fully zero-copy mmap-backed.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
-/// Only the superblock grid is heap-allocated (computed at load time).
+/// No heap allocation — the superblock grid is persisted on disk and loaded as
+/// a zero-copy OwnedBytes slice.
+///
+/// V5 packs the block grid to 4-bit (50% grid memory) while keeping sb_grid at
+/// full 8-bit. The reader unpacks 4-bit values via ×17 to get u8-equivalent
+/// upper bounds, so the same `/255.0` weight scale works for both levels.
 ///
 /// Hot-path accessors cache raw pointers from the OwnedBytes slices and use
 /// unchecked reads with `ptr::read_unaligned` to eliminate per-iteration bounds
@@ -70,7 +78,7 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
 ///
 /// Uses two-level pruning hierarchy (Carlson et al., SIGIR 2025):
 /// 1. **Superblock grid**: coarse upper bounds over groups of `BMP_SUPERBLOCK_SIZE` blocks
-/// 2. **Block grid**: fine-grained upper bounds per individual block
+/// 2. **Block grid**: fine-grained upper bounds per individual block (4-bit packed)
 #[derive(Clone)]
 pub struct BmpIndex {
     /// BMP block size (number of consecutive virtual_ids per block)
@@ -84,9 +92,11 @@ pub struct BmpIndex {
     /// Total sparse vectors (from TOC entry)
     pub total_vectors: u32,
 
-    // ── V3 section metadata ──────────────────────────────────────────
+    // ── V5 section metadata ──────────────────────────────────────────
     num_dims: u32,
     total_postings: u32,
+    /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
+    packed_row_size: u32,
 
     // ── Zero-copy OwnedBytes sections (keeps backing store alive) ────
     block_term_starts_bytes: OwnedBytes,
@@ -94,11 +104,10 @@ pub struct BmpIndex {
     term_posting_starts_bytes: OwnedBytes,
     postings_bytes: OwnedBytes,
     dim_ids_bytes: OwnedBytes,
+    /// 4-bit packed block grid: `grid[dim_idx * packed_row_size + block_id/2]`
     grid_bytes: OwnedBytes,
-
-    // ── Computed at load time (heap-allocated) ───────────────────────
     /// sb_grid[dim_idx * num_superblocks + sb_id] = max impact across all blocks in superblock
-    sb_grid: Vec<u8>,
+    sb_grid_bytes: OwnedBytes,
     /// Number of superblocks
     pub num_superblocks: u32,
 }
@@ -109,11 +118,14 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V3 blob from the given file handle.
+    /// Parse a BMP V5 blob from the given file handle.
     ///
     /// Reads the 48-byte footer, then acquires the entire blob as a single
-    /// `OwnedBytes` and slices it into zero-copy sections. Only the superblock
-    /// grid is heap-allocated.
+    /// `OwnedBytes` and slices it into zero-copy sections. The superblock
+    /// grid is persisted on disk and loaded as a zero-copy slice — no heap
+    /// allocation at load time.
+    ///
+    /// V5 stores the block grid in 4-bit packed format (50% smaller).
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -121,18 +133,18 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V3, BMP_BLOB_MAGIC_V3};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V5, BMP_BLOB_MAGIC_V5};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V3 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V5 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for footer".into(),
             ));
         }
 
         // Read the footer (last 48 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V3 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V5 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V3 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V5 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -145,14 +157,14 @@ impl BmpIndex {
         let bmp_block_size = u32::from_le_bytes(fb[24..28].try_into().unwrap());
         let num_ordinals = u32::from_le_bytes(fb[28..32].try_into().unwrap());
         let max_weight_scale = f32::from_le_bytes(fb[32..36].try_into().unwrap());
-        // fb[36..40] reserved
+        let sb_grid_offset = u32::from_le_bytes(fb[36..40].try_into().unwrap());
         // fb[40..44] reserved
         let magic = u32::from_le_bytes(fb[44..48].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V3 {
+        if magic != BMP_BLOB_MAGIC_V5 {
             return Err(crate::Error::Corruption(format!(
                 "Invalid BMP blob magic: {:#x} (expected {:#x})",
-                magic, BMP_BLOB_MAGIC_V3
+                magic, BMP_BLOB_MAGIC_V5
             )));
         }
 
@@ -166,19 +178,20 @@ impl BmpIndex {
                 total_vectors,
                 num_dims,
                 total_postings: 0,
+                packed_row_size: 0,
                 block_term_starts_bytes: OwnedBytes::empty(),
                 term_dim_ids_bytes: OwnedBytes::empty(),
                 term_posting_starts_bytes: OwnedBytes::empty(),
                 postings_bytes: OwnedBytes::empty(),
                 dim_ids_bytes: OwnedBytes::empty(),
                 grid_bytes: OwnedBytes::empty(),
-                sb_grid: Vec::new(),
+                sb_grid_bytes: OwnedBytes::empty(),
                 num_superblocks: 0,
             });
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V3 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V5 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
@@ -197,8 +210,16 @@ impl BmpIndex {
         // dim_ids and grid offsets come from footer
         let dim_ids_start = dim_ids_offset as usize;
         let dim_ids_end = dim_ids_start + num_dims as usize * 4;
+
+        // V5: grid is 4-bit packed — packed_row_size = ceil(num_blocks / 2)
+        let packed_row_size = (num_blocks as usize).div_ceil(2) as u32;
         let grid_start = dim_ids_end;
-        let grid_end = grid_start + num_dims as usize * num_blocks as usize;
+        let grid_end = grid_start + num_dims as usize * packed_row_size as usize;
+
+        // sb_grid from footer — full 8-bit precision
+        let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE);
+        let sb_grid_start = sb_grid_offset as usize;
+        let sb_grid_end = sb_grid_start + num_dims as usize * num_superblocks as usize;
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
         let block_term_starts_bytes = blob.slice(0..bts_end);
@@ -207,31 +228,11 @@ impl BmpIndex {
         let postings_bytes = blob.slice(tps_end..post_end);
         let dim_ids_bytes = blob.slice(dim_ids_start..dim_ids_end);
         let grid_bytes = blob.slice(grid_start..grid_end);
-
-        // ── Compute superblock grid from grid_bytes (only heap allocation) ──
-        let grid = grid_bytes.as_slice();
-        let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE);
-        let mut sb_grid = vec![0u8; num_dims as usize * num_superblocks as usize];
-
-        for dim_idx in 0..num_dims as usize {
-            let row_start = dim_idx * num_blocks as usize;
-            for sb in 0..num_superblocks as usize {
-                let start = sb * BMP_SUPERBLOCK_SIZE as usize;
-                let end = (start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks as usize);
-                let mut max_val = 0u8;
-                for b in start..end {
-                    let v = grid[row_start + b];
-                    if v > max_val {
-                        max_val = v;
-                    }
-                }
-                sb_grid[dim_idx * num_superblocks as usize + sb] = max_val;
-            }
-        }
+        let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
 
         log::debug!(
-            "BMP V3 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
-             num_ordinals={}, max_weight_scale={:.4}, terms={}, postings={}",
+            "BMP V5 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
+             num_ordinals={}, max_weight_scale={:.4}, terms={}, postings={}, packed_row_size={}",
             num_blocks,
             num_superblocks,
             num_dims,
@@ -240,6 +241,7 @@ impl BmpIndex {
             max_weight_scale,
             total_terms,
             total_postings,
+            packed_row_size,
         );
 
         Ok(Self {
@@ -250,13 +252,14 @@ impl BmpIndex {
             total_vectors,
             num_dims,
             total_postings,
+            packed_row_size,
             block_term_starts_bytes,
             term_dim_ids_bytes,
             term_posting_starts_bytes,
             postings_bytes,
             dim_ids_bytes,
             grid_bytes,
-            sb_grid,
+            sb_grid_bytes,
             num_superblocks,
         })
     }
@@ -298,13 +301,16 @@ impl BmpIndex {
 
         out[..nsb].fill(0.0);
 
+        let sb_grid = self.sb_grid_bytes.as_slice();
         for &(dim_idx, weight) in query_dims {
-            let row = &self.sb_grid[dim_idx * nsb..dim_idx * nsb + nsb];
+            let row = &sb_grid[dim_idx * nsb..dim_idx * nsb + nsb];
             accumulate_u8_weighted(row, weight, &mut out[..nsb]);
         }
     }
 
     /// Compute block UBs for blocks `[block_start..block_end)` within one superblock.
+    ///
+    /// V5: reads 4-bit packed grid, unpacks via ×17 to get u8-equivalent UBs.
     pub fn compute_block_ubs_range(
         &self,
         query_dims: &[(usize, f32)],
@@ -314,19 +320,20 @@ impl BmpIndex {
     ) {
         let count = block_end - block_start;
         debug_assert!(out.len() >= count);
-        let nb = self.num_blocks as usize;
+        let prs = self.packed_row_size as usize;
         let grid = self.grid_bytes.as_slice();
 
         out[..count].fill(0.0);
 
         for &(dim_idx, weight) in query_dims {
-            let row_offset = dim_idx * nb + block_start;
-            let row = &grid[row_offset..row_offset + count];
-            accumulate_u8_weighted(row, weight, &mut out[..count]);
+            let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
+            accumulate_u4_weighted(row, block_start, count, weight, &mut out[..count]);
         }
     }
 
     /// Build per-block query-dim presence masks for blocks `[block_start..block_end)`.
+    ///
+    /// V5: reads 4-bit packed grid, unpacks inline to check presence.
     pub fn compute_block_masks_range(
         &self,
         query_dims: &[(usize, f32)],
@@ -336,17 +343,23 @@ impl BmpIndex {
     ) {
         let count = block_end - block_start;
         debug_assert!(masks.len() >= count);
-        let nb = self.num_blocks as usize;
+        let prs = self.packed_row_size as usize;
         let grid = self.grid_bytes.as_slice();
 
         masks[..count].fill(0);
 
         for (q, &(dim_idx, _weight)) in query_dims.iter().enumerate() {
-            let row_offset = dim_idx * nb + block_start;
-            let row = &grid[row_offset..row_offset + count];
+            let row = &grid[dim_idx * prs..];
             let bit = 1u32 << q;
             for b in 0..count {
-                if unsafe { *row.get_unchecked(b) } > 0 {
+                let abs_b = block_start + b;
+                let byte_val = unsafe { *row.get_unchecked(abs_b / 2) };
+                let val = if abs_b.is_multiple_of(2) {
+                    byte_val & 0x0F
+                } else {
+                    byte_val >> 4
+                };
+                if val > 0 {
                     unsafe { *masks.get_unchecked_mut(b) |= bit };
                 }
             }
@@ -529,11 +542,9 @@ impl BmpIndex {
 
     /// Estimated heap memory usage in bytes.
     ///
-    /// V3 zero-copy: only the superblock grid is heap-allocated.
-    /// All other data is mmap-backed OwnedBytes (OS page cache).
+    /// V4 fully zero-copy: all data including sb_grid is mmap-backed OwnedBytes.
     pub fn estimated_memory_bytes(&self) -> usize {
-        let sb_grid = self.sb_grid.capacity();
-        sb_grid + std::mem::size_of::<Self>()
+        std::mem::size_of::<Self>()
     }
 }
 
@@ -646,5 +657,177 @@ unsafe fn accumulate_u8_weighted_neon(input: &[u8], weight: f32, out: &mut [f32]
     let base = chunks * 16;
     for i in 0..remainder {
         *out.get_unchecked_mut(base + i) += *input.get_unchecked(base + i) as f32 * weight;
+    }
+}
+
+// ============================================================================
+// 4-bit grid accumulation (V5)
+// ============================================================================
+
+/// Accumulate 4-bit packed grid values into f32 output.
+///
+/// Internally unpacks u4 → u8 (×17) then does FMA, so the caller can use the
+/// same `/255.0` weight scale as for u8 grids.
+///
+/// `packed[i/2]`: low nibble = even element, high nibble = odd element.
+#[inline]
+fn accumulate_u4_weighted(
+    packed: &[u8],
+    elem_offset: usize,
+    count: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    if count == 0 {
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if elem_offset.is_multiple_of(2) {
+            // SAFETY: NEON is always available on aarch64. Even-aligned fast path.
+            unsafe { accumulate_u4_weighted_neon(packed, elem_offset, count, weight, out) };
+            return;
+        }
+    }
+
+    // Scalar fallback (also used for odd elem_offset on aarch64)
+    for i in 0..count {
+        let abs_idx = elem_offset + i;
+        let byte_val = unsafe { *packed.get_unchecked(abs_idx / 2) };
+        let val = if abs_idx.is_multiple_of(2) {
+            byte_val & 0x0F
+        } else {
+            byte_val >> 4
+        };
+        unsafe {
+            *out.get_unchecked_mut(i) += (val as u32 * 17) as f32 * weight;
+        }
+    }
+}
+
+/// NEON implementation for 4-bit grid accumulation.
+///
+/// Processes 32 elements (16 packed bytes) per iteration:
+/// 1. Load 16 packed bytes
+/// 2. Extract low/high nibbles
+/// 3. Scale ×17 to get u8-equivalent values
+/// 4. Interleave to element order
+/// 5. Widen to f32 and FMA into output
+///
+/// Requires `elem_offset` to be even (always true since block_start is
+/// a multiple of BMP_SUPERBLOCK_SIZE=64).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn accumulate_u4_weighted_neon(
+    packed: &[u8],
+    elem_offset: usize,
+    count: usize,
+    weight: f32,
+    out: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    debug_assert!(elem_offset.is_multiple_of(2));
+
+    let weight_v = vdupq_n_f32(weight);
+    let mask_lo = vdupq_n_u8(0x0F);
+    let scale17 = vdupq_n_u8(17);
+
+    let byte_offset = elem_offset / 2;
+    let packed_ptr = packed.as_ptr().add(byte_offset);
+    let out_ptr = out.as_mut_ptr();
+
+    let chunks = count / 32;
+    let remainder = count % 32;
+
+    for chunk in 0..chunks {
+        let pb = packed_ptr.add(chunk * 16);
+        let ob = out_ptr.add(chunk * 32);
+
+        // Load 16 packed bytes (= 32 elements)
+        let bytes = vld1q_u8(pb);
+
+        // Extract nibbles
+        let low = vandq_u8(bytes, mask_lo);
+        let high = vshrq_n_u8::<4>(bytes);
+
+        // Scale to u8 range: val * 17 (15*17=255, fits in u8)
+        let low_scaled = vmulq_u8(low, scale17);
+        let high_scaled = vmulq_u8(high, scale17);
+
+        // Interleave to element order: (low[0],high[0],low[1],high[1],...)
+        let elems_0_15 = vzip1q_u8(low_scaled, high_scaled);
+        let elems_16_31 = vzip2q_u8(low_scaled, high_scaled);
+
+        // Process first 16 elements through u8→f32 widen+FMA pipeline
+        {
+            let lo8 = vget_low_u8(elems_0_15);
+            let hi8 = vget_high_u8(elems_0_15);
+            let lo16 = vmovl_u8(lo8);
+            let hi16 = vmovl_u8(hi8);
+
+            let u32_0 = vmovl_u16(vget_low_u16(lo16));
+            let f32_0 = vcvtq_f32_u32(u32_0);
+            let acc_0 = vld1q_f32(ob);
+            vst1q_f32(ob, vfmaq_f32(acc_0, f32_0, weight_v));
+
+            let u32_1 = vmovl_u16(vget_high_u16(lo16));
+            let f32_1 = vcvtq_f32_u32(u32_1);
+            let acc_1 = vld1q_f32(ob.add(4));
+            vst1q_f32(ob.add(4), vfmaq_f32(acc_1, f32_1, weight_v));
+
+            let u32_2 = vmovl_u16(vget_low_u16(hi16));
+            let f32_2 = vcvtq_f32_u32(u32_2);
+            let acc_2 = vld1q_f32(ob.add(8));
+            vst1q_f32(ob.add(8), vfmaq_f32(acc_2, f32_2, weight_v));
+
+            let u32_3 = vmovl_u16(vget_high_u16(hi16));
+            let f32_3 = vcvtq_f32_u32(u32_3);
+            let acc_3 = vld1q_f32(ob.add(12));
+            vst1q_f32(ob.add(12), vfmaq_f32(acc_3, f32_3, weight_v));
+        }
+
+        // Process second 16 elements
+        {
+            let lo8 = vget_low_u8(elems_16_31);
+            let hi8 = vget_high_u8(elems_16_31);
+            let lo16 = vmovl_u8(lo8);
+            let hi16 = vmovl_u8(hi8);
+
+            let u32_0 = vmovl_u16(vget_low_u16(lo16));
+            let f32_0 = vcvtq_f32_u32(u32_0);
+            let acc_0 = vld1q_f32(ob.add(16));
+            vst1q_f32(ob.add(16), vfmaq_f32(acc_0, f32_0, weight_v));
+
+            let u32_1 = vmovl_u16(vget_high_u16(lo16));
+            let f32_1 = vcvtq_f32_u32(u32_1);
+            let acc_1 = vld1q_f32(ob.add(20));
+            vst1q_f32(ob.add(20), vfmaq_f32(acc_1, f32_1, weight_v));
+
+            let u32_2 = vmovl_u16(vget_low_u16(hi16));
+            let f32_2 = vcvtq_f32_u32(u32_2);
+            let acc_2 = vld1q_f32(ob.add(24));
+            vst1q_f32(ob.add(24), vfmaq_f32(acc_2, f32_2, weight_v));
+
+            let u32_3 = vmovl_u16(vget_high_u16(hi16));
+            let f32_3 = vcvtq_f32_u32(u32_3);
+            let acc_3 = vld1q_f32(ob.add(28));
+            vst1q_f32(ob.add(28), vfmaq_f32(acc_3, f32_3, weight_v));
+        }
+    }
+
+    // Scalar remainder
+    let base_elem = chunks * 32;
+    for i in 0..remainder {
+        let abs_idx = elem_offset + base_elem + i;
+        let byte_val = *packed.get_unchecked(abs_idx / 2);
+        let val = if abs_idx.is_multiple_of(2) {
+            byte_val & 0x0F
+        } else {
+            byte_val >> 4
+        };
+        *out.get_unchecked_mut(base_elem + i) += (val as u32 * 17) as f32 * weight;
     }
 }

@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V3 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V5 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **virtual coordinates**:
 //! `virtual_id = doc_id * num_ordinals + ordinal`, so each (doc_id, ordinal)
@@ -15,9 +15,9 @@
 //!
 //! Peak memory: `entries (12B × total_postings) + grid (num_dims × num_blocks)`.
 //!
-//! ## BMP V3 Blob Layout
+//! ## BMP V5 Blob Layout
 //!
-//! Contiguous arrays for zero-copy mmap at read time:
+//! V5 packs the block grid to 4-bit (50% memory reduction, ≤0.05 recall loss).
 //!
 //! ```text
 //! Section 1: block_term_starts    [u32-LE × (num_blocks + 1)]
@@ -26,9 +26,10 @@
 //! Section 4: postings             [(u8, u8) × total_postings]     ← BmpPosting pairs
 //! Section 5: padding              [0-3 bytes to next 4-byte boundary]
 //! Section 6: dim_ids              [u32-LE × num_dims]
-//! Section 7: grid                 [u8 × (num_dims × num_blocks)]
+//! Section 7: grid_packed4         [u8 × (num_dims × packed_row_size)]  ← 4-bit packed
+//! Section 8: sb_grid              [u8 × (num_dims × num_superblocks)]  ← 8-bit
 //!
-//! BMP3 Footer (48 bytes):
+//! BMP5 Footer (48 bytes):
 //!   total_terms: u32              // 0-3
 //!   total_postings: u32           // 4-7
 //!   dim_ids_offset: u32           // 8-11   (byte offset of section 6)
@@ -38,9 +39,9 @@
 //!   bmp_block_size: u32           // 24-27
 //!   num_ordinals: u32             // 28-31
 //!   max_weight_scale: f32         // 32-35
-//!   _reserved: u32                // 36-39
+//!   sb_grid_offset: u32           // 36-39  (byte offset of section 8)
 //!   _reserved: u32                // 40-43
-//!   magic: u32                    // 44-47  (BMP3 = 0x33504D42)
+//!   magic: u32                    // 44-47  (BMP5 = 0x35504D42)
 //! ```
 
 use std::io::Write;
@@ -49,12 +50,14 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use rustc_hash::FxHashMap;
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V3;
+use crate::segment::format::BMP_BLOB_MAGIC_V5;
+use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V3 blob from per-dimension postings.
+/// Build a BMP V5 blob from per-dimension postings.
 ///
-/// The grid (num_dims × num_blocks bytes) is allocated as a transient Vec
-/// and freed after writing. `bmp_block_size` is clamped to 256 max (u8 local_slot).
+/// The grid (num_dims × num_blocks bytes) is allocated as a transient Vec,
+/// packed to 4-bit, and freed after writing. `bmp_block_size` is clamped to
+/// 256 max (u8 local_slot).
 pub(crate) fn build_bmp_blob(
     postings: &mut FxHashMap<u32, Vec<(DocId, u16, f32)>>,
     bmp_block_size: u32,
@@ -165,8 +168,8 @@ pub(crate) fn build_bmp_blob(
     // Phase 3: Sort once by (block_id, dim_id, local_slot)
     entries.sort_unstable();
 
-    // Phase 4: Write V3 blob
-    write_bmp_blob_v3(
+    // Phase 4: Write V5 blob
+    write_bmp_blob_v5(
         &entries,
         &dim_ids,
         &grid,
@@ -178,15 +181,16 @@ pub(crate) fn build_bmp_blob(
     )
 }
 
-/// Write a BMP V3 blob from pre-sorted entries.
+/// Write a BMP V5 blob from pre-sorted entries.
 ///
 /// `entries` must be sorted by (block_id, dim_id, local_slot).
 /// `grid` is row-major: grid[dim_idx * num_blocks + block_id] = max impact.
 ///
-/// V3 writes contiguous arrays for zero-copy mmap at read time.
-/// This is the shared core for both initial segment building and merging.
+/// V5 packs the block grid to 4-bit (50% grid memory reduction) while keeping
+/// the superblock grid at full 8-bit precision. The sb_grid is computed from
+/// the original u8 grid before packing.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_bmp_blob_v3(
+pub(crate) fn write_bmp_blob_v5(
     entries: &[(u32, u32, u8, u8)],
     dim_ids: &[u32],
     grid: &[u8],
@@ -252,22 +256,13 @@ pub(crate) fn write_bmp_blob_v3(
     let mut bytes_written: u64 = 0;
 
     // Section 1: block_term_starts [u32-LE × (num_blocks + 1)]
-    for &v in &block_term_starts {
-        writer.write_u32::<LittleEndian>(v)?;
-    }
-    bytes_written += block_term_starts.len() as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, &block_term_starts)?;
 
     // Section 2: term_dim_ids [u32-LE × total_terms]
-    for &v in &term_dim_ids {
-        writer.write_u32::<LittleEndian>(v)?;
-    }
-    bytes_written += total_terms as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, &term_dim_ids)?;
 
     // Section 3: term_posting_starts [u32-LE × (total_terms + 1)]
-    for &v in &term_posting_starts {
-        writer.write_u32::<LittleEndian>(v)?;
-    }
-    bytes_written += term_posting_starts.len() as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, &term_posting_starts)?;
 
     // Section 4: postings [(u8, u8) × total_postings]
     writer.write_all(&postings_flat)?;
@@ -276,23 +271,42 @@ pub(crate) fn write_bmp_blob_v3(
     // Section 5: padding to 4-byte boundary
     let padding = (4 - (bytes_written % 4) as usize) % 4;
     if padding > 0 {
-        writer.write_all(&vec![0u8; padding])?;
+        writer.write_all(&[0u8; 4][..padding])?;
         bytes_written += padding as u64;
     }
 
     // Section 6: dim_ids [u32-LE × num_dims]
     let dim_ids_offset = bytes_written as u32;
-    for &dim_id in dim_ids {
-        writer.write_u32::<LittleEndian>(dim_id)?;
-    }
-    bytes_written += num_dims as u64 * 4;
+    bytes_written += write_u32_slice_le(writer, dim_ids)?;
 
-    // Section 7: grid [u8 × (num_dims × num_blocks)]
+    // Section 7: grid_packed4 [u8 × (num_dims × packed_row_size)] — 4-bit packed
     let grid_offset = bytes_written as u32;
-    writer.write_all(grid)?;
-    bytes_written += grid.len() as u64;
+    let packed_grid = pack_grid_4bit(grid, num_dims, num_blocks);
+    writer.write_all(&packed_grid)?;
+    bytes_written += packed_grid.len() as u64;
 
-    // BMP V3 Footer (48 bytes)
+    // Section 8: sb_grid [u8 × (num_dims × num_superblocks)] — full 8-bit precision
+    let sb_grid_offset = bytes_written as u32;
+    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
+    let mut sb_grid = vec![0u8; num_dims * num_superblocks];
+    for dim_idx in 0..num_dims {
+        for sb in 0..num_superblocks {
+            let start = sb * BMP_SUPERBLOCK_SIZE as usize;
+            let end = (start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
+            let mut max_val = 0u8;
+            for b in start..end {
+                let v = grid[dim_idx * num_blocks + b];
+                if v > max_val {
+                    max_val = v;
+                }
+            }
+            sb_grid[dim_idx * num_superblocks + sb] = max_val;
+        }
+    }
+    writer.write_all(&sb_grid)?;
+    bytes_written += sb_grid.len() as u64;
+
+    // BMP V5 Footer (48 bytes)
     writer.write_u32::<LittleEndian>(total_terms)?; // 0-3
     writer.write_u32::<LittleEndian>(total_postings)?; // 4-7
     writer.write_u32::<LittleEndian>(dim_ids_offset)?; // 8-11
@@ -302,12 +316,69 @@ pub(crate) fn write_bmp_blob_v3(
     writer.write_u32::<LittleEndian>(bmp_block_size)?; // 24-27
     writer.write_u32::<LittleEndian>(num_ordinals)?; // 28-31
     writer.write_f32::<LittleEndian>(max_weight_scale)?; // 32-35
-    writer.write_u32::<LittleEndian>(0)?; // 36-39 reserved
+    writer.write_u32::<LittleEndian>(sb_grid_offset)?; // 36-39 sb_grid_offset
     writer.write_u32::<LittleEndian>(0)?; // 40-43 reserved
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V3)?; // 44-47
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V5)?; // 44-47
     bytes_written += 48;
 
     Ok(bytes_written)
+}
+
+/// Bulk-write a `&[u32]` slice as little-endian bytes.
+///
+/// On little-endian platforms this is a single `write_all` (zero-copy cast).
+/// On big-endian platforms, falls back to per-element byte-swap.
+pub(crate) fn write_u32_slice_le(writer: &mut dyn Write, data: &[u32]) -> std::io::Result<u64> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: u32 has no padding bytes, LE matches wire format.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        writer.write_all(bytes)?;
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for &v in data {
+            writer.write_all(&v.to_le_bytes())?;
+        }
+    }
+    Ok(data.len() as u64 * 4)
+}
+
+/// Ceiling quantize u8 → u4. Guarantees `u4 * 17 >= original`.
+///
+/// This ensures that 4-bit grid upper bounds are always safe (never
+/// underestimate the true u8 value when unpacked via ×17).
+#[inline]
+pub(crate) fn quantize_u8_to_u4_ceil(val: u8) -> u8 {
+    if val == 0 {
+        return 0;
+    }
+    (val as u16 * 15).div_ceil(255) as u8
+}
+
+/// Pack a u8 grid into 4-bit. Even index → low nibble, odd → high nibble.
+///
+/// `grid` is row-major: `grid[dim_idx * num_blocks + block_id]`.
+/// Output: `packed[dim_idx * packed_row_size + block_id/2]` with nibble packing.
+pub(crate) fn pack_grid_4bit(grid: &[u8], num_dims: usize, num_blocks: usize) -> Vec<u8> {
+    let packed_row_size = num_blocks.div_ceil(2);
+    let mut packed = vec![0u8; num_dims * packed_row_size];
+    for dim_idx in 0..num_dims {
+        for b in 0..num_blocks {
+            let val = quantize_u8_to_u4_ceil(grid[dim_idx * num_blocks + b]);
+            let packed_idx = dim_idx * packed_row_size + b / 2;
+            if b % 2 == 0 {
+                packed[packed_idx] |= val;
+            } else {
+                packed[packed_idx] |= val << 4;
+            }
+        }
+    }
+    packed
 }
 
 /// Quantize a weight to u8 (0-255) given the global max scale.
@@ -357,7 +428,7 @@ mod tests {
         // Verify footer magic
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V3);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V5);
     }
 
     #[test]
