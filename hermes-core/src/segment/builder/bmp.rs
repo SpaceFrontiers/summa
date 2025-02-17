@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V3 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **virtual coordinates**:
 //! `virtual_id = doc_id * num_ordinals + ordinal`, so each (doc_id, ordinal)
@@ -10,39 +10,37 @@
 //!
 //! ## Memory efficiency
 //!
-//! All postings are collected into a single flat Vec, sorted once, then streamed
-//! directly to the output writer block-by-block. No per-block Vec allocations,
-//! no intermediate buffer for the entire blob.
+//! All postings are collected into a single flat Vec, sorted once, then written
+//! as contiguous arrays. No per-block Vec allocations, no intermediate buffer.
 //!
 //! Peak memory: `entries (12B × total_postings) + grid (num_dims × num_blocks)`.
 //!
-//! ## Blob Layout
+//! ## BMP V3 Blob Layout
+//!
+//! Contiguous arrays for zero-copy mmap at read time:
 //!
 //! ```text
-//! [Block Forward Index Data]
-//!   For each block:
-//!     num_terms: u16
-//!     For each term (sorted by dim_id):
-//!       dim_id: u32
-//!       num_postings: u16
-//!       postings: [(local_slot: u8, impact: u8)] × num_postings
+//! Section 1: block_term_starts    [u32-LE × (num_blocks + 1)]
+//! Section 2: term_dim_ids         [u32-LE × total_terms]
+//! Section 3: term_posting_starts  [u32-LE × (total_terms + 1)]    ← prefix sums
+//! Section 4: postings             [(u8, u8) × total_postings]     ← BmpPosting pairs
+//! Section 5: padding              [0-3 bytes to next 4-byte boundary]
+//! Section 6: dim_ids              [u32-LE × num_dims]
+//! Section 7: grid                 [u8 × (num_dims × num_blocks)]
 //!
-//! [Block Offset Table]
-//!   offsets: [u32; num_blocks]  // relative to blob start
-//!
-//! [Block-Max Grid]
-//!   dim_ids: [u32; num_dims]
-//!   grid_data: [u8; num_dims * num_blocks]  // row-major
-//!
-//! [BMP Footer] (32 bytes)
-//!   grid_offset: u32
-//!   offsets_table_offset: u32
-//!   bmp_block_size: u32
-//!   num_blocks: u32
-//!   num_dims: u32
-//!   num_ordinals: u32
-//!   max_weight_scale: f32
-//!   magic: u32 (BMP2)
+//! BMP3 Footer (48 bytes):
+//!   total_terms: u32              // 0-3
+//!   total_postings: u32           // 4-7
+//!   dim_ids_offset: u32           // 8-11   (byte offset of section 6)
+//!   grid_offset: u32              // 12-15  (byte offset of section 7)
+//!   num_blocks: u32               // 16-19
+//!   num_dims: u32                 // 20-23
+//!   bmp_block_size: u32           // 24-27
+//!   num_ordinals: u32             // 28-31
+//!   max_weight_scale: f32         // 32-35
+//!   _reserved: u32                // 36-39
+//!   _reserved: u32                // 40-43
+//!   magic: u32                    // 44-47  (BMP3 = 0x33504D42)
 //! ```
 
 use std::io::Write;
@@ -51,7 +49,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use rustc_hash::FxHashMap;
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC;
+use crate::segment::format::BMP_BLOB_MAGIC_V3;
 
 /// Build a BMP blob from per-dimension postings (convenience wrapper for tests).
 #[cfg(test)]
@@ -210,8 +208,8 @@ pub(crate) fn build_bmp_blob_with_grid_cap(
     // Phase 3: Sort once by (block_id, dim_id, local_slot)
     entries.sort_unstable();
 
-    // Phase 4: Stream to writer
-    write_bmp_blob_streaming(
+    // Phase 4: Write V3 blob
+    write_bmp_blob_v3(
         &entries,
         &dim_ids,
         &grid,
@@ -223,14 +221,15 @@ pub(crate) fn build_bmp_blob_with_grid_cap(
     )
 }
 
-/// Stream a BMP blob from pre-sorted entries directly to the writer.
+/// Write a BMP V3 blob from pre-sorted entries.
 ///
 /// `entries` must be sorted by (block_id, dim_id, local_slot).
 /// `grid` is row-major: grid[dim_idx * num_blocks + block_id] = max impact.
 ///
+/// V3 writes contiguous arrays for zero-copy mmap at read time.
 /// This is the shared core for both initial segment building and merging.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_bmp_blob_streaming(
+pub(crate) fn write_bmp_blob_v3(
     entries: &[(u32, u32, u8, u8)],
     dim_ids: &[u32],
     grid: &[u8],
@@ -241,33 +240,31 @@ pub(crate) fn write_bmp_blob_streaming(
     writer: &mut dyn Write,
 ) -> std::io::Result<u64> {
     let num_dims = dim_ids.len();
-    let mut bytes_written: u64 = 0;
-    let mut block_offsets: Vec<u32> = Vec::with_capacity(num_blocks);
+
+    // Single pass: build flat arrays from sorted entries
+    let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
+    let mut term_dim_ids: Vec<u32> = Vec::new();
+    let mut term_posting_starts: Vec<u32> = Vec::new();
+    let mut postings_flat: Vec<u8> = Vec::new(); // (local_slot, impact) pairs
+
     let mut entry_idx = 0;
+    let mut posting_count: u32 = 0;
 
     for block_id in 0..num_blocks as u32 {
-        block_offsets.push(bytes_written as u32);
+        block_term_starts.push(term_dim_ids.len() as u32);
 
-        // Find all entries for this block (entries are sorted by block_id)
+        // Find all entries for this block
         let block_start = entry_idx;
         while entry_idx < entries.len() && entries[entry_idx].0 == block_id {
             entry_idx += 1;
         }
-
         let block_entries = &entries[block_start..entry_idx];
 
         if block_entries.is_empty() {
-            writer.write_u16::<LittleEndian>(0)?;
-            bytes_written += 2;
             continue;
         }
 
-        // Count unique dims (entries are sorted by dim_id within block)
-        let num_terms = count_unique_dims(block_entries);
-        writer.write_u16::<LittleEndian>(num_terms as u16)?;
-        bytes_written += 2;
-
-        // Write term groups (already grouped by dim_id due to sort order)
+        // Group by dim_id (entries are sorted by dim_id within block)
         let mut i = 0;
         while i < block_entries.len() {
             let dim_id = block_entries[i].1;
@@ -275,61 +272,85 @@ pub(crate) fn write_bmp_blob_streaming(
             while i < block_entries.len() && block_entries[i].1 == dim_id {
                 i += 1;
             }
-            let count = (i - group_start) as u16;
-            writer.write_u32::<LittleEndian>(dim_id)?;
-            writer.write_u16::<LittleEndian>(count)?;
-            bytes_written += 6;
+
+            term_dim_ids.push(dim_id);
+            term_posting_starts.push(posting_count);
+
             for e in &block_entries[group_start..i] {
-                writer.write_all(&[e.2, e.3])?;
-                bytes_written += 2;
+                postings_flat.push(e.2); // local_slot
+                postings_flat.push(e.3); // impact
+                posting_count += 1;
             }
         }
     }
+    // Sentinel for block_term_starts
+    block_term_starts.push(term_dim_ids.len() as u32);
+    // Sentinel for term_posting_starts
+    term_posting_starts.push(posting_count);
 
-    // Block offset table
-    let offsets_table_offset = bytes_written as u32;
-    for &offset in &block_offsets {
-        writer.write_u32::<LittleEndian>(offset)?;
+    let total_terms = term_dim_ids.len() as u32;
+    let total_postings = posting_count;
+
+    // ── Write sections ──────────────────────────────────────────────────
+    let mut bytes_written: u64 = 0;
+
+    // Section 1: block_term_starts [u32-LE × (num_blocks + 1)]
+    for &v in &block_term_starts {
+        writer.write_u32::<LittleEndian>(v)?;
     }
-    bytes_written += num_blocks as u64 * 4;
+    bytes_written += block_term_starts.len() as u64 * 4;
 
-    // Block-max grid: dim_ids then row-major grid data
-    let grid_offset = bytes_written as u32;
+    // Section 2: term_dim_ids [u32-LE × total_terms]
+    for &v in &term_dim_ids {
+        writer.write_u32::<LittleEndian>(v)?;
+    }
+    bytes_written += total_terms as u64 * 4;
+
+    // Section 3: term_posting_starts [u32-LE × (total_terms + 1)]
+    for &v in &term_posting_starts {
+        writer.write_u32::<LittleEndian>(v)?;
+    }
+    bytes_written += term_posting_starts.len() as u64 * 4;
+
+    // Section 4: postings [(u8, u8) × total_postings]
+    writer.write_all(&postings_flat)?;
+    bytes_written += postings_flat.len() as u64;
+
+    // Section 5: padding to 4-byte boundary
+    let padding = (4 - (bytes_written % 4) as usize) % 4;
+    if padding > 0 {
+        writer.write_all(&vec![0u8; padding])?;
+        bytes_written += padding as u64;
+    }
+
+    // Section 6: dim_ids [u32-LE × num_dims]
+    let dim_ids_offset = bytes_written as u32;
     for &dim_id in dim_ids {
         writer.write_u32::<LittleEndian>(dim_id)?;
     }
     bytes_written += num_dims as u64 * 4;
+
+    // Section 7: grid [u8 × (num_dims × num_blocks)]
+    let grid_offset = bytes_written as u32;
     writer.write_all(grid)?;
     bytes_written += grid.len() as u64;
 
-    // BMP footer (32 bytes)
-    writer.write_u32::<LittleEndian>(grid_offset)?;
-    writer.write_u32::<LittleEndian>(offsets_table_offset)?;
-    writer.write_u32::<LittleEndian>(bmp_block_size)?;
-    writer.write_u32::<LittleEndian>(num_blocks as u32)?;
-    writer.write_u32::<LittleEndian>(num_dims as u32)?;
-    writer.write_u32::<LittleEndian>(num_ordinals)?;
-    writer.write_f32::<LittleEndian>(max_weight_scale)?;
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC)?;
-    bytes_written += 32;
+    // BMP V3 Footer (48 bytes)
+    writer.write_u32::<LittleEndian>(total_terms)?; // 0-3
+    writer.write_u32::<LittleEndian>(total_postings)?; // 4-7
+    writer.write_u32::<LittleEndian>(dim_ids_offset)?; // 8-11
+    writer.write_u32::<LittleEndian>(grid_offset)?; // 12-15
+    writer.write_u32::<LittleEndian>(num_blocks as u32)?; // 16-19
+    writer.write_u32::<LittleEndian>(num_dims as u32)?; // 20-23
+    writer.write_u32::<LittleEndian>(bmp_block_size)?; // 24-27
+    writer.write_u32::<LittleEndian>(num_ordinals)?; // 28-31
+    writer.write_f32::<LittleEndian>(max_weight_scale)?; // 32-35
+    writer.write_u32::<LittleEndian>(0)?; // 36-39 reserved
+    writer.write_u32::<LittleEndian>(0)?; // 40-43 reserved
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V3)?; // 44-47
+    bytes_written += 48;
 
     Ok(bytes_written)
-}
-
-/// Count unique dim_ids in a slice sorted by (block_id, dim_id, local_slot).
-fn count_unique_dims(entries: &[(u32, u32, u8, u8)]) -> usize {
-    if entries.is_empty() {
-        return 0;
-    }
-    let mut count = 1;
-    let mut prev = entries[0].1;
-    for e in &entries[1..] {
-        if e.1 != prev {
-            count += 1;
-            prev = e.1;
-        }
-    }
-    count
 }
 
 /// Quantize a weight to u8 (0-255) given the global max scale.
@@ -379,7 +400,7 @@ mod tests {
         // Verify footer magic
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V3);
     }
 
     #[test]
@@ -392,10 +413,10 @@ mod tests {
         let size = build_bmp_blob(&mut postings, 64, 0.0, None, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify footer: num_ordinals should be 2
-        let footer_start = buf.len() - 32;
+        // Verify footer: num_ordinals should be 2 (at offset 28-31 in 48-byte footer)
+        let footer_start = buf.len() - 48;
         let fb = &buf[footer_start..];
-        let num_ordinals = u32::from_le_bytes(fb[20..24].try_into().unwrap());
+        let num_ordinals = u32::from_le_bytes(fb[28..32].try_into().unwrap());
         assert_eq!(num_ordinals, 2);
     }
 }

@@ -314,7 +314,7 @@ fn merge_bmp_field(
         if bmp.num_ordinals > new_num_ordinals {
             new_num_ordinals = bmp.num_ordinals;
         }
-        for &dim_id in bmp.dim_ids() {
+        for dim_id in bmp.dim_ids() {
             dim_set.insert(dim_id);
         }
         total_postings_est += bmp.total_postings() as usize;
@@ -359,10 +359,10 @@ fn merge_bmp_field(
 
         for block_id in 0..bmp.num_blocks {
             let (term_start, term_end) = bmp.block_term_range(block_id);
-            let block_dim_ids = bmp.block_term_dim_ids(term_start, term_end);
 
-            for (rel_idx, &dim_id) in block_dim_ids.iter().enumerate() {
-                let ti = term_start + rel_idx as u32;
+            for rel_idx in 0..(term_end - term_start) {
+                let ti = term_start + rel_idx;
+                let dim_id = bmp.block_term_dim_id(ti);
                 let dim_idx = dim_to_idx[&dim_id];
 
                 for p in bmp.term_postings(ti) {
@@ -417,7 +417,7 @@ fn merge_bmp_field(
 
     // Phase 4: Stream BMP blob to writer
     let current_offset = writer.offset();
-    let blob_len = super::super::builder::bmp::write_bmp_blob_streaming(
+    let blob_len = super::super::builder::bmp::write_bmp_blob_v3(
         &entries,
         &dim_ids,
         &grid,

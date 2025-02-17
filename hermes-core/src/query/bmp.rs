@@ -332,15 +332,12 @@ fn score_block_bsearch_flat(
     block_mask: u32,
     acc: &mut [f32],
 ) {
-    let block_dims = index.block_term_dim_ids(term_start, term_end);
-
     for (q, &(dim_id, w)) in query_by_dim.iter().enumerate() {
         // Bitmask skip: if this query dim has zero max in this block, skip
         if block_mask & (1 << q) == 0 {
             continue;
         }
-        if let Ok(rel_idx) = block_dims.binary_search(&dim_id) {
-            let ti = term_start + rel_idx as u32;
+        if let Some(ti) = index.find_dim_in_block(term_start, term_end, dim_id) {
             for p in index.term_postings(ti) {
                 // SAFETY: local_slot < block_size = acc.len()
                 unsafe {
@@ -400,6 +397,7 @@ fn score_superblock_blocks(
                 let (ts, te) = index.block_term_range(next_block);
                 if ts < te {
                     prefetch_read(index.term_dim_ids_ptr(ts));
+                    prefetch_read(index.term_posting_starts_ptr(ts));
                     if let Some(ptr) = index.first_posting_ptr(next_block) {
                         prefetch_read(ptr);
                     }
