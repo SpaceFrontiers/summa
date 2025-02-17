@@ -346,27 +346,21 @@ impl IndexService for IndexServiceImpl {
     ) -> Result<Response<DeleteIndexResponse>, Status> {
         let req = request.into_inner();
 
-        // 1. Evict from registry — atomic, prevents any new operations from
-        //    obtaining references to this index.
+        // 1. Evict from registry — prevents new operations from reaching this index.
         let handle = self.registry.evict(&req.index_name);
 
-        // 2. If the index was open, flush and wait for in-flight operations.
-        //    The write lock waits for all concurrent read locks (batch_index, etc.)
-        //    to finish, then holds exclusive access through file deletion.
+        // 2. Stop all background work before deleting files:
+        //    - Abort in-flight merge tasks (they could write new segment files)
+        //    - Drop the handle, which joins indexing worker threads (sync)
+        //    No commit — we're about to delete everything.
         if let Some(handle) = handle {
-            let mut w = handle.writer.write().await;
-            if let Err(e) = w.commit().await {
-                warn!(
-                    "Error committing writer during delete: index={}, error={}",
-                    req.index_name, e
-                );
-            }
-            w.wait_for_merging_thread().await;
+            handle.writer.write().await.abort_merges().await;
+            drop(handle);
         }
 
         // 3. Delete directory — safe because:
         //    - No new operations can obtain the index (evicted from registry)
-        //    - All in-flight writes finished (write lock acquired above)
+        //    - Merge tasks aborted, worker threads joined
         let index_path = self.registry.data_dir.join(&req.index_name);
         if index_path.exists() {
             tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&index_path))

@@ -559,6 +559,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.segment_manager.maybe_merge().await;
     }
 
+    /// Abort all in-flight merge tasks without waiting for completion.
+    pub async fn abort_merges(&self) {
+        self.segment_manager.abort_merges().await;
+    }
+
     /// Wait for the in-flight background merge to complete (if any).
     pub async fn wait_for_merging_thread(&self) {
         self.segment_manager.wait_for_merging_thread().await;

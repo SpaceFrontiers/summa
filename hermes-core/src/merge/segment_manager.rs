@@ -584,6 +584,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok((output_hex, total_docs as u32))
     }
 
+    /// Abort all in-flight merge tasks without waiting for completion.
+    /// Used during index deletion to stop background work immediately.
+    pub async fn abort_merges(&self) {
+        let handles: Vec<JoinHandle<()>> =
+            { std::mem::take(&mut *self.merge_handles.lock().await) };
+        for h in handles {
+            h.abort();
+        }
+    }
+
     /// Wait for all current in-flight merges to complete.
     pub async fn wait_for_merging_thread(self: &Arc<Self>) {
         let handles: Vec<JoinHandle<()>> =

@@ -540,11 +540,19 @@ impl BmpIndex {
         self.total_postings as u64
     }
 
-    /// Estimated heap memory usage in bytes.
+    /// Estimated memory usage in bytes (mmap-backed region sizes).
     ///
-    /// V5 fully zero-copy: all data including sb_grid is mmap-backed OwnedBytes.
+    /// V5 fully zero-copy: all data is mmap-backed OwnedBytes, but the
+    /// mapped regions still consume RSS when paged in by the OS.
     pub fn estimated_memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + self.block_term_starts_bytes.len()
+            + self.term_dim_ids_bytes.len()
+            + self.term_posting_starts_bytes.len()
+            + self.postings_bytes.len()
+            + self.dim_ids_bytes.len()
+            + self.grid_bytes.len()
+            + self.sb_grid_bytes.len()
     }
 }
 

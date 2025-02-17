@@ -301,8 +301,7 @@ fn merge_bmp_field(
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
 ) -> Result<()> {
-    use crate::segment::builder::bmp::{pack_grid_4bit, write_u32_slice_le};
-    use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
+    use crate::segment::builder::bmp::{stream_write_grids, write_u32_slice_le};
     use byteorder::{LittleEndian, WriteBytesExt};
 
     // ── Phase 0: Compute merged parameters from source segments ──────────
@@ -359,11 +358,11 @@ fn merge_bmp_field(
     };
 
     let ebs = effective_block_size as u64;
-    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
 
     // ── Single-pass: buffer postings + count simultaneously ──────────────
-    let mut grid = vec![0u8; num_dims * num_blocks];
-    let mut sb_grid = vec![0u8; num_dims * num_superblocks];
+    // Grid entries are collected sparsely — no dense grid allocation.
+    // They are sorted and streamed dim-by-dim at write time.
+    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::new(); // (dim_idx, block_id, max_impact)
     let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
     let mut term_dim_ids: Vec<u32> = Vec::new();
     let mut term_posting_starts: Vec<u32> = vec![0]; // prefix sums
@@ -446,16 +445,8 @@ fn merge_bmp_field(
             cumulative_postings += dim_counts[dim_idx];
             term_posting_starts.push(cumulative_postings);
 
-            // Grid
-            let grid_idx = dim_idx * num_blocks + block as usize;
-            grid[grid_idx] = dim_max_imp[dim_idx];
-
-            // sb_grid
-            let sb = block as usize / BMP_SUPERBLOCK_SIZE as usize;
-            let sb_idx = dim_idx * num_superblocks + sb;
-            if dim_max_imp[dim_idx] > sb_grid[sb_idx] {
-                sb_grid[sb_idx] = dim_max_imp[dim_idx];
-            }
+            // Collect sparse grid entry (no dense grid allocation)
+            grid_entries.push((dim_idx as u32, block, dim_max_imp[dim_idx]));
 
             // Flush dim postings to flat buffer
             postings_buf.extend_from_slice(&dim_posting_bufs[dim_idx]);
@@ -519,16 +510,13 @@ fn merge_bmp_field(
     let dim_ids_offset = bytes_written as u32;
     bytes_written += write_u32_slice_le(writer, &dim_ids).map_err(crate::Error::Io)?;
 
-    // Section 7: grid_packed4 [u8 × (num_dims × packed_row_size)] — 4-bit packed
+    // Sections 7+8: packed grid + sb_grid (streaming from sparse grid entries)
+    grid_entries.sort_unstable();
     let grid_offset = bytes_written as u32;
-    let packed_grid = pack_grid_4bit(&grid, num_dims, num_blocks);
-    writer.write_all(&packed_grid).map_err(crate::Error::Io)?;
-    bytes_written += packed_grid.len() as u64;
-
-    // Section 8: sb_grid [u8 × (num_dims × num_superblocks)] — full 8-bit precision
-    let sb_grid_offset = bytes_written as u32;
-    writer.write_all(&sb_grid).map_err(crate::Error::Io)?;
-    bytes_written += sb_grid.len() as u64;
+    let (packed_bytes, sb_bytes) = stream_write_grids(&grid_entries, num_dims, num_blocks, writer)
+        .map_err(crate::Error::Io)?;
+    let sb_grid_offset = (bytes_written + packed_bytes) as u32;
+    bytes_written += packed_bytes + sb_bytes;
 
     // BMP V5 Footer (48 bytes)
     use crate::segment::format::BMP_BLOB_MAGIC_V5;

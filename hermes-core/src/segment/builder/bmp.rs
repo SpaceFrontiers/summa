@@ -13,7 +13,7 @@
 //! All postings are collected into a single flat Vec, sorted once, then written
 //! as contiguous arrays. No per-block Vec allocations, no intermediate buffer.
 //!
-//! Peak memory: `entries (12B × total_postings) + grid (num_dims × num_blocks)`.
+//! Peak memory: `entries (12B × total_postings) + grid_entries (9B × total_terms)`.
 //!
 //! ## BMP V5 Blob Layout
 //!
@@ -55,9 +55,10 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
 /// Build a BMP V5 blob from per-dimension postings.
 ///
-/// The grid (num_dims × num_blocks bytes) is allocated as a transient Vec,
-/// packed to 4-bit, and freed after writing. `bmp_block_size` is clamped to
-/// 256 max (u8 local_slot).
+/// Grid entries `(dim_idx, block_id, max_impact)` are collected sparsely
+/// during the posting scan — no dense grid allocation. The 4-bit packed grid
+/// and 8-bit superblock grid are streamed dim-by-dim during write.
+/// `bmp_block_size` is clamped to 256 max (u8 local_slot).
 pub(crate) fn build_bmp_blob(
     postings: &mut FxHashMap<u32, Vec<(DocId, u16, f32)>>,
     bmp_block_size: u32,
@@ -126,18 +127,15 @@ pub(crate) fn build_bmp_blob(
 
     let mut dim_ids: Vec<u32> = postings.keys().copied().collect();
     dim_ids.sort_unstable();
-    let num_dims = dim_ids.len();
 
-    // Phase 2: Flatten all postings into a single sorted Vec + build grid
+    // Phase 2: Flatten all postings into a single sorted Vec
     let dim_to_idx: FxHashMap<u32, usize> =
         dim_ids.iter().enumerate().map(|(i, &d)| (d, i)).collect();
 
     let total_postings_est: usize = postings.values().map(|v| v.len()).sum();
     let mut entries: Vec<(u32, u32, u8, u8)> = Vec::with_capacity(total_postings_est);
-    let mut grid = vec![0u8; num_dims * num_blocks];
 
     for (&dim_id, dim_posts) in postings.iter() {
-        let dim_idx = dim_to_idx[&dim_id];
         for &(doc_id, ordinal, weight) in dim_posts {
             let abs_w = weight.abs();
             if abs_w < weight_threshold {
@@ -150,11 +148,6 @@ pub(crate) fn build_bmp_blob(
 
             if impact_u8 == 0 {
                 continue;
-            }
-
-            let grid_idx = dim_idx * num_blocks + block_id as usize;
-            if impact_u8 > grid[grid_idx] {
-                grid[grid_idx] = impact_u8;
             }
 
             entries.push((block_id, dim_id, local_slot, impact_u8));
@@ -172,7 +165,7 @@ pub(crate) fn build_bmp_blob(
     write_bmp_blob_v5(
         &entries,
         &dim_ids,
-        &grid,
+        &dim_to_idx,
         num_blocks,
         effective_block_size,
         num_ordinals,
@@ -184,16 +177,13 @@ pub(crate) fn build_bmp_blob(
 /// Write a BMP V5 blob from pre-sorted entries.
 ///
 /// `entries` must be sorted by (block_id, dim_id, local_slot).
-/// `grid` is row-major: grid[dim_idx * num_blocks + block_id] = max impact.
-///
-/// V5 packs the block grid to 4-bit (50% grid memory reduction) while keeping
-/// the superblock grid at full 8-bit precision. The sb_grid is computed from
-/// the original u8 grid before packing.
+/// Grid entries are collected sparsely during the block iteration and
+/// streamed dim-by-dim — no dense grid allocation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_blob_v5(
     entries: &[(u32, u32, u8, u8)],
     dim_ids: &[u32],
-    grid: &[u8],
+    dim_to_idx: &FxHashMap<u32, usize>,
     num_blocks: usize,
     bmp_block_size: u32,
     num_ordinals: u32,
@@ -202,11 +192,12 @@ pub(crate) fn write_bmp_blob_v5(
 ) -> std::io::Result<u64> {
     let num_dims = dim_ids.len();
 
-    // Single pass: build flat arrays from sorted entries
+    // Single pass: build flat arrays from sorted entries + collect grid entries
     let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
     let mut term_dim_ids: Vec<u32> = Vec::new();
     let mut term_posting_starts: Vec<u32> = Vec::new();
     let mut postings_flat: Vec<u8> = Vec::new(); // (local_slot, impact) pairs
+    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::new(); // (dim_idx, block_id, max_impact)
 
     let mut entry_idx = 0;
     let mut posting_count: u32 = 0;
@@ -230,7 +221,11 @@ pub(crate) fn write_bmp_blob_v5(
         while i < block_entries.len() {
             let dim_id = block_entries[i].1;
             let group_start = i;
+            let mut max_impact = 0u8;
             while i < block_entries.len() && block_entries[i].1 == dim_id {
+                if block_entries[i].3 > max_impact {
+                    max_impact = block_entries[i].3;
+                }
                 i += 1;
             }
 
@@ -242,6 +237,10 @@ pub(crate) fn write_bmp_blob_v5(
                 postings_flat.push(e.3); // impact
                 posting_count += 1;
             }
+
+            // Collect sparse grid entry (no dense grid allocation)
+            let dim_idx = dim_to_idx[&dim_id];
+            grid_entries.push((dim_idx as u32, block_id, max_impact));
         }
     }
     // Sentinel for block_term_starts
@@ -251,6 +250,9 @@ pub(crate) fn write_bmp_blob_v5(
 
     let total_terms = term_dim_ids.len() as u32;
     let total_postings = posting_count;
+
+    // Sort grid entries by (dim_idx, block_id) for streaming write
+    grid_entries.sort_unstable();
 
     // ── Write sections ──────────────────────────────────────────────────
     let mut bytes_written: u64 = 0;
@@ -279,32 +281,11 @@ pub(crate) fn write_bmp_blob_v5(
     let dim_ids_offset = bytes_written as u32;
     bytes_written += write_u32_slice_le(writer, dim_ids)?;
 
-    // Section 7: grid_packed4 [u8 × (num_dims × packed_row_size)] — 4-bit packed
+    // Sections 7+8: packed grid + sb_grid (streaming from sparse grid entries)
     let grid_offset = bytes_written as u32;
-    let packed_grid = pack_grid_4bit(grid, num_dims, num_blocks);
-    writer.write_all(&packed_grid)?;
-    bytes_written += packed_grid.len() as u64;
-
-    // Section 8: sb_grid [u8 × (num_dims × num_superblocks)] — full 8-bit precision
-    let sb_grid_offset = bytes_written as u32;
-    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
-    let mut sb_grid = vec![0u8; num_dims * num_superblocks];
-    for dim_idx in 0..num_dims {
-        for sb in 0..num_superblocks {
-            let start = sb * BMP_SUPERBLOCK_SIZE as usize;
-            let end = (start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
-            let mut max_val = 0u8;
-            for b in start..end {
-                let v = grid[dim_idx * num_blocks + b];
-                if v > max_val {
-                    max_val = v;
-                }
-            }
-            sb_grid[dim_idx * num_superblocks + sb] = max_val;
-        }
-    }
-    writer.write_all(&sb_grid)?;
-    bytes_written += sb_grid.len() as u64;
+    let (packed_bytes, sb_bytes) = stream_write_grids(&grid_entries, num_dims, num_blocks, writer)?;
+    let sb_grid_offset = (bytes_written + packed_bytes) as u32;
+    bytes_written += packed_bytes + sb_bytes;
 
     // BMP V5 Footer (48 bytes)
     writer.write_u32::<LittleEndian>(total_terms)?; // 0-3
@@ -360,25 +341,60 @@ pub(crate) fn quantize_u8_to_u4_ceil(val: u8) -> u8 {
     (val as u16 * 15).div_ceil(255) as u8
 }
 
-/// Pack a u8 grid into 4-bit. Even index → low nibble, odd → high nibble.
+/// Stream-write 4-bit packed grid (section 7) and 8-bit superblock grid (section 8).
 ///
-/// `grid` is row-major: `grid[dim_idx * num_blocks + block_id]`.
-/// Output: `packed[dim_idx * packed_row_size + block_id/2]` with nibble packing.
-pub(crate) fn pack_grid_4bit(grid: &[u8], num_dims: usize, num_blocks: usize) -> Vec<u8> {
+/// `grid_entries` must be sorted by `(dim_idx, block_id)`.
+/// Each entry is `(dim_idx, block_id, max_impact_u8)`.
+///
+/// Memory: O(packed_row_size + num_superblocks) — one row buffer each.
+/// Returns `(packed_grid_bytes, sb_grid_bytes)`.
+pub(crate) fn stream_write_grids(
+    grid_entries: &[(u32, u32, u8)],
+    num_dims: usize,
+    num_blocks: usize,
+    writer: &mut dyn Write,
+) -> std::io::Result<(u64, u64)> {
     let packed_row_size = num_blocks.div_ceil(2);
-    let mut packed = vec![0u8; num_dims * packed_row_size];
-    for dim_idx in 0..num_dims {
-        for b in 0..num_blocks {
-            let val = quantize_u8_to_u4_ceil(grid[dim_idx * num_blocks + b]);
-            let packed_idx = dim_idx * packed_row_size + b / 2;
-            if b % 2 == 0 {
-                packed[packed_idx] |= val;
+    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
+
+    let mut row_buf = vec![0u8; packed_row_size];
+    let mut sb_row = vec![0u8; num_superblocks];
+
+    // Section 7: packed 4-bit grid, one dim row at a time
+    let mut gi = 0;
+    for dim_idx in 0..num_dims as u32 {
+        row_buf.fill(0);
+        while gi < grid_entries.len() && grid_entries[gi].0 == dim_idx {
+            let b = grid_entries[gi].1 as usize;
+            let q4 = quantize_u8_to_u4_ceil(grid_entries[gi].2);
+            if b.is_multiple_of(2) {
+                row_buf[b / 2] |= q4;
             } else {
-                packed[packed_idx] |= val << 4;
+                row_buf[b / 2] |= q4 << 4;
             }
+            gi += 1;
         }
+        writer.write_all(&row_buf)?;
     }
-    packed
+    let packed_bytes = (num_dims * packed_row_size) as u64;
+
+    // Section 8: 8-bit superblock grid, one dim row at a time
+    gi = 0;
+    for dim_idx in 0..num_dims as u32 {
+        sb_row.fill(0);
+        while gi < grid_entries.len() && grid_entries[gi].0 == dim_idx {
+            let b = grid_entries[gi].1 as usize;
+            let sb = b / BMP_SUPERBLOCK_SIZE as usize;
+            if grid_entries[gi].2 > sb_row[sb] {
+                sb_row[sb] = grid_entries[gi].2;
+            }
+            gi += 1;
+        }
+        writer.write_all(&sb_row)?;
+    }
+    let sb_bytes = (num_dims * num_superblocks) as u64;
+
+    Ok((packed_bytes, sb_bytes))
 }
 
 /// Quantize a weight to u8 (0-255) given the global max scale.
