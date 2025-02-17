@@ -127,7 +127,7 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | build_threshold_kwarg | quantization_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | query_config_block | positions_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | nprobe_kwarg | build_threshold_kwarg | quantization_kwarg | quantization_factor_kwarg | weight_threshold_kwarg | block_size_kwarg | pruning_kwarg | query_config_block | positions_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -141,6 +141,8 @@ build_threshold_kwarg = { "build_threshold" ~ ":" ~ build_threshold_spec }
 build_threshold_spec = @{ ASCII_DIGIT+ }
 nprobe_kwarg = { "nprobe" ~ ":" ~ nprobe_spec }
 quantization_kwarg = { "quantization" ~ ":" ~ quantization_spec }
+quantization_factor_kwarg = { "quantization_factor" ~ ":" ~ quantization_factor_spec }
+quantization_factor_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
 block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
 block_size_spec = @{ ASCII_DIGIT+ }

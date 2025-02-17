@@ -64,6 +64,7 @@ pub(crate) fn build_bmp_blob(
     bmp_block_size: u32,
     weight_threshold: f32,
     pruning_fraction: Option<f32>,
+    quantization_factor: Option<f32>,
     writer: &mut dyn Write,
 ) -> std::io::Result<u64> {
     if postings.is_empty() {
@@ -116,7 +117,14 @@ pub(crate) fn build_bmp_blob(
         return Ok(0);
     }
 
-    let max_weight_scale = global_max_weight;
+    // Fixed quantization: impact = min(255, round(weight * factor))
+    // Derive max_weight_scale = 255 / factor for backward-compatible query math.
+    // Dynamic quantization: impact = round(weight / max * 255)
+    let max_weight_scale = if let Some(factor) = quantization_factor {
+        255.0 / factor
+    } else {
+        global_max_weight
+    };
     let num_ordinals = max_ordinal as u32 + 1;
 
     // Virtual ID space
@@ -423,7 +431,7 @@ mod tests {
     fn test_build_bmp_blob_empty() {
         let mut postings = FxHashMap::default();
         let mut buf = Vec::new();
-        let size = build_bmp_blob(&mut postings, 64, 0.0, None, &mut buf).unwrap();
+        let size = build_bmp_blob(&mut postings, 64, 0.0, None, None, &mut buf).unwrap();
         assert_eq!(size, 0);
         assert!(buf.is_empty());
     }
@@ -437,7 +445,7 @@ mod tests {
         postings.insert(1, vec![(0, 0, 0.8)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(&mut postings, 64, 0.0, None, &mut buf).unwrap();
+        let size = build_bmp_blob(&mut postings, 64, 0.0, None, None, &mut buf).unwrap();
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
@@ -454,7 +462,7 @@ mod tests {
         postings.insert(0u32, vec![(0u32, 0u16, 1.0f32), (0, 1, 0.8), (1, 0, 0.5)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(&mut postings, 64, 0.0, None, &mut buf).unwrap();
+        let size = build_bmp_blob(&mut postings, 64, 0.0, None, None, &mut buf).unwrap();
         assert!(size > 0);
 
         // Verify footer: num_ordinals should be 2 (at offset 28-31 in 48-byte footer)
@@ -462,5 +470,80 @@ mod tests {
         let fb = &buf[footer_start..];
         let num_ordinals = u32::from_le_bytes(fb[28..32].try_into().unwrap());
         assert_eq!(num_ordinals, 2);
+    }
+
+    #[test]
+    fn test_build_bmp_blob_quantization_factor() {
+        let mut postings = FxHashMap::default();
+        // dim 0: doc 0 with weight 2.0, doc 1 with weight 1.0
+        postings.insert(0u32, vec![(0u32, 0u16, 2.0f32), (1, 0, 1.0)]);
+
+        // With factor=100: impact(2.0) = min(255, round(2.0 * 100)) = 200
+        //                   impact(1.0) = min(255, round(1.0 * 100)) = 100
+        // max_weight_scale = 255/100 = 2.55
+        let mut buf = Vec::new();
+        let size = build_bmp_blob(&mut postings, 64, 0.0, None, Some(100.0), &mut buf).unwrap();
+        assert!(size > 0);
+
+        // Verify max_weight_scale in footer (bytes 32-35)
+        let footer_start = buf.len() - 48;
+        let fb = &buf[footer_start..];
+        let scale = f32::from_le_bytes(fb[32..36].try_into().unwrap());
+        assert!(
+            (scale - 2.55).abs() < 0.001,
+            "scale={}, expected 2.55",
+            scale
+        );
+    }
+
+    #[test]
+    fn test_quantization_factor_vs_dynamic() {
+        // Two segments with different max weights should produce different
+        // max_weight_scale with dynamic quantization but same with fixed factor.
+
+        // Segment A: max weight = 3.0
+        let mut postings_a = FxHashMap::default();
+        postings_a.insert(0u32, vec![(0u32, 0u16, 3.0f32), (1, 0, 1.5)]);
+
+        // Segment B: max weight = 1.0
+        let mut postings_b = FxHashMap::default();
+        postings_b.insert(0u32, vec![(0u32, 0u16, 1.0f32), (1, 0, 0.5)]);
+
+        // Dynamic: different scales
+        let mut buf_a = Vec::new();
+        build_bmp_blob(&mut postings_a.clone(), 64, 0.0, None, None, &mut buf_a).unwrap();
+        let scale_a = f32::from_le_bytes(
+            buf_a[buf_a.len() - 48 + 32..buf_a.len() - 48 + 36]
+                .try_into()
+                .unwrap(),
+        );
+
+        let mut buf_b = Vec::new();
+        build_bmp_blob(&mut postings_b.clone(), 64, 0.0, None, None, &mut buf_b).unwrap();
+        let scale_b = f32::from_le_bytes(
+            buf_b[buf_b.len() - 48 + 32..buf_b.len() - 48 + 36]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(scale_a, scale_b, "Dynamic scales should differ");
+
+        // Fixed factor=50: same scale = 255/50 = 5.1
+        let mut buf_af = Vec::new();
+        build_bmp_blob(&mut postings_a, 64, 0.0, None, Some(50.0), &mut buf_af).unwrap();
+        let scale_af = f32::from_le_bytes(
+            buf_af[buf_af.len() - 48 + 32..buf_af.len() - 48 + 36]
+                .try_into()
+                .unwrap(),
+        );
+
+        let mut buf_bf = Vec::new();
+        build_bmp_blob(&mut postings_b, 64, 0.0, None, Some(50.0), &mut buf_bf).unwrap();
+        let scale_bf = f32::from_le_bytes(
+            buf_bf[buf_bf.len() - 48 + 32..buf_bf.len() - 48 + 36]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(scale_af, scale_bf, "Fixed factor scales must be identical");
+        assert!((scale_af - 5.1).abs() < 0.001);
     }
 }

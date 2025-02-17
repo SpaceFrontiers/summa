@@ -108,6 +108,7 @@ pub(super) fn build_sparse_streaming(
             SparseFormat::Bmp => {
                 let bmp_block_size = sparse_config.map(|c| c.bmp_block_size).unwrap_or(64);
                 let weight_threshold = sparse_config.map(|c| c.weight_threshold).unwrap_or(0.0);
+                let quantization_factor = sparse_config.and_then(|c| c.quantization_factor);
 
                 let blob_offset = current_offset;
                 let blob_len = super::bmp::build_bmp_blob(
@@ -115,6 +116,7 @@ pub(super) fn build_sparse_streaming(
                     bmp_block_size,
                     weight_threshold,
                     pruning_fraction,
+                    quantization_factor,
                     writer,
                 )
                 .map_err(crate::Error::Io)?;

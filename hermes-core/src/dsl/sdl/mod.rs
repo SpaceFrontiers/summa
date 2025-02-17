@@ -219,6 +219,7 @@ struct IndexConfig {
     build_threshold: Option<usize>,
     // Sparse vector index params
     quantization: Option<WeightQuantization>,
+    quantization_factor: Option<f32>,
     weight_threshold: Option<f32>,
     block_size: Option<usize>,
     pruning: Option<f32>,
@@ -375,6 +376,18 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                     "uint4" | "u4" => WeightQuantization::UInt4,
                     _ => WeightQuantization::default(),
                 });
+            }
+        }
+        Rule::quantization_factor_kwarg => {
+            // quantization_factor_kwarg = { "quantization_factor" ~ ":" ~ quantization_factor_spec }
+            if let Some(f) = p.into_inner().next() {
+                config.quantization_factor = Some(f.as_str().parse().unwrap_or_else(|_| {
+                    log::warn!(
+                        "Invalid quantization_factor value '{}', using default 50.0",
+                        f.as_str()
+                    );
+                    50.0
+                }));
             }
         }
         Rule::weight_threshold_kwarg => {
@@ -640,6 +653,7 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
         bmp_superblock_size: 64,
         pruning: None,
         query_config: None,
+        quantization_factor: None,
     }
 }
 
@@ -647,6 +661,9 @@ fn parse_sparse_vector_config(pair: pest::iterators::Pair<Rule>) -> SparseVector
 fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg: IndexConfig) {
     if let Some(q) = idx_cfg.quantization {
         config.weight_quantization = q;
+    }
+    if let Some(f) = idx_cfg.quantization_factor {
+        config.quantization_factor = Some(f);
     }
     if let Some(t) = idx_cfg.weight_threshold {
         config.weight_threshold = t;
@@ -1361,6 +1378,22 @@ mod tests {
         let config = f.sparse_vector_config.as_ref().unwrap();
         assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
         assert_eq!(config.pruning, Some(0.1));
+    }
+
+    #[test]
+    fn test_sparse_vector_with_quantization_factor() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16> [indexed<quantization: uint8, quantization_factor: 50>, stored]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let f = &indexes[0].fields[0];
+        assert_eq!(f.name, "embedding");
+        let config = f.sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
+        assert_eq!(config.quantization_factor, Some(50.0));
     }
 
     #[test]

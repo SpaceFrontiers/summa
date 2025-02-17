@@ -245,6 +245,20 @@ pub struct SparseVectorConfig {
     /// Query-time configuration (tokenizer, weighting)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_config: Option<SparseQueryConfig>,
+    /// Fixed quantization factor for absolute weight-to-u8 conversion.
+    ///
+    /// When set, BMP impacts are quantized as `min(255, round(weight * factor))`
+    /// instead of the default relative quantization `round(weight / max * 255)`.
+    /// This makes u8 impacts comparable across segments (same weight → same u8),
+    /// eliminating rescaling during merge and enabling future zero-copy merge.
+    ///
+    /// Choose factor so that `max_expected_weight * factor ≤ 255`.
+    /// For SPLADE models (weights typically 0-5): factor=50 gives good range.
+    /// For DeepImpact (weights typically 0-100): factor=2.5.
+    ///
+    /// Standard in production IR systems (PISA, Anserini).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization_factor: Option<f32>,
 }
 
 fn default_block_size() -> usize {
@@ -276,6 +290,7 @@ impl Default for SparseVectorConfig {
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
+            quantization_factor: None,
         }
     }
 }
@@ -315,6 +330,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(20), // Process top 20 query dimensions
                 pruning: Some(0.1),       // Keep top 10% of query dims
             }),
+            quantization_factor: None,
         }
     }
 
@@ -343,6 +359,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(20),
                 pruning: Some(0.1),
             }),
+            quantization_factor: None,
         }
     }
 
@@ -373,6 +390,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(15), // Fewer query dimensions
                 pruning: Some(0.15),      // Keep top 15% of query dims
             }),
+            quantization_factor: None,
         }
     }
 
@@ -391,6 +409,7 @@ impl SparseVectorConfig {
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
+            quantization_factor: None,
         }
     }
 
@@ -422,6 +441,7 @@ impl SparseVectorConfig {
                 max_query_dims: Some(50), // Process more dimensions
                 pruning: None,            // No fraction-based pruning
             }),
+            quantization_factor: None,
         }
     }
 
@@ -478,6 +498,7 @@ impl SparseVectorConfig {
             bmp_superblock_size: 64,
             pruning: None,
             query_config: None,
+            quantization_factor: None,
         })
     }
 
@@ -491,6 +512,15 @@ impl SparseVectorConfig {
     /// Set query configuration (builder pattern)
     pub fn with_query_config(mut self, config: SparseQueryConfig) -> Self {
         self.query_config = Some(config);
+        self
+    }
+
+    /// Set fixed quantization factor (builder pattern)
+    ///
+    /// When set, BMP quantizes as `min(255, round(weight * factor))`.
+    /// All segments use the same scale, eliminating rescaling during merge.
+    pub fn with_quantization_factor(mut self, factor: f32) -> Self {
+        self.quantization_factor = Some(factor);
         self
     }
 }

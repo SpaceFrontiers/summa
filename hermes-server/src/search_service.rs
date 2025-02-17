@@ -327,6 +327,12 @@ impl SearchService for SearchServiceImpl {
                     .entry(field_id)
                     .or_insert(sparse_idx.num_dimensions() as u32);
             }
+            for (&field_id, bmp_idx) in segment.bmp_indexes() {
+                *sparse_totals.entry(field_id).or_default() += bmp_idx.total_vectors as u64;
+                sparse_dims
+                    .entry(field_id)
+                    .or_insert(bmp_idx.num_dimensions() as u32);
+            }
         }
 
         let mut vector_stats = Vec::new();

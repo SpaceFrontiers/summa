@@ -341,6 +341,19 @@ fn merge_bmp_field(
         return Ok(());
     }
 
+    // Check if all segments share the same max_weight_scale (e.g. fixed quantization_factor).
+    // When true, rescale_impact is a no-op (rescale=1.0) for all segments.
+    let all_same_scale = bmp_indexes.iter().all(|bi| {
+        bi.is_none_or(|b| (b.max_weight_scale - new_max_weight_scale).abs() < f32::EPSILON)
+    });
+    if all_same_scale {
+        log::debug!(
+            "[merge_bmp] field {}: all segments share max_weight_scale={:.4}, no rescaling needed",
+            field_id,
+            new_max_weight_scale,
+        );
+    }
+
     let mut dim_ids: Vec<u32> = dim_set.into_iter().collect();
     dim_ids.sort_unstable();
     let num_dims = dim_ids.len();
