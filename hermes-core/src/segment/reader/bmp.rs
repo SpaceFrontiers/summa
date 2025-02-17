@@ -339,7 +339,7 @@ impl BmpIndex {
         query_dims: &[(usize, f32)],
         block_start: usize,
         block_end: usize,
-        masks: &mut [u32],
+        masks: &mut [u64],
     ) {
         let count = block_end - block_start;
         debug_assert!(masks.len() >= count);
@@ -349,8 +349,8 @@ impl BmpIndex {
         masks[..count].fill(0);
 
         for (q, &(dim_idx, _weight)) in query_dims.iter().enumerate() {
-            let row = &grid[dim_idx * prs..];
-            let bit = 1u32 << q;
+            let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
+            let bit = 1u64 << q;
             for b in 0..count {
                 let abs_b = block_start + b;
                 let byte_val = unsafe { *row.get_unchecked(abs_b / 2) };
@@ -542,7 +542,7 @@ impl BmpIndex {
 
     /// Estimated heap memory usage in bytes.
     ///
-    /// V4 fully zero-copy: all data including sb_grid is mmap-backed OwnedBytes.
+    /// V5 fully zero-copy: all data including sb_grid is mmap-backed OwnedBytes.
     pub fn estimated_memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
     }

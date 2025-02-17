@@ -136,7 +136,7 @@ pub struct SparseFieldToc {
 /// V3 layout:
 /// ```text
 /// [block data ...]
-/// [skip section: SparseSkipEntry × total_skips (20B each)]
+/// [skip section: SparseSkipEntry × total_skips (24B each)]
 /// [TOC: per-field header(13B) + per-dim entries(28B each)]
 /// [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)]
 /// ```

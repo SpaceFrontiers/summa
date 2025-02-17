@@ -84,7 +84,7 @@ struct BmpScratch {
     sb_order: Vec<u32>,
     // Block-level (reused per superblock, sized to BMP_SUPERBLOCK_SIZE)
     local_block_ubs: Vec<f32>,
-    local_block_masks: Vec<u32>,
+    local_block_masks: Vec<u64>,
     local_block_order: Vec<u32>,
     // Per-slot accumulator (sized to block_size) — u32 for integer scoring
     acc: Vec<u32>,
@@ -97,14 +97,13 @@ impl BmpScratch {
             self.sb_ubs.resize(num_superblocks, 0.0);
         }
         if self.sb_order.capacity() < num_superblocks {
-            self.sb_order
-                .reserve(num_superblocks - self.sb_order.capacity());
+            self.sb_order.reserve(num_superblocks - self.sb_order.len());
         }
         if self.local_block_ubs.len() < sb_size {
             self.local_block_ubs.resize(sb_size, 0.0);
         }
         if self.local_block_masks.len() < sb_size {
-            self.local_block_masks.resize(sb_size, 0);
+            self.local_block_masks.resize(sb_size, 0u64);
         }
         if self.local_block_order.len() < sb_size {
             self.local_block_order.resize(sb_size, 0);
@@ -377,12 +376,12 @@ fn score_block_bsearch_int(
     term_start: u32,
     term_end: u32,
     query_by_dim_u16: &[(u32, u16)],
-    block_mask: u32,
+    block_mask: u64,
     acc: &mut [u32],
 ) {
     for (q, &(dim_id, w)) in query_by_dim_u16.iter().enumerate() {
         // Bitmask skip: if this query dim has zero max in this block, skip
-        if block_mask & (1 << q) == 0 {
+        if block_mask & (1u64 << q) == 0 {
             continue;
         }
         if let Some(ti) = index.find_dim_in_block(term_start, term_end, dim_id) {
@@ -414,7 +413,7 @@ fn score_superblock_blocks(
     count: usize,
     local_order: &[u32],
     local_ubs: &[f32],
-    local_masks: &[u32],
+    local_masks: &[u64],
     query_by_dim_u16: &[(u32, u16)],
     dequant: f32,
     block_size: usize,

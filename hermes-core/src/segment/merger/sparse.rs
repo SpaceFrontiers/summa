@@ -4,7 +4,7 @@
 //! ```text
 //! [block data for all dims across all fields]
 //! [skip section: SparseSkipEntry × total (24B each), contiguous]
-//! [TOC: per-field header(9B) + per-dim entries(24B each)]
+//! [TOC: per-field header(13B) + per-dim entries(28B each)]
 //! [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24B]
 //! ```
 //!
@@ -282,13 +282,13 @@ impl SegmentMerger {
 
 /// Merge BMP fields using a **single-pass block-at-a-time** approach.
 ///
-/// V4 improvements over V3:
+/// V5 improvements over V3:
 /// - **Single pass**: postings are buffered per-dim during the counting pass,
 ///   eliminating the second iteration over source segments entirely.
 /// - **FxHashMap dim lookup**: O(1) dim_id → dim_idx instead of O(log n) binary search.
 /// - **Indexed arrays**: per-dim counts and max impacts use flat arrays indexed by dim_idx,
 ///   with a `touched_dims` list for O(touched) reset instead of O(num_dims).
-/// - **sb_grid on disk**: superblock grid is computed during merge and persisted in V4 format.
+/// - **sb_grid on disk**: superblock grid is computed during merge and persisted in V5 format.
 /// - **Bulk writes**: `write_u32_slice_le()` for sections 1-3, 6.
 #[allow(clippy::too_many_arguments)]
 fn merge_bmp_field(
@@ -481,7 +481,7 @@ fn merge_bmp_field(
         effective_block_size,
     );
 
-    // ── Write V4 blob — no second pass ───────────────────────────────────
+    // ── Write V5 blob — no second pass ───────────────────────────────────
     let blob_start = writer.offset();
     let mut bytes_written: u64 = 0;
 
