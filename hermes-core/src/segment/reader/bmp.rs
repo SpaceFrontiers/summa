@@ -1,15 +1,16 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V5 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V6 zero-copy**.
 //!
-//! V5 stores contiguous arrays on disk so that at load time the entire blob
+//! V6 stores contiguous arrays on disk so that at load time the entire blob
 //! is acquired as a single `OwnedBytes` (mmap-backed or Arc-Vec) and sliced
 //! into typed sections. No heap allocation — all data including the superblock
 //! grid is mmap-backed.
 //!
-//! V5 packs the block grid to 4-bit (50% grid memory reduction) while keeping
+//! V6 packs the block grid to 4-bit (50% grid memory reduction) while keeping
 //! the superblock grid at full 8-bit precision for safe hierarchical pruning.
 //!
-//! Uses **virtual coordinates**: `virtual_id = doc_id * num_ordinals + ordinal`.
-//! Blocks are over virtual_ids. Postings are 2 bytes: `(local_slot, impact)`.
+//! Uses **compact virtual coordinates**: sequential IDs assigned to unique
+//! `(doc_id, ordinal)` pairs. A doc_map lookup table (Section 9) maps virtual
+//! IDs back to original coordinates at query time.
 //!
 //! Based on Mallia, Suel & Tonellotto (SIGIR 2024).
 
@@ -62,15 +63,18 @@ unsafe fn read_u32_unchecked(base: *const u8, idx: usize) -> u32 {
     }
 }
 
-/// BMP V5 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V6 index for a single sparse field — fully zero-copy mmap-backed.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
 /// a zero-copy OwnedBytes slice.
 ///
-/// V5 packs the block grid to 4-bit (50% grid memory) while keeping sb_grid at
+/// V6 packs the block grid to 4-bit (50% grid memory) while keeping sb_grid at
 /// full 8-bit. The reader unpacks 4-bit values via ×17 to get u8-equivalent
 /// upper bounds, so the same `/255.0` weight scale works for both levels.
+///
+/// V6 uses compact virtual IDs with a doc_map lookup table (Section 9) instead
+/// of the sparse `doc_id * num_ordinals + ordinal` scheme.
 ///
 /// Hot-path accessors cache raw pointers from the OwnedBytes slices and use
 /// unchecked reads with `ptr::read_unaligned` to eliminate per-iteration bounds
@@ -85,14 +89,14 @@ pub struct BmpIndex {
     pub bmp_block_size: u32,
     /// Number of blocks
     pub num_blocks: u32,
-    /// Number of ordinals (virtual_id = doc_id * num_ordinals + ordinal)
-    pub num_ordinals: u32,
+    /// Number of compact virtual documents (= actual vector count)
+    pub num_virtual_docs: u32,
     /// Global max weight scale factor (for dequantizing u8 impacts back to f32)
     pub max_weight_scale: f32,
     /// Total sparse vectors (from TOC entry)
     pub total_vectors: u32,
 
-    // ── V5 section metadata ──────────────────────────────────────────
+    // ── V6 section metadata ──────────────────────────────────────────
     num_dims: u32,
     total_postings: u32,
     /// Packed row size for 4-bit grid: `(num_blocks + 1) / 2`
@@ -110,6 +114,10 @@ pub struct BmpIndex {
     sb_grid_bytes: OwnedBytes,
     /// Number of superblocks
     pub num_superblocks: u32,
+    /// doc_map_ids[virtual_id] = original doc_id — zero-copy OwnedBytes
+    doc_map_ids_bytes: OwnedBytes,
+    /// doc_map_ordinals[virtual_id] = original ordinal — zero-copy OwnedBytes
+    doc_map_ordinals_bytes: OwnedBytes,
 }
 
 // SAFETY: All raw pointer access is derived from OwnedBytes which are Send+Sync
@@ -118,14 +126,15 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V5 blob from the given file handle.
+    /// Parse a BMP V6 blob from the given file handle.
     ///
     /// Reads the 48-byte footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections. The superblock
     /// grid is persisted on disk and loaded as a zero-copy slice — no heap
     /// allocation at load time.
     ///
-    /// V5 stores the block grid in 4-bit packed format (50% smaller).
+    /// V6 stores the block grid in 4-bit packed format (50% smaller) and uses
+    /// compact virtual IDs with a doc_map lookup table (Section 9).
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -133,18 +142,18 @@ impl BmpIndex {
         _total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V5, BMP_BLOB_MAGIC_V5};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE_V6, BMP_BLOB_MAGIC_V6};
 
-        if blob_len < BMP_BLOB_FOOTER_SIZE_V5 as u64 {
+        if blob_len < BMP_BLOB_FOOTER_SIZE_V6 as u64 {
             return Err(crate::Error::Corruption(
                 "BMP blob too small for footer".into(),
             ));
         }
 
         // Read the footer (last 48 bytes of the blob)
-        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V5 as u64;
+        let footer_start = blob_offset + blob_len - BMP_BLOB_FOOTER_SIZE_V6 as u64;
         let footer_bytes = handle
-            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V5 as u64)
+            .read_bytes_range_sync(footer_start..footer_start + BMP_BLOB_FOOTER_SIZE_V6 as u64)
             .map_err(crate::Error::Io)?;
         let fb = footer_bytes.as_slice();
 
@@ -155,16 +164,16 @@ impl BmpIndex {
         let num_blocks = u32::from_le_bytes(fb[16..20].try_into().unwrap());
         let num_dims = u32::from_le_bytes(fb[20..24].try_into().unwrap());
         let bmp_block_size = u32::from_le_bytes(fb[24..28].try_into().unwrap());
-        let num_ordinals = u32::from_le_bytes(fb[28..32].try_into().unwrap());
+        let num_virtual_docs = u32::from_le_bytes(fb[28..32].try_into().unwrap());
         let max_weight_scale = f32::from_le_bytes(fb[32..36].try_into().unwrap());
         let sb_grid_offset = u32::from_le_bytes(fb[36..40].try_into().unwrap());
-        // fb[40..44] reserved
+        let doc_map_offset = u32::from_le_bytes(fb[40..44].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[44..48].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC_V5 {
+        if magic != BMP_BLOB_MAGIC_V6 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected {:#x})",
-                magic, BMP_BLOB_MAGIC_V5
+                "Invalid BMP blob magic: {:#x} (expected BMP6 {:#x})",
+                magic, BMP_BLOB_MAGIC_V6
             )));
         }
 
@@ -173,7 +182,7 @@ impl BmpIndex {
             return Ok(Self {
                 bmp_block_size,
                 num_blocks,
-                num_ordinals,
+                num_virtual_docs,
                 max_weight_scale,
                 total_vectors,
                 num_dims,
@@ -187,11 +196,13 @@ impl BmpIndex {
                 grid_bytes: OwnedBytes::empty(),
                 sb_grid_bytes: OwnedBytes::empty(),
                 num_superblocks: 0,
+                doc_map_ids_bytes: OwnedBytes::empty(),
+                doc_map_ordinals_bytes: OwnedBytes::empty(),
             });
         }
 
         // Read entire blob (excluding footer) as one OwnedBytes — zero-copy mmap slice
-        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V5 as u64;
+        let data_len = blob_len - BMP_BLOB_FOOTER_SIZE_V6 as u64;
         let blob = handle
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
@@ -211,7 +222,7 @@ impl BmpIndex {
         let dim_ids_start = dim_ids_offset as usize;
         let dim_ids_end = dim_ids_start + num_dims as usize * 4;
 
-        // V5: grid is 4-bit packed — packed_row_size = ceil(num_blocks / 2)
+        // V6: grid is 4-bit packed — packed_row_size = ceil(num_blocks / 2)
         let packed_row_size = (num_blocks as usize).div_ceil(2) as u32;
         let grid_start = dim_ids_end;
         let grid_end = grid_start + num_dims as usize * packed_row_size as usize;
@@ -220,6 +231,13 @@ impl BmpIndex {
         let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE);
         let sb_grid_start = sb_grid_offset as usize;
         let sb_grid_end = sb_grid_start + num_dims as usize * num_superblocks as usize;
+
+        // Section 9: doc_map (compact virtual_id → (doc_id, ordinal) lookup)
+        let dm_start = doc_map_offset as usize;
+        let dm_ids_end = dm_start + num_virtual_docs as usize * 4;
+        let dm_ords_end = dm_ids_end + num_virtual_docs as usize * 2;
+        let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
+        let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
         let block_term_starts_bytes = blob.slice(0..bts_end);
@@ -231,23 +249,25 @@ impl BmpIndex {
         let sb_grid_bytes = blob.slice(sb_grid_start..sb_grid_end);
 
         log::debug!(
-            "BMP V5 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
-             num_ordinals={}, max_weight_scale={:.4}, terms={}, postings={}, packed_row_size={}",
+            "BMP V6 index loaded: num_blocks={}, num_superblocks={}, num_dims={}, bmp_block_size={}, \
+             num_virtual_docs={}, max_weight_scale={:.4}, terms={}, postings={}, packed_row_size={}, \
+             doc_map={}B",
             num_blocks,
             num_superblocks,
             num_dims,
             bmp_block_size,
-            num_ordinals,
+            num_virtual_docs,
             max_weight_scale,
             total_terms,
             total_postings,
             packed_row_size,
+            num_virtual_docs as usize * 6,
         );
 
         Ok(Self {
             bmp_block_size,
             num_blocks,
-            num_ordinals,
+            num_virtual_docs,
             max_weight_scale,
             total_vectors,
             num_dims,
@@ -261,15 +281,36 @@ impl BmpIndex {
             grid_bytes,
             sb_grid_bytes,
             num_superblocks,
+            doc_map_ids_bytes,
+            doc_map_ordinals_bytes,
         })
     }
 
-    /// Convert a virtual_id from the flat accumulator to (doc_id, ordinal).
-    #[inline]
+    /// Convert a compact virtual_id to (doc_id, ordinal) via table lookup.
+    ///
+    /// Uses unchecked reads — virtual_id is validated by the caller
+    /// (only called for top-k results which are valid compact virtual IDs).
+    #[inline(always)]
     pub fn virtual_to_doc(&self, virtual_id: u32) -> (u32, u16) {
-        let doc_id = virtual_id / self.num_ordinals;
-        let ordinal = (virtual_id % self.num_ordinals) as u16;
-        (doc_id, ordinal)
+        let ids = self.doc_map_ids_bytes.as_slice();
+        let ords = self.doc_map_ordinals_bytes.as_slice();
+        debug_assert!((virtual_id as usize + 1) * 4 <= ids.len());
+        debug_assert!((virtual_id as usize + 1) * 2 <= ords.len());
+        unsafe {
+            let doc_id = read_u32_unchecked(ids.as_ptr(), virtual_id as usize);
+            let p = ords.as_ptr().add(virtual_id as usize * 2);
+            let ordinal = u16::from_le((p as *const u16).read_unaligned());
+            (doc_id, ordinal)
+        }
+    }
+
+    /// Get the original doc_id for a compact virtual_id (no ordinal needed).
+    /// Used in the predicate filter path — hot loop, unchecked reads.
+    #[inline(always)]
+    pub fn doc_id_for_virtual(&self, virtual_id: u32) -> u32 {
+        let d = self.doc_map_ids_bytes.as_slice();
+        debug_assert!((virtual_id as usize + 1) * 4 <= d.len());
+        unsafe { read_u32_unchecked(d.as_ptr(), virtual_id as usize) }
     }
 
     /// Binary search for a dimension ID in the global dim_ids array.
@@ -310,7 +351,7 @@ impl BmpIndex {
 
     /// Compute block UBs for blocks `[block_start..block_end)` within one superblock.
     ///
-    /// V5: reads 4-bit packed grid, unpacks via ×17 to get u8-equivalent UBs.
+    /// Reads 4-bit packed grid, unpacks via ×17 to get u8-equivalent UBs.
     pub fn compute_block_ubs_range(
         &self,
         query_dims: &[(usize, f32)],
@@ -333,7 +374,7 @@ impl BmpIndex {
 
     /// Build per-block query-dim presence masks for blocks `[block_start..block_end)`.
     ///
-    /// V5: reads 4-bit packed grid, unpacks inline to check presence.
+    /// Reads 4-bit packed grid, unpacks inline to check presence.
     pub fn compute_block_masks_range(
         &self,
         query_dims: &[(usize, f32)],
@@ -542,7 +583,7 @@ impl BmpIndex {
 
     /// Estimated memory usage in bytes (mmap-backed region sizes).
     ///
-    /// V5 fully zero-copy: all data is mmap-backed OwnedBytes, but the
+    /// V6 fully zero-copy: all data is mmap-backed OwnedBytes, but the
     /// mapped regions still consume RSS when paged in by the OS.
     pub fn estimated_memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -553,6 +594,8 @@ impl BmpIndex {
             + self.dim_ids_bytes.len()
             + self.grid_bytes.len()
             + self.sb_grid_bytes.len()
+            + self.doc_map_ids_bytes.len()
+            + self.doc_map_ordinals_bytes.len()
     }
 }
 
@@ -669,7 +712,7 @@ unsafe fn accumulate_u8_weighted_neon(input: &[u8], weight: f32, out: &mut [f32]
 }
 
 // ============================================================================
-// 4-bit grid accumulation (V5)
+// 4-bit grid accumulation
 // ============================================================================
 
 /// Accumulate 4-bit packed grid values into f32 output.

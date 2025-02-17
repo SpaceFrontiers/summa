@@ -1,8 +1,8 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V5 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V6 format**.
 //!
-//! Builds a block-at-a-time (BAAT) index using **virtual coordinates**:
-//! `virtual_id = doc_id * num_ordinals + ordinal`, so each (doc_id, ordinal)
-//! pair is a unique "virtual document". Blocks are over virtual_ids.
+//! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
+//! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
+//! table (Section 9) enables query-time recovery of the original coordinates.
 //!
 //! Postings are 2 bytes each: `(local_slot: u8, impact: u8)`.
 //!
@@ -12,26 +12,30 @@
 //!
 //! Uses a K-way merge over per-dim cursors — **zero intermediate allocation**.
 //! Each dim's postings are already sorted by `(doc_id, ordinal)` = sorted by
-//! `virtual_id` = sorted by `block_id`, so a min-heap merges them in block
-//! order directly into the output arrays.
+//! `compact_virtual_id` = sorted by `block_id`, so a min-heap merges them in
+//! block order directly into the output arrays.
 //!
 //! Peak memory: `output arrays only + O(num_dims) heap`.
 //!
-//! ## BMP V5 Blob Layout
+//! ## BMP V6 Blob Layout
 //!
-//! V5 packs the block grid to 4-bit (50% memory reduction, ≤0.05 recall loss).
+//! V6 uses compact virtual IDs (sequential assignment) instead of the sparse
+//! `doc_id * num_ordinals + ordinal` scheme, eliminating catastrophic space
+//! blowup when ordinal distribution is skewed.
 //!
 //! ```text
-//! Section 1: block_term_starts    [u32-LE × (num_blocks + 1)]
-//! Section 2: term_dim_ids         [u32-LE × total_terms]
-//! Section 3: term_posting_starts  [u32-LE × (total_terms + 1)]    ← prefix sums
-//! Section 4: postings             [(u8, u8) × total_postings]     ← BmpPosting pairs
-//! Section 5: padding              [0-3 bytes to next 4-byte boundary]
-//! Section 6: dim_ids              [u32-LE × num_dims]
-//! Section 7: grid_packed4         [u8 × (num_dims × packed_row_size)]  ← 4-bit packed
-//! Section 8: sb_grid              [u8 × (num_dims × num_superblocks)]  ← 8-bit
+//! Section 1:  block_term_starts    [u32-LE × (num_blocks + 1)]
+//! Section 2:  term_dim_ids         [u32-LE × total_terms]
+//! Section 3:  term_posting_starts  [u32-LE × (total_terms + 1)]    ← prefix sums
+//! Section 4:  postings             [(u8, u8) × total_postings]     ← BmpPosting pairs
+//! Section 5:  padding              [0-3 bytes to next 4-byte boundary]
+//! Section 6:  dim_ids              [u32-LE × num_dims]
+//! Section 7:  grid_packed4         [u8 × (num_dims × packed_row_size)]  ← 4-bit packed
+//! Section 8:  sb_grid              [u8 × (num_dims × num_superblocks)]  ← 8-bit
+//! Section 9a: doc_map_ids          [u32-LE × num_virtual_docs]
+//! Section 9b: doc_map_ordinals     [u16-LE × num_virtual_docs]
 //!
-//! BMP5 Footer (48 bytes):
+//! BMP6 Footer (48 bytes):
 //!   total_terms: u32              // 0-3
 //!   total_postings: u32           // 4-7
 //!   dim_ids_offset: u32           // 8-11   (byte offset of section 6)
@@ -39,11 +43,11 @@
 //!   num_blocks: u32               // 16-19
 //!   num_dims: u32                 // 20-23
 //!   bmp_block_size: u32           // 24-27
-//!   num_ordinals: u32             // 28-31
+//!   num_virtual_docs: u32         // 28-31  (= actual vector count)
 //!   max_weight_scale: f32         // 32-35
 //!   sb_grid_offset: u32           // 36-39  (byte offset of section 8)
-//!   _reserved: u32                // 40-43
-//!   magic: u32                    // 44-47  (BMP5 = 0x35504D42)
+//!   doc_map_offset: u32           // 40-43  (byte offset of section 9)
+//!   magic: u32                    // 44-47  (BMP6 = 0x36504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -51,17 +55,20 @@ use std::collections::BinaryHeap;
 use std::io::Write;
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::DocId;
-use crate::segment::format::BMP_BLOB_MAGIC_V5;
+use crate::segment::format::BMP_BLOB_MAGIC_V6;
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V5 blob from per-dimension postings.
+/// Build a BMP V6 blob from per-dimension postings.
+///
+/// Uses compact virtual IDs: sequential IDs assigned to unique `(doc_id, ordinal)`
+/// pairs, eliminating the sparse `doc_id * num_ordinals + ordinal` space.
 ///
 /// Uses a K-way merge over per-dim cursors to avoid flattening all postings
 /// into a single Vec + global sort. Each dim's postings are already sorted by
-/// `(doc_id, ordinal)` = sorted by `virtual_id` = sorted by `block_id`.
+/// `(doc_id, ordinal)` = sorted by `compact_virtual_id` = sorted by `block_id`.
 /// A min-heap merges them in `(block_id, dim_id)` order.
 ///
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
@@ -94,11 +101,10 @@ pub(crate) fn build_bmp_blob(
         }
     }
 
-    // Phase 1: Find global max weight, max doc_id, and num_ordinals
+    // Phase 1: Find global max weight AND collect unique (doc_id, ordinal) pairs.
+    // Single pass over all postings — avoids double iteration.
     let mut global_max_weight: f32 = 0.0;
-    let mut max_doc_id: DocId = 0;
-    let mut max_ordinal: u16 = 0;
-    let mut has_any = false;
+    let mut vid_set: FxHashSet<(DocId, u16)> = FxHashSet::default();
 
     for dim_postings in postings.values() {
         for &(doc_id, ordinal, weight) in dim_postings {
@@ -106,20 +112,14 @@ pub(crate) fn build_bmp_blob(
             if abs_w < weight_threshold {
                 continue;
             }
-            has_any = true;
             if abs_w > global_max_weight {
                 global_max_weight = abs_w;
             }
-            if doc_id > max_doc_id {
-                max_doc_id = doc_id;
-            }
-            if ordinal > max_ordinal {
-                max_ordinal = ordinal;
-            }
+            vid_set.insert((doc_id, ordinal));
         }
     }
 
-    if global_max_weight == 0.0 || !has_any {
+    if global_max_weight == 0.0 || vid_set.is_empty() {
         return Ok(0);
     }
 
@@ -131,13 +131,24 @@ pub(crate) fn build_bmp_blob(
     } else {
         global_max_weight
     };
-    let num_ordinals = max_ordinal as u32 + 1;
 
-    // Virtual ID space
-    let max_virtual_id = max_doc_id as u64 * num_ordinals as u64 + max_ordinal as u64;
+    // Assign compact virtual IDs: sequential IDs for unique (doc_id, ordinal) pairs.
+    // This eliminates the sparse `doc_id * num_ordinals + ordinal` space that causes
+    // catastrophic grid blowup when ordinal distribution is skewed.
+    let mut vid_pairs: Vec<(DocId, u16)> = vid_set.into_iter().collect();
+    vid_pairs.sort_unstable();
+    let num_virtual_docs = vid_pairs.len();
+
+    // Build lookup: (doc_id, ordinal) → compact virtual_id
+    let vid_map: FxHashMap<(DocId, u16), u32> = vid_pairs
+        .iter()
+        .enumerate()
+        .map(|(i, &pair)| (pair, i as u32))
+        .collect();
+
     // Safety: local_slot is u8, so block_size must not exceed 256
     let effective_block_size = bmp_block_size.min(256);
-    let num_blocks = (max_virtual_id / effective_block_size as u64 + 1) as usize;
+    let num_blocks = num_virtual_docs.div_ceil(effective_block_size as usize);
 
     let mut dim_ids: Vec<u32> = postings.keys().copied().collect();
     dim_ids.sort_unstable();
@@ -158,7 +169,6 @@ pub(crate) fn build_bmp_blob(
     let mut heap: BinaryHeap<Reverse<(u32, u32, usize)>> = BinaryHeap::with_capacity(num_dims);
 
     let bs64 = effective_block_size as u64;
-    let nord64 = num_ordinals as u64;
 
     // Initialize heap with first valid posting from each dim
     for (dim_idx, &dim_id) in dim_ids.iter().enumerate() {
@@ -172,7 +182,7 @@ pub(crate) fn build_bmp_blob(
             if impact == 0 {
                 continue;
             }
-            let virtual_id = doc_id as u64 * nord64 + ordinal as u64;
+            let virtual_id = vid_map[&(doc_id, ordinal)] as u64;
             let block_id = (virtual_id / bs64) as u32;
             cursors[dim_idx] = pos;
             heap.push(Reverse((block_id, dim_id, dim_idx)));
@@ -230,7 +240,7 @@ pub(crate) fn build_bmp_blob(
                     continue;
                 }
 
-                let virtual_id = doc_id as u64 * nord64 + ordinal as u64;
+                let virtual_id = vid_map[&(doc_id, ordinal)] as u64;
                 let bid2 = (virtual_id / bs64) as u32;
                 if bid2 != block_id {
                     // This posting belongs to a later block — record and stop
@@ -263,7 +273,7 @@ pub(crate) fn build_bmp_blob(
                     if abs_w >= weight_threshold {
                         let impact = quantize_weight(abs_w, max_weight_scale);
                         if impact > 0 {
-                            let virtual_id = doc_id as u64 * nord64 + ordinal as u64;
+                            let virtual_id = vid_map[&(doc_id, ordinal)] as u64;
                             let nb = (virtual_id / bs64) as u32;
                             cursors[dim_idx] = pos;
                             heap.push(Reverse((nb, dim_id, dim_idx)));
@@ -293,12 +303,11 @@ pub(crate) fn build_bmp_blob(
     let packed_row_size = num_blocks.div_ceil(2);
     let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
     log::info!(
-        "[bmp_build] max_doc_id={} num_ordinals={} num_blocks={} num_dims={} \
+        "[bmp_build] num_virtual_docs={} num_blocks={} num_dims={} \
          total_terms={} total_postings={} grid_entries={} \
          block_term_starts={}B term_dim_ids={}B term_posting_starts={}B \
-         postings_flat={}B grid={}B sb_grid={}B",
-        max_doc_id,
-        num_ordinals,
+         postings_flat={}B grid={}B sb_grid={}B doc_map={}B",
+        num_virtual_docs,
         num_blocks,
         num_dims,
         total_terms,
@@ -310,9 +319,10 @@ pub(crate) fn build_bmp_blob(
         total_postings as usize * 2,
         num_dims * packed_row_size,
         num_dims * num_superblocks,
+        num_virtual_docs * 6,
     );
 
-    // ── Write V5 sections ───────────────────────────────────────────────
+    // ── Write V6 sections ───────────────────────────────────────────────
     let mut bytes_written: u64 = 0;
 
     // Section 1: block_term_starts [u32-LE × (num_blocks + 1)]
@@ -345,7 +355,20 @@ pub(crate) fn build_bmp_blob(
     let sb_grid_offset = (bytes_written + packed_bytes) as u32;
     bytes_written += packed_bytes + sb_bytes;
 
-    // BMP V5 Footer (48 bytes)
+    // Section 9a: doc_map_ids [u32-LE × num_virtual_docs]
+    let doc_map_offset = bytes_written as u32;
+    for &(doc_id, _) in &vid_pairs {
+        writer.write_u32::<LittleEndian>(doc_id)?;
+    }
+    bytes_written += num_virtual_docs as u64 * 4;
+
+    // Section 9b: doc_map_ordinals [u16-LE × num_virtual_docs]
+    for &(_, ord) in &vid_pairs {
+        writer.write_u16::<LittleEndian>(ord)?;
+    }
+    bytes_written += num_virtual_docs as u64 * 2;
+
+    // BMP V6 Footer (48 bytes)
     writer.write_u32::<LittleEndian>(total_terms)?;
     writer.write_u32::<LittleEndian>(total_postings)?;
     writer.write_u32::<LittleEndian>(dim_ids_offset)?;
@@ -353,11 +376,11 @@ pub(crate) fn build_bmp_blob(
     writer.write_u32::<LittleEndian>(num_blocks as u32)?;
     writer.write_u32::<LittleEndian>(num_dims as u32)?;
     writer.write_u32::<LittleEndian>(effective_block_size)?;
-    writer.write_u32::<LittleEndian>(num_ordinals)?;
+    writer.write_u32::<LittleEndian>(num_virtual_docs as u32)?;
     writer.write_f32::<LittleEndian>(max_weight_scale)?;
     writer.write_u32::<LittleEndian>(sb_grid_offset)?;
-    writer.write_u32::<LittleEndian>(0)?; // reserved
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V5)?;
+    writer.write_u32::<LittleEndian>(doc_map_offset)?;
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V6)?;
     bytes_written += 48;
 
     Ok(bytes_written)
@@ -502,7 +525,7 @@ mod tests {
         // Verify footer magic
         let footer_start = buf.len() - 4;
         let magic = u32::from_le_bytes(buf[footer_start..].try_into().unwrap());
-        assert_eq!(magic, BMP_BLOB_MAGIC_V5);
+        assert_eq!(magic, BMP_BLOB_MAGIC_V6);
     }
 
     #[test]
@@ -515,11 +538,12 @@ mod tests {
         let size = build_bmp_blob(&mut postings, 64, 0.0, None, None, &mut buf).unwrap();
         assert!(size > 0);
 
-        // Verify footer: num_ordinals should be 2 (at offset 28-31 in 48-byte footer)
+        // Verify footer: num_virtual_docs should be 3 (at offset 28-31 in 48-byte footer)
+        // 3 unique (doc_id, ordinal) pairs: (0,0), (0,1), (1,0)
         let footer_start = buf.len() - 48;
         let fb = &buf[footer_start..];
-        let num_ordinals = u32::from_le_bytes(fb[28..32].try_into().unwrap());
-        assert_eq!(num_ordinals, 2);
+        let num_virtual_docs = u32::from_le_bytes(fb[28..32].try_into().unwrap());
+        assert_eq!(num_virtual_docs, 3);
     }
 
     #[test]

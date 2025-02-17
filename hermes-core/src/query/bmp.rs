@@ -3,8 +3,9 @@
 //! Superblock-at-a-time (SaaT) processor that groups BMP blocks into superblocks
 //! and uses hierarchical pruning for faster query execution.
 //!
-//! Uses **virtual coordinates**: `virtual_id = doc_id * num_ordinals + ordinal`.
-//! Always uses the flat scoring path — no ordinal branching needed.
+//! Uses **compact virtual coordinates**: sequential IDs assigned to unique
+//! `(doc_id, ordinal)` pairs. A doc_map lookup table maps virtual IDs back
+//! to original coordinates at query time.
 //!
 //! Based on:
 //! - Mallia, Suel & Tonellotto (SIGIR 2024): BMP block-at-a-time processing
@@ -122,8 +123,8 @@ thread_local! {
 /// Execute a BMP query against the given index.
 ///
 /// Returns top-k results sorted by score descending.
-/// Scores are computed over virtual documents (doc_id × num_ordinals + ordinal),
-/// then mapped back to real (doc_id, ordinal) pairs.
+/// Scores are computed over compact virtual documents, then mapped back to
+/// real (doc_id, ordinal) pairs via the doc_map lookup table.
 ///
 /// Uses superblock pruning: computes coarse UBs over groups of 64 blocks,
 /// prunes entire superblocks, then scores only surviving blocks.
@@ -311,7 +312,6 @@ fn execute_bmp_inner(
                 alpha,
                 k,
                 &predicate,
-                index.num_ordinals,
                 &mut collector,
                 &mut blocks_scored,
                 &mut scratch.acc,
@@ -348,13 +348,11 @@ fn execute_bmp_inner(
 
     let mut results = result;
 
-    // ── Phase 4: Map virtual_ids back to (doc_id, ordinal) ────────────
-    if index.num_ordinals > 1 {
-        for r in &mut results {
-            let (doc_id, ordinal) = index.virtual_to_doc(r.doc_id);
-            r.doc_id = doc_id;
-            r.ordinal = ordinal;
-        }
+    // ── Phase 4: Map compact virtual_ids back to (doc_id, ordinal) ────
+    for r in &mut results {
+        let (doc_id, ordinal) = index.virtual_to_doc(r.doc_id);
+        r.doc_id = doc_id;
+        r.ordinal = ordinal;
     }
 
     Ok(results)
@@ -420,7 +418,6 @@ fn score_superblock_blocks(
     alpha: f32,
     k: usize,
     predicate: &Option<&dyn Fn(crate::DocId) -> bool>,
-    num_ordinals: u32,
     collector: &mut ScoreCollector,
     blocks_scored: &mut u32,
     acc: &mut [u32],
@@ -470,17 +467,18 @@ fn score_superblock_blocks(
 
         // Collect results: dequantize u32 → f32
         let base = block_id * index.bmp_block_size;
+        let num_vdocs = index.num_virtual_docs;
         for (i, &score_u32) in acc[..block_size].iter().enumerate() {
             if score_u32 > 0 {
+                let virtual_id = base + i as u32;
+                // Guard against phantom slots in the last block
+                if virtual_id >= num_vdocs {
+                    continue;
+                }
                 let score = score_u32 as f32 * dequant;
                 if collector.would_enter(score) {
-                    let virtual_id = base + i as u32;
                     if let Some(pred) = predicate {
-                        let doc_id = if num_ordinals > 1 {
-                            virtual_id / num_ordinals
-                        } else {
-                            virtual_id
-                        };
+                        let doc_id = index.doc_id_for_virtual(virtual_id);
                         if !pred(doc_id) {
                             continue;
                         }
