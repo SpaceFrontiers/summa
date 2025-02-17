@@ -7,8 +7,11 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tonic::Status;
 
+use log::{info, warn};
+
+use hermes_core::segment::{SegmentId, SegmentReader, delete_segment};
 use hermes_core::structures::QueryWeighting;
-use hermes_core::{Index, IndexConfig, IndexWriter, MmapDirectory, Schema};
+use hermes_core::{Index, IndexConfig, IndexMetadata, IndexWriter, MmapDirectory, Schema};
 
 /// Combined index + writer handle under a single registry entry
 pub struct IndexHandle {
@@ -224,6 +227,119 @@ impl IndexRegistry {
     pub fn evict(&self, name: &str) -> Option<IndexHandle> {
         self.open_locks.write().remove(name);
         self.handles.write().remove(name)
+    }
+
+    /// Validate all indexes on disk, removing corrupt segments.
+    ///
+    /// For each index directory, loads metadata.json, tries to open every
+    /// segment, and removes any that fail validation. Operates directly on
+    /// metadata files — the index is not opened through the normal path.
+    pub async fn doctor_all_indexes(&self) {
+        info!("Doctor: scanning indexes in {:?}", self.data_dir);
+
+        let entries = match std::fs::read_dir(&self.data_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Doctor: cannot read data directory: {}", e);
+                return;
+            }
+        };
+
+        let mut total_removed = 0usize;
+        let mut indexes_checked = 0usize;
+
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().into_string().ok() else {
+                continue;
+            };
+
+            let index_path = self.data_dir.join(&name);
+            let dir = MmapDirectory::new(&index_path);
+
+            // Load metadata — skip directories that aren't indexes
+            let meta = match IndexMetadata::load(&dir).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Doctor: {}: cannot load metadata, skipping ({})", name, e);
+                    continue;
+                }
+            };
+
+            indexes_checked += 1;
+            let schema = Arc::new(meta.schema.clone());
+            let segment_ids: Vec<String> = meta.segment_ids();
+
+            if segment_ids.is_empty() {
+                continue;
+            }
+
+            let mut bad_segments: Vec<String> = Vec::new();
+            for seg_id_str in &segment_ids {
+                let Some(seg_id) = SegmentId::from_hex(seg_id_str) else {
+                    warn!(
+                        "Doctor: {}: invalid segment id '{}', marking corrupt",
+                        name, seg_id_str
+                    );
+                    bad_segments.push(seg_id_str.clone());
+                    continue;
+                };
+
+                match SegmentReader::open(&dir, seg_id, Arc::clone(&schema), 0).await {
+                    Ok(_reader) => {
+                        // Segment is valid — drop the reader
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Doctor: {}: segment {} is corrupt ({}), will remove",
+                            name, seg_id_str, e
+                        );
+                        bad_segments.push(seg_id_str.clone());
+                    }
+                }
+            }
+
+            if bad_segments.is_empty() {
+                info!("Doctor: {}: all {} segments OK", name, segment_ids.len());
+                continue;
+            }
+
+            // Remove bad segments from metadata and save
+            let mut meta = meta;
+            for seg_id_str in &bad_segments {
+                meta.remove_segment(seg_id_str);
+            }
+            if let Err(e) = meta.save(&dir).await {
+                warn!("Doctor: {}: failed to save metadata: {}", name, e);
+                continue;
+            }
+
+            // Delete orphan segment files
+            for seg_id_str in &bad_segments {
+                if let Some(seg_id) = SegmentId::from_hex(seg_id_str) {
+                    let _ = delete_segment(&dir, seg_id).await;
+                }
+            }
+
+            let removed = bad_segments.len();
+            total_removed += removed;
+            info!(
+                "Doctor: {}: removed {} corrupt segment(s), {} remaining",
+                name,
+                removed,
+                segment_ids.len() - removed,
+            );
+        }
+
+        info!(
+            "Doctor: done — checked {} index(es), removed {} corrupt segment(s)",
+            indexes_checked, total_removed,
+        );
     }
 
     /// List all indexes on disk.

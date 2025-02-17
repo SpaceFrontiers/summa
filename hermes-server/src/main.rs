@@ -58,6 +58,10 @@ struct Args {
     /// Maximum number of tokio worker threads (default: min(cpus, 16))
     #[arg(long)]
     worker_threads: Option<usize>,
+
+    /// Validate all indexes on startup, remove corrupt segments
+    #[arg(long)]
+    doctor: bool,
 }
 
 fn main() -> Result<()> {
@@ -119,6 +123,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     };
 
     let registry = Arc::new(registry::IndexRegistry::new(args.data_dir.clone(), config));
+
+    if args.doctor {
+        registry.doctor_all_indexes().await;
+    }
 
     let search_service = search_service::SearchServiceImpl {
         registry: Arc::clone(&registry),
