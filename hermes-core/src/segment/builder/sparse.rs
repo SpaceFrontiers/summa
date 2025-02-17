@@ -111,7 +111,7 @@ pub(super) fn build_sparse_streaming(
 
                 let max_grid_bytes = sparse_config
                     .map(|c| c.max_bmp_grid_bytes)
-                    .unwrap_or(256 * 1024 * 1024);
+                    .unwrap_or(1024 * 1024 * 1024);
 
                 let blob_offset = current_offset;
                 let blob_len = super::bmp::build_bmp_blob_with_grid_cap(

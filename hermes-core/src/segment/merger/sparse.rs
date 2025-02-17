@@ -77,16 +77,20 @@ impl SegmentMerger {
                     .iter()
                     .map(|seg| seg.bmp_indexes().get(&field.0))
                     .collect();
-                let total_vectors: u32 = bmp_indexes
+                let total_vectors_bmp: u32 = bmp_indexes
                     .iter()
                     .filter_map(|bi| bi.map(|idx| idx.total_vectors))
                     .sum();
-                let has_data = bmp_indexes.iter().any(|bi| bi.is_some());
-                if has_data {
+                let has_bmp_data = bmp_indexes.iter().any(|bi| bi.is_some());
+                if has_bmp_data {
                     let bmp_block_size = sparse_config
                         .as_ref()
                         .map(|c| c.bmp_block_size)
                         .unwrap_or(64);
+                    let max_grid_bytes = sparse_config
+                        .as_ref()
+                        .map(|c| c.max_bmp_grid_bytes)
+                        .unwrap_or(0);
 
                     merge_bmp_field(
                         &bmp_indexes,
@@ -94,7 +98,8 @@ impl SegmentMerger {
                         field.0,
                         quantization,
                         bmp_block_size,
-                        total_vectors,
+                        max_grid_bytes,
+                        total_vectors_bmp,
                         &mut writer,
                         &mut field_tocs,
                     )?;
@@ -301,6 +306,7 @@ fn merge_bmp_field(
     field_id: u32,
     quantization: crate::structures::WeightQuantization,
     bmp_block_size: u32,
+    max_grid_bytes: u64,
     total_vectors: u32,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
@@ -348,8 +354,13 @@ fn merge_bmp_field(
     dim_ids.sort_unstable();
     let num_dims = dim_ids.len();
 
-    // ── Grid cap: auto-scale block_size if grid would exceed 128MB ───────
-    const MAX_GRID_BYTES: u64 = 128 * 1024 * 1024;
+    // ── Grid cap: auto-scale block_size if grid would exceed limit ─────
+    // 0 = use default (512MB); otherwise honour the per-field config value
+    let grid_cap = if max_grid_bytes > 0 {
+        max_grid_bytes
+    } else {
+        512 * 1024 * 1024
+    };
     let mut effective_block_size = bmp_block_size;
     let mut num_blocks = if max_merged_virtual == 0 {
         1
@@ -358,8 +369,8 @@ fn merge_bmp_field(
     };
 
     let grid_bytes = num_dims as u64 * num_blocks as u64;
-    if grid_bytes > MAX_GRID_BYTES && num_dims > 0 {
-        let max_blocks = MAX_GRID_BYTES / num_dims as u64;
+    if grid_bytes > grid_cap && num_dims > 0 {
+        let max_blocks = grid_cap / num_dims as u64;
         if let Some(ratio) = max_merged_virtual.checked_div(max_blocks) {
             effective_block_size = (ratio + 1).next_power_of_two() as u32;
             effective_block_size = effective_block_size.max(bmp_block_size);
@@ -374,6 +385,30 @@ fn merge_bmp_field(
                 effective_block_size,
                 num_blocks,
             );
+        }
+    }
+
+    // Cap block_size at 256 to prevent u8 overflow in local_slot postings
+    if effective_block_size > 256 {
+        effective_block_size = 256;
+        num_blocks = if max_merged_virtual == 0 {
+            1
+        } else {
+            (max_merged_virtual / effective_block_size as u64 + 1) as usize
+        };
+
+        let capped_grid = num_dims as u64 * num_blocks as u64;
+        if capped_grid > grid_cap {
+            log::warn!(
+                "[merge_bmp] Grid {:.0}MB ({} dims × {} blocks) exceeds {:.0}MB cap at block_size=256 \
+                 for field {}, skipping BMP merge",
+                capped_grid as f64 / (1024.0 * 1024.0),
+                num_dims,
+                num_blocks,
+                grid_cap as f64 / (1024.0 * 1024.0),
+                field_id,
+            );
+            return Ok(());
         }
     }
 

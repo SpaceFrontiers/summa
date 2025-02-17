@@ -168,6 +168,28 @@ pub(crate) fn build_bmp_blob_with_grid_cap(
         }
     }
 
+    // Cap block_size at 256 to prevent u8 overflow in local_slot postings
+    if effective_block_size > 256 {
+        effective_block_size = 256;
+        num_blocks = (max_virtual_id / effective_block_size as u64 + 1) as usize;
+
+        // If grid still exceeds cap at max block_size, BMP is infeasible
+        if max_grid_bytes > 0 {
+            let capped_grid = num_dims as u64 * num_blocks as u64;
+            if capped_grid > max_grid_bytes {
+                log::info!(
+                    "[bmp] Grid {:.0}MB ({} dims × {} blocks) exceeds {:.0}MB cap at block_size=256, \
+                     BMP infeasible for this field",
+                    capped_grid as f64 / (1024.0 * 1024.0),
+                    num_dims,
+                    num_blocks,
+                    max_grid_bytes as f64 / (1024.0 * 1024.0),
+                );
+                return Ok(0);
+            }
+        }
+    }
+
     // Phase 2: Flatten all postings into a single sorted Vec + build grid
     let dim_to_idx: FxHashMap<u32, usize> =
         dim_ids.iter().enumerate().map(|(i, &d)| (d, i)).collect();
