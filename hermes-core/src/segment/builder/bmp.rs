@@ -10,10 +10,12 @@
 //!
 //! ## Memory efficiency
 //!
-//! All postings are collected into a single flat Vec, sorted once, then written
-//! as contiguous arrays. No per-block Vec allocations, no intermediate buffer.
+//! Uses a K-way merge over per-dim cursors — **zero intermediate allocation**.
+//! Each dim's postings are already sorted by `(doc_id, ordinal)` = sorted by
+//! `virtual_id` = sorted by `block_id`, so a min-heap merges them in block
+//! order directly into the output arrays.
 //!
-//! Peak memory: `entries (12B × total_postings) + grid_entries (9B × total_terms)`.
+//! Peak memory: `output arrays only + O(num_dims) heap`.
 //!
 //! ## BMP V5 Blob Layout
 //!
@@ -44,6 +46,8 @@
 //!   magic: u32                    // 44-47  (BMP5 = 0x35504D42)
 //! ```
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::io::Write;
 
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -55,9 +59,11 @@ use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
 /// Build a BMP V5 blob from per-dimension postings.
 ///
-/// Grid entries `(dim_idx, block_id, max_impact)` are collected sparsely
-/// during the posting scan — no dense grid allocation. The 4-bit packed grid
-/// and 8-bit superblock grid are streamed dim-by-dim during write.
+/// Uses a K-way merge over per-dim cursors to avoid flattening all postings
+/// into a single Vec + global sort. Each dim's postings are already sorted by
+/// `(doc_id, ordinal)` = sorted by `virtual_id` = sorted by `block_id`.
+/// A min-heap merges them in `(block_id, dim_id)` order.
+///
 /// `bmp_block_size` is clamped to 256 max (u8 local_slot).
 pub(crate) fn build_bmp_blob(
     postings: &mut FxHashMap<u32, Vec<(DocId, u16, f32)>>,
@@ -135,125 +141,147 @@ pub(crate) fn build_bmp_blob(
 
     let mut dim_ids: Vec<u32> = postings.keys().copied().collect();
     dim_ids.sort_unstable();
+    let num_dims = dim_ids.len();
 
-    // Phase 2: Flatten all postings into a single sorted Vec
-    let dim_to_idx: FxHashMap<u32, usize> =
-        dim_ids.iter().enumerate().map(|(i, &d)| (d, i)).collect();
+    // Phase 2: K-way merge over per-dim cursors
+    //
+    // Collect dim slices (avoid repeated HashMap lookups in hot loop)
+    let dim_slices: Vec<&[(DocId, u16, f32)]> = dim_ids
+        .iter()
+        .map(|&d| postings.get(&d).map(|v| v.as_slice()).unwrap_or(&[]))
+        .collect();
 
-    let total_postings_est: usize = postings.values().map(|v| v.len()).sum();
-    let mut entries: Vec<(u32, u32, u8, u8)> = Vec::with_capacity(total_postings_est);
+    // Per-dim cursor positions
+    let mut cursors: Vec<usize> = vec![0; num_dims];
 
-    for (&dim_id, dim_posts) in postings.iter() {
-        for &(doc_id, ordinal, weight) in dim_posts {
+    // Min-heap: (block_id, dim_id, dim_idx)
+    let mut heap: BinaryHeap<Reverse<(u32, u32, usize)>> = BinaryHeap::with_capacity(num_dims);
+
+    let bs64 = effective_block_size as u64;
+    let nord64 = num_ordinals as u64;
+
+    // Initialize heap with first valid posting from each dim
+    for (dim_idx, &dim_id) in dim_ids.iter().enumerate() {
+        let posts = dim_slices[dim_idx];
+        for (pos, &(doc_id, ordinal, weight)) in posts.iter().enumerate() {
             let abs_w = weight.abs();
             if abs_w < weight_threshold {
                 continue;
             }
-            let virtual_id = doc_id as u64 * num_ordinals as u64 + ordinal as u64;
-            let block_id = (virtual_id / effective_block_size as u64) as u32;
-            let local_slot = (virtual_id % effective_block_size as u64) as u8;
-            let impact_u8 = quantize_weight(abs_w, max_weight_scale);
-
-            if impact_u8 == 0 {
+            let impact = quantize_weight(abs_w, max_weight_scale);
+            if impact == 0 {
                 continue;
             }
-
-            entries.push((block_id, dim_id, local_slot, impact_u8));
+            let virtual_id = doc_id as u64 * nord64 + ordinal as u64;
+            let block_id = (virtual_id / bs64) as u32;
+            cursors[dim_idx] = pos;
+            heap.push(Reverse((block_id, dim_id, dim_idx)));
+            break;
         }
     }
 
-    if entries.is_empty() {
+    if heap.is_empty() {
         return Ok(0);
     }
 
-    // Phase 3: Sort once by (block_id, dim_id, local_slot)
-    entries.sort_unstable();
-
-    // Phase 4: Write V5 blob
-    write_bmp_blob_v5(
-        &entries,
-        &dim_ids,
-        &dim_to_idx,
-        num_blocks,
-        effective_block_size,
-        num_ordinals,
-        max_weight_scale,
-        writer,
-    )
-}
-
-/// Write a BMP V5 blob from pre-sorted entries.
-///
-/// `entries` must be sorted by (block_id, dim_id, local_slot).
-/// Grid entries are collected sparsely during the block iteration and
-/// streamed dim-by-dim — no dense grid allocation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_bmp_blob_v5(
-    entries: &[(u32, u32, u8, u8)],
-    dim_ids: &[u32],
-    dim_to_idx: &FxHashMap<u32, usize>,
-    num_blocks: usize,
-    bmp_block_size: u32,
-    num_ordinals: u32,
-    max_weight_scale: f32,
-    writer: &mut dyn Write,
-) -> std::io::Result<u64> {
-    let num_dims = dim_ids.len();
-
-    // Single pass: build flat arrays from sorted entries + collect grid entries
+    // Output arrays
     let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
     let mut term_dim_ids: Vec<u32> = Vec::new();
     let mut term_posting_starts: Vec<u32> = Vec::new();
-    let mut postings_flat: Vec<u8> = Vec::new(); // (local_slot, impact) pairs
+    let mut postings_flat: Vec<u8> = Vec::new();
     let mut grid_entries: Vec<(u32, u32, u8)> = Vec::new(); // (dim_idx, block_id, max_impact)
-
-    let mut entry_idx = 0;
     let mut posting_count: u32 = 0;
+    let mut last_block_filled: i64 = -1; // tracks which blocks have block_term_starts entries
 
-    for block_id in 0..num_blocks as u32 {
-        block_term_starts.push(term_dim_ids.len() as u32);
-
-        // Find all entries for this block
-        let block_start = entry_idx;
-        while entry_idx < entries.len() && entries[entry_idx].0 == block_id {
-            entry_idx += 1;
+    while let Some(&Reverse((block_id, _, _))) = heap.peek() {
+        // Fill block_term_starts for empty blocks up to and including this one
+        let fill_from = (last_block_filled + 1) as u32;
+        for _ in fill_from..=block_id {
+            block_term_starts.push(term_dim_ids.len() as u32);
         }
-        let block_entries = &entries[block_start..entry_idx];
+        last_block_filled = block_id as i64;
 
-        if block_entries.is_empty() {
-            continue;
-        }
-
-        // Group by dim_id (entries are sorted by dim_id within block)
-        let mut i = 0;
-        while i < block_entries.len() {
-            let dim_id = block_entries[i].1;
-            let group_start = i;
-            let mut max_impact = 0u8;
-            while i < block_entries.len() && block_entries[i].1 == dim_id {
-                if block_entries[i].3 > max_impact {
-                    max_impact = block_entries[i].3;
-                }
-                i += 1;
+        // Process all dims with postings in this block
+        while let Some(&Reverse((bid, dim_id, dim_idx))) = heap.peek() {
+            if bid != block_id {
+                break;
             }
+            heap.pop();
+
+            let posts = dim_slices[dim_idx];
+            let mut pos = cursors[dim_idx];
+            let mut max_impact = 0u8;
+            let mut next_block: Option<u32> = None;
 
             term_dim_ids.push(dim_id);
             term_posting_starts.push(posting_count);
 
-            for e in &block_entries[group_start..i] {
-                postings_flat.push(e.2); // local_slot
-                postings_flat.push(e.3); // impact
+            // Process all postings for this dim in this block
+            while pos < posts.len() {
+                let (doc_id, ordinal, weight) = posts[pos];
+                let abs_w = weight.abs();
+                if abs_w < weight_threshold {
+                    pos += 1;
+                    continue;
+                }
+                let impact = quantize_weight(abs_w, max_weight_scale);
+                if impact == 0 {
+                    pos += 1;
+                    continue;
+                }
+
+                let virtual_id = doc_id as u64 * nord64 + ordinal as u64;
+                let bid2 = (virtual_id / bs64) as u32;
+                if bid2 != block_id {
+                    // This posting belongs to a later block — record and stop
+                    next_block = Some(bid2);
+                    break;
+                }
+
+                let local_slot = (virtual_id % bs64) as u8;
+                postings_flat.push(local_slot);
+                postings_flat.push(impact);
                 posting_count += 1;
+                max_impact = max_impact.max(impact);
+                pos += 1;
             }
 
-            // Collect sparse grid entry (no dense grid allocation)
-            let dim_idx = dim_to_idx[&dim_id];
+            // Grid entry
             grid_entries.push((dim_idx as u32, block_id, max_impact));
+
+            // Advance cursor
+            if let Some(nb) = next_block {
+                // Already found the next valid posting at `pos`
+                cursors[dim_idx] = pos;
+                heap.push(Reverse((nb, dim_id, dim_idx)));
+            } else {
+                // Scan for next valid posting (skipping invalids past this block)
+                cursors[dim_idx] = pos;
+                while pos < posts.len() {
+                    let (doc_id, ordinal, weight) = posts[pos];
+                    let abs_w = weight.abs();
+                    if abs_w >= weight_threshold {
+                        let impact = quantize_weight(abs_w, max_weight_scale);
+                        if impact > 0 {
+                            let virtual_id = doc_id as u64 * nord64 + ordinal as u64;
+                            let nb = (virtual_id / bs64) as u32;
+                            cursors[dim_idx] = pos;
+                            heap.push(Reverse((nb, dim_id, dim_idx)));
+                            break;
+                        }
+                    }
+                    pos += 1;
+                }
+            }
         }
     }
-    // Sentinel for block_term_starts
+
+    // Fill remaining empty blocks
+    for _ in (last_block_filled + 1) as u32..num_blocks as u32 {
+        block_term_starts.push(term_dim_ids.len() as u32);
+    }
+    // Sentinels
     block_term_starts.push(term_dim_ids.len() as u32);
-    // Sentinel for term_posting_starts
     term_posting_starts.push(posting_count);
 
     let total_terms = term_dim_ids.len() as u32;
@@ -262,7 +290,29 @@ pub(crate) fn write_bmp_blob_v5(
     // Sort grid entries by (dim_idx, block_id) for streaming write
     grid_entries.sort_unstable();
 
-    // ── Write sections ──────────────────────────────────────────────────
+    let packed_row_size = num_blocks.div_ceil(2);
+    let num_superblocks = num_blocks.div_ceil(BMP_SUPERBLOCK_SIZE as usize);
+    log::info!(
+        "[bmp_build] max_doc_id={} num_ordinals={} num_blocks={} num_dims={} \
+         total_terms={} total_postings={} grid_entries={} \
+         block_term_starts={}B term_dim_ids={}B term_posting_starts={}B \
+         postings_flat={}B grid={}B sb_grid={}B",
+        max_doc_id,
+        num_ordinals,
+        num_blocks,
+        num_dims,
+        total_terms,
+        total_postings,
+        grid_entries.len(),
+        (num_blocks + 1) * 4,
+        total_terms as usize * 4,
+        (total_terms as usize + 1) * 4,
+        total_postings as usize * 2,
+        num_dims * packed_row_size,
+        num_dims * num_superblocks,
+    );
+
+    // ── Write V5 sections ───────────────────────────────────────────────
     let mut bytes_written: u64 = 0;
 
     // Section 1: block_term_starts [u32-LE × (num_blocks + 1)]
@@ -287,7 +337,7 @@ pub(crate) fn write_bmp_blob_v5(
 
     // Section 6: dim_ids [u32-LE × num_dims]
     let dim_ids_offset = bytes_written as u32;
-    bytes_written += write_u32_slice_le(writer, dim_ids)?;
+    bytes_written += write_u32_slice_le(writer, &dim_ids)?;
 
     // Sections 7+8: packed grid + sb_grid (streaming from sparse grid entries)
     let grid_offset = bytes_written as u32;
@@ -296,18 +346,18 @@ pub(crate) fn write_bmp_blob_v5(
     bytes_written += packed_bytes + sb_bytes;
 
     // BMP V5 Footer (48 bytes)
-    writer.write_u32::<LittleEndian>(total_terms)?; // 0-3
-    writer.write_u32::<LittleEndian>(total_postings)?; // 4-7
-    writer.write_u32::<LittleEndian>(dim_ids_offset)?; // 8-11
-    writer.write_u32::<LittleEndian>(grid_offset)?; // 12-15
-    writer.write_u32::<LittleEndian>(num_blocks as u32)?; // 16-19
-    writer.write_u32::<LittleEndian>(num_dims as u32)?; // 20-23
-    writer.write_u32::<LittleEndian>(bmp_block_size)?; // 24-27
-    writer.write_u32::<LittleEndian>(num_ordinals)?; // 28-31
-    writer.write_f32::<LittleEndian>(max_weight_scale)?; // 32-35
-    writer.write_u32::<LittleEndian>(sb_grid_offset)?; // 36-39 sb_grid_offset
-    writer.write_u32::<LittleEndian>(0)?; // 40-43 reserved
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V5)?; // 44-47
+    writer.write_u32::<LittleEndian>(total_terms)?;
+    writer.write_u32::<LittleEndian>(total_postings)?;
+    writer.write_u32::<LittleEndian>(dim_ids_offset)?;
+    writer.write_u32::<LittleEndian>(grid_offset)?;
+    writer.write_u32::<LittleEndian>(num_blocks as u32)?;
+    writer.write_u32::<LittleEndian>(num_dims as u32)?;
+    writer.write_u32::<LittleEndian>(effective_block_size)?;
+    writer.write_u32::<LittleEndian>(num_ordinals)?;
+    writer.write_f32::<LittleEndian>(max_weight_scale)?;
+    writer.write_u32::<LittleEndian>(sb_grid_offset)?;
+    writer.write_u32::<LittleEndian>(0)?; // reserved
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC_V5)?;
     bytes_written += 48;
 
     Ok(bytes_written)
