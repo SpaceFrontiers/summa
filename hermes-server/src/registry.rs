@@ -121,7 +121,6 @@ impl IndexRegistry {
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         Self::precache_idf_files(&index);
-        Self::warmup_bmp_indexes(&index).await;
 
         self.handles.write().insert(
             name.to_string(),
@@ -219,41 +218,6 @@ impl IndexRegistry {
                 hermes_core::tokenizer::idf_weights_cache().get_or_load(&name, Some(&dir));
             });
         }
-    }
-
-    /// Prefault all BMP index data into the page cache in a background thread.
-    ///
-    /// Eagerly loads the searcher (triggering segment loading + madvise readahead),
-    /// then spawns a background thread to synchronously touch every page for
-    /// guaranteed warm cache on the first query.
-    async fn warmup_bmp_indexes(index: &Arc<Index<MmapDirectory>>) {
-        // Eagerly load segments (triggers BmpIndex::parse → advise_willneed)
-        let searcher = match index.reader().await {
-            Ok(reader) => match reader.searcher().await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::warn!("BMP warmup: failed to get searcher: {}", e);
-                    return;
-                }
-            },
-            Err(e) => {
-                log::warn!("BMP warmup: failed to get reader: {}", e);
-                return;
-            }
-        };
-
-        // Spawn blocking warmup: synchronous page-touch for guaranteed warm cache
-        tokio::task::spawn_blocking(move || {
-            let start = std::time::Instant::now();
-            searcher.warmup_bmp();
-            let elapsed = start.elapsed();
-            if elapsed.as_millis() > 10 {
-                log::info!(
-                    "BMP warmup completed in {:.1}ms",
-                    elapsed.as_secs_f64() * 1000.0
-                );
-            }
-        });
     }
 
     /// Evict an index from the registry atomically.

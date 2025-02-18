@@ -349,69 +349,6 @@ impl OwnedBytes {
     pub fn to_vec(&self) -> Vec<u8> {
         self.as_slice().to_vec()
     }
-
-    /// Issue `madvise(MADV_WILLNEED)` to start asynchronous kernel readahead.
-    ///
-    /// Non-blocking: returns immediately. The kernel will start paging data in
-    /// the background. For non-mmap-backed data this is a no-op.
-    ///
-    /// Call this at load time so that by the time the first query arrives
-    /// (typically 100ms+ later), pages are already in the page cache.
-    pub(crate) fn advise_willneed(&self) {
-        if self.range.is_empty() {
-            return;
-        }
-        #[cfg(all(unix, feature = "native"))]
-        if let SharedBytes::Mmap(ref mmap) = self.data {
-            let base = mmap.as_ptr().wrapping_add(self.range.start);
-            let len = self.range.len();
-            unsafe {
-                unsafe extern "C" {
-                    fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
-                }
-                madvise(base, len, 3); // MADV_WILLNEED = 3
-            }
-        }
-    }
-
-    /// Touch every page in this slice to force the OS to page in the data.
-    ///
-    /// For mmap-backed data, this triggers page faults now (at a predictable time)
-    /// rather than during the first query. Reads one byte per 4KB page.
-    ///
-    /// On Unix with mmap-backed data, also issues `madvise(MADV_WILLNEED)` to
-    /// hint the kernel to start readahead.
-    pub(crate) fn prefault(&self) {
-        let s = self.as_slice();
-        if s.is_empty() {
-            return;
-        }
-
-        // On Unix with mmap: issue MADV_WILLNEED for async readahead
-        #[cfg(all(unix, feature = "native"))]
-        if let SharedBytes::Mmap(ref mmap) = self.data {
-            let base = mmap.as_ptr().wrapping_add(self.range.start);
-            let len = self.range.len();
-            // MADV_WILLNEED = 3 on macOS and Linux
-            unsafe {
-                unsafe extern "C" {
-                    fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
-                }
-                madvise(base, len, 3);
-            }
-        }
-
-        // Portable page-touch: read one byte per 4KB page to force page-in.
-        // Uses volatile read + black_box to prevent the compiler from
-        // optimizing away the loads.
-        let mut acc: u8 = 0;
-        for offset in (0..s.len()).step_by(4096) {
-            acc = acc.wrapping_add(unsafe { *s.as_ptr().add(offset) });
-        }
-        // Touch the last byte too (covers partial last page)
-        acc = acc.wrapping_add(unsafe { *s.as_ptr().add(s.len() - 1) });
-        std::hint::black_box(acc);
-    }
 }
 
 impl AsRef<[u8]> for OwnedBytes {

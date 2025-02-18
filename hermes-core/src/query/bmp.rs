@@ -689,8 +689,8 @@ fn compute_sb_ubs_compact(
 
 /// Compute block UBs from compact 4-bit grid for blocks `[block_start..block_end)`.
 ///
-/// Same as `BmpIndex::compute_block_ubs_range` but operates on a compact grid
-/// where dim rows are contiguous in memory (L1-cache friendly).
+/// Operates on compact (query-local) grid where dim rows are contiguous
+/// in memory (L1-cache friendly).
 #[inline]
 fn compute_block_ubs_compact(
     compact_grid: &[u8],

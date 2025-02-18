@@ -282,18 +282,6 @@ impl<D: Directory + 'static> Searcher<D> {
         &self.segments
     }
 
-    /// Synchronously prefault all BMP index data across all segments.
-    ///
-    /// Blocks until every page of every BMP index is in the page cache.
-    /// Eliminates cold-start latency for the first sparse vector query.
-    ///
-    /// Call from a blocking context (e.g., `tokio::task::spawn_blocking`).
-    pub fn warmup_bmp(&self) {
-        for seg in &self.segments {
-            seg.warmup_bmp();
-        }
-    }
-
     /// Get default fields for search
     pub fn default_fields(&self) -> &[crate::Field] {
         &self.default_fields

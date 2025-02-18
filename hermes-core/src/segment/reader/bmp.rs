@@ -199,9 +199,6 @@ impl BmpIndex {
             .read_bytes_range_sync(blob_offset..blob_offset + data_len)
             .map_err(crate::Error::Io)?;
 
-        // Start async kernel readahead for the entire blob.
-        blob.advise_willneed();
-
         let term_dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
 
         // V8 Section A: block_data_starts [u32 × (num_blocks + 1)]
@@ -323,66 +320,6 @@ impl BmpIndex {
         None
     }
 
-    /// Compute upper bound scores for ALL superblocks in a single vectorized pass.
-    pub fn compute_superblock_ubs(&self, query_dims: &[(usize, f32)], out: &mut [f32]) {
-        let nsb = self.num_superblocks as usize;
-        debug_assert!(out.len() >= nsb);
-
-        out[..nsb].fill(0.0);
-
-        let sb_grid = self.sb_grid_bytes.as_slice();
-        for &(dim_idx, weight) in query_dims {
-            let row = &sb_grid[dim_idx * nsb..dim_idx * nsb + nsb];
-            accumulate_u8_weighted(row, weight, &mut out[..nsb]);
-        }
-    }
-
-    /// Compute block UBs for blocks `[block_start..block_end)` within one superblock.
-    ///
-    /// Reads 4-bit packed grid, unpacks via ×17 to get u8-equivalent UBs.
-    pub fn compute_block_ubs_range(
-        &self,
-        query_dims: &[(usize, f32)],
-        block_start: usize,
-        block_end: usize,
-        out: &mut [f32],
-    ) {
-        let count = block_end - block_start;
-        debug_assert!(out.len() >= count);
-        let prs = self.packed_row_size as usize;
-        let grid = self.grid_bytes.as_slice();
-
-        out[..count].fill(0.0);
-
-        for &(dim_idx, weight) in query_dims {
-            let row = &grid[dim_idx * prs..(dim_idx + 1) * prs];
-            accumulate_u4_weighted(row, block_start, count, weight, &mut out[..count]);
-        }
-    }
-
-    /// Build per-block query-dim presence masks for blocks `[block_start..block_end)`.
-    ///
-    /// Reads 4-bit packed grid, unpacks inline to check presence.
-    /// Uses SIMD when available to process 32 blocks at a time per query dim.
-    pub fn compute_block_masks_range(
-        &self,
-        query_dims: &[(usize, f32)],
-        block_start: usize,
-        block_end: usize,
-        masks: &mut [u64],
-    ) {
-        let prs = self.packed_row_size as usize;
-        let grid = self.grid_bytes.as_slice();
-        compute_block_masks_4bit(
-            grid,
-            prs,
-            query_dims,
-            block_start,
-            block_end - block_start,
-            masks,
-        );
-    }
-
     // ── V8 hot-path block-data accessors ─────────────────────────────
 
     /// Byte offset range in block_data_bytes for a block.
@@ -497,27 +434,6 @@ impl BmpIndex {
             + self.sb_grid_bytes.len()
             + self.doc_map_ids_bytes.len()
             + self.doc_map_ordinals_bytes.len()
-    }
-
-    /// Prefault all mmap-backed sections into the OS page cache.
-    ///
-    /// Eliminates 20-50ms cold-start penalty on first query by forcing page
-    /// faults at a predictable time (segment load) rather than during query
-    /// execution. On Unix, also issues `madvise(MADV_WILLNEED)` for readahead.
-    ///
-    /// V8 sections are prefaulted in query access order:
-    /// 1. sb_grid (superblock UB computation)
-    /// 2. grid (block UB + mask computation)
-    /// 3. block_data_starts + block_data (block scoring — all contiguous per block)
-    /// 4. doc_map (virtual-to-doc mapping for result output)
-    pub fn warmup(&self) {
-        self.sb_grid_bytes.prefault();
-        self.grid_bytes.prefault();
-        self.block_data_starts_bytes.prefault();
-        self.block_data_bytes.prefault();
-        self.dim_ids_bytes.prefault();
-        self.doc_map_ids_bytes.prefault();
-        self.doc_map_ordinals_bytes.prefault();
     }
 
     /// Extract compact grid data for query-relevant dims into caller-provided buffers.
