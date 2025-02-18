@@ -33,7 +33,7 @@
 //! - **Bitmask skip**: Register-level mask check replaces grid DRAM lookups
 //! - **Bucket sort**: O(n) superblock ordering by UB descending
 //! - **Binary search scoring**: O(|query| × log|block_terms|) per block
-//! - **Extended prefetch**: N+1 block metadata + N+2 block term starts prefetched
+//! - **Multi-level prefetch**: SB offset warming → pre-loop burst → N+1/N+2 data pipeline
 //! - **Thread-local scratch**: Zero per-query allocation for large buffers
 //! - **Early termination**: stop when superblock/block UB < top-k threshold
 
@@ -312,6 +312,17 @@ fn execute_bmp_inner(
             let block_end = (block_start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
             let count = block_end - block_start;
 
+            // Level 1: Warm block_data_starts for this superblock (~260 bytes, 4-5 cache lines).
+            // Ensures block_data_ptr() never stalls on offset lookups during scoring.
+            // Range includes the sentinel at block_end (needed by block_data_range).
+            {
+                let bds_base = index.block_data_starts_ptr(0);
+                // 16 blocks × 4 bytes = 64 bytes = 1 cache line per prefetch
+                for b in (block_start..block_end + 1).step_by(16) {
+                    prefetch_read(unsafe { bds_base.add(b * 4) });
+                }
+            }
+
             // Compute block UBs + masks from compact grid (L1-cached)
             compute_block_ubs_compact(
                 &scratch.compact_grid,
@@ -351,6 +362,18 @@ fn execute_bmp_inner(
                 &mut blocks_scored,
                 &mut scratch.acc,
             );
+
+            // Cross-superblock lookahead: prefetch next superblock's block_data_starts.
+            // Gives offsets time to arrive during pruning check + UB/mask computation.
+            // Range includes the sentinel at next_end (needed by block_data_range).
+            if let Some(&next_sb) = scratch.sb_order.get(idx + 1) {
+                let next_start = next_sb as usize * BMP_SUPERBLOCK_SIZE as usize;
+                let next_end = (next_start + BMP_SUPERBLOCK_SIZE as usize).min(num_blocks);
+                let bds_base = index.block_data_starts_ptr(0);
+                for b in (next_start..next_end + 1).step_by(16) {
+                    prefetch_read(unsafe { bds_base.add(b * 4) });
+                }
+            }
 
             sbs_scored += 1;
         }
@@ -473,6 +496,16 @@ fn score_superblock_blocks(
 ) {
     let dim_id_width = index.term_dim_id_width;
 
+    // Level 2: Pre-warm first few blocks' data (eliminates cold-start for first block).
+    // block_data_starts offsets are already in cache from superblock-level prefetch.
+    for &li in local_order.iter().take(4) {
+        let li = li as usize;
+        if li >= count {
+            break;
+        }
+        prefetch_read(index.block_data_ptr((block_start + li) as u32));
+    }
+
     for (order_idx, &local_idx) in local_order.iter().enumerate() {
         if local_idx as usize >= count {
             break;
@@ -486,19 +519,17 @@ fn score_superblock_blocks(
 
         let block_id = (block_start + local_idx as usize) as u32;
 
-        // V8 prefetch: single prefetch loads all block scoring data (contiguous)
+        // Level 3: Two-deep data prefetch (N+1 and N+2 block data).
+        // block_data_starts offsets are warm from superblock-level prefetch,
+        // so block_data_ptr() reads hit L1/L2 cache (no stall on offset lookup).
         if order_idx + 1 < local_order.len() {
             let next_local = local_order[order_idx + 1] as usize;
             if next_local < count {
-                let next_block = (block_start + next_local) as u32;
-                prefetch_read(index.block_data_ptr(next_block));
-                // N+2: prefetch block_data_starts entry
+                prefetch_read(index.block_data_ptr((block_start + next_local) as u32));
                 if order_idx + 2 < local_order.len() {
                     let next2_local = local_order[order_idx + 2] as usize;
                     if next2_local < count {
-                        prefetch_read(
-                            index.block_data_starts_ptr((block_start + next2_local) as u32),
-                        );
+                        prefetch_read(index.block_data_ptr((block_start + next2_local) as u32));
                     }
                 }
             }
@@ -521,7 +552,8 @@ fn score_superblock_blocks(
             );
         }
 
-        // Collect results: dequantize u32 → f32, only visit touched slots
+        // Collect results + lazy zeroing in one pass over touched slots.
+        // Dequantize u32 → f32, clear each slot immediately after reading.
         let base = block_id * index.bmp_block_size;
         let num_vdocs = index.num_virtual_docs;
         let mut scan = touched;
@@ -529,6 +561,7 @@ fn score_superblock_blocks(
             let i = scan.trailing_zeros() as usize;
             scan &= scan - 1; // clear lowest set bit
             let score_u32 = acc[i];
+            acc[i] = 0; // lazy zero: clear immediately after read
             if score_u32 > 0 {
                 let virtual_id = base + i as u32;
                 // Guard against phantom slots in the last block
@@ -545,14 +578,6 @@ fn score_superblock_blocks(
                     }
                 }
             }
-        }
-
-        // Lazy zeroing: only clear touched slots instead of acc[..block_size].fill(0)
-        let mut clear = touched;
-        while clear != 0 {
-            let bit = clear.trailing_zeros() as usize;
-            acc[bit] = 0;
-            clear &= clear - 1;
         }
         *blocks_scored += 1;
     }

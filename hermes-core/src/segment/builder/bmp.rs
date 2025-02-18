@@ -59,7 +59,7 @@ use std::collections::BinaryHeap;
 use std::io::Write;
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 /// Look up a compact virtual ID by binary search on sorted `vid_pairs`.
 ///
@@ -118,8 +118,10 @@ pub(crate) fn build_bmp_blob(
 
     // Phase 1: Find global max weight AND collect unique (doc_id, ordinal) pairs.
     // Single pass over all postings — avoids double iteration.
+    // Uses Vec + sort + dedup instead of FxHashSet to avoid hash table overhead
+    // (~60 MB vs ~160 MB for 10M pairs).
     let mut global_max_weight: f32 = 0.0;
-    let mut vid_set: FxHashSet<(DocId, u16)> = FxHashSet::default();
+    let mut vid_pairs: Vec<(DocId, u16)> = Vec::new();
 
     for dim_postings in postings.values() {
         for &(doc_id, ordinal, weight) in dim_postings {
@@ -130,11 +132,11 @@ pub(crate) fn build_bmp_blob(
             if abs_w > global_max_weight {
                 global_max_weight = abs_w;
             }
-            vid_set.insert((doc_id, ordinal));
+            vid_pairs.push((doc_id, ordinal));
         }
     }
 
-    if global_max_weight == 0.0 || vid_set.is_empty() {
+    if global_max_weight == 0.0 || vid_pairs.is_empty() {
         return Ok(0);
     }
 
@@ -150,8 +152,8 @@ pub(crate) fn build_bmp_blob(
     // Assign compact virtual IDs: sequential IDs for unique (doc_id, ordinal) pairs.
     // This eliminates the sparse `doc_id * num_ordinals + ordinal` space that causes
     // catastrophic grid blowup when ordinal distribution is skewed.
-    let mut vid_pairs: Vec<(DocId, u16)> = vid_set.into_iter().collect();
     vid_pairs.sort_unstable();
+    vid_pairs.dedup();
     let num_virtual_docs = vid_pairs.len();
 
     // Lookup: binary search on sorted vid_pairs (O(log N) per lookup, saves ~50-80 bytes/entry)
