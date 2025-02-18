@@ -473,6 +473,20 @@ impl BmpIndex {
     pub(crate) fn packed_row_size(&self) -> usize {
         self.packed_row_size as usize
     }
+
+    /// Direct access to mmap-backed superblock grid (zero-copy, zero allocation).
+    /// Used for large segments where compact grid extraction would be too expensive.
+    #[inline]
+    pub(crate) fn sb_grid_slice(&self) -> &[u8] {
+        self.sb_grid_bytes.as_slice()
+    }
+
+    /// Direct access to mmap-backed block grid (zero-copy, zero allocation).
+    /// Used for large segments where compact grid extraction would be too expensive.
+    #[inline]
+    pub(crate) fn grid_slice(&self) -> &[u8] {
+        self.grid_bytes.as_slice()
+    }
 }
 
 /// Iterator over dimension IDs stored in zero-copy OwnedBytes.

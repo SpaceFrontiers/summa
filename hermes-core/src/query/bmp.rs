@@ -258,28 +258,50 @@ fn execute_bmp_inner(
             block_size,
         );
 
-        // ── Extract compact grids for L1 cache locality ─────────────
-        // Copy only query-relevant dim rows into contiguous buffers.
-        // For ~20 query dims: sb_grid ~480B + grid ~15KB ≈ 16KB → L1 cache.
-        // Eliminates scattered DRAM accesses across the full grid (potentially MBs).
-        let dim_indices: Vec<usize> = resolved.iter().map(|&(idx, _)| idx).collect();
-        index.extract_compact_grids(
-            &dim_indices,
-            &mut scratch.compact_sb_grid,
-            &mut scratch.compact_grid,
-        );
-
-        // Compact resolved: local dim indices (0..num_query_dims) into compact grid
-        let compact_resolved: Vec<(usize, f32)> =
-            (0..resolved.len()).map(|i| (i, resolved[i].1)).collect();
-
         let prs = index.packed_row_size();
 
-        // Phase 2: Compute SUPERBLOCK UBs from compact grid
+        // ── Grid access strategy ─────────────────────────────────────
+        // For small segments: copy query-relevant grid rows into compact
+        // buffers that fit L1 cache (~16KB for 20 dims × 750 blocks).
+        // For large segments: use mmap-backed grid directly (zero alloc)
+        // to avoid multi-MB thread-local scratch that never shrinks.
+        const COMPACT_GRID_MAX: usize = 128 * 1024; // 128KB — fits L2 comfortably
+        let compact_sb_size = resolved.len() * num_superblocks_total;
+        let compact_grid_size = resolved.len() * prs;
+        let use_compact = compact_sb_size + compact_grid_size <= COMPACT_GRID_MAX;
+
+        // grid_dims: (dim_index_into_grid, weight) — local for compact, global for direct
+        let grid_dims: Vec<(usize, f32)>;
+        let sb_grid_slice: &[u8];
+        let grid_slice: &[u8];
+
+        if use_compact {
+            let dim_indices: Vec<usize> = resolved.iter().map(|&(idx, _)| idx).collect();
+            index.extract_compact_grids(
+                &dim_indices,
+                &mut scratch.compact_sb_grid,
+                &mut scratch.compact_grid,
+            );
+            grid_dims = (0..resolved.len()).map(|i| (i, resolved[i].1)).collect();
+            sb_grid_slice = &scratch.compact_sb_grid;
+            grid_slice = &scratch.compact_grid;
+        } else {
+            // Direct mmap access — zero allocation. Grid layout uses global dim indices.
+            grid_dims = resolved.clone();
+            sb_grid_slice = index.sb_grid_slice();
+            grid_slice = index.grid_slice();
+            // Shrink oversized compact buffers from previous queries
+            if scratch.compact_grid.capacity() > COMPACT_GRID_MAX {
+                scratch.compact_sb_grid = Vec::new();
+                scratch.compact_grid = Vec::new();
+            }
+        }
+
+        // Phase 2: Compute SUPERBLOCK UBs from grid
         compute_sb_ubs_compact(
-            &scratch.compact_sb_grid,
+            sb_grid_slice,
             num_superblocks_total,
-            &compact_resolved,
+            &grid_dims,
             &mut scratch.sb_ubs,
         );
         bucket_sort_blocks_desc_into(
@@ -323,19 +345,19 @@ fn execute_bmp_inner(
                 }
             }
 
-            // Compute block UBs + masks from compact grid (L1-cached)
+            // Compute block UBs + masks from grid
             compute_block_ubs_compact(
-                &scratch.compact_grid,
+                grid_slice,
                 prs,
-                &compact_resolved,
+                &grid_dims,
                 block_start,
                 block_end,
                 &mut scratch.local_block_ubs,
             );
             compute_block_masks_4bit(
-                &scratch.compact_grid,
+                grid_slice,
                 prs,
-                &compact_resolved,
+                &grid_dims,
                 block_start,
                 block_end - block_start,
                 &mut scratch.local_block_masks,
