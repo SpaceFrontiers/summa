@@ -328,13 +328,13 @@ pub(crate) fn build_bmp_blob(
     // ── Write V8 interleaved sections ───────────────────────────────────
     let mut bytes_written: u64 = 0;
 
-    // Sections A+B: block-interleaved data
+    // Sections A+B: block-interleaved data (consumes intermediate arrays)
     bytes_written += write_v8_interleaved_sections(
         writer,
-        &block_term_starts,
-        &term_dim_ids,
-        &term_posting_starts,
-        &postings_flat,
+        block_term_starts,
+        term_dim_ids,
+        term_posting_starts,
+        postings_flat,
         num_blocks,
         num_dims,
     )?;
@@ -406,43 +406,72 @@ pub(crate) fn write_u32_slice_le(writer: &mut dyn Write, data: &[u32]) -> std::i
 
 /// Write V8 interleaved block data: Sections A (block_data_starts) + B (per-block data) + padding.
 ///
-/// Converts V7-style intermediate arrays (block_term_starts, term_dim_ids,
-/// term_posting_starts, postings_flat) into per-block interleaved data where
-/// all scoring data for one block is contiguous.
+/// **Consumes** the intermediate arrays to free memory before writing.
+/// Uses a two-pass approach to avoid building a giant `block_data_buf`:
+///   Pass 1: compute per-block data sizes → fill `block_data_starts`, write Section A
+///   Pass 2: stream each block's data directly to writer using a small reusable buffer
+///
+/// Peak memory: only the input arrays + small per-block scratch (~4 KB).
+/// Previous approach held inputs + full block_data_buf (~2× data size).
 ///
 /// Returns total bytes written (sections A + B + padding).
 pub(crate) fn write_v8_interleaved_sections(
     writer: &mut dyn Write,
-    block_term_starts: &[u32],
-    term_dim_ids: &[u32],
-    term_posting_starts: &[u32],
-    postings_flat: &[u8],
+    block_term_starts: Vec<u32>,
+    term_dim_ids: Vec<u32>,
+    term_posting_starts: Vec<u32>,
+    postings_flat: Vec<u8>,
     num_blocks: usize,
     num_dims: usize,
 ) -> std::io::Result<u64> {
     let dim_id_width: u8 = if num_dims <= 65536 { 2 } else { 4 };
 
+    // Pass 1: compute per-block byte sizes for block_data_starts
     let mut block_data_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
-    let mut block_data_buf: Vec<u8> = Vec::new();
-
+    let mut cumulative: u32 = 0;
     for b in 0..num_blocks {
-        block_data_starts.push(block_data_buf.len() as u32);
+        block_data_starts.push(cumulative);
         let ts = block_term_starts[b] as usize;
         let te = block_term_starts[b + 1] as usize;
         let nt = te - ts;
         if nt == 0 {
             continue;
         }
+        // num_terms(2) + dim_indices(nt × width) + posting_starts((nt+1) × 2) + postings
+        let posting_bytes = (term_posting_starts[te] - term_posting_starts[ts]) as usize * 2;
+        let block_size = 2 + nt * dim_id_width as usize + (nt + 1) * 2 + posting_bytes;
+        cumulative += block_size as u32;
+    }
+    block_data_starts.push(cumulative);
+
+    let mut bytes_written: u64 = 0;
+
+    // Section A: block_data_starts [u32 × (num_blocks + 1)]
+    bytes_written += write_u32_slice_le(writer, &block_data_starts)?;
+    drop(block_data_starts);
+
+    // Pass 2: stream each block's interleaved data directly to writer.
+    // Small per-block scratch buffer (~200-2000 bytes typical, reused).
+    let mut blk_buf: Vec<u8> = Vec::with_capacity(4096);
+
+    for b in 0..num_blocks {
+        let ts = block_term_starts[b] as usize;
+        let te = block_term_starts[b + 1] as usize;
+        let nt = te - ts;
+        if nt == 0 {
+            continue;
+        }
+        blk_buf.clear();
 
         // num_terms (u16)
-        block_data_buf.extend_from_slice(&(nt as u16).to_le_bytes());
+        blk_buf.extend_from_slice(&(nt as u16).to_le_bytes());
 
         // term_dim_indices
         for &dim_id in &term_dim_ids[ts..te] {
             if dim_id_width == 2 {
-                block_data_buf.extend_from_slice(&(dim_id as u16).to_le_bytes());
+                blk_buf.extend_from_slice(&(dim_id as u16).to_le_bytes());
             } else {
-                block_data_buf.extend_from_slice(&dim_id.to_le_bytes());
+                blk_buf.extend_from_slice(&dim_id.to_le_bytes());
             }
         }
 
@@ -450,24 +479,23 @@ pub(crate) fn write_v8_interleaved_sections(
         let first_posting = term_posting_starts[ts];
         for &ps in &term_posting_starts[ts..=te] {
             let relative = (ps - first_posting) as u16;
-            block_data_buf.extend_from_slice(&relative.to_le_bytes());
+            blk_buf.extend_from_slice(&relative.to_le_bytes());
         }
 
         // postings [(u8, u8) × block_posting_count]
         let p_start = term_posting_starts[ts] as usize * 2;
         let p_end = term_posting_starts[te] as usize * 2;
-        block_data_buf.extend_from_slice(&postings_flat[p_start..p_end]);
+        blk_buf.extend_from_slice(&postings_flat[p_start..p_end]);
+
+        writer.write_all(&blk_buf)?;
     }
-    block_data_starts.push(block_data_buf.len() as u32);
+    bytes_written += cumulative as u64;
 
-    let mut bytes_written: u64 = 0;
-
-    // Section A: block_data_starts [u32 × (num_blocks + 1)]
-    bytes_written += write_u32_slice_le(writer, &block_data_starts)?;
-
-    // Section B: block_data
-    writer.write_all(&block_data_buf)?;
-    bytes_written += block_data_buf.len() as u64;
+    // Inputs consumed — freed here (before grid/doc_map writes in caller)
+    drop(block_term_starts);
+    drop(term_dim_ids);
+    drop(term_posting_starts);
+    drop(postings_flat);
 
     // Padding to 4-byte boundary
     let padding = (4 - (bytes_written % 4) as usize) % 4;

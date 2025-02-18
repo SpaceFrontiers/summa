@@ -357,7 +357,11 @@ fn merge_bmp_field(
     // Since doc_offsets produce non-overlapping doc_id ranges, segments
     // occupy contiguous ranges in vid_pairs. new_vid = vid_base[seg] + src_vid.
     // No sort or binary search needed — sequential enumeration is already sorted.
-    let mut vid_pairs: Vec<(u32, u16)> = Vec::new();
+    let total_vids: usize = bmp_indexes
+        .iter()
+        .filter_map(|bi| bi.map(|b| b.num_virtual_docs as usize))
+        .sum();
+    let mut vid_pairs: Vec<(u32, u16)> = Vec::with_capacity(total_vids);
     let mut vid_bases: Vec<u64> = Vec::with_capacity(bmp_indexes.len());
     for (seg_idx, bmp_opt) in bmp_indexes.iter().enumerate() {
         vid_bases.push(vid_pairs.len() as u64);
@@ -390,19 +394,30 @@ fn merge_bmp_field(
     // the output block buffer. Completed output blocks are flushed incrementally.
     //
     // Memory: O(output_arrays + one_source_block) instead of O(all_postings).
-    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::new(); // (dim_idx, block_id, max_impact)
+    //
+    // Pre-allocate from source segment stats to avoid realloc+copy during growth.
+    let est_total_postings: usize = bmp_indexes
+        .iter()
+        .filter_map(|bi| bi.map(|b| b.total_postings() as usize))
+        .sum();
+    // grid_entries has one entry per (dim, block) pair with non-zero postings.
+    // No exact stat available; total_postings is a safe upper bound (terms ≤ postings).
+    let est_total_terms = est_total_postings;
+    let mut grid_entries: Vec<(u32, u32, u8)> = Vec::with_capacity(est_total_terms);
     let mut block_term_starts: Vec<u32> = Vec::with_capacity(num_blocks + 1);
-    let mut term_dim_ids: Vec<u32> = Vec::new();
-    let mut term_posting_starts: Vec<u32> = vec![0]; // prefix sums
+    let mut term_dim_ids: Vec<u32> = Vec::with_capacity(est_total_terms);
+    let mut term_posting_starts: Vec<u32> = Vec::with_capacity(est_total_terms + 1);
+    term_posting_starts.push(0);
     let mut cumulative_postings: u32 = 0;
-    let mut postings_buf: Vec<u8> = Vec::new();
+    let mut postings_buf: Vec<u8> = Vec::with_capacity(est_total_postings * 2);
 
     // Buffer for the current output block being assembled
-    let mut block_buf: Vec<(u32, u8, u8)> = Vec::new(); // (dim_idx, local_slot, impact)
+    let mut block_buf: Vec<(u32, u8, u8)> = Vec::with_capacity(256); // (dim_idx, local_slot, impact)
     let mut current_block: i64 = -1;
 
     // Temporary buffer for one source block's remapped postings (reused across iterations)
-    let mut src_block_buf: Vec<(u32, u32, u8, u8)> = Vec::new(); // (new_block, dim_idx, new_slot, impact)
+    let mut src_block_buf: Vec<(u32, u32, u8, u8)> =
+        Vec::with_capacity(effective_block_size as usize * 256);
 
     /// Flush the current output block buffer: sort by dim_idx, group, emit to output arrays.
     #[inline(never)]
@@ -544,13 +559,13 @@ fn merge_bmp_field(
     // ── Write V8 blob — block-interleaved format ──────────────────────────
     let mut bytes_written: u64 = 0;
 
-    // Sections A+B: block-interleaved data
+    // Sections A+B: block-interleaved data (consumes intermediate arrays, freeing ~2× postings memory)
     bytes_written += write_v8_interleaved_sections(
         writer,
-        &block_term_starts,
-        &term_dim_ids,
-        &term_posting_starts,
-        &postings_buf,
+        block_term_starts,
+        term_dim_ids,
+        term_posting_starts,
+        postings_buf,
         num_blocks,
         num_dims,
     )
